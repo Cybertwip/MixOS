@@ -42,11 +42,11 @@ case "$DEVICE" in
 		break
 	  fi
 	done
-	if [ "$HDMI_STATUS" = "connected" ]; then
-      sed -i '/Rotation/s//Rotation \= 0/g' $HOME/.local/share/duckstation/settings.ini
-	else
-      sed -i '/Rotation/s//Rotation \= Rotate270/g' $HOME/.local/share/duckstation/settings.ini
-	fi
+    if [ "$HDMI_STATUS" = "connected" ]; then
+      sed -i "/Rotation/c\Rotation \= 0" $HOME/.local/share/duckstation/settings.ini
+    else
+      sed -i "/Rotation/c\Rotation \= Rotate270" $HOME/.local/share/duckstation/settings.ini
+    fi
     ;;
   *)
     continue
