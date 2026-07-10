@@ -23,7 +23,7 @@ else
 	if [ -f "Arkbuild_package_cache/${CHIPSET}/retrorun.commit" ]; then
 	  sudo rm -f Arkbuild_package_cache/${CHIPSET}/retrorun.commit
 	fi
-	sudo tar -czpf Arkbuild_package_cache/${CHIPSET}/retrorun.tar.gz Arkbuild/usr/local/bin/retrorun
+	sudo tar -czpf Arkbuild_package_cache/${CHIPSET}/retrorun.tar.gz Arkbuild/usr/local/bin/retrorun*
 	sudo git --git-dir=Arkbuild/home/ark/${CHIPSET}_core_builds/retrorun/.git --work-tree=Arkbuild/home/ark/${CHIPSET}_core_builds/retrorun rev-parse HEAD > Arkbuild_package_cache/${CHIPSET}/retrorun.commit
 fi
 if [[ "${BUILD_ARMHF}" == "y" ]]; then
@@ -43,7 +43,7 @@ if [[ "${BUILD_ARMHF}" == "y" ]]; then
 	  if [ -f "Arkbuild_package_cache/${CHIPSET}/retrorun32.commit" ]; then
 	    sudo rm -f Arkbuild_package_cache/${CHIPSET}/retrorun32.commit
 	  fi
-	  sudo tar -czpf Arkbuild_package_cache/${CHIPSET}/retrorun32.tar.gz Arkbuild/usr/local/bin/retrorun32
+	  sudo tar -czpf Arkbuild_package_cache/${CHIPSET}/retrorun32.tar.gz Arkbuild/usr/local/bin/retrorun32*
 	  sudo git --git-dir=Arkbuild32/home/ark/${CHIPSET}_core_builds/retrorun/.git --work-tree=Arkbuild32/home/ark/${CHIPSET}_core_builds/retrorun rev-parse HEAD > Arkbuild_package_cache/${CHIPSET}/retrorun32.commit
   fi
 fi
