@@ -63,8 +63,6 @@ if [[ -f $(find /opt/system/Tools -maxdepth 1 -iname wifikeyfile.txt) ]]; then
 
 	dialog --infobox "Starting Wifi importer.  Please wait..." 5 $width > /dev/tty1
 	#printf "Starting Wifi importer.  Please wait..." > /dev/tty1
-	sudo systemctl stop networkwatchdaemon
-	sudo systemctl restart NetworkManager
 
 	dos2unix "$keyfile"
 	mapfile wificreds < "$keyfile"
@@ -101,8 +99,6 @@ if [[ -f $(find /opt/system/Tools -maxdepth 1 -iname wifikeyfile.txt) ]]; then
 	  dialog --infobox "The contents of the ${keyfile_base} are invalid.  It can not be imported.  File has been renamed to ${keyfile}.nogood in the tools folder." $height $width 2>&1 > /dev/tty1 
 	  sleep 10
 	fi
-	sudo systemctl stop NetworkManager
-	sudo systemctl start networkwatchdaemon
 	dialog --clear
 	printf "\033c" > /dev/tty1
 	exit 0
