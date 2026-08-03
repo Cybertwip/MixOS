@@ -61,17 +61,40 @@ For the first visible Linux boot, preserve the stock LK display state and use
 the `simple-framebuffer` node at `0x82700000`; do not reset DSI/MMSYS yet. The
 full JD9365 program remains in the DTB for the later native panel adapter.
 
-Input still requires small MT6592 adapters:
+The first input layer is implemented by `linux/j36_mt6592_input.c` as one
+minimal polled platform driver. It consumes the DTB's
+`j36,j36-ultra-input` node and covers:
 
-1. GPIO controller access for the polled D-pad, stick clicks, and special key.
-2. KPD register reader for the matrix-backed face/shoulder/start/select keys.
-3. AUXADC IIO provider for joystick channels 15, 14, 12, and 13.
+1. GPIO DIN for the D-pad, stick clicks, and special key.
+2. KPD scan memory for face/shoulder/start/select/menu/volume keys.
+3. AUXADC channels 15, 14, 12, and 13 for both analog sticks.
 
-Those adapters can be rewired from the existing MVII driver files without
-changing the generic Debian userspace.
+It never changes pinmux or touches MMSYS, DSI, MIPI-TX, panel, or backlight
+registers.
 
-## Implemented Linux adapter
+## Incremental build
 
-`linux/j36_mt6592_input.c` now implements the first input layer as one minimal
-polled platform driver. It consumes the DTB's `j36,j36-ultra-input` node and
-covers the GPIO, KPD and AUXADC paths without touching display registers.
+After the R36 baseline build has finished, run:
+
+```sh
+./build-j36-ultra.sh
+```
+
+This reuses the existing `darkos-r36` Multipass VM but does **not** rerun
+`make rg351mp`. The first J36 run creates a persistent ARMv7 Linux 6.12 LTS
+workspace. Later runs reuse it and incrementally rebuild only changed kernel,
+DTB, input-module, initramfs, and `boot.img` files.
+
+Artifacts are copied to:
+
+```text
+../dArkOS-artifacts/j36-ultra/boot.img
+../dArkOS-artifacts/j36-ultra/mt6592-j36-ultra.dtb
+../dArkOS-artifacts/j36-ultra/j36_mt6592_input.ko
+../dArkOS-artifacts/j36-ultra/manifest.txt
+```
+
+The generated `boot.img` is a first-stage serial/framebuffer/input bring-up
+image sized for the stock 9 MiB BOOTIMG partition. It is not yet a complete
+dArkOS image: native MT6592 MSDC/eMMC or SD storage must be ported before a
+persistent Debian root filesystem can be mounted.
