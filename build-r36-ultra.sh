@@ -53,7 +53,9 @@ Usage: ./build-r36-ultra.sh
 Builds the RG351MP/RK3326 base image used for R36 Ultra bring-up.
 It does not yet inject an R36 Ultra-specific DTB.
 
-On macOS the script automatically creates or reuses a Multipass VM.
+On macOS the script automatically creates or reuses a Multipass VM. Failed
+builds resume from the last completed infrastructure checkpoint instead of
+recreating the partition image, Debian rootfs, U-Boot, or kernel.
 Artifacts are copied to:
   ${ARTIFACT_DIR}
 
@@ -171,45 +173,32 @@ rsync -a --delete \\
     '$VM_SOURCE_MOUNT/' '$VM_BUILD_DIR/'
 "
 
-log "Starting the build. This can take many hours."
-log "Target: make rg351mp DEBIAN_CODE_NAME=${DEBIAN_RELEASE} BUILD_ARMHF=${ARMHF} ENABLE_CACHE=${CACHE}"
+log "Starting or resuming the checkpointed R36/RG351MP build"
+log "Completed partition, Debian bootstrap, U-Boot and kernel stages are preserved across retries."
+
+multipass exec "$VM_NAME" -- env \
+    DEBIAN_CODE_NAME="$DEBIAN_RELEASE" \
+    BUILD_ARMHF="$ARMHF" \
+    ENABLE_CACHE="$CACHE" \
+    DARKOS_R36_STATE_DIR="/home/ubuntu/darkos-r36-state" \
+    bash "$VM_BUILD_DIR/device/r36-ultra/build-in-vm.sh"
 
 multipass exec "$VM_NAME" -- bash -lc "
 set -Eeuo pipefail
+STATE_DIR='/home/ubuntu/darkos-r36-state/${DEBIAN_RELEASE}-armhf-${ARMHF}'
+read -r IMAGE < \$STATE_DIR/latest-image
 cd '$VM_BUILD_DIR'
-BUILD_DATE=\"\$(date +%m%d%Y)\"
-IMAGE=\"dArkOS_RG351MP_${DEBIAN_RELEASE}_\${BUILD_DATE}.img\"
-
-# create_image.sh intentionally skips an archive that already exists. Remove
-# only this run's generated output so a same-day rebuild cannot reuse stale data.
-rm -f \"\$IMAGE\" \"\${IMAGE}.7z\" \"\${IMAGE}.7z.\"*
-touch .r36-ultra-build-start
-
-make rg351mp \\
-    DEBIAN_CODE_NAME='$DEBIAN_RELEASE' \\
-    BUILD_ARMHF='$ARMHF' \\
-    ENABLE_CACHE='$CACHE'
-
-[[ -s \"\$IMAGE\" ]] || {
-    echo \"Expected image was not produced: \$IMAGE\" >&2
-    exit 1
-}
-[[ -f \"\${IMAGE}.7z.001\" && \"\${IMAGE}.7z.001\" -nt .r36-ultra-build-start ]] || {
-    echo \"Expected fresh split archive was not produced: \${IMAGE}.7z.001\" >&2
-    exit 1
-}
-if grep -q 'Exiting build with return code' build.log; then
-    echo 'A verified build step reported failure; inspect build.log.' >&2
-    exit 1
-fi
-
-7z t \"\${IMAGE}.7z.001\"
-sudo parted -s \"\$IMAGE\" print
-cp -f \"\${IMAGE}.7z.\"* build.log '$VM_ARTIFACT_MOUNT/'
+[[ -s "\$IMAGE" ]] || { echo "missing image: \$IMAGE" >&2; exit 1; }
+[[ -f "\${IMAGE}.7z.001" ]] || { echo "missing archive: \${IMAGE}.7z.001" >&2; exit 1; }
+7z t "\${IMAGE}.7z.001"
+sudo parted -s "\$IMAGE" print
+cp -f "\${IMAGE}.7z."* '$VM_ARTIFACT_MOUNT/'
+cp -f "\$STATE_DIR/resume.log" '$VM_ARTIFACT_MOUNT/build-r36-ultra-resume.log'
+[[ -f build.log ]] && cp -f build.log '$VM_ARTIFACT_MOUNT/build.log' || true
 if [[ '$COPY_RAW_IMAGE' == '1' ]]; then
-    cp -f \"\$IMAGE\" '$VM_ARTIFACT_MOUNT/'
+    cp -f "\$IMAGE" '$VM_ARTIFACT_MOUNT/'
 fi
-printf '%s\\n' \"\$IMAGE\" > '$VM_ARTIFACT_MOUNT/latest-image.txt'
+printf '%s\n' "\$IMAGE" > '$VM_ARTIFACT_MOUNT/latest-image.txt'
 "
 
 log "Build completed and verified."
