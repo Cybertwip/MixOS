@@ -80,11 +80,12 @@ fi
 
 run_make() {
     cd "$SCRIPT_DIR"
-    log "Building RG351MP base (Debian ${DEBIAN_RELEASE}, ARMHF=${ARMHF}, cache=${CACHE})"
-    make rg351mp \
-        DEBIAN_CODE_NAME="$DEBIAN_RELEASE" \
+    log "Building or resuming RG351MP (Debian ${DEBIAN_RELEASE}, ARMHF=${ARMHF}, cache=${CACHE})"
+    env DEBIAN_CODE_NAME="$DEBIAN_RELEASE" \
         BUILD_ARMHF="$ARMHF" \
-        ENABLE_CACHE="$CACHE"
+        ENABLE_CACHE="$CACHE" \
+        DARKOS_R36_STATE_DIR="${DARKOS_R36_STATE_DIR:-$HOME/darkos-r36-state}" \
+        bash device/r36-ultra/build-in-vm.sh
 }
 
 if [[ "$(uname -s)" != "Darwin" ]]; then

@@ -126,7 +126,7 @@ ensure_armhf_mounts() {
 
 ensure_ccache_mount() {
     sudo mkdir -p Arkbuild/home/ark/Arkbuild_ccache
-    if ! grep -qs "$ROOT/Arkbuild_ccache" /proc/mounts; then
+    if ! mountpoint -q Arkbuild/home/ark/Arkbuild_ccache; then
         sudo mount --bind "$ROOT/Arkbuild_ccache" Arkbuild/home/ark/Arkbuild_ccache
     fi
 }
@@ -218,7 +218,7 @@ if ! marked userspace; then
     if marked component-build_deps; then
         ensure_ccache_mount
     fi
-    if ! marked component-build_deps && grep -qs "$ROOT/Arkbuild_ccache" /proc/mounts; then
+    if ! marked component-build_deps && mountpoint -q Arkbuild/home/ark/Arkbuild_ccache; then
         sudo umount -l Arkbuild/home/ark/Arkbuild_ccache || true
     fi
     userspace_scripts=(
