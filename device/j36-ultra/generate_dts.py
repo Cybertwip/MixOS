@@ -199,6 +199,17 @@ def generate(sources: dict[str, str]) -> str:
     init_bytes = format_bytes(records)
     keymap_cells = format_cells(keymap, per_line=3)
     matrix_map_cells = format_cells(matrix_bit_map, per_line=4)
+    direct_map = []
+    for _name, gpio, code in direct_keys:
+        direct_map.extend((gpio, code))
+    direct_map_cells = format_cells(direct_map, per_line=4, indent="\t\t")
+    axis_map = [
+        joy_x, ABS_X, 1,
+        joy_y, ABS_Y, 1,
+        joy_z, ABS_Z, 0,
+        joy_rz, ABS_RZ, 0,
+    ]
+    axis_map_cells = format_cells(axis_map, per_line=6, indent="\t\t")
 
     return f"""/dts-v1/;
 
@@ -308,6 +319,11 @@ def generate(sources: dict[str, str]) -> str:
 \t\t\tstatus = \"okay\";
 \t\t}};
 
+\t\tpericfg: syscon@10003000 {{
+\t\t\tcompatible = \"j36,mt6592-pericfg\", \"syscon\";
+\t\t\treg = <0x10003000 0x1000>;
+\t\t}};
+
 \t\tauxadc: adc@11001000 {{
 \t\t\tcompatible = \"j36,mt6592-auxadc\";
 \t\t\treg = <0x11001000 0x1000>;
@@ -362,7 +378,8 @@ def generate(sources: dict[str, str]) -> str:
 \t\t\tphy-names = \"dphy\";
 \t\t\t#address-cells = <1>;
 \t\t\t#size-cells = <0>;
-\t\t\tstatus = \"okay\";
+\t\t\tj36,preserve-lk-state;
+\t\t\tstatus = \"disabled\";
 
 \t\t\tpanel: panel@0 {{
 \t\t\t\tcompatible = \"j36,jd9365-qc-190227\";
@@ -476,9 +493,34 @@ def generate(sources: dict[str, str]) -> str:
 \t\tstatus = \"okay\";
 \t}};
 
+\tj36_input: gamepad-input {{
+\t\tcompatible = \"j36,j36-ultra-input\";
+\t\tj36,gpio-controller = <&gpio>;
+\t\tj36,keypad-controller = <&keypad>;
+\t\tj36,auxadc-controller = <&auxadc>;
+\t\tj36,pericfg-controller = <&pericfg>;
+\t\tpoll-interval-ms = <5>;
+\t\tj36,direct-key-map = <
+{direct_map_cells}
+\t\t>;
+\t\tj36,matrix-key-map = <
+{matrix_map_cells}
+\t\t>;
+\t\t/* Triples are <AUXADC channel Linux ABS code inverted>. */
+\t\tj36,axis-map = <
+{axis_map_cells}
+\t\t>;
+\t\tj36,raw-min = <800>;
+\t\tj36,raw-max = <3900>;
+\t\tj36,fallback-center = <{joy_center}>;
+\t\tj36,deadzone = <{joy_deadzone}>;
+\t\tstatus = \"okay\";
+\t}};
+
 \tgamepad-gpio-keys {{
 \t\tcompatible = \"gpio-keys-polled\";
 \t\tpoll-interval = <5>;
+\t\tstatus = \"disabled\";
 {chr(10).join(gpio_children)}
 \t}};
 
@@ -489,6 +531,7 @@ def generate(sources: dict[str, str]) -> str:
 \t\t#address-cells = <1>;
 \t\t#size-cells = <0>;
 \t\tmediatek,fallback-center = <{joy_center}>;
+\t\tstatus = \"disabled\";
 
 \t\taxis@0 {{
 \t\t\treg = <0>;

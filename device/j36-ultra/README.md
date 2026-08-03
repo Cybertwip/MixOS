@@ -69,3 +69,9 @@ Input still requires small MT6592 adapters:
 
 Those adapters can be rewired from the existing MVII driver files without
 changing the generic Debian userspace.
+
+## Implemented Linux adapter
+
+`linux/j36_mt6592_input.c` now implements the first input layer as one minimal
+polled platform driver. It consumes the DTB's `j36,j36-ultra-input` node and
+covers the GPIO, KPD and AUXADC paths without touching display registers.
