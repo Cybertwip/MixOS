@@ -104,9 +104,11 @@ static void __iomem *j36_iomap_phandle(struct device *dev, const char *property)
 	if (ret)
 		return ERR_PTR(ret);
 
-	/* Do not claim the region: these are shared SoC blocks whose eventual
+	/*
+	 * Do not claim the region: these are shared SoC blocks whose eventual
 	 * native providers may map the same registers. This adapter only reads the
-	 * GPIO/KPD paths and performs the vendor AUXADC conversion sequence. */
+	 * GPIO/KPD paths and performs the vendor AUXADC conversion sequence.
+	 */
 	base = devm_ioremap(dev, resource.start, resource_size(&resource));
 	if (!base)
 		return ERR_PTR(-ENOMEM);
@@ -289,6 +291,7 @@ static void j36_poll(struct work_struct *work)
 
 	for (i = 0; i < j36->direct_count; ++i) {
 		bool state = j36_gpio_pressed(j36, j36->direct[i].source);
+
 		if (state != j36->direct[i].state) {
 			j36->direct[i].state = state;
 			input_report_key(j36->input, j36->direct[i].code, state);
@@ -298,6 +301,7 @@ static void j36_poll(struct work_struct *work)
 
 	for (i = 0; i < j36->matrix_count; ++i) {
 		bool state = j36_matrix_pressed(j36, j36->matrix[i].source);
+
 		if (state != j36->matrix[i].state) {
 			j36->matrix[i].state = state;
 			input_report_key(j36->input, j36->matrix[i].code, state);
@@ -407,8 +411,10 @@ static int j36_input_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	/* Match the validated MVII initialization: enable the scan memory only if
-	 * needed, and ungate the AUXADC peripheral clock without touching DSI. */
+	/*
+	 * Match the validated MVII initialization: enable the scan memory only if
+	 * needed, and ungate the AUXADC peripheral clock without touching DSI.
+	 */
 	writew(J36_KPD_DEBOUNCE_DEFAULT, j36->keypad + J36_KPD_DEBOUNCE);
 	writew(1, j36->keypad + J36_KPD_EN);
 	writel(J36_PERI_PDN0_AUXADC_BITS,

@@ -36,6 +36,7 @@ It does not rerun 'make rg351mp'.
 
 Overrides:
   J36_UPDATE_KERNEL=1 ./build-j36-ultra.sh
+  J36_REBUILD_BUSYBOX=1 ./build-j36-ultra.sh
   J36_KERNEL_BRANCH=linux-6.12.y ./build-j36-ultra.sh
   J36_ARTIFACT_DIR=/path/to/output ./build-j36-ultra.sh
 USAGE
@@ -101,8 +102,10 @@ multipass mount "$ARTIFACT_DIR" "$VM_NAME:$VM_ARTIFACT_MOUNT"
 log "Synchronizing only the changed dArkOS/J36 sources into the persistent VM"
 multipass exec "$VM_NAME" -- bash -lc "
 set -Eeuo pipefail
-sudo apt-get update
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y rsync
+if ! command -v rsync >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y rsync
+fi
 mkdir -p '$VM_BUILD_DIR' '$VM_WORK_DIR/powerengine-drivers'
 rsync -a --delete \\
     --exclude='.git/' \\
@@ -131,6 +134,9 @@ multipass exec "$VM_NAME" -- env \
     J36_KERNEL_BRANCH="${J36_KERNEL_BRANCH:-linux-6.12.y}" \
     J36_KERNEL_URL="${J36_KERNEL_URL:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}" \
     J36_UPDATE_KERNEL="${J36_UPDATE_KERNEL:-0}" \
+    J36_BUSYBOX_URL="${J36_BUSYBOX_URL:-https://git.busybox.net/busybox}" \
+    J36_BUSYBOX_BRANCH="${J36_BUSYBOX_BRANCH:-1_36_stable}" \
+    J36_REBUILD_BUSYBOX="${J36_REBUILD_BUSYBOX:-0}" \
     bash "$VM_BUILD_DIR/device/j36-ultra/build-in-vm.sh"
 
 log "J36 Ultra artifacts are ready: $ARTIFACT_DIR"

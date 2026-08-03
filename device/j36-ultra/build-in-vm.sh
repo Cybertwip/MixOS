@@ -12,6 +12,9 @@ KERNEL_URL="${J36_KERNEL_URL:-https://git.kernel.org/pub/scm/linux/kernel/git/st
 KERNEL_BRANCH="${J36_KERNEL_BRANCH:-linux-6.12.y}"
 KERNEL_SRC="$WORK/linux"
 KERNEL_OUT="$WORK/kernel-build"
+BUSYBOX_URL="${J36_BUSYBOX_URL:-https://git.busybox.net/busybox}"
+BUSYBOX_BRANCH="${J36_BUSYBOX_BRANCH:-1_36_stable}"
+BUSYBOX_SRC="$WORK/busybox"
 MODULE_SRC="$WORK/module-src"
 DTB_OUT="$WORK/dtb"
 INITROOT="$WORK/initramfs-root"
@@ -28,12 +31,11 @@ mkdir -p "$WORK" "$CACHE" "$ARTIFACTS" "$EXPORT_DIR"
 
 if [[ ! -f "$WORK/.deps-installed" ]]; then
     log "Installing the one-time ARMv7 kernel build dependencies"
-    sudo dpkg --add-architecture armhf
     sudo apt-get update
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
         bc bison build-essential ccache cpio device-tree-compiler \
-        dpkg-dev fakeroot flex gcc-arm-linux-gnueabihf git gzip \
-        libelf-dev libssl-dev python3 rsync xz-utils
+        flex gcc-arm-linux-gnueabihf git gzip libelf-dev libssl-dev \
+        python3 rsync xz-utils
     touch "$WORK/.deps-installed"
 fi
 
@@ -75,6 +77,22 @@ config_v SERIAL_8250_NR_UARTS 4
 config_v SERIAL_8250_RUNTIME_UARTS 4
 config_s LOCALVERSION "-j36"
 
+# multi_v7_defconfig enables dozens of unrelated boards. Prune user-selectable
+# ARCH/MACH/SOC targets so the zImage plus initramfs fits the fixed 9 MiB slot.
+while IFS='=' read -r option _value; do
+    symbol="${option#CONFIG_}"
+    case "$symbol" in
+        ARCH_MULTIPLATFORM|ARCH_MULTI_V7|ARCH_MULTI_V6_V7|ARCH_MEDIATEK|MACH_MT6592)
+            ;;
+        ARCH_*|MACH_*|SOC_*)
+            config_n "$symbol"
+            ;;
+    esac
+done < <(grep -E '^CONFIG_(ARCH|MACH|SOC)_[A-Z0-9_]+=y$' "$CONFIG")
+for symbol in ARCH_MULTIPLATFORM ARCH_MULTI_V7 ARCH_MULTI_V6_V7 ARCH_MEDIATEK MACH_MT6592; do
+    config_y "$symbol"
+done
+
 # Keep this first-stage image below the fixed 9 MiB BOOTIMG partition. Storage,
 # networking, audio and native DRM/DSI are added only after the serial/fb/input
 # bring-up is proven.
@@ -114,17 +132,23 @@ KERNEL_RELEASE="$(make -s -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
 MODULE="$MODULE_SRC/j36_mt6592_input.ko"
 [[ -s "$MODULE" ]] || die "input module was not produced"
 
-BUSYBOX_DEB="$(find "$CACHE" -maxdepth 1 -name 'busybox-static_*_armhf.deb' | head -n1 || true)"
-if [[ -z "$BUSYBOX_DEB" ]]; then
-    log "Downloading the armhf BusyBox package once for the bring-up initramfs"
-    (cd "$CACHE" && apt-get download busybox-static:armhf)
-    BUSYBOX_DEB="$(find "$CACHE" -maxdepth 1 -name 'busybox-static_*_armhf.deb' | head -n1)"
+if [[ ! -d "$BUSYBOX_SRC/.git" ]]; then
+    log "Cloning BusyBox $BUSYBOX_BRANCH once for the ARM bring-up initramfs"
+    git clone --depth=1 --branch "$BUSYBOX_BRANCH" "$BUSYBOX_URL" "$BUSYBOX_SRC"
 fi
-rm -rf "$WORK/busybox-root" "$INITROOT"
-mkdir -p "$WORK/busybox-root" "$INITROOT"/{bin,dev,etc,lib/modules/$KERNEL_RELEASE/extra,proc,root,sbin,sys,tmp}
-dpkg-deb -x "$BUSYBOX_DEB" "$WORK/busybox-root"
-BUSYBOX="$(find "$WORK/busybox-root" -type f -name busybox | head -n1)"
-[[ -n "$BUSYBOX" ]] || die "busybox-static package did not contain busybox"
+if [[ ! -x "$BUSYBOX_SRC/busybox" || "${J36_REBUILD_BUSYBOX:-0}" == 1 ]]; then
+    log "Building the static ARMv7 BusyBox once"
+    make -C "$BUSYBOX_SRC" distclean
+    make -C "$BUSYBOX_SRC" defconfig
+    sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' "$BUSYBOX_SRC/.config"
+    yes '' | make -C "$BUSYBOX_SRC" oldconfig >/dev/null || true
+    make -C "$BUSYBOX_SRC" CROSS_COMPILE=arm-linux-gnueabihf- -j"$(nproc)"
+fi
+BUSYBOX="$BUSYBOX_SRC/busybox"
+[[ -x "$BUSYBOX" ]] || die "static ARM BusyBox was not produced"
+
+rm -rf "$INITROOT"
+mkdir -p "$INITROOT"/{bin,dev,etc,lib/modules/$KERNEL_RELEASE/extra,proc,root,sbin,sys,tmp}
 cp "$BUSYBOX" "$INITROOT/bin/busybox"
 chmod 0755 "$INITROOT/bin/busybox"
 for applet in sh mount mkdir mknod cat echo sleep dmesg insmod ls hexdump \
