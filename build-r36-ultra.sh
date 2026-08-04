@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Build the unmodified dArkOS RG351MP base used for R36 Ultra bring-up.
+# Build the dArkOS RG351MP base used for R36 Ultra bring-up.  The default
+# profile is Debian + EmulationStation with bundled applications disabled.
 #
 # macOS: builds inside a persistent Ubuntu 24.04 Multipass VM.
-# Linux: runs the same make target directly on the host.
+# Linux: runs the same checkpointed build directly on the host.
 #
 # Optional environment overrides:
 #   DARKOS_VM_NAME=darkos-r36
@@ -38,7 +39,7 @@ if [[ "$BUNDLED_APPS" == "y" ]]; then
 else
     BUILD_PROFILE="gui"
 fi
-STATE_KEY="${DEBIAN_RELEASE}-armhf-${ARMHF}-profile-${BUILD_PROFILE}"
+STATE_KEY="${DEBIAN_RELEASE}-armhf-${ARMHF}-profile-${BUILD_PROFILE}-v2"
 VM_SOURCE_MOUNT="/mnt/darkos-host"
 VM_ARTIFACT_MOUNT="/mnt/darkos-artifacts"
 VM_BUILD_DIR="/home/ubuntu/dArkOS"

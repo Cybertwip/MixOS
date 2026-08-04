@@ -1,8 +1,9 @@
 #!/bin/bash
 
 echo -e "Boostraping Debian....\n\n"
-if [ -f "Arkbuild_package_cache/debian_${DEBIAN_CODE_NAME}_rootfs.tar.gz" ] && [ "$(cat Arkbuild_package_cache/debian_${DEBIAN_CODE_NAME}_rootfs.commit)" == "$(curl -s https://deb.debian.org/debian/dists/stable/Release | grep "^Version:" | cut -d' ' -f2)" ]; then
-    sudo tar -xvzpf Arkbuild_package_cache/debian_${DEBIAN_CODE_NAME}_rootfs.tar.gz
+ROOTFS_CACHE="Arkbuild_package_cache/debian_${DEBIAN_CODE_NAME}_armhf-${BUILD_ARMHF:-y}_rootfs"
+if [ -f "${ROOTFS_CACHE}.tar.gz" ] && [ "$(cat "${ROOTFS_CACHE}.commit")" == "$(curl -s https://deb.debian.org/debian/dists/stable/Release | grep "^Version:" | cut -d' ' -f2)" ]; then
+    sudo tar -xvzpf "${ROOTFS_CACHE}.tar.gz"
 else
 	if [[ "${ENABLE_CACHE}" == "y" ]]; then
 	  export DEBIAN_LOCATION="http://127.0.0.1:3142/deb.debian.org/debian/"
@@ -24,8 +25,8 @@ else
 	  sudo chroot Arkbuild/ eatmydata apt-get -y update
 	  sudo chroot Arkbuild/ eatmydata apt-get -y install libc6:armhf liblzma5:armhf libasound2t64:armhf libfreetype6:armhf libxkbcommon-x11-0:armhf libudev1:armhf libudev0:armhf libgbm1:armhf libstdc++6:armhf
 	fi
-	sudo cat Arkbuild/etc/os-release | grep "^DEBIAN_VERSION_FULL=" | cut -d'=' -f2 > Arkbuild_package_cache/debian_${DEBIAN_CODE_NAME}_rootfs.commit
-	sudo tar -cvpzf Arkbuild_package_cache/debian_${DEBIAN_CODE_NAME}_rootfs.tar.gz Arkbuild/
+		sudo cat Arkbuild/etc/os-release | grep "^DEBIAN_VERSION_FULL=" | cut -d'=' -f2 > "${ROOTFS_CACHE}.commit"
+		sudo tar -cvpzf "${ROOTFS_CACHE}.tar.gz" Arkbuild/
 fi
 
 # Bind essential host filesystems into chroot for networking
@@ -86,4 +87,3 @@ LABEL=\"end_modeswitch\"" | sudo tee Arkbuild/etc/udev/rules.d/40-usb_modeswitch
 sudo chroot Arkbuild/ sync
 sleep 5
 sudo chroot Arkbuild/ umount /proc
-
