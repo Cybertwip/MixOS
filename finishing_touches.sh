@@ -314,8 +314,13 @@ fi
 sudo rm -rf Arkbuild/home/ark/.emulationstation/music
 sudo chroot Arkbuild/ bash -c "ln -sfv /roms/bgmusic/ /home/ark/.emulationstation/music"
 
-# Set launchimage to PIC mode
-sudo chroot Arkbuild/ touch /home/ark/.config/.GameLoadingIModePIC
+# The GUI-only image does not build image-viewer, so use the built-in ASCII
+# loading screen instead of leaving a launcher dependency on a skipped app.
+if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
+  sudo chroot Arkbuild/ touch /home/ark/.config/.GameLoadingIModePIC
+else
+  sudo chroot Arkbuild/ touch /home/ark/.config/.GameLoadingIModeASCII
+fi
 
 # Set default volume
 sudo cp audio/asound.state.${CHIPSET} Arkbuild/var/local/asound.state

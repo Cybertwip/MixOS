@@ -1,7 +1,21 @@
 #!/bin/bash
 
 echo -e "Boostraping Debian....\n\n"
-ROOTFS_CACHE="Arkbuild_package_cache/debian_${DEBIAN_CODE_NAME}_armhf-${BUILD_ARMHF:-y}_rootfs"
+if [[ "${USERSPACE_ARCH:-}" == "armhf" ]]; then
+  DEBOOTSTRAP_ARCH=armhf
+  QEMU_STATIC=qemu-arm-static
+  ROOTFS_VARIANT=userspace-armhf
+elif [[ "${USERSPACE_ARCH:-}" == "arm64" ]]; then
+  DEBOOTSTRAP_ARCH=arm64
+  QEMU_STATIC=qemu-aarch64-static
+  ROOTFS_VARIANT=userspace-arm64
+else
+  # Legacy device builds retain the original arm64 + optional armhf behavior.
+  DEBOOTSTRAP_ARCH=arm64
+  QEMU_STATIC=qemu-aarch64-static
+  ROOTFS_VARIANT="arm64-multiarch-${BUILD_ARMHF:-y}"
+fi
+ROOTFS_CACHE="Arkbuild_package_cache/debian_${DEBIAN_CODE_NAME}_${ROOTFS_VARIANT}_rootfs"
 if [ -f "${ROOTFS_CACHE}.tar.gz" ] && [ "$(cat "${ROOTFS_CACHE}.commit")" == "$(curl -s https://deb.debian.org/debian/dists/stable/Release | grep "^Version:" | cut -d' ' -f2)" ]; then
     sudo tar -xvzpf "${ROOTFS_CACHE}.tar.gz"
 else
@@ -11,15 +25,15 @@ else
 	  export DEBIAN_LOCATION="http://deb.debian.org/debian/"
 	fi
 	# Bootstrap base system
-	sudo eatmydata debootstrap --no-check-gpg --include=eatmydata --resolve-deps --arch=arm64 --foreign ${DEBIAN_CODE_NAME} Arkbuild ${DEBIAN_LOCATION}
-	sudo cp /usr/bin/qemu-aarch64-static Arkbuild/usr/bin/
+	sudo eatmydata debootstrap --no-check-gpg --include=eatmydata --resolve-deps --arch=${DEBOOTSTRAP_ARCH} --foreign ${DEBIAN_CODE_NAME} Arkbuild ${DEBIAN_LOCATION}
+	sudo cp "/usr/bin/${QEMU_STATIC}" Arkbuild/usr/bin/
 	if [[ "${ENABLE_CACHE}" == "y" ]]; then
 	  echo 'Acquire::http::proxy "http://127.0.0.1:3142";' | sudo tee Arkbuild/etc/apt/apt.conf.d/99proxy
 	fi
 	sudo chroot Arkbuild/ apt-get -y install ccache eatmydata
 	sudo chroot Arkbuild/ eatmydata /debootstrap/debootstrap --second-stage
 
-	if [[ "${BUILD_ARMHF}" == "y" ]]; then
+	if [[ -z "${USERSPACE_ARCH:-}" && "${BUILD_ARMHF}" == "y" ]]; then
 	  # Enable armhf architecture and update
 	  sudo chroot Arkbuild/ dpkg --add-architecture armhf
 	  sudo chroot Arkbuild/ eatmydata apt-get -y update

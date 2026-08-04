@@ -10,9 +10,10 @@ BUILD_BLUEALSA ?= y
 BUILD_JOBS ?= 4
 
 # The R36 Ultra bring-up build defaults to a Debian + EmulationStation image.
-# Set BUILD_BUNDLED_APPS=y only when the complete emulator/application bundle
-# is wanted.
+# Its native userspace defaults to armhf.  The complete emulator/application
+# bundle is available only with USERSPACE_ARCH=arm64 BUILD_BUNDLED_APPS=y.
 R36_BUILD_BUNDLED_APPS = $(if $(strip $(BUILD_BUNDLED_APPS)),$(BUILD_BUNDLED_APPS),n)
+R36_USERSPACE_ARCH = $(if $(strip $(USERSPACE_ARCH)),$(USERSPACE_ARCH),armhf)
 
 # Ensure system binaries like parted are in the path, and silence strict GCC warnings
 PATH := $(PATH):/usr/sbin:/sbin
@@ -35,11 +36,11 @@ all:
 	@echo "Please specify a valid build target: make rgb10, make rg353m, or make r36-ultra"
 
 r36-ultra:
-	$(info dArkOS R36 Ultra GUI base will use Debian $(DEBIAN_CODE_NAME).)
+	$(info dArkOS R36 Ultra base will use Debian $(DEBIAN_CODE_NAME).)
 	$(info parallel build jobs: $(BUILD_JOBS))
-	$(info adding armhf 32bit compatibility? $(BUILD_ARMHF))
+	$(info Debian userspace architecture: $(R36_USERSPACE_ARCH))
 	$(info building bundled emulators/applications? $(R36_BUILD_BUNDLED_APPS))
-	env BUILD_BUNDLED_APPS="$(R36_BUILD_BUNDLED_APPS)" ./build-r36-ultra.sh
+	env USERSPACE_ARCH="$(R36_USERSPACE_ARCH)" BUILD_BUNDLED_APPS="$(R36_BUILD_BUNDLED_APPS)" ./build-r36-ultra.sh
 
 a10mini:
 	$(info dArkOS will be built using the $(DEBIAN_CODE_NAME) release of Debian.)

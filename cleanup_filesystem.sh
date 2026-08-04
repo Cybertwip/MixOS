@@ -1,5 +1,12 @@
 #!/bin/bash
 
+SELECTED_USERSPACE_ARCH="${USERSPACE_ARCH:-}"
+if [[ "$SELECTED_USERSPACE_ARCH" == armhf ]]; then
+  NATIVE_PACKAGE_MODE=native
+else
+  NATIVE_PACKAGE_MODE=64
+fi
+
 # Cleanup to reduce image size and remove build remnants
 echo -e "Cleaning up filesystem"
 call_chroot "rm -rf /home/ark/EmulationStation-fcamod"
@@ -83,7 +90,7 @@ call_chroot "apt remove -y autotools-dev \
 call_chroot "apt -y autoremove"
 call_chroot "apt -y clean"
 
-if [[ "${BUILD_ARMHF}" == "y" ]]; then
+if [[ -z "$SELECTED_USERSPACE_ARCH" && "${BUILD_ARMHF}" == "y" ]]; then
   # Ensure additional needed packages are still in place
   while read NEEDED_PACKAGE; do
     if [[ ! "$NEEDED_PACKAGE" =~ ^# ]]; then
@@ -106,12 +113,12 @@ fi
 while read NEEDED_PACKAGE; do
   if [[ ! "$NEEDED_PACKAGE" =~ ^# ]]; then
     if [[ "$CHIPSET" != *"3566"* ]]; then
-      install_package 64 ${NEEDED_PACKAGE}
-      protect_package 64 ${NEEDED_PACKAGE}
+      install_package ${NATIVE_PACKAGE_MODE} ${NEEDED_PACKAGE}
+      protect_package ${NATIVE_PACKAGE_MODE} ${NEEDED_PACKAGE}
     else
       if [[ "$NEEDED_PACKAGE" != "ffmpeg" ]]; then
-        install_package 64 ${NEEDED_PACKAGE}
-        protect_package 64 ${NEEDED_PACKAGE}
+        install_package ${NATIVE_PACKAGE_MODE} ${NEEDED_PACKAGE}
+        protect_package ${NATIVE_PACKAGE_MODE} ${NEEDED_PACKAGE}
       else
         continue
       fi
@@ -123,14 +130,14 @@ sync
 if [[ "$BUILD_BLUEALSA" == "y" ]]; then
   while read BLUETOOTH_NEEDED_PACKAGE; do
     if [[ ! "$BLUETOOTH_NEEDED_PACKAGE" =~ ^# ]]; then
-      install_package 64 ${BLUETOOTH_NEEDED_PACKAGE}
-      protect_package 64 ${BLUETOOTH_NEEDED_PACKAGE}
+      install_package ${NATIVE_PACKAGE_MODE} ${BLUETOOTH_NEEDED_PACKAGE}
+      protect_package ${NATIVE_PACKAGE_MODE} ${BLUETOOTH_NEEDED_PACKAGE}
     fi
   done <bluetooth_needed_packages.txt
   call_chroot "systemctl disable watchforbtaudio bluetooth bluealsa"
 fi
 
-if [[ "${BUILD_ARMHF}" == "y" ]]; then
+if [[ "$SELECTED_USERSPACE_ARCH" == armhf || ( -z "$SELECTED_USERSPACE_ARCH" && "${BUILD_ARMHF}" == "y" ) ]]; then
   cd Arkbuild/usr/lib/arm-linux-gnueabihf
   for LIB in libEGL.so libEGL.so.1 libGLES_CM.so libGLES_CM.so.1 libGLESv1_CM.so libGLESv1_CM.so.1 libGLESv1_CM.so.1.1.0 libGLESv2.so libGLESv2.so.2 libGLESv2.so.2.0.0 libGLESv2.so.2.1.0 libGLESv3.so libGLESv3.so.3 libgbm.so libgbm.so.1 libgbm.so.1.0.0 libmali.so libmali.so.1 libMaliOpenCL.so libOpenCL.so libwayland-egl.so libwayland-egl.so.1 libwayland-egl.so.1.0.0
   do
@@ -156,34 +163,37 @@ if [[ "${BUILD_ARMHF}" == "y" ]]; then
   rm -f libasound2_1.2.8-1+b1_armhf.deb
 fi
 
-cd Arkbuild/usr/lib/aarch64-linux-gnu
-for LIB in libEGL.so libEGL.so.1 libGLES_CM.so libGLES_CM.so.1 libGLESv1_CM.so libGLESv1_CM.so.1 libGLESv1_CM.so.1.1.0 libGLESv2.so libGLESv2.so.2 libGLESv2.so.2.0.0 libGLESv2.so.2.1.0 libGLESv3.so libGLESv3.so.3 libgbm.so libgbm.so.1 libgbm.so.1.0.0 libmali.so libmali.so.1 libMaliOpenCL.so libOpenCL.so libwayland-egl.so libwayland-egl.so.1 libwayland-egl.so.1.0.0
-do
-  sudo rm -fv ${LIB}
-  sudo ln -sfv libMali.so ${LIB}
-done
-cd ../../../../
+if [[ "$SELECTED_USERSPACE_ARCH" == armhf ]]; then
+  call_chroot "ln -sfv /usr/lib/arm-linux-gnueabihf/libSDL2.so /usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0"
+  call_chroot "ln -sfv /usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0.${extension} /usr/lib/arm-linux-gnueabihf/libSDL2.so"
+  call_chroot "ln -sfv /usr/lib/arm-linux-gnueabihf/bin/sdl2-config /usr/bin/sdl2-config"
+else
+  cd Arkbuild/usr/lib/aarch64-linux-gnu
+  for LIB in libEGL.so libEGL.so.1 libGLES_CM.so libGLES_CM.so.1 libGLESv1_CM.so libGLESv1_CM.so.1 libGLESv1_CM.so.1.1.0 libGLESv2.so libGLESv2.so.2 libGLESv2.so.2.0.0 libGLESv2.so.2.1.0 libGLESv3.so libGLESv3.so.3 libgbm.so libgbm.so.1 libgbm.so.1.0.0 libmali.so libmali.so.1 libMaliOpenCL.so libOpenCL.so libwayland-egl.so libwayland-egl.so.1 libwayland-egl.so.1.0.0
+  do
+    sudo rm -fv ${LIB}
+    sudo ln -sfv libMali.so ${LIB}
+  done
+  cd ../../../../
 
-# Make sure the built librga shared libs are still available in aarch64
-sudo cp -av Arkbuild/usr/lib/librga.so* Arkbuild/usr/lib/aarch64-linux-gnu/
-
+  # Make sure the built librga shared libs are still available in aarch64.
+  sudo cp -av Arkbuild/usr/lib/librga.so* Arkbuild/usr/lib/aarch64-linux-gnu/ || true
+  call_chroot "ln -sfv /usr/lib/aarch64-linux-gnu/libSDL2.so /usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0"
+  call_chroot "ln -sfv /usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0.${extension} /usr/lib/aarch64-linux-gnu/libSDL2.so"
+  if [[ -z "$SELECTED_USERSPACE_ARCH" && "${BUILD_ARMHF}" == "y" ]]; then
+    call_chroot "ln -sfv /usr/lib/arm-linux-gnueabihf/libSDL2.so /usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0"
+    call_chroot "ln -sfv /usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0.${extension} /usr/lib/arm-linux-gnueabihf/libSDL2.so"
+  fi
+  call_chroot "ln -sfv /usr/lib/aarch64-linux-gnu/bin/sdl2-config /usr/bin/sdl2-config"
+fi
 
 if [[ "${ENABLE_CACHE}" == "y" ]]; then
   sudo rm -f Arkbuild/etc/apt/apt.conf.d/99proxy
   sudo sed -i '/127.0.0.1:3142\//s///' Arkbuild/etc/apt/sources.list
 fi
-
-call_chroot "ln -sfv /usr/lib/aarch64-linux-gnu/libSDL2.so /usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0"
-call_chroot "ln -sfv /usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0.${extension} /usr/lib/aarch64-linux-gnu/libSDL2.so"
-if [[ "${BUILD_ARMHF}" == "y" ]]; then
-  call_chroot "ln -sfv /usr/lib/arm-linux-gnueabihf/libSDL2.so /usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0"
-  call_chroot "ln -sfv /usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0.${extension} /usr/lib/arm-linux-gnueabihf/libSDL2.so"
-fi
-# Ensure sdl2-config is linked to the proper version
-call_chroot "ln -sfv /usr/lib/aarch64-linux-gnu/bin/sdl2-config /usr/bin/sdl2-config"
 # Ensure sdl-image is symlinked properly
 call_chroot "rm /lib/libSDL_image-1.2.so.0"
-call_chroot "cd /lib && ln -sf $(find /lib/ -name libSDL_image-1.2.so.0.* | head -n 1) /lib/libSDL_image-1.2.so.0"
+call_chroot "cd /lib && ln -sf \$(find /lib/ -name 'libSDL_image-1.2.so.0.*' | head -n 1) /lib/libSDL_image-1.2.so.0"
 call_chroot "ldconfig"
 
 if grep -qs "Arkbuild/home/ark/Arkbuild_ccache" /proc/mounts; then
@@ -204,8 +214,11 @@ if [[ "${CHIPSET}" == "rk3566" ]]; then
   sudo rm -f Arkbuild/usr/share/vulkan/icd.d/*_icd.*
 fi
 
-# Ensure libvulkan is symlinked properly
-call_chroot "find /usr/lib/aarch64-linux-gnu -type f -name 'libvulkan.so*' -not -name 'libvulkan.so.1.3.274' -delete"
-call_chroot "rm -f /usr/lib/aarch64-linux-gnu/libvulkan.so.1 /usr/lib/aarch64-linux-gnu/libvulkan.so"
-call_chroot "ln -sf /usr/lib/aarch64-linux-gnu/libvulkan.so.1.3.274 /usr/lib/aarch64-linux-gnu/libvulkan.so.1"
-call_chroot "ln -sf /usr/lib/aarch64-linux-gnu/libvulkan.so.1 /usr/lib/aarch64-linux-gnu/libvulkan.so"
+# Ensure the legacy arm64 Vulkan loader is symlinked properly.  The armhf-only
+# GUI profile does not install or use this arm64 library directory.
+if [[ "$SELECTED_USERSPACE_ARCH" != armhf ]]; then
+  call_chroot "find /usr/lib/aarch64-linux-gnu -type f -name 'libvulkan.so*' -not -name 'libvulkan.so.1.3.274' -delete"
+  call_chroot "rm -f /usr/lib/aarch64-linux-gnu/libvulkan.so.1 /usr/lib/aarch64-linux-gnu/libvulkan.so"
+  call_chroot "ln -sf /usr/lib/aarch64-linux-gnu/libvulkan.so.1.3.274 /usr/lib/aarch64-linux-gnu/libvulkan.so.1"
+  call_chroot "ln -sf /usr/lib/aarch64-linux-gnu/libvulkan.so.1 /usr/lib/aarch64-linux-gnu/libvulkan.so"
+fi

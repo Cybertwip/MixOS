@@ -2,6 +2,7 @@
 
 BUILD_JOBS="${BUILD_JOBS:-4}"
 BUILD_BUNDLED_APPS="${BUILD_BUNDLED_APPS:-y}"
+ES_ARCH="${USERSPACE_ARCH:-arm64}"
 
 # Build and install EmulationStation-fcamod
 if [ -f ../exports.sh ];
@@ -29,8 +30,9 @@ else
   ES_BRANCH="351v"
 fi
 
-if [ -f "Arkbuild_package_cache/${CHIPSET}/emulationstation_${ES_BRANCH}.tar.gz" ] && [ "$(cat Arkbuild_package_cache/${CHIPSET}/emulationstation_${ES_BRANCH}.commit)" == "$(curl -s https://api.github.com/repos/christianhaitian/EmulationStation-fcamod/commits/${ES_BRANCH} | jq -r '.sha')" ]; then
-    sudo tar -xvzpf Arkbuild_package_cache/${CHIPSET}/emulationstation_${ES_BRANCH}.tar.gz
+ES_CACHE="Arkbuild_package_cache/${CHIPSET}/emulationstation_${ES_BRANCH}_${ES_ARCH}"
+if [ -f "${ES_CACHE}.tar.gz" ] && [ "$(cat "${ES_CACHE}.commit")" == "$(curl -s https://api.github.com/repos/christianhaitian/EmulationStation-fcamod/commits/${ES_BRANCH} | jq -r '.sha')" ]; then
+    sudo tar -xvzpf "${ES_CACHE}.tar.gz"
 else
 	set_es_variables
 	call_chroot "cd /home/ark &&
@@ -61,14 +63,9 @@ else
 	     cp -a resources /usr/bin/emulationstation/
 	     "
 	fi
-	if [ -f "Arkbuild_package_cache/${CHIPSET}/emulationstation.tar.gz" ]; then
-	  sudo rm -f Arkbuild_package_cache/${CHIPSET}/emulationstation_${ES_BRANCH}.tar.gz
-	fi
-	if [ -f "Arkbuild_package_cache/${CHIPSET}/emulationstation.commit" ]; then
-	  sudo rm -f Arkbuild_package_cache/${CHIPSET}/emulationstation_${ES_BRANCH}.commit
-	fi
-	sudo tar -czpf Arkbuild_package_cache/${CHIPSET}/emulationstation_${ES_BRANCH}.tar.gz Arkbuild/usr/bin/emulationstation/
-	sudo git --git-dir=Arkbuild/home/ark/EmulationStation-fcamod/.git --work-tree=Arkbuild/home/ark/EmulationStation-fcamod rev-parse HEAD > Arkbuild_package_cache/${CHIPSET}/emulationstation_${ES_BRANCH}.commit
+		sudo rm -f "${ES_CACHE}.tar.gz" "${ES_CACHE}.commit"
+		sudo tar -czpf "${ES_CACHE}.tar.gz" Arkbuild/usr/bin/emulationstation/
+		sudo git --git-dir=Arkbuild/home/ark/EmulationStation-fcamod/.git --work-tree=Arkbuild/home/ark/EmulationStation-fcamod rev-parse HEAD > "${ES_CACHE}.commit"
 fi
 sudo rm -rf Arkbuild/home/ark/EmulationStation-fcamod*
 sudo mkdir -p Arkbuild/etc/emulationstation/themes

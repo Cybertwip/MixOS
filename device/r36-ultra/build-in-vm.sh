@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Checkpointed RG351MP/R36 base builder for Ubuntu. This sources the existing
-# dArkOS build stages but preserves completed partition/bootstrap/U-Boot/kernel
-# work across retries.
+# Checkpointed RG351MP/R36 base builder for Ubuntu.  The default profile builds
+# a native armhf Debian userspace and EmulationStation on the existing arm64
+# RK3326 kernel/boot chain, while preserving completed stages across retries.
 
 set -o pipefail
 
@@ -9,7 +9,10 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd "$ROOT" || exit 1
 
 DEBIAN_CODE_NAME="${DEBIAN_CODE_NAME:-trixie}"
-BUILD_ARMHF="${BUILD_ARMHF:-y}"
+USERSPACE_ARCH="${USERSPACE_ARCH:-armhf}"
+# R36 builds are single-userspace-architecture images.  Keep the legacy
+# multiarch switch off; USERSPACE_ARCH selects the native rootfs instead.
+BUILD_ARMHF=n
 BUILD_JOBS="${BUILD_JOBS:-4}"
 BUILD_BUNDLED_APPS="${BUILD_BUNDLED_APPS:-n}"
 ENABLE_CACHE="${ENABLE_CACHE:-y}"
@@ -17,13 +20,13 @@ CHIPSET=rk3326
 UNIT=rg351mp
 if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
     BUILD_PROFILE=full
-    IMAGE_PREFIX="dArkOS_RG351MP_FULL_armhf-${BUILD_ARMHF}"
+    IMAGE_PREFIX="dArkOS_RG351MP_FULL_${USERSPACE_ARCH}"
 else
     BUILD_PROFILE=gui
-    IMAGE_PREFIX="dArkOS_R36_ULTRA_GUI_BASE_armhf-${BUILD_ARMHF}"
+    IMAGE_PREFIX="dArkOS_R36_ULTRA_GUI_BASE_${USERSPACE_ARCH}"
 fi
-FILESYSTEM="ArkOS_R36_${DEBIAN_CODE_NAME}_armhf-${BUILD_ARMHF}_${BUILD_PROFILE}_File_System.img"
-export DEBIAN_CODE_NAME BUILD_ARMHF BUILD_JOBS BUILD_BUNDLED_APPS
+FILESYSTEM="ArkOS_R36_${DEBIAN_CODE_NAME}_${USERSPACE_ARCH}_${BUILD_PROFILE}_File_System.img"
+export DEBIAN_CODE_NAME USERSPACE_ARCH BUILD_ARMHF BUILD_JOBS BUILD_BUNDLED_APPS
 export ENABLE_CACHE CHIPSET UNIT BUILD_PROFILE FILESYSTEM
 
 # Keep direct make, CMake, Meson/Ninja, and helper scripts on the same
@@ -36,7 +39,7 @@ nproc() { printf '%s\n' "$BUILD_JOBS"; }
 export -f nproc
 
 STATE_ROOT="${DARKOS_R36_STATE_DIR:-$HOME/darkos-r36-state}"
-STATE_DIR="$STATE_ROOT/${DEBIAN_CODE_NAME}-armhf-${BUILD_ARMHF}-profile-${BUILD_PROFILE}-v2"
+STATE_DIR="$STATE_ROOT/${DEBIAN_CODE_NAME}-userspace-${USERSPACE_ARCH}-profile-${BUILD_PROFILE}-v3"
 mkdir -p "$STATE_DIR"
 LOG="$STATE_DIR/resume.log"
 CURRENT_STAGE="$STATE_DIR/current-stage"
@@ -54,14 +57,18 @@ maybe_stop() {
     fi
 }
 
-[[ "$BUILD_ARMHF" == y || "$BUILD_ARMHF" == n ]] || \
-    fail "BUILD_ARMHF must be y or n"
+[[ "$USERSPACE_ARCH" == armhf || "$USERSPACE_ARCH" == arm64 ]] || \
+    fail "USERSPACE_ARCH must be armhf or arm64"
 [[ "$BUILD_BUNDLED_APPS" == y || "$BUILD_BUNDLED_APPS" == n ]] || \
     fail "BUILD_BUNDLED_APPS must be y or n"
 [[ "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || \
     fail "BUILD_JOBS must be a positive integer"
 
-log "Configuration: Debian=${DEBIAN_CODE_NAME}, profile=${BUILD_PROFILE}, ARMHF=${BUILD_ARMHF}, jobs=${BUILD_JOBS}, cache=${ENABLE_CACHE}"
+if [[ "$USERSPACE_ARCH" == armhf && "$BUILD_BUNDLED_APPS" == y ]]; then
+    fail "The armhf-only R36 profile supports Debian + EmulationStation only; set BUILD_BUNDLED_APPS=n"
+fi
+
+log "Configuration: Debian=${DEBIAN_CODE_NAME}, userspace=${USERSPACE_ARCH}, profile=${BUILD_PROFILE}, jobs=${BUILD_JOBS}, cache=${ENABLE_CACHE}"
 
 if [[ "${DARKOS_R36_RESET:-0}" == 1 ]]; then
     fail "DARKOS_R36_RESET requires a fresh build; use 'make clean' manually before retrying"
@@ -140,18 +147,6 @@ ensure_rootfs_mounts() {
         sudo tee Arkbuild/etc/resolv.conf >/dev/null
 }
 
-ensure_armhf_mounts() {
-    [[ "$BUILD_ARMHF" == y && -d Arkbuild32 ]] || return 0
-    sudo mkdir -p Arkbuild32/{dev/pts,proc,sys}
-    mountpoint -q Arkbuild32/dev || sudo mount --bind /dev Arkbuild32/dev
-    mountpoint -q Arkbuild32/dev/pts || \
-        sudo mount -t devpts none Arkbuild32/dev/pts -o newinstance,ptmxmode=0666
-    mountpoint -q Arkbuild32/proc || sudo mount --bind /proc Arkbuild32/proc
-    mountpoint -q Arkbuild32/sys || sudo mount --bind /sys Arkbuild32/sys
-    printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | \
-        sudo tee Arkbuild32/etc/resolv.conf >/dev/null
-}
-
 ensure_ccache_mount() {
     sudo mkdir -p Arkbuild/home/ark/Arkbuild_ccache
     if ! mountpoint -q Arkbuild/home/ark/Arkbuild_ccache; then
@@ -190,6 +185,13 @@ clear_foreign_rootfs_mount() {
     fi
 }
 
+clear_legacy_multiarch_root() {
+    if [[ -d Arkbuild32 ]]; then
+        log "Removing legacy secondary armhf build root; this profile is single-architecture"
+        remove_arkbuild32
+    fi
+}
+
 run_stage() {
     local name="$1" script="$2" rc
     if marked "$name"; then
@@ -206,9 +208,38 @@ run_stage() {
     mark "$name"
 }
 
+verify_native_userspace() {
+    local actual foreign
+    actual="$(sudo chroot Arkbuild dpkg --print-architecture)" || \
+        fail "Could not query the Debian userspace architecture"
+    [[ "$actual" == "$USERSPACE_ARCH" ]] || \
+        fail "Expected ${USERSPACE_ARCH} userspace, found ${actual}"
+    foreign="$(sudo chroot Arkbuild dpkg --print-foreign-architectures)" || \
+        fail "Could not query foreign Debian architectures"
+    [[ -z "$foreign" ]] || \
+        fail "Single-architecture build unexpectedly contains foreign architectures: ${foreign}"
+    log "Verified native ${actual} Debian userspace with no foreign architecture"
+}
+
+verify_gui_architecture() {
+    local binary header
+    binary="Arkbuild/usr/bin/emulationstation/emulationstation"
+    [[ -x "$binary" ]] || fail "EmulationStation GUI binary is missing"
+    header="$(readelf -h "$binary")" || fail "Could not inspect the EmulationStation GUI binary"
+    if [[ "$USERSPACE_ARCH" == armhf ]]; then
+        grep -q 'Class:.*ELF32' <<<"$header" && grep -q 'Machine:.*ARM' <<<"$header" || \
+            fail "EmulationStation is not a 32-bit ARM binary"
+    else
+        grep -q 'Class:.*ELF64' <<<"$header" && grep -q 'Machine:.*AArch64' <<<"$header" || \
+            fail "EmulationStation is not a 64-bit AArch64 binary"
+    fi
+    log "Verified ${USERSPACE_ARCH} EmulationStation GUI binary"
+}
+
 # A GUI-only and a full-app build use different filesystem/image names.  Make
 # sure a mount left by the other profile cannot contaminate this build.
 clear_foreign_rootfs_mount
+clear_legacy_multiarch_root
 
 # Infer checkpoints made by the original monolithic build that failed before
 # this resume runner existed.
@@ -243,6 +274,7 @@ else
     ensure_rootfs_mounts
 fi
 run_stage bootstrap bootstrap_rootfs.sh
+verify_native_userspace
 run_stage image image_setup.sh
 
 if ! marked kernel; then
@@ -254,11 +286,10 @@ fi
 maybe_stop kernel
 
 # A failed userspace phase can be safely retried.  The default GUI profile only
-# builds the graphics/runtime prerequisites and EmulationStation.  The original
-# complete emulator/application list remains available with
-# BUILD_BUNDLED_APPS=y.
+# builds the native graphics/runtime prerequisites and EmulationStation.  The
+# original complete emulator/application list remains available only for the
+# arm64 userspace profile with BUILD_BUNDLED_APPS=y.
 if ! marked userspace; then
-    ensure_armhf_mounts
     if marked component-build_deps; then
         ensure_ccache_mount
     fi
@@ -333,24 +364,6 @@ if ! marked userspace; then
         mark "$component"
     done
 
-    # Full builds create the armhf build root while compiling RetroArch.  The
-    # GUI-only profile has no 32-bit applications to trigger that path, so make
-    # the requested compatibility runtime explicit without adding any apps.
-    if [[ "$BUILD_BUNDLED_APPS" == n && "$BUILD_ARMHF" == y ]]; then
-        component=component-armhf-support
-        if marked "$component"; then
-            log "Skipping completed 32-bit compatibility support"
-        else
-            printf '%s\n' "userspace:armhf-support" > "$CURRENT_STAGE"
-            log "Building 32-bit compatibility libraries (no bundled apps)"
-            setup_arkbuild32 || fail "32-bit compatibility setup failed"
-            [[ -n "${extension:-}" ]] || fail "SDL2 extension was not detected for armhf support"
-            [[ -e "Arkbuild/usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0.${extension}" ]] || \
-                fail "32-bit SDL2 compatibility library was not installed"
-            printf '%s\n' "$extension" > "$STATE_DIR/sdl2-extension"
-            mark "$component"
-        fi
-    fi
     mark userspace
 else
     ensure_rootfs_mounts
@@ -362,6 +375,7 @@ else
             Arkbuild/home/ark/${CHIPSET}_core_builds/scripts/sdl2.sh 2>/dev/null || true)"
     fi
 fi
+verify_gui_architecture
 
 # Final image assembly is kept as one checkpoint because these scripts shrink
 # and unmount the root filesystem. If it fails, the log identifies the exact

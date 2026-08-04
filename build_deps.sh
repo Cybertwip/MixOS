@@ -4,7 +4,15 @@ BUILD_JOBS="${BUILD_JOBS:-4}"
 
 echo -e "Installing build dependencies and needed packages...\n\n"
 
-if [ "$1" == "32" ]; then
+if [[ "${USERSPACE_ARCH:-}" == "armhf" ]]; then
+  BIT="native"
+  ARCH="arm-linux-gnueabihf"
+  CHROOT_DIR="Arkbuild"
+elif [[ "${USERSPACE_ARCH:-}" == "arm64" ]]; then
+  BIT="64"
+  ARCH="aarch64-linux-gnu"
+  CHROOT_DIR="Arkbuild"
+elif [ "$1" == "32" ]; then
   BIT="32"
   ARCH="arm-linux-gnueabihf"
   CHROOT_DIR="Arkbuild32"
@@ -52,8 +60,12 @@ sudo chroot ${CHROOT_DIR}/ bash -c "/usr/sbin/update-ccache-symlinks"
 sudo chroot ${CHROOT_DIR}/ bash -c "ln -s /usr/include/libdrm/ /usr/include/drm"
 
 # Place libmali manually (assumes you have libmali.so or mali drivers ready)
-ARCHITECTURE_ARRAY=("aarch64-linux-gnu")
-if [[ "${BUILD_ARMHF}" == "y" ]]; then
+if [[ "${USERSPACE_ARCH:-}" == "armhf" ]]; then
+  ARCHITECTURE_ARRAY=("arm-linux-gnueabihf")
+else
+  ARCHITECTURE_ARRAY=("aarch64-linux-gnu")
+fi
+if [[ -z "${USERSPACE_ARCH:-}" && "${BUILD_ARMHF}" == "y" ]]; then
   ARCHITECTURE_ARRAY+=("arm-linux-gnueabihf")
 fi
 for ARCHITECTURE in "${ARCHITECTURE_ARRAY[@]}"

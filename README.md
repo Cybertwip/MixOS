@@ -31,9 +31,10 @@ Now you should be able to just run make <device_name> to build for a supported d
 
 The R36 Ultra helper currently builds the RG351MP/RK3326 base image used for
 bring-up (the R36-specific DTB layer is still separate).  Its default profile
-is intentionally small: Debian, the kernel/device support, and the
-EmulationStation GUI are built, while bundled emulators and standalone
-applications are skipped.
+is intentionally small: one native armhf (32-bit) Debian userspace and the
+EmulationStation GUI are built, while the arm64 userspace, bundled emulators,
+and standalone applications are skipped.  The existing RK3326 kernel/U-Boot
+chain is still arm64; a 32-bit kernel would be a separate board port.
 
 ```bash
 ./build-r36-ultra.sh
@@ -41,20 +42,21 @@ applications are skipped.
 make r36-ultra
 ```
 
-The default is four parallel build jobs with armhf/32-bit compatibility:
+The default is four parallel build jobs and an armhf-only userspace:
 
 ```bash
-BUILD_JOBS=4 BUILD_ARMHF=y BUILD_BUNDLED_APPS=n ./build-r36-ultra.sh
+BUILD_JOBS=4 USERSPACE_ARCH=armhf BUILD_BUNDLED_APPS=n ./build-r36-ultra.sh
 ```
 
 - Change `BUILD_JOBS` to control internal Make/CMake/Meson parallelism.
-- Set `BUILD_ARMHF=n` to omit 32-bit compatibility libraries.
-- Set `BUILD_BUNDLED_APPS=y` only when the complete emulator/application
-  bundle is required.
+- Set `USERSPACE_ARCH=arm64` to build a single-architecture arm64 userspace
+  instead.  The R36 helper never produces an arm64+armhf multiarch rootfs.
+- The complete emulator/application bundle is retained only for the arm64
+  profile (`USERSPACE_ARCH=arm64 BUILD_BUNDLED_APPS=y`).
 
 **Notes**
 - To build on a different release of Debian, change the DEBIAN_CODE_NAME export in the Makefile or add DEBIAN_CODE_NAME=<release> as a variable to `make`.  Other debian code names can be found at https://www.debian.org/releases/
-- By default, this will build with both a 64bit and 32bit userspace.  This is primarily to support some 32bit ports available through PortMaster.  There are also some 32bit retroarch emulators available but the performance seems to be similar to the 64bit retroarch emulators at this point.
+- Standard device targets (other than `r36-ultra`) build with both a 64bit and 32bit userspace by default.  This is primarily to support some 32bit ports available through PortMaster.  There are also some 32bit retroarch emulators available but the performance seems to be similar to the 64bit retroarch emulators at this point.
  - To build without 32bit support, change the BUILD_ARMHF export in the Makefile to n or add BUILD_ARMHF=n as a variable to `make`.
 - For RK3566, you can add Kodi to your build.  Just change the BUILD_KODI export in the Makefile to y or add BUILD_KODI=y as a variavble to `make`.  Kodi is also available as a prepackaged build in the extra_packages/rk3566 subfolder.  Just copy it to your tools folder and launch from Options/Tools in the start menu.
  - Be aware that building Kodi will add a significant amount of time to your build.  Could be double or triple the build time.

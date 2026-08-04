@@ -170,7 +170,10 @@ function remove_arkbuild32() {
 
 updateapt="N"
 function install_package() {
-  if [ "$1" == "32" ]; then
+  if [ "$1" == "native" ]; then
+    NEEDED_ARCH=""
+    CHROOT_DIR="Arkbuild"
+  elif [ "$1" == "32" ]; then
     NEEDED_ARCH=""
     CHROOT_DIR="Arkbuild32"
   elif [ "$1" == "armhf" ]; then

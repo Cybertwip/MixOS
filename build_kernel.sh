@@ -25,6 +25,16 @@ if [ ! -d "$KERNEL_SRC" ]; then
 fi
 cd $KERNEL_SRC
 make ARCH=arm64 ${DEF_CONFIG}
+if [[ "${USERSPACE_ARCH:-arm64}" == "armhf" ]]; then
+  # A 64-bit RK3326 kernel can boot a native 32-bit Debian userspace only when
+  # AArch32 compatibility execution is enabled.
+  ./scripts/config --enable COMPAT
+  make ARCH=arm64 olddefconfig
+  grep -q '^CONFIG_COMPAT=y' .config || {
+    echo "The RK3326 kernel configuration does not support armhf userspace." >&2
+    exit 1
+  }
+fi
 CFLAGS=-Wno-deprecated-declarations make -j"${BUILD_JOBS}" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
 CFLAGS=-Wno-deprecated-declarations make -j"${BUILD_JOBS}" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image dtbs modules
 verify_action
@@ -55,13 +65,19 @@ elif [ "$UNIT" == "rgb10" ]; then
   sudo cp $KERNEL_SRC/arch/arm64/boot/dts/rockchip/${KERNEL_DTB_ALT_RGB10S} ${mountpoint}/rk3326-odroidgo2-linux-v11.dtb.rgb10s
 fi
 
-# Create uInitrd from generated initramfs
-sudo cp /usr/bin/qemu-aarch64-static Arkbuild/usr/bin/
+# Create uInitrd from generated initramfs.  The kernel remains arm64, but the
+# chroot helper must match the selected Debian userspace architecture.
+if [[ "${USERSPACE_ARCH:-arm64}" == "armhf" ]]; then
+  QEMU_STATIC=qemu-arm-static
+else
+  QEMU_STATIC=qemu-aarch64-static
+fi
+sudo cp "/usr/bin/${QEMU_STATIC}" Arkbuild/usr/bin/
 KERNEL_VERSION=$(basename $(find Arkbuild/lib/modules -maxdepth 1 -mindepth 1 -type d))
 # Create symlink so depmod/initramfs can find modules for uname -r (host kernel)
 sudo touch Arkbuild/lib/modules/${KERNEL_VERSION}/modules.builtin.modinfo
 call_chroot "uname() { echo ${KERNEL_VERSION}; }; export -f uname; depmod ${KERNEL_VERSION}; update-initramfs -c -k ${KERNEL_VERSION}"
-sudo rm Arkbuild/usr/bin/qemu-aarch64-static
+sudo rm "Arkbuild/usr/bin/${QEMU_STATIC}"
 sudo cp Arkbuild/boot/initrd.img-* ${mountpoint}/initrd.img
 if ! command -v mkimage &> /dev/null; then
   sudo apt -y update

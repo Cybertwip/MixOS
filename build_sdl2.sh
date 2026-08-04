@@ -8,7 +8,15 @@ else
   sub_folder="build"
 fi
 
-if [ "$1" == "32" ]; then
+if [[ "${USERSPACE_ARCH:-}" == "armhf" ]]; then
+  BITNESS="32"
+  ARCH="arm-linux-gnueabihf"
+  CHROOT_DIR="Arkbuild"
+elif [[ "${USERSPACE_ARCH:-}" == "arm64" ]]; then
+  BITNESS="64"
+  ARCH="aarch64-linux-gnu"
+  CHROOT_DIR="Arkbuild"
+elif [ "$1" == "32" ]; then
   BITNESS="32"
   ARCH="arm-linux-gnueabihf"
   CHROOT_DIR="Arkbuild32"
@@ -56,6 +64,6 @@ sudo chroot ${CHROOT_DIR}/ bash -c "ln -sfv /usr/lib/${ARCH}/libSDL2.so /usr/lib
 sudo chroot ${CHROOT_DIR}/ bash -c "ln -sfv /usr/lib/${ARCH}/libSDL2-2.0.so.0.${extension} /usr/lib/${ARCH}/libSDL2.so"
 sudo chroot ${CHROOT_DIR}/ bash -c "ln -sfv /usr/include/SDL2 /usr/local/include/"
 sudo chroot ${CHROOT_DIR}/ bash -c "rm -f /usr/bin/sdl2-config"
-sudo chroot ${CHROOT_DIR}/ bash -c "ln -sfv /usr/lib/aarch64-linux-gnu/bin/sdl2-config /usr/bin/sdl2-config"
+sudo chroot ${CHROOT_DIR}/ bash -c "ln -sfv /usr/lib/${ARCH}/bin/sdl2-config /usr/bin/sdl2-config"
 sudo cp -R ${CHROOT_DIR}/home/ark/${CHIPSET}_core_builds/SDL/include/* ${CHROOT_DIR}/usr/include/${ARCH}/SDL2/
 sudo rm -rf ${CHROOT_DIR}/home/ark/${CHIPSET}_core_builds/SDL

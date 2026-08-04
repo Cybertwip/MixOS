@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the dArkOS RG351MP base used for R36 Ultra bring-up.  The default
-# profile is Debian + EmulationStation with bundled applications disabled.
+# profile is a native armhf Debian userspace + EmulationStation with bundled
+# applications disabled.  The RK3326 kernel/boot chain remains arm64.
 #
 # macOS: builds inside a persistent Ubuntu 24.04 Multipass VM.
 # Linux: runs the same checkpointed build directly on the host.
@@ -14,7 +15,7 @@
 #   DARKOS_ARTIFACT_DIR=/path/to/output
 #   DARKOS_COPY_RAW_IMAGE=0       # Set to 1 to copy the raw .img to macOS.
 #   DEBIAN_CODE_NAME=trixie
-#   BUILD_ARMHF=y
+#   USERSPACE_ARCH=armhf          # armhf (default) or arm64; never multiarch.
 #   BUILD_JOBS=4
 #   BUILD_BUNDLED_APPS=n         # Debian + EmulationStation only (default).
 #   ENABLE_CACHE=y
@@ -30,7 +31,7 @@ UBUNTU_IMAGE="${DARKOS_UBUNTU_IMAGE:-24.04}"
 ARTIFACT_DIR="${DARKOS_ARTIFACT_DIR:-${SCRIPT_DIR}-artifacts}"
 COPY_RAW_IMAGE="${DARKOS_COPY_RAW_IMAGE:-0}"
 DEBIAN_RELEASE="${DEBIAN_CODE_NAME:-trixie}"
-ARMHF="${BUILD_ARMHF:-y}"
+USERSPACE_ARCH="${USERSPACE_ARCH:-armhf}"
 BUILD_JOBS="${BUILD_JOBS:-4}"
 BUNDLED_APPS="${BUILD_BUNDLED_APPS:-n}"
 CACHE="${ENABLE_CACHE:-y}"
@@ -39,7 +40,7 @@ if [[ "$BUNDLED_APPS" == "y" ]]; then
 else
     BUILD_PROFILE="gui"
 fi
-STATE_KEY="${DEBIAN_RELEASE}-armhf-${ARMHF}-profile-${BUILD_PROFILE}-v2"
+STATE_KEY="${DEBIAN_RELEASE}-userspace-${USERSPACE_ARCH}-profile-${BUILD_PROFILE}-v3"
 VM_SOURCE_MOUNT="/mnt/darkos-host"
 VM_ARTIFACT_MOUNT="/mnt/darkos-artifacts"
 VM_BUILD_DIR="/home/ubuntu/dArkOS"
@@ -61,10 +62,11 @@ usage() {
     cat <<USAGE
 Usage: ./build-r36-ultra.sh
 
-Builds the RG351MP/RK3326 base image used for R36 Ultra bring-up.  By
-default this produces Debian with the EmulationStation GUI and does not build
-the bundled emulators or standalone applications.  It does not yet inject an
-R36 Ultra-specific DTB.
+Builds the RG351MP/RK3326 base image used for R36 Ultra bring-up.  By default
+this produces one native armhf (32-bit) Debian userspace with the
+EmulationStation GUI.  It does not add an arm64 userspace or build the bundled
+emulators and standalone applications.  The existing arm64 RK3326 kernel/boot
+chain is retained, and the R36 Ultra-specific DTB is not yet injected.
 
 On macOS the script automatically creates or reuses a Multipass VM. Failed
 builds resume from the last completed infrastructure checkpoint instead of
@@ -76,11 +78,11 @@ Common overrides:
   DARKOS_VM_CPUS=4 DARKOS_VM_MEMORY=8G ./build-r36-ultra.sh
   BUILD_JOBS=8 ./build-r36-ultra.sh
   DARKOS_COPY_RAW_IMAGE=1 ./build-r36-ultra.sh
-  BUILD_ARMHF=n ./build-r36-ultra.sh
-  BUILD_BUNDLED_APPS=y ./build-r36-ultra.sh
+  USERSPACE_ARCH=arm64 ./build-r36-ultra.sh
+  USERSPACE_ARCH=arm64 BUILD_BUNDLED_APPS=y ./build-r36-ultra.sh
 
 Defaults:
-  BUILD_JOBS=4 BUILD_ARMHF=y BUILD_BUNDLED_APPS=n
+  BUILD_JOBS=4 USERSPACE_ARCH=armhf BUILD_BUNDLED_APPS=n
 USAGE
 }
 
@@ -92,7 +94,7 @@ elif [[ $# -ne 0 ]]; then
     exit 2
 fi
 
-[[ "$ARMHF" == "y" || "$ARMHF" == "n" ]] || die "BUILD_ARMHF must be y or n."
+[[ "$USERSPACE_ARCH" == "armhf" || "$USERSPACE_ARCH" == "arm64" ]] || die "USERSPACE_ARCH must be armhf or arm64."
 [[ "$BUNDLED_APPS" == "y" || "$BUNDLED_APPS" == "n" ]] || die "BUILD_BUNDLED_APPS must be y or n."
 [[ "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || die "BUILD_JOBS must be a positive integer."
 [[ "$CACHE" == "y" || "$CACHE" == "n" ]] || die "ENABLE_CACHE must be y or n."
@@ -100,9 +102,9 @@ fi
 
 run_make() {
     cd "$SCRIPT_DIR"
-    log "Building or resuming RG351MP (Debian ${DEBIAN_RELEASE}, profile=${BUILD_PROFILE}, ARMHF=${ARMHF}, jobs=${BUILD_JOBS}, cache=${CACHE})"
+    log "Building or resuming RG351MP (Debian ${DEBIAN_RELEASE}, userspace=${USERSPACE_ARCH}, profile=${BUILD_PROFILE}, jobs=${BUILD_JOBS}, cache=${CACHE})"
     env DEBIAN_CODE_NAME="$DEBIAN_RELEASE" \
-        BUILD_ARMHF="$ARMHF" \
+        USERSPACE_ARCH="$USERSPACE_ARCH" \
         BUILD_JOBS="$BUILD_JOBS" \
         BUILD_BUNDLED_APPS="$BUNDLED_APPS" \
         ENABLE_CACHE="$CACHE" \
@@ -201,7 +203,7 @@ log "Completed partition, Debian bootstrap, U-Boot and kernel stages are preserv
 
 multipass exec "$VM_NAME" -- env \
     DEBIAN_CODE_NAME="$DEBIAN_RELEASE" \
-    BUILD_ARMHF="$ARMHF" \
+    USERSPACE_ARCH="$USERSPACE_ARCH" \
     BUILD_JOBS="$BUILD_JOBS" \
     BUILD_BUNDLED_APPS="$BUNDLED_APPS" \
     ENABLE_CACHE="$CACHE" \
