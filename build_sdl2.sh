@@ -1,5 +1,7 @@
 #!/bin/bash
 
+BUILD_JOBS="${BUILD_JOBS:-4}"
+
 if [ "$CHIPSET" == "rk3326" ]; then
   sub_folder=""
 else
@@ -18,8 +20,11 @@ fi
 
 # Build and install SDL2
 if [ "$ARCH" == "arm-linux-gnueabihf" ]; then
-  sudo chroot ${CHROOT_DIR}/ bash -c "source /root/.bashrc && cd /home/ark &&
-    export CFLAGS=\"-Wno-error=int-conversion\" &&
+	  sudo chroot ${CHROOT_DIR}/ bash -c "source /root/.bashrc && cd /home/ark &&
+	    export MAKEFLAGS=\"-j${BUILD_JOBS}\" &&
+	    export CMAKE_BUILD_PARALLEL_LEVEL=\"${BUILD_JOBS}\" &&
+	    nproc() { printf '%s\\n' '${BUILD_JOBS}'; } && export -f nproc &&
+	    export CFLAGS=\"-Wno-error=int-conversion\" &&
     if [ ! -d ${CHIPSET}_core_builds ]; then git clone https://github.com/christianhaitian/${CHIPSET}_core_builds.git; fi &&
     cd ${CHIPSET}_core_builds &&
     if [[ ${UNIT} == *"miniloong"* ]]; then cp patches/${UNIT}/sdl2/*.patch patches/.; fi &&
@@ -29,8 +34,11 @@ if [ "$ARCH" == "arm-linux-gnueabihf" ]; then
     make install
     "
 else
-  sudo chroot ${CHROOT_DIR}/ bash -c "source /root/.bashrc && cd /home/ark &&
-    if [ ! -d ${CHIPSET}_core_builds ]; then git clone https://github.com/christianhaitian/${CHIPSET}_core_builds.git; fi &&
+	  sudo chroot ${CHROOT_DIR}/ bash -c "source /root/.bashrc && cd /home/ark &&
+	    export MAKEFLAGS=\"-j${BUILD_JOBS}\" &&
+	    export CMAKE_BUILD_PARALLEL_LEVEL=\"${BUILD_JOBS}\" &&
+	    nproc() { printf '%s\\n' '${BUILD_JOBS}'; } && export -f nproc &&
+	    if [ ! -d ${CHIPSET}_core_builds ]; then git clone https://github.com/christianhaitian/${CHIPSET}_core_builds.git; fi &&
     cd ${CHIPSET}_core_builds &&
     if [[ ${UNIT} == *"miniloong"* ]]; then cp patches/${UNIT}/sdl2/*.patch patches/.; fi &&
     chmod 777 builds-alt.sh &&

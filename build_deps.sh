@@ -1,5 +1,7 @@
 #!/bin/bash
 
+BUILD_JOBS="${BUILD_JOBS:-4}"
+
 echo -e "Installing build dependencies and needed packages...\n\n"
 
 if [ "$1" == "32" ]; then
@@ -82,9 +84,9 @@ sudo chroot ${CHROOT_DIR}/ bash -c "git clone https://github.com/mesonbuild/meso
 sudo chroot ${CHROOT_DIR}/ bash -c "cd /home/ark &&
   git clone https://github.com/christianhaitian/linux-rga.git &&
   cd linux-rga &&
-  git checkout 1fc02d56d97041c86f01bc1284b7971c6098c5fb &&
-  meson build && cd build &&
-  meson compile &&
+	  git checkout 1fc02d56d97041c86f01bc1284b7971c6098c5fb &&
+	  meson build && cd build &&
+	  meson compile -j ${BUILD_JOBS} &&
   cp -r librga.so* /usr/lib/${ARCH}/ &&
   cd .. &&
   mkdir -p /usr/local/include/rga &&
@@ -93,10 +95,10 @@ sudo chroot ${CHROOT_DIR}/ bash -c "cd /home/ark &&
 
 # Build and install libgo2
 sudo chroot ${CHROOT_DIR}/ bash -c "cd /home/ark &&
-  git clone https://github.com/OtherCrashOverride/libgo2.git &&
-  cd libgo2 &&
-  premake4 gmake &&
-  make -j$(nproc) &&
+	  git clone https://github.com/OtherCrashOverride/libgo2.git &&
+	  cd libgo2 &&
+	  premake4 gmake &&
+	  make -j${BUILD_JOBS} &&
   cp libgo2.so* /usr/lib/${ARCH}/ &&
   mkdir -p /usr/include/go2 &&
   cp -L src/*.h /usr/include/go2/

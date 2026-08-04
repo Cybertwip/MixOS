@@ -10,13 +10,34 @@ cd "$ROOT" || exit 1
 
 DEBIAN_CODE_NAME="${DEBIAN_CODE_NAME:-trixie}"
 BUILD_ARMHF="${BUILD_ARMHF:-y}"
+BUILD_JOBS="${BUILD_JOBS:-4}"
+BUILD_BUNDLED_APPS="${BUILD_BUNDLED_APPS:-n}"
 ENABLE_CACHE="${ENABLE_CACHE:-y}"
 CHIPSET=rk3326
 UNIT=rg351mp
-export DEBIAN_CODE_NAME BUILD_ARMHF ENABLE_CACHE CHIPSET UNIT
+if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
+    BUILD_PROFILE=full
+    IMAGE_PREFIX=dArkOS_RG351MP
+    FILESYSTEM=ArkOS_File_System.img
+else
+    BUILD_PROFILE=gui
+    IMAGE_PREFIX=dArkOS_R36_ULTRA_GUI_BASE
+    FILESYSTEM=ArkOS_R36_GUI_File_System.img
+fi
+export DEBIAN_CODE_NAME BUILD_ARMHF BUILD_JOBS BUILD_BUNDLED_APPS
+export ENABLE_CACHE CHIPSET UNIT BUILD_PROFILE FILESYSTEM
+
+# Keep direct make, CMake, Meson/Ninja, and helper scripts on the same
+# configurable parallelism limit.  Exporting nproc also covers child bash
+# scripts that still derive their job count with $(nproc).
+export MAKEFLAGS="-j${BUILD_JOBS}"
+export CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS"
+export NINJAFLAGS="-j${BUILD_JOBS}"
+nproc() { printf '%s\n' "$BUILD_JOBS"; }
+export -f nproc
 
 STATE_ROOT="${DARKOS_R36_STATE_DIR:-$HOME/darkos-r36-state}"
-STATE_DIR="$STATE_ROOT/${DEBIAN_CODE_NAME}-armhf-${BUILD_ARMHF}"
+STATE_DIR="$STATE_ROOT/${DEBIAN_CODE_NAME}-armhf-${BUILD_ARMHF}-profile-${BUILD_PROFILE}"
 mkdir -p "$STATE_DIR"
 LOG="$STATE_DIR/resume.log"
 CURRENT_STAGE="$STATE_DIR/current-stage"
@@ -33,6 +54,15 @@ maybe_stop() {
         exit 0
     fi
 }
+
+[[ "$BUILD_ARMHF" == y || "$BUILD_ARMHF" == n ]] || \
+    fail "BUILD_ARMHF must be y or n"
+[[ "$BUILD_BUNDLED_APPS" == y || "$BUILD_BUNDLED_APPS" == n ]] || \
+    fail "BUILD_BUNDLED_APPS must be y or n"
+[[ "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || \
+    fail "BUILD_JOBS must be a positive integer"
+
+log "Configuration: Debian=${DEBIAN_CODE_NAME}, profile=${BUILD_PROFILE}, ARMHF=${BUILD_ARMHF}, jobs=${BUILD_JOBS}, cache=${ENABLE_CACHE}"
 
 if [[ "${DARKOS_R36_RESET:-0}" == 1 ]]; then
     fail "DARKOS_R36_RESET requires a fresh build; use 'make clean' manually before retrying"
@@ -53,8 +83,8 @@ export PATH="$TOOLCHAIN/bin:$PATH"
 if [[ -s "$STATE_DIR/build-date" ]]; then
     BUILD_DATE="$(cat "$STATE_DIR/build-date")"
 else
-    existing_image="$(ls -1t dArkOS_RG351MP_${DEBIAN_CODE_NAME}_*.img 2>/dev/null | head -n 1 || true)"
-    if [[ -n "$existing_image" && -f ArkOS_File_System.img ]]; then
+    existing_image="$(ls -1t "${IMAGE_PREFIX}_${DEBIAN_CODE_NAME}_"*.img 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$existing_image" && -f "$FILESYSTEM" ]]; then
         BUILD_DATE="${existing_image##*_}"
         BUILD_DATE="${BUILD_DATE%.img}"
     else
@@ -80,8 +110,7 @@ ROM_PART_START=$(( STORAGE_PART_END + 1 ))
 ROM_PART_END=$(( ROM_PART_START + (ROM_PART_SIZE * 1024 * 1024 / 512) - 1 ))
 DISK_START_PADDING=$(( (SYSTEM_PART_START + 2048 - 1) / 2048 ))
 DISK_SIZE=$(( DISK_START_PADDING + SYSTEM_SIZE + STORAGE_SIZE + ROM_PART_SIZE + 1 ))
-FILESYSTEM=ArkOS_File_System.img
-DISK="dArkOS_RG351MP_${DEBIAN_CODE_NAME}_${BUILD_DATE}.img"
+DISK="${IMAGE_PREFIX}_${DEBIAN_CODE_NAME}_${BUILD_DATE}.img"
 export ROOT_FILESYSTEM_FORMAT ROOT_FILESYSTEM_FORMAT_PARAMETERS
 export ROOT_FILESYSTEM_MOUNT_OPTIONS SYSTEM_PART_START SYSTEM_PART_END
 export STORAGE_PART_START STORAGE_PART_END ROM_PART_START ROM_PART_END
@@ -151,6 +180,17 @@ clear_stale_boot_mount() {
     fi
 }
 
+clear_foreign_rootfs_mount() {
+    local mounted_source
+    mountpoint -q Arkbuild || return 0
+    mounted_source="$(findmnt -n -o SOURCE Arkbuild || true)"
+    if ! sudo losetup -j "$ROOT/$FILESYSTEM" 2>/dev/null | \
+        cut -d: -f1 | grep -Fxq "$mounted_source"; then
+        log "Unmounting root filesystem left by a different R36 build profile"
+        remove_arkbuild
+    fi
+}
+
 run_stage() {
     local name="$1" script="$2" rc
     if marked "$name"; then
@@ -166,6 +206,10 @@ run_stage() {
     fi
     mark "$name"
 }
+
+# A GUI-only and a full-app build use different filesystem/image names.  Make
+# sure a mount left by the other profile cannot contaminate this build.
+clear_foreign_rootfs_mount
 
 # Infer checkpoints made by the original monolithic build that failed before
 # this resume runner existed.
@@ -210,9 +254,10 @@ else
 fi
 maybe_stop kernel
 
-# A failed userspace phase can be safely retried: package/component caches and
-# ccache make earlier component stages cheap, while rerunning SDL establishes
-# the cross-stage `extension` variable required by RetroArch and cleanup.
+# A failed userspace phase can be safely retried.  The default GUI profile only
+# builds the graphics/runtime prerequisites and EmulationStation.  The original
+# complete emulator/application list remains available with
+# BUILD_BUNDLED_APPS=y.
 if ! marked userspace; then
     ensure_armhf_mounts
     if marked component-build_deps; then
@@ -221,48 +266,56 @@ if ! marked userspace; then
     if ! marked component-build_deps && mountpoint -q Arkbuild/home/ark/Arkbuild_ccache; then
         sudo umount -l Arkbuild/home/ark/Arkbuild_ccache || true
     fi
-    userspace_scripts=(
-        build_deps.sh
-        build_sdl2.sh
-        build_ppssppsa.sh
-        build_ppsspp-2021sa.sh
-        build_duckstationsa.sh
-        build_mupen64plussa.sh
-        build_gzdoom.sh
-        build_lzdoom.sh
-        build_retroarch.sh
-        build_retrorun.sh
-        build_yabasanshirosa.sh
-        build_mednafen.sh
-        build_ecwolfsa.sh
-        build_hypseus-singe.sh
-        build_openbor.sh
-        build_solarus.sh
-        build_scummvmsa.sh
-        build_fake08.sh
-        build_xroar.sh
-        build_mvem.sh
-        build_bigpemu.sh
-        build_ogage.sh
-        build_ogacontrols.sh
-        build_351files.sh
-        build_filemanager.sh
-        build_filebrowser.sh
-        build_gptokeyb.sh
-        build_image-viewer.sh
-        build_emulationstation.sh
-        build_linapple.sh
-        build_applewinsa.sh
-        build_piemu.sh
-        build_ti99sim.sh
-        build_gametank.sh
-        build_openmsxsa.sh
-        build_flycastsa.sh
-        build_sdljoytest.sh
-        build_controllertester.sh
-        build_batteryplus.sh
-        build_drastic.sh
-    )
+    if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
+        userspace_scripts=(
+            build_deps.sh
+            build_sdl2.sh
+            build_ppssppsa.sh
+            build_ppsspp-2021sa.sh
+            build_duckstationsa.sh
+            build_mupen64plussa.sh
+            build_gzdoom.sh
+            build_lzdoom.sh
+            build_retroarch.sh
+            build_retrorun.sh
+            build_yabasanshirosa.sh
+            build_mednafen.sh
+            build_ecwolfsa.sh
+            build_hypseus-singe.sh
+            build_openbor.sh
+            build_solarus.sh
+            build_scummvmsa.sh
+            build_fake08.sh
+            build_xroar.sh
+            build_mvem.sh
+            build_bigpemu.sh
+            build_ogage.sh
+            build_ogacontrols.sh
+            build_351files.sh
+            build_filemanager.sh
+            build_filebrowser.sh
+            build_gptokeyb.sh
+            build_image-viewer.sh
+            build_emulationstation.sh
+            build_linapple.sh
+            build_applewinsa.sh
+            build_piemu.sh
+            build_ti99sim.sh
+            build_gametank.sh
+            build_openmsxsa.sh
+            build_flycastsa.sh
+            build_sdljoytest.sh
+            build_controllertester.sh
+            build_batteryplus.sh
+            build_drastic.sh
+        )
+    else
+        userspace_scripts=(
+            build_deps.sh
+            build_sdl2.sh
+            build_emulationstation.sh
+        )
+    fi
     if [[ -s "$STATE_DIR/sdl2-extension" ]]; then
         extension="$(cat "$STATE_DIR/sdl2-extension")"
     fi
@@ -280,6 +333,25 @@ if ! marked userspace; then
         fi
         mark "$component"
     done
+
+    # Full builds create the armhf build root while compiling RetroArch.  The
+    # GUI-only profile has no 32-bit applications to trigger that path, so make
+    # the requested compatibility runtime explicit without adding any apps.
+    if [[ "$BUILD_BUNDLED_APPS" == n && "$BUILD_ARMHF" == y ]]; then
+        component=component-armhf-support
+        if marked "$component"; then
+            log "Skipping completed 32-bit compatibility support"
+        else
+            printf '%s\n' "userspace:armhf-support" > "$CURRENT_STAGE"
+            log "Building 32-bit compatibility libraries (no bundled apps)"
+            setup_arkbuild32 || fail "32-bit compatibility setup failed"
+            [[ -n "${extension:-}" ]] || fail "SDL2 extension was not detected for armhf support"
+            [[ -e "Arkbuild/usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0.${extension}" ]] || \
+                fail "32-bit SDL2 compatibility library was not installed"
+            printf '%s\n' "$extension" > "$STATE_DIR/sdl2-extension"
+            mark "$component"
+        fi
+    fi
     mark userspace
 else
     ensure_rootfs_mounts

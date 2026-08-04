@@ -1,5 +1,8 @@
 #!/bin/bash
 
+BUILD_JOBS="${BUILD_JOBS:-4}"
+BUILD_BUNDLED_APPS="${BUILD_BUNDLED_APPS:-y}"
+
 # Build and install EmulationStation-fcamod
 if [ -f ../exports.sh ];
 then
@@ -37,7 +40,7 @@ else
 	  cd EmulationStation-fcamod &&
 	  git submodule update --init &&
 	  cmake -DSCREENSCRAPER_DEV_LOGIN=\"devid=\$devid&devpassword=\$devpass\" -DGAMESDB_APIKEY=\"\$apikey\" -DSCREENSCRAPER_SOFTNAME=\"\$softname\" . &&
-	  make -j\$(nproc) &&
+	  make -j${BUILD_JOBS} &&
 	  mkdir -pv /usr/bin/emulationstation &&
 	  cp -a emulationstation /usr/bin/emulationstation &&
 	  chmod 777 /usr/bin/emulationstation &&
@@ -52,7 +55,7 @@ else
 	     cd EmulationStation-fcamod-${ES_BRANCH_ALT} &&
 	     git submodule update --init &&
 	     cmake -DSCREENSCRAPER_DEV_LOGIN=\"devid=\$devid&devpassword=\$devpass\" -DGAMESDB_APIKEY=\"\$apikey\" -DSCREENSCRAPER_SOFTNAME=\"\$softname\" . &&
-	     make -j\$(nproc) &&
+	     make -j${BUILD_JOBS} &&
 	     cp -a emulationstation /usr/bin/emulationstation/emulationstation.fullscreen &&
 	     chmod 777 /usr/bin/emulationstation/emulationstation.fullscreen &&
 	     cp -a resources /usr/bin/emulationstation/
@@ -69,14 +72,20 @@ else
 fi
 sudo rm -rf Arkbuild/home/ark/EmulationStation-fcamod*
 sudo mkdir -p Arkbuild/etc/emulationstation/themes
-if [[ "${BUILD_ARMHF}" == "y" ]]; then
+if [[ "${BUILD_BUNDLED_APPS}" != "y" ]]; then
+  sudo cp Emulationstation/es_systems.cfg.gui-only Arkbuild/etc/emulationstation/es_systems.cfg
+elif [[ "${BUILD_ARMHF}" == "y" ]]; then
   sudo cp Emulationstation/es_systems.cfg.${CHIPSET} Arkbuild/etc/emulationstation/es_systems.cfg
 else
   sudo cp Emulationstation/es_systems.cfg.${CHIPSET}-64bit_Only Arkbuild/etc/emulationstation/es_systems.cfg
 fi
 sudo cp Emulationstation/es_input.cfg.${UNIT} Arkbuild/etc/emulationstation/es_input.cfg
 sudo cp Emulationstation/es_settings.cfg.${UNIT} Arkbuild/home/ark/.emulationstation/es_settings.cfg
-sudo cp Emulationstation/emulationstation.sh.${UNIT} Arkbuild/usr/bin/emulationstation/emulationstation.sh
+if [[ "${BUILD_BUNDLED_APPS}" == "y" ]]; then
+  sudo cp Emulationstation/emulationstation.sh.${UNIT} Arkbuild/usr/bin/emulationstation/emulationstation.sh
+else
+  sudo cp Emulationstation/emulationstation.sh.gui-only Arkbuild/usr/bin/emulationstation/emulationstation.sh
+fi
 sudo cp Emulationstation/fonts/* Arkbuild/usr/bin/emulationstation/resources/
 sudo mkdir -p Arkbuild/usr/share/fonts/truetype/droid/
 sudo wget -t 5 -T 30 --no-check-certificate https://github.com/aosp-mirror/platform_frameworks_base/raw/refs/heads/main/data/fonts/DroidSansFallbackFull.ttf -O Arkbuild/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf
@@ -87,4 +96,3 @@ call_chroot "chown -R ark:ark /home/ark/"
 sudo chmod 777 Arkbuild/usr/bin/emulationstation/emulationstation.sh
 sudo cp Emulationstation/emulationstation.service Arkbuild/etc/systemd/system/emulationstation.service
 call_chroot "systemctl enable emulationstation"
-

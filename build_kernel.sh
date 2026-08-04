@@ -1,5 +1,7 @@
 #!/bin/bash
 
+BUILD_JOBS="${BUILD_JOBS:-4}"
+
 # Build and install custom kernel from christianhaitian/linux
 if [ "$UNIT" == "rgb10" ] || [ "$UNIT" == "rk2020" ]; then
   KERNEL_SRC="odroidgoA-4.4.y"
@@ -23,8 +25,8 @@ if [ ! -d "$KERNEL_SRC" ]; then
 fi
 cd $KERNEL_SRC
 make ARCH=arm64 ${DEF_CONFIG}
-CFLAGS=-Wno-deprecated-declarations make -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
-CFLAGS=-Wno-deprecated-declarations make -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image dtbs modules
+CFLAGS=-Wno-deprecated-declarations make -j"${BUILD_JOBS}" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
+CFLAGS=-Wno-deprecated-declarations make -j"${BUILD_JOBS}" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image dtbs modules
 verify_action
 cd ..
 

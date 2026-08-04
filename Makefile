@@ -5,6 +5,12 @@ ENABLE_CACHE ?= y
 BUILD_KODI ?= n
 BUILD_ARMHF ?= y
 BUILD_BLUEALSA ?= y
+BUILD_JOBS ?= 4
+
+# The R36 Ultra bring-up build defaults to a Debian + EmulationStation image.
+# Set BUILD_BUNDLED_APPS=y only when the complete emulator/application bundle
+# is wanted.
+R36_BUILD_BUNDLED_APPS = $(if $(strip $(BUILD_BUNDLED_APPS)),$(BUILD_BUNDLED_APPS),n)
 
 # Ensure system binaries like parted are in the path, and silence strict GCC warnings
 PATH := $(PATH):/usr/sbin:/sbin
@@ -15,6 +21,7 @@ export ENABLE_CACHE
 export BUILD_KODI
 export BUILD_ARMHF
 export BUILD_BLUEALSA
+export BUILD_JOBS
 export PATH
 export KCFLAGS
 
@@ -23,7 +30,14 @@ ifeq ($(DEBIAN_CODE_NAME),)
 endif
 
 all:
-	@echo "Please specify a valid build target: make rgb10 or make rg353m"
+	@echo "Please specify a valid build target: make rgb10, make rg353m, or make r36-ultra"
+
+r36-ultra:
+	$(info dArkOS R36 Ultra GUI base will use Debian $(DEBIAN_CODE_NAME).)
+	$(info parallel build jobs: $(BUILD_JOBS))
+	$(info adding armhf 32bit compatibility? $(BUILD_ARMHF))
+	$(info building bundled emulators/applications? $(R36_BUILD_BUNDLED_APPS))
+	env BUILD_BUNDLED_APPS="$(R36_BUILD_BUNDLED_APPS)" ./build-r36-ultra.sh
 
 a10mini:
 	$(info dArkOS will be built using the $(DEBIAN_CODE_NAME) release of Debian.)

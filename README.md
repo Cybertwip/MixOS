@@ -27,6 +27,31 @@ access to over 64,000 packages you can install via the Debian Advanced Package T
      
 Now you should be able to just run make <device_name> to build for a supported device.  Example: `make rg353m`
 
+### R36 Ultra bring-up build
+
+The R36 Ultra helper currently builds the RG351MP/RK3326 base image used for
+bring-up (the R36-specific DTB layer is still separate).  Its default profile
+is intentionally small: Debian, the kernel/device support, and the
+EmulationStation GUI are built, while bundled emulators and standalone
+applications are skipped.
+
+```bash
+./build-r36-ultra.sh
+# or
+make r36-ultra
+```
+
+The default is four parallel build jobs with armhf/32-bit compatibility:
+
+```bash
+BUILD_JOBS=4 BUILD_ARMHF=y BUILD_BUNDLED_APPS=n ./build-r36-ultra.sh
+```
+
+- Change `BUILD_JOBS` to control internal Make/CMake/Meson parallelism.
+- Set `BUILD_ARMHF=n` to omit 32-bit compatibility libraries.
+- Set `BUILD_BUNDLED_APPS=y` only when the complete emulator/application
+  bundle is required.
+
 **Notes**
 - To build on a different release of Debian, change the DEBIAN_CODE_NAME export in the Makefile or add DEBIAN_CODE_NAME=<release> as a variable to `make`.  Other debian code names can be found at https://www.debian.org/releases/
 - By default, this will build with both a 64bit and 32bit userspace.  This is primarily to support some 32bit ports available through PortMaster.  There are also some 32bit retroarch emulators available but the performance seems to be similar to the 64bit retroarch emulators at this point.

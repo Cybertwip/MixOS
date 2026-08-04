@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<systemList xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+	<system>
+		<name>system</name>
+		<fullname>Debian System</fullname>
+		<path>/opt/system</path>
+		<extension>.sh .SH</extension>
+		<command>%ROM%</command>
+		<platform>ignore</platform>
+		<theme>ports</theme>
+		<manufacturer>Debian</manufacturer>
+		<release>current</release>
+		<hardware>operating system</hardware>
+	</system>
+</systemList>

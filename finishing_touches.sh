@@ -1,5 +1,7 @@
 #!/bin/bash
 
+BUILD_BUNDLED_APPS="${BUILD_BUNDLED_APPS:-y}"
+
 # Create boot.ini
 if [ "$UNIT" == "rg351mp" ]; then
   INITRD_LOADERADDRESS="0x01100000"
@@ -145,20 +147,43 @@ EOF
 # Default set timezone to New York
 sudo chroot Arkbuild/ bash -c "ln -sf /usr/share/zoneinfo/America/New_York /etc/localtime"
 
-# Fetch older Debian library versions for PortMaster compatibility
-source ./fetch_compat_libs.sh
+# Fetch older Debian library versions only for the optional application/port
+# bundle.  The GUI-only image does not ship PortMaster or those applications.
+if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
+  source ./fetch_compat_libs.sh
+fi
 
 # Various tools available through Options added here
 sudo mkdir -p Arkbuild/opt/system/Advanced
-sudo cp dArkOS_Tools/*.sh Arkbuild/opt/system/
-sudo cp dArkOS_Tools/${CHIPSET}/*.sh Arkbuild/opt/system/Advanced/
-sudo cp dArkOS_Tools/Advanced/*.sh Arkbuild/opt/system/Advanced/
-sudo cp scripts/"Enable Quick Mode".sh Arkbuild/opt/system/Advanced/
-if [[ "$UNIT" == *"rgb10"* ]] || [[ "$UNIT" == "rk2020" ]] || [[ "$UNIT" == *"oga"* ]]; then
-  sudo cp dArkOS_Tools/OGA/*.sh Arkbuild/opt/system/Advanced/
+if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
+  sudo cp dArkOS_Tools/*.sh Arkbuild/opt/system/
+  if compgen -G "dArkOS_Tools/${CHIPSET}/*.sh" >/dev/null; then
+    sudo cp dArkOS_Tools/${CHIPSET}/*.sh Arkbuild/opt/system/Advanced/
+  fi
+  sudo cp dArkOS_Tools/Advanced/*.sh Arkbuild/opt/system/Advanced/
+  sudo cp scripts/"Enable Quick Mode".sh Arkbuild/opt/system/Advanced/
+  if [[ "$UNIT" == *"rgb10"* ]] || [[ "$UNIT" == "rk2020" ]] || [[ "$UNIT" == *"oga"* ]]; then
+    sudo cp dArkOS_Tools/OGA/*.sh Arkbuild/opt/system/Advanced/
+  else
+    sudo cp scripts/Switch* Arkbuild/usr/local/bin/
+    sudo cp scripts/"Switch to SD2 for Roms.sh" Arkbuild/opt/system/Advanced/
+  fi
 else
-  sudo cp scripts/Switch* Arkbuild/usr/local/bin/
-  sudo cp scripts/"Switch to SD2 for Roms.sh" Arkbuild/opt/system/Advanced/
+  gui_tools=(
+    "Change Password.sh"
+    "Disable Remote Services.sh"
+    "Enable Remote Services.sh"
+    "Network Info.sh"
+    "Remove ._ Files.sh"
+    "System Info.sh"
+    "USB Drive Mount.sh"
+    "USB Drive Unmount.sh"
+    "Update.sh"
+    "Wifi.sh"
+  )
+  for tool in "${gui_tools[@]}"; do
+    sudo cp "dArkOS_Tools/$tool" Arkbuild/opt/system/
+  done
 fi
 sudo chroot Arkbuild/ bash -c "chown -R ark:ark /opt"
 sudo chmod -R 777 Arkbuild/opt/system/
@@ -381,15 +406,20 @@ fi
 sudo chroot Arkbuild/ bash -c "chown -R ark:ark /home/ark"
 
 # Clone some themes to the tempthemes folder
-sudo mkdir Arkbuild/tempthemes
-if [[ "$UNIT" == *"rgb10"* ]] || [[ "$UNIT" == "rk2020" ]] || [[ "$UNIT" == *"oga"* ]]; then
-  sudo git clone --depth=1 https://github.com/pix33l/es-theme-pixui.git Arkbuild/tempthemes/es-theme-pixui
+sudo mkdir -p Arkbuild/tempthemes
+if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
+  if [[ "$UNIT" == *"rgb10"* ]] || [[ "$UNIT" == "rk2020" ]] || [[ "$UNIT" == *"oga"* ]]; then
+    sudo git clone --depth=1 https://github.com/pix33l/es-theme-pixui.git Arkbuild/tempthemes/es-theme-pixui
+  fi
+  sudo git clone --depth=1 https://github.com/Jetup13/es-theme-freeplay.git Arkbuild/tempthemes/es-theme-freeplay
+  sudo git clone --depth=1 https://github.com/Jetup13/es-theme-minimal-arkos.git Arkbuild/tempthemes/es-theme-minimal-arkos
+  sudo git clone --depth=1 https://github.com/Jetup13/es-theme-nes-box.git Arkbuild/tempthemes/es-theme-nes-box
+  sudo git clone --depth=1 https://github.com/Jetup13/es-theme-switch.git Arkbuild/tempthemes/es-theme-switch
+  sudo git clone --depth=1 https://github.com/dani7959/es-theme-replica.git Arkbuild/tempthemes/es-theme-replica
+else
+  # One theme is enough for the system-tools-only EmulationStation GUI.
+  sudo git clone --depth=1 https://github.com/Jetup13/es-theme-nes-box.git Arkbuild/tempthemes/es-theme-nes-box
 fi
-sudo git clone --depth=1 https://github.com/Jetup13/es-theme-freeplay.git Arkbuild/tempthemes/es-theme-freeplay
-sudo git clone --depth=1 https://github.com/Jetup13/es-theme-minimal-arkos.git Arkbuild/tempthemes/es-theme-minimal-arkos
-sudo git clone --depth=1 https://github.com/Jetup13/es-theme-nes-box.git Arkbuild/tempthemes/es-theme-nes-box
-sudo git clone --depth=1 https://github.com/Jetup13/es-theme-switch.git Arkbuild/tempthemes/es-theme-switch
-sudo git clone --depth=1 https://github.com/dani7959/es-theme-replica.git Arkbuild/tempthemes/es-theme-replica
 
 sync
 sudo umount -l ${mountpoint}
@@ -418,66 +448,76 @@ fat32_mountpoint=mnt/roms
 mkdir -p ${fat32_mountpoint}
 sudo mount ${LOOP_ROM} ${fat32_mountpoint}
 sudo mkdir -p Arkbuild/roms
-while read GAME_SYSTEM; do
-  if [[ ! "$GAME_SYSTEM" =~ ^# ]]; then
-    echo -e "Creating ${fat32_mountpoint}/${GAME_SYSTEM}\n"
-    sudo mkdir -p ${fat32_mountpoint}/${GAME_SYSTEM}
-  fi
-done <game_systems.txt
+if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
+  while read GAME_SYSTEM; do
+    if [[ ! "$GAME_SYSTEM" =~ ^# ]]; then
+      echo -e "Creating ${fat32_mountpoint}/${GAME_SYSTEM}\n"
+      sudo mkdir -p ${fat32_mountpoint}/${GAME_SYSTEM}
+    fi
+  done <game_systems.txt
+else
+  # The GUI-only image needs only system data and theme/media locations.  Do
+  # not populate emulator folders, PortMaster, ThemeMaster, or sample games.
+  gui_directories=(backup bgmusic bios launchimages shutdownimages themes tools)
+  for directory in "${gui_directories[@]}"; do
+    echo -e "Creating ${fat32_mountpoint}/${directory}\n"
+    sudo mkdir -p "${fat32_mountpoint}/${directory}"
+  done
+fi
 
-# Add latest version of PortMaster install to roms/tools folder
-for (( ; ; ))
-do
- #wget -t 3 -T 60 --no-check-certificate https://github.com/PortsMaster/PortMaster-GUI/releases/download/8.5.22_0528/PortMaster.zip
- PMver=$(curl --silent -qI https://github.com/PortsMaster/PortMaster-GUI/releases/latest | awk -F '/' '/^location/ {print  substr($NF, 1, length($NF)-1)}')
- wget -t 3 -T 60 --no-check-certificate https://github.com/PortsMaster/PortMaster-GUI/releases/download/${PMver}/Install.PortMaster.sh
- if [ $? == 0 ]; then
-  break
- fi
- sleep 10
-done
-sudo mv -f Install.PortMaster.sh ${fat32_mountpoint}/tools/Install.PortMaster.sh
-chmod 777 ${fat32_mountpoint}/tools/Install.PortMaster.sh
+if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
+  # Add latest version of PortMaster install to roms/tools folder
+  for (( ; ; ))
+  do
+   #wget -t 3 -T 60 --no-check-certificate https://github.com/PortsMaster/PortMaster-GUI/releases/download/8.5.22_0528/PortMaster.zip
+   PMver=$(curl --silent -qI https://github.com/PortsMaster/PortMaster-GUI/releases/latest | awk -F '/' '/^location/ {print  substr($NF, 1, length($NF)-1)}')
+   wget -t 3 -T 60 --no-check-certificate https://github.com/PortsMaster/PortMaster-GUI/releases/download/${PMver}/Install.PortMaster.sh
+   if [ $? == 0 ]; then
+    break
+   fi
+   sleep 10
+  done
+  sudo mv -f Install.PortMaster.sh ${fat32_mountpoint}/tools/Install.PortMaster.sh
+  chmod 777 ${fat32_mountpoint}/tools/Install.PortMaster.sh
 
-# Add latest version of ThemeMaster to roms/tools folder
-for (( ; ; ))
-do
- wget -t 3 -T 60 --no-check-certificate https://github.com/JohnIrvine1433/ThemeMaster/archive/refs/heads/master.zip
- if [ $? == 0 ]; then
-  break
- fi
- sleep 10
-done
-sudo unzip -X -o master.zip -d ${fat32_mountpoint}/tools/
-sudo rm -rf ${fat32_mountpoint}/tools/ThemeMaster
-sudo mv -f ${fat32_mountpoint}/tools/ThemeMaster-master/ThemeMaster ${fat32_mountpoint}/tools/
-sudo mv -f ${fat32_mountpoint}/tools/ThemeMaster-master/ThemeMaster.sh ${fat32_mountpoint}/tools/
-sudo rm -rf ${fat32_mountpoint}/tools/ThemeMaster-master/
-rm -f master.zip
+  # Add latest version of ThemeMaster to roms/tools folder
+  for (( ; ; ))
+  do
+   wget -t 3 -T 60 --no-check-certificate https://github.com/JohnIrvine1433/ThemeMaster/archive/refs/heads/master.zip
+   if [ $? == 0 ]; then
+    break
+   fi
+   sleep 10
+  done
+  sudo unzip -X -o master.zip -d ${fat32_mountpoint}/tools/
+  sudo rm -rf ${fat32_mountpoint}/tools/ThemeMaster
+  sudo mv -f ${fat32_mountpoint}/tools/ThemeMaster-master/ThemeMaster ${fat32_mountpoint}/tools/
+  sudo mv -f ${fat32_mountpoint}/tools/ThemeMaster-master/ThemeMaster.sh ${fat32_mountpoint}/tools/
+  sudo rm -rf ${fat32_mountpoint}/tools/ThemeMaster-master/
+  rm -f master.zip
 
-# Get some sample pico-8 games
-sudo rm -rf /roms/pico-8/carts/*
-sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/1/15133.p8.png -O ${fat32_mountpoint}/pico-8/carts/celeste.p8.png
-sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/sc/scrap_boy-6.p8.png -O ${fat32_mountpoint}/pico-8/carts/scrap_boy-6.p8.png
-sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/di/dinkykong-0.p8.png -O ${fat32_mountpoint}/pico-8/carts/dinkykong-0.p8.png
-sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/po/poom_0-9.p8.png -O ${fat32_mountpoint}/pico-8/carts/poom_0-9.p8.png
-sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/ch/cherrybomb-0.p8.png -O ${fat32_mountpoint}/pico-8/carts/cherrybomb-0.p8.png
+  # Get some sample pico-8 games
+  sudo rm -rf /roms/pico-8/carts/*
+  sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/1/15133.p8.png -O ${fat32_mountpoint}/pico-8/carts/celeste.p8.png
+  sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/sc/scrap_boy-6.p8.png -O ${fat32_mountpoint}/pico-8/carts/scrap_boy-6.p8.png
+  sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/di/dinkykong-0.p8.png -O ${fat32_mountpoint}/pico-8/carts/dinkykong-0.p8.png
+  sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/po/poom_0-9.p8.png -O ${fat32_mountpoint}/pico-8/carts/poom_0-9.p8.png
+  sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/ch/cherrybomb-0.p8.png -O ${fat32_mountpoint}/pico-8/carts/cherrybomb-0.p8.png
+fi
 
-# Copy default game launch images
+# Copy default GUI launch and shutdown images.
 sudo cp launchimages/loading.ascii.${UNIT} ${fat32_mountpoint}/launchimages/loading.ascii
 sudo cp launchimages/loading.jpg.${UNIT} ${fat32_mountpoint}/launchimages/loading.jpg
-
-# Copy default shutdown launch image
 sudo cp shutdownimages/bye.gif ${fat32_mountpoint}/shutdownimages/
 
-# Copy various tools to roms folders
-sudo cp -a ecwolf/Scan* ${fat32_mountpoint}/wolf/
-sudo cp -a scummvm/scripts/Scan* ${fat32_mountpoint}/scummvm/
-sudo cp -a hypseus-singe/scripts/Scan* ${fat32_mountpoint}/alg/
-sudo cp -a scummvm/scripts/menu.scummvm ${fat32_mountpoint}/scummvm/
-
-# Clone some themes to the roms/themes folder
-sudo git clone --depth=1 https://github.com/Jetup13/es-theme-nes-box.git ${fat32_mountpoint}/themes/es-theme-nes-box
+if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
+  # Copy application-specific scanners and seed the pre-expansion theme folder.
+  sudo cp -a ecwolf/Scan* ${fat32_mountpoint}/wolf/
+  sudo cp -a scummvm/scripts/Scan* ${fat32_mountpoint}/scummvm/
+  sudo cp -a hypseus-singe/scripts/Scan* ${fat32_mountpoint}/alg/
+  sudo cp -a scummvm/scripts/menu.scummvm ${fat32_mountpoint}/scummvm/
+  sudo git clone --depth=1 https://github.com/Jetup13/es-theme-nes-box.git ${fat32_mountpoint}/themes/es-theme-nes-box
+fi
 sync
 
 # Create roms.tar for use after exfat partition creation

@@ -14,6 +14,8 @@
 #   DARKOS_COPY_RAW_IMAGE=0       # Set to 1 to copy the raw .img to macOS.
 #   DEBIAN_CODE_NAME=trixie
 #   BUILD_ARMHF=y
+#   BUILD_JOBS=4
+#   BUILD_BUNDLED_APPS=n         # Debian + EmulationStation only (default).
 #   ENABLE_CACHE=y
 
 set -Eeuo pipefail
@@ -28,7 +30,15 @@ ARTIFACT_DIR="${DARKOS_ARTIFACT_DIR:-${SCRIPT_DIR}-artifacts}"
 COPY_RAW_IMAGE="${DARKOS_COPY_RAW_IMAGE:-0}"
 DEBIAN_RELEASE="${DEBIAN_CODE_NAME:-trixie}"
 ARMHF="${BUILD_ARMHF:-y}"
+BUILD_JOBS="${BUILD_JOBS:-4}"
+BUNDLED_APPS="${BUILD_BUNDLED_APPS:-n}"
 CACHE="${ENABLE_CACHE:-y}"
+if [[ "$BUNDLED_APPS" == "y" ]]; then
+    BUILD_PROFILE="full"
+else
+    BUILD_PROFILE="gui"
+fi
+STATE_KEY="${DEBIAN_RELEASE}-armhf-${ARMHF}-profile-${BUILD_PROFILE}"
 VM_SOURCE_MOUNT="/mnt/darkos-host"
 VM_ARTIFACT_MOUNT="/mnt/darkos-artifacts"
 VM_BUILD_DIR="/home/ubuntu/dArkOS"
@@ -50,8 +60,10 @@ usage() {
     cat <<USAGE
 Usage: ./build-r36-ultra.sh
 
-Builds the RG351MP/RK3326 base image used for R36 Ultra bring-up.
-It does not yet inject an R36 Ultra-specific DTB.
+Builds the RG351MP/RK3326 base image used for R36 Ultra bring-up.  By
+default this produces Debian with the EmulationStation GUI and does not build
+the bundled emulators or standalone applications.  It does not yet inject an
+R36 Ultra-specific DTB.
 
 On macOS the script automatically creates or reuses a Multipass VM. Failed
 builds resume from the last completed infrastructure checkpoint instead of
@@ -61,8 +73,13 @@ Artifacts are copied to:
 
 Common overrides:
   DARKOS_VM_CPUS=4 DARKOS_VM_MEMORY=8G ./build-r36-ultra.sh
+  BUILD_JOBS=8 ./build-r36-ultra.sh
   DARKOS_COPY_RAW_IMAGE=1 ./build-r36-ultra.sh
   BUILD_ARMHF=n ./build-r36-ultra.sh
+  BUILD_BUNDLED_APPS=y ./build-r36-ultra.sh
+
+Defaults:
+  BUILD_JOBS=4 BUILD_ARMHF=y BUILD_BUNDLED_APPS=n
 USAGE
 }
 
@@ -75,14 +92,18 @@ elif [[ $# -ne 0 ]]; then
 fi
 
 [[ "$ARMHF" == "y" || "$ARMHF" == "n" ]] || die "BUILD_ARMHF must be y or n."
+[[ "$BUNDLED_APPS" == "y" || "$BUNDLED_APPS" == "n" ]] || die "BUILD_BUNDLED_APPS must be y or n."
+[[ "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || die "BUILD_JOBS must be a positive integer."
 [[ "$CACHE" == "y" || "$CACHE" == "n" ]] || die "ENABLE_CACHE must be y or n."
 [[ "$COPY_RAW_IMAGE" == "0" || "$COPY_RAW_IMAGE" == "1" ]] || die "DARKOS_COPY_RAW_IMAGE must be 0 or 1."
 
 run_make() {
     cd "$SCRIPT_DIR"
-    log "Building or resuming RG351MP (Debian ${DEBIAN_RELEASE}, ARMHF=${ARMHF}, cache=${CACHE})"
+    log "Building or resuming RG351MP (Debian ${DEBIAN_RELEASE}, profile=${BUILD_PROFILE}, ARMHF=${ARMHF}, jobs=${BUILD_JOBS}, cache=${CACHE})"
     env DEBIAN_CODE_NAME="$DEBIAN_RELEASE" \
         BUILD_ARMHF="$ARMHF" \
+        BUILD_JOBS="$BUILD_JOBS" \
+        BUILD_BUNDLED_APPS="$BUNDLED_APPS" \
         ENABLE_CACHE="$CACHE" \
         DARKOS_R36_STATE_DIR="${DARKOS_R36_STATE_DIR:-$HOME/darkos-r36-state}" \
         bash device/r36-ultra/build-in-vm.sh
@@ -180,13 +201,15 @@ log "Completed partition, Debian bootstrap, U-Boot and kernel stages are preserv
 multipass exec "$VM_NAME" -- env \
     DEBIAN_CODE_NAME="$DEBIAN_RELEASE" \
     BUILD_ARMHF="$ARMHF" \
+    BUILD_JOBS="$BUILD_JOBS" \
+    BUILD_BUNDLED_APPS="$BUNDLED_APPS" \
     ENABLE_CACHE="$CACHE" \
     DARKOS_R36_STATE_DIR="/home/ubuntu/darkos-r36-state" \
     bash "$VM_BUILD_DIR/device/r36-ultra/build-in-vm.sh"
 
 multipass exec "$VM_NAME" -- bash -lc "
 set -Eeuo pipefail
-STATE_DIR='/home/ubuntu/darkos-r36-state/${DEBIAN_RELEASE}-armhf-${ARMHF}'
+STATE_DIR='/home/ubuntu/darkos-r36-state/${STATE_KEY}'
 read -r IMAGE < \$STATE_DIR/latest-image
 cd '$VM_BUILD_DIR'
 [[ -s "\$IMAGE" ]] || { echo "missing image: \$IMAGE" >&2; exit 1; }
