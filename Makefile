@@ -1,5 +1,7 @@
 SHELL := /bin/bash
 
+.PHONY: all r36-ultra
+
 DEBIAN_CODE_NAME ?= trixie
 ENABLE_CACHE ?= y
 BUILD_KODI ?= n
