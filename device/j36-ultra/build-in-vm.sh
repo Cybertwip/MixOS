@@ -1765,11 +1765,12 @@ fetch_fbdoom_wad() {
     return 0
 }
 
-# Off by default.  fbdoom did its job -- it proved the panel, the pads and the
-# framebuffer before there was a GPU stack to prove them with -- and everything it
-# proved is now proved again, further along, by EmulationStation on mtk_drm + lima.
-# Keeping it would put a game and a 35 MiB IWAD on the BOOT partition, which is for
-# the boot payload, not for userland software.  J36_DOOM=1 brings it back verbatim.
+# Off by default, and the default is about the download rather than about the game:
+# J36_DOOM=1 clones doomgeneric and fetches a 26 MiB Freedoom IWAD, which is not
+# something a kernel build should do unasked.  What it no longer costs is the BOOT
+# partition -- with J36_DOOM=1 the binary and the IWAD go into the second partition's
+# /opt/mixos tree, and the dashboard grows a Doom card that runs them.  With
+# J36_DOOM=0 that card says so and everything else is unchanged.
 if [[ "${J36_DOOM:-0}" == 1 ]]; then
     set +e
     build_fbdoom
@@ -2800,18 +2801,18 @@ cp "$DTB_OUT/mt6592-j36-ultra.dtb" "$SDBOOT/"
 cp "$ARTIFACTS/initramfs-j36-ultra.cpio.gz" "$SDBOOT/initrd.img"
 
 # j36/ is read by /init, not by the LK, so nothing here goes through a load
-# window and nothing here has a size limit.  Delete the directory on the card and
-# the boot is exactly what it was before -- /init says so and carries on.
-if [[ -n "$DOOM_BIN" ]]; then
-    mkdir -p "$SDBOOT/j36"
-    cp "$DOOM_BIN" "$SDBOOT/j36/doom"
-    chmod 0755 "$SDBOOT/j36/doom"
-    if [[ -n "$DOOM_WAD" ]]; then
-        cp "$DOOM_WAD" "$SDBOOT/j36/$(basename "$DOOM_WAD")"
-    fi
-fi
+# window and nothing here has a size limit worth worrying about.  Delete a directory
+# under it on the card and the boot is exactly what it was before -- /init says so and
+# carries on.
+#
+# What is deliberately NOT here any more is Doom and its IWAD.  This is a small vfat
+# partition that an R36S card shares with its own kernel, initrd and device trees, and
+# 26 MiB of game on it was 26 MiB the boot payload might need.  Doom moved to the
+# second partition with the dashboard; see the sd-root payload below.
 
-# The same rule for the GPU payload, and the same consequence: remove
+# Remove j36/mfgpower or j36/modules and j36.lima=1 finds nothing, says so, and the
+# boot continues.  load.order is written from the walk above, one module per line in
+# the order insmod needs them.
 # j36/mfgpower or j36/modules and j36.lima=1 finds nothing, says so, and the boot
 # continues.  load.order is written from the walk above, one module per line in
 # the order insmod needs them.
@@ -3832,6 +3833,108 @@ implied warranties of merchantability, fitness for a particular purpose and
 non-infringement.
 LICENCE
 
+# ── The second-partition payload: /opt/mixos ──────────────────────────────────
+#
+# Everything above goes on the vfat BOOT partition, where the LK and /init can reach
+# it before there is a rootfs.  This does not: it is userland software, it is 50 MB of
+# it, and BOOT is a small partition an R36S card shares with its own boot files.
+#
+# WHY A NEW DIRECTORY AND NOT /usr.  One Debian rootfs on this card serves two
+# machines -- this board and an R36S -- and the rule that has held all the way through
+# this bring-up is that nothing on it is modified.  /opt/mixos is a path neither ArkOS
+# nor dArkOS nor Debian has ever used, so unpacking this payload adds files and
+# changes none: an R36S booting the same card gets its own libEGL.so symlink, its own
+# EmulationStation and its own units, and never looks in /opt.
+#
+# WHY IT IS A TARBALL AS WELL AS A TREE.  vfat cannot hold symlinks, which is why the
+# GL payload carries a `links' file; ext4 and btrfs can, and this payload uses them
+# for the SONAME aliases Qt's loader asks for.  A tarball is the copy that cannot lose
+# them -- or the modes, or the ownership -- whatever machine does the copying.
+#
+#   sudo tar -xzf sd-root.tar.gz -C /path/to/the/mounted/second/partition
+#
+# It is not fatal for any of this to be absent.  With no /opt/mixos on the card /init
+# writes no drop-in, emulationstation.service runs whatever the rootfs has, and the
+# boot is exactly what it was.
+SDROOT="$ARTIFACTS/sd-root"
+rm -rf "$SDROOT" "$ARTIFACTS/sd-root.tar.gz"
+if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" ]]; then
+    mkdir -p "$SDROOT/opt/mixos/bin"
+
+    if [[ -n "$MIXDASH_BIN" && -n "$QT_PAYLOAD" ]]; then
+        cp "$MIXDASH_BIN" "$SDROOT/opt/mixos/bin/mixdash"
+        chmod 0755 "$SDROOT/opt/mixos/bin/mixdash"
+        cp "$QT_PAYLOAD/bin/qt.conf" "$SDROOT/opt/mixos/bin/qt.conf"
+        mkdir -p "$SDROOT/opt/mixos/qt"
+        # -a: the SONAME aliases in lib/ are symlinks and have to stay symlinks.
+        cp -a "$QT_PAYLOAD/lib" "$QT_PAYLOAD/plugins" "$QT_PAYLOAD/fonts" \
+              "$SDROOT/opt/mixos/qt/"
+        log "dash: staged the dashboard and $(ls -1 "$SDROOT/opt/mixos/qt/lib" | wc -l) Qt files into opt/mixos/"
+    elif [[ -n "$MIXDASH_BIN" ]]; then
+        # Deliberately not staged alone.  A dashboard with no Qt beside it is a
+        # binary the loader cannot start, and a card that carries it would look
+        # configured while failing before main().
+        log "dash: the dashboard was built but its Qt payload was not, so neither is staged"
+    fi
+
+    # Doom, and the IWAD under the name doomgeneric's iwads[] table knows it by --
+    # d_iwad.c matches the filename before it opens the file.
+    if [[ -n "$DOOM_BIN" ]]; then
+        cp "$DOOM_BIN" "$SDROOT/opt/mixos/bin/doom"
+        chmod 0755 "$SDROOT/opt/mixos/bin/doom"
+        if [[ -n "$DOOM_WAD" ]]; then
+            mkdir -p "$SDROOT/opt/mixos/share/doom"
+            cp "$DOOM_WAD" "$SDROOT/opt/mixos/share/doom/$(basename "$DOOM_WAD")"
+        fi
+        log "dash: staged doom into opt/mixos/bin/"
+    fi
+
+    # Ms-PL 3(C) again: mixdash is MixOS's own code, so the tree it ships in has to
+    # carry its notice.  Short, and pointing at the full text on the other partition
+    # rather than repeating 40 lines of licence in two places on one card.
+    cat > "$SDROOT/opt/mixos/README.txt" <<'MIXOSREADME'
+MixOS -- J36 Ultra (MediaTek MT6592, ARMv7) second-partition payload.
+
+Unpack this into the root of the card's second partition -- the shared armhf Debian
+rootfs -- and nothing already on it is touched: everything here is under /opt/mixos,
+a directory neither Debian nor ArkOS nor dArkOS uses.  An R36S booting the same card
+is unaffected and never looks in it.
+
+  bin/mixdash          the dashboard.  Qt5 Widgets on the linuxfb platform plugin,
+                       which writes into /dev/fb0 -- the framebuffer the MVII LK
+                       already lit and simplefb still owns.  No EGL, no GBM, no mode
+                       set.  Run it by hand with --probe to have it report the
+                       framebuffer's geometry and exit.
+  bin/qt.conf          where Qt finds its plugins.  Read from the executable's own
+                       directory, so mixdash works from a plain shell.
+  qt/lib               Qt 5.15 and its runtime closure, from Debian trixie armhf.
+                       The dashboard's RPATH names this directory and /run/j36/gl.
+  qt/plugins/platforms libqlinuxfb.so, the one plugin this needs.
+  qt/fonts             DejaVu Sans, two faces.
+  bin/doom             framebuffer Doom (doomgeneric), if the build staged it.
+  share/doom           its IWAD.
+
+The initramfs writes a systemd drop-in in /run -- in memory, never on the card -- that
+points emulationstation.service at bin/mixdash.  Delete this directory and that
+drop-in is not written, so the rootfs's own EmulationStation runs and the card is
+exactly what it was.
+
+Licence: the MixOS work here (bin/mixdash) is under the Microsoft Public License;
+the full text is in LICENSE.txt on the BOOT partition.  Qt, its dependencies and the
+fonts are Debian's packages under their own terms (LGPL-3 with Qt's exceptions for
+Qt itself; see /usr/share/doc on a Debian machine).  doomgeneric and Doom's engine
+source are id Software's under the GPL, as Debian and doomgeneric ship them.  MixOS
+is a divergent fork of dArkOS, which continues ArkOS; the operating system
+underneath is Debian.  MixOS supports the MediaTek line of processors.
+MIXOSREADME
+
+    ( cd "$SDROOT" && tar -czf "$ARTIFACTS/sd-root.tar.gz" \
+        --owner=root --group=root --numeric-owner opt )
+    log "dash: sd-root.tar.gz is $(stat -c %s "$ARTIFACTS/sd-root.tar.gz") bytes"
+else
+    log "dash: nothing for the second partition, so no sd-root payload"
+fi
+
 (
     cd "$ARTIFACTS"
     # The Doom payload is optional, and sha256sum takes a missing operand as an
@@ -3839,8 +3942,11 @@ LICENCE
     sums=(boot.img zImage zImage-j36-ultra mt6592-j36-ultra.dtb
           j36_mt6592_input.ko initramfs-j36-ultra.cpio.gz
           sd-boot/zImage sd-boot/mvii/boot.conf)
-    if [[ -f sd-boot/j36/doom ]]; then
-        sums+=(sd-boot/j36/doom)
+    if [[ -f sd-root/opt/mixos/bin/mixdash ]]; then
+        sums+=(sd-root/opt/mixos/bin/mixdash)
+    fi
+    if [[ -f sd-root/opt/mixos/bin/doom ]]; then
+        sums+=(sd-root/opt/mixos/bin/doom)
     fi
     if [[ -f sd-boot/j36/mfgpower ]]; then
         sums+=(sd-boot/j36/mfgpower sd-boot/j36/modules/load.order)
