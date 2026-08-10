@@ -2,7 +2,8 @@
 """Generate the J36 Ultra MT6592 bring-up DTS from the MVII driver sources.
 
 The panel timing, power GPIOs, compact 155-record JD9365 command table, keypad
-matrix, direct GPIO keys, framebuffer and AUXADC channels are parsed from:
+matrix, keypad pad mux, direct GPIO keys, framebuffer and AUXADC channels are
+parsed from:
   PowerEngine/OS/MVII/Kernel/ARM/MediaTek/J36Ultra/Drivers
 
 No data is taken from PowerEngine/Reference/J36-ULTRA.
@@ -639,6 +640,17 @@ def generate(sources: dict[str, str]) -> str:
 \t\tj36,keypad-controller = <&keypad>;
 \t\tj36,auxadc-controller = <&auxadc>;
 \t\tj36,pericfg-controller = <&pericfg>;
+\t\t/*
+\t\t * The keypad's 32 kHz clock is not on the SoC side at all: it is one bit
+\t\t * of MT6323 register 0x40, reached over PWRAP. This is the step whose
+\t\t * absence is invisible from here -- with the clock gated the scan engine
+\t\t * sits with KP_EN set, KP_DEBOUNCE loaded and every scan memory reading
+\t\t * its idle all-ones pattern, which is indistinguishable from a correctly
+\t\t * configured matrix that nobody is pressing. A live capture showed exactly
+\t\t * that: en=1, deb=0x400, mem ffff ffff ffff ffff 00ff, before and after a
+\t\t * verified-correct pad mux.
+\t\t */
+\t\tj36,pwrap-controller = <&pwrap>;
 \t\tpoll-interval-ms = <5>;
 \t\tj36,direct-key-map = <
 {direct_map_cells}

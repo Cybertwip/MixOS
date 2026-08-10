@@ -2,12 +2,34 @@
 /*
  * Minimal J36 Ultra input adapter for MediaTek MT6592.
  *
- * This intentionally mirrors the non-destructive polling paths in PowerEngine
+ * This intentionally mirrors the polling paths in PowerEngine
  * OS/MVII/Kernel/ARM/MediaTek/J36Ultra/Drivers/mt6592_keys.c:
- *   - direct active-low buttons are read from GPIO DIN only;
+ *   - direct active-low buttons are read from GPIO DIN, with a pull-up armed so
+ *     "active low" has a defined idle to be low against;
  *   - matrix buttons are read from the five KPD_MEM scan words;
- *   - joystick axes are read from AUXADC channels after a fresh stop/start;
- *   - no pinmux writes are performed, preserving the preloader/LK setup.
+ *   - joystick axes are read from AUXADC channels after a fresh stop/start.
+ *
+ * IT DOES WRITE PINMUX, and it has to. This driver used to say "no pinmux writes
+ * are performed, preserving the preloader/LK setup", and that was a description
+ * of a broken keypad: the boot chain leaves three of the block's eight pads
+ * parked as plain GPIO -- KPROW3 (11), KPCOL3 (12) and KPCOL4 (2) -- so the block
+ * scans two rows against three columns and only matrix bits {0,1,2,9,10,11} ever
+ * change. VOL-, VOL+, SELECT, START, MENU, R2 and A read as never pressed, with a
+ * perfectly correct keymap sitting above them. The pads and their per-pad modes
+ * come from the keypad node (j36,kpd-strobe-pads / -sense-pads), and the rule is
+ * as narrow as MVII's: touch a pad only if its mode is wrong, and log the before
+ * and after of every write. A pad already in its wanted mode is left exactly as
+ * found, floating sense line or not.
+ *
+ * AND ONE PAD CANNOT BE READ AT ALL WITHOUT DRIVING IT. GPIO 93 is D-pad UP's
+ * EINT (it is KPROW2's pad, which is why matrix row 2 is dead on this board) and
+ * it reads 0 with the internal pull-up armed and verified in the register
+ * readback, held or released -- something loads it harder than that resistor can
+ * fight. A pad that already reads 0 has nowhere to move when its switch closes,
+ * so it gets driven high for about a microsecond per poll and sampled while
+ * driven. Which pads need that is MEASURED at probe, not hardcoded: every mapped
+ * button pad is armed, given time to settle, and read. That keeps a board
+ * revision which populates the missing pull-up off this path entirely.
  */
 
 #include <linux/bitops.h>
@@ -25,14 +47,61 @@
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 
+#define J36_GPIO_DIR_BASE             0x0000
+#define J36_GPIO_PULLEN_BASE          0x0100
+#define J36_GPIO_PULLSEL_BASE         0x0200
+#define J36_GPIO_DOUT_BASE            0x0400
 #define J36_GPIO_DIN_BASE             0x0500
 #define J36_GPIO_BANK_STRIDE          0x0010
 #define J36_GPIO_PINS_PER_BANK        16
+/* Every 16-pin GPIO register has a write-1-to-set at +4 and a write-1-to-reset at
+ * +8, so one pad is changed without reading the register and without disturbing
+ * its neighbours. MODE is the exception and is read-modify-written below. */
+#define J36_GPIO_BANK_SET             0x0004
+#define J36_GPIO_BANK_RST             0x0008
+#define J36_GPIO_MODE_BASE            0x0600
+#define J36_GPIO_MODE_STRIDE          0x0010
+#define J36_GPIO_MODE_BITS            3
+#define J36_GPIO_MODE_PER_REG         5
+#define J36_GPIO_MODE_MASK            0x7
+/* The highest pad the hardware decodes: both the preloader's mt_set_gpio_mode and
+ * stock LK's reject anything above this before touching a register. */
+#define J36_GPIO_MAX                  168
+/* Roughly a microsecond. Long enough for a pad to settle against its own few tens
+ * of picofarads, short enough that driving a held button's pad to ground for the
+ * duration is a duty cycle under a thousandth of the 5 ms poll. */
+#define J36_GPIO_SETTLE_US            1
+#define J36_PULLUP_SETTLE_US          64
+#define J36_PAD_MAX                   16
 
 #define J36_KPD_MEM1                  0x0004
 #define J36_KPD_DEBOUNCE              0x0018
+#define J36_KPD_SEL                   0x0020
 #define J36_KPD_EN                    0x0024
 #define J36_KPD_DEBOUNCE_DEFAULT      0x0400
+#define J36_KPD_DEBOUNCE_MASK         0x3fff
+#define J36_KPD_SEL_DOUBLE_KEY        BIT(0)
+
+/*
+ * PWRAP, WACS2 channel only. The full bring-up from reset is not here and is not
+ * needed: the preloader and LK both leave the wrapper at INIT_DONE, and this
+ * driver checks that rather than assuming it. If the wrapper is not ready the
+ * failure is logged and the probe continues -- if the PMIC bus is broken, the
+ * buttons are the least of it, and bailing out would also skip the KP_EN write
+ * that at least leaves the block as the boot chain left it.
+ */
+#define J36_PWRAP_WACS2_CMD           0x009c
+#define J36_PWRAP_WACS2_RDATA         0x00a0
+#define J36_PWRAP_WACS2_VLDCLR        0x00a4
+#define J36_PWRAP_FSM_IDLE            0x0
+#define J36_PWRAP_FSM_WFVLDCLR        0x6
+#define J36_PWRAP_POLL_LIMIT          10000
+
+/* MT6323 register 0x40, bit 0: the keypad's 32 kHz clock gate. Read-modify-write
+ * rather than an assignment, because 0x40 gates more than the keypad and the
+ * vendor only ever clears this one bit. */
+#define J36_PMIC_KPD_CLK_GATE_REG     0x0040
+#define J36_PMIC_KPD_CLK_GATE_BIT     BIT(0)
 
 #define J36_AUXADC_CON1_SET           0x0008
 #define J36_AUXADC_CON1_CLR           0x000c
@@ -55,6 +124,9 @@ struct j36_key_map {
 	u32 source;
 	u32 code;
 	bool state;
+	/* Set by the probe below for a pad that will not idle high on its own
+	 * pull-up, and therefore has to be driven high to be read at all. */
+	bool driven;
 };
 
 struct j36_axis_map {
@@ -71,6 +143,7 @@ struct j36_input {
 	void __iomem *keypad;
 	void __iomem *auxadc;
 	void __iomem *pericfg;
+	void __iomem *pwrap;
 	struct input_dev *input;
 	struct delayed_work poll_work;
 	unsigned int poll_ms;
@@ -81,6 +154,14 @@ struct j36_input {
 	unsigned int matrix_count;
 	struct j36_axis_map *axes;
 	unsigned int axis_count;
+
+	/* Pads the keypad block owns. Nothing else in this driver may drive, pull
+	 * or read them as GPIO; the one exception is the mux pass at probe, which
+	 * runs before the scanner is enabled and only on a pad whose mode is
+	 * wrong. The last time a loop here ran over a list that happened to
+	 * include a column pad, that column stopped scanning. */
+	u32 owned_pads[J36_PAD_MAX];
+	unsigned int owned_pad_count;
 
 	u32 raw_min;
 	u32 raw_max;
@@ -190,14 +271,341 @@ static int j36_read_axes(struct j36_input *j36)
 	return 0;
 }
 
-static bool j36_gpio_pressed(struct j36_input *j36, u32 gpio)
+static u32 j36_gpio_read_bit(struct j36_input *j36, u32 base, u32 gpio)
 {
 	u32 bank = gpio / J36_GPIO_PINS_PER_BANK;
-	u32 bit = gpio % J36_GPIO_PINS_PER_BANK;
-	u32 value = readl(j36->gpio + J36_GPIO_DIN_BASE +
-			  bank * J36_GPIO_BANK_STRIDE);
+	u32 value = readl(j36->gpio + base + bank * J36_GPIO_BANK_STRIDE);
 
-	return !(value & BIT(bit));
+	return (value >> (gpio % J36_GPIO_PINS_PER_BANK)) & 1;
+}
+
+static void j36_gpio_write_bit(struct j36_input *j36, u32 base, u32 gpio, bool on)
+{
+	u32 bank = gpio / J36_GPIO_PINS_PER_BANK;
+
+	writel(BIT(gpio % J36_GPIO_PINS_PER_BANK),
+	       j36->gpio + base + bank * J36_GPIO_BANK_STRIDE +
+	       (on ? J36_GPIO_BANK_SET : J36_GPIO_BANK_RST));
+}
+
+static u32 j36_gpio_get_mode(struct j36_input *j36, u32 gpio)
+{
+	u32 reg = J36_GPIO_MODE_BASE +
+		  (gpio / J36_GPIO_MODE_PER_REG) * J36_GPIO_MODE_STRIDE;
+	u32 shift = (gpio % J36_GPIO_MODE_PER_REG) * J36_GPIO_MODE_BITS;
+
+	return (readl(j36->gpio + reg) >> shift) & J36_GPIO_MODE_MASK;
+}
+
+/* Five pads per 16-pin-spaced register and no atomic set/reset pair, so this one
+ * register family has to be read back. */
+static void j36_gpio_set_mode(struct j36_input *j36, u32 gpio, u32 mode)
+{
+	u32 reg = J36_GPIO_MODE_BASE +
+		  (gpio / J36_GPIO_MODE_PER_REG) * J36_GPIO_MODE_STRIDE;
+	u32 shift = (gpio % J36_GPIO_MODE_PER_REG) * J36_GPIO_MODE_BITS;
+	u32 value = readl(j36->gpio + reg);
+
+	value &= ~(J36_GPIO_MODE_MASK << shift);
+	value |= (mode & J36_GPIO_MODE_MASK) << shift;
+	writel(value, j36->gpio + reg);
+}
+
+/*
+ * Input, pull-up, in that order -- PULLSEL before PULLEN so the resistor is never
+ * briefly enabled in the wrong direction.
+ *
+ * A PARKED PULL-DOWN IS OVERRIDDEN, NOT PRESERVED. Every button pad on this
+ * connector idles low on a parked pull-down and only the three keypad sense lines
+ * idle high; a pad that idles low cannot report a closure because it already reads
+ * 0 and has nowhere to move. So the pull-up is not hardening, it is the thing that
+ * makes a press observable. MODE is deliberately not touched here: the four D-pad
+ * pads are mode-0 EINTs already and reprogramming a button pad's mode is what
+ * wedged the earlier bring-up.
+ */
+static void j36_gpio_arm_pullup(struct j36_input *j36, u32 gpio)
+{
+	j36_gpio_write_bit(j36, J36_GPIO_DIR_BASE, gpio, false);
+	j36_gpio_write_bit(j36, J36_GPIO_PULLSEL_BASE, gpio, true);
+	j36_gpio_write_bit(j36, J36_GPIO_PULLEN_BASE, gpio, true);
+}
+
+/*
+ * Supply the high with the output driver, for a microsecond at a time: drive the
+ * pad high, let it settle, sample DIN while it is still driven, put it straight
+ * back to an input. Released, the driver wins and DIN reads 1; held, the closed
+ * switch wins and DIN reads 0 -- which is the point, the driver is deliberately
+ * not strong enough to beat a dead short, so the switch still decides.
+ *
+ * Yes, this shorts the driver to ground while the button is held, and that is the
+ * honest cost. It is bounded: output for one settle plus one read, once per poll.
+ * The alternative was leaving D-pad UP permanently dead.
+ *
+ * PULLEN off first, so the pull-down this pad is parked on is not still fighting
+ * while the driver ramps. DOUT before DIR, always -- setting the direction first
+ * would drive whatever DOUT happened to hold, which on a button pad means a
+ * deliberate short to ground for as long as it takes to notice.
+ */
+static u32 j36_gpio_read_driven(struct j36_input *j36, u32 gpio)
+{
+	u32 value;
+
+	j36_gpio_write_bit(j36, J36_GPIO_PULLEN_BASE, gpio, false);
+	j36_gpio_write_bit(j36, J36_GPIO_DOUT_BASE, gpio, true);
+	j36_gpio_write_bit(j36, J36_GPIO_DIR_BASE, gpio, true);
+	udelay(J36_GPIO_SETTLE_US);
+	value = j36_gpio_read_bit(j36, J36_GPIO_DIN_BASE, gpio);
+	/* Input again before anything else: the pad must stop driving the instant
+	 * the sample is taken. Everything after this is housekeeping. */
+	j36_gpio_write_bit(j36, J36_GPIO_DIR_BASE, gpio, false);
+	j36_gpio_write_bit(j36, J36_GPIO_PULLSEL_BASE, gpio, true);
+	j36_gpio_write_bit(j36, J36_GPIO_PULLEN_BASE, gpio, true);
+	return value;
+}
+
+static bool j36_pad_is_owned(struct j36_input *j36, u32 gpio)
+{
+	unsigned int i;
+
+	for (i = 0; i < j36->owned_pad_count; ++i) {
+		if (j36->owned_pads[i] == gpio)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Apply one pad list from the keypad node. Cells are <pad mux-mode> pairs.
+ *
+ * The rule is narrow on purpose: touch a pad only if its mode is wrong. The five
+ * pads the preloader already muxes work, and a "corrective" pull on a sense line
+ * that reads fine without one would be a change with no evidence behind it. Mode
+ * is written before direction, so a row pad is never a GPIO output for the width
+ * of two stores -- muxed the wrong way round it would drive its whole row low and
+ * every key on it would read pressed for as long as that lasted.
+ *
+ * Strobes get no pull (the block restores them after each pulse); senses get a
+ * pull-up; reserved pads are buttons and want mode 0, an input, pulled up.
+ */
+static int j36_apply_pads(struct j36_input *j36, struct device_node *node,
+			  const char *property, bool output, bool pullup,
+			  bool remember)
+{
+	struct device *dev = j36->dev;
+	int count = of_property_count_u32_elems(node, property);
+	unsigned int pairs;
+	unsigned int i;
+
+	if (count == -EINVAL) {
+		dev_warn(dev, "%s is missing; leaving those pads as the boot chain left them\n",
+			 property);
+		return 0;
+	}
+	if (count < 0)
+		return count;
+	if (count == 0 || count % 2)
+		return -EINVAL;
+	pairs = (unsigned int)count / 2;
+
+	for (i = 0; i < pairs; ++i) {
+		u32 pad, want, mode;
+
+		if (of_property_read_u32_index(node, property, i * 2, &pad) ||
+		    of_property_read_u32_index(node, property, i * 2 + 1, &want))
+			return -EINVAL;
+		if (pad > J36_GPIO_MAX || want > J36_GPIO_MODE_MASK) {
+			dev_err(dev, "%s[%u]: pad %u mode %u is out of range\n",
+				property, i, pad, want);
+			return -EINVAL;
+		}
+		if (remember) {
+			if (j36->owned_pad_count >= J36_PAD_MAX)
+				return -ENOSPC;
+			j36->owned_pads[j36->owned_pad_count++] = pad;
+		}
+
+		mode = j36_gpio_get_mode(j36, pad);
+		if (mode == want) {
+			dev_dbg(dev, "%s pad %u already mode %u\n", property, pad, mode);
+			continue;
+		}
+		j36_gpio_set_mode(j36, pad, want);
+		j36_gpio_write_bit(j36, J36_GPIO_DIR_BASE, pad, output);
+		if (pullup) {
+			j36_gpio_write_bit(j36, J36_GPIO_PULLSEL_BASE, pad, true);
+			j36_gpio_write_bit(j36, J36_GPIO_PULLEN_BASE, pad, true);
+		} else {
+			j36_gpio_write_bit(j36, J36_GPIO_PULLEN_BASE, pad, false);
+		}
+		dev_info(dev, "%s pad %u: mode %u -> %u, now mode %u din %u\n",
+			 property, pad, mode, want,
+			 j36_gpio_get_mode(j36, pad),
+			 j36_gpio_read_bit(j36, J36_GPIO_DIN_BASE, pad));
+	}
+	return 0;
+}
+
+/*
+ * One WACS2 transaction. The leftover-state recovery at the top is not optional
+ * and the stock kernel's pwrap_wacs2_hal does exactly the same thing: a read whose
+ * caller timed out before collecting RDATA -- or a hand-off from the preloader
+ * mid-transaction -- leaves the FSM parked in WFVLDCLR, and without writing VLDCLR
+ * the engine never returns to IDLE, so every later PMIC transaction times out.
+ * Clearing a stale VLDCLR here makes that wedge self-heal.
+ */
+static int j36_pwrap_xfer(struct j36_input *j36, bool write, u32 adr, u32 wdata,
+			  u32 *rdata)
+{
+	unsigned int i;
+	u32 value;
+
+	if (adr & ~0xffffu || wdata & ~0xffffu)
+		return -EINVAL;
+	if (!write && !rdata)
+		return -EINVAL;
+
+	value = readl(j36->pwrap + J36_PWRAP_WACS2_RDATA);
+	if (((value >> 16) & 0x7) == J36_PWRAP_FSM_WFVLDCLR)
+		writel(1, j36->pwrap + J36_PWRAP_WACS2_VLDCLR);
+
+	for (i = 0; i < J36_PWRAP_POLL_LIMIT; ++i) {
+		value = readl(j36->pwrap + J36_PWRAP_WACS2_RDATA);
+		if (((value >> 16) & 0x7) == J36_PWRAP_FSM_IDLE)
+			break;
+		cpu_relax();
+	}
+	if (i == J36_PWRAP_POLL_LIMIT)
+		return -ETIMEDOUT;
+
+	writel(((u32)write << 31) | ((adr >> 1) << 16) | wdata,
+	       j36->pwrap + J36_PWRAP_WACS2_CMD);
+	if (write)
+		return 0;
+
+	for (i = 0; i < J36_PWRAP_POLL_LIMIT; ++i) {
+		value = readl(j36->pwrap + J36_PWRAP_WACS2_RDATA);
+		if (((value >> 16) & 0x7) == J36_PWRAP_FSM_WFVLDCLR) {
+			*rdata = value & 0xffff;
+			writel(1, j36->pwrap + J36_PWRAP_WACS2_VLDCLR);
+			return 0;
+		}
+		cpu_relax();
+	}
+	return -ETIMEDOUT;
+}
+
+static int j36_pwrap_read(struct j36_input *j36, u32 adr, u32 *rdata)
+{
+	return j36_pwrap_xfer(j36, false, adr, 0, rdata);
+}
+
+static int j36_pwrap_write(struct j36_input *j36, u32 adr, u32 wdata)
+{
+	return j36_pwrap_xfer(j36, true, adr, wdata, NULL);
+}
+
+/* INIT_DONE0 is bit 21 of WACS2_RDATA, and it only refreshes after a transaction,
+ * so a cold read of it right after hand-off can be stale. */
+static bool j36_pwrap_ready(struct j36_input *j36)
+{
+	return !!(readl(j36->pwrap + J36_PWRAP_WACS2_RDATA) & BIT(21));
+}
+
+/*
+ * Ungate the keypad's 32 kHz clock in the PMIC. Best effort: a PWRAP failure is
+ * logged and otherwise ignored, for the reason given beside the register defines.
+ */
+static void j36_kpd_clock_ungate(struct j36_input *j36)
+{
+	struct device *dev = j36->dev;
+	u32 value = 0;
+	int ret;
+
+	if (!j36_pwrap_ready(j36)) {
+		dev_warn(dev, "PWRAP is not at INIT_DONE; leaving the KPD clock gate alone\n");
+		return;
+	}
+	ret = j36_pwrap_read(j36, J36_PMIC_KPD_CLK_GATE_REG, &value);
+	if (ret) {
+		dev_warn(dev, "KPD clock ungate: PMIC read failed (%d)\n", ret);
+		return;
+	}
+	if (!(value & J36_PMIC_KPD_CLK_GATE_BIT)) {
+		dev_info(dev, "KPD clock already ungated (PMIC 0x40 = 0x%04x)\n", value);
+		return;
+	}
+	ret = j36_pwrap_write(j36, J36_PMIC_KPD_CLK_GATE_REG,
+			      value & ~J36_PMIC_KPD_CLK_GATE_BIT);
+	if (ret) {
+		dev_warn(dev, "KPD clock ungate: PMIC write failed (%d)\n", ret);
+		return;
+	}
+	if (j36_pwrap_read(j36, J36_PMIC_KPD_CLK_GATE_REG, &value))
+		return;
+	dev_info(dev, "KPD clock ungated (PMIC 0x40 now 0x%04x)\n", value);
+}
+
+static int j36_setup_pads(struct j36_input *j36)
+{
+	struct device_node *node;
+	int ret;
+
+	node = of_parse_phandle(j36->dev->of_node, "j36,keypad-controller", 0);
+	if (!node)
+		return -EINVAL;
+
+	/* Rows first, then columns, then the pad this board took back off the
+	 * block: the vendor order is pads, then clock, then KPD_EN. */
+	ret = j36_apply_pads(j36, node, "j36,kpd-strobe-pads", true, false, true);
+	if (!ret)
+		ret = j36_apply_pads(j36, node, "j36,kpd-sense-pads", false, true, true);
+	if (!ret)
+		ret = j36_apply_pads(j36, node, "j36,kpd-reserved-pads", false, true, false);
+	of_node_put(node);
+	return ret;
+}
+
+/*
+ * Ask each button pad whether its pull-up actually took, because on pad 93 it does
+ * not. The pull needs a moment against the pad's own capacitance before the answer
+ * means anything, so the settle below is generous by orders of magnitude rather
+ * than cut fine. A false positive -- a pad marked because the user was holding
+ * that button at probe -- is harmless: the driven read is correct for a healthy pad
+ * too, it just costs the microsecond.
+ */
+static void j36_probe_idle_pads(struct j36_input *j36)
+{
+	unsigned int i;
+	unsigned int driven = 0;
+
+	for (i = 0; i < j36->direct_count; ++i) {
+		if (j36_pad_is_owned(j36, j36->direct[i].source))
+			continue;
+		j36_gpio_arm_pullup(j36, j36->direct[i].source);
+	}
+	udelay(J36_PULLUP_SETTLE_US);
+	for (i = 0; i < j36->direct_count; ++i) {
+		u32 pad = j36->direct[i].source;
+
+		if (j36_pad_is_owned(j36, pad))
+			continue;
+		if (j36_gpio_read_bit(j36, J36_GPIO_DIN_BASE, pad))
+			continue;
+		j36->direct[i].driven = true;
+		++driven;
+		dev_info(j36->dev,
+			 "pad %u will not idle high on its pull-up; switching it to a driven read\n",
+			 pad);
+	}
+	dev_info(j36->dev, "pads needing a driven read: %u\n", driven);
+}
+
+static bool j36_gpio_pressed(struct j36_input *j36, const struct j36_key_map *key)
+{
+	u32 value = key->driven ? j36_gpio_read_driven(j36, key->source)
+				: j36_gpio_read_bit(j36, J36_GPIO_DIN_BASE, key->source);
+
+	return !value;
 }
 
 static bool j36_matrix_pressed(struct j36_input *j36, u32 matrix_bit)
@@ -290,7 +698,7 @@ static void j36_poll(struct work_struct *work)
 	bool changed = false;
 
 	for (i = 0; i < j36->direct_count; ++i) {
-		bool state = j36_gpio_pressed(j36, j36->direct[i].source);
+		bool state = j36_gpio_pressed(j36, &j36->direct[i]);
 
 		if (state != j36->direct[i].state) {
 			j36->direct[i].state = state;
@@ -374,6 +782,9 @@ static int j36_input_probe(struct platform_device *pdev)
 	j36->pericfg = j36_iomap_phandle(dev, "j36,pericfg-controller");
 	if (IS_ERR(j36->pericfg))
 		return dev_err_probe(dev, PTR_ERR(j36->pericfg), "map PERICFG\n");
+	j36->pwrap = j36_iomap_phandle(dev, "j36,pwrap-controller");
+	if (IS_ERR(j36->pwrap))
+		return dev_err_probe(dev, PTR_ERR(j36->pwrap), "map PWRAP\n");
 
 	ret = j36_read_map(dev, "j36,direct-key-map", 2,
 			    &j36->direct, &j36->direct_count);
@@ -412,13 +823,26 @@ static int j36_input_probe(struct platform_device *pdev)
 		return ret;
 
 	/*
-	 * Match the validated MVII initialization: enable the scan memory only if
-	 * needed, and ungate the AUXADC peripheral clock without touching DSI.
+	 * Match the validated MVII initialization order: pads, then clock, then
+	 * KPD_EN, and ungate the AUXADC peripheral clock without touching DSI. The
+	 * pad pass has to come before the scanner is enabled -- that is the one
+	 * window in which writing a pad the block owns is legitimate.
 	 */
-	writew(J36_KPD_DEBOUNCE_DEFAULT, j36->keypad + J36_KPD_DEBOUNCE);
+	ret = j36_setup_pads(j36);
+	if (ret)
+		return dev_err_probe(dev, ret, "apply keypad pads\n");
+	j36_kpd_clock_ungate(j36);
+	writew(J36_KPD_DEBOUNCE_DEFAULT & J36_KPD_DEBOUNCE_MASK,
+	       j36->keypad + J36_KPD_DEBOUNCE);
+	/* Double-key off exactly as the preloader does it: read KP_SEL, clear bit 0,
+	 * write it back. A clear rather than an assignment, because KP_SEL's upper
+	 * bits are column enables on parts that populate them. */
+	writew(readw(j36->keypad + J36_KPD_SEL) & ~J36_KPD_SEL_DOUBLE_KEY,
+	       j36->keypad + J36_KPD_SEL);
 	writew(1, j36->keypad + J36_KPD_EN);
 	writel(J36_PERI_PDN0_AUXADC_BITS,
 	       j36->pericfg + J36_PERI_PDN0_CLR);
+	j36_probe_idle_pads(j36);
 
 	INIT_DELAYED_WORK(&j36->poll_work, j36_poll);
 	ret = devm_add_action_or_reset(dev, j36_cancel_poll, j36);
