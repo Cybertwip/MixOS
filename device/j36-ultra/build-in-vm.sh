@@ -1257,6 +1257,8 @@ at the ARMv7 payload instead.
   mvii/boot.conf            filenames and command line for the MVII LK
   j36/doom                  framebuffer Doom, static ARMv7, run before hand-over
   j36/freedoom1.wad         the game data it loads (Freedoom, freely licensed)
+  j36/mfgpower              powers the Mali-450 and reads its ID back; the gate
+  j36/modules/              lima and its dependencies, plus load.order
 
 The R36S kernel on the same card is arm64 and stays there for the R36S.  The
 armhf Debian rootfs is shared, and this kernel can now mount it: MSDC1, the
@@ -1324,6 +1326,11 @@ j36.doom=1
     hand-over.  Delete the word, or the j36 directory, and the boot is exactly
     what it was: /init says so on the panel and carries on.
 
+j36.lima=1
+    Power the Mali-450 and load the DRM lima driver, in that order and only in
+    that order -- see below.  Same removal story as j36.doom: delete the word, or
+    j36/mfgpower, or j36/modules, and the GPU is never touched.
+
 Doom, and what it is for
 ------------------------
 
@@ -1364,6 +1371,67 @@ hacx.wad.  /init takes the first of those it finds in j36/.
 There is no sound: doomgeneric is built with sound compiled out, which is honest
 about this kernel, since nothing drives the MT6592 audio path yet.
 
+The Mali-450, and why a helper runs before the driver
+-----------------------------------------------------
+
+This SoC has a Mali-450 MP4 and DRM lima drives that generation.  The register
+map in the device tree is not inferred from a datasheet: the stock kernel's own
+`struct resource' array names all eighteen blocks -- GP at 0x13040000 with IRQ
+234, its MMU at 0x13043000/235, four PPs at 0x13048000, 0x1304a000, 0x1304c000
+and 0x1304e000 with 236/238/240/242, their MMUs at 0x13044000..0x13047000 with
+237/239/241/243, both L2 caches, the broadcast and DLBU blocks -- and every offset
+from that base agrees with lima's own mali450 table, and with the MALI_BASE the
+MVII LK's bare-metal Utgard driver uses on this board.  Three sources, one map.
+
+What is NOT already done for us is power.  MT6592 gates the MFG domain through
+the SPM's MTCMOS, and nothing on this boot path un-gates it: the MVII LK can, but
+only its own kernel ever calls that code, not the hand-off to Linux.  A read into
+an unpowered MTK subsystem does not return garbage -- it stalls the bus, and the
+watchdog reboots the board with nothing in any log.  A lima built into the kernel
+would do that during probe, on every boot, before the console or Doom or anything
+else this card is for.
+
+So lima is a module and j36/mfgpower is the gate.  It powers the domain through
+the SPM the way the LK does -- PWR_ON, PWR_ON_S, wait for both status bits, drop
+the isolation cell and the clock disable, assert reset-not, bring the SRAM up and
+wait for its ack, then open the SMI-common and MFG clock gates -- and then reads
+the GP and PP version registers back.  It prints every value on the way, and it
+exits non-zero unless a Mali-450 answered.  Only on zero does /init insmod the
+modules named in j36/modules/load.order, in that order.  On failure it says so and
+the boot carries on untouched.
+
+If it works you get /dev/dri/renderD128 and no /dev/dri/card0.  That is not a
+fault: lima is a render-only driver.  It rasterises; it does not own a display.
+
+EmulationStation, and what is still missing
+-------------------------------------------
+
+ES on this card cannot start yet, and no combination of flags reaches it.  The
+chain, each link measured rather than assumed:
+
+  1. lima gives a render node and no KMS device, because a Mali-450 has no
+     display controller.  The panel is driven by simplefb, which is a framebuffer
+     and not a DRM device.
+  2. SDL2's video backends are KMSDRM, X11, Wayland, offscreen and dummy.  There
+     is no fbdev backend, so /dev/fb0 is of no use to it, and KMSDRM needs a card
+     node -- the one thing step 1 does not produce.
+  3. simpledrm could produce that node, and it is deliberately disabled: it binds
+     the same `simple-framebuffer' the working display is on and evicts simplefb
+     when it does.  Even enabled it would not help, because Mesa's renderonly
+     driver table has no simpledrm entry, so there would be no GBM and no EGL to
+     put on top of it.
+  4. The GL stack in the shared rootfs is the RK3326's Mali-G31 Bifrost blob, and
+     emulationstation.service forces it with SDL_VIDEO_EGL_DRIVER=libEGL.so.
+     Bifrost is a different architecture from this Utgard part; that library
+     cannot drive this GPU whatever else is true.
+
+What closes it is a real MT6592 display driver -- a DRM/KMS device for the
+DISP/OVL/DSI path, so there is a card0 for KMSDRM to open and something for
+Mesa's lima driver to present through.  That is the next piece of work, not a
+setting.  ES is left enabled and failing on purpose: its unit is Restart=on-failure
+under the default 5-starts-in-10-s limit, so it gives up on its own and the log
+says why.  Add systemd.mask=emulationstation.service to bootargs to silence it.
+
 Rebooting
 ---------
 
@@ -1384,6 +1452,14 @@ README
           sd-boot/zImage sd-boot/mvii/boot.conf)
     if [[ -f sd-boot/j36/doom ]]; then
         sums+=(sd-boot/j36/doom)
+    fi
+    if [[ -f sd-boot/j36/mfgpower ]]; then
+        sums+=(sd-boot/j36/mfgpower sd-boot/j36/modules/load.order)
+        # Named individually rather than by glob, so that a module that failed to
+        # copy is a missing line here instead of a silently shorter list.
+        while IFS= read -r ko; do
+            sums+=("sd-boot/j36/modules/$ko")
+        done < sd-boot/j36/modules/load.order
     fi
     sha256sum "${sums[@]}" > SHA256SUMS
     {
@@ -1417,6 +1493,16 @@ README
             echo "fbdoom_start=j36.doom=1 on the command line, /init runs it before switch_root"
         else
             echo "fbdoom=not staged"
+        fi
+        if [[ -f sd-boot/j36/mfgpower ]]; then
+            echo "gpu=mali-450 mp4 at 0x13040000 (gp irq 234..pp_bcast 244, GIC_SPI 202..212)"
+            echo "gpu_driver=lima, CONFIG_DRM_LIMA=m ($(tr '\n' ' ' < sd-boot/j36/modules/load.order))"
+            echo "gpu_power=j36/mfgpower ($(stat -c %s sd-boot/j36/mfgpower) bytes, static ARMv7, SPM MTCMOS via /dev/mem)"
+            echo "gpu_start=j36.lima=1 on the command line; /init loads the modules only if mfgpower exits 0"
+            echo "gpu_nodes=renderD128 only; lima is render-only and there is no card0"
+            echo "emulationstation=blocked on a KMS driver, not on configuration (see sd-boot/README.txt)"
+        else
+            echo "gpu=not staged"
         fi
     } > manifest.txt
 )
