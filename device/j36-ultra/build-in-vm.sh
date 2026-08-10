@@ -538,6 +538,45 @@ bb_disable() {
     sed -i "s|^$sym=y\$|# $sym is not set|" "$cfg"
 }
 
+# ── EVERY EXTERNAL COMMAND /init RUNS, IN EXACTLY ONE LIST ───────────────────
+#
+# This used to be two lists -- a set of CONFIG_ symbols asserted during the
+# BusyBox build, and a set of names symlinked to busybox in the initramfs -- and
+# they drifted, which is invisible until the device says so. What it said was
+#
+#   /init: line 346: ln: not found
+#
+# and the consequence was not a missing symlink. /init's GL staging runs `cp' and
+# `ln'; neither was in either list, so the payload directory was created, the
+# systemd drop-in pointing LD_LIBRARY_PATH at it was written, and the directory
+# stayed empty. EmulationStation's one GL DT_NEEDED is the bare name `libEGL.so',
+# so the loader missed the empty path and resolved it in /usr/lib, where dArkOS
+# has pointed that name at the RK3326's libMali.so. That blob is Tag_CPU_arch v8
+# -- ARMv8-A -- and this SoC is a Cortex-A7. ES died on SIGILL, status 132,
+# before main(), six times, until systemd gave up on the restart counter.
+#
+# `grep' was missing too, and had been all along: /init asks /proc/consoles which
+# console the kernel chose, under a 2>/dev/null that hid the failure, so
+# panel_is_console stayed 0 and every say() line went to stdout AND /dev/tty1 --
+# the doubled output on the panel was this, not a driver.
+#
+# So: one list, asserted and symlinked from the same array. Adding a command to
+# /init without adding it here now fails the build instead of the boot.
+INIT_APPLETS=(sh mount umount mkdir mknod cat cp ln ls tr grep echo sleep dmesg
+              insmod hexdump setsid cttyhack switch_root sync poweroff reboot
+              uname)
+
+# Most applets are CONFIG_<applet in caps>; three are not, and guessing would
+# assert a symbol that does not exist, which greps false and dies on a correct
+# config. sh is provided by ash, and halt/poweroff/reboot are one applet.
+bb_applet_symbol() {
+    case "$1" in
+        sh)              printf 'CONFIG_ASH\n' ;;
+        poweroff|reboot) printf 'CONFIG_HALT\n' ;;
+        *)               printf 'CONFIG_%s\n' "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')" ;;
+    esac
+}
+
 if [[ ! -x "$BUSYBOX_SRC/busybox" || "${J36_REBUILD_BUSYBOX:-0}" == 1 ]]; then
     log "Building the static ARMv7 BusyBox once"
     make -C "$BUSYBOX_SRC" distclean
@@ -580,16 +619,19 @@ if [[ ! -x "$BUSYBOX_SRC/busybox" || "${J36_REBUILD_BUSYBOX:-0}" == 1 ]]; then
     ! grep -q '^CONFIG_TC=y$' "$BUSYBOX_SRC/.config" || \
         die "busybox CONFIG_TC is still on and it cannot build against Linux 6.3+ headers"
 
-    # And the applets /init actually invokes. defconfig has all of them today;
+    # And the applets /init actually invokes, derived from INIT_APPLETS so this
+    # cannot fall behind the symlink loop again. defconfig has all of them today;
     # asserting it turns a future defconfig change into a build failure here
     # instead of an init that dies on the device with `sh: not found'.
-    for sym in CONFIG_ASH CONFIG_SH_IS_ASH CONFIG_MOUNT CONFIG_MKDIR CONFIG_MKNOD \
-               CONFIG_CAT CONFIG_ECHO CONFIG_SLEEP CONFIG_DMESG CONFIG_INSMOD \
-               CONFIG_LS CONFIG_HEXDUMP CONFIG_SETSID CONFIG_CTTYHACK CONFIG_HALT \
-               CONFIG_UNAME CONFIG_SWITCH_ROOT CONFIG_UMOUNT CONFIG_SYNC; do
+    for applet in "${INIT_APPLETS[@]}"; do
+        sym="$(bb_applet_symbol "$applet")"
         grep -q "^$sym=y\$" "$BUSYBOX_SRC/.config" || \
-            die "busybox $sym is off; /init uses that applet"
+            die "busybox $sym is off; /init runs \`$applet'"
     done
+    # Not an applet, so not in the list: it decides which shell CONFIG_ASH
+    # installs as /bin/sh, and /init is #!/bin/sh.
+    grep -q '^CONFIG_SH_IS_ASH=y$' "$BUSYBOX_SRC/.config" || \
+        die "busybox CONFIG_SH_IS_ASH is off; /init is #!/bin/sh"
 
     make -C "$BUSYBOX_SRC" CROSS_COMPILE=arm-linux-gnueabihf- -j"$(nproc)"
 fi
@@ -605,9 +647,17 @@ rm -rf "$INITROOT"
 mkdir -p "$INITROOT"/{bin,dev,etc,lib/modules/$KERNEL_RELEASE/extra,proc,root,sbin,sys,tmp}
 cp "$BUSYBOX" "$INITROOT/bin/busybox"
 chmod 0755 "$INITROOT/bin/busybox"
-for applet in sh mount umount mkdir mknod cat echo sleep dmesg insmod ls hexdump \
-              setsid cttyhack switch_root sync poweroff reboot uname; do
+for applet in "${INIT_APPLETS[@]}"; do
     ln -sf busybox "$INITROOT/bin/$applet"
+done
+# The build asserts the CONFIG_ symbol for each of these, but only when it builds
+# BusyBox; a cached busybox skips that block entirely. This runs every time, and
+# it is the check that matters, because a name absent here is a command /init
+# cannot run no matter how BusyBox was configured.
+for applet in "${INIT_APPLETS[@]}"; do
+    "$BUSYBOX" "$applet" --help >/dev/null 2>&1 || \
+        grep -qx "$applet" <(compgen -W "$("$BUSYBOX" --list 2>/dev/null | tr '\n' ' ')" 2>/dev/null) || \
+        die "the initramfs BusyBox has no \`$applet' applet, which /init runs"
 done
 cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 
@@ -2182,7 +2232,8 @@ README
         if [[ -f sd-boot/j36/gl/links ]]; then
             echo "gl=debian armhf mesa 25.0.7 from the shared rootfs (lima_dri.so + mediatek_dri.so)"
             echo "gl_front_end=$(ls sd-boot/j36/gl/*.so* | xargs -n1 basename | tr '\n' ' ')"
-            echo "gl_reason=dArkOS points libEGL/libGLESv*/libgbm at the RK3326 Mali blob"
+            echo "gl_reason=dArkOS points libEGL.so, libgbm.so{,.1,.1.0.0} and libGLESv1_CM.so at the RK3326 Mali blob"
+            echo "gl_load_bearing=libgbm.so.1 -- libEGL_mesa.so.0 needs it, so mesa's own EGL cannot load without this payload"
             echo "gl_install=tmpfs on the rootfs /run plus a systemd drop-in; nothing is written to the card"
             echo "emulationstation=default; j36.es=1 supplies the GL front end"
         else
