@@ -1136,10 +1136,10 @@ setup_es_gl() {
         say "es: the GL payload is incomplete, missing:$missing"
         say "    ($staged of the libraries copied.)  The drop-in is deliberately"
         say "    NOT written: pointing LD_LIBRARY_PATH at a directory that cannot"
-        say "    satisfy libEGL.so sends ES to /usr/lib and the RK3326 Mali blob,"
-        say "    which is ARMv8-A on this Cortex-A7 -- SIGILL, status 132, before"
-        say "    main().  Leaving the environment alone fails in the same place"
-        say "    but without this initramfs having claimed to fix it."
+        say "    satisfy those names sends ES to /usr/lib and the RK3326 Mali blob,"
+        say "    which is ARMv8-A on this Cortex-A7.  Leaving the environment alone"
+        say "    fails in the same place but without this initramfs having claimed"
+        say "    to fix it."
         return 1
     fi
 
@@ -1147,35 +1147,58 @@ setup_es_gl() {
     cat > /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPIN'
 # Written by the J36 Ultra initramfs, into a tmpfs. Not on the card, not in the
 # rootfs: it exists only for as long as this boot does.
+[Service]
+Environment="LD_LIBRARY_PATH=/run/j36/gl"
+Environment="SDL_VIDEODRIVER=kmsdrm"
+Environment="SDL_VIDEO_EGL_DRIVER=libEGL.so.1"
+DROPIN
+
+    # The GL front end SDL is told to dlopen, and it follows the binary rather than
+    # the board -- these two paragraphs are the whole difference between them.
+    if [ "$es_gles20" = 1 ]; then
+        cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINES2'
+
+# The GLES 2.0 binary is the one mounted, and ES2 is the one API measured to build
+# a context on lima here: "OpenGL ES 2.0 Mesa 25.0.7-2+deb13u1".  ES1 cannot,
+# anywhere -- Debian's Mesa 25.0.7 is a -Dgles1=disabled build, so eglCreateContext
+# returns EGL_BAD_ALLOC for it on lima, on llvmpipe and on softpipe alike.
 #
-# The two GL_DRIVER names are libGL, not libGLESv1_CM, and the reason is that a
-# GLES1 CONTEXT cannot be created at all here: Debian's Mesa 25.0.7 is built
-# without GLES1, so eglCreateContext for ES1 returns EGL_BAD_ALLOC on lima, on
-# llvmpipe and on softpipe alike -- the package, not this SoC.  What does come up
-# is desktop GL as a COMPATIBILITY profile, and compat GL is a superset of the
-# fixed-function subset ES uses: all 29 gl* symbols in emulationstation's
-# undefined list are exported by glvnd's libGL.so.1 with the signatures GLES1
-# gives them, so the GLES10 renderer runs unmodified.  It is also the context SDL
-# asks for anyway -- setupWindow() never sets SDL_GL_CONTEXT_PROFILE_MASK and this
-# SDL2 has no RPI video driver, so SDL binds EGL_OPENGL_API.
+# No LD_PRELOAD.  Renderer_GLES20.cpp resolves all 43 entry points through
+# SDL_GL_GetProcAddress, which under this videodriver is eglGetProcAddress, so the
+# binary carries no GL library in its DT_NEEDED and there is nothing that has to be
+# forced into the global scope.  That is also what makes one binary correct on both
+# machines: nothing in it names libMali.so or libGLESv2.so.
+Environment="SDL_VIDEO_GL_DRIVER=libGLESv2.so.2"
+DROPINES2
+    else
+        cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINGL'
+
+# Fallback: the rootfs's own binary, which is fixed-function.  The GL_DRIVER name
+# is libGL and not libGLESv1_CM because a GLES1 CONTEXT cannot be created at all
+# here -- Debian's Mesa 25.0.7 is built without GLES1, so eglCreateContext for ES1
+# returns EGL_BAD_ALLOC on lima, on llvmpipe and on softpipe alike.  What does come
+# up is desktop GL as a COMPATIBILITY profile, and compat GL is a superset of the
+# fixed-function subset that binary uses: all 29 gl* symbols in its undefined list
+# are exported by glvnd's libGL.so.1 with the signatures GLES1 gives them.  It is
+# also the context SDL asks for anyway -- Renderer_GLES10.cpp's setupWindow() never
+# sets SDL_GL_CONTEXT_PROFILE_MASK and sets MAJOR_VERSION twice, so SDL sends no
+# context attribs and EGL falls back to its own default of OpenGL.
 #
-# What this does NOT do is fix a broken dispatch, because there was not one.
+# What the preload does NOT do is fix a broken dispatch, because there was not one.
 # Measured against the image's own libraries: with a compat context current, the
 # GLES1 stub and libGL both return "4.5 (Compatibility Profile) Mesa 25.0.7" from
 # glGetString and both accept glMatrixMode/glLoadMatrixf/glEnableClientState with
 # glGetError 0 -- glvnd gives libEGL and both GL front ends one shared
-# current-context table.  With no preload at all the calls reach the library ES was
-# linked against, which returns NULL, and that is the 134.  So the preload has to
-# be there and either name works; naming libGL is naming the API actually in use,
-# and it takes libGLESv1_CM.so.1 -- whose contexts this Mesa cannot create -- out
-# of the load-bearing set.
-[Service]
-Environment="LD_LIBRARY_PATH=/run/j36/gl"
+# current-context table.  It is there because that binary names only libEGL.so as a
+# dependency and glvnd's libEGL exports no gl* entry point at all.
+#
+# This path has never drawn a frame on this board: it is the 134.  It is kept
+# because it is what happens when j36/es is not on the card, and it should say so
+# rather than look like the intended configuration.
 Environment="LD_PRELOAD=libGL.so.1"
-Environment="SDL_VIDEODRIVER=kmsdrm"
-Environment="SDL_VIDEO_EGL_DRIVER=libEGL.so.1"
 Environment="SDL_VIDEO_GL_DRIVER=libGL.so.1"
-DROPIN
+DROPINGL
+    fi
 
     # j36.es=debug appends the diagnostics.  Kept out of the default drop-in
     # because it is noise on a board that works, and kept in the same file
