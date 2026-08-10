@@ -562,9 +562,15 @@ bb_disable() {
 #
 # So: one list, asserted and symlinked from the same array. Adding a command to
 # /init without adding it here now fails the build instead of the boot.
+# Every name /init calls has to be in here.  This busybox is built without
+# FEATURE_SH_STANDALONE, so ash does not look inside the binary for an applet it
+# cannot find on PATH -- the applet being compiled in is not enough, the symlink
+# is what makes it callable.  chmod was the one that was missing, and it failed
+# the only way a missing applet can: "/init: line NNN: chmod: not found", twice,
+# which is why the probe log stayed unwritable.
 INIT_APPLETS=(sh mount umount mkdir mknod cat cp ln ls tr grep echo sleep dmesg
               insmod hexdump setsid cttyhack switch_root sync poweroff reboot
-              uname)
+              uname chmod)
 
 # Most applets are CONFIG_<applet in caps>; three are not, and guessing would
 # assert a symbol that does not exist, which greps false and dies on a correct
