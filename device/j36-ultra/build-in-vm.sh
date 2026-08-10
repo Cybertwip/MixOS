@@ -2706,8 +2706,8 @@ is the only thing that drives its Mali-G31.  Replacing them would trade this
 board's GL for the other board's.
 
 So with j36.es=1 the initramfs, after it has mounted the rootfs and before it hands
-over, mounts a tmpfs on the rootfs's /run and puts two things in it: the
-libraries from j36/gl/, and a systemd drop-in at
+over, mounts a tmpfs on the rootfs's /run and puts three things in it: the
+libraries from j36/gl/, the binary from j36/es/, and a systemd drop-in at
 /run/systemd/system/emulationstation.service.d/j36-gl.conf that sets
 LD_LIBRARY_PATH=/run/j36/gl and the SDL variables.  systemd reads drop-ins from
 /run exactly as it reads them from /etc, and it reads them after the unit file, so
@@ -2715,37 +2715,80 @@ the drop-in's SDL_VIDEO_EGL_DRIVER replaces the unit's own rather than fighting 
 Mounting /run from the initrd is the documented half of the handover: PID 1 adopts
 a /run that is already a tmpfs instead of mounting another over the top.
 
+The binary goes in over /usr/bin/emulationstation/emulationstation as a BIND MOUNT,
+which is the same constraint solved the same way: the mount table is in memory, the
+file underneath is not touched, and switch_root moves the mount across with
+everything else under /newroot.
+
 Pull the card into an R36S and none of it exists.  Nothing was written to the
 filesystem, so there is nothing to undo.
 
-One variable is worth explaining because it looks like a workaround and is not.
-LD_PRELOAD names a GL library because EmulationStation's undefined GL symbols are
-glMatrixMode, glLoadMatrixf, glEnableClientState and 26 more like them -- fixed
-function -- while the only GL library it declares a dependency on is libEGL.so.
-That works against a vendor blob, where one object exports EGL and GLES1 and GLES2
-together.  glvnd's libEGL exports no gl* entry point at all, so a library that has
-them has to be in the global scope before the binary starts or it does not start.
+The renderer, and why the binary had to be rebuilt
+-------------------------------------------------
 
-Which library is the part that had to be measured.  libGLESv1_CM.so.1 is the
-obvious answer -- ES is built with USE_OPENGLES_10 and includes <GLES/gl.h> -- and
-it is the wrong one, because DEBIAN'S MESA IS BUILT WITHOUT GLES1.  An ES1 context
-comes back EGL_BAD_ALLOC from dri2_create_context, and not only on lima: the same
-request fails identically on llvmpipe and on softpipe, so it is the package and not
-this SoC.  Mesa maps a driver whose context creation returned NULL to
-__DRI_CTX_ERROR_NO_MEMORY and that to EGL_BAD_ALLOC, which is why a build-time
-absence arrives looking like an out-of-memory.
+GLES1 is the one API this stack cannot supply, and that is a property of the
+package rather than of this SoC: Debian's armhf Mesa 25.0.7 is a -Dgles1=disabled
+build, so eglCreateContext for an ES1 context returns 0x3003 EGL_BAD_ALLOC on lima,
+on llvmpipe AND on softpipe.  The rootfs's EmulationStation is compiled
+-DUSE_OPENGLES_10, so on this board it asks for the one thing that cannot be given,
+does not check the answer, and aborts -- the 134 below.
 
-So LD_PRELOAD names libGL.so.1, and the fixed-function renderer runs on a
-COMPATIBILITY-profile desktop context.  Two things make that a fit rather than a
-hope: all 29 of ES's undefined gl* symbols are exported by glvnd's libGL.so.1 with
-the signatures GLES1 gives them -- the subset ES uses is client arrays, the matrix
-stack, glTexImage2D with GL_ALPHA, GL_CLAMP_TO_EDGE and the stencil calls, common
-to GLES1 and to GL compat -- and a compat context does come up, reporting "4.5
-(Compatibility Profile) Mesa 25.0.7" on llvmpipe.
+The error code says there is nothing to configure around it.  Mesa's
+validate_context_version rejects an API the screen does not advertise with
+__DRI_CTX_ERROR_BAD_API, which surfaces as EGL_BAD_MATCH; BAD_ALLOC is
+__DRI_CTX_ERROR_NO_MEMORY, a driver whose own context creation returned NULL.  ES1
+is BAD_ALLOC everywhere here, so the version gate passed and
+MESA_GL_VERSION_OVERRIDE has nothing to override.
 
-Be precise about what that changes, because it is easy to overclaim.  The dispatch
-was never broken.  Run against the image's own libraries, in a binary linked the
-way ES is -- gl* undefined, no libGL in DT_NEEDED -- with a compat context current:
+What lima does give is ES2: "OpenGL ES 2.0 Mesa 25.0.7-2+deb13u1", context created
+and made current on an ARGB8888 window surface.  So es/Renderer_GLES20.cpp is a
+third renderer -- the 351v tree has only Renderer_GLES10.cpp and Renderer_GL21.cpp,
+both fixed-function -- and the build compiles the same upstream commit the rootfs's
+copy came from with -DUSE_OPENGLES_20 instead.  The renderer's own header comment
+carries the details; three of its decisions matter from outside:
+
+  - It links no GL library and resolves all 43 entry points through
+    SDL_GL_GetProcAddress.  Every unversioned GL name on this rootfs -- libEGL.so,
+    libGLESv2.so, libGLESv2.so.2, libGLESv1_CM.so* -- is a symlink to an
+    SONAME-less ARMv8-A libMali.so, so any -l against them records a DT_NEEDED that
+    is SIGILL on a Cortex-A7.  With none of them named, one binary is correct on
+    both machines and no LD_PRELOAD is needed at all.
+  - It asks for ES2 explicitly.  Both upstream renderers set
+    SDL_GL_CONTEXT_MAJOR_VERSION twice instead of MAJOR then MINOR (GLES10: 1 then
+    0; GL21: 2 then 1), and with major_version 0 SDL sends no context attributes,
+    so EGL falls back to its own default of desktop OpenGL.  That typo is why the
+    fixed-function binary was getting a compat context by accident.
+  - Three one-line fragment programs instead of one with a mode uniform, because
+    Utgard fragment hardware has no branching; and the ALPHA-texture program
+    follows the spec's MODULATE row (Cv = Cf, Av = Af * At) rather than multiplying
+    the texel in, which a naive shader does and which renders every glyph black.
+
+The fallback, and why LD_PRELOAD is still in the file
+----------------------------------------------------
+
+Delete j36/es/ from the card and the rootfs's own binary runs.  /init notices,
+says which one it mounted, and writes a different drop-in: LD_PRELOAD=libGL.so.1
+and SDL_VIDEO_GL_DRIVER=libGL.so.1.  That path has never drawn a frame on this
+board -- it is the 134 -- but it is what the card does without the directory, so it
+is configured deliberately rather than left to chance.
+
+Its reasoning, since the file still carries it.  That binary's undefined GL symbols
+are glMatrixMode, glLoadMatrixf, glEnableClientState and 26 more like them, while
+the only GL library it declares a dependency on is libEGL.so.  That works against a
+vendor blob, where one object exports EGL and GLES1 and GLES2 together; glvnd's
+libEGL exports no gl* entry point at all, so a library that has them must be in the
+global scope before the binary starts or it does not start.  libGLESv1_CM.so.1 is
+the obvious choice and the wrong one, for the reason above.  libGL.so.1 works
+because all 29 of those symbols are exported by it with the signatures GLES1 gives
+them -- client arrays, the matrix stack, glTexImage2D with GL_ALPHA,
+GL_CLAMP_TO_EDGE and the stencil calls are common to GLES1 and to GL compat -- and
+a compat context does come up, reporting "4.5 (Compatibility Profile) Mesa 25.0.7"
+on llvmpipe.
+
+Be precise about what the preload changes, because it is easy to overclaim: the
+dispatch was never broken.  Run against the image's own libraries, in a binary
+linked the way ES is -- gl* undefined, no libGL in DT_NEEDED -- with a compat
+context current:
 
   LD_PRELOAD=libGL.so.1          glGetString -> "4.5 (Compatibility Profile)"
   LD_PRELOAD=libGLESv1_CM.so.1   glGetString -> "4.5 (Compatibility Profile)"
@@ -2759,18 +2802,16 @@ eglMakeCurrent installed is what the stubs dispatch into, no matter which stub
 library the symbol came from.  Only one copy of libGLdispatch is ever loaded, and
 LD_LIBRARY_PATH puts the payload's ahead of the rootfs's.
 
-So the preload is necessary and its name is not the fault.  ES aborting means the
-CONTEXT was never created -- which is why the probe's GL row on the DRM nodes is
-the measurement that matters, and why the row set is worth reading in full:
+So the preload was necessary and its name was not the fault.  ES aborting means the
+CONTEXT was never created, and on the DRM nodes it never is -- which is what the
+rebuild above is for, and why the probe's GL row was the measurement that decided
+between the two:
 
-  GL=ctx    desktop compat works on lima; the payload above is the whole fix.
+  GL=ctx    desktop compat works on lima; the library payload alone would do.
   GL=0x3003 lima cannot create a compat context either.  Then no fixed-function
-            context of any kind exists on this stack, and no environment can make
-            one: the ES1 half is a Mesa built without it and the compat half is
-            the driver.  That is the case where the renderer has to change, and
-            the 351v tree carries only Renderer_GLES10.cpp and Renderer_GL21.cpp,
-            both fixed-function -- so it would mean a GLES2 renderer, source work,
-            not a rebuild of the one it already has.
+            context of any kind exists on this stack and no environment can make
+            one: the ES1 half is a Mesa built without it, the compat half is the
+            driver, and the renderer has to change.  It did.
 
 Note that the error code discriminates before the source does.  Mesa's
 validate_context_version rejects an API the screen does not advertise with
@@ -2792,9 +2833,14 @@ executes is one this SoC does not have.  EmulationStation itself is v7 and fine.
 So SIGILL is never an ES bug and never a Mesa bug -- it means the GL payload did
 not take, and the loader fell back to /usr/lib.  Check for "es: GL front end in
 /run/j36/gl" in the boot log, and `ls /run/j36/gl` on the device: if libEGL.so is
-not in there, nothing else in this section matters yet.
+not in there, nothing else in this section matters yet.  With j36/es/ on the card
+this one should be gone for good: that binary names no GL library at all, so there
+is nothing for the loader to resolve to the blob.
 
-The other signature is the one after that one is fixed:
+The other signature is the one after that one is fixed, and it is the fixed-function
+binary's -- if it appears while "es: the GLES 2.0 binary is mounted over the
+rootfs's" is in the boot log, then the bind mount and the abort disagree and the
+mount is what to doubt first:
 
   emulationstation.sh[878]: terminate called after throwing an instance of
                             'std::logic_error'
@@ -2879,15 +2925,18 @@ What it found, and it was the control row that found it:
 The third line clears the whole lower half of the stack in one measurement: gbm,
 the kmsro mediatek-to-lima pairing, the config, the ARGB8888 visual, lima's own
 context creation and the kernel uAPI all work.  The first line is a Mesa built
-without GLES1, which is why LD_PRELOAD names libGL.so.1 -- see the section above.
+without GLES1.  Between them they are the whole argument for the rebuild: the one
+API measured to work here is the one no renderer in the tree was written against.
 
-What is still open after those three lines is the GL row on the DRM nodes, and it
-is the one to read first, because ES asks for desktop GL and nothing else:
-setupWindow() sets SDL_GL_CONTEXT_MAJOR_VERSION twice (1, then 0), never sets
+The GL row on the DRM nodes is what the fixed-function binary's fate hung on,
+because it asks for desktop GL and nothing else -- setupWindow() sets
+SDL_GL_CONTEXT_MAJOR_VERSION twice (1, then 0), never sets
 SDL_GL_CONTEXT_PROFILE_MASK, and with no RPI video driver in this SDL2
 KMSDRM_GLES_DefaultProfileConfig is compiled out to an empty function.  With
 major_version 0 SDL sends no context attributes at all, so the probe's GL row and
-SDL's request are the same call, and its result is ES's fate.
+SDL's request were the same call.  The GLES 2.0 binary does not depend on it: it
+sets PROFILE_MASK_ES and MAJOR 2 / MINOR 0, so its row is the ES2 one, which is
+measured working.
 
 Add systemd.mask=emulationstation.service to bootargs to get the machine back to a
 console.
@@ -2939,6 +2988,9 @@ README
     # would make the AND-list fail and take the manifest with it.
     if [[ -f sd-boot/j36/eglprobe ]]; then
         sums+=(sd-boot/j36/eglprobe)
+    fi
+    if [[ -f sd-boot/j36/es/emulationstation ]]; then
+        sums+=(sd-boot/j36/es/emulationstation)
     fi
     sha256sum "${sums[@]}" > SHA256SUMS
     {
@@ -3002,6 +3054,17 @@ README
             echo "gl_install=tmpfs on the rootfs /run plus a systemd drop-in; nothing is written to the card"
             echo "emulationstation=default; j36.es=1 supplies the GL front end"
             echo "es_boot_word=$(grep -o 'j36\.es=[a-z0-9]*' sd-boot/mvii/boot.conf)"
+            if [[ -f sd-boot/j36/es/emulationstation ]]; then
+                echo "es_binary=j36/es/emulationstation ($(stat -c %s sd-boot/j36/es/emulationstation) bytes, stripped ARMv7)"
+                echo "es_commit=$ES_COMMIT (the rootfs's own EmulationStation commit)"
+                echo "es_renderer=USE_OPENGLES_20, es/Renderer_GLES20.cpp, no GL library in DT_NEEDED"
+                echo "es_renderer_reason=ES1 is 0x3003 EGL_BAD_ALLOC everywhere (mesa built -Dgles1=disabled); ES2 is ctx/cur on lima"
+                echo "es_install=bind mount over /usr/bin/emulationstation/emulationstation from a tmpfs; the rootfs file is untouched"
+                echo "es_gl_driver=SDL_VIDEO_GL_DRIVER=libGLESv2.so.2, no LD_PRELOAD"
+            else
+                echo "es_binary=not staged; the rootfs's fixed-function one runs and aborts with status 134"
+                echo "es_gl_driver=SDL_VIDEO_GL_DRIVER=libGL.so.1 with LD_PRELOAD=libGL.so.1 (the fallback)"
+            fi
             if [[ -f sd-boot/j36/eglprobe ]]; then
                 echo "es_probe=j36/eglprobe ($(stat -c %s sd-boot/j36/eglprobe) bytes, dynamic ARMv7, dlopens libEGL.so.1 and libgbm.so.1)"
                 echo "es_probe_run=j36.es=debug only, as ExecStartPre and again as ExecStopPost; card0 and renderD128 separately, then -s with LIBGL_ALWAYS_SOFTWARE=1 as the control"
