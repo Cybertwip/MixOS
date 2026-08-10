@@ -423,3 +423,124 @@ The `backlight` node is `status = "disabled"`. It is a `pwm-backlight` consuming
 consumer whose provider has no driver does not fail — it defers, and keeps
 deferring until `driver_deferred_probe_timeout` expires. That was the whole gap
 between 0.87 s and 11.38 s, plus an error on the panel.
+
+## fbdoom: proving a program can drive the panel and the pad
+
+Booting proves the machine runs. It does not prove a *program* can drive this
+display or read this gamepad, and the cheapest honest answer to that is
+doomgeneric writing 32-bit pixels into `/dev/fb0` and reading `/dev/input/event0`.
+
+Nothing already on the card could ask the question. SDL2's video backends are
+KMSDRM, X11, Wayland, offscreen and dummy — there is **no fbdev backend** — so the
+`gzdoom`, `lzdoom` and EmulationStation already in the shared rootfs all need
+DRM/KMS or a GL stack. doomgeneric needs neither, nor SDL, nor X11.
+
+The panel is `640x480`, stride 2560, `x8r8g8b8`, and doomgeneric's `rgba8888`
+packing is bit-identical to it, so the blit is one `memcpy` per line.
+`DOOMGENERIC_RESY=400` gives a clean 2× of Doom's 320x200 and is letterboxed with
+40 black lines top and bottom, because `i_video.c` computes a `y_offset` and then
+never applies it. `/init` puts `/dev/tty0` into `KD_GRAPHICS` while Doom holds the
+screen, including on the way out through a signal, so a crash cannot leave the
+panel frozen on the last frame and kernel messages cannot paint over a frame.
+
+The binary and the IWAD live on the FAT BOOT partition and not in the initramfs:
+the initramfs goes into `boot.img`, which is asserted against the fixed 9 MiB
+BOOTIMG slot, and 2 MiB of Doom plus 24 MiB of WAD would push that payload into
+RECOVERY. A vfat mount gives every file mode 0755, so the binary is executable
+straight off the card.
+
+The source list is *checked*, not written: it is derived from the pinned
+doomgeneric tree by exclusion and then diffed against upstream's own `SRC_DOOM`,
+so a file added upstream is a build failure here rather than a link error against
+a library this board has not got. The whole step runs with `errexit` suspended —
+a game must never cost the user the kernel artifacts.
+
+## The Mali-450, and why a userspace helper runs before the driver
+
+MT6592 carries a **Mali-450 MP4**, which DRM `lima` drives. The register map is
+not inferred from a datasheet; it is read out of the stock kernel's own
+`struct resource` array in `.data`, which names all eighteen blocks:
+
+| block | base | INTID | `GIC_SPI` |
+| --- | --- | --- | --- |
+| GP | `0x13040000` | 234 | 202 |
+| GP MMU | `0x13043000` | 235 | 203 |
+| PP0 / PP0 MMU | `0x13048000` / `0x13044000` | 236 / 237 | 204 / 205 |
+| PP1 / PP1 MMU | `0x1304a000` / `0x13045000` | 238 / 239 | 206 / 207 |
+| PP2 / PP2 MMU | `0x1304c000` / `0x13046000` | 240 / 241 | 208 / 209 |
+| PP3 / PP3 MMU | `0x1304e000` / `0x13047000` | 242 / 243 | 210 / 211 |
+| L2 #1 / L2 #0 | `0x13041000` / `0x13050000` | — | — |
+| DMA / Broadcast / DLBU | `0x13052000` / `0x13053000` / `0x13054000` | — | — |
+| PP MMU bcast / PP bcast | `0x13055000` / `0x13056000` | — / 244 | — / 212 |
+
+Every offset from `0x13040000` matches lima's own mali450 column in
+`lima_device.c` block for block, and `0x13040000` is also the `MALI_BASE` the MVII
+LK's bare-metal Utgard driver uses on this board. Three independent sources, one
+map. The `GIC_SPI` column is `INTID − 32`, the same conversion MSDC1's 72 came
+from, and the type cell is `IRQ_TYPE_LEVEL_LOW`.
+
+The clocks are `fixed-clock`s at **0** Hz, and that is deliberate.
+`lima_clk_init()` returns `devm_clk_get`'s error for a missing `"bus"` or
+`"core"`, so the properties are mandatory; it then only `clk_prepare_enable`s them
+— a no-op on a fixed-clock — and prints their rates. `lima_devfreq_init()` returns
+0 immediately when `operating-points-v2` is absent. MT6592 has no clock driver and
+nothing in this boot path programs a GPU rate, so a plausible-looking megahertz
+number would be an invention. Zero is what lima prints and never uses.
+
+### Why lima is `=m` and not built in
+
+The MFG power domain is **gated when Linux starts**. The MVII LK has a proven
+`mfg_power_on()` in `mt6592_gpu_offload.c`, but its only callers are in the MVII
+kernel, not in the LK's hand-off to Linux. Reading an unpowered MTK subsystem does
+not return garbage — it stalls the AXI bus, and the watchdog reboots the board with
+nothing in any log. A built-in lima would do that during probe on *every* boot,
+before the console, before the input driver, before Doom.
+
+So `CONFIG_DRM_LIMA=m`, and `tools/mfgpower.c` is the gate. It is a static ARMv7
+`/dev/mem` helper that transcribes the LK's sequence register for register — set
+`PWR_ON`, then `PWR_ON_S`, wait for both `SPM_PWR_STATUS` bits, clear
+`PWR_CLK_DIS | PWR_ISO` and assert `PWR_RST_B`, clear `SRAM_PDN`, wait for
+`MFG_SRAM_ACK` to fall, then open `DISP_CG_CLR0` bit 0 (SMI common) and
+`MFG_CG_CLR` bit 0 — and then reads back `MALI_GP_VERSION` and the four
+`MALI_PP_VERSION` registers, checking for products `0x0d07` and `0xcf07`. It
+prints every value and exits non-zero unless a Mali-450 answered. `/init` runs it,
+shows its log on the panel, and `insmod`s the modules in `j36/modules/load.order`
+only on exit 0. That order is derived at build time from `modinfo -F depends`,
+because the initramfs has `insmod` and not `modprobe` and resolves nothing itself.
+
+`/dev/mem` is the right tool and not a shortcut: `phys_mem_access_prot` in
+`drivers/char/mem.c` returns `pgprot_noncached` for an `O_SYNC` or non-RAM pfn, so
+the window is an ordinary uncached device mapping, and `STRICT_DEVMEM` blocks RAM,
+not MMIO. The MMU, reset and L2 half of the LK's driver is deliberately **not**
+transcribed: lima resets those blocks itself during probe and wants the MMUs on
+its own page tables, so anything done here would be work lima undoes.
+
+The kernel configuration keeps `DRM=y` (lima's two tristate helpers, `DRM_SCHED`
+and `DRM_GEM_SHMEM_HELPER`, follow lima to `=m`, so only the core has to be
+resident) and prunes **every other** `DRM_*` symbol by enumeration. That prune
+matters: `multi_v7_defconfig` turns on a dozen DRM drivers and one of them,
+`DRM_SIMPLEDRM`, binds the same `simple-framebuffer` node `FB_SIMPLE` is driving —
+and wins, by calling `drm_aperture_acquire_from_firmware()` and evicting the
+working display. It is refused outright after `olddefconfig`, at either value.
+
+### EmulationStation is blocked, not misconfigured
+
+If lima loads you get `/dev/dri/renderD128` and **no** `card0`. That is not a
+fault; lima is render-only, because a Mali-450 has no display controller. The
+consequence is that ES cannot start yet, and no flag reaches it:
+
+1. No KMS device from lima. The panel is on `simplefb`, which is a framebuffer,
+   not a DRM device.
+2. SDL2's only viable backend here is KMSDRM, which needs a card node.
+3. `simpledrm` could supply one, and is disabled for the reason above — and even
+   enabled it would not help, because Mesa's kmsro/renderonly driver table has no
+   `simpledrm` entry, so there would be no GBM and no EGL on top of it.
+4. The shared rootfs's GL is the RK3326's Mali-G31 **Bifrost** blob, forced by
+   `SDL_VIDEO_EGL_DRIVER=libEGL.so` in `emulationstation.service`. Bifrost is a
+   different architecture from this Utgard part.
+
+What closes it is a real MT6592 DRM/KMS driver for the DISP/OVL/DSI path — the
+same work the full JD9365 program in the DTB is being kept for. Until then ES is
+left enabled and failing, because its unit is bounded (`Restart=on-failure`, five
+starts in ten seconds) and its failure is evidence;
+`systemd.mask=emulationstation.service` in `bootargs` silences it.

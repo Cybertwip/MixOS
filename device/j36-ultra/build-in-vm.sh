@@ -676,6 +676,7 @@ mount_bootfs() {
     return 1
 }
 
+# ── Doom, if the card carries it and the command line asks ───────────────────
 #
 # Doom's own stdout goes to the serial port when there is one: /dev/console is
 # the panel, and the panel is in KD_GRAPHICS while Doom holds it, so anything
@@ -1080,16 +1081,20 @@ build_mfgpower() {
 }
 
 collect_lima_modules() {
-    local -A ko_path=() ko_deps=() emitted=()
+    local -A ko_path=() ko_deps=() emitted=() builtin=()
     local -a pending=(lima) deplist=()
     local name path deps dep ready progress header
 
+    # `builtin' is not bookkeeping for its own sake: without it a name that has no
+    # .ko is re-searched once per module that depends on it, and each search walks
+    # the whole kernel build tree.  drm is exactly that case, being DRM=y.
     while (( ${#pending[@]} )); do
         name="${pending[0]}"
         pending=("${pending[@]:1}")
-        if [[ -n "${ko_path[$name]:-}" ]]; then continue; fi
+        if [[ -n "${ko_path[$name]:-}" || -n "${builtin[$name]:-}" ]]; then continue; fi
         path="$(find "$KERNEL_OUT" -name "$name.ko" -print -quit 2>/dev/null)"
         if [[ -z "$path" ]]; then
+            builtin[$name]=1
             log "lima: $name.ko was not built; its symbols must be in vmlinux"
             continue
         fi
