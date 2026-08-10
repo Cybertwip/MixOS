@@ -18,6 +18,12 @@ KERNEL_OUT="$WORK/kernel-build"
 BUSYBOX_URL="${J36_BUSYBOX_URL:-https://git.busybox.net/busybox}"
 BUSYBOX_BRANCH="${J36_BUSYBOX_BRANCH:-1_36_stable}"
 BUSYBOX_SRC="$WORK/busybox"
+# fbdoom: the first thing that draws a moving picture on this panel.  Pinned to a
+# commit rather than a branch because the build recipe below derives its source
+# list from the layout of that tree -- see the fbdoom section for why.
+DOOM_URL="${J36_DOOM_URL:-https://github.com/ozkl/doomgeneric}"
+DOOM_COMMIT="${J36_DOOM_COMMIT:-dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284}"
+DOOM_SRC="$WORK/doomgeneric"
 MODULE_SRC="$WORK/module-src"
 DTB_OUT="$WORK/dtb"
 INITROOT="$WORK/initramfs-root"
@@ -654,6 +660,152 @@ python3 "$ROOT/device/j36-ultra/create_boot_image.py" \
 # Assert it, because the kernel config above just grew MMC, btrfs and ext4 and
 # nothing else in this build would notice the payload crossing into RECOVERY.
 fits_in "$ARTIFACTS/boot.img" $((0x00900000)) "the BOOTIMG payload"
+
+# ── fbdoom: the first moving picture on this panel ────────────────────────────
+#
+# Everything above proves the machine boots.  Nothing above proves the panel can
+# be driven by a program, which is the next question, and the cheapest honest
+# answer to it is Doom writing 32-bit pixels into /dev/fb0 and reading the pad
+# from /dev/input/event0.
+#
+# NOTHING ON THE ROOTFS COULD DO THIS.  The shared armhf rootfs already carries
+# gzdoom, lzdoom and EmulationStation.  SDL2 has no fbdev backend -- KMSDRM,
+# X11, Wayland, offscreen and dummy are the whole list -- so all three need
+# either DRM/KMS, which this kernel has no driver for yet, or a GL stack, and the
+# GL stack on that card is the RK3326's Mali-G31 Bifrost blob for a SoC whose GPU
+# is a Mali-450.  doomgeneric needs none of it: no SDL, no X11, no GL, no DRM.
+#
+# WHERE IT LIVES, AND WHY NOT IN THE INITRAMFS.  The initramfs goes into both
+# payloads, and boot.img is capped at the 9 MiB BOOTIMG slot asserted just above.
+# A static ARM Doom is around 2 MiB and the IWAD is 24 MiB more, so putting
+# either there would push the eMMC payload into RECOVERY.  Both go on the FAT
+# BOOT partition instead, under j36/, where there is no size limit worth
+# worrying about and no rule about what may be executed from a vfat mount: the
+# default mount gives every file mode 0755.  /init mounts that partition, runs
+# Doom, and carries on with the boot when it exits, so this costs the normal boot
+# path nothing but a mount and an exec.
+#
+# THE SOURCE LIST IS CHECKED, NOT WRITTEN.  doomgeneric's own Makefile is a
+# hand-maintained object list for its X11 front end.  Deriving ours from the tree
+# by exclusion -- every .c except the other front ends and the SDL/Allegro sound
+# and GUS/icon/MIDI files -- and then diffing it against that list means an
+# upstream file this recipe does not know about is a build failure here rather
+# than a link error against a library this board has not got.  That check is only
+# meaningful because DOOM_COMMIT is pinned; overriding it is what should trip it.
+#
+# NONE OF IT IS FATAL.  A game must never cost the user the kernel artifacts, so
+# the build runs with errexit suspended and a failure only means the payload is
+# not staged.  That matters most on the first build on a new machine, where this
+# is the one step whose compiler has never been exercised here.
+FBDOOM_SRC="$ROOT/device/j36-ultra/fbdoom/doomgeneric_j36.c"
+DOOM_BIN=""
+DOOM_WAD=""
+
+build_fbdoom() {
+    local dir stamp want expected actual
+    local -a srcs
+
+    [[ -f "$FBDOOM_SRC" ]] || { log "fbdoom: $FBDOOM_SRC is missing"; return 1; }
+
+    if [[ ! -d "$DOOM_SRC/.git" ]]; then
+        log "Cloning doomgeneric once for the framebuffer Doom payload"
+        # Not --depth=1: the pinned commit has to be in the clone.
+        git clone "$DOOM_URL" "$DOOM_SRC" || return 1
+    fi
+    git -C "$DOOM_SRC" checkout -q "$DOOM_COMMIT" 2>/dev/null || {
+        git -C "$DOOM_SRC" fetch -q origin || return 1
+        git -C "$DOOM_SRC" checkout -q "$DOOM_COMMIT" || return 1
+    }
+
+    dir="$DOOM_SRC/doomgeneric"
+    [[ -d "$dir" ]] || { log "fbdoom: $dir is not in that checkout"; return 1; }
+    cp "$FBDOOM_SRC" "$dir/" || return 1
+
+    mapfile -t srcs < <(cd "$dir" && ls ./*.c | sed 's|^\./||' |
+        grep -vE '^(doomgeneric_|i_sdl|i_allegro|gusconf\.c|icon\.c|mus2mid\.c)') || return 1
+    (( ${#srcs[@]} > 50 )) || { log "fbdoom: only ${#srcs[@]} sources found"; return 1; }
+
+    expected="$(sed -n 's/^SRC_DOOM = //p' "$dir/Makefile" | tr ' ' '\n' |
+        sed 's|\.o$|.c|' | grep -v '^doomgeneric_xlib\.c$' | sort)"
+    actual="$(printf '%s\n' "${srcs[@]}" | sort)"
+    if [[ "$expected" != "$actual" ]]; then
+        log "fbdoom: the derived source list no longer matches doomgeneric's own Makefile:"
+        diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+        return 1
+    fi
+
+    DOOM_BIN="$dir/doom-j36"
+    stamp="$dir/.j36-built"
+    want="$DOOM_COMMIT $(sha256sum "$FBDOOM_SRC" | awk '{print $1}')"
+    if [[ -x "$DOOM_BIN" && "$(cat "$stamp" 2>/dev/null)" == "$want" ]]; then
+        log "fbdoom: reusing $DOOM_BIN"
+    else
+        # 640x400 is a clean 2x of doom's 320x200 inside the 640x480 panel;
+        # doomgeneric_j36.c explains why 480 would leave garbage on screen.
+        # -std=gnu17 pins the dialect: this is 1997 C, and gcc 14 promoted
+        # implicit declarations and int/pointer mismatches to hard errors.
+        log "fbdoom: compiling ${#srcs[@]} sources in one pass for ARMv7"
+        ( cd "$dir" && arm-linux-gnueabihf-gcc \
+            -O2 -std=gnu17 -fcommon -static \
+            -DNORMALUNIX -DLINUX -DSNDSERV -D_DEFAULT_SOURCE \
+            -DDOOMGENERIC_RESX=640 -DDOOMGENERIC_RESY=400 \
+            -Wno-error=implicit-function-declaration \
+            -o doom-j36 "${srcs[@]}" doomgeneric_j36.c -lm ) || return 1
+        printf '%s\n' "$want" >"$stamp"
+    fi
+
+    # Static on purpose: this runs from the initramfs, before switch_root, so
+    # there is no ld.so and no /lib to link against.
+    verify_arm_elf "$DOOM_BIN" "the fbdoom binary" || return 1
+    readelf -d "$DOOM_BIN" 2>/dev/null | grep -q NEEDED &&
+        { log "fbdoom: $DOOM_BIN wants shared libraries and the initramfs has none"; return 1; }
+
+    log "fbdoom: $(stat -c %s "$DOOM_BIN") bytes, static ARM"
+    return 0
+}
+
+fetch_fbdoom_wad() {
+    local name
+    if [[ -n "${J36_DOOM_WAD:-}" ]]; then
+        [[ -f "$J36_DOOM_WAD" ]] || { log "fbdoom: J36_DOOM_WAD=$J36_DOOM_WAD is not a file"; return 1; }
+        name="$(basename "$J36_DOOM_WAD")"
+        # d_iwad.c identifies an IWAD by filename before it opens it, so a WAD
+        # under a name its iwads[] table does not carry is refused by the engine.
+        case "$name" in
+            doom.wad|doom1.wad|doom2.wad|plutonia.wad|tnt.wad|chex.wad|hacx.wad|\
+            freedm.wad|freedoom1.wad|freedoom2.wad) ;;
+            *) log "fbdoom: $name is not a name doomgeneric's iwads[] table knows; it will be refused" ;;
+        esac
+        DOOM_WAD="$J36_DOOM_WAD"
+        return 0
+    fi
+    python3 "$ROOT/device/j36-ultra/fetch_freedoom.py" \
+        --cache "$CACHE" --out "$CACHE/freedoom1.wad" || return 1
+    DOOM_WAD="$CACHE/freedoom1.wad"
+    return 0
+}
+
+if [[ "${J36_DOOM:-1}" == 1 ]]; then
+    set +e
+    build_fbdoom
+    doom_rc=$?
+    set -e
+    if (( doom_rc != 0 )); then
+        DOOM_BIN=""
+        log "fbdoom: not staged, see the error above -- the kernel payload is unaffected"
+    else
+        set +e
+        fetch_fbdoom_wad
+        wad_rc=$?
+        set -e
+        if (( wad_rc != 0 )); then
+            DOOM_WAD=""
+            log "fbdoom: no IWAD, so the binary ships without one; drop a doom.wad into j36/ on the card"
+        fi
+    fi
+else
+    log "fbdoom: J36_DOOM=0, skipping the Doom payload"
+fi
 
 # ── The SD BOOT payload ───────────────────────────────────────────────────────
 #
