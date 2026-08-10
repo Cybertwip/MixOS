@@ -483,8 +483,12 @@ insmod /lib/modules/*/extra/j36_mt6592_input.ko || say "input module load failed
 # before the machine is handed to it.  Failing that we stay here with a shell,
 # which is strictly better than the kernel panicking on a root= it cannot honour.
 root_hint=""
+want_doom=0
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
+        j36.doom|j36.doom=1)
+            want_doom=1
+            ;;
         root=/dev/*)
             root_hint="${arg#root=}"
             ;;
@@ -833,6 +837,18 @@ mkdir -p "$SDBOOT/mvii"
 cp "$ZIMAGE" "$SDBOOT/zImage"
 cp "$DTB_OUT/mt6592-j36-ultra.dtb" "$SDBOOT/"
 cp "$ARTIFACTS/initramfs-j36-ultra.cpio.gz" "$SDBOOT/initrd.img"
+
+# j36/ is read by /init, not by the LK, so nothing here goes through a load
+# window and nothing here has a size limit.  Delete the directory on the card and
+# the boot is exactly what it was before -- /init says so and carries on.
+if [[ -n "$DOOM_BIN" ]]; then
+    mkdir -p "$SDBOOT/j36"
+    cp "$DOOM_BIN" "$SDBOOT/j36/doom"
+    chmod 0755 "$SDBOOT/j36/doom"
+    if [[ -n "$DOOM_WAD" ]]; then
+        cp "$DOOM_WAD" "$SDBOOT/j36/$(basename "$DOOM_WAD")"
+    fi
+fi
 
 # rdinit=/init stays even though root= is now present, and the two do not
 # conflict: rdinit means the kernel never mounts a root filesystem itself, so a
