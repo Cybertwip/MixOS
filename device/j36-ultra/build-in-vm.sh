@@ -1172,6 +1172,13 @@ ensure_run_tmpfs() {
     return 1
 }
 
+# Set by setup_es_gl for setup_dash to read: whether the Mesa payload is complete
+# enough to point a child at, and whether the probe was staged.  They are separate
+# because the payload can be there without the probe and the dashboard's 3D cube
+# card needs the first while the boot-time diagnostics need the second.
+gl_ready=0
+probe_ready=0
+
 setup_es_gl() {
     if [ ! -f /bootfs/j36/gl/links ]; then
         say "gl: j36.gl was asked for but j36/gl/ is not on the card"
@@ -1233,7 +1240,14 @@ setup_es_gl() {
     # there: /run/j36/gl is an ld.so search path and an executable in it is a name
     # the loader has to stat and skip.
     es_gles20=0
-    if [ -f /bootfs/j36/es/emulationstation ]; then
+    if [ "$want_dash" = 1 ]; then
+        # j36.dash=1 means EmulationStation is not the shell on this boot and its
+        # binary is never executed, so replacing that binary is work with no
+        # observable effect.  The bind mount is skipped rather than made harmless:
+        # a mount over a file on the shared rootfs that nothing will open is still a
+        # mount somebody would have to explain.
+        say "es: j36.dash=1, so the GLES 2.0 EmulationStation is not staged at all"
+    elif [ -f /bootfs/j36/es/emulationstation ]; then
         mkdir -p /newroot/run/j36/es
         if cp /bootfs/j36/es/emulationstation /newroot/run/j36/es/emulationstation; then
             chmod 0755 /newroot/run/j36/es/emulationstation
@@ -1260,6 +1274,7 @@ setup_es_gl() {
     if [ -f /bootfs/j36/eglprobe ]; then
         if cp /bootfs/j36/eglprobe /newroot/run/j36/eglprobe; then
             chmod 0755 /newroot/run/j36/eglprobe
+            probe_ready=1
             # The drop-in tees the probe's output to a file so ExecStopPost can
             # print it again after ES's own spew has scrolled past.  emulation-
             # station.service is User=ark and this directory is root-owned 0755,
@@ -1296,8 +1311,15 @@ setup_es_gl() {
     # libgbm.so.1 is load-bearing either way, and twice over: SDL2's KMSDRM backend
     # dlopens it and libEGL_mesa.so.0 carries it in its own DT_NEEDED, so without it
     # Mesa's EGL pulls the RK3326 blob in as its gbm and cannot initialise.
+    #   The dashboard.  mixdash itself needs none of them -- it is Qt on linuxfb and
+    #     it draws with the CPU -- but the 3D cube card runs eglprobe, which dlopens
+    #     the same pair the GLES 2.0 binary does.
+    #
+    # libgbm.so.1 is load-bearing either way, and twice over: SDL2's KMSDRM backend
+    # dlopens it and libEGL_mesa.so.0 carries it in its own DT_NEEDED, so without it
+    # Mesa's EGL pulls the RK3326 blob in as its gbm and cannot initialise.
     missing=""
-    if [ "$es_gles20" = 1 ]; then
+    if [ "$es_gles20" = 1 ] || [ "$want_dash" = 1 ]; then
         needs="libEGL.so.1 libgbm.so.1 libGLESv2.so.2"
     else
         needs="libEGL.so libgbm.so.1 libGL.so.1"
@@ -1314,6 +1336,20 @@ setup_es_gl() {
         say "    fails in the same place but without this initramfs having claimed"
         say "    to fix it."
         return 1
+    fi
+    gl_ready=1
+
+    # And with the dashboard as the shell there is no EmulationStation drop-in to
+    # write: every line below configures SDL, a videodriver and a GL front end for a
+    # binary that will not be executed on this boot.  setup_dash puts the one thing
+    # from here that a Qt dashboard still needs -- the search path its children use
+    # to find Mesa rather than the RK3326 blob -- into mixdash.service, where it can
+    # be read next to the process it applies to instead of inherited from a unit
+    # named after a program that is gone.
+    if [ "$want_dash" = 1 ]; then
+        say "gl: payload in /run/j36/gl; no ES drop-in, the dashboard is the shell"
+        say "    $(ls /newroot/run/j36/gl | tr '\n' ' ')"
+        return 0
     fi
 
     mkdir -p /newroot/run/systemd/system/emulationstation.service.d
@@ -1497,30 +1533,56 @@ DROPINPROBE
 
 # ── The dashboard, in place of EmulationStation ───────────────────────────────
 #
-# WHY A DROP-IN AND NOT A UNIT OF ITS OWN.  emulationstation.service is what starts
-# a shell on this rootfs, and the rootfs is the shared one, so it cannot be edited.
-# A drop-in under /run/systemd/system/<unit>.d/ is read after the unit file and an
-# `ExecStart=' with nothing after it RESETS the list, so this unit ends up running
-# mixdash and never running EmulationStation -- with nothing written to the card and
-# nothing left behind on the next boot.  Masking the unit and adding our own was the
-# alternative; this way is the one already proved on this board by j36-gl.conf.
+# A UNIT OF OUR OWN, AND WHY THE OBVIOUS WAY TO REMOVE ES DOES NOT WORK HERE.
+# EmulationStation should not be an autostart service in these builds at all, and
+# the normal way to say that is to mask it -- ln -s /dev/null over the unit name.
+# That cannot work on this card, and the reason is a precedence rule rather than an
+# opinion: build_emulationstation.sh installs the unit as
+# /etc/systemd/system/emulationstation.service, /etc outranks /run for unit FILES,
+# and /etc is on the shared rootfs that nothing here is allowed to write.  A mask
+# dropped in /run/systemd/system would be silently ignored, and a build that thought
+# it had removed ES while ES was still starting is worse than one that never tried.
 #
-# zz- so that it sorts last.  systemd merges drop-ins in name order, so zz-j36-dash
-# has the last word on ExecStart even though j36-gl.conf set an ExecStart of its own
-# under j36.gl=debug.  ExecStartPre is deliberately NOT reset: the two probe lines
-# j36-gl.conf adds are the payload's own measurements and neither of them takes the
-# panel.
+# So the removal is done with the two levers /run does still win:
+#
+#   1  mixdash.service, a unit of ours in /run/systemd/system, wanted by
+#      multi-user.target through a symlink in /run/systemd/system/
+#      multi-user.target.wants/.  Unit files do not merge across the three trees but
+#      dependency directories DO -- .wants is additive -- so a want written in /run
+#      is honoured for a target that lives in /usr/lib.  This is the only thing that
+#      starts the dashboard, so there is exactly one of it however the rest of this
+#      resolves.
+#   2  a drop-in on emulationstation.service that resets ExecStart to an echo.
+#      Drop-ins from /run ARE merged into a unit in /etc, so this is what actually
+#      stops the EmulationStation binary from ever being executed: the unit may
+#      still be pulled in by multi-user.target and it may still reach "active", but
+#      what it runs is one line of text explaining that the dashboard replaced it.
+#      Type=oneshot and Restart=no as well, because the unit's own Restart=on-failure
+#      is what turned a single 134 into six identical stack traces on the panel.
+#
+# It matters that (2) does not launch mixdash even though it could.  If it did, then
+# on a card where the mask in (1) is not needed the dashboard would be started twice
+# -- once by each unit -- and two processes drawing into /dev/fb0 and both reading
+# the same evdev nodes is a fault that looks like a broken dashboard.  One owner.
+#
+# Nothing here writes to the card, and the whole arrangement is gone on the next
+# boot: /run/systemd/system is the tmpfs mounted a few lines up.
+#
+# The units that name ES in ordering -- ogage.service After=, welcome-message and
+# wifi_importer Before= -- are all ordering only, no Requires, so none of them fails
+# or hangs whether ES starts, echoes or is skipped.  That was checked, not assumed.
 #
 # WHERE THE PAYLOAD IS, asked rather than assumed.  find_mixos() looks for it in the
 # rootfs first, because extracting sd-root.tar.gz there is what the artifact README
 # says to do, and then on every other partition of the card -- a tree extracted onto
 # a data partition works, read-only mounted, without a keyboard and without a shell.
 #
-# WHY User=root.  The unit is User=ark.  Qt's linuxfb plugin puts /dev/tty0 into
-# KD_GRAPHICS so the kernel's console stops drawing over the dashboard, and that is
-# an ioctl on a device ark cannot open; the Restart and Power off cards call reboot
-# and poweroff; and the 3D cube card needs DRM master for its modeset.  All three
-# are root, and none of them is worth a polkit rule on a card that cannot be edited.
+# WHY User=root.  The unit ES ran under is User=ark, and three things the dashboard
+# does are not ark's: Qt's linuxfb plugin puts /dev/tty0 into KD_GRAPHICS so the
+# kernel's console stops drawing over the dashboard, which is an ioctl on a device
+# ark cannot open; the Restart and Power off cards call reboot and poweroff; and the
+# 3D cube card needs DRM master for its modeset.  None of them is worth a polkit rule
+# on a card that cannot be edited.
 #
 # WHY LD_LIBRARY_PATH NAMES BOTH DIRECTORIES.  mixdash finds its own Qt through
 # RPATH -- built with --disable-new-dtags, so it is DT_RPATH and it covers the
@@ -1580,22 +1642,33 @@ setup_dash() {
     fi
     if ! find_mixos; then
         say "dash: no opt/mixos/bin/mixdash on any partition of this card."
-        say "      The drop-in is deliberately NOT written, so the rootfs's own"
-        say "      EmulationStation starts instead of nothing at all.  Unpack"
-        say "      sd-root.tar.gz onto the second partition: see its README.txt."
+        say "      Unpack sd-root.tar.gz onto the second partition: see its"
+        say "      README.txt.  EmulationStation is NOT started as a fallback --"
+        say "      it aborts at Renderer_GLES10.cpp:129 on this board and its unit"
+        say "      restarts it, so the panel would end up black with six identical"
+        say "      stack traces on it instead of this message.  A readable console"
+        say "      is the better failure."
+        neuter_es
         return 1
     fi
 
-    mkdir -p /newroot/run/systemd/system/emulationstation.service.d
-    cat > /newroot/run/systemd/system/emulationstation.service.d/zz-j36-dash.conf <<DROPINDASH
+    # ── the dashboard's own unit ─────────────────────────────────────────────────
+    cat > /newroot/run/systemd/system/mixdash.service <<UNITDASH
 # Written by the J36 Ultra initramfs, into a tmpfs.  Not on the card, not in the
-# rootfs: it exists only for as long as this boot does.  It resets ExecStart, so
-# this unit runs the dashboard and EmulationStation is not started.
+# rootfs: it exists only for as long as this boot does.
+[Unit]
+Description=MixOS dashboard (J36 Ultra)
+Documentation=file:///opt/mixos/README.txt
+# Ordering only, and the same place EmulationStation sat: firstboot resizes the data
+# partition and a dashboard that lists it should not race that.  A unit that is not
+# installed is simply not ordered against, so naming it costs nothing.
+After=firstboot.service systemd-user-sessions.service
+
 [Service]
+Type=simple
 User=root
 Group=root
 WorkingDirectory=$mixos_root/bin
-ExecStart=
 ExecStart=$mixos_root/bin/mixdash
 Restart=on-failure
 RestartSec=2
@@ -1606,10 +1679,83 @@ Environment="QT_QPA_FB_DISABLE_INPUT=1"
 Environment="QT_QPA_FONTDIR=$mixos_root/qt/fonts"
 StandardOutput=journal+console
 StandardError=journal+console
-DROPINDASH
 
-    say "dash: mixdash will run instead of EmulationStation"
-    say "      $mixos_root/bin/mixdash, linuxfb on /dev/fb0"
+[Install]
+WantedBy=multi-user.target
+UNITDASH
+
+    # The [Install] section above is inert -- nothing runs systemctl enable on a
+    # read-only rootfs -- so the want is written by hand.  .wants directories are
+    # merged across /etc, /run and /usr/lib, which is why this works for a target
+    # whose own unit file is in /usr/lib and cannot be touched.
+    mkdir -p /newroot/run/systemd/system/multi-user.target.wants
+    ln -sf ../mixdash.service \
+           /newroot/run/systemd/system/multi-user.target.wants/mixdash.service
+
+    # The probe, before the dashboard.  -f is the one mode that touches nothing it
+    # cannot give back: it counts the pixels already in /dev/fb0, undoes a backlight
+    # at zero and a console left in KD_GRAPHICS, and paints colour bars with the CPU.
+    # Run here it is a handover signal that costs a second -- bars and then a
+    # dashboard means both halves work, bars that stay mean mixdash never started,
+    # and no bars at all mean nothing userspace draws will be seen and the dashboard
+    # is not the thing to debug.  It is NOT -p or -c: those two modeset, and on a
+    # kernel with no fbdev emulation the CRTC is disabled when the client exits, so
+    # either one would hide the dashboard for the rest of the boot.
+    if [ "$probe_ready" = 1 ]; then
+        cat >> /newroot/run/systemd/system/mixdash.service <<'UNITPROBE'
+
+[Service]
+ExecStartPre=-/bin/sh -c '/run/j36/eglprobe -f 1 2>&1 | tee /run/j36/eglprobe.log'
+UNITPROBE
+        # And under j36.gl=debug the two library questions as well, plus the replay:
+        # the dashboard covers the panel with its own drawing, so the only way to
+        # read the probe's verdict is after the shell has exited.
+        if [ "$gl_debug" = 1 ]; then
+            cat >> /newroot/run/systemd/system/mixdash.service <<'UNITDBG'
+ExecStartPre=-/bin/sh -c '/run/j36/eglprobe 2>&1 | tee -a /run/j36/eglprobe.log'
+ExecStartPre=-/bin/sh -c 'LIBGL_ALWAYS_SOFTWARE=1 /run/j36/eglprobe -s 2>&1 | tee -a /run/j36/eglprobe.log'
+ExecStopPost=-/bin/sh -c 'echo "--- eglprobe, repeated now that the shell has exited ---"; cat /run/j36/eglprobe.log'
+Environment="EGL_LOG_LEVEL=debug"
+Environment="LIBGL_DEBUG=verbose"
+UNITDBG
+        fi
+    fi
+
+    neuter_es
+
+    say "dash: mixdash.service is the shell; EmulationStation is not started"
+    say "      $mixos_root/bin/mixdash, Qt on linuxfb over /dev/fb0"
+    if [ "$gl_ready" != 1 ]; then
+        say "dash: /run/j36/gl has no usable Mesa payload, so the 3D cube card will"
+        say "      find no libEGL.  The dashboard itself does not need one."
+    fi
+    return 0
+}
+
+# ── EmulationStation, taken out of the boot ───────────────────────────────────
+#
+# ExecStart= with nothing after it resets the list; the echo is what replaces it.
+# This is the lever that actually stops the binary from running, because the unit
+# file itself is in /etc and out of reach -- see the comment above setup_dash.
+#
+# Called on the failure path too, and that is deliberate: a card with no dashboard on
+# it should show the reason on the console, not six copies of ES's abort.
+neuter_es() {
+    mkdir -p /newroot/run/systemd/system/emulationstation.service.d
+    cat > /newroot/run/systemd/system/emulationstation.service.d/zz-j36-dash.conf <<'DROPINDASH'
+# Written by the J36 Ultra initramfs, into a tmpfs.  EmulationStation is not part of
+# these builds: mixdash.service is the shell, and this drop-in is what keeps the unit
+# in /etc/systemd/system from starting the binary anyway.
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=
+ExecStart=/bin/echo "j36: EmulationStation is not started in this build -- mixdash.service is the shell."
+# The unit's own Restart=on-failure is what turned one abort into six stack traces
+# scrolling a 640x480 panel.  Nothing here can fail, but it is stated anyway.
+Restart=no
+DROPINDASH
+    say "es: emulationstation.service is neutered for this boot (ExecStart reset)"
     return 0
 }
 
