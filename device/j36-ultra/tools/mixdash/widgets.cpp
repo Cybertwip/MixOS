@@ -368,7 +368,10 @@ QString CardGrid::currentTitle() const
 
 QRectF CardGrid::cardRect(int i) const
 {
-    const int cols = qMin(Theme::GridCols, qMax(1, m_entries.size()));
+    /* qMin<int> spelled out: Theme::GridCols is an unnamed enum, so template
+     * deduction against an int has nothing to deduce and the two-argument form
+     * does not compile. */
+    const int cols = qMin<int>(Theme::GridCols, qMax(1, m_entries.size()));
     const int rows = qMax(1, (m_entries.size() + cols - 1) / cols);
 
     const qreal availW = width() - 2.0 * Theme::Margin - (cols - 1) * Theme::Gap;
@@ -390,7 +393,7 @@ void CardGrid::moveBy(int dx, int dy)
     if (m_entries.isEmpty())
         return;
 
-    const int cols = qMin(Theme::GridCols, m_entries.size());
+    const int cols = qMin<int>(Theme::GridCols, m_entries.size());
     const int rows = qMax(1, (m_entries.size() + cols - 1) / cols);
     int c = m_index % cols;
     int r = m_index / cols;
