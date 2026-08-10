@@ -2301,7 +2301,7 @@ ES_URL="https://github.com/christianhaitian/EmulationStation-fcamod"
 ES_COMMIT="74498be31cd016af6a42d00310f876d7256eff52"
 ES_RENDERER="$ROOT/device/j36-ultra/es/Renderer_GLES20.cpp"
 ES_PATCH="$ROOT/device/j36-ultra/es/patch-gles20.py"
-ES_CHROOT="$WORK/es-chroot"
+ARMHF_CHROOT="$WORK/es-chroot"
 ES_BIN=""
 
 # Debian trixie armhf has all of ES's dependencies.  --no-install-recommends
@@ -2310,73 +2310,78 @@ ES_BUILD_DEPS=(build-essential cmake git pkg-config ca-certificates
                libsdl2-dev libsdl2-mixer-dev libfreeimage-dev libfreetype-dev
                libcurl4-openssl-dev libvlc-dev libasound2-dev rapidjson-dev)
 
-es_chroot_run() {
-    sudo chroot "$ES_CHROOT" bash -c "$1"
+armhf_chroot_run() {
+    sudo chroot "$ARMHF_CHROOT" bash -c "$1"
 }
 
 # The chroot is built once and kept.  Preferred base is MixOS's own armhf rootfs
 # cache, because if the R36 base build has run then it is already on disk and it is
 # the same debootstrap the target was made from; debootstrap is the fallback for a
 # machine where only this build has ever run.
-ensure_es_chroot() {
+#
+# Two things build in here now -- the dashboard and, when it is asked for,
+# EmulationStation -- so the base and the dependencies are separate steps.  A card
+# that only wants mixdash should not spend twenty emulated minutes installing
+# libvlc-dev, and chroot_install_deps below is what keeps the two apart.
+ensure_armhf_chroot() {
     local suite="${DEBIAN_RELEASE:-trixie}" base m
     base="$ROOT/Arkbuild_package_cache/debian_${suite}_userspace-armhf_rootfs.tar.gz"
 
-    if [[ ! -f "$ES_CHROOT/.j36-base" ]]; then
-        sudo rm -rf "$ES_CHROOT" "$WORK/es-chroot-x"
+    if [[ ! -f "$ARMHF_CHROOT/.j36-base" ]]; then
+        sudo rm -rf "$ARMHF_CHROOT" "$WORK/es-chroot-x"
         mkdir -p "$WORK/es-chroot-x"
         if [[ -f "$base" ]]; then
-            log "es: unpacking the armhf $suite rootfs from the MixOS package cache"
+            log "chroot: unpacking the armhf $suite rootfs from the MixOS package cache"
             sudo tar -xpzf "$base" -C "$WORK/es-chroot-x" || return 1
             # The cache tarball carries MixOS's own chroot name at the top.
-            sudo mv "$WORK/es-chroot-x/Arkbuild" "$ES_CHROOT" || return 1
+            sudo mv "$WORK/es-chroot-x/Arkbuild" "$ARMHF_CHROOT" || return 1
         else
-            log "es: no armhf rootfs in the package cache, debootstrapping one"
+            log "chroot: no armhf rootfs in the package cache, debootstrapping one"
             command -v qemu-arm-static >/dev/null || {
-                log "es: qemu-arm-static is not installed and there is no cached rootfs"; return 1; }
+                log "chroot: qemu-arm-static is not installed and there is no cached rootfs"; return 1; }
             sudo eatmydata debootstrap --no-check-gpg --include=eatmydata \
-                --resolve-deps --arch=armhf --foreign "$suite" "$ES_CHROOT" \
+                --resolve-deps --arch=armhf --foreign "$suite" "$ARMHF_CHROOT" \
                 "${J36_DEBIAN_MIRROR:-http://deb.debian.org/debian}" || return 1
-            sudo cp /usr/bin/qemu-arm-static "$ES_CHROOT/usr/bin/" || return 1
-            sudo chroot "$ES_CHROOT" /debootstrap/debootstrap --second-stage || return 1
+            sudo cp /usr/bin/qemu-arm-static "$ARMHF_CHROOT/usr/bin/" || return 1
+            sudo chroot "$ARMHF_CHROOT" /debootstrap/debootstrap --second-stage || return 1
         fi
         sudo rm -rf "$WORK/es-chroot-x"
-        sudo touch "$ES_CHROOT/.j36-base"
+        sudo touch "$ARMHF_CHROOT/.j36-base"
     fi
 
     # /dev, /proc and /sys are bound for apt's maintainer scripts and for nproc.
-    # They are unmounted in es_chroot_teardown when the build is done: a bind mount
+    # They are unmounted in armhf_chroot_teardown when the build is done: a bind mount
     # of /sys left inside a directory tree is something the next rsync of this
     # machine trips over, with an unlink() permission denied that names a sysfs
     # file and explains nothing.
     for m in dev proc sys; do
-        mountpoint -q "$ES_CHROOT/$m" || sudo mount --bind "/$m" "$ES_CHROOT/$m" || return 1
+        mountpoint -q "$ARMHF_CHROOT/$m" || sudo mount --bind "/$m" "$ARMHF_CHROOT/$m" || return 1
     done
     printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | \
-        sudo tee "$ES_CHROOT/etc/resolv.conf" >/dev/null
-    printf 'exit 101\n' | sudo tee "$ES_CHROOT/usr/sbin/policy-rc.d" >/dev/null
-    sudo chmod 0755 "$ES_CHROOT/usr/sbin/policy-rc.d"
+        sudo tee "$ARMHF_CHROOT/etc/resolv.conf" >/dev/null
+    printf 'exit 101\n' | sudo tee "$ARMHF_CHROOT/usr/sbin/policy-rc.d" >/dev/null
+    sudo chmod 0755 "$ARMHF_CHROOT/usr/sbin/policy-rc.d"
 
-    if [[ ! -f "$ES_CHROOT/.j36-deps" ]]; then
+    if [[ ! -f "$ARMHF_CHROOT/.j36-deps" ]]; then
         log "es: installing ${#ES_BUILD_DEPS[@]} build dependencies into the armhf chroot"
-        es_chroot_run "eatmydata apt-get -y update" || return 1
-        es_chroot_run "DEBIAN_FRONTEND=noninteractive eatmydata apt-get -y \
+        armhf_chroot_run "eatmydata apt-get -y update" || return 1
+        armhf_chroot_run "DEBIAN_FRONTEND=noninteractive eatmydata apt-get -y \
             --no-install-recommends install ${ES_BUILD_DEPS[*]}" || return 1
-        sudo touch "$ES_CHROOT/.j36-deps"
+        sudo touch "$ARMHF_CHROOT/.j36-deps"
     fi
     return 0
 }
 
-es_chroot_teardown() {
+armhf_chroot_teardown() {
     local m
     for m in dev/pts dev proc sys; do
-        mountpoint -q "$ES_CHROOT/$m" && sudo umount -l "$ES_CHROOT/$m"
+        mountpoint -q "$ARMHF_CHROOT/$m" && sudo umount -l "$ARMHF_CHROOT/$m"
     done
     return 0
 }
 
 build_es_gles20() {
-    local src="$ES_CHROOT/home/build/es" out="$CACHE/emulationstation-gles20"
+    local src="$ARMHF_CHROOT/home/build/es" out="$CACHE/emulationstation-gles20"
     local stamp="$CACHE/emulationstation-gles20.stamp" want header needed lib
 
     [[ -f "$ES_RENDERER" ]] || { log "es: $ES_RENDERER is missing"; return 1; }
@@ -2392,7 +2397,7 @@ $(sha256sum "$ES_PATCH" | awk '{print $1}')"
         return 0
     fi
 
-    ensure_es_chroot || { es_chroot_teardown; return 1; }
+    ensure_armhf_chroot || { armhf_chroot_teardown; return 1; }
 
     # Cloned from outside the chroot: git over TLS under qemu-arm is minutes of
     # emulated crypto for no reason.  --depth 1 of one SHA rather than of a branch,
@@ -2401,7 +2406,7 @@ $(sha256sum "$ES_PATCH" | awk '{print $1}')"
         log "es: cloning EmulationStation-fcamod at $ES_COMMIT"
         sudo rm -rf "$src"
         sudo mkdir -p "$src"
-        sudo chown "$(id -u):$(id -g)" "$ES_CHROOT/home/build" "$src" || true
+        sudo chown "$(id -u):$(id -g)" "$ARMHF_CHROOT/home/build" "$src" || true
         git -C "$src" init -q || return 1
         git -C "$src" remote add origin "$ES_URL" || return 1
         git -C "$src" fetch -q --depth 1 origin "$ES_COMMIT" || return 1
@@ -2420,12 +2425,12 @@ $(sha256sum "$ES_PATCH" | awk '{print $1}')"
     # CMAKE_POLICY_VERSION_MINIMUM because upstream's cmake_minimum_required is
     # 2.8 and trixie's cmake is 3.31, which makes anything under 3.5 an error.
     log "es: configuring and building EmulationStation for armhf (emulated; this is slow)"
-    es_chroot_run "cd /home/build/es && rm -rf CMakeCache.txt CMakeFiles && \
+    armhf_chroot_run "cd /home/build/es && rm -rf CMakeCache.txt CMakeFiles && \
         cmake -DGLES20=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release ." \
-        || { es_chroot_teardown; return 1; }
-    es_chroot_run "cd /home/build/es && make -j\$(nproc)" \
-        || { es_chroot_teardown; return 1; }
-    es_chroot_teardown
+        || { armhf_chroot_teardown; return 1; }
+    armhf_chroot_run "cd /home/build/es && make -j\$(nproc)" \
+        || { armhf_chroot_teardown; return 1; }
+    armhf_chroot_teardown
 
     [[ -f "$src/emulationstation" ]] || { log "es: make left no binary"; return 1; }
 
@@ -2490,7 +2495,7 @@ if [[ "${J36_ES:-1}" == 1 ]]; then
         set -e
         if (( es_rc != 0 )); then
             ES_BIN=""
-            es_chroot_teardown
+            armhf_chroot_teardown
             log "es: the GLES 2.0 binary was not built, see the error above -- the card"
             log "    will carry no j36/es and the rootfs's own EmulationStation will run,"
             log "    which on this board is the status 134"

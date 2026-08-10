@@ -243,22 +243,51 @@ QString Dashboard::firstExisting(const QStringList &candidates)
     return QString();
 }
 
+/*
+ * doomgeneric identifies an IWAD by its filename before it opens it -- d_iwad.c
+ * matches against a fixed iwads[] table -- so this looks for those names and not
+ * for *.wad.  The order is the order that table has them in.
+ */
+QString Dashboard::firstWad()
+{
+    const QStringList names = QStringList()
+        << "freedoom1.wad" << "freedoom2.wad" << "freedm.wad"
+        << "doom.wad" << "doom1.wad" << "doom2.wad"
+        << "plutonia.wad" << "tnt.wad" << "chex.wad" << "hacx.wad";
+    for (const QString &dir : QStringList() << "/opt/mixos/share/doom" << "/roms/doom")
+        for (const QString &n : names)
+            if (QFileInfo(dir + "/" + n).isFile())
+                return dir + "/" + n;
+    return QString();
+}
+
 void Dashboard::buildPages()
 {
     QVector<AppEntry> apps;
 
-    AppEntry games;
-    games.title = "Games";
-    games.accent = Theme::blue();
-    games.glyph = GlyphGames;
-    games.exe = firstExisting(QStringList()
-                              << "/usr/bin/emulationstation/emulationstation.sh"
-                              << "/run/j36/es/emulationstation"
-                              << "/usr/bin/emulationstation/emulationstation");
-    games.subtitle = games.exe.isEmpty() ? QString("EmulationStation")
-                                         : QString("EmulationStation. It sets its own\ndisplay mode.");
-    games.available = !games.exe.isEmpty();
-    apps.append(games);
+    /*
+     * Doom, and it is first because it is the one thing on this card already proved
+     * to put a moving picture on this panel: doomgeneric writes 32-bit pixels into
+     * /dev/fb0 and reads the pad through evdev, which is exactly the layer this
+     * dashboard draws in.  No EGL, no GBM, no mode set -- so it hands the panel back
+     * when it exits, which EmulationStation never did.
+     */
+    AppEntry doom;
+    doom.title = "Doom";
+    doom.accent = Theme::blue();
+    doom.glyph = GlyphGames;
+    doom.exe = firstExisting(QStringList() << "/opt/mixos/bin/doom");
+    const QString wad = firstWad();
+    if (!doom.exe.isEmpty() && !wad.isEmpty())
+        doom.args = QStringList() << "-iwad" << wad;
+    doom.available = !doom.exe.isEmpty() && !wad.isEmpty();
+    if (doom.exe.isEmpty())
+        doom.subtitle = "Not installed. J36_DOOM=1\nputs it in /opt/mixos.";
+    else if (wad.isEmpty())
+        doom.subtitle = "No IWAD in\n/opt/mixos/share/doom.";
+    else
+        doom.subtitle = QFileInfo(wad).fileName() + ".\n640x400 straight into /dev/fb0.";
+    apps.append(doom);
 
     AppEntry files;
     files.title = "Files";
@@ -283,7 +312,8 @@ void Dashboard::buildPages()
     probe.title = "Display test";
     probe.accent = Theme::purple();
     probe.glyph = GlyphDisplay;
-    probe.exe = firstExisting(QStringList() << "/run/j36/eglprobe");
+    probe.exe = firstExisting(QStringList() << "/run/j36/eglprobe"
+                                            << "/opt/mixos/bin/eglprobe");
     probe.args = QStringList() << "-p";
     probe.subtitle = probe.exe.isEmpty() ? QString("eglprobe is not on this card.")
                                          : QString("eglprobe -p, the EGL and KMS\npath, end to end.");

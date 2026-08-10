@@ -105,7 +105,7 @@ int probe(void)
 QString loadFont()
 {
     QStringList files;
-    const QDir payload("/run/j36/qt/fonts");
+    const QDir payload("/opt/mixos/qt/fonts");
     if (payload.exists())
         for (const QString &f : payload.entryList(QStringList() << "*.ttf", QDir::Files, QDir::Name))
             files << payload.filePath(f);

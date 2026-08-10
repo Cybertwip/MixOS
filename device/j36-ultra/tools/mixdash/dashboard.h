@@ -95,6 +95,7 @@ private:
     void launch(const QString &title, const QString &exe, const QStringList &args);
     void toast(const QString &text, int ms = 2400);
     static QString firstExisting(const QStringList &candidates);
+    static QString firstWad();
 
     StatusBar *m_bar = nullptr;
     CardGrid *m_apps = nullptr;
