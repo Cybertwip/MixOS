@@ -177,7 +177,8 @@ j36/modules/           lima.ko and its dependencies, plus load.order
 j36/mtkdrm/            the MT6592 display set, plus load.order (j36.mtkdrm=1)
 j36/audio/             the ALSA core and the MT6592 AFE, plus load.order (j36.audio=1)
 j36/gl/                Mesa's GL front end, plus links (vfat has no symlinks)
-j36/eglprobe           what can create a GL context, and why not
+j36/eglprobe           what can create a GL context, and with -p whether a frame
+                       reaches the glass: five held colours, CPU then lima
 j36/es/emulationstation  the same ES with a GLES 2.0 renderer (j36.es=1)
 ```
 
