@@ -86,10 +86,11 @@
  * shaders, hands over 36 vertices and page-flips the result, which is the
  * smallest thing that cannot be faked -- see cube() for what that adds.
  *
- * Usage: eglprobe [-s | -p | -c [seconds] | /dev/dri/node ...].  With no
- * arguments it probes card0 and renderD128.  Exit status: 0 if some API created
- * a context on some display (for -p, if the mode was set; for -c, if a frame was
- * drawn), 1 otherwise.  Nothing is written anywhere; stdout is the whole output.
+ * Usage: eglprobe [-i | -s | -p | -c [seconds] | /dev/dri/node ...].  With no
+ * arguments it probes the display node and renderD128.  Exit status: 0 if some API
+ * created a context on some display (for -p, if the mode was set; for -c, if a frame
+ * was drawn; for -i, if a modesetting node exists at all), 1 otherwise.  Nothing is
+ * written anywhere; stdout is the whole output.
  */
 
 #define _GNU_SOURCE
@@ -2184,7 +2185,8 @@ out:
 
 int main(int argc, char **argv)
 {
-    int wins = 0, painted = -1, cubed = -1, i;
+    int wins = 0, painted = -1, cubed = -1, listed = -1, i;
+    const char *node;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
 
@@ -2195,27 +2197,36 @@ int main(int argc, char **argv)
         for (i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "-s")) {
                 wins += probe_surfaceless();
+            } else if (!strcmp(argv[i], "-i")) {
+                listed = display_node() ? 0 : 1;
             } else if (!strcmp(argv[i], "-p")) {
-                painted = paint("/dev/dri/card0");
+                /* No node that modesets is not a reason to fall back to card0 -- that
+                 * is precisely the assumption that made -p meaningless before. */
+                node = display_node();
+                painted = node ? paint(node) : 1;
             } else if (!strcmp(argv[i], "-c")) {
                 /* An optional number of seconds after it, so the dashboard can ask
                  * for a short one and a bring-up session for a long one. */
                 int secs = CUBE_SECONDS;
                 if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
                     secs = atoi(argv[++i]);
-                cubed = cube("/dev/dri/card0", secs > 0 ? secs : CUBE_SECONDS);
+                node = display_node();
+                cubed = node ? cube(node, secs > 0 ? secs : CUBE_SECONDS) : 1;
             } else {
                 wins += probe(argv[i], strstr(argv[i], "/card") != NULL);
             }
         }
     } else {
-        /* Display node first: it is the one SDL will actually be handed. */
-        wins += probe("/dev/dri/card0", 1);
+        /* The display node first, because it is the one SDL will actually be handed
+         * -- if there is one, which is the first thing worth knowing. */
+        node = display_node();
+        if (node)
+            wins += probe(node, 1);
         wins += probe("/dev/dri/renderD128", 0);
     }
 
-    if (painted >= 0 || cubed >= 0)
-        return (painted > 0 || cubed > 0) ? 1 : 0;
+    if (painted >= 0 || cubed >= 0 || listed >= 0)
+        return (painted > 0 || cubed > 0 || listed > 0) ? 1 : 0;
 
     printf("eglprobe: %s\n", wins ? "a context came up, see which API above"
                                   : "no API created a context on any node");
