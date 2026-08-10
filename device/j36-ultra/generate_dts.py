@@ -574,16 +574,95 @@ def generate(sources: dict[str, str]) -> str:
 \t\t\tstatus = \"okay\";
 \t\t}};
 
+\t\t/*
+\t\t * The display pipe, as mainline mtk_drm sees it.
+\t\t *
+\t\t * MT6592's DDP is the MT2701/MT8173 generation. Every base and offset
+\t\t * below was checked against the MVII LK that lights this panel today, so
+\t\t * almost nothing here is new: each node names
+\t\t * \"mediatek,mt6592-<block>\" first and \"mediatek,mt2701-<block>\"
+\t\t * second, and __of_match_node() scores the first higher where the kernel
+\t\t * patch adds an mt6592 entry (MMSYS and OVL, which are the only two that
+\t\t * differ) and falls through to the second everywhere else, because the
+\t\t * mt2701 driver data is already exact -- mutex MOD 0x488 / SOF 1, RDMA
+\t\t * FIFO 4 KiB, the COLOR start offset, the DSI CMDQ and VM_CMD offsets,
+\t\t * and MPPLL_PRESERVE 3. See linux/0002-drm-mediatek-mt6592.patch, which
+\t\t * records how each of those was measured.
+\t\t *
+\t\t * They must all be siblings of mmsys. mtk_mmsys_probe() registers the
+\t\t * \"mediatek-drm\" platform device as its own child, and mtk_drm_probe()
+\t\t * then collects components by walking
+\t\t * for_each_child_of_node(mmsys_node->parent) -- a node one level deeper
+\t\t * is never found, and a node with status = \"disabled\" is skipped.
+\t\t *
+\t\t * All five drivers are modules, and nothing insmods them unless the
+\t\t * card's BOOT partition carries a j36/mtkdrm directory and the command
+\t\t * line says j36.mtkdrm=1. With the modules absent these nodes bind
+\t\t * nothing at all, so the default boot stays byte-identical and they can
+\t\t * safely say okay. Even when they do load, no register is touched until
+\t\t * userspace opens /dev/dri/card0 and sets a mode: DRM_FBDEV_EMULATION is
+\t\t * off, so mtk_drm registers a card and then waits, and the LK's image on
+\t\t * the simple-framebuffer below stays exactly where it is.
+\t\t */
+\t\tdsi_phy: phy@10010000 {{
+\t\t\tcompatible = \"mediatek,mt6592-mipi-tx\", \"mediatek,mt2701-mipi-tx\";
+\t\t\treg = <0x10010000 0x1000>;
+\t\t\t#phy-cells = <0>;
+\t\t\t/*
+\t\t\t * This PHY is also the DSI host's \"hs\" clock provider, which is
+\t\t\t * how mtk_dsi asks for a data rate: clk_set_rate(hs_clk, ...)
+\t\t\t * lands in mtk_mipi_tx_pll_set_rate and the PLL is programmed
+\t\t\t * from it at phy_power_on. clock-output-names is mandatory --
+\t\t\t * mtk_mipi_tx_probe fails the probe without it.
+\t\t\t *
+\t\t\t * The unnamed reference clock is taken for its NAME only, as the
+\t\t\t * PLL's clk parent; mt8173_mipi_tx_pll_prepare hardcodes the
+\t\t\t * 26 MHz reference in its PCW arithmetic and never reads this
+\t\t\t * rate. 26 MHz is nonetheless the true reference: mainline's
+\t\t\t * pcw = data_rate * 2 * txdiv << 24 / 26000000 is the same
+\t\t\t * number as the LK's pcw = data_Rate * txdiv / 13, and the two
+\t\t\t * txdiv ladders (500/250/125/62) are identical.
+\t\t\t *
+\t\t\t * mediatek,efuse-trim-reg is the LK's, not mainline's: the LK
+\t\t\t * reads DSI_EFUSE_RES3 here and programs each lane's RT_CODE
+\t\t\t * from it, defaulting to 0x8. Mainline wants an nvmem
+\t\t\t * \"calibration-data\" cell instead, does not find one, logs
+\t\t\t * \"can't get nvmem_cell_get, ignore it\" and carries on -- and
+\t\t\t * the mt2701 signal path never writes RT_CODE, so the LK's
+\t\t\t * calibration survives untouched underneath it.
+\t\t\t */
+\t\t\t#clock-cells = <0>;
+\t\t\tclocks = <&dsi_ref_clk>;
+\t\t\tclock-output-names = \"mipi_tx0_pll\";
+\t\t\tmediatek,efuse-trim-reg = <0x10206180>;
+\t\t\tstatus = \"okay\";
+\t\t}};
+
 \t\tmmsys: syscon@14000000 {{
-\t\t\tcompatible = \"j36,mt6592-mmsys\", \"syscon\";
+\t\t\tcompatible = \"mediatek,mt6592-mmsys\", \"mediatek,mt2701-mmsys\", \"syscon\";
 \t\t\treg = <0x14000000 0x1000>;
 \t\t}};
 
-\t\tdsi_phy: phy@10010000 {{
-\t\t\tcompatible = \"j36,mt6592-mipi-tx\";
-\t\t\treg = <0x10010000 0x1000>;
-\t\t\t#phy-cells = <0>;
-\t\t\tmediatek,efuse-trim-reg = <0x10206180>;
+\t\tovl0: ovl@14007000 {{
+\t\t\tcompatible = \"mediatek,mt6592-disp-ovl\", \"mediatek,mt2701-disp-ovl\";
+\t\t\treg = <0x14007000 0x1000>;
+\t\t\tinterrupts = <0 185 8>; /* GIC_SPI 185 = INTID 217, IRQ_TYPE_LEVEL_LOW */
+\t\t\tclocks = <&disp_clk>;
+\t\t\tstatus = \"okay\";
+\t\t}};
+
+\t\trdma0: rdma@14008000 {{
+\t\t\tcompatible = \"mediatek,mt6592-disp-rdma\", \"mediatek,mt2701-disp-rdma\";
+\t\t\treg = <0x14008000 0x1000>;
+\t\t\tinterrupts = <0 184 8>; /* GIC_SPI 184 = INTID 216, IRQ_TYPE_LEVEL_LOW */
+\t\t\tclocks = <&disp_clk>;
+\t\t\t/*
+\t\t\t * No mediatek,rdma-fifo-size: mt2701_rdma_driver_data already
+\t\t\t * says SZ_4K and that is the measured value. The LK never writes
+\t\t\t * RDMA_FIFO_CON at all, so this came out of the stock 3.4
+\t\t\t * kernel's display probe, which writes 0x81000010 to 0x14008030
+\t\t\t * + 0x10 -- FIFO_UNDERFLOW_EN | ((4096 / 16) << 16) | (256 / 16).
+\t\t\t */
 \t\t\tstatus = \"okay\";
 \t\t}};
 
@@ -595,15 +674,49 @@ def generate(sources: dict[str, str]) -> str:
 \t\t\tstatus = \"okay\";
 \t\t}};
 
+\t\tcolor0: color@1400b000 {{
+\t\t\tcompatible = \"mediatek,mt6592-disp-color\", \"mediatek,mt2701-disp-color\";
+\t\t\treg = <0x1400b000 0x1000>;
+\t\t\tclocks = <&disp_clk>;
+\t\t\t/*
+\t\t\t * No interrupts, deliberately. mtk_disp_color_probe asks for
+\t\t\t * none, so declaring one would be decoration. It exists --
+\t\t\t * INTID 220, GIC_SPI 188 -- and this is where to put it if
+\t\t\t * something ever wants it.
+\t\t\t */
+\t\t\tstatus = \"okay\";
+\t\t}};
+
 \t\tdsi: dsi@1400c000 {{
-\t\t\tcompatible = \"j36,mt6592-dsi\";
+\t\t\tcompatible = \"mediatek,mt6592-dsi\", \"mediatek,mt2701-dsi\";
 \t\t\treg = <0x1400c000 0x1000>;
+\t\t\tinterrupts = <0 189 8>; /* GIC_SPI 189 = INTID 221, IRQ_TYPE_LEVEL_LOW */
+\t\t\tclocks = <&disp_clk>, <&disp_clk>, <&dsi_phy>;
+\t\t\tclock-names = \"engine\", \"digital\", \"hs\";
 \t\t\tphys = <&dsi_phy>;
 \t\t\tphy-names = \"dphy\";
 \t\t\t#address-cells = <1>;
 \t\t\t#size-cells = <0>;
 \t\t\tj36,preserve-lk-state;
-\t\t\tstatus = \"disabled\";
+\t\t\tstatus = \"okay\";
+
+\t\t\t/*
+\t\t\t * The OF graph is not optional here and it is not documentation:
+\t\t\t * mtk_dsi_host_attach calls devm_drm_of_get_bridge(dev,
+\t\t\t * dev->of_node, 0, 0), which resolves port 0 / endpoint 0 of THIS
+\t\t\t * node to the panel. A port with no reg counts as port 0, so the
+\t\t\t * bare port/endpoint pair below is enough.
+\t\t\t *
+\t\t\t * And component_add for the DSI happens inside that same
+\t\t\t * host_attach, so the DRM master never completes until the panel
+\t\t\t * driver calls mipi_dsi_attach(). No panel module, no
+\t\t\t * /dev/dri/card0.
+\t\t\t */
+\t\t\tport {{
+\t\t\t\tdsi_out: endpoint {{
+\t\t\t\t\tremote-endpoint = <&panel_in>;
+\t\t\t\t}};
+\t\t\t}};
 
 \t\t\tpanel: panel@0 {{
 \t\t\t\tcompatible = \"j36,jd9365-qc-190227\";
@@ -611,10 +724,35 @@ def generate(sources: dict[str, str]) -> str:
 \t\t\t\tlabel = \"J36 Ultra JD9365 QC 190227\";
 \t\t\t\treset-gpios = <&gpio {reset_gpio} {GPIO_ACTIVE_LOW}>;
 \t\t\t\tmediatek,power-gpios = <&gpio {power0_gpio} 0>, <&gpio {power1_gpio} 0>;
-\t\t\t\tbacklight = <&backlight>;
+\t\t\t\t/*
+\t\t\t\t * No backlight phandle, and that is a fix, not an omission.
+\t\t\t\t * drm_panel_of_backlight -> of_find_backlight returns
+\t\t\t\t * -EPROBE_DEFER for as long as the referenced node has not
+\t\t\t\t * registered a backlight device, and the backlight node below is
+\t\t\t\t * disabled precisely because its PWM and GPIO providers have no
+\t\t\t\t * drivers in this profile. A phandle here would defer the panel
+\t\t\t\t * forever, and with it the whole DRM master. The LK switched this
+\t\t\t\t * backlight on before Linux started and nothing here turns it off.
+\t\t\t\t *
+\t\t\t\t * reset-gpios and mediatek,power-gpios are the same story in
+\t\t\t\t * reverse: they record what the LK does, and the panel driver
+\t\t\t\t * must NOT resolve them with gpiod, because &gpio is
+\t\t\t\t * j36,mt6592-gpio and has no driver either.
+\t\t\t\t */
 \t\t\t\tdsi,lanes = <{lanes}>;
 \t\t\t\tdsi,format = <0>; /* MIPI_DSI_FMT_RGB888 */
-\t\t\t\tdsi,flags = <5>;  /* VIDEO | VIDEO_SYNC_PULSE */
+\t\t\t\t/*
+\t\t\t\t * VIDEO only -- 1, not the 5 this used to say.
+\t\t\t\t *
+\t\t\t\t * The LK runs this panel in SYNC_EVENT video mode: dsi_drv.c's
+\t\t\t\t * g_lcm.mode is DSI_SYNC_EVENT_VDO_MODE and the measured
+\t\t\t\t * DSI_MODE_CTRL handoff value is 0x2. mtk_dsi_set_mode picks
+\t\t\t\t * SYNC_EVENT (2) only when MIPI_DSI_MODE_VIDEO is set and
+\t\t\t\t * MIPI_DSI_MODE_VIDEO_SYNC_PULSE is clear, so asking for
+\t\t\t\t * SYNC_PULSE here would have programmed mode 3 and disagreed
+\t\t\t\t * with the bootloader on a panel that demonstrably works.
+\t\t\t\t */
+\t\t\t\tdsi,flags = <1>;  /* MIPI_DSI_MODE_VIDEO */
 \t\t\t\tmediatek,dsi-pll-clock-mhz = <{pll_mhz}>;
 \t\t\t\tclock-frequency = <{pixel_clock}>;
 \t\t\t\thactive = <{width}>;
@@ -677,7 +815,30 @@ def generate(sources: dict[str, str]) -> str:
 \t\t\t\t\tde-active = <1>;
 \t\t\t\t\tpixelclk-active = <0>;
 \t\t\t\t}};
+
+\t\t\t\tport {{
+\t\t\t\t\tpanel_in: endpoint {{
+\t\t\t\t\t\tremote-endpoint = <&dsi_out>;
+\t\t\t\t\t}};
+\t\t\t\t}};
 \t\t\t}};
+\t\t}};
+
+\t\tmutex: mutex@1400e000 {{
+\t\t\tcompatible = \"mediatek,mt6592-disp-mutex\", \"mediatek,mt2701-disp-mutex\";
+\t\t\treg = <0x1400e000 0x1000>;
+\t\t\tclocks = <&disp_clk>;
+\t\t\t/*
+\t\t\t * No interrupts: mtk_mutex_probe asks for none. INTID 225,
+\t\t\t * GIC_SPI 193, if one is ever wanted.
+\t\t\t *
+\t\t\t * This node is what makes the handoff exact. mt2701_mutex_mod[]
+\t\t\t * numbers OVL0 = 3, COLOR0 = 7 and RDMA0 = 10, so the MOD word
+\t\t\t * this driver builds for the OVL0 -> RDMA0 -> COLOR0 -> DSI0 path
+\t\t\t * is 0x488, and mt2712_mutex_sof[MUTEX_SOF_DSI0] is 1 -- both the
+\t\t\t * LK's measured MUTEX0_MOD and MUTEX0_SOF.
+\t\t\t */
+\t\t\tstatus = \"okay\";
 \t\t}};
 \t}};
 
@@ -724,6 +885,49 @@ def generate(sources: dict[str, str]) -> str:
 \t\tcompatible = \"fixed-clock\";
 \t\t#clock-cells = <0>;
 \t\tclock-frequency = <200000000>;
+\t}};
+
+\t/*
+\t * One clock for the whole display pipe, and its rate is honestly zero.
+\t *
+\t * OVL0, RDMA0, COLOR0, MUTEX and the DSI host's \"engine\" and \"digital\"
+\t * clocks are all mandatory -- each of those probes returns the error from
+\t * devm_clk_get -- and every one of them is used for exactly one thing:
+\t * clk_prepare_enable, which on a fixed-clock is a no-op. Not one of them is
+\t * ever rate-queried. The only clk_get_rate calls in the whole mediatek DRM
+\t * directory are in mtk_dpi, mtk_disp_merge and mtk_hdmi, and none of those
+\t * three is on this path; the only clk_set_rate is on the DSI's \"hs\" clock,
+\t * which is the MIPI-TX PHY and not this node.
+\t *
+\t * So there is nothing here to get right, exactly as with the Mali clocks
+\t * below, and for the same reason: MT6592 has no clock driver in mainline,
+\t * the LK ungated MMSYS before it drew the boot logo, and no rate in this
+\t * pipe is programmable from here. A plausible megahertz number would be an
+\t * invention. Six phandles into one node rather than six identical nodes,
+\t * because six copies of nothing is still nothing.
+\t */
+\tdisp_clk: clock-disp {{
+\t\tcompatible = \"fixed-clock\";
+\t\t#clock-cells = <0>;
+\t\tclock-frequency = <0>;
+\t}};
+
+\t/*
+\t * The MIPI-TX PLL's reference, and this one is a real number.
+\t *
+\t * mtk_mipi_tx_probe takes it with devm_clk_get(dev, NULL) and uses only
+\t * __clk_get_name() on it, to name the PLL's parent; the PCW arithmetic in
+\t * mt8173_mipi_tx_pll_prepare hardcodes 26000000 rather than reading it. It
+\t * is still 26 MHz and not zero, because that hardcoded reference is the one
+\t * this SoC actually has: mainline computes
+\t * pcw = ((data_rate * 2 * txdiv) << 24) / 26000000 and the LK computes
+\t * pcw = data_Rate * txdiv / 13 with data_Rate in MHz, which is the same
+\t * quotient, and the two txdiv ladders agree at every step.
+\t */
+\tdsi_ref_clk: clock-dsi-ref {{
+\t\tcompatible = \"fixed-clock\";
+\t\t#clock-cells = <0>;
+\t\tclock-frequency = <26000000>;
 \t}};
 
 \t/*

@@ -57,27 +57,38 @@ elif [[ "${J36_UPDATE_KERNEL:-0}" == 1 ]]; then
     git -C "$KERNEL_SRC" reset --hard FETCH_HEAD
 fi
 
-# ── The one change this build makes to the kernel itself ──────────────────────
+# ── The two changes this build makes to the kernel itself ─────────────────────
 #
 # mtk-sd carries no compatible for MT6592 and refuses to probe without pinctrl;
 # linux/0001-mtk-sd-mt6592.patch fixes both, and its header records why neither
 # can be worked around from the device tree instead.
+#
+# linux/0002-drm-mediatek-mt6592.patch is the display half, and it is four hunks
+# in two files because MT6592's DDP is the MT2701/MT8173 generation: only the
+# pipeline order and the OVL colour-format numbering are genuinely this SoC's own.
+# Its header records, register by register, what was measured against the MVII LK
+# and against the stock 3.4 kernel to prove the rest of the mt2701 driver data
+# exact.  Everything else that port needs is device tree, not code.
 #
 # Applied idempotently rather than from a stamp file, because this checkout
 # persists across runs and a stamp can outlive the tree it describes -- a
 # J36_UPDATE_KERNEL reset above throws the patch away and would leave the stamp
 # claiming otherwise.  `apply --reverse --check' succeeds only when the change is
 # already present, so the tree is asked instead of a bookkeeping file.
-MTKSD_PATCH="$ROOT/device/j36-ultra/linux/0001-mtk-sd-mt6592.patch"
-[[ -f "$MTKSD_PATCH" ]] || die "missing kernel patch: $MTKSD_PATCH"
-if git -C "$KERNEL_SRC" apply --reverse --check "$MTKSD_PATCH" 2>/dev/null; then
-    log "The mtk-sd MT6592 patch is already applied"
-elif git -C "$KERNEL_SRC" apply --check "$MTKSD_PATCH" 2>/dev/null; then
-    log "Applying the mtk-sd MT6592 patch"
-    git -C "$KERNEL_SRC" apply "$MTKSD_PATCH"
-else
-    die "0001-mtk-sd-mt6592.patch neither applies to nor is applied in $KERNEL_SRC; refresh it against $KERNEL_BRANCH"
-fi
+apply_kernel_patch() {
+    local patch="$ROOT/device/j36-ultra/linux/$1" what="$2"
+    [[ -f "$patch" ]] || die "missing kernel patch: $patch"
+    if git -C "$KERNEL_SRC" apply --reverse --check "$patch" 2>/dev/null; then
+        log "The $what patch is already applied"
+    elif git -C "$KERNEL_SRC" apply --check "$patch" 2>/dev/null; then
+        log "Applying the $what patch"
+        git -C "$KERNEL_SRC" apply "$patch"
+    else
+        die "$1 neither applies to nor is applied in $KERNEL_SRC; refresh it against $KERNEL_BRANCH"
+    fi
+}
+apply_kernel_patch 0001-mtk-sd-mt6592.patch "mtk-sd MT6592"
+apply_kernel_patch 0002-drm-mediatek-mt6592.patch "mtk_drm MT6592 display"
 
 mkdir -p "$KERNEL_OUT"
 if [[ ! -f "$KERNEL_OUT/.config" ]]; then
@@ -239,28 +250,66 @@ done
 # only piece that has to be resident, and a modular DRM core would mean loading
 # four more .ko in a fixed order from a shell that has no modprobe.
 #
+# ── The display: mtk_drm, modular for the same reason and one more ─────────────
+#
+# mediatek-drm is the KMS half of the pair: lima renders, mtk_drm scans out, and
+# Mesa's kmsro glue needs both card nodes to exist before EGL can present
+# anything.  MT6592's DDP is the MT2701/MT8173 generation, so the driver is almost
+# entirely reused -- see linux/0002-drm-mediatek-mt6592.patch and the display
+# section of generate_dts.py, which between them record every register that was
+# measured to prove it.
+#
+# Four symbols, and every one of them =m:
+#
+#   DRM_MEDIATEK        mediatek-drm.ko, which contains mtk_dsi
+#   MTK_MMSYS           two modules from one symbol, mtk-mmsys.ko and mtk-mutex.ko
+#   PHY_MTK_MIPI_DSI    phy-mtk-mipi-dsi-drv.ko, note the -drv
+#
+# MTK_MMSYS is the one that has to be forced.  It is `default ARCH_MEDIATEK', so
+# it is =y in this configuration today and mtk-mmsys is already inside vmlinux --
+# invisible only because no node in the old device tree carried a compatible it
+# matched.  The moment the display nodes land it would bind at boot, register the
+# "mediatek-drm" and "clk-mt2701-mm" platform devices as its children, and the
+# claim that a default boot is byte-identical would stop being true.  As a module
+# it binds nothing until /init insmods it.
+#
+# DRM_MEDIATEK_DP and DRM_MEDIATEK_HDMI stay off: neither block exists on this
+# SoC, and the HDMI one `select's SND_SOC_HDMI_CODEC.  The prune below takes them
+# because the allowlist names DRM_MEDIATEK exactly, not a prefix.
+#
 # The prune matters more here than in the ARCH loop above: multi_v7_defconfig
 # turns on a dozen other DRM drivers, and one of them, DRM_SIMPLEDRM, matches the
 # very `simple-framebuffer' node FB_SIMPLE is driving.  Two drivers bidding for
 # one panel is a lottery, and simpledrm wins it by calling
 # drm_aperture_acquire_from_firmware() and evicting simplefb -- which is the
-# working display.  So every DRM_* symbol that is not lima is turned off, by
-# enumeration rather than by name, and DRM_SIMPLEDRM is then refused outright
-# after olddefconfig.  The helper symbols lima `select's are swept up by this too;
-# that is harmless, because a selected symbol's value is computed from the select
-# and olddefconfig puts them back.
+# working display.  So every DRM_* symbol that is not lima or mediatek is turned
+# off, by enumeration rather than by name, and DRM_SIMPLEDRM is then refused
+# outright after olddefconfig.  The helper symbols those two `select' are swept up
+# by this too; that is harmless, because a selected symbol's value is computed
+# from the select and olddefconfig puts them back, and DRM_BRIDGE and
+# DRM_PANEL_BRIDGE are `def_bool y' and cannot be turned off at all.
 config_y DRM
 while IFS='=' read -r option _value; do
     symbol="${option#CONFIG_}"
     case "$symbol" in
-        DRM|DRM_LIMA) ;;
+        DRM|DRM_LIMA|DRM_MEDIATEK) ;;
         DRM_*) config_n "$symbol" ;;
     esac
 done < <(grep -E '^CONFIG_DRM_[A-Z0-9_]+=(y|m)$' "$CONFIG")
 config_m DRM_LIMA
-# lima registers no CRTC, so there is no framebuffer for DRM to emulate; this
-# symbol is `default FB' and would otherwise arrive on the back of FB_SIMPLE and
-# drag DRM_KMS_HELPER in for nothing.
+config_m MTK_MMSYS
+config_m PHY_MTK_MIPI_DSI
+config_m DRM_MEDIATEK
+# Off, and it is doing real work switched off.
+#
+# lima registers no CRTC, so for lima there is nothing to emulate; the symbol is
+# `default FB' and would otherwise arrive on the back of FB_SIMPLE and drag
+# DRM_KMS_HELPER in for nothing.  mediatek-drm does register a CRTC, and leaving
+# this off is what keeps the two display paths out of each other's way: with no
+# fbdev emulation mtk_drm creates no second /dev/fb, so /dev/fb0 stays simplefb's
+# window onto the LK's framebuffer and the console keeps working, and mtk_drm
+# programs no register at all until userspace opens /dev/dri/card0 and sets a
+# mode.  Loading the modules is therefore visually a no-op.
 config_n DRM_FBDEV_EMULATION
 # mfgpower reaches the SPM through /dev/mem.  STRICT_DEVMEM may stay on: it
 # blocks RAM, not MMIO, and mem.c maps a non-RAM pfn opened O_SYNC as
@@ -320,6 +369,16 @@ for wanted_module in DRM_LIMA DRM_SCHED DRM_GEM_SHMEM_HELPER; do
         die "CONFIG_${wanted_module}=m was not selected; lima must be a module because the MFG power domain is gated until /init runs mfgpower"
 done
 
+# The display set, and =m matters here for a different reason: these bind real
+# device tree nodes, so a =y among them takes the panel on every boot whether the
+# card carries the payload or not. MTK_MMSYS is the one to watch -- it is
+# `default ARCH_MEDIATEK' and comes back as =y from any olddefconfig that has
+# forgotten the config_m above.
+for wanted_module in DRM_MEDIATEK MTK_MMSYS PHY_MTK_MIPI_DSI; do
+    grep -q "^CONFIG_${wanted_module}=m$" "$CONFIG" || \
+        die "CONFIG_${wanted_module}=m was not selected; the mtk_drm display path must be modular so the default boot binds none of it"
+done
+
 # Off on purpose, and worth failing over: WIRELESS defaults to y under NET, and
 # an accidental =y here drags cfg80211 and a WLAN menu into an image with 2.5 MiB
 # of slack in a fixed partition.
@@ -339,10 +398,22 @@ for refused in DRM_SIMPLEDRM; do
     fi
 done
 
+# Neither block is on this SoC. DRM_MEDIATEK_HDMI additionally `select's
+# SND_SOC_HDMI_CODEC, which is how a display driver quietly turns into an audio
+# subsystem in an image with a fixed partition and 2.5 MiB of slack.
+for refused in DRM_MEDIATEK_HDMI DRM_MEDIATEK_DP; do
+    if grep -qE "^CONFIG_${refused}=(y|m)$" "$CONFIG"; then
+        die "CONFIG_${refused} came back after olddefconfig; MT6592 has neither block"
+    fi
+done
+
 # Print the whole DRM set rather than trusting the assertions above to have named
 # everything that matters. This is the line to read when a kernel bump changes
-# what `select' pulls in: it is four symbols today.
-log "DRM configuration: $(grep -E '^CONFIG_DRM.*=(y|m)$' "$CONFIG" | tr '\n' ' ')"
+# what `select' pulls in. MTK_ and PHY_MTK_ are in the same line because the
+# display path spans three directories and its Kconfig symbols do not share a
+# prefix -- mediatek-drm is useless without mtk-mmsys, mtk-mutex and the MIPI-TX
+# PHY, and none of those three is a DRM_ symbol.
+log "DRM configuration: $(grep -E '^CONFIG_(DRM|MTK_|PHY_MTK_).*=(y|m)$' "$CONFIG" | tr '\n' ' ')"
 
 log "Building the incremental ARMv7 kernel and its symbol table"
 export CCACHE_DIR="${CCACHE_DIR:-$ROOT/Arkbuild_ccache}"
@@ -416,7 +487,7 @@ log "Regenerating the J36 DTB from the current PowerEngine Drivers"
 J36_DRIVERS_DIR="$DRIVERS" J36_DTB_OUT_DIR="$DTB_OUT" \
     "$ROOT/build-j36-ultra-dtb.sh"
 
-log "Building only the J36 input adapter module"
+log "Building the out-of-tree J36 modules: the input adapter and the panel"
 mkdir -p "$MODULE_SRC"
 rsync -a --delete "$ROOT/device/j36-ultra/linux/" "$MODULE_SRC/"
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
@@ -426,6 +497,13 @@ KERNEL_RELEASE="$(make -s -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
 MODULE="$MODULE_SRC/j36_mt6592_input.ko"
 [[ -s "$MODULE" ]] || die "input module was not produced"
 verify_arm_elf "$MODULE" "the input module"
+# The panel module is not part of the initramfs and not part of a default boot; it
+# is staged with the rest of the mtkdrm payload further down.  It is built here
+# because it is in the same M= directory, and checked here because a missing .ko
+# would otherwise surface as a load.order line that names a file that is not there.
+PANEL_MODULE="$MODULE_SRC/j36_jd9365_panel.ko"
+[[ -s "$PANEL_MODULE" ]] || die "panel module was not produced"
+verify_arm_elf "$PANEL_MODULE" "the panel module"
 fits_in "$DTB_OUT/mt6592-j36-ultra.dtb" $((0x00040000)) "the device tree"
 
 if [[ ! -d "$BUSYBOX_SRC/.git" ]]; then
@@ -561,7 +639,7 @@ show() {
 
 say ""
 say "J36 Ultra ARMv7 bring-up initramfs"
-say "Display stays on the stock-LK framebuffer; native DSI is disabled."
+say "Display: the LK's framebuffer on /dev/fb0. mtk_drm loads only with j36.mtkdrm=1."
 insmod /lib/modules/*/extra/j36_mt6592_input.ko || say "input module load failed"
 
 # ── Hand over to the rootfs on the card, if there is one ─────────────────────
@@ -574,6 +652,7 @@ insmod /lib/modules/*/extra/j36_mt6592_input.ko || say "input module load failed
 root_hint=""
 want_doom=0
 want_lima=0
+want_mtkdrm=0
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         j36.doom|j36.doom=1)
@@ -581,6 +660,9 @@ for arg in $(cat /proc/cmdline); do
             ;;
         j36.lima|j36.lima=1)
             want_lima=1
+            ;;
+        j36.mtkdrm|j36.mtkdrm=1)
+            want_mtkdrm=1
             ;;
         root=/dev/*)
             root_hint="${arg#root=}"
@@ -753,12 +835,58 @@ run_lima() {
     return 0
 }
 
-if [ "$want_doom" = 1 ] || [ "$want_lima" = 1 ]; then
+# ── The display pipe, if the command line asks ────────────────────────────────
+#
+# lima renders and this scans out; Mesa needs both card nodes before EGL can
+# present anything.  Everything here is a module for the same containment reason
+# as lima, plus one of its own: these bind real device tree nodes, so a built-in
+# set would take the panel on every boot whether the card carried the payload or
+# not.  As modules, deleting j36/mtkdrm from the card restores the previous boot
+# exactly, with no reflash.
+#
+# There is no gate program here and there does not need to be one.  MMSYS is
+# already powered and clocked -- the LK drew the boot logo through it -- so
+# nothing in this set reads an unpowered block, which is the failure mode
+# mfgpower exists to prevent for the MFG domain.  What replaces the gate is
+# CONFIG_DRM_FBDEV_EMULATION=n: with no fbdev emulation these modules program no
+# register at all until userspace opens /dev/dri/card0 and sets a mode, so
+# loading them is visually a no-op and /dev/fb0 stays simplefb's window onto the
+# LK's framebuffer.
+#
+# The last line of load.order is the panel, and it is the one to watch.  mtk_dsi
+# calls component_add from inside mtk_dsi_host_attach, which only runs when a
+# mipi_dsi_driver has probed on the panel node and called mipi_dsi_attach() -- so
+# no panel module means no DRM master and no card node, however well the other
+# four loaded.  If /dev/dri stays empty after this, that is the first thing dmesg
+# will say.
+run_mtkdrm() {
+    if [ ! -f /bootfs/j36/mtkdrm/load.order ]; then
+        say "mtkdrm: j36.mtkdrm was asked for but j36/mtkdrm/load.order is not on the card"
+        return 1
+    fi
+    while IFS= read -r ko; do
+        case "$ko" in ''|'#'*) continue ;; esac
+        if insmod "/bootfs/j36/mtkdrm/$ko" >/tmp/insmod.log 2>&1; then
+            say "mtkdrm: loaded $ko"
+        else
+            say "mtkdrm: FAILED to load $ko"
+            show /tmp/insmod.log
+        fi
+    done < /bootfs/j36/mtkdrm/load.order
+    say "DRM devices:"
+    ls -l /dev/dri 2>/dev/null || say "  none"
+    return 0
+}
+
+if [ "$want_doom" = 1 ] || [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ]; then
     if mount_bootfs; then
-        # Doom first: it owns the panel while it runs, and lima leaves a driver
-        # loaded that has no reason to be disturbed by a game exiting.
+        # Doom first: it owns the panel while it runs, and the two driver payloads
+        # leave modules loaded that have no reason to be disturbed by a game
+        # exiting.  mtkdrm last of the three, so that if it does disturb the panel
+        # the two things that were already proved have already run.
         if [ "$want_doom" = 1 ]; then run_doom; fi
         if [ "$want_lima" = 1 ]; then run_lima; fi
+        if [ "$want_mtkdrm" = 1 ]; then run_mtkdrm; fi
         umount /bootfs
     fi
 fi
@@ -1080,10 +1208,27 @@ build_mfgpower() {
     return 0
 }
 
-collect_lima_modules() {
+# collect_modules <label> <order-array> <paths-array> <root>...
+#
+# ONE ROOT IS NOT ENOUGH, AND THAT IS WHY THIS TAKES A LIST.  The walk below
+# follows `modinfo -F depends', which is a SYMBOL relationship, and the display
+# set has a member that no symbol points at: mediatek-drm reaches the MIPI-TX PHY
+# through the generic phy API, so a walk seeded only at mediatek-drm would build a
+# load.order with phy-mtk-mipi-dsi-drv missing from it and mtk_dsi would sit in
+# deferred probe forever with nothing in the log naming the absent module.  The
+# out-of-tree panel module is the same case for the same reason.  So every module
+# that has to be present is named as a root, and the walk's job is only to find
+# what those roots need underneath them and to order the result.
+#
+# Search paths are $KERNEL_OUT and $MODULE_SRC in that order, because the panel
+# is built out-of-tree and is not under the kernel build directory at all.
+collect_modules() {
+    local label="$1"
+    local -n order_ref="$2" paths_ref="$3"
+    shift 3
     local -A ko_path=() ko_deps=() emitted=() builtin=()
-    local -a pending=(lima) deplist=()
-    local name path deps dep ready progress header
+    local -a pending=("$@") roots=("$@") discovery=() deplist=()
+    local name path deps dep ready progress header dir root
 
     # `builtin' is not bookkeeping for its own sake: without it a name that has no
     # .ko is re-searched once per module that depends on it, and each search walks
@@ -1092,32 +1237,47 @@ collect_lima_modules() {
         name="${pending[0]}"
         pending=("${pending[@]:1}")
         if [[ -n "${ko_path[$name]:-}" || -n "${builtin[$name]:-}" ]]; then continue; fi
-        path="$(find "$KERNEL_OUT" -name "$name.ko" -print -quit 2>/dev/null)"
+        path=""
+        for dir in "$KERNEL_OUT" "$MODULE_SRC"; do
+            path="$(find "$dir" -name "$name.ko" -print -quit 2>/dev/null)"
+            [[ -n "$path" ]] && break
+        done
         if [[ -z "$path" ]]; then
             builtin[$name]=1
-            log "lima: $name.ko was not built; its symbols must be in vmlinux"
+            log "$label: $name.ko was not built; its symbols must be in vmlinux"
             continue
         fi
-        header="$(readelf -h "$path" 2>/dev/null)" || { log "lima: cannot read $path"; return 1; }
-        grep -q 'Machine:.*ARM' <<<"$header" || { log "lima: $name.ko is not an ARM object"; return 1; }
+        header="$(readelf -h "$path" 2>/dev/null)" || { log "$label: cannot read $path"; return 1; }
+        grep -q 'Machine:.*ARM' <<<"$header" || { log "$label: $name.ko is not an ARM object"; return 1; }
         ko_path[$name]="$path"
+        discovery+=("$name")
         deps="$(modinfo -F depends "$path" 2>/dev/null || true)"
         ko_deps[$name]="$deps"
         read -ra deplist <<<"${deps//,/ }"
         for dep in "${deplist[@]}"; do pending+=("$dep"); done
     done
 
-    if [[ -z "${ko_path[lima]:-}" ]]; then
-        log "lima: lima.ko was not built even though CONFIG_DRM_LIMA=m was asserted"
-        return 1
-    fi
+    # A root that resolved to nothing is fatal, not a "must be built in": a root is
+    # named here precisely because this payload is useless without it.
+    for root in "${roots[@]}"; do
+        if [[ -z "${ko_path[$root]:-}" ]]; then
+            log "$label: $root.ko was not built even though its Kconfig symbol was asserted =m"
+            return 1
+        fi
+    done
 
-    # Emit dependency-first.  Repeated passes rather than a recursive walk: the
-    # set is four modules deep at most, and a cycle -- which the module loader
+    # Emit dependency-first.  Repeated passes rather than a recursive walk: the set
+    # is a handful of modules deep at most, and a cycle -- which the module loader
     # could not resolve either -- shows up as a pass that emits nothing.
-    while (( ${#LIMA_MODULE_ORDER[@]} < ${#ko_path[@]} )); do
+    #
+    # The inner loop walks `discovery' and not the associative array's own key
+    # order, so the output is deterministic and follows the order the roots were
+    # given.  Insmod order among independent modules does not have to be right --
+    # deferred probe sorts that out -- but a load.order that shuffles between
+    # builds is one more thing to rule out when a boot goes wrong.
+    while (( ${#order_ref[@]} < ${#ko_path[@]} )); do
         progress=0
-        for name in "${!ko_path[@]}"; do
+        for name in "${discovery[@]}"; do
             if [[ -n "${emitted[$name]:-}" ]]; then continue; fi
             ready=1
             read -ra deplist <<<"${ko_deps[$name]//,/ }"
@@ -1126,18 +1286,18 @@ collect_lima_modules() {
             done
             if (( ready )); then
                 emitted[$name]=1
-                LIMA_MODULE_ORDER+=("$name.ko")
-                LIMA_MODULE_PATHS+=("${ko_path[$name]}")
+                order_ref+=("$name.ko")
+                paths_ref+=("${ko_path[$name]}")
                 progress=1
             fi
         done
         if (( progress == 0 )); then
-            log "lima: circular dependency among ${!ko_path[*]}"
+            log "$label: circular dependency among ${!ko_path[*]}"
             return 1
         fi
     done
 
-    log "lima: load order ${LIMA_MODULE_ORDER[*]}"
+    log "$label: load order ${order_ref[*]}"
     return 0
 }
 
