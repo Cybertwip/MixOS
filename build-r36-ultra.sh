@@ -210,23 +210,31 @@ multipass exec "$VM_NAME" -- env \
     DARKOS_R36_STATE_DIR="/home/ubuntu/darkos-r36-state" \
     bash "$VM_BUILD_DIR/device/r36-ultra/build-in-vm.sh"
 
-multipass exec "$VM_NAME" -- bash -lc "
+multipass exec "$VM_NAME" -- bash -lc '
 set -Eeuo pipefail
-STATE_DIR='/home/ubuntu/darkos-r36-state/${STATE_KEY}'
-read -r IMAGE < \$STATE_DIR/latest-image
-cd '$VM_BUILD_DIR'
-[[ -s "\$IMAGE" ]] || { echo "missing image: \$IMAGE" >&2; exit 1; }
-[[ -f "\${IMAGE}.7z.001" ]] || { echo "missing archive: \${IMAGE}.7z.001" >&2; exit 1; }
-7z t "\${IMAGE}.7z.001"
-sudo parted -s "\$IMAGE" print
-cp -f "\${IMAGE}.7z."* '$VM_ARTIFACT_MOUNT/'
-cp -f "\$STATE_DIR/resume.log" '$VM_ARTIFACT_MOUNT/build-r36-ultra-resume.log'
-[[ -f build.log ]] && cp -f build.log '$VM_ARTIFACT_MOUNT/build.log' || true
-if [[ '$COPY_RAW_IMAGE' == '1' ]]; then
-    cp -f "\$IMAGE" '$VM_ARTIFACT_MOUNT/'
+STATE_DIR=$1
+BUILD_DIR=$2
+ARTIFACT_DIR=$3
+COPY_RAW=$4
+read -r IMAGE < "$STATE_DIR/latest-image"
+cd "$BUILD_DIR"
+[[ -s "$IMAGE" ]] || { echo "missing image: $IMAGE" >&2; exit 1; }
+[[ -f "${IMAGE}.7z.001" ]] || { echo "missing archive: ${IMAGE}.7z.001" >&2; exit 1; }
+7z t "${IMAGE}.7z.001"
+sudo parted -s "$IMAGE" print
+cp -f -- "${IMAGE}.7z."* "$ARTIFACT_DIR/"
+cp -f -- "$STATE_DIR/resume.log" "$ARTIFACT_DIR/build-r36-ultra-resume.log"
+[[ -f build.log ]] && cp -f -- build.log "$ARTIFACT_DIR/build.log" || true
+if [[ "$COPY_RAW" == 1 ]]; then
+    cp -f -- "$IMAGE" "$ARTIFACT_DIR/"
 fi
-printf '%s\n' "\$IMAGE" > '$VM_ARTIFACT_MOUNT/latest-image.txt'
-"
+printf "%s\n" "$IMAGE" > "$ARTIFACT_DIR/latest-image.txt"
+sync "$ARTIFACT_DIR"
+' artifact-copy \
+    "/home/ubuntu/darkos-r36-state/${STATE_KEY}" \
+    "$VM_BUILD_DIR" \
+    "$VM_ARTIFACT_MOUNT" \
+    "$COPY_RAW_IMAGE"
 
 log "Build completed and verified."
 log "Artifacts: ${ARTIFACT_DIR}"
