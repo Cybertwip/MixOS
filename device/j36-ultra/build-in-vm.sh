@@ -1889,9 +1889,9 @@ After=systemd-user-sessions.service
 Type=simple
 StandardOutput=journal+console
 StandardError=journal+console
-# The loop counts with `for' and not with a variable on purpose: systemd expands \$FOO
-# in a command line even inside quotes, and whether \$\$ escapes it depends on the
-# version.  Six words and no dollar sign is the same loop with nothing to get wrong.
+# The loop counts with six words and not with a shell variable on purpose: systemd
+# expands \$FOO in a command line even inside quotes, and whether \$\$ escapes it
+# depends on the version.  No dollar sign is the same loop with nothing to get wrong.
 ExecStart=/bin/sh -c 'for i in 1 2 3 4 5 6; do \\
   echo ""; \\
   echo "j36: MixOS dashboard did not start -- its payload is not on this card."; \\
