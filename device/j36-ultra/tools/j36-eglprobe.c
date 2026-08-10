@@ -23,6 +23,18 @@
  *     SDL's KMSDRM backend will scan out (SDL_kmsdrmvideo.c:1197) -- can be made
  *     current, and what glGetString then answers.
  *
+ * With -s it asks the same three questions of the surfaceless platform, with no
+ * DRM device and no gbm in the picture, which is worth a row because of what
+ * EGL_BAD_ALLOC means.  Mesa maps __DRI_CTX_ERROR_NO_MEMORY to EGL_BAD_ALLOC and
+ * that is the bucket it uses whenever the driver's own context creation returns
+ * NULL -- including when _mesa_compute_version() ends up at 0 because the
+ * extensions that API requires are not all there.  So a BAD_ALLOC says "the
+ * driver said no", not which API it cannot do.  Run -s with
+ * LIBGL_ALWAYS_SOFTWARE=1 and the driver is swrast, which does desktop GL, GLES1
+ * and GLES2 on any machine: a row that fails there fails for a reason that has
+ * nothing to do with this SoC, and a row that works there but not on the DRM
+ * nodes is lima's.
+ *
  * It probes the display node and the render node separately, because on this SoC
  * they are different chips: /dev/dri/card0 is mtk_drm (display, no GPU) and
  * /dev/dri/renderD128 is lima (GPU, no scanout), and Mesa bridges them with
@@ -50,8 +62,9 @@
  * gets.  So this measures the libraries ES will use, not the ones Debian
  * shipped.
  *
- * Exit status: 0 if some API created a context on some node, 1 otherwise.
- * Nothing is written anywhere; stdout is the whole output.
+ * Usage: eglprobe [-s | /dev/dri/node ...].  With no arguments it probes card0
+ * and renderD128.  Exit status: 0 if some API created a context on some display,
+ * 1 otherwise.  Nothing is written anywhere; stdout is the whole output.
  */
 
 #define _GNU_SOURCE
@@ -97,6 +110,8 @@ typedef int32_t EGLint;
 #define EGL_OPENGL_API             0x30A2
 
 #define EGL_PLATFORM_GBM_KHR       0x31D7
+#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
+#define EGL_DONT_CARE              ((EGLint)-1)
 
 #define GL_VERSION                 0x1F02
 #define GL_EXTENSIONS              0x1F03
@@ -266,6 +281,115 @@ static const struct api APIS[] = {
     { "ES2", EGL_OPENGL_ES_API, EGL_OPENGL_ES2_BIT, 2 },
 };
 
+/*
+ * Try each API on an initialised display and build up the one-line verdict.
+ * gbm == NULL means there is no native window to be had, so the context is taken
+ * current against EGL_NO_SURFACE instead -- what the surfaceless platform is for.
+ * Returns the number of APIs that produced a context.
+ */
+static int try_apis(EGLDisplay dpy, struct gbm_device *gbm, int scanout)
+{
+    EGLint e;
+    int wins = 0;
+    size_t a;
+
+    line[0] = '\0';
+    line_n = 0;
+
+    for (a = 0; a < sizeof(APIS) / sizeof(APIS[0]); a++) {
+        const struct api *api = &APIS[a];
+        EGLint attr[] = {
+            EGL_RED_SIZE,        8,
+            EGL_GREEN_SIZE,      8,
+            EGL_BLUE_SIZE,       8,
+            EGL_DEPTH_SIZE,      24,
+            EGL_RENDERABLE_TYPE, api->renderable,
+            /* EGL_WINDOW_BIT is eglChooseConfig's default, so a surfaceless
+             * display -- whose configs are pbuffer-only -- has to be told not to
+             * care or every row would come back nocfg for the wrong reason. */
+            EGL_SURFACE_TYPE,    gbm ? EGL_WINDOW_BIT : EGL_DONT_CARE,
+            EGL_NONE
+        };
+        EGLint cattr[] = { EGL_CONTEXT_CLIENT_VERSION, api->client_version, EGL_NONE };
+        EGLConfig pick[64], cfg;
+        EGLint count = 0, i;
+        EGLContext ctx;
+        struct gbm_surface *gs = NULL;
+        EGLSurface surf = NULL;
+
+        eglclear();
+        if (!p_eglBindAPI(api->bind)) {
+            appendf(" %s=nobind", api->name);
+            continue;
+        }
+        if (!p_eglChooseConfig(dpy, attr, pick, 64, &count) || count == 0) {
+            appendf(" %s=nocfg", api->name);
+            continue;
+        }
+
+        /*
+         * Prefer the ARGB8888 visual, which is what SDL_EGL_SetRequiredVisualId
+         * pins for a KMSDRM window, and fall back to the first config the way
+         * SDL does when nothing carries that visual.
+         */
+        cfg = pick[0];
+        for (i = 0; i < count; i++) {
+            EGLint vis = 0;
+            p_eglGetConfigAttrib(dpy, pick[i], EGL_NATIVE_VISUAL_ID, &vis);
+            if ((uint32_t)vis == FOURCC_ARGB8888) {
+                cfg = pick[i];
+                break;
+            }
+        }
+
+        ctx = p_eglCreateContext(dpy, cfg, NULL,
+                                 api->client_version ? cattr : NULL);
+        if (!ctx) {
+            e = p_eglGetError();
+            appendf(" %s=0x%04x(%s)", api->name, e, eglerr(e));
+            continue;
+        }
+        wins++;
+        appendf(" %s=ctx", api->name);
+
+        /*
+         * A context alone is not what ES needs; it needs glGetString to answer
+         * on a current one.  So take it the whole way: an ARGB8888 gbm surface
+         * the size of the panel, a window surface on it, make current, ask.
+         */
+        if (gbm) {
+            gs = p_gbm_surface_create(gbm, 640, 480, FOURCC_ARGB8888,
+                                      scanout ? (GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING)
+                                              : GBM_BO_USE_RENDERING);
+            surf = gs ? p_eglCreateWindowSurface(dpy, cfg, gs, NULL) : NULL;
+        }
+        if (gbm && !gs) {
+            appendf("/nogbm");
+        } else if (gbm && !surf) {
+            e = p_eglGetError();
+            appendf("/srf0x%04x", e);
+        } else if (!p_eglMakeCurrent(dpy, surf, surf, ctx)) {
+            e = p_eglGetError();
+            appendf("/cur0x%04x", e);
+        } else {
+            const unsigned char *(*gl_get_string)(unsigned int) =
+                (const unsigned char *(*)(unsigned int))
+                    p_eglGetProcAddress("glGetString");
+            const unsigned char *ver = gl_get_string ? gl_get_string(GL_VERSION) : NULL;
+            const unsigned char *ext = gl_get_string ? gl_get_string(GL_EXTENSIONS) : NULL;
+            appendf("/cur \"%s\" ext=%s", ver ? (const char *)ver : "NULL",
+                    ext ? "ok" : "NULL");
+            p_eglMakeCurrent(dpy, NULL, NULL, NULL);
+        }
+        if (surf)
+            p_eglDestroySurface(dpy, surf);
+        if (gs)
+            p_gbm_surface_destroy(gs);
+        p_eglDestroyContext(dpy, ctx);
+    }
+    return wins;
+}
+
 /* Returns the number of APIs that produced a context on this device. */
 static int probe(const char *path, int scanout)
 {
@@ -275,10 +399,6 @@ static int probe(const char *path, int scanout)
     const char *how = "getdisplay";
     struct gbm_device *gbm;
     int fd, wins = 0;
-    size_t a;
-
-    line[0] = '\0';
-    line_n = 0;
 
     printf("== %s\n", path);
 
@@ -356,98 +476,54 @@ static int probe(const char *path, int scanout)
         printf("eglGetConfigs: none\n");
     }
 
-    for (a = 0; a < sizeof(APIS) / sizeof(APIS[0]); a++) {
-        const struct api *api = &APIS[a];
-        EGLint attr[] = {
-            EGL_RED_SIZE,        8,
-            EGL_GREEN_SIZE,      8,
-            EGL_BLUE_SIZE,       8,
-            EGL_DEPTH_SIZE,      24,
-            EGL_RENDERABLE_TYPE, api->renderable,
-            EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
-            EGL_NONE
-        };
-        EGLint cattr[] = { EGL_CONTEXT_CLIENT_VERSION, api->client_version, EGL_NONE };
-        EGLConfig pick[64], cfg;
-        EGLint count = 0, i;
-        EGLContext ctx;
-        struct gbm_surface *gs;
-        EGLSurface surf;
-
-        eglclear();
-        if (!p_eglBindAPI(api->bind)) {
-            appendf(" %s=nobind", api->name);
-            continue;
-        }
-        if (!p_eglChooseConfig(dpy, attr, pick, 64, &count) || count == 0) {
-            appendf(" %s=nocfg", api->name);
-            continue;
-        }
-
-        /*
-         * Prefer the ARGB8888 visual, which is what SDL_EGL_SetRequiredVisualId
-         * pins for a KMSDRM window, and fall back to the first config the way
-         * SDL does when nothing carries that visual.
-         */
-        cfg = pick[0];
-        for (i = 0; i < count; i++) {
-            EGLint vis = 0;
-            p_eglGetConfigAttrib(dpy, pick[i], EGL_NATIVE_VISUAL_ID, &vis);
-            if ((uint32_t)vis == FOURCC_ARGB8888) {
-                cfg = pick[i];
-                break;
-            }
-        }
-
-        ctx = p_eglCreateContext(dpy, cfg, NULL,
-                                 api->client_version ? cattr : NULL);
-        if (!ctx) {
-            e = p_eglGetError();
-            appendf(" %s=0x%04x(%s)", api->name, e, eglerr(e));
-            continue;
-        }
-        wins++;
-        appendf(" %s=ctx", api->name);
-
-        /*
-         * A context alone is not what ES needs; it needs glGetString to answer
-         * on a current one.  So take it the whole way: an ARGB8888 gbm surface
-         * the size of the panel, a window surface on it, make current, ask.
-         */
-        gs = p_gbm_surface_create(gbm, 640, 480, FOURCC_ARGB8888,
-                                  scanout ? (GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING)
-                                          : GBM_BO_USE_RENDERING);
-        surf = gs ? p_eglCreateWindowSurface(dpy, cfg, gs, NULL) : NULL;
-        if (!gs) {
-            appendf("/nogbm");
-        } else if (!surf) {
-            e = p_eglGetError();
-            appendf("/srf0x%04x", e);
-        } else if (!p_eglMakeCurrent(dpy, surf, surf, ctx)) {
-            e = p_eglGetError();
-            appendf("/cur0x%04x", e);
-        } else {
-            const unsigned char *(*gl_get_string)(unsigned int) =
-                (const unsigned char *(*)(unsigned int))
-                    p_eglGetProcAddress("glGetString");
-            const unsigned char *ver = gl_get_string ? gl_get_string(GL_VERSION) : NULL;
-            const unsigned char *ext = gl_get_string ? gl_get_string(GL_EXTENSIONS) : NULL;
-            appendf("/cur \"%s\" ext=%s", ver ? (const char *)ver : "NULL",
-                    ext ? "ok" : "NULL");
-            p_eglMakeCurrent(dpy, NULL, NULL, NULL);
-        }
-        if (surf)
-            p_eglDestroySurface(dpy, surf);
-        if (gs)
-            p_gbm_surface_destroy(gs);
-        p_eglDestroyContext(dpy, ctx);
-    }
+    wins = try_apis(dpy, gbm, scanout);
     printf("ctx:%s\n", line);
 
     p_eglTerminate(dpy);
 out_gbm:
     p_gbm_device_destroy(gbm);
     close(fd);
+    return wins;
+}
+
+/*
+ * The same three questions with no DRM device and no gbm anywhere in the path.
+ * Run by the caller with LIBGL_ALWAYS_SOFTWARE=1, so the driver underneath is
+ * swrast, which does desktop GL, GLES1 and GLES2 on any machine: this row says
+ * whether the Mesa in the payload can build those contexts at all, which is the
+ * half of a BAD_ALLOC that the DRM nodes cannot tell us.
+ */
+static int probe_surfaceless(void)
+{
+    EGLDisplay dpy = NULL;
+    EGLint major = 0, minor = 0, e;
+    int wins;
+
+    printf("== surfaceless\n");
+
+    if (p_eglGetPlatformDisplayEXT)
+        dpy = p_eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, NULL, NULL);
+    if (!dpy && p_eglGetPlatformDisplay)
+        dpy = p_eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, NULL, NULL);
+    if (!dpy) {
+        e = p_eglGetError();
+        printf("no display: 0x%04x %s\n", e, eglerr(e));
+        return 0;
+    }
+    if (!p_eglInitialize(dpy, &major, &minor)) {
+        e = p_eglGetError();
+        printf("eglInitialize: 0x%04x %s\n", e, eglerr(e));
+        return 0;
+    }
+
+    printf("egl %d.%d surfaceless vendor=%s apis=%s\n", major, minor,
+           p_eglQueryString(dpy, EGL_VENDOR) ?: "?",
+           p_eglQueryString(dpy, EGL_CLIENT_APIS) ?: "?");
+
+    wins = try_apis(dpy, NULL, 0);
+    printf("ctx:%s\n", line);
+
+    p_eglTerminate(dpy);
     return wins;
 }
 
@@ -461,8 +537,12 @@ int main(int argc, char **argv)
         return 1;
 
     if (argc > 1) {
-        for (i = 1; i < argc; i++)
-            wins += probe(argv[i], strstr(argv[i], "/card") != NULL);
+        for (i = 1; i < argc; i++) {
+            if (!strcmp(argv[i], "-s"))
+                wins += probe_surfaceless();
+            else
+                wins += probe(argv[i], strstr(argv[i], "/card") != NULL);
+        }
     } else {
         /* Display node first: it is the one SDL will actually be handed. */
         wins += probe("/dev/dri/card0", 1);

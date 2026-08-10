@@ -1030,6 +1030,15 @@ setup_es_gl() {
     if [ -f /bootfs/j36/eglprobe ]; then
         if cp /bootfs/j36/eglprobe /newroot/run/j36/eglprobe; then
             chmod 0755 /newroot/run/j36/eglprobe
+            # The drop-in tees the probe's output to a file so ExecStopPost can
+            # print it again after ES's own spew has scrolled past.  emulation-
+            # station.service is User=ark and this directory is root-owned 0755,
+            # so tee could not create that file -- it said "permission denied"
+            # and the repeat had nothing to print.  Create it here, where we are
+            # root, and let anyone write it.  A log in a tmpfs that is thrown
+            # away on reboot does not need to be guarded.
+            : > /newroot/run/j36/eglprobe.log
+            chmod 0666 /newroot/run/j36/eglprobe.log
         else
             say "es: could not copy the EGL probe"
         fi
