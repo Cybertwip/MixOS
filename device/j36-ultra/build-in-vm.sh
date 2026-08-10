@@ -151,9 +151,21 @@ done
 # BTRFS because the rootfs this card already carries is btrfs: dArkOS's own
 # scripts/setup_partition.sh sets ROOT_FILESYSTEM_FORMAT="btrfs". EXT4 because a
 # hand-made card usually is not, and /init tries both.
+#
+# EXFAT and VFAT are not for /init -- they are the other two partitions on the
+# same card, and the rootfs mounts them itself.  finishing_touches.sh writes the
+# post-expansion fstab as
+#
+#   LABEL=BOOT /boot vfat defaults 0 2
+#   LABEL=EASYROMS /roms exfat defaults,auto,umask=000,... 0 0
+#
+# and firstboot installs it over /etc/fstab as its last act, so from the second
+# boot onwards this kernel is asked for both.  Neither entry carries nofail, so a
+# filesystem the kernel does not know is not a missing ROMs directory: local-fs
+# fails, and systemd takes a machine with no keyboard driver into emergency mode.
 for symbol in \
     BLOCK BLK_DEV MMC MMC_BLOCK MMC_MTK REGULATOR REGULATOR_FIXED_VOLTAGE \
-    EXT4_FS BTRFS_FS; do
+    EXT4_FS BTRFS_FS EXFAT_FS VFAT_FS; do
     config_y "$symbol"
 done
 
@@ -199,6 +211,15 @@ make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
 # asserted =y and not =m on purpose: a module for the driver that mounts the
 # filesystem the modules live on cannot be loaded.
 #
+# MEDIATEK_WATCHDOG is in the list as the reboot path, not as a watchdog
+# feature: it is the only thing that registers a restart handler on this SoC, and
+# without it `reboot' ends in "Reboot failed -- System halted". It arrives from
+# multi_v7_defconfig rather than from a config_y here, which is exactly the kind
+# of symbol a future ARCH prune would take out silently. The two NLS charsets go
+# with EXFAT_FS and VFAT_FS: exfat's default iocharset is utf8 and vfat's
+# codepage is 437, and a mount whose charset is missing fails as surely as one
+# whose filesystem is.
+#
 # This list is the real fix for the systemd freeze, not the NET=y above. UNIX was
 # already in the enable list and had been silently dropped for being under `if
 # NET' while NET was in the disable list -- a config_y whose result nothing
@@ -209,7 +230,8 @@ make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
 for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 FB_SIMPLE SERIAL_8250_MT6577 BLK_DEV_INITRD MODULES \
                 MMC MMC_BLOCK MMC_MTK REGULATOR_FIXED_VOLTAGE \
-                EXT4_FS BTRFS_FS \
+                EXT4_FS BTRFS_FS EXFAT_FS VFAT_FS NLS_UTF8 NLS_CODEPAGE_437 \
+                WATCHDOG WATCHDOG_CORE MEDIATEK_WATCHDOG \
                 NET UNIX INET SECCOMP_FILTER NAMESPACES NET_NS PID_NS \
                 CGROUPS FHANDLE INOTIFY_USER SIGNALFD TIMERFD EPOLL \
                 DEVTMPFS DEVTMPFS_MOUNT TMPFS TMPFS_XATTR TMPFS_POSIX_ACL \
@@ -421,9 +443,16 @@ mount -t devpts devpts /dev/pts
 # the interactive shell at the bottom is exec'd on /dev/tty1 explicitly for the
 # same reason -- `exec setsid cttyhack sh' alone inherits /dev/console and puts
 # the prompt on a serial port that may have nothing plugged into it.
+#
+# boot.conf now puts console=tty0 last, so the panel usually IS /dev/console and
+# writing to both would double every line on a 30-line screen.  Ask the kernel
+# which console it chose rather than re-parsing the command line: /proc/consoles
+# flags the one /dev/console maps to with a C.
+panel_is_console=0
+if grep -q '^tty0 .*C' /proc/consoles 2>/dev/null; then panel_is_console=1; fi
 say() {
     echo "$@"
-    if [ -c /dev/tty1 ]; then echo "$@" >/dev/tty1; fi
+    if [ "$panel_is_console" = 0 ] && [ -c /dev/tty1 ]; then echo "$@" >/dev/tty1; fi
     return 0
 }
 
@@ -666,7 +695,24 @@ initrd=initrd.img
 # other mmcblk partitions, otherwise it gives you a shell.  mmcblk0p2 is the
 # dArkOS ROOTFS partition, and microSD is mmcblk0 because MSDC1 is the only MMC
 # host in the device tree.  Remove root= to stop at the initramfs.
-bootargs=console=tty0 console=ttyS0,115200n8 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait
+#
+# The panel is the LAST console= on purpose.  /dev/console is whichever came
+# last, and with the UART last the boot appears to stop dead at "random: crng
+# init done": systemd logs to /dev/kmsg only until journald takes over, and
+# everything it said after that went to a serial port with nothing plugged into
+# it.  Both consoles still receive every printk; only /dev/console moves.
+# systemd.journald.forward_to_console=1 is the other half -- it puts the service
+# log on the panel too, which is the difference between watching a boot and
+# watching a blinking cursor.
+#
+# firstboot.service is masked because it is dArkOS's RK3326 first-boot script and
+# this configuration cannot finish it.  It expands the partitions in two stages
+# with a reboot in between, then untars /roms.tar and /tempthemes, which a
+# GUI-mode build does not ship; with the tars missing its two progress loops spin
+# 15000 subshells apiece before giving up, which is the several minutes of dead
+# panel before it reboots again.  Delete the systemd.mask= word to let it run on a
+# card that does carry the tars.
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.journald.forward_to_console=1
 CONF
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
@@ -710,10 +756,13 @@ README
         echo "zimage_size=$(stat -c %s zImage)"
         echo "dtb_sha256=$(sha256sum mt6592-j36-ultra.dtb | awk '{print $1}')"
         echo "bootimg_size=$(stat -c %s boot.img) (slot 0x900000)"
-        echo "storage=msdc1 mtk-sd mediatek,mt6592-mmc (btrfs, ext4)"
+        echo "storage=msdc1 mtk-sd mediatek,mt6592-mmc (btrfs, ext4, exfat, vfat)"
         echo "msdc1_irq=GIC_SPI 72 (INTID 104 - 32)"
         echo "userspace=net+unix+namespaces (systemd 257 on the shared armhf rootfs)"
         echo "wireless=off"
+        echo "reboot=mtk_wdt via watchdog@10007000 (mediatek,mt6589-wdt)"
+        echo "console=tty0 last, journald forwarded to it"
+        echo "firstboot=masked (RK3326 script, no /roms.tar in a GUI-mode build)"
         echo "bootimg_kernel=zImage-j36-ultra (device tree appended, ATAG path)"
         echo "sd_kernel=sd-boot/zImage (plain, LK passes the tree in r2)"
         echo "display=stock-lk-simple-framebuffer"

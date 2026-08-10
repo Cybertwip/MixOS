@@ -432,6 +432,45 @@ def generate(sources: dict[str, str]) -> str:
 \t\t}};
 
 \t\t/*
+\t\t * Without this node the kernel cannot restart the board. Userspace gets
+\t\t * all the way through a clean shutdown -- filesystems unmounted, swaps
+\t\t * deactivated, \"systemd-shutdown[1]: Rebooting.\" -- and then:
+\t\t *
+\t\t *   reboot: Restarting system
+\t\t *   Reboot failed -- System halted
+\t\t *
+\t\t * machine_restart() had no handler to call. On MediaTek the reset is the
+\t\t * TOPRGU watchdog: watchdog_core.c registers a restart handler for any
+\t\t * watchdog whose ops provide .restart, and mtk_wdt provides it.
+\t\t * CONFIG_MEDIATEK_WATCHDOG was already y -- multi_v7_defconfig keeps it
+\t\t * under ARCH_MEDIATEK -- so the driver was built in the whole time and
+\t\t * simply had nothing to probe. That matters for the first-boot scripts as
+\t\t * much as for a user reboot: dArkOS expands its partitions in two stages
+\t\t * with a reboot between them, and a reboot that halts turns that into a
+\t\t * power-cycle by hand.
+\t\t *
+\t\t * 0x10007000 is the RGU here, from three places that agree: the mtkclient
+\t\t * chip table (watchdog=0x10007000 for MT6592), its stage1 payload for this
+\t\t * family, which reboots by writing RESTART 0x1971, MODE 0x22000014 and
+\t\t * SWRST 0x1209, and PowerEngine's own bare-metal Standalone/src/hello.c.
+\t\t * mtk_wdt_restart() writes that same SWRST key 0x1209 at offset 0x14,
+\t\t * after probe has already put the 0x22000000 key into MODE.
+\t\t *
+\t\t * mediatek,mt6589-wdt alone, with no invented mt6592 string in front of
+\t\t * it: mt6589-wdt is the plain variant of this block in the driver's OF
+\t\t * table -- no reset controller, no clock -- and a leading compatible that
+\t\t * matches nothing only risks the node not binding at all. No interrupt is
+\t\t * needed (platform_get_irq_optional), and probe calls mtk_wdt_stop(), so
+\t\t * the hardware timer stays disarmed; nothing in the dArkOS rootfs opens
+\t\t * /dev/watchdog, and the board already runs for minutes with no node at
+\t\t * all, so the LK is not leaving it armed either.
+\t\t */
+\t\twatchdog: watchdog@10007000 {{
+\t\t\tcompatible = \"mediatek,mt6589-wdt\";
+\t\t\treg = <0x10007000 0x100>;
+\t\t}};
+
+\t\t/*
 \t\t * 83, not mainline's 51: the stock kernel's resource array gives this
 \t\t * base INTID 115, and 115 - 32 = 83. Console output does not prove
 \t\t * either number, because 8250 console writes poll the THRE bit and
