@@ -87,16 +87,23 @@ run ./device/j36-ultra/sync-mvii-board.sh to restore them from a PowerEngine che
 # A warning, not a failure.  This build is self-contained by design, so a
 # PowerEngine tree that happens to be newer than the vendored copies must not stop
 # it -- but silently building last week's keymap is worse than being told.
-if [[ -d "$DRIVERS_HOST" ]]; then
-    drifted=()
-    while read -r want file; do
-        [[ -n "${file:-}" ]] || continue
-        [[ -f "$DRIVERS_HOST/$file" ]] || continue
-        have="$(shasum -a 256 "$DRIVERS_HOST/$file" | awk '{print $1}')"
-        [[ "$have" == "$want" ]] || drifted+=("$file")
-    done < <(grep -E '^[0-9a-f]{64}  ' "$BOARD_SRC/PROVENANCE.txt" 2>/dev/null || true)
-    if (( ${#drifted[@]} )); then
-        darkos_warn "MVII drivers have moved since mvii-board/ was vendored: ${drifted[*]}"
+#
+# Written as a pipe into a subshell rather than `done < <(...)': macOS /bin/sh is
+# bash 3.2 in POSIX mode, which rejects process substitution outright, and it
+# rejects it at PARSE time -- so `sh ./build-j36-ultra.sh' died on this block
+# before the script had run a single line.
+if [[ -d "$DRIVERS_HOST" && -f "$BOARD_SRC/PROVENANCE.txt" ]]; then
+    drifted="$(
+        grep -E '^[0-9a-f]{64}  ' "$BOARD_SRC/PROVENANCE.txt" |
+        while read -r want file; do
+            [ -n "${file:-}" ] || continue
+            [ -f "$DRIVERS_HOST/$file" ] || continue
+            have="$(shasum -a 256 "$DRIVERS_HOST/$file" | awk '{print $1}')"
+            [ "$have" = "$want" ] || printf '%s ' "$file"
+        done
+    )"
+    if [[ -n "$drifted" ]]; then
+        darkos_warn "MVII drivers have moved since mvii-board/ was vendored: $drifted"
         darkos_warn "run ./device/j36-ultra/sync-mvii-board.sh to pick the changes up"
     fi
 fi
