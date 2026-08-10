@@ -665,6 +665,7 @@ root_hint=""
 want_doom=0
 want_lima=0
 want_mtkdrm=0
+want_es=0
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         j36.doom|j36.doom=1)
@@ -675,6 +676,9 @@ for arg in $(cat /proc/cmdline); do
             ;;
         j36.mtkdrm|j36.mtkdrm=1)
             want_mtkdrm=1
+            ;;
+        j36.es|j36.es=1)
+            want_es=1
             ;;
         root=/dev/*)
             root_hint="${arg#root=}"
@@ -890,15 +894,102 @@ run_mtkdrm() {
     return 0
 }
 
-if [ "$want_doom" = 1 ] || [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ]; then
+# ── EmulationStation's GL front end, installed without touching the rootfs ───
+#
+# This is the last link in the chain: card0 from mtkdrm, a render node from lima,
+# and now a libEGL/libgbm/libGLES that are Mesa's rather than the RK3326 blob's.
+#
+# NOTHING ON THE SHARED ROOTFS IS WRITTEN, and that is the whole design of this
+# function. The card carries one Debian rootfs for two machines, and the R36S needs
+# its libEGL.so -> libMali.so symlinks to stay exactly where they are: that blob is
+# the only thing that drives its Mali-G31. So the five libraries go into a tmpfs
+# and the environment that points at them goes into a systemd drop-in in the same
+# tmpfs. Pull this card into an R36S and there is no trace of any of it.
+#
+# The mechanism is the initrd's half of a contract systemd documents: /run must be
+# a tmpfs, and if the initrd has already mounted one, PID 1 adopts it with its
+# contents rather than mounting its own over the top. Drop-ins under
+# /run/systemd/system/<unit>.d/ are read exactly like ones in /etc, and they are
+# read AFTER the unit file, so an Environment= here replaces the unit's own
+# SDL_VIDEO_EGL_DRIVER=libEGL.so instead of adding to it.
+#
+# Why each variable is set:
+#   LD_LIBRARY_PATH   puts the five staged libraries ahead of
+#                     /usr/lib/arm-linux-gnueabihf, where the blob's symlinks live.
+#                     Ahead of, not instead of: everything else EmulationStation
+#                     needs -- SDL2, freetype, VLC, and Mesa's own back end,
+#                     libgallium and dri/lima_dri.so and dri/mediatek_dri.so --
+#                     still comes from the rootfs, untouched.
+#   LD_PRELOAD        EmulationStation's 29 undefined GL symbols are GLES1
+#                     fixed-function calls, and it names only libEGL.so as a
+#                     dependency because the blob it was linked against exported
+#                     both from one object. glvnd's libEGL does not export a single
+#                     gl* entry point, so the GLES1 library has to be forced into
+#                     the global scope or the binary will not start.
+#   SDL_VIDEODRIVER   kmsdrm. SDL2 here has KMSDRM, wayland, offscreen and dummy
+#                     and no fbdev at all, so this is the only backend that can
+#                     drive this panel, and naming it stops SDL trying wayland
+#                     first on a machine with no compositor.
+#   SDL_VIDEO_*_DRIVER  the versioned SONAMEs, because SDL dlopens by name and the
+#                     unversioned ones in /usr/lib are the blob's symlinks.
+setup_es_gl() {
+    if [ ! -f /bootfs/j36/gl/links ]; then
+        say "es: j36.es was asked for but j36/gl/ is not on the card"
+        return 1
+    fi
+    if [ -z "$rootdev" ]; then
+        say "es: no rootfs was found, so there is no systemd to configure"
+        return 1
+    fi
+
+    if ! mount -t tmpfs -o mode=0755 tmpfs /newroot/run 2>/dev/null; then
+        say "es: could not mount a tmpfs on the rootfs /run"
+        return 1
+    fi
+
+    mkdir -p /newroot/run/j36/gl
+    for so in /bootfs/j36/gl/*.so*; do
+        [ -f "$so" ] || continue
+        cp "$so" /newroot/run/j36/gl/ || say "es: could not copy $so"
+    done
+    # The links file stands in for symlinks vfat cannot store: "name target", one
+    # pair per line, targets relative to this directory except libEGL.so's, which
+    # is a plain filename too.
+    while read -r name target; do
+        case "$name" in ''|'#'*) continue ;; esac
+        ln -sf "$target" "/newroot/run/j36/gl/$name"
+    done < /bootfs/j36/gl/links
+
+    mkdir -p /newroot/run/systemd/system/emulationstation.service.d
+    cat > /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPIN'
+# Written by the J36 Ultra initramfs, into a tmpfs. Not on the card, not in the
+# rootfs: it exists only for as long as this boot does.
+[Service]
+Environment="LD_LIBRARY_PATH=/run/j36/gl"
+Environment="LD_PRELOAD=libGLESv1_CM.so.1"
+Environment="SDL_VIDEODRIVER=kmsdrm"
+Environment="SDL_VIDEO_EGL_DRIVER=libEGL.so.1"
+Environment="SDL_VIDEO_GL_DRIVER=libGLESv1_CM.so.1"
+DROPIN
+
+    say "es: GL front end in /run/j36/gl, drop-in in /run/systemd/system"
+    say "    $(ls /newroot/run/j36/gl | tr '\n' ' ')"
+    return 0
+}
+
+if [ "$want_doom" = 1 ] || [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_es" = 1 ]; then
     if mount_bootfs; then
         # Doom first: it owns the panel while it runs, and the two driver payloads
         # leave modules loaded that have no reason to be disturbed by a game
-        # exiting.  mtkdrm last of the three, so that if it does disturb the panel
-        # the two things that were already proved have already run.
+        # exiting.  mtkdrm after those, so that if it does disturb the panel the
+        # two things that were already proved have already run.  The GL front end
+        # last, because it is the only one of the four that is not finished when
+        # this script ends -- it is a message to systemd, and systemd has not
+        # started yet.
         if [ "$want_doom" = 1 ]; then run_doom; fi
         if [ "$want_lima" = 1 ]; then run_lima; fi
         if [ "$want_mtkdrm" = 1 ]; then run_mtkdrm; fi
+        if [ "$want_es" = 1 ]; then setup_es_gl; fi
         umount /bootfs
     fi
 fi
@@ -1365,6 +1456,154 @@ else
     log "mtkdrm: J36_MTKDRM=0, skipping the display payload"
 fi
 
+# ── The GL runtime, which turned out not to need building ─────────────────────
+#
+# The plan of record for this step was "armhf Mesa with lima and kmsro on a
+# J36-only library path". Two thirds of that had already happened without anyone
+# arranging it, which measuring the built rootfs is the only way to find out:
+#
+#   /usr/lib/arm-linux-gnueabihf/dri/lima_dri.so       present
+#   /usr/lib/arm-linux-gnueabihf/dri/mediatek_dri.so   present
+#   libgallium-25.0.7-2+deb13u1.so                     present, 25 MB
+#   libEGL_mesa.so.0.0.0                               present
+#   libdrm.so.2.124.0                                  present
+#   /usr/share/glvnd/egl_vendor.d/50_mesa.json          present
+#
+# Debian trixie's armhf Mesa is 25.0.7 and it ships both halves of the pair this
+# board needs: lima for the Mali-450 render node and mediatek for kmsro, which is
+# the kmsro entry that pairs an mtk_drm card with a lima renderer. So there is
+# nothing to cross-compile. dArkOS installs that Mesa and then, in utils.sh,
+# overwrites the FRONT of it -- libEGL.so, libGLESv2.so*, libgbm.so* and
+# libGLESv1_CM.so are replaced by symlinks to the RK3326's Mali-G31 blob. The
+# back end was never touched.
+#
+# So this payload is the front end, and only the front end: the five glvnd/Mesa
+# libraries whose names dArkOS took over, staged where only this board looks.
+# Nothing on the shared rootfs is modified or moved -- the R36S keeps its
+# libMali.so symlinks exactly as they are, which it has to, because that blob is
+# the only thing that drives its GPU.
+#
+# Why these five and not fewer: libgbm and libEGL are what SDL2's KMSDRM backend
+# dlopens, libGLESv1_CM is what EmulationStation actually calls (its 29 undefined
+# GL symbols are glMatrixMode, glLoadMatrixf, glEnableClientState -- fixed-function
+# GLES1, not ES2), libGLESv2 is there because SDL asks for it when a context
+# request comes out as ES2, and libGLdispatch is glvnd's own dependency. Four of
+# the five are currently intact on the rootfs and the payload ships them anyway:
+# utils.sh's clobber list names all four, so which ones survive is an accident of
+# which code path ran, and a payload that depends on an accident is not a payload.
+GL_PACKAGES=(libgbm1 libglvnd0 libegl1 libgles1 libgles2)
+GL_PAYLOAD=""
+GL_MIRROR="${J36_DEBIAN_MIRROR:-http://deb.debian.org/debian}"
+GL_SUITES=("${DEBIAN_RELEASE:-trixie}" "${DEBIAN_RELEASE:-trixie}-updates")
+
+# Resolved out of the archive's own Packages index rather than from hand-written
+# .deb URLs, because a pinned URL stops existing the moment Debian supersedes the
+# revision -- the pool keeps one version per source and a point release moves it.
+# The index says where the current one is, whatever it is called this month.
+collect_gl_payload() {
+    local out="$WORK/gl-payload" idx="$WORK/gl-index" pkg suite url filename deb
+    local -a found=()
+
+    rm -rf "$out" "$idx"
+    mkdir -p "$out" "$idx"
+
+    for suite in "${GL_SUITES[@]}"; do
+        url="$GL_MIRROR/dists/$suite/main/binary-armhf/Packages.gz"
+        if curl -fsSL --retry 3 --max-time 300 -o "$idx/$suite.gz" "$url"; then
+            gzip -dc "$idx/$suite.gz" > "$idx/$suite" || return 1
+            log "gl: read the $suite armhf package index"
+        else
+            log "gl: no $suite index at $url"
+        fi
+    done
+    ls "$idx"/*.gz >/dev/null 2>&1 || { log "gl: no package index could be fetched"; return 1; }
+
+    for pkg in "${GL_PACKAGES[@]}"; do
+        filename=""
+        # A later suite wins only when it actually carries the package: a
+        # -updates index that has never shipped this source must not blank out the
+        # hit the base suite gave. awk rather than grep -A, because a Filename:
+        # field can sit anywhere in its stanza.
+        local hit
+        for suite in "${GL_SUITES[@]}"; do
+            [[ -f "$idx/$suite" ]] || continue
+            hit="$(awk -v p="$pkg" '
+                /^Package: /  { inpkg = ($2 == p) }
+                /^Filename: / { if (inpkg) found = $2 }
+                END           { print found }' "$idx/$suite")"
+            [[ -n "$hit" ]] && filename="$hit"
+        done
+        if [[ -z "$filename" ]]; then
+            log "gl: $pkg is not in any index that was fetched"
+            return 1
+        fi
+        deb="$out/$(basename "$filename")"
+        curl -fsSL --retry 3 --max-time 300 -o "$deb" "$GL_MIRROR/$filename" || {
+            log "gl: could not download $filename"; return 1; }
+        # --fsys-tarfile and not -x, so that the package's own symlinks are
+        # discarded here instead of being copied onto a filesystem that cannot
+        # hold them. The links are rebuilt from SONAMEs below.
+        dpkg-deb --fsys-tarfile "$deb" | \
+            tar -C "$out" -xf - --wildcards --no-same-owner \
+                './usr/lib/arm-linux-gnueabihf/*.so*' 2>/dev/null || true
+        rm -f "$deb"
+        found+=("$pkg")
+    done
+
+    local libdir="$out/usr/lib/arm-linux-gnueabihf" so soname base
+    [[ -d "$libdir" ]] || { log "gl: the packages contained no armhf libraries"; return 1; }
+
+    GL_PAYLOAD="$out/staged"
+    mkdir -p "$GL_PAYLOAD"
+    : > "$GL_PAYLOAD/links"
+
+    # The links file exists because vfat has no symlinks. Each line is
+    # "name target" and /init makes them in a tmpfs at boot. Targets are derived
+    # from each library's own SONAME rather than written down, so a Debian
+    # revision that bumps a minor version does not silently produce a payload
+    # whose links point at filenames that are not in it.
+    for so in "$libdir"/*.so*; do
+        [[ -f "$so" && ! -L "$so" ]] || continue
+        base="$(basename "$so")"
+        verify_arm_elf "$so" "the GL library $base"
+        cp "$so" "$GL_PAYLOAD/$base"
+        soname="$(readelf -d "$so" | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')"
+        if [[ -n "$soname" && "$soname" != "$base" ]]; then
+            printf '%s %s\n' "$soname" "$base" >> "$GL_PAYLOAD/links"
+        fi
+    done
+
+    # And one link that is not a SONAME. EmulationStation's DT_NEEDED entry is the
+    # bare development name `libEGL.so', because it was linked against dArkOS's
+    # libEGL.so -> libMali.so symlink, where the blob exported EGL and GLES1 and
+    # GLES2 all from one object. glvnd's libEGL is only ever installed as
+    # libEGL.so.1, so without this alias the binary does not load at all.
+    local egl
+    egl="$(sed -n 's/^libEGL\.so\.1 \(.*\)$/\1/p' "$GL_PAYLOAD/links")"
+    if [[ -z "$egl" ]]; then
+        log "gl: no library in the payload has SONAME libEGL.so.1"
+        return 1
+    fi
+    printf '%s %s\n' "libEGL.so" "$egl" >> "$GL_PAYLOAD/links"
+
+    log "gl: staged $(ls -1 "$GL_PAYLOAD" | grep -c '\.so') libraries from ${found[*]}"
+    log "gl: links $(tr '\n' ';' < "$GL_PAYLOAD/links")"
+    return 0
+}
+
+if [[ "${J36_ES:-1}" == 1 ]]; then
+    set +e
+    collect_gl_payload
+    gl_rc=$?
+    set -e
+    if (( gl_rc != 0 )); then
+        GL_PAYLOAD=""
+        log "gl: the GL front end was not staged, see the error above -- the kernel payload is unaffected"
+    fi
+else
+    log "gl: J36_ES=0, skipping the GL front end"
+fi
+
 # ── The SD BOOT payload ───────────────────────────────────────────────────────
 #
 # Copy this tree onto the FAT partition labelled BOOT and the MVII LK boots the
@@ -1428,6 +1667,18 @@ if (( ${#MTKDRM_MODULE_ORDER[@]} > 0 )); then
     log "mtkdrm: staged ${#MTKDRM_MODULE_ORDER[@]} modules into j36/mtkdrm/"
 fi
 
+# j36/gl/ is the GL front end plus the links file that stands in for the symlinks
+# vfat cannot hold. Same removal contract as the other three: delete the directory
+# and j36.es=1 finds nothing, says so, and EmulationStation starts against the
+# rootfs's own libraries exactly as it does today -- which is to say against the
+# RK3326 blob, and fails, which is the behaviour this replaces.
+if [[ -n "$GL_PAYLOAD" ]]; then
+    mkdir -p "$SDBOOT/j36/gl"
+    cp "$GL_PAYLOAD"/*.so* "$SDBOOT/j36/gl/"
+    cp "$GL_PAYLOAD/links" "$SDBOOT/j36/gl/links"
+    log "gl: staged $(ls -1 "$SDBOOT/j36/gl" | wc -l) files into j36/gl/"
+fi
+
 # rdinit=/init stays even though root= is now present, and the two do not
 # conflict: rdinit means the kernel never mounts a root filesystem itself, so a
 # root= it could not honour can no longer panic it.  /init does the mounting, and
@@ -1453,14 +1704,16 @@ initrd=initrd.img
 # last so /dev/console is the panel and not a serial port with nothing plugged
 # into it.  The two masked units are RK3326-only: firstboot is dArkOS's expansion
 # script, which a GUI-mode build has no tars for, and batt_led is the battery LED
-# daemon, which restarts forever on hardware this kernel does not describe.  Any
-# of them can be deleted here.  j36.doom=1 runs j36/doom off this partition
-# before the hand-over, as the panel and pad test; MENU quits it and the boot
-# carries on.  j36.lima=1 powers the Mali-450 and loads the DRM driver, but only
-# if j36/mfgpower reads the right GPU back.  j36.mtkdrm=1 loads the MT6592 display
-# driver, which adds /dev/dri/card0 and touches no register until something opens
-# it.  Delete any word, or the j36 directory, to boot straight through.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.doom=1 j36.lima=1 j36.mtkdrm=1
+# daemon, which restarts forever on hardware this kernel does not describe.
+#
+# The three j36 words are the GPU, the display and the GL front end, and they are
+# in dependency order: lima gives a render node, mtkdrm gives /dev/dri/card0, es
+# points EmulationStation at Mesa instead of the RK3326 blob.  Delete any of them,
+# or the matching directory under j36/, and the boot carries straight on.
+# j36.doom=1 is the panel and pad test and is no longer on by default; add it back
+# to run j36/doom before the hand-over -- MENU quits it.  ../README.txt explains
+# every word.
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.es=1
 CONF
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
