@@ -51,6 +51,11 @@ struct AppEntry {
     QStringList args;
     int internal = 0;
     bool available = true;
+    /* Ask twice.  For a child that sets its own mode through /dev/dri/card0: it
+     * takes the scanout away from the framebuffer this dashboard draws into and
+     * nothing gives it back, so the warning has to come before the launch -- once
+     * the child has the panel, no toast of ours can be seen. */
+    bool confirm = false;
 };
 
 /*

@@ -74,10 +74,15 @@
  * proves and for the four verdicts the sequence can return.  It holds each
  * frame for three seconds, because the instrument for this one is an eye.
  *
- * Usage: eglprobe [-s | -p | /dev/dri/node ...].  With no arguments it probes
- * card0 and renderD128.  Exit status: 0 if some API created a context on some
- * display (or, for -p, if the mode was set), 1 otherwise.  Nothing is written
- * anywhere; stdout is the whole output.
+ * With -c it draws a rotating cube.  Every phase of -p is a clear, so a driver
+ * that could do nothing but clear a buffer would pass all five; -c compiles two
+ * shaders, hands over 36 vertices and page-flips the result, which is the
+ * smallest thing that cannot be faked -- see cube() for what that adds.
+ *
+ * Usage: eglprobe [-s | -p | -c [seconds] | /dev/dri/node ...].  With no
+ * arguments it probes card0 and renderD128.  Exit status: 0 if some API created
+ * a context on some display (for -p, if the mode was set; for -c, if a frame was
+ * drawn), 1 otherwise.  Nothing is written anywhere; stdout is the whole output.
  */
 
 #define _GNU_SOURCE
@@ -95,6 +100,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -1280,9 +1286,762 @@ out:
     return ok ? 0 : 1;
 }
 
+/* ── -c: the rotating cube ─────────────────────────────────────────────────────
+ *
+ * -p answers "does a frame reach the glass".  It cannot answer "does the GPU
+ * work", because every one of its five phases is a clear: three written by the
+ * CPU and two by glClear, and a driver that can only clear a buffer would pass
+ * all five.  Nothing in this bring-up has yet asked lima to rasterise anything.
+ *
+ * So this does the smallest thing that cannot be faked by a clear: it compiles
+ * two shaders, uploads 36 vertices and draws a cube that turns.  Everything it
+ * exercises is something no other phase touches -- the shader compiler, the
+ * vertex path, the depth buffer, the tiler -- and the answer is legible from
+ * across the room, which on a 640x480 panel photographed by hand is the point.
+ *
+ * It is also the first thing here that pages: -p re-does a full modeset for each
+ * of its five frames, which is right for five frames and impossible for sixty a
+ * second, so this flips and waits for the vblank event.  If PAGE_FLIP is refused
+ * it says so and falls back to the modeset, because a slow cube is still an
+ * answer and a missing one is not.
+ *
+ * What it deliberately does NOT do is link against GLES.  Every entry point comes
+ * through eglGetProcAddress, so the only DT_NEEDED here is still libc and the GL
+ * it measures is whichever one LD_LIBRARY_PATH found -- for us /run/j36/gl, the
+ * Mesa payload, and not the RK3326 Mali blob the shared rootfs points /usr/lib at.
+ */
+
+/* Long enough to see it turn several times, short enough that the dashboard does
+ * not look wedged while it holds the panel. */
+#define CUBE_SECONDS 20
+#define CUBE_PI 3.14159265358979f
+
+/*
+ * sin by hand.  sinf() lives in libm, and libm in DT_NEEDED would break the one
+ * property this file is built around -- that a missing library is a printed result
+ * rather than a dead loader -- for the sake of two calls a frame.  Reduced to
+ * [-pi/2, pi/2] first, where the ninth-order Taylor series is good to about 2e-6,
+ * which is below float precision and far below one pixel of cube.
+ */
+static float rsin(float a)
+{
+    const float two = 2.0f * CUBE_PI;
+    float x2;
+
+    a -= (float)(int)(a / two) * two;
+    if (a >  CUBE_PI) a -= two;
+    if (a < -CUBE_PI) a += two;
+    if (a >  CUBE_PI / 2.0f) a =  CUBE_PI - a;
+    if (a < -CUBE_PI / 2.0f) a = -CUBE_PI - a;
+
+    x2 = a * a;
+    return a * (1.0f - x2 * (1.0f / 6.0f
+                    - x2 * (1.0f / 120.0f
+                    - x2 * (1.0f / 5040.0f
+                    - x2 * (1.0f / 362880.0f)))));
+}
+
+static float rcos(float a)
+{
+    return rsin(a + CUBE_PI / 2.0f);
+}
+
+/* Column-major, the way GL wants them, so glUniformMatrix4fv takes them as they
+ * are and there is no transpose to get backwards. */
+static void m_zero(float *m)
+{
+    memset(m, 0, 16 * sizeof(float));
+}
+
+/* out = a * b.  out must not alias either input. */
+static void m_mul(float *out, const float *a, const float *b)
+{
+    int c, r, k;
+
+    for (c = 0; c < 4; c++) {
+        for (r = 0; r < 4; r++) {
+            float s = 0.0f;
+            for (k = 0; k < 4; k++)
+                s += a[k * 4 + r] * b[c * 4 + k];
+            out[c * 4 + r] = s;
+        }
+    }
+}
+
+static void m_perspective(float *m, float fovy_deg, float aspect, float zn, float zf)
+{
+    const float h = fovy_deg * CUBE_PI / 360.0f;   /* half the field, in radians */
+    const float f = rcos(h) / rsin(h);             /* cot(h), i.e. 1/tan(h) */
+
+    m_zero(m);
+    m[0]  = f / aspect;
+    m[5]  = f;
+    m[10] = (zf + zn) / (zn - zf);
+    m[11] = -1.0f;
+    m[14] = 2.0f * zf * zn / (zn - zf);
+}
+
+static void m_translate(float *m, float x, float y, float z)
+{
+    m_zero(m);
+    m[0] = m[5] = m[10] = m[15] = 1.0f;
+    m[12] = x;
+    m[13] = y;
+    m[14] = z;
+}
+
+static void m_rot_x(float *m, float a)
+{
+    const float s = rsin(a), c = rcos(a);
+
+    m_zero(m);
+    m[0] = 1.0f;
+    m[5] = c;  m[6] = s;
+    m[9] = -s; m[10] = c;
+    m[15] = 1.0f;
+}
+
+static void m_rot_y(float *m, float a)
+{
+    const float s = rsin(a), c = rcos(a);
+
+    m_zero(m);
+    m[0] = c;  m[2] = -s;
+    m[5] = 1.0f;
+    m[8] = s;  m[10] = c;
+    m[15] = 1.0f;
+}
+
+/*
+ * 36 vertices: six faces, two triangles each, position then colour.  Built from a
+ * face table rather than written out, because the winding is the part that has to
+ * be right -- u x v is the outward normal, so (o, o+u, o+u+v) and (o, o+u+v, o+v)
+ * are counter-clockwise seen from outside, which is what GL_CULL_FACE's default
+ * GL_CCW/GL_BACK pair expects.  Get that backwards and the cube renders
+ * inside-out, which looks like a depth bug and is not one.
+ *
+ * The colours are MixOS's six accents, so the cube is recognisably this project's
+ * and each face is distinguishable in a photograph.
+ */
+static float cube_verts[36 * 6];
+
+static void build_cube(void)
+{
+    static const struct { float o[3], u[3], v[3], c[3]; } FACES[6] = {
+        /* +X */ { { 1, -1, -1 }, { 0, 2, 0 }, { 0, 0, 2 }, { 0.039f, 0.518f, 1.000f } },
+        /* -X */ { { -1, -1, -1 }, { 0, 0, 2 }, { 0, 2, 0 }, { 0.188f, 0.690f, 0.780f } },
+        /* +Y */ { { -1, 1, -1 }, { 0, 0, 2 }, { 2, 0, 0 }, { 1.000f, 0.388f, 0.518f } },
+        /* -Y */ { { -1, -1, -1 }, { 2, 0, 0 }, { 0, 0, 2 }, { 0.580f, 0.439f, 0.859f } },
+        /* +Z */ { { -1, -1, 1 }, { 2, 0, 0 }, { 0, 2, 0 }, { 1.000f, 0.624f, 0.039f } },
+        /* -Z */ { { -1, -1, -1 }, { 0, 2, 0 }, { 2, 0, 0 }, { 0.157f, 0.784f, 0.251f } }
+    };
+    static const int TRI[6][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 },
+                                   { 0, 0 }, { 1, 1 }, { 0, 1 } };
+    int f, k, i, n = 0;
+
+    for (f = 0; f < 6; f++) {
+        for (k = 0; k < 6; k++) {
+            for (i = 0; i < 3; i++)
+                cube_verts[n++] = FACES[f].o[i]
+                                + (float)TRI[k][0] * FACES[f].u[i]
+                                + (float)TRI[k][1] * FACES[f].v[i];
+            for (i = 0; i < 3; i++)
+                cube_verts[n++] = FACES[f].c[i];
+        }
+    }
+}
+
+/*
+ * eglGetProcAddress first, because that is the one function guaranteed to come
+ * from the same driver the context did.  libGLESv2.so.2 is the fallback for an EGL
+ * older than 1.5, which is only allowed to return extension entry points -- and it
+ * is a fallback and not the first choice on purpose: on this card's shared rootfs
+ * /usr/lib's libGLESv2.so.2 is a symlink to the R36S's ARMv8-A libMali.so, so this
+ * dlopen fails cleanly rather than loading the wrong GPU's driver.
+ */
+static void *cube_gles;
+
+static void *glsym(const char *name)
+{
+    void *p = p_eglGetProcAddress(name);
+
+    if (p)
+        return p;
+    if (!cube_gles)
+        cube_gles = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_LOCAL);
+    return cube_gles ? dlsym(cube_gles, name) : NULL;
+}
+
+#define GLSYM(name)                                                             \
+    do {                                                                        \
+        *(void **)(&p_##name) = glsym(#name);                                   \
+        if (!p_##name) {                                                        \
+            printf("cube: this GLES2 has no %s\n", #name);                      \
+            return 0;                                                           \
+        }                                                                       \
+    } while (0)
+
+static int load_gles(void)
+{
+    GLSYM(glViewport);
+    GLSYM(glEnable);
+    GLSYM(glDepthFunc);
+    GLSYM(glClearColor);
+    GLSYM(glClear);
+    GLSYM(glGetError);
+    GLSYM(glGetString);
+    GLSYM(glCreateShader);
+    GLSYM(glShaderSource);
+    GLSYM(glCompileShader);
+    GLSYM(glGetShaderiv);
+    GLSYM(glGetShaderInfoLog);
+    GLSYM(glDeleteShader);
+    GLSYM(glCreateProgram);
+    GLSYM(glAttachShader);
+    GLSYM(glLinkProgram);
+    GLSYM(glGetProgramiv);
+    GLSYM(glGetProgramInfoLog);
+    GLSYM(glUseProgram);
+    GLSYM(glGetAttribLocation);
+    GLSYM(glGetUniformLocation);
+    GLSYM(glUniformMatrix4fv);
+    GLSYM(glVertexAttribPointer);
+    GLSYM(glEnableVertexAttribArray);
+    GLSYM(glDrawArrays);
+
+    /* Optional: eglSwapBuffers flushes, so this is only belt and braces. */
+    *(void **)(&p_glFinish) = glsym("glFinish");
+    return 1;
+}
+#undef GLSYM
+
+static const char CUBE_VS[] =
+    "attribute vec3 a_pos;\n"
+    "attribute vec3 a_col;\n"
+    "uniform mat4 u_mvp;\n"
+    "varying vec3 v_col;\n"
+    "void main()\n"
+    "{\n"
+    "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
+    "    v_col = a_col;\n"
+    "}\n";
+
+static const char CUBE_FS[] =
+    "precision mediump float;\n"
+    "varying vec3 v_col;\n"
+    "void main()\n"
+    "{\n"
+    "    gl_FragColor = vec4(v_col, 1.0);\n"
+    "}\n";
+
+static unsigned int compile_shader(unsigned int kind, const char *src, const char *what)
+{
+    unsigned int sh;
+    int ok = 0, len = 0;
+    char log[512];
+
+    sh = p_glCreateShader(kind);
+    if (!sh) {
+        printf("cube: glCreateShader(%s) returned 0, gl error 0x%04x\n",
+               what, p_glGetError());
+        return 0;
+    }
+    p_glShaderSource(sh, 1, &src, NULL);
+    p_glCompileShader(sh);
+    p_glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        log[0] = '\0';
+        p_glGetShaderInfoLog(sh, (int)sizeof(log), &len, log);
+        log[sizeof(log) - 1] = '\0';
+        printf("cube: the %s shader did not compile: %s\n",
+               what, log[0] ? log : "(the driver returned no log)");
+        p_glDeleteShader(sh);
+        return 0;
+    }
+    return sh;
+}
+
+/*
+ * One fb per gbm buffer, kept.  A gbm surface rotates through a handful of buffers
+ * and hands the same ones back for the rest of the run, so ADDFB2 per frame would
+ * be an ioctl and a kernel allocation for a framebuffer that already exists.
+ */
+struct bofb { uint32_t handle, fb; };
+static struct bofb cube_fbs[8];
+static int cube_fb_n;
+
+static uint32_t fb_for(struct gbm_bo *bo)
+{
+    struct drm_mode_fb_cmd2 fb;
+    union gbm_bo_handle h = p_gbm_bo_get_handle(bo);
+    int i;
+
+    for (i = 0; i < cube_fb_n; i++)
+        if (cube_fbs[i].handle == h.u32)
+            return cube_fbs[i].fb;
+
+    if (cube_fb_n == (int)(sizeof(cube_fbs) / sizeof(cube_fbs[0]))) {
+        printf("cube: more than %d gbm buffers in the swap chain, which this "
+               "cache was not built for\n", cube_fb_n);
+        return 0;
+    }
+
+    memset(&fb, 0, sizeof(fb));
+    fb.width = paint_mode.hdisplay;
+    fb.height = paint_mode.vdisplay;
+    fb.pixel_format = FOURCC_ARGB8888;
+    fb.handles[0] = h.u32;
+    fb.pitches[0] = p_gbm_bo_get_stride(bo);
+    if (drm_ioctl(DRM_IOCTL_MODE_ADDFB2, &fb) < 0) {
+        printf("cube: ADDFB2 on lima's buffer (handle %u, stride %u): %m -- lima "
+               "rendered it but the display device will not scan it out\n",
+               fb.handles[0], fb.pitches[0]);
+        return 0;
+    }
+
+    cube_fbs[cube_fb_n].handle = h.u32;
+    cube_fbs[cube_fb_n].fb = fb.fb_id;
+    cube_fb_n++;
+    printf("cube: swap-chain buffer %d: handle %u, stride %u, fb %u\n",
+           cube_fb_n, h.u32, fb.pitches[0], fb.fb_id);
+    return fb.fb_id;
+}
+
+/*
+ * Flip and wait for the vblank event.  Returns -1 if the ioctl was refused (the
+ * caller falls back to a modeset for the rest of the run), 1 if the flip completed,
+ * 0 if it was accepted but no event arrived.
+ *
+ * poll() rather than a bare read(), because read() on the DRM fd blocks: a driver
+ * that accepts a flip and never completes it would be indistinguishable from a
+ * hang, and a hang on this board costs a power cycle to find out about.
+ */
+static int flip(uint32_t fb)
+{
+    static int quiet;
+    struct drm_mode_crtc_page_flip f;
+    struct pollfd pfd;
+    char buf[256];
+    ssize_t n;
+    size_t off;
+
+    memset(&f, 0, sizeof(f));
+    f.crtc_id = paint_crtc;
+    f.fb_id = fb;
+    f.flags = DRM_MODE_PAGE_FLIP_EVENT;
+    if (drm_ioctl(DRM_IOCTL_MODE_PAGE_FLIP, &f) < 0)
+        return -1;
+
+    pfd.fd = paint_fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    /* 500 ms is a couple of dozen vblanks.  A flip that has not completed by then
+     * is not late, it is lost. */
+    if (poll(&pfd, 1, 500) <= 0) {
+        if (!quiet++)
+            printf("cube: a flip was accepted but no completion event came within "
+                   "500 ms -- the frames are unpaced from here on\n");
+        return 0;
+    }
+
+    n = read(paint_fd, buf, sizeof(buf));
+    for (off = 0; n > 0 && off + sizeof(struct drm_event) <= (size_t)n; ) {
+        struct drm_event e;
+        memcpy(&e, buf + off, sizeof(e));
+        if (e.length < sizeof(e) || off + e.length > (size_t)n)
+            break;
+        if (e.type == DRM_EVENT_FLIP_COMPLETE)
+            return 1;
+        off += e.length;
+    }
+    return 0;
+}
+
+/*
+ * Any button stops it, so the cube is not a twenty-second wait when it is being
+ * launched from the dashboard.  struct input_event on a 32-bit kernel with 32-bit
+ * userspace is 16 bytes -- two longs of timeval, then u16 type, u16 code, s32
+ * value -- and it is written out here for the same reason the DRM structs are.
+ */
+struct j36_input_event {
+    long     sec, usec;
+    uint16_t type, code;
+    int32_t  value;
+};
+
+#define J36_EV_KEY 0x01
+
+static int quit_fds[8];
+static int quit_n;
+
+static void quit_open(void)
+{
+    char path[32];
+    int i, fd;
+
+    for (i = 0; i < 32 && quit_n < (int)(sizeof(quit_fds) / sizeof(quit_fds[0])); i++) {
+        snprintf(path, sizeof(path), "/dev/input/event%d", i);
+        fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd >= 0)
+            quit_fds[quit_n++] = fd;
+    }
+}
+
+static int quit_pressed(void)
+{
+    struct j36_input_event ev;
+    int i;
+
+    for (i = 0; i < quit_n; i++)
+        while (read(quit_fds[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev))
+            if (ev.type == J36_EV_KEY && ev.value == 1)
+                return 1;
+    return 0;
+}
+
+static void quit_close(void)
+{
+    while (quit_n)
+        close(quit_fds[--quit_n]);
+}
+
+static double now_s(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static int cube(const char *path, int seconds)
+{
+    EGLint attr[] = {
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+        EGL_DEPTH_SIZE, 16,          /* attr[7]: zeroed below if nothing has depth */
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_NONE
+    };
+    EGLint cattr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    EGLDisplay dpy = NULL;
+    EGLConfig pick[64], cfg;
+    EGLContext ctx = NULL;
+    EGLSurface surf = NULL;
+    struct gbm_device *gbm = NULL;
+    struct gbm_surface *gs = NULL;
+    struct gbm_bo *held = NULL;
+    const unsigned char *s;
+    unsigned int prog = 0, vs, fs;
+    EGLint count = 0, i, depth = 0, e;
+    int a_pos, a_col, u_mvp;
+    long frames = 0, marked = 0;
+    double t0, t, mark;
+    int paged = 1, quit = 0;
+    float proj[16];
+
+    printf("== %s, rotating cube for %ds\n", path, seconds);
+
+    if (!p_eglSwapBuffers || !p_gbm_surface_lock_front_buffer ||
+        !p_gbm_surface_release_buffer || !p_gbm_bo_get_handle ||
+        !p_gbm_bo_get_stride) {
+        printf("cube: this payload's libgbm is missing one of the four surface "
+               "entry points the cube needs\n");
+        return 1;
+    }
+
+    paint_fd = open(path, O_RDWR | O_CLOEXEC);
+    if (paint_fd < 0) {
+        printf("open: %m\n");
+        return 1;
+    }
+    if (drm_ioctl(DRM_IOCTL_SET_MASTER, NULL) < 0)
+        printf("cube: SET_MASTER: %m (a modeset may not be permitted)\n");
+    if (!find_crtc())
+        goto out;
+
+    gbm = p_gbm_create_device(paint_fd);
+    if (!gbm) {
+        printf("cube: gbm_create_device on the display node failed\n");
+        goto out;
+    }
+
+    if (p_eglGetPlatformDisplayEXT)
+        dpy = p_eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR, gbm, NULL);
+    if (!dpy && p_eglGetPlatformDisplay)
+        dpy = p_eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm, NULL);
+    if (!dpy)
+        dpy = p_eglGetDisplay(gbm);
+    if (!dpy || !p_eglInitialize(dpy, NULL, NULL)) {
+        printf("cube: no EGL on this device\n");
+        goto out_gbm;
+    }
+
+    eglclear();
+    if (!p_eglBindAPI(EGL_OPENGL_ES_API)) {
+        printf("cube: eglBindAPI(ES): 0x%04x\n", p_eglGetError());
+        goto out_dpy;
+    }
+    if (!p_eglChooseConfig(dpy, attr, pick, 64, &count) || count == 0) {
+        /* A cube is convex, so back-face culling alone draws it correctly and a
+         * depth buffer is a nicety rather than a requirement. */
+        printf("cube: no ES2 window config carries a depth buffer; asking again "
+               "without one and relying on back-face culling\n");
+        attr[7] = 0;
+        if (!p_eglChooseConfig(dpy, attr, pick, 64, &count) || count == 0) {
+            printf("cube: no ES2 window config at all\n");
+            goto out_dpy;
+        }
+    }
+
+    /* The ARGB8888 visual, for the reason paint_gl picks it: it is the one format
+     * this display device is known to scan out. */
+    cfg = pick[0];
+    for (i = 0; i < count; i++) {
+        EGLint vis = 0;
+        p_eglGetConfigAttrib(dpy, pick[i], EGL_NATIVE_VISUAL_ID, &vis);
+        if ((uint32_t)vis == FOURCC_ARGB8888) {
+            cfg = pick[i];
+            break;
+        }
+    }
+    p_eglGetConfigAttrib(dpy, cfg, EGL_DEPTH_SIZE, &depth);
+
+    gs = p_gbm_surface_create(gbm, paint_mode.hdisplay, paint_mode.vdisplay,
+                              FOURCC_ARGB8888,
+                              GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+    if (!gs) {
+        printf("cube: gbm_surface_create %ux%u AR24 SCANOUT|RENDERING failed -- "
+               "kmsro cannot pair lima with this display device\n",
+               paint_mode.hdisplay, paint_mode.vdisplay);
+        goto out_dpy;
+    }
+
+    ctx = p_eglCreateContext(dpy, cfg, NULL, cattr);
+    surf = ctx ? p_eglCreateWindowSurface(dpy, cfg, gs, NULL) : NULL;
+    if (!ctx || !surf || !p_eglMakeCurrent(dpy, surf, surf, ctx)) {
+        e = p_eglGetError();
+        printf("cube: no current ES2 context on that surface: 0x%04x %s\n",
+               e, eglerr(e));
+        goto out_gs;
+    }
+
+    if (!load_gles())
+        goto out_current;
+
+    s = p_glGetString(GL_RENDERER);
+    printf("cube: renderer \"%s\"\n", s ? (const char *)s : "NULL");
+    s = p_glGetString(GL_VERSION);
+    printf("cube: version \"%s\"\n", s ? (const char *)s : "NULL");
+    s = p_glGetString(GL_SHADING_LANGUAGE_VERSION);
+    printf("cube: glsl \"%s\", depth buffer %d bits\n",
+           s ? (const char *)s : "NULL", depth);
+
+    /*
+     * The shaders.  This is the measurement -p cannot make: a driver that can
+     * clear a buffer will pass every phase of -p, and a driver whose compiler is
+     * broken fails here with a log that says why.
+     */
+    vs = compile_shader(GL_VERTEX_SHADER, CUBE_VS, "vertex");
+    fs = vs ? compile_shader(GL_FRAGMENT_SHADER, CUBE_FS, "fragment") : 0;
+    if (!vs || !fs)
+        goto out_current;
+
+    prog = p_glCreateProgram();
+    if (prog) {
+        int ok = 0, len = 0;
+        char log[512];
+        p_glAttachShader(prog, vs);
+        p_glAttachShader(prog, fs);
+        p_glLinkProgram(prog);
+        p_glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            log[0] = '\0';
+            p_glGetProgramInfoLog(prog, (int)sizeof(log), &len, log);
+            log[sizeof(log) - 1] = '\0';
+            printf("cube: the program did not link: %s\n",
+                   log[0] ? log : "(the driver returned no log)");
+            prog = 0;
+        }
+    }
+    if (!prog) {
+        printf("cube: no program, so there is nothing to draw with\n");
+        goto out_current;
+    }
+
+    a_pos = p_glGetAttribLocation(prog, "a_pos");
+    a_col = p_glGetAttribLocation(prog, "a_col");
+    u_mvp = p_glGetUniformLocation(prog, "u_mvp");
+    if (a_pos < 0 || a_col < 0 || u_mvp < 0) {
+        printf("cube: the linked program has no a_pos/a_col/u_mvp (%d/%d/%d)\n",
+               a_pos, a_col, u_mvp);
+        goto out_current;
+    }
+
+    build_cube();
+    m_perspective(proj, 45.0f,
+                  (float)paint_mode.hdisplay / (float)paint_mode.vdisplay,
+                  0.1f, 20.0f);
+
+    p_glViewport(0, 0, (int)paint_mode.hdisplay, (int)paint_mode.vdisplay);
+    if (depth > 0) {
+        p_glEnable(GL_DEPTH_TEST);
+        p_glDepthFunc(GL_LESS);
+    }
+    p_glEnable(GL_CULL_FACE);
+    p_glUseProgram(prog);
+    /*
+     * Client-side vertex arrays, which GLES2 allows and GLES3 core does not.  A
+     * VBO would be three more entry points for 864 bytes of cube that is uploaded
+     * once, and the driver copies it either way.
+     */
+    p_glEnableVertexAttribArray((unsigned int)a_pos);
+    p_glEnableVertexAttribArray((unsigned int)a_col);
+    p_glVertexAttribPointer((unsigned int)a_pos, 3, GL_FLOAT, 0,
+                            6 * (int)sizeof(float), cube_verts);
+    p_glVertexAttribPointer((unsigned int)a_col, 3, GL_FLOAT, 0,
+                            6 * (int)sizeof(float), cube_verts + 3);
+
+    quit_open();
+    printf("cube: %d input device%s open; any button stops it early\n",
+           quit_n, quit_n == 1 ? "" : "s");
+
+    t0 = now_s();
+    mark = t0;
+    for (;;) {
+        float mvp[16], mv[16], rot[16], rx[16], ry[16], view[16];
+        struct gbm_bo *bo;
+        uint32_t fb;
+        float ang;
+
+        t = now_s();
+        if (t - t0 >= (double)seconds || quit)
+            break;
+
+        /* One turn every seven seconds about Y, and a slower one about X so that
+         * more than two faces are ever visible. */
+        ang = (float)(t - t0) * 0.9f;
+        m_rot_y(ry, ang);
+        m_rot_x(rx, ang * 0.6f);
+        m_mul(rot, ry, rx);
+        m_translate(view, 0.0f, 0.0f, -4.5f);
+        m_mul(mv, view, rot);
+        m_mul(mvp, proj, mv);
+
+        /*
+         * MVII's desktop grey rather than black, on purpose: a frame that arrives
+         * with nothing drawn in it is then distinguishable from a frame that never
+         * arrived at all, which is exactly the ambiguity that made the ES black
+         * screen so expensive to read.
+         */
+        p_glClearColor(0.102f, 0.110f, 0.149f, 1.0f);
+        p_glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        p_glUniformMatrix4fv(u_mvp, 1, 0, mvp);
+        p_glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        if (frames == 0) {
+            unsigned int ge = p_glGetError();
+            if (ge != GL_NO_ERROR)
+                printf("cube: gl error 0x%04x after the first draw\n", ge);
+        }
+
+        if (!p_eglSwapBuffers(dpy, surf)) {
+            e = p_eglGetError();
+            printf("cube: eglSwapBuffers: 0x%04x %s\n", e, eglerr(e));
+            break;
+        }
+        bo = p_gbm_surface_lock_front_buffer(gs);
+        if (!bo) {
+            printf("cube: no front buffer after a swap\n");
+            break;
+        }
+        fb = fb_for(bo);
+        if (!fb) {
+            p_gbm_surface_release_buffer(gs, bo);
+            break;
+        }
+
+        if (frames == 0) {
+            /* The first frame needs the mode as well as the buffer. */
+            if (setcrtc(fb) < 0) {
+                printf("cube: SETCRTC: %m\n");
+                p_gbm_surface_release_buffer(gs, bo);
+                break;
+            }
+            printf("cube: the first frame is on crtc %u\n", paint_crtc);
+        } else if (paged) {
+            if (flip(fb) < 0) {
+                printf("cube: PAGE_FLIP: %m -- falling back to a modeset per "
+                       "frame, which will be slow but will still turn\n");
+                paged = 0;
+                if (setcrtc(fb) < 0) {
+                    p_gbm_surface_release_buffer(gs, bo);
+                    break;
+                }
+            }
+        } else if (setcrtc(fb) < 0) {
+            printf("cube: SETCRTC: %m\n");
+            p_gbm_surface_release_buffer(gs, bo);
+            break;
+        }
+
+        /* Only now is the previous frame off the CRTC and safe to give back. */
+        if (held)
+            p_gbm_surface_release_buffer(gs, held);
+        held = bo;
+        frames++;
+
+        if (t - mark >= 1.0) {
+            printf("cube: %.0fs, %ld frames, %.1f fps\n", t - t0, frames,
+                   (double)(frames - marked) / (t - mark));
+            mark = t;
+            marked = frames;
+        }
+        if (quit_pressed()) {
+            printf("cube: a button was pressed\n");
+            quit = 1;
+        }
+    }
+
+    t = now_s();
+    printf("cube: %ld frames in %.1fs, %.1f fps, %s\n", frames, t - t0,
+           t > t0 ? (double)frames / (t - t0) : 0.0,
+           paged ? "page-flipped" : "one modeset per frame");
+    if (frames == 0)
+        printf("cube: nothing was drawn, so the messages above are the finding\n");
+    else
+        printf("cube: if the panel showed a turning cube then lima compiles, "
+               "rasterises and scans out, and the GLES driver is not what is "
+               "wrong with this board\n");
+
+    quit_close();
+    if (held)
+        p_gbm_surface_release_buffer(gs, held);
+
+out_current:
+    for (i = 0; i < cube_fb_n; i++)
+        drm_ioctl(DRM_IOCTL_MODE_RMFB, &cube_fbs[i].fb);
+    cube_fb_n = 0;
+    p_eglMakeCurrent(dpy, NULL, NULL, NULL);
+    if (surf)
+        p_eglDestroySurface(dpy, surf);
+    if (ctx)
+        p_eglDestroyContext(dpy, ctx);
+out_gs:
+    p_gbm_surface_destroy(gs);
+out_dpy:
+    p_eglTerminate(dpy);
+out_gbm:
+    p_gbm_device_destroy(gbm);
+out:
+    drm_ioctl(DRM_IOCTL_DROP_MASTER, NULL);
+    close(paint_fd);
+    paint_fd = -1;
+    return frames > 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
-    int wins = 0, painted = -1, i;
+    int wins = 0, painted = -1, cubed = -1, i;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
 
@@ -1291,12 +2050,20 @@ int main(int argc, char **argv)
 
     if (argc > 1) {
         for (i = 1; i < argc; i++) {
-            if (!strcmp(argv[i], "-s"))
+            if (!strcmp(argv[i], "-s")) {
                 wins += probe_surfaceless();
-            else if (!strcmp(argv[i], "-p"))
+            } else if (!strcmp(argv[i], "-p")) {
                 painted = paint("/dev/dri/card0");
-            else
+            } else if (!strcmp(argv[i], "-c")) {
+                /* An optional number of seconds after it, so the dashboard can ask
+                 * for a short one and a bring-up session for a long one. */
+                int secs = CUBE_SECONDS;
+                if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+                    secs = atoi(argv[++i]);
+                cubed = cube("/dev/dri/card0", secs > 0 ? secs : CUBE_SECONDS);
+            } else {
                 wins += probe(argv[i], strstr(argv[i], "/card") != NULL);
+            }
         }
     } else {
         /* Display node first: it is the one SDL will actually be handed. */
@@ -1304,8 +2071,8 @@ int main(int argc, char **argv)
         wins += probe("/dev/dri/renderD128", 0);
     }
 
-    if (painted >= 0)
-        return painted;
+    if (painted >= 0 || cubed >= 0)
+        return (painted > 0 || cubed > 0) ? 1 : 0;
 
     printf("eglprobe: %s\n", wins ? "a context came up, see which API above"
                                   : "no API created a context on any node");
