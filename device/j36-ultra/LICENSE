@@ -25,6 +25,12 @@ Ms-PL, the licence below:
     tools/mfgpower.c            the MFG power-domain bring-up probe
     README.md, this file        the documentation
 
+    Each of those carries an `SPDX-License-Identifier: MS-PL' header, with one
+    deliberate exception: es/patch-gles20.py has none, because build-in-vm.sh
+    stamps the EmulationStation build with a SHA-256 of that file, so editing it at
+    all -- even to add a comment -- discards a finished ES build and rebuilds it
+    from scratch.  It is Ms-PL by this listing instead.
+
 GPL-2.0-only, and deliberately NOT relicensed:
 
     linux/j36_mt6592_input.c    keypad and GPIO key adapter

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MS-PL
+# Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
+# device/j36-ultra/LICENSE for the full text and for what it does not cover.
 # Refresh device/j36-ultra/mvii-board/ from a PowerEngine MVII checkout.
 #
-# THIS SCRIPT IS NOT PART OF THE BUILD.  Nothing in dArkOS runs it, and the build
+# THIS SCRIPT IS NOT PART OF THE BUILD.  Nothing in MixOS runs it, and the build
 # does not need PowerEngine to be present -- mvii-board/ is committed, and the DTB
 # generator reads it.  Run this by hand when the MVII drivers change and the DTB
 # should follow.
@@ -17,7 +20,7 @@
 # rather than seven dead keys on the device.
 #
 # Usage:
-#   ./device/j36-ultra/sync-mvii-board.sh                     # find PowerEngine beside dArkOS
+#   ./device/j36-ultra/sync-mvii-board.sh                     # find PowerEngine beside the checkout
 #   POWERENGINE_ROOT=/path/to/PowerEngine ./...sync-mvii-board.sh
 #   J36_DRIVERS_DIR=/path/to/J36Ultra/Drivers ./...sync-mvii-board.sh
 
@@ -43,7 +46,7 @@ FILES=(
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 [[ -d "$DRIVERS" ]] || die "MVII J36 Drivers not found: $DRIVERS
-set POWERENGINE_ROOT or J36_DRIVERS_DIR. This script is the only thing in dArkOS
+set POWERENGINE_ROOT or J36_DRIVERS_DIR. This script is the only thing in MixOS
 that needs a PowerEngine checkout; the build itself does not."
 
 # macOS ships shasum, Linux ships sha256sum, and this runs on both.
@@ -71,7 +74,7 @@ done
 # The provenance record exists so that a stale vendored copy is a visible fact
 # rather than a mystery: the commit these came from, and a hash per file that
 # build-j36-ultra.sh re-checks whenever a PowerEngine checkout happens to be
-# sitting next to dArkOS.
+# sitting next to this checkout.
 commit="$(git -C "$DRIVERS" rev-parse HEAD 2>/dev/null || echo unknown)"
 describe="$(git -C "$DRIVERS" describe --always --dirty 2>/dev/null || echo unknown)"
 {

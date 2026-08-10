@@ -51,7 +51,7 @@ kernel checkpoint in the state directory survives.
 
 ### `DARKOS_R36_BOOT_PAYLOAD`
 
-The BOOT partition of a working dArkOS R36 image, which supplies what this
+The BOOT partition of a working R36 image, which supplies what this
 pipeline never produced: the R36S device tree, the u-boot panel variants, the
 off-charging bitmaps and the dtb selector. It defaults to
 `<artifacts>/Reference/BOOT`, and on macOS it **must** live under the artifact

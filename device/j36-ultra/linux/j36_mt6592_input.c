@@ -873,5 +873,5 @@ static struct platform_driver j36_input_driver = {
 module_platform_driver(j36_input_driver);
 
 MODULE_DESCRIPTION("J36 Ultra MT6592 polled gamepad adapter");
-MODULE_AUTHOR("dArkOS / PowerEngine integration");
+MODULE_AUTHOR("MixOS / PowerEngine integration");
 MODULE_LICENSE("GPL");

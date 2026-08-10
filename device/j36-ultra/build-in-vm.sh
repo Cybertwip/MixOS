@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MS-PL
+# Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
+# device/j36-ultra/LICENSE for the full text and for what it does not cover.
 # Incremental J36 Ultra ARMv7 bring-up builder. Run inside Ubuntu, normally via
 # ./build-j36-ultra.sh on macOS. It never invokes the RG351MP/R36 build target.
 
@@ -8,7 +11,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 WORK="${J36_WORK_DIR:-$HOME/j36-ultra-work}"
 # The MVII board sources are vendored in this checkout, so nothing here reaches
 # outside it. They used to be rsynced into the VM from a PowerEngine tree on the
-# host, which made a dArkOS build depend on a sibling repository being present.
+# host, which made a MixOS build depend on a sibling repository being present.
 DRIVERS="${J36_DRIVERS_DIR:-$ROOT/device/j36-ultra/mvii-board}"
 EXPORT_DIR="${J36_EXPORT_DIR:-$WORK/export}"
 KERNEL_URL="${J36_KERNEL_URL:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
@@ -169,7 +172,7 @@ done
 # vmmc-supply the host advertises no voltage at all, and card init then fails
 # with nothing in the log pointing at the reason.
 #
-# BTRFS because the rootfs this card already carries is btrfs: dArkOS's own
+# BTRFS because the rootfs this card already carries is btrfs: MixOS's own
 # scripts/setup_partition.sh sets ROOT_FILESYSTEM_FORMAT="btrfs". EXT4 because a
 # hand-made card usually is not, and /init tries both.
 #
@@ -375,7 +378,7 @@ config_m SND_DUMMY
 #
 # The rest are dead weight, and named explicitly rather than left to the prune so
 # that the intent survives a kernel bump that renames one of them.  Nothing in the
-# dArkOS rootfs opens /dev/dsp or /dev/sequencer.
+# MixOS rootfs opens /dev/dsp or /dev/sequencer.
 for symbol in SND_SUPPORT_OLD_API SND_PCM_OSS SND_MIXER_OSS SND_SEQUENCER \
     SND_VERBOSE_PROCFS SND_DEBUG; do
     config_n "$symbol"
@@ -650,8 +653,8 @@ bb_disable() {
 # `ln'; neither was in either list, so the payload directory was created, the
 # systemd drop-in pointing LD_LIBRARY_PATH at it was written, and the directory
 # stayed empty. EmulationStation's one GL DT_NEEDED is the bare name `libEGL.so',
-# so the loader missed the empty path and resolved it in /usr/lib, where dArkOS
-# has pointed that name at the RK3326's libMali.so. That blob is Tag_CPU_arch v8
+# so the loader missed the empty path and resolved it in /usr/lib, where the
+# shared rootfs has pointed that name at the RK3326's libMali.so. That blob is Tag_CPU_arch v8
 # -- ARMv8-A -- and this SoC is a Cortex-A7. ES died on SIGILL, status 132,
 # before main(), six times, until systemd gave up on the restart counter.
 #
@@ -880,7 +883,7 @@ done
 
 mkdir -p /newroot
 
-# btrfs first because that is what dArkOS formats ROOTFS as, ext4 second because
+# btrfs first because that is what MixOS formats ROOTFS as, ext4 second because
 # a hand-made card usually is not.  Mounted read-only to test, so a candidate
 # that is not the root filesystem is never written to.
 try_root() {
@@ -1272,7 +1275,7 @@ setup_es_gl() {
     # Nothing above is allowed to fail quietly, because of what the fallback is.
     # The drop-in tells the loader to look in this directory; if the directory is
     # empty the loader simply misses and finds the same names in /usr/lib, where
-    # dArkOS has pointed them at the RK3326's libMali.so -- an ARMv8-A object on a
+    # the shared rootfs has pointed them at the RK3326's libMali.so -- an ARMv8-A object on a
     # Cortex-A7. For the rootfs's binary that is SIGILL before main(), which names
     # neither this directory nor the blob; for the GLES 2.0 one it is SDL dlopening
     # the blob and reporting no EGL. Neither message points here, so it has to be
@@ -2031,13 +2034,13 @@ fi
 # Debian trixie's armhf Mesa is 25.0.7 and it ships both halves of the pair this
 # board needs: lima for the Mali-450 render node and mediatek for kmsro, which is
 # the kmsro entry that pairs an mtk_drm card with a lima renderer. So there is
-# nothing to cross-compile. dArkOS installs that Mesa and then, in utils.sh,
+# nothing to cross-compile. MixOS installs that Mesa and then, in utils.sh,
 # overwrites the FRONT of it -- libEGL.so, libGLESv2.so*, libgbm.so* and
 # libGLESv1_CM.so are replaced by symlinks to the RK3326's Mali-G31 blob. The
 # back end was never touched.
 #
 # So this payload is the front end, and only the front end: the five glvnd/Mesa
-# libraries whose names dArkOS took over, staged where only this board looks.
+# libraries whose names MixOS took over, staged where only this board looks.
 # Nothing on the shared rootfs is modified or moved -- the R36S keeps its
 # libMali.so symlinks exactly as they are, which it has to, because that blob is
 # the only thing that drives its GPU.
@@ -2185,7 +2188,7 @@ collect_gl_payload() {
     done
 
     # And one link that is not a SONAME. EmulationStation's DT_NEEDED entry is the
-    # bare development name `libEGL.so', because it was linked against dArkOS's
+    # bare development name `libEGL.so', because it was linked against the rootfs's
     # libEGL.so -> libMali.so symlink, where the blob exported EGL and GLES1 and
     # GLES2 all from one object. glvnd's libEGL is only ever installed as
     # libEGL.so.1, so without this alias the binary does not load at all.
@@ -2291,7 +2294,7 @@ build_eglprobe() {
 # artifacts still ship, /init finds no j36/es, says so, and the rootfs's own binary
 # runs and fails in the way it already fails.
 ES_URL="https://github.com/christianhaitian/EmulationStation-fcamod"
-# The rootfs's own ES commit, read out of the dArkOS package cache's
+# The rootfs's own ES commit, read out of the MixOS package cache's
 # emulationstation_351v_armhf.commit.  Pinned rather than tracking the branch so
 # that the renderer patch's anchors stay valid and the only difference from the
 # installed binary stays the renderer.
@@ -2311,7 +2314,7 @@ es_chroot_run() {
     sudo chroot "$ES_CHROOT" bash -c "$1"
 }
 
-# The chroot is built once and kept.  Preferred base is dArkOS's own armhf rootfs
+# The chroot is built once and kept.  Preferred base is MixOS's own armhf rootfs
 # cache, because if the R36 base build has run then it is already on disk and it is
 # the same debootstrap the target was made from; debootstrap is the fallback for a
 # machine where only this build has ever run.
@@ -2323,9 +2326,9 @@ ensure_es_chroot() {
         sudo rm -rf "$ES_CHROOT" "$WORK/es-chroot-x"
         mkdir -p "$WORK/es-chroot-x"
         if [[ -f "$base" ]]; then
-            log "es: unpacking the armhf $suite rootfs from the dArkOS package cache"
+            log "es: unpacking the armhf $suite rootfs from the MixOS package cache"
             sudo tar -xpzf "$base" -C "$WORK/es-chroot-x" || return 1
-            # The cache tarball carries dArkOS's own chroot name at the top.
+            # The cache tarball carries MixOS's own chroot name at the top.
             sudo mv "$WORK/es-chroot-x/Arkbuild" "$ES_CHROOT" || return 1
         else
             log "es: no armhf rootfs in the package cache, debootstrapping one"
@@ -2502,7 +2505,7 @@ fi
 # ── The SD BOOT payload ───────────────────────────────────────────────────────
 #
 # Copy this tree onto the FAT partition labelled BOOT and the MVII LK boots the
-# card instead of the eMMC.  /mvii/boot.conf is written because a dArkOS card
+# card instead of the eMMC.  /mvii/boot.conf is written because an R36S card
 # already carries a boot.ini, and that boot.ini names the RK3326's arm64 `Image`
 # and an rk3326 device tree.  The LK parses boot.ini first and boot.conf second
 # precisely so this file gets the last word; without it the LK would load the
@@ -2631,7 +2634,7 @@ fi
 cat > "$SDBOOT/mvii/boot.conf" <<'CONF'
 # MVII LK SD hand-off, J36 Ultra (MT6592, ARMv7).
 #
-# Read after the card's own boot.ini, so these override it: a dArkOS boot.ini
+# Read after the card's own boot.ini, so these override it: an R36S boot.ini
 # names the RK3326 arm64 kernel, which this SoC cannot execute.  Keep this file
 # short -- the LK reads it into a fixed 2 KiB buffer.  ../README.txt is the long
 # form and explains every word below.
@@ -2668,7 +2671,7 @@ cat > "$SDBOOT/README.txt" <<'README'
 J36 Ultra (MT6592, ARMv7) SD card BOOT payload.
 
 Copy the contents of this directory into the root of the FAT partition labelled
-BOOT.  Existing files are not disturbed: an R36S dArkOS card keeps its Image,
+BOOT.  Existing files are not disturbed: an R36S card keeps its Image,
 uInitrd, rk3326 device trees and boot.ini, and mvii/boot.conf points the MVII LK
 at the ARMv7 payload instead.
 
@@ -2685,6 +2688,8 @@ at the ARMv7 payload instead.
                             -p whether a frame reaches the glass; j36.es=debug
   j36/es/emulationstation   the same EmulationStation with a GLES 2.0 renderer,
                             bind-mounted over the rootfs's fixed-function one
+  LICENSE.txt               which licence covers which file above, and where the
+                            GPL-2.0-only source is; keep it with the payload
 
 The R36S kernel on the same card is arm64 and stays there for the R36S.  The
 armhf Debian rootfs is shared, and this kernel can now mount it: MSDC1, the
@@ -2713,7 +2718,7 @@ systemd.journald.forward_to_console=1
     journal with -- it costs a redraw per line on a 640x480 framebuffer.
 
 systemd.mask=firstboot.service
-    dArkOS's first-boot script is written for the RK3326 image and this
+    MixOS's first-boot script is written for the RK3326 image and this
     configuration cannot finish it.  It expands the partitions in two stages with
     a reboot between them, then untars /roms.tar and /tempthemes -- which a
     GUI-mode build does not ship.  With the tars missing, its two progress loops
@@ -3039,7 +3044,7 @@ than assumed, and it is worth keeping the list because it is also the fault tree
      one reason it was never the answer -- the other being that it binds the same
      `simple-framebuffer' the working display is on and evicts simplefb.
   4. A GL front end that is Mesa's.  Debian's Mesa was in the rootfs all along;
-     what was not was its front door.  dArkOS points libEGL.so, libgbm.so{,.1,.1.0.0}
+     what was not was its front door.  The shared rootfs points libEGL.so, libgbm.so{,.1,.1.0.0}
      and libGLESv1_CM.so at the RK3326's Mali-G31 blob, and
      emulationstation.service pins SDL to it with SDL_VIDEO_EGL_DRIVER=libEGL.so.
      Bifrost is a different architecture from this SoC's Utgard part, so that
@@ -3414,7 +3419,141 @@ calls.  Without that node userspace shuts down cleanly and then prints "Reboot
 failed -- System halted", which is a halt, not a crash -- the card is safe to
 pull at that point.  `poweroff' still ends the same way, because nothing drives
 the PMIC yet; hold the power button instead.
+
+Licence
+-------
+
+See LICENSE.txt beside this file.  In short: the MixOS bring-up work is under the
+Microsoft Public License, the three kernel modules and the kernel itself are
+GPL-2.0-only, and everything else on the card is Debian's under its own terms.
+MixOS is a divergent fork of dArkOS, which continues ArkOS; the operating system
+underneath is Debian.  MixOS supports the MediaTek line of processors, and this
+card is that support.
 README
+
+# Ms-PL section 3(C) is the reason this is written and not just linked from the
+# repository: a card handed to somebody else is a distribution, and it has to carry
+# its notices with it.  It is not added to SHA256SUMS, for the same reason
+# README.txt is not -- the sums cover what the machine executes.
+cat > "$SDBOOT/LICENSE.txt" <<'LICENCE'
+MixOS -- J36 Ultra (MediaTek MT6592, ARMv7) SD BOOT payload
+Copyright (c) 2025-2026 the MixOS project and contributors
+
+MixOS supports the MediaTek line of processors.  This card is that support: a
+32-bit ARM kernel, an mtk_drm display path, mtk-sd storage, the MT6592 AFE, a
+keypad adapter and Mesa's lima/kmsro pair, on a Cortex-A7 from 2013.
+
+This payload is not licensed uniformly.  Saying otherwise would be a false
+statement about other people's code.
+
+Microsoft Public License (Ms-PL), in full below:
+
+    j36/eglprobe            the EGL/GBM/DRM scanout probe
+    j36/mfgpower            the MFG power-domain bring-up probe
+    mvii/boot.conf          the MVII LK hand-off
+    README.txt, this file   the documentation
+
+GNU General Public License, version 2 only:
+
+    zImage                  Linux 6.12 LTS, plus two MixOS patches (mtk-sd and
+                            drm/mediatek for MT6592)
+    initrd.img              busybox and a shell /init
+    j36/modules/*.ko        lima and its dependencies -- kernel modules
+    j36/mtkdrm/*.ko         mtk_drm, and MixOS's j36_jd9365_panel
+    j36/audio/*.ko          the ALSA core, and MixOS's j36_mt6592_audio
+    j36_mt6592_input.ko     MixOS's keypad and GPIO key adapter
+
+    The three MixOS modules are GPL-2.0-only deliberately and are not Ms-PL: they
+    derive from and link against GPL-2.0-only kernel internals, and Ms-PL is not
+    GPL-compatible.
+
+Their own terms:
+
+    j36/gl/*.so*            Mesa, from Debian (MIT and others)
+    j36/es/emulationstation EmulationStation-fcamod, under its own licence, with a
+                            third renderer added by MixOS that follows it
+    the rootfs on ROOTFS    Debian.  Per-package terms are in
+                            /usr/share/doc/*/copyright on the running device.
+
+SOURCE.  Everything GPL-2.0-only here is built from public source: Linux 6.12 LTS
+from kernel.org with the two patches in the MixOS repository under
+device/j36-ultra/linux/, the three MixOS modules in the same directory, and
+busybox, Mesa and EmulationStation as Debian packages them.  The MixOS build
+script that assembled this card is device/j36-ultra/build-in-vm.sh, and it is the
+complete recipe -- nothing here was produced by hand.
+
+ATTRIBUTION.  MixOS is a divergent fork of dArkOS, itself a Debian-based
+continuation of ArkOS by christianhaitian.  Divergent is meant literally: MixOS
+adds a second SoC vendor and a 32-bit kernel to a build system that assumed
+neither, and neither dArkOS nor ArkOS endorses it, is affiliated with it, or should
+receive its bug reports.  Thanks are owed to the Debian project above all -- the
+operating system this device runs is Debian, and MixOS is a device port on top of
+it -- and to ArkOS and dArkOS, to MediaTek's documentation and vendor sources, to
+Mesa for lima and kmsro, and to the Linux kernel, SDL, busybox and
+EmulationStation projects.  MixOS is not affiliated with or endorsed by the Debian
+project, MediaTek, or Microsoft; "Ms-PL" is simply the licence chosen for the
+MixOS work.
+
+
+Microsoft Public License (Ms-PL)
+
+This license governs use of the accompanying software. If you use the software,
+you accept this license. If you do not accept the license, do not use the
+software.
+
+1. Definitions
+
+The terms "reproduce," "reproduction," "derivative works," and "distribution"
+have the same meaning here as under U.S. copyright law.
+
+A "contribution" is the original software, or any additions or changes to the
+software.
+
+A "contributor" is any person that distributes its contribution under this
+license.
+
+"Licensed patents" are a contributor's patent claims that read directly on its
+contribution.
+
+2. Grant of Rights
+
+(A) Copyright Grant- Subject to the terms of this license, including the license
+conditions and limitations in section 3, each contributor grants you a
+non-exclusive, worldwide, royalty-free copyright license to reproduce its
+contribution, prepare derivative works of its contribution, and distribute its
+contribution or any derivative works that you create.
+
+(B) Patent Grant- Subject to the terms of this license, including the license
+conditions and limitations in section 3, each contributor grants you a
+non-exclusive, worldwide, royalty-free license under its licensed patents to make,
+have made, use, sell, offer for sale, import, and/or otherwise dispose of its
+contribution in the software or derivative works of the contribution in the
+software.
+
+3. Conditions and Limitations
+
+(A) No Trademark License- This license does not grant you rights to use any
+contributors' name, logo, or trademarks.
+
+(B) If you bring a patent claim against any contributor over patents that you
+claim are infringed by the software, your patent license from such contributor to
+the software ends automatically.
+
+(C) If you distribute any portion of the software, you must retain all copyright,
+patent, trademark, and attribution notices that are present in the software.
+
+(D) If you distribute any portion of the software in source code form, you may do
+so only under this license by including a complete copy of this license with your
+distribution. If you distribute any portion of the software in compiled or binary
+form, you may do so only under a license that complies with this license.
+
+(E) The software is licensed "as-is." You bear the risk of using it. The
+contributors give no express warranties, guarantees, or conditions. You may have
+additional consumer rights under your local laws which this license cannot change.
+To the extent permitted under your local laws, the contributors exclude the
+implied warranties of merchantability, fitness for a particular purpose and
+non-infringement.
+LICENCE
 
 (
     cd "$ARTIFACTS"
@@ -3464,6 +3603,7 @@ README
     fi
     sha256sum "${sums[@]}" > SHA256SUMS
     {
+        echo "licence=Ms-PL for the MixOS bring-up work, GPL-2.0-only for the kernel and the three MixOS modules, per-payload in sd-boot/LICENSE.txt"
         echo "kernel_branch=$KERNEL_BRANCH"
         echo "kernel_release=$KERNEL_RELEASE"
         echo "kernel_arch=arm (ARMv7, 32-bit)"
@@ -3534,7 +3674,7 @@ README
         if [[ -f sd-boot/j36/gl/links ]]; then
             echo "gl=debian armhf mesa 25.0.7 from the shared rootfs (lima_dri.so + mediatek_dri.so)"
             echo "gl_front_end=$(ls sd-boot/j36/gl/*.so* | xargs -n1 basename | tr '\n' ' ')"
-            echo "gl_reason=dArkOS points libEGL.so, libgbm.so{,.1,.1.0.0} and libGLESv1_CM.so at the RK3326 Mali blob"
+            echo "gl_reason=the shared rootfs points libEGL.so, libgbm.so{,.1,.1.0.0} and libGLESv1_CM.so at the RK3326 Mali blob"
             echo "gl_load_bearing=libgbm.so.1 -- libEGL_mesa.so.0 needs it, so mesa's own EGL cannot load without this payload"
             echo "gl_install=tmpfs on the rootfs /run plus a systemd drop-in; nothing is written to the card"
             echo "emulationstation=default; j36.es=1 supplies the GL front end"

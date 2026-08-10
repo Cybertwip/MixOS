@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MS-PL
+# Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
+# device/j36-ultra/LICENSE for the full text and for what it does not cover.
 # Test a split .7z image archive, at most once per version of that archive.
 #
 # Usage: verify_archive.sh IMAGE_PATH STATE_DIR

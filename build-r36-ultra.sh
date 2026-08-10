@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Build the dArkOS RG351MP base used for R36 Ultra bring-up.  The default
+# SPDX-License-Identifier: MS-PL
+# Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
+# device/j36-ultra/LICENSE for the full text and for what it does not cover.
+# Build the MixOS RG351MP base used for R36 Ultra bring-up.  The default
 # profile is a native armhf Debian userspace + EmulationStation with bundled
 # applications disabled.  The RK3326 kernel/boot chain remains arm64.
 #
@@ -15,7 +18,7 @@
 #   DARKOS_ARTIFACT_DIR=/path/to/output
 #   DARKOS_COPY_RAW_IMAGE=0       # Set to 1 to copy the raw .img to macOS.
 #   DARKOS_R36_BOOT_PAYLOAD=<artifacts>/Reference/BOOT
-#                                 # The BOOT partition of a working dArkOS R36
+#                                 # The BOOT partition of a working R36
 #                                 # image.  Supplies what this pipeline never
 #                                 # produced: the R36S device tree, the u-boot
 #                                 # panel variants, the off-charging bitmaps and

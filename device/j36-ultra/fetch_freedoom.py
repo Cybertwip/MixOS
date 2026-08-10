@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MS-PL
+# Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
+# device/j36-ultra/LICENSE for the full text and for what it does not cover.
 """Fetch one Freedoom IWAD for the J36 Ultra fbdoom payload.
 
 doomgeneric is an engine and ships no game data, so something has to supply an

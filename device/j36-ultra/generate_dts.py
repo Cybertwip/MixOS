@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MS-PL
+# Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
+# device/j36-ultra/LICENSE for the full text and for what it does not cover.
 """Generate the J36 Ultra MT6592 bring-up DTS from the MVII driver sources.
 
 The panel timing, power GPIOs, compact 155-record JD9365 command table, keypad
@@ -445,7 +448,7 @@ def generate(sources: dict[str, str]) -> str:
 \t\t * CONFIG_MEDIATEK_WATCHDOG was already y -- multi_v7_defconfig keeps it
 \t\t * under ARCH_MEDIATEK -- so the driver was built in the whole time and
 \t\t * simply had nothing to probe. That matters for the first-boot scripts as
-\t\t * much as for a user reboot: dArkOS expands its partitions in two stages
+\t\t * much as for a user reboot: MixOS expands its partitions in two stages
 \t\t * with a reboot between them, and a reboot that halts turns that into a
 \t\t * power-cycle by hand.
 \t\t *
@@ -461,7 +464,7 @@ def generate(sources: dict[str, str]) -> str:
 \t\t * table -- no reset controller, no clock -- and a leading compatible that
 \t\t * matches nothing only risks the node not binding at all. No interrupt is
 \t\t * needed (platform_get_irq_optional), and probe calls mtk_wdt_stop(), so
-\t\t * the hardware timer stays disarmed; nothing in the dArkOS rootfs opens
+\t\t * the hardware timer stays disarmed; nothing in the MixOS rootfs opens
 \t\t * /dev/watchdog, and the board already runs for minutes with no node at
 \t\t * all, so the LK is not leaving it armed either.
 \t\t */

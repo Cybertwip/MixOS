@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MS-PL */
+/* Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
+ * device/j36-ultra/LICENSE for the full text and for what it does not cover. */
 /*
  * j36-eglprobe -- ask EGL the question EmulationStation's abort throws away.
  *

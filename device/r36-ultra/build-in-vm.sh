@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MS-PL
+# Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
+# device/j36-ultra/LICENSE for the full text and for what it does not cover.
 # Checkpointed RG351MP/R36 base builder for Ubuntu.  The default profile builds
 # a native armhf Debian userspace and EmulationStation on the existing arm64
 # RK3326 kernel/boot chain, while preserving completed stages across retries.
@@ -139,7 +142,7 @@ export KERNEL_SRC DEF_CONFIG SCREEN_ROTATION KERNEL_DTB mountpoint
 BOOT_STASH="$STATE_DIR/boot"
 # What the pipeline never wrote at all: the R36S device tree, the u-boot panel
 # variants, the off-charging bitmaps and the dtb selector.  Taken from the BOOT
-# partition of a working dArkOS R36 image.
+# partition of a working R36 image.
 BOOT_PAYLOAD="${DARKOS_R36_BOOT_PAYLOAD:-}"
 # LABEL=ROOTFS rather than /dev/mmcblk0p2: an R36S has two card slots and no
 # eMMC, so the mmcblk index depends on which slot enumerates first, while the

@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: MS-PL
+# Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
+# device/j36-ultra/LICENSE for the full text and for what it does not cover.
 # Build the FAT32 BOOT partition of the R36 image, and own it end to end.
 #
 # Before this stage existed, the boot partition was a side effect: build_kernel.sh
@@ -19,7 +22,7 @@
 # mounted with LOOP_BOOT exported so finishing_touches.sh can add boot.ini and
 # detach it the way it always has.
 #
-# Reference for what belongs here: the BOOT partition of a working dArkOS R36
+# Reference for what belongs here: the BOOT partition of a working R36
 # image, which the caller points at with DARKOS_R36_BOOT_PAYLOAD.
 
 boot_log() { printf '\n[r36-boot] %s\n' "$*"; }

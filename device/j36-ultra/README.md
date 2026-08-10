@@ -1,5 +1,11 @@
 # J36 Ultra MT6592 bring-up DTB
 
+MediaTek MT6592 (Cortex-A7, ARMv7, Mali-450 MP4) support for **MixOS**.  This
+directory is licensed under the **Microsoft Public License** — see
+[LICENSE](LICENSE), which also records file by file the parts that are
+`GPL-2.0-only` and why they are not relicensed.  Attribution and thanks are at the
+bottom of this file and in [../../LICENSES.md](../../LICENSES.md).
+
 Build from the repository root:
 
 ```sh
@@ -25,7 +31,7 @@ keypad pad mux, and asserts on all three.
 `PROVENANCE.txt` records the upstream commit and a SHA-256 per file.
 `./device/j36-ultra/sync-mvii-board.sh` refreshes the copies from a PowerEngine
 checkout and rewrites that record; it is run **by hand**, never by the build. If
-a PowerEngine tree does happen to sit beside dArkOS, `build-j36-ultra.sh`
+a PowerEngine tree does happen to sit beside this checkout, `build-j36-ultra.sh`
 re-checks those hashes and warns when they have drifted — a warning and not a
 failure, because a missing or older sibling repository must not be able to stop
 this build.
@@ -180,6 +186,8 @@ j36/gl/                Mesa's GL front end, plus links (vfat has no symlinks)
 j36/eglprobe           what can create a GL context, and with -p whether a frame
                        reaches the glass: five held colours, CPU then lima
 j36/es/emulationstation  the same ES with a GLES 2.0 renderer (j36.es=1)
+LICENSE.txt            which licence covers which file above, and where the
+                       GPL-2.0-only source is
 ```
 
 `j36/doom` and `j36/freedoom1.wad` are no longer staged — see the fbdoom section
@@ -191,7 +199,7 @@ matching word from `bootargs`, restores the previous boot exactly, from any
 machine that can read an SD card and with no reflash. `/init` says on the panel
 what it found and carries on either way.
 
-`mvii/boot.conf` exists because a dArkOS card already carries a `boot.ini`, and
+`mvii/boot.conf` exists because an R36S card already carries a `boot.ini`, and
 that `boot.ini` names the arm64 `Image` and an rk3326 tree. The LK parses
 `boot.ini` first and `/mvii/boot.conf` second precisely so this file gets the
 last word; without it the LK would load the arm64 kernel, refuse it at the magic
@@ -249,7 +257,7 @@ Three things had to be true before that worked, and none of them are guesses:
   nothing in the log pointing at why.
 
 `CONFIG_BTRFS_FS` is built in because that is what the shared rootfs is:
-dArkOS's own `scripts/setup_partition.sh` sets `ROOT_FILESYSTEM_FORMAT="btrfs"`.
+MixOS's own `scripts/setup_partition.sh` sets `ROOT_FILESYSTEM_FORMAT="btrfs"`.
 `CONFIG_EXT4_FS` too, because a hand-made card usually is not.
 
 ## What PID 1 needs, and why the size prune took it away
@@ -359,10 +367,10 @@ no invented `mt6592` string in front of it: `mt6589-wdt` is the plain variant of
 this block in the driver's OF table (no reset controller, no clock), and a leading
 compatible that matches nothing only risks the node not binding. No interrupt is
 needed, and probe calls `mtk_wdt_stop()`, so the hardware timer stays disarmed —
-nothing in the dArkOS rootfs opens `/dev/watchdog`, and the board already ran for
+nothing in the MixOS rootfs opens `/dev/watchdog`, and the board already ran for
 minutes with no node at all.
 
-This is not only about a user pressing reboot. dArkOS expands its partitions in
+This is not only about a user pressing reboot. MixOS expands its partitions in
 two stages *with a reboot between them*, so a reboot that halts turns first boot
 into a sequence of power cycles by hand. `poweroff` still ends in a halt, because
 nothing drives the PMIC yet.
@@ -558,3 +566,51 @@ same work the full JD9365 program in the DTB is being kept for. Until then ES is
 left enabled and failing, because its unit is bounded (`Restart=on-failure`, five
 starts in ten seconds) and its failure is evidence;
 `systemd.mask=emulationstation.service` in `bootargs` silences it.
+
+## Licence and attribution
+
+The original MixOS work here — `build-in-vm.sh`, `generate_dts.py`,
+`create_boot_image.py`, `fetch_freedoom.py`, `sync-mvii-board.sh`,
+`es/patch-gles20.py`, `tools/j36-eglprobe.c`, `tools/mfgpower.c` and this
+documentation — is under the **Microsoft Public License (Ms-PL)**. The full text
+and the exact per-file scope are in [LICENSE](LICENSE).
+
+Three things in this directory are **not** Ms-PL, and the distinction is not
+cosmetic:
+
+- `linux/j36_mt6592_input.c`, `linux/j36_mt6592_audio.c`,
+  `linux/j36_jd9365_panel.c` and the two `linux/*.patch` files are
+  **`GPL-2.0-only`**. They derive from and link against GPL-2.0-only kernel
+  internals, and Ms-PL is not GPL-compatible — its section 3(D) adds a condition
+  GPLv2 section 6 forbids adding — so relicensing them is not this project's to
+  do, and it is not attempted.
+- `es/Renderer_GLES20.cpp` is written to drop into EmulationStation's own
+  `es-core/src/renderers/` beside its two existing renderers. It is a derivative
+  of that tree and follows **EmulationStation's** licence.
+- `mvii-board/` is five verbatim MediaTek/MVII board headers and driver sources,
+  redistributed unmodified with a SHA-256 each in `mvii-board/PROVENANCE.txt`.
+  They are inputs the DTS generator parses, not MixOS work.
+
+A finished card is an aggregate: the Linux kernel, Mesa, SDL, EmulationStation,
+busybox, the Freedoom IWAD and the Debian rootfs each arrive under their own terms.
+`build-in-vm.sh` writes the same statement onto the card as `sd-boot/LICENSE.txt`,
+mapped payload file by payload file, because handing somebody a card is a
+distribution and Ms-PL section 3(C) says the notices travel with it.
+
+**MixOS supports the MediaTek line of processors**, and this directory is that
+support. MixOS is a *divergent* fork of dArkOS, itself a Debian-based continuation
+of ArkOS by christianhaitian: it adds a second SoC vendor and a 32-bit ARM kernel
+to a build system that assumed one vendor and arm64, and it changes shared files to
+do it. Neither dArkOS nor ArkOS endorses this port, is affiliated with it, or
+should receive its bug reports.
+
+Thanks, in the order the debt is owed: to the **Debian** project, whose operating
+system this device actually runs — the rootfs is Debian, built with Debian's tools,
+and everything on the card that is not the kernel or the eleven files above is
+Debian's work; to **ArkOS** and **dArkOS** for the distribution this grew out of;
+to **MediaTek**, whose register documentation and vendor driver sources the device
+tree generator reads directly rather than guessing from; to **Mesa**, whose lima
+and kmsro drivers are the only reason a Utgard part from 2013 can run a GLES 2.0
+UI at all; and to the **Linux kernel**, **SDL**, **busybox**, **doomgeneric** and
+**EmulationStation** projects. MixOS is not affiliated with or endorsed by any of
+them, nor by Microsoft — Ms-PL is simply the licence chosen for the MixOS work.

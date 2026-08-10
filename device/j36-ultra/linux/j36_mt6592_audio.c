@@ -794,7 +794,7 @@ static const struct snd_pcm_ops j36_afe_pcm_ops = {
  *
  * Two controls, and they exist as much for the userspace on the card as for a
  * person with amixer: alsa-restore wants a controlC0 to restore into, and the
- * dArkOS units and EmulationStation both look for a "Master" element. Seven
+ * MixOS units and EmulationStation both look for a "Master" element. Seven
  * steps and not a hundred, because the class-D level field really is four bits
  * with seven usable values -- a 0..100 scale here would be a fiction.
  */
@@ -1037,5 +1037,5 @@ static struct platform_driver j36_afe_driver = {
 module_platform_driver(j36_afe_driver);
 
 MODULE_DESCRIPTION("J36 Ultra MT6592 AFE DL1 playback adapter");
-MODULE_AUTHOR("dArkOS / PowerEngine integration");
+MODULE_AUTHOR("MixOS / PowerEngine integration");
 MODULE_LICENSE("GPL");

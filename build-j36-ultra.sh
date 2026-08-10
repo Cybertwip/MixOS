@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MS-PL
+# Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
+# device/j36-ultra/LICENSE for the full text and for what it does not cover.
 # Add the ARMv7/MT6592 J36 Ultra layer on top of the R36 Ultra build.
 #
 # THIS IS AN EXTENSION OF build-r36-ultra.sh, NOT A SECOND BUILD SYSTEM.  It used
