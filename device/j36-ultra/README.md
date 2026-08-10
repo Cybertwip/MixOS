@@ -65,12 +65,21 @@ The first input layer is implemented by `linux/j36_mt6592_input.c` as one
 minimal polled platform driver. It consumes the DTB's
 `j36,j36-ultra-input` node and covers:
 
-1. GPIO DIN for the D-pad, stick clicks, and special key.
+1. GPIO DIN for the D-pad, stick clicks, and special key, with a pull-up armed so
+   "active low" has a defined idle to be low against.
 2. KPD scan memory for face/shoulder/start/select/menu/volume keys.
 3. AUXADC channels 15, 14, 12, and 13 for both analog sticks.
 
-It never changes pinmux or touches MMSYS, DSI, MIPI-TX, panel, or backlight
-registers.
+It also does the two things without which the matrix half of that list is dead:
+it muxes the three keypad pads the boot chain leaves parked (KPROW3 pad 11 at
+mode 3, KPCOL3 pad 12 at mode 3, KPCOL4 pad 2 at mode 6, from the DT keypad
+node), and it ungates the keypad's 32 kHz clock in the MT6323 PMIC over PWRAP.
+Both failures look identical from the SoC side -- scan memories reading their
+idle all-ones pattern -- so both were chased in the keymap first. Pad mux writes
+are confined to a pad whose mode is measurably wrong, and every one is logged
+with its before and after. See `linux/README.md`.
+
+It touches no MMSYS, DSI, MIPI-TX, panel, or backlight register.
 
 ## Incremental build
 

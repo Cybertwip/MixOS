@@ -31,6 +31,12 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+DARKOS_LOG_TAG="build-r36-ultra"
+# The Multipass daemon repair, the create-or-start, the mount refresh and the
+# checkout rsync live here because build-j36-ultra.sh needs the same four.
+# shellcheck source=device/common/multipass.sh
+. "$SCRIPT_DIR/device/common/multipass.sh"
+
 VM_NAME="${DARKOS_VM_NAME:-darkos-r36}"
 VM_CPUS="${DARKOS_VM_CPUS:-8}"
 VM_MEMORY="${DARKOS_VM_MEMORY:-16G}"
@@ -53,19 +59,6 @@ STATE_KEY="${DEBIAN_RELEASE}-userspace-${USERSPACE_ARCH}-profile-${BUILD_PROFILE
 VM_SOURCE_MOUNT="/mnt/darkos-host"
 VM_ARTIFACT_MOUNT="/mnt/darkos-artifacts"
 VM_BUILD_DIR="/home/ubuntu/dArkOS"
-
-log() {
-    printf '\n[build-r36-ultra] %s\n' "$*"
-}
-
-warn() {
-    printf '\n[build-r36-ultra] WARNING: %s\n' "$*" >&2
-}
-
-die() {
-    printf '\n[build-r36-ultra] ERROR: %s\n' "$*" >&2
-    exit 1
-}
 
 usage() {
     cat <<USAGE
@@ -103,15 +96,15 @@ elif [[ $# -ne 0 ]]; then
     exit 2
 fi
 
-[[ "$USERSPACE_ARCH" == "armhf" || "$USERSPACE_ARCH" == "arm64" ]] || die "USERSPACE_ARCH must be armhf or arm64."
-[[ "$BUNDLED_APPS" == "y" || "$BUNDLED_APPS" == "n" ]] || die "BUILD_BUNDLED_APPS must be y or n."
-[[ "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || die "BUILD_JOBS must be a positive integer."
-[[ "$CACHE" == "y" || "$CACHE" == "n" ]] || die "ENABLE_CACHE must be y or n."
-[[ "$COPY_RAW_IMAGE" == "0" || "$COPY_RAW_IMAGE" == "1" ]] || die "DARKOS_COPY_RAW_IMAGE must be 0 or 1."
+[[ "$USERSPACE_ARCH" == "armhf" || "$USERSPACE_ARCH" == "arm64" ]] || darkos_die "USERSPACE_ARCH must be armhf or arm64."
+[[ "$BUNDLED_APPS" == "y" || "$BUNDLED_APPS" == "n" ]] || darkos_die "BUILD_BUNDLED_APPS must be y or n."
+[[ "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || darkos_die "BUILD_JOBS must be a positive integer."
+[[ "$CACHE" == "y" || "$CACHE" == "n" ]] || darkos_die "ENABLE_CACHE must be y or n."
+[[ "$COPY_RAW_IMAGE" == "0" || "$COPY_RAW_IMAGE" == "1" ]] || darkos_die "DARKOS_COPY_RAW_IMAGE must be 0 or 1."
 
 run_make() {
     cd "$SCRIPT_DIR"
-    log "Building or resuming RG351MP (Debian ${DEBIAN_RELEASE}, userspace=${USERSPACE_ARCH}, profile=${BUILD_PROFILE}, jobs=${BUILD_JOBS}, cache=${CACHE})"
+    darkos_log "Building or resuming RG351MP (Debian ${DEBIAN_RELEASE}, userspace=${USERSPACE_ARCH}, profile=${BUILD_PROFILE}, jobs=${BUILD_JOBS}, cache=${CACHE})"
     env DEBIAN_CODE_NAME="$DEBIAN_RELEASE" \
         USERSPACE_ARCH="$USERSPACE_ARCH" \
         BUILD_JOBS="$BUILD_JOBS" \
@@ -123,91 +116,34 @@ run_make() {
 }
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
-    command -v make >/dev/null 2>&1 || die "make is required."
+    command -v make >/dev/null 2>&1 || darkos_die "make is required."
     run_make
     exit $?
 fi
 
-command -v multipass >/dev/null 2>&1 || die "Multipass is required on macOS. Install and launch Multipass first."
-
 available_kib="$(df -Pk "$SCRIPT_DIR" | awk 'NR == 2 { print $4 }')"
 available_gib=$((available_kib / 1024 / 1024))
 if (( available_gib < 140 )); then
-    warn "Only about ${available_gib} GiB is free. The initial build may exhaust the disk; 160-180 GiB free is recommended."
+    darkos_warn "Only about ${available_gib} GiB is free. The initial build may exhaust the disk; 160-180 GiB free is recommended."
 fi
 
-if ! multipass list >/dev/null 2>&1; then
-    log "Starting Multipass"
-    open -a Multipass >/dev/null 2>&1 || true
-    for _ in {1..10}; do
-        multipass list >/dev/null 2>&1 && break
-        sleep 2
-    done
-
-    # Some macOS updates leave Multipass installed but unload its launch daemon,
-    # which makes the GUI loop forever at "Waiting for daemon". Repair only that
-    # existing service; macOS will show one administrator-authentication dialog.
-    if ! multipass list >/dev/null 2>&1 &&
-       ! launchctl print system/com.canonical.multipassd >/dev/null 2>&1 &&
-       [[ -f /Library/LaunchDaemons/com.canonical.multipassd.plist ]]; then
-        log "Reloading the installed Multipass daemon"
-        osascript -e 'do shell script "mkdir -p /Library/Logs/Multipass; launchctl bootout system/com.canonical.multipassd >/dev/null 2>&1 || true; launchctl bootstrap system /Library/LaunchDaemons/com.canonical.multipassd.plist; launchctl enable system/com.canonical.multipassd; launchctl kickstart -k system/com.canonical.multipassd" with administrator privileges'
-    fi
-
-    for _ in {1..20}; do
-        multipass list >/dev/null 2>&1 && break
-        sleep 2
-    done
-    multipass list >/dev/null 2>&1 || die "Could not connect to the Multipass daemon."
-fi
-
-if multipass info "$VM_NAME" >/dev/null 2>&1; then
-    log "Reusing Multipass VM ${VM_NAME}"
-    multipass start "$VM_NAME" >/dev/null 2>&1 || true
-else
-    log "Creating Ubuntu ${UBUNTU_IMAGE} VM ${VM_NAME}"
-    multipass launch "$UBUNTU_IMAGE" \
-        --name "$VM_NAME" \
-        --cpus "$VM_CPUS" \
-        --memory "$VM_MEMORY" \
-        --disk "$VM_DISK"
-fi
+darkos_multipass_ready
+darkos_vm_ensure "$VM_NAME" "$VM_CPUS" "$VM_MEMORY" "$VM_DISK" "$UBUNTU_IMAGE"
 
 mkdir -p "$ARTIFACT_DIR"
+darkos_vm_remount "$VM_NAME" \
+    "$SCRIPT_DIR:$VM_SOURCE_MOUNT" \
+    "$ARTIFACT_DIR:$VM_ARTIFACT_MOUNT"
 
-# Refresh the mounts so moving the checkout or artifact directory is handled.
-multipass umount "$VM_NAME:$VM_SOURCE_MOUNT" >/dev/null 2>&1 || true
-multipass umount "$VM_NAME:$VM_ARTIFACT_MOUNT" >/dev/null 2>&1 || true
-multipass mount "$SCRIPT_DIR" "$VM_NAME:$VM_SOURCE_MOUNT"
-multipass mount "$ARTIFACT_DIR" "$VM_NAME:$VM_ARTIFACT_MOUNT"
-
-log "Preparing the Ubuntu build environment"
+darkos_log "Preparing the Ubuntu build environment"
 multipass exec "$VM_NAME" -- bash -lc "
 set -Eeuo pipefail
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git make rsync tmux
 printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\\n' \"\$(id -un)\" | sudo tee /etc/sudoers.d/darkos-build >/dev/null
 sudo chmod 0440 /etc/sudoers.d/darkos-build
-mkdir -p '$VM_BUILD_DIR'
-rsync -a --delete \\
-    --exclude='.git/' \\
-    --exclude='Arkbuild/' \\
-    --exclude='Arkbuild32/' \\
-    --exclude='Arkbuild_ccache/' \\
-    --exclude='Arkbuild_package_cache/' \\
-    --exclude='prebuilts/' \\
-    --exclude='mnt/' \\
-    --exclude='main/' \\
-    --exclude='initrd/' \\
-    --exclude='rg351/' \\
-    --exclude='odroidgoA-4.4.y/' \\
-    --exclude='u-boot-rk3326/' \\
-    --exclude='build.log*' \\
-    --exclude='*.img' \\
-    --exclude='*.img.7z*' \\
-    --exclude='device/r36-ultra/boot-payload/' \\
-    '$VM_SOURCE_MOUNT/' '$VM_BUILD_DIR/'
 "
+darkos_vm_sync_checkout "$VM_NAME" "$VM_SOURCE_MOUNT" "$VM_BUILD_DIR"
 
 # The reference BOOT payload is read with sudo by install_boot.sh, and a
 # Multipass host mount belongs to the ubuntu user rather than to root.  Copy it
@@ -219,7 +155,7 @@ if [[ -d "$BOOT_PAYLOAD_DIR" ]]; then
     if [[ "$BOOT_PAYLOAD_DIR" == "$ARTIFACT_DIR"/* ]]; then
         payload_relative="${BOOT_PAYLOAD_DIR#"$ARTIFACT_DIR"/}"
         VM_BOOT_PAYLOAD="$VM_BUILD_DIR/device/r36-ultra/boot-payload"
-        log "Staging the reference boot payload from ${BOOT_PAYLOAD_DIR}"
+        darkos_log "Staging the reference boot payload from ${BOOT_PAYLOAD_DIR}"
         multipass exec "$VM_NAME" -- bash -lc "
 set -Eeuo pipefail
 mkdir -p '$VM_BOOT_PAYLOAD'
@@ -235,14 +171,14 @@ rsync -rt --delete \\
 du -sh '$VM_BOOT_PAYLOAD'
 "
     else
-        warn "DARKOS_R36_BOOT_PAYLOAD is outside ${ARTIFACT_DIR}, which the build VM cannot read; the R36S device tree and the off-charging bitmaps will not be installed."
+        darkos_warn "DARKOS_R36_BOOT_PAYLOAD is outside ${ARTIFACT_DIR}, which the build VM cannot read; the R36S device tree and the off-charging bitmaps will not be installed."
     fi
 else
-    warn "No reference boot payload at ${BOOT_PAYLOAD_DIR}; the boot partition will get only the files this build produces."
+    darkos_warn "No reference boot payload at ${BOOT_PAYLOAD_DIR}; the boot partition will get only the files this build produces."
 fi
 
-log "Starting or resuming the checkpointed R36/RG351MP build"
-log "Completed partition, Debian bootstrap, U-Boot and kernel stages are preserved across retries."
+darkos_log "Starting or resuming the checkpointed R36/RG351MP build"
+darkos_log "Completed partition, Debian bootstrap, U-Boot and kernel stages are preserved across retries."
 
 multipass exec "$VM_NAME" -- env \
     DEBIAN_CODE_NAME="$DEBIAN_RELEASE" \
@@ -280,6 +216,6 @@ sync "$ARTIFACT_DIR"
     "$VM_ARTIFACT_MOUNT" \
     "$COPY_RAW_IMAGE"
 
-log "Build completed and verified."
-log "Artifacts: ${ARTIFACT_DIR}"
-warn "This is the RG351MP/RK3326 base image. It does not yet contain the R36 Ultra-specific DTB layer."
+darkos_log "Build completed and verified."
+darkos_log "Artifacts: ${ARTIFACT_DIR}"
+darkos_warn "This is the RG351MP/RK3326 base image. It does not yet contain the R36 Ultra-specific DTB layer."

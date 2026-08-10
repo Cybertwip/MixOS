@@ -1,11 +1,28 @@
 #!/usr/bin/env bash
-# Incrementally build the separate ARMv7/MT6592 J36 Ultra bring-up layer.
-# Reuses the persistent Multipass VM created by build-r36-ultra.sh, but never
-# reruns or patches the incompatible AArch64/RK3326 image.
+# Add the ARMv7/MT6592 J36 Ultra layer on top of the R36 Ultra build.
+#
+# THIS IS AN EXTENSION OF build-r36-ultra.sh, NOT A SECOND BUILD SYSTEM.  It used
+# to carry its own copy of the Multipass daemon repair, the VM create-or-start and
+# the checkout rsync with its own exclude list, and it had to refuse to run while
+# an R36 build was in flight because the two would fight over the VM checkout.
+# Two entry points that can disagree is one exclude list that goes stale.  Now the
+# R36 wrapper owns the VM and the base image, this script resumes it, and what is
+# left here is only what is J36-specific:
+#
+#   - the DTB, generated on the host from the current MVII drivers;
+#   - the ARMv7 kernel workspace, input module and boot.img built in the VM.
+#
+# The R36 base build is checkpointed, so resuming a finished one costs seconds.
+# Set J36_RESUME_R36=0 to skip it and build the J36 layer against whatever base
+# is already in the VM.
 
 set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+DARKOS_LOG_TAG="build-j36-ultra"
+# shellcheck source=device/common/multipass.sh
+. "$ROOT/device/common/multipass.sh"
+
 VM_NAME="${DARKOS_VM_NAME:-darkos-r36}"
 VM_CPUS="${DARKOS_VM_CPUS:-8}"
 VM_MEMORY="${DARKOS_VM_MEMORY:-16G}"
@@ -14,35 +31,39 @@ UBUNTU_IMAGE="${DARKOS_UBUNTU_IMAGE:-24.04}"
 POWERENGINE_ROOT="${POWERENGINE_ROOT:-$(dirname "$ROOT")/PowerEngineV3/PowerEngine}"
 DRIVERS_HOST="${J36_DRIVERS_DIR:-$POWERENGINE_ROOT/OS/MVII/Kernel/ARM/MediaTek/J36Ultra/Drivers}"
 ARTIFACT_DIR="${J36_ARTIFACT_DIR:-${ROOT}-artifacts/j36-ultra}"
+RESUME_R36="${J36_RESUME_R36:-1}"
 VM_SOURCE_MOUNT="/mnt/darkos-host"
 VM_DRIVERS_MOUNT="/mnt/j36-drivers-host"
 VM_ARTIFACT_MOUNT="/mnt/j36-artifacts"
 VM_BUILD_DIR="/home/ubuntu/dArkOS"
 VM_WORK_DIR="/home/ubuntu/j36-ultra-work"
 
-log() { printf '\n[build-j36-ultra] %s\n' "$*"; }
-die() { printf '\n[build-j36-ultra] ERROR: %s\n' "$*" >&2; exit 1; }
-
 usage() {
     cat <<USAGE
 Usage: ./build-j36-ultra.sh
 
-Reuses Multipass VM: $VM_NAME
-Writes artifacts to: $ARTIFACT_DIR
+Resumes the R36 Ultra build (build-r36-ultra.sh, checkpointed) and then adds the
+J36 Ultra layer on top of it in the same Multipass VM: $VM_NAME
 
-The first run clones/builds the small J36 ARMv7 kernel workspace. Later runs
-reuse that kernel build and only rebuild changed DTB/module/boot artifacts.
-It does not rerun 'make rg351mp'.
+Writes J36 artifacts to: $ARTIFACT_DIR
+
+The first J36 run creates the persistent ARMv7 Linux 6.12 LTS workspace.  Later
+runs reuse it and rebuild only changed kernel, DTB, input-module, initramfs and
+boot.img files.
 
 Overrides:
+  J36_RESUME_R36=0 ./build-j36-ultra.sh      # J36 layer only, leave the base as is
   J36_UPDATE_KERNEL=1 ./build-j36-ultra.sh
   J36_REBUILD_BUSYBOX=1 ./build-j36-ultra.sh
   J36_KERNEL_BRANCH=linux-6.12.y ./build-j36-ultra.sh
   J36_ARTIFACT_DIR=/path/to/output ./build-j36-ultra.sh
+
+Anything build-r36-ultra.sh honours (BUILD_JOBS, USERSPACE_ARCH,
+DARKOS_R36_BOOT_PAYLOAD, ...) is inherited by the resumed base build.
 USAGE
 }
 
-if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
     exit 0
 elif [[ $# -ne 0 ]]; then
@@ -50,83 +71,44 @@ elif [[ $# -ne 0 ]]; then
     exit 2
 fi
 
-[[ "$(uname -s)" == Darwin ]] || die "run this wrapper on macOS"
-[[ -d "$DRIVERS_HOST" ]] || die "PowerEngine J36 Drivers not found: $DRIVERS_HOST"
-command -v multipass >/dev/null 2>&1 || die "Multipass is required"
+[[ "$(uname -s)" == "Darwin" ]] || darkos_die "run this wrapper on macOS"
+[[ "$RESUME_R36" == "0" || "$RESUME_R36" == "1" ]] || darkos_die "J36_RESUME_R36 must be 0 or 1."
+[[ -d "$DRIVERS_HOST" ]] || darkos_die "PowerEngine J36 Drivers not found: $DRIVERS_HOST"
 
-if ! multipass list >/dev/null 2>&1; then
-    log "Starting Multipass"
-    open -a Multipass >/dev/null 2>&1 || true
-    for _ in {1..10}; do
-        multipass list >/dev/null 2>&1 && break
-        sleep 2
-    done
-    if ! multipass list >/dev/null 2>&1 && \
-       ! launchctl print system/com.canonical.multipassd >/dev/null 2>&1 && \
-       [[ -f /Library/LaunchDaemons/com.canonical.multipassd.plist ]]; then
-        log "Reloading the installed Multipass daemon"
-        osascript -e 'do shell script "mkdir -p /Library/Logs/Multipass; launchctl bootout system/com.canonical.multipassd >/dev/null 2>&1 || true; launchctl bootstrap system /Library/LaunchDaemons/com.canonical.multipassd.plist; launchctl enable system/com.canonical.multipassd; launchctl kickstart -k system/com.canonical.multipassd" with administrator privileges'
-    fi
-    for _ in {1..20}; do
-        multipass list >/dev/null 2>&1 && break
-        sleep 2
-    done
-    multipass list >/dev/null 2>&1 || die "could not connect to Multipass"
-fi
-
-if multipass info "$VM_NAME" >/dev/null 2>&1; then
-    multipass start "$VM_NAME" >/dev/null 2>&1 || true
-else
-    log "Creating the persistent Ubuntu VM $VM_NAME"
-    multipass launch "$UBUNTU_IMAGE" --name "$VM_NAME" \
-        --cpus "$VM_CPUS" --memory "$VM_MEMORY" --disk "$VM_DISK"
-fi
-
-# Do not unmount or rewrite the VM checkout while the baseline image is active.
-if multipass exec "$VM_NAME" -- bash -lc \
-    "pgrep -f '[b]uild_rg351mp.sh|[m]ake[[:space:]].*rg351mp' >/dev/null"; then
-    die "the R36/RG351MP baseline build is still running. Re-run this command after it finishes."
-fi
-
-log "Regenerating the DTB locally from the current MVII Drivers"
+# The DTB is generated on the host from the MVII drivers, and its generator
+# asserts on the panel record table and on the keypad pad mux.  Run it before
+# anything slow: a keymap or pad-mux regression should fail in a second, not after
+# the base image has been rebuilt.
+darkos_log "Regenerating the DTB from the current MVII drivers"
 J36_DRIVERS_DIR="$DRIVERS_HOST" "$ROOT/build-j36-ultra-dtb.sh"
 
-mkdir -p "$ARTIFACT_DIR"
-multipass umount "$VM_NAME:$VM_SOURCE_MOUNT" >/dev/null 2>&1 || true
-multipass umount "$VM_NAME:$VM_DRIVERS_MOUNT" >/dev/null 2>&1 || true
-multipass umount "$VM_NAME:$VM_ARTIFACT_MOUNT" >/dev/null 2>&1 || true
-multipass mount "$ROOT" "$VM_NAME:$VM_SOURCE_MOUNT"
-multipass mount "$DRIVERS_HOST" "$VM_NAME:$VM_DRIVERS_MOUNT"
-multipass mount "$ARTIFACT_DIR" "$VM_NAME:$VM_ARTIFACT_MOUNT"
+if [[ "$RESUME_R36" == "1" ]]; then
+    darkos_log "Resuming the R36 Ultra base build; completed stages are skipped"
+    "$ROOT/build-r36-ultra.sh"
+else
+    darkos_log "Skipping the R36 base build (J36_RESUME_R36=0)"
+    darkos_multipass_ready
+    darkos_vm_ensure "$VM_NAME" "$VM_CPUS" "$VM_MEMORY" "$VM_DISK" "$UBUNTU_IMAGE"
+    darkos_vm_remount "$VM_NAME" "$ROOT:$VM_SOURCE_MOUNT"
+    darkos_vm_sync_checkout "$VM_NAME" "$VM_SOURCE_MOUNT" "$VM_BUILD_DIR"
+fi
 
-log "Synchronizing only the changed dArkOS/J36 sources into the persistent VM"
+# The checkout is already in the VM either way, and device/j36-ultra rode along
+# with it.  What is still missing is J36-only: the MVII driver sources the in-VM
+# build reads its board constants from, and somewhere to put the results.
+mkdir -p "$ARTIFACT_DIR"
+darkos_vm_remount "$VM_NAME" \
+    "$DRIVERS_HOST:$VM_DRIVERS_MOUNT" \
+    "$ARTIFACT_DIR:$VM_ARTIFACT_MOUNT"
+
+darkos_log "Staging the MVII driver sources into the VM"
 multipass exec "$VM_NAME" -- bash -lc "
 set -Eeuo pipefail
-if ! command -v rsync >/dev/null 2>&1; then
-    sudo apt-get update
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y rsync
-fi
-mkdir -p '$VM_BUILD_DIR' '$VM_WORK_DIR/powerengine-drivers'
-rsync -a --delete \\
-    --exclude='.git/' \\
-    --exclude='Arkbuild/' \\
-    --exclude='Arkbuild32/' \\
-    --exclude='Arkbuild_ccache/' \\
-    --exclude='Arkbuild_package_cache/' \\
-    --exclude='prebuilts/' \\
-    --exclude='mnt/' \\
-    --exclude='main/' \\
-    --exclude='initrd/' \\
-    --exclude='rg351/' \\
-    --exclude='odroidgoA-4.4.y/' \\
-    --exclude='build.log*' \\
-    --exclude='*.img' \\
-    --exclude='*.img.7z*' \\
-    '$VM_SOURCE_MOUNT/' '$VM_BUILD_DIR/'
+mkdir -p '$VM_WORK_DIR/powerengine-drivers'
 rsync -a --delete '$VM_DRIVERS_MOUNT/' '$VM_WORK_DIR/powerengine-drivers/'
 "
 
-log "Running the incremental J36-only build"
+darkos_log "Building the J36 Ultra layer"
 multipass exec "$VM_NAME" -- env \
     J36_WORK_DIR="$VM_WORK_DIR" \
     J36_DRIVERS_DIR="$VM_WORK_DIR/powerengine-drivers" \
@@ -139,7 +121,7 @@ multipass exec "$VM_NAME" -- env \
     J36_REBUILD_BUSYBOX="${J36_REBUILD_BUSYBOX:-0}" \
     bash "$VM_BUILD_DIR/device/j36-ultra/build-in-vm.sh"
 
-log "J36 Ultra artifacts are ready: $ARTIFACT_DIR"
+darkos_log "J36 Ultra artifacts are ready: $ARTIFACT_DIR"
 printf '  %s\n' \
     "$ARTIFACT_DIR/boot.img" \
     "$ARTIFACT_DIR/mt6592-j36-ultra.dtb" \
