@@ -467,11 +467,15 @@ if [ -n "$rootdev" ]; then
 fi
 
 say ""
-if [ -n "$root_hint" ] && [ "$root_hint" != "$rootdev" ]; then
-    say "root=$root_hint held no filesystem with /sbin/init"
+# Reached two ways: no root was found, or one was and switch_root refused it.
+# Only the first is a missing-card story, and only it should be told as one.
+if [ -z "$rootdev" ]; then
+    if [ -n "$root_hint" ]; then
+        say "root=$root_hint held no filesystem with /sbin/init"
+    fi
+    say "No rootfs after ${waited}s; staying in the initramfs."
+    say ""
 fi
-say "No rootfs after ${waited}s; staying in the initramfs."
-say ""
 
 # ── Why the card did not come up ──────────────────────────────────────────────
 #

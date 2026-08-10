@@ -192,13 +192,32 @@ host and its partitions land on `mmcblk0`.
 
 Three things had to be true before that worked, and none of them are guesses:
 
-- **The interrupt is GIC_SPI 40, level-low.** MediaTek IRQ IDs on MT6592 run 64
-  above the GIC SPI number. That offset comes from a `struct resource` array in
-  the stock kernel's `.data` (file offsets `0xb2b050`–`0xb2b1c4`), which gives
-  MSDC0/1/2 → 103/104/105 and UART0..3 → 115..118; mainline `mt6592.dtsi` places
-  those same UARTs at GIC_SPI 51..54. Four independent confirmations of −64, so
-  MSDC1's 104 is SPI 40. The node's parent is `sysirq`, which is where the
-  level-low inversion is handled.
+- **The interrupt is GIC_SPI 72, level-low.** A `struct resource` array in the
+  stock kernel's `.data` (virt `0xc0b33050`–`0xc0b331c4`) gives MSDC0/1/3 →
+  103/104/105 and UART0..3 → 115..118. Those are GIC **interrupt IDs**, not SPI
+  indices: `mt_irq_mask` writes `GICD_ICENABLER + (irq>>5)*4` and
+  `mt_irq_set_sens` writes `GICD_ICFGR + (irq>>4)*4`, both applying the number
+  raw, and the GIC fixes those indices at INTID/32 and INTID/16. So SPI =
+  INTID − 32, and 104 → 72.
+
+  The proof is on this board, not in the derivation: the stock kernel's
+  `irqaction` for `gpt_handler` (virt `0xc0b33380`) reads `irq=176`,
+  `IRQF_TRIGGER_LOW`, `name="mt6592-gpt"`, and this tree already declares that
+  timer as `GIC_SPI 144` — 176 − 32 — with no arch-timer node behind it, so
+  nothing would ever schedule if that number were wrong.
+
+  This said SPI 40 for one boot, from taking mainline `mt6592.dtsi`'s
+  `GIC_SPI 51..54` for those UARTs at face value and inferring −64. Do not
+  derive these from that file. A wrong UART SPI is invisible — 8250 console
+  writes poll `THRE` and never use the interrupt — so the error only surfaced
+  when the same arithmetic was applied to a device that needs its IRQ.
+
+  The node's parent is `sysirq`, at `0x10200220` on this SoC and not the
+  `MCUCFG+0x620` later MediaTek parts use: `mt_irq_set_polarity`
+  (`0xc0325148`) computes `0xf0200220 + ((irq-32)>>5)*4`, bit `irq&31`. Its
+  linear bit is INTID − 32, which is exactly the bit mainline's `mtk-sysirq`
+  derives from `hwirq`, and its seven words cover SPI 0–223 for INTIDs 32–255
+  with none left over — a third agreement with −32.
 - **`mtk-sd` needed a compatible.** MT6592 is a 12-bit-divider part: the LK writes
   CKDIV into `MSDC_CFG[19:8]` and CKMOD into `[21:20]`, which is `clk_div_bits ==
   12`, not the 8-bit mt8135 layout. No in-tree entry pairs a 12-bit divider with
