@@ -2523,6 +2523,17 @@ j36.es=1
     j36.lima=1 and j36.mtkdrm=1 to be any use: without them there is no render node
     and no card node for Mesa to open.
 
+    It also mounts j36/es/emulationstation over the rootfs's own, if the card
+    carries one, and that is the second half of the fix.  The rootfs's binary was
+    compiled with the fixed-function renderer, and GLES1 is the one API this stack
+    cannot supply: Debian's armhf Mesa 25.0.7 is a -Dgles1=disabled build, so an ES1
+    context is 0x3003 EGL_BAD_ALLOC on lima, on llvmpipe and on softpipe alike.
+    Renderer_GLES10.cpp then reads glGetString(GL_EXTENSIONS) without having checked
+    SDL_GL_CreateContext, so a context that was never created arrives as
+    std::string(NULL) and aborts with status 134.  The binary in j36/es/ is the same
+    upstream commit with a GLES 2.0 renderer instead, and ES2 is what lima does
+    give: "OpenGL ES 2.0 Mesa 25.0.7-2+deb13u1".
+
 Doom, and what it is for
 ------------------------
 
