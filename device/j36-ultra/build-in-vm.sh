@@ -1053,10 +1053,10 @@ setup_es_gl() {
     #
     # These three are the load-bearing names: libEGL.so is the only GL string in
     # ES's DT_NEEDED, libgbm.so.1 is a clobbered SONAME that libEGL_mesa.so.0
-    # itself needs, and libGLESv1_CM.so.1 is the LD_PRELOAD that supplies the
+    # itself needs, and libGL.so.1 is the LD_PRELOAD that supplies the
     # fixed-function entry points ES calls.
     missing=""
-    for need in libEGL.so libgbm.so.1 libGLESv1_CM.so.1; do
+    for need in libEGL.so libgbm.so.1 libGL.so.1; do
         [ -e "/newroot/run/j36/gl/$need" ] || missing="$missing $need"
     done
     if [ -n "$missing" ]; then
@@ -1074,12 +1074,26 @@ setup_es_gl() {
     cat > /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPIN'
 # Written by the J36 Ultra initramfs, into a tmpfs. Not on the card, not in the
 # rootfs: it exists only for as long as this boot does.
+#
+# The two GL_DRIVER names are libGL, not libGLESv1_CM, and that is measured, not
+# a preference.  Debian's Mesa 25.0.7 is built without GLES1: an ES1 context
+# request comes back EGL_BAD_ALLOC not just on lima but on llvmpipe and softpipe
+# too, so it is the package and not this SoC.  What does come up is desktop GL as
+# a COMPATIBILITY profile -- "4.5 (Compatibility Profile)" on llvmpipe, 2.1 on
+# lima -- and compat GL is a superset of the fixed-function subset ES uses.  All
+# 29 gl* symbols in emulationstation's undefined list are exported by glvnd's
+# libGL.so.1, with the same signatures GLES1 gives them, so the GLES10 renderer
+# runs unmodified against a 2.1 context.  It also happens to be the context SDL
+# was asking for all along: Renderer_GLES10.cpp::setupWindow() never sets
+# SDL_GL_CONTEXT_PROFILE_MASK, and with no RPI video driver in this SDL2 the
+# profile stays desktop, so SDL binds EGL_OPENGL_API.  The preload was the half
+# that disagreed.
 [Service]
 Environment="LD_LIBRARY_PATH=/run/j36/gl"
-Environment="LD_PRELOAD=libGLESv1_CM.so.1"
+Environment="LD_PRELOAD=libGL.so.1"
 Environment="SDL_VIDEODRIVER=kmsdrm"
 Environment="SDL_VIDEO_EGL_DRIVER=libEGL.so.1"
-Environment="SDL_VIDEO_GL_DRIVER=libGLESv1_CM.so.1"
+Environment="SDL_VIDEO_GL_DRIVER=libGL.so.1"
 DROPIN
 
     # j36.es=debug appends the diagnostics.  Kept out of the default drop-in
@@ -1105,7 +1119,7 @@ DROPIN
     #                    SDL_GL_MakeCurrent and checks neither return value, then
     #                    at line 129 does
     #                        std::string glExts = (const char *)glGetString(GL_EXTENSIONS);
-    #                    With no current context glvnd's GLESv1 stub returns NULL,
+    #                    With no current context glvnd's libGL stub returns NULL,
     #                    and std::string(NULL) throws std::logic_error
     #                    "basic_string: construction from null is not valid" --
     #                    abort, status 134.  So a 134 means the context failed and
@@ -1153,9 +1167,16 @@ DROPINDBG
         # scroll away before it could be photographed.  The second copy comes
         # from the log rather than a second run, so it cannot disagree with the
         # first.
+        # The second line is the same probe with no DRM device at all and the
+        # software driver forced.  swrast does desktop GL, GLES1 and GLES2
+        # everywhere, so it says whether this Mesa can build those contexts at
+        # all -- and a row that works there but returns BAD_ALLOC on the nodes
+        # above is lima's, not the payload's.  It appends to the same log so the
+        # repeat after ES exits carries both.
         if [ -x /newroot/run/j36/eglprobe ]; then
             cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINPROBE'
 ExecStartPre=-/bin/sh -c '/run/j36/eglprobe 2>&1 | tee /run/j36/eglprobe.log'
+ExecStartPre=-/bin/sh -c 'LIBGL_ALWAYS_SOFTWARE=1 /run/j36/eglprobe -s 2>&1 | tee -a /run/j36/eglprobe.log'
 ExecStopPost=-/bin/sh -c 'echo "--- eglprobe, repeated now that ES has exited ---"; cat /run/j36/eglprobe.log'
 DROPINPROBE
         fi
