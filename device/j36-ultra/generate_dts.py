@@ -387,18 +387,62 @@ def generate(sources: dict[str, str]) -> str:
 \t\t\treg = <0x10200220 0x1c>;
 \t\t}};
 
+\t\t/*
+\t\t * This node is where the SPI numbering in this file is anchored, so it
+\t\t * is worth writing down once here rather than at every consumer.
+\t\t *
+\t\t * MediaTek's own kernel numbers interrupts by GIC interrupt ID, not by
+\t\t * SPI index. Three independent register computations in the stock
+\t\t * MT6592 kernel say so, all applying the raw number with no offset:
+\t\t *
+\t\t *   mt_irq_mask      0xc0324d68  GICD_ICENABLER 0xf0211180 + (irq>>5)*4,
+\t\t *                                bit irq&31
+\t\t *   mt_irq_set_sens  0xc03250b8  GICD_ICFGR     0xf0211c00 + (irq>>4)*4,
+\t\t *                                bit pair 2*(irq&15)
+\t\t *   mt_irq_set_polarity
+\t\t *                    0xc0325148  INT_POL_CTL0   0xf0200220 + ((irq-32)>>5)*4,
+\t\t *                                bit irq&31
+\t\t *
+\t\t * The GIC layout fixes ICENABLER's index at INTID/32 and ICFGR's at
+\t\t * INTID/16, so the argument is an INTID and SPI = INTID - 32. The
+\t\t * polarity register agrees: its linear bit is INTID-32, which is
+\t\t * exactly the bit mainline's mtk-sysirq computes from hwirq, and its
+\t\t * seven words cover SPI 0..223 for INTIDs 32..255 with nothing over.
+\t\t * INT_POL_CTL0 is at MCUCFG+0x220 on this SoC, not the +0x620 later
+\t\t * MediaTek parts use -- hence the reg on the sysirq node above.
+\t\t *
+\t\t * And this timer is the hardware proof, not just the derivation: the
+\t\t * stock kernel's own irqaction for gpt_handler, at 0xc0b33380, reads
+\t\t * {{handler=gpt_handler, irq=176, flags=0x15228 (IRQF_TRIGGER_LOW |
+\t\t * __IRQF_TIMER | ...), name=\"mt6592-gpt\"}}. 176 - 32 = 144, the value
+\t\t * below, and it is the clockevent for this profile -- there is no
+\t\t * arch-timer node, so if 144 were wrong nothing would schedule at all.
+\t\t * IRQF_TRIGGER_LOW is the type cell's 8.
+\t\t *
+\t\t * Do not derive these from mainline mt6592.dtsi. It puts UART0..UART3
+\t\t * at GIC_SPI 51..54 where the stock kernel has INTIDs 115..118, i.e.
+\t\t * -64, and that cost a boot: see the MSDC1 node.
+\t\t */
 \t\ttimer: timer@10008000 {{
 \t\t\tcompatible = \"mediatek,mt6577-timer\";
 \t\t\treg = <0x10008000 0x80>;
-\t\t\tinterrupts = <0 144 8>; /* GIC_SPI, IRQ_TYPE_LEVEL_LOW */
+\t\t\tinterrupts = <0 144 8>; /* GIC_SPI 144 = INTID 176, IRQ_TYPE_LEVEL_LOW */
 \t\t\tclocks = <&system_clk>, <&rtc_clk>;
 \t\t\tclock-names = \"system-clk\", \"rtc-clk\";
 \t\t}};
 
+\t\t/*
+\t\t * 83, not mainline's 51: the stock kernel's resource array gives this
+\t\t * base INTID 115, and 115 - 32 = 83. Console output does not prove
+\t\t * either number, because 8250 console writes poll the THRE bit and
+\t\t * never touch the interrupt -- which is precisely why a wrong SPI here
+\t\t * survived unnoticed and then got copied to MSDC1, where it mattered.
+\t\t * Receiving is what needs the IRQ, so a shell on ttyS0 is the test.
+\t\t */
 \t\tuart0: serial@11002000 {{
 \t\t\tcompatible = \"mediatek,mt6577-uart\";
 \t\t\treg = <0x11002000 0x400>;
-\t\t\tinterrupts = <0 51 8>; /* GIC_SPI, IRQ_TYPE_LEVEL_LOW */
+\t\t\tinterrupts = <0 83 8>; /* GIC_SPI 83 = INTID 115, IRQ_TYPE_LEVEL_LOW */
 \t\t\tclocks = <&uart_clk>;
 \t\t\tstatus = \"okay\";
 \t\t}};
@@ -676,15 +720,26 @@ def generate(sources: dict[str, str]) -> str:
 \t *                   this card (mt6592_msdc_sd.c). MSDC0 at 0x11230000 is
 \t *                   the eMMC and is deliberately left out of this tree.
 \t *
-\t *   interrupts 40   The stock MT6592 kernel carries a platform resource
+\t *   interrupts 72   The stock MT6592 kernel carries a platform resource
 \t *                   array in .data at 0xc0b33050..0xc0b331c4 holding
 \t *                   {{start, end, name, IORESOURCE_MEM}} followed by
 \t *                   {{irq, 0, name, IORESOURCE_IRQ}}. It gives MSDC0 IRQ
-\t *                   103, MSDC1 104, MSDC2 105, and -- in the same array,
-\t *                   which is what makes it usable -- UART0..UART3 as
-\t *                   115..118. Mainline's own mt6592.dtsi puts those four
-\t *                   UARTs at GIC_SPI 51..54, so MediaTek's IRQ IDs run
-\t *                   64 above the GIC SPI number on this SoC. 104 - 64 = 40.
+\t *                   103, MSDC1 104, MSDC3 105.
+\t *
+\t *                   Those are GIC interrupt IDs, so the SPI number is 32
+\t *                   lower -- see the note on the timer node above, which
+\t *                   proves the -32 on an interrupt this board is already
+\t *                   fielding. 104 - 32 = 72.
+\t *
+\t *                   This said 40 for one boot, from trusting mainline
+\t *                   mt6592.dtsi's UART SPIs (51..54 against the stock
+\t *                   kernel's 115..118, implying -64). Every request then
+\t *                   died on mtk-sd's 5-second software watchdog with
+\t *                   host->error=0x2 REQ_CMD_TMO and no "CMD bus busy"
+\t *                   line -- the command reached the controller and no
+\t *                   interrupt ever came back. A card that simply does not
+\t *                   answer raises MSDC_INT_CMDTMO in milliseconds; only a
+\t *                   misrouted IRQ is silent for a full five seconds.
 \t *
 \t *   compatible      mt6592-mmc, added by 0001-mtk-sd-mt6592.patch. MT6592
 \t *                   is a 12-bit-divider part: the LK writes CKDIV in
@@ -706,7 +761,7 @@ def generate(sources: dict[str, str]) -> str:
 \tmmc1: mmc@11240000 {{
 \t\tcompatible = \"mediatek,mt6592-mmc\";
 \t\treg = <0x11240000 0x1000>;
-\t\tinterrupts = <0 40 8>; /* GIC_SPI 40, IRQ_TYPE_LEVEL_LOW */
+\t\tinterrupts = <0 72 8>; /* GIC_SPI 72 = INTID 104, IRQ_TYPE_LEVEL_LOW */
 \t\tclocks = <&msdc1_src_clk>, <&msdc1_h_clk>;
 \t\tclock-names = \"source\", \"hclk\";
 \t\tvmmc-supply = <&msdc1_vmmc>;
