@@ -135,6 +135,7 @@ darkos_vm_remount "$VM_NAME" \
     "$SCRIPT_DIR:$VM_SOURCE_MOUNT" \
     "$ARTIFACT_DIR:$VM_ARTIFACT_MOUNT"
 
+darkos_vm_refuse_concurrent_build "$VM_NAME"
 darkos_vm_prepare_once "$VM_NAME" /home/ubuntu/darkos-r36-state/vm-tools.done \
     git make rsync tmux
 darkos_vm_sync_checkout "$VM_NAME" "$VM_SOURCE_MOUNT" "$VM_BUILD_DIR"

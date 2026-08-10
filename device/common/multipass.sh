@@ -134,6 +134,26 @@ touch '$stamp'
 "
 }
 
+# darkos_vm_refuse_concurrent_build NAME
+#
+# The checkout sync is `rsync --delete` over the directory a build reads its own
+# scripts from, so two wrappers running at once is not a race that produces a bad
+# image -- it is one that rewrites the running build's source tree underneath it.
+# The J36 wrapper used to guard this by grepping for `build_rg351mp.sh` and
+# `make ... rg351mp`, neither of which is how anything is invoked any more, so the
+# guard had quietly stopped guarding. Match the script that actually runs.
+darkos_vm_refuse_concurrent_build() {
+    local name=$1 running
+
+    running="$(multipass exec "$name" -- bash -lc \
+        "pgrep -af '[b]uild-in-vm\.sh' || true" 2>/dev/null)"
+    [[ -z "$running" ]] && return 0
+
+    darkos_warn "a build is already running in $name:"
+    printf '%s\n' "$running" >&2
+    darkos_die "refusing to rewrite the VM checkout underneath it; re-run when it finishes"
+}
+
 # darkos_vm_sync_checkout NAME SOURCE_MOUNT BUILD_DIR
 darkos_vm_sync_checkout() {
     local name=$1 source_mount=$2 build_dir=$3

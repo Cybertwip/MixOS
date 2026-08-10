@@ -90,6 +90,7 @@ else
     darkos_multipass_ready
     darkos_vm_ensure "$VM_NAME" "$VM_CPUS" "$VM_MEMORY" "$VM_DISK" "$UBUNTU_IMAGE"
     darkos_vm_remount "$VM_NAME" "$ROOT:$VM_SOURCE_MOUNT"
+    darkos_vm_refuse_concurrent_build "$VM_NAME"
     darkos_vm_sync_checkout "$VM_NAME" "$VM_SOURCE_MOUNT" "$VM_BUILD_DIR"
 fi
 
