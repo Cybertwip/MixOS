@@ -199,12 +199,16 @@ cd "$BUILD_DIR"
 # bytes; see device/r36-ultra/verify_archive.sh for why this is cached at all.
 bash device/r36-ultra/verify_archive.sh "$IMAGE" "$STATE_DIR"
 sudo parted -s "$IMAGE" print
-cp -f -- "${IMAGE}.7z."* "$ARTIFACT_DIR/"
+# Stamped, because these are the big ones and they cross the VM mount: the two
+# archive volumes are 2.4 GiB and the raw image 8.3 GB, and a resumed build
+# arrives here with bytes it has already copied.  The logs below are kilobytes
+# and change every run, so they just get copied.
+bash device/r36-ultra/copy_artifacts.sh "$ARTIFACT_DIR" "${IMAGE}.7z."*
+if [[ "$COPY_RAW" == 1 ]]; then
+    bash device/r36-ultra/copy_artifacts.sh "$ARTIFACT_DIR" "$IMAGE"
+fi
 cp -f -- "$STATE_DIR/resume.log" "$ARTIFACT_DIR/build-r36-ultra-resume.log"
 [[ -f build.log ]] && cp -f -- build.log "$ARTIFACT_DIR/build.log" || true
-if [[ "$COPY_RAW" == 1 ]]; then
-    cp -f -- "$IMAGE" "$ARTIFACT_DIR/"
-fi
 printf "%s\n" "$IMAGE" > "$ARTIFACT_DIR/latest-image.txt"
 sync "$ARTIFACT_DIR"
 ' artifact-copy \
