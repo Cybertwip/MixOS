@@ -1953,35 +1953,74 @@ without j36,preserve-lk-state in the tree rather than pretend it can bring a dar
 panel up.  Cold start is not implemented; the device tree keeps the init table,
 the PMIC sequence and the GPIO sequence so that it can be.
 
-EmulationStation, and what is still missing
--------------------------------------------
+EmulationStation
+----------------
 
-ES on this card cannot start yet.  The chain, each link measured rather than
-assumed, and two of the four now closed:
+It is the default now.  Four links had to close for that, each one measured rather
+than assumed, and it is worth keeping the list because it is also the fault tree:
 
-  1. CLOSED.  There is a KMS device: j36.mtkdrm=1 gives /dev/dri/card0 for the
-     display and lima gives /dev/dri/renderD128 for rendering.  Before this, the
-     panel was simplefb only -- a framebuffer, not a DRM device.
-  2. SDL2's video backends are KMSDRM, X11, Wayland, offscreen and dummy.  There
-     is no fbdev backend, so /dev/fb0 is of no use to it, and KMSDRM needs a card
-     node -- which step 1 now produces.
-  3. CLOSED, and this is why mediatek-drm specifically.  Mesa's renderonly table
-     has a mediatek entry, so lima's render node can be presented through an
-     mtk_drm card via kmsro.  simpledrm has no such entry, which is one reason it
-     was never the answer -- the other being that it binds the same
+  1. A KMS device.  j36.mtkdrm=1 gives /dev/dri/card0 for the display, j36.lima=1
+     gives /dev/dri/renderD128 for rendering.  Before this the panel was simplefb
+     only -- a framebuffer, not a DRM device -- and SDL cannot use one.
+  2. An SDL2 that can drive it.  This one needed nothing: the SDL2 in the shared
+     rootfs has KMSDRM, wayland, offscreen and dummy compiled in.  There is no
+     fbdev backend, which is why /dev/fb0 was never a route to ES, and KMSDRM
+     needs the card node step 1 produces.
+  3. A Mesa that can pair the two.  This is why the display driver is
+     mediatek-drm specifically: Debian's armhf Mesa 25.0.7 ships BOTH halves of
+     the pair, dri/lima_dri.so for the renderer and dri/mediatek_dri.so for the
+     kmsro display, so a GBM surface on an mtk_drm card is rendered by lima
+     without anything having to be told.  simpledrm has no such entry, which is
+     one reason it was never the answer -- the other being that it binds the same
      `simple-framebuffer' the working display is on and evicts simplefb.
-  4. STILL OPEN, and now the only link.  The GL stack in the shared rootfs is the
-     RK3326's Mali-G31 Bifrost blob, and emulationstation.service forces it with
+  4. A GL front end that is Mesa's.  Debian's Mesa was in the rootfs all along;
+     what was not was its front door.  dArkOS replaces libEGL.so, libGLESv2.so*,
+     libGLESv1_CM.so* and libgbm.so* with symlinks to the RK3326's Mali-G31 blob,
+     and emulationstation.service pins SDL to it with
      SDL_VIDEO_EGL_DRIVER=libEGL.so.  Bifrost is a different architecture from
-     this Utgard part; that library cannot drive this GPU whatever else is true.
+     this SoC's Utgard part, so that library cannot drive this GPU whatever else
+     is true.  j36.es=1 closes it: see the next section.
 
-So what closes it is an armhf Mesa carrying lima and kmsro, installed on a library
-path only this board looks at -- the shared rootfs's libEGL/libGLESv2/libgbm
-symlinks belong to the R36S's blob and must not move.  That is the next piece of
-work, not a setting.  ES is left enabled and failing on purpose: its unit is
-Restart=on-failure under the default 5-starts-in-10-s limit, so it gives up on its
-own and the log says why.  Add systemd.mask=emulationstation.service to bootargs
-to silence it.
+So there was no Mesa to cross-compile.  The whole of step 4 is five small
+libraries -- about 1.5 MB, most of it glvnd's dispatch table -- and an environment.
+
+The GL front end, and why it is a tmpfs
+---------------------------------------
+
+THE SHARED ROOTFS IS NOT WRITTEN.  That is the constraint everything here follows
+from.  One Debian armhf rootfs serves two machines, and the R36S needs its
+libEGL.so -> libMali.so symlinks to stay exactly where they are, because that blob
+is the only thing that drives its Mali-G31.  Replacing them would trade this
+board's GL for the other board's.
+
+So with j36.es=1 the initramfs, after it has mounted the rootfs and before it hands
+over, mounts a tmpfs on the rootfs's /run and puts two things in it: the five
+libraries from j36/gl/, and a systemd drop-in at
+/run/systemd/system/emulationstation.service.d/j36-gl.conf that sets
+LD_LIBRARY_PATH=/run/j36/gl and the SDL variables.  systemd reads drop-ins from
+/run exactly as it reads them from /etc, and it reads them after the unit file, so
+the drop-in's SDL_VIDEO_EGL_DRIVER replaces the unit's own rather than fighting it.
+Mounting /run from the initrd is the documented half of the handover: PID 1 adopts
+a /run that is already a tmpfs instead of mounting another over the top.
+
+Pull the card into an R36S and none of it exists.  Nothing was written to the
+filesystem, so there is nothing to undo.
+
+One variable is worth explaining because it looks like a workaround and is not.
+LD_PRELOAD names libGLESv1_CM.so.1 because EmulationStation's undefined GL symbols
+are glMatrixMode, glLoadMatrixf, glEnableClientState and 26 more like them -- fixed
+function OpenGL ES 1.x -- while the only GL library it declares a dependency on is
+libEGL.so.  That works against a vendor blob, where one object exports EGL and
+GLES1 and GLES2 together.  glvnd's libEGL exports no gl* entry point at all, so the
+GLES1 library has to be in the global scope before the binary starts or it does not
+start.  Mesa implements GLES1 over any gallium driver, lima included.
+
+If it does not come up, the order to check things in is: /dev/dri (step 1),
+then `SDL_VIDEODRIVER=kmsdrm` with any SDL program (step 2), then
+`EGL_LOG_LEVEL=debug MESA_DEBUG=1` in the drop-in (steps 3 and 4).  ES's own log is
+/home/ark/.emulationstation/es_log.txt, and its LogLevel is `disabled` in
+es_settings.cfg until you change it.  Add systemd.mask=emulationstation.service to
+bootargs to get the machine back to a console.
 
 Rebooting
 ---------
@@ -2017,6 +2056,14 @@ README
         while IFS= read -r ko; do
             sums+=("sd-boot/j36/mtkdrm/$ko")
         done < sd-boot/j36/mtkdrm/load.order
+    fi
+    if [[ -f sd-boot/j36/gl/links ]]; then
+        sums+=(sd-boot/j36/gl/links)
+        # Glob here and not a manifest walk, because links names the SONAMEs and
+        # not the files: the same library is one file and one or two names.
+        for gl in sd-boot/j36/gl/*.so*; do
+            [[ -f "$gl" ]] && sums+=("$gl")
+        done
     fi
     sha256sum "${sums[@]}" > SHA256SUMS
     {
@@ -2056,10 +2103,31 @@ README
             echo "gpu_driver=lima, CONFIG_DRM_LIMA=m ($(tr '\n' ' ' < sd-boot/j36/modules/load.order))"
             echo "gpu_power=j36/mfgpower ($(stat -c %s sd-boot/j36/mfgpower) bytes, static ARMv7, SPM MTCMOS via /dev/mem)"
             echo "gpu_start=j36.lima=1 on the command line; /init loads the modules only if mfgpower exits 0"
-            echo "gpu_nodes=renderD128 only; lima is render-only and there is no card0"
-            echo "emulationstation=blocked on a KMS driver, not on configuration (see sd-boot/README.txt)"
+            echo "gpu_nodes=renderD128 from lima; card0 comes from mtk_drm, not from lima"
         else
             echo "gpu=not staged"
+        fi
+        if [[ -f sd-boot/j36/mtkdrm/load.order ]]; then
+            echo "display_drm=mediatek-drm, mt6592 via mt2701 fallback compatibles"
+            echo "display_ddp=ovl0 0x14007000 -> rdma0 0x14008000 -> color0 0x1400b000 -> dsi0 0x1400c000"
+            echo "display_mutex=mod 0x488, sof 1 (matches the LK register for register)"
+            echo "display_phy=mediatek,mt2701-mipi-tx (mppll_preserve 3, as the LK writes)"
+            echo "display_data_rate=192 MHz from the pixel clock; the LK programmed 214"
+            echo "display_modules=$(tr '\n' ' ' < sd-boot/j36/mtkdrm/load.order)"
+            echo "display_start=j36.mtkdrm=1; no register is programmed until card0 is opened"
+            echo "display_fbdev=CONFIG_DRM_FBDEV_EMULATION=n, so /dev/fb0 stays simplefb's"
+        else
+            echo "display_drm=not staged"
+        fi
+        if [[ -f sd-boot/j36/gl/links ]]; then
+            echo "gl=debian armhf mesa 25.0.7 from the shared rootfs (lima_dri.so + mediatek_dri.so)"
+            echo "gl_front_end=$(ls sd-boot/j36/gl/*.so* | xargs -n1 basename | tr '\n' ' ')"
+            echo "gl_reason=dArkOS points libEGL/libGLESv*/libgbm at the RK3326 Mali blob"
+            echo "gl_install=tmpfs on the rootfs /run plus a systemd drop-in; nothing is written to the card"
+            echo "emulationstation=default; j36.es=1 supplies the GL front end"
+        else
+            echo "gl=not staged"
+            echo "emulationstation=enabled but will fail; without j36/gl it runs against the RK3326 blob"
         fi
     } > manifest.txt
 )
