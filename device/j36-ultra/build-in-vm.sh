@@ -1507,16 +1507,30 @@ collect_gl_payload() {
     rm -rf "$out" "$idx"
     mkdir -p "$out" "$idx"
 
+    # .xz first and .gz second, because the archive does not carry both for every
+    # suite: trixie has a Packages.gz and trixie-updates answers 404 for it. Trying
+    # one compression and giving up would silently stop looking at -updates, which
+    # is the half that carries a superseded revision.
+    local ext indices=0
     for suite in "${GL_SUITES[@]}"; do
-        url="$GL_MIRROR/dists/$suite/main/binary-armhf/Packages.gz"
-        if curl -fsSL --retry 3 --max-time 300 -o "$idx/$suite.gz" "$url"; then
-            gzip -dc "$idx/$suite.gz" > "$idx/$suite" || return 1
-            log "gl: read the $suite armhf package index"
+        for ext in xz gz; do
+            url="$GL_MIRROR/dists/$suite/main/binary-armhf/Packages.$ext"
+            curl -fsSL --retry 3 --max-time 300 --remove-on-error \
+                -o "$idx/$suite.$ext" "$url" || continue
+            case "$ext" in
+                xz) xz -dc "$idx/$suite.$ext" > "$idx/$suite" ;;
+                gz) gzip -dc "$idx/$suite.$ext" > "$idx/$suite" ;;
+            esac || return 1
+            log "gl: read the $suite armhf package index ($ext)"
+            break
+        done
+        if [[ -s "$idx/$suite" ]]; then
+            indices=$((indices + 1))
         else
-            log "gl: no $suite index at $url"
+            log "gl: no $suite index in the archive"
         fi
     done
-    ls "$idx"/*.gz >/dev/null 2>&1 || { log "gl: no package index could be fetched"; return 1; }
+    (( indices > 0 )) || { log "gl: no package index could be fetched"; return 1; }
 
     for pkg in "${GL_PACKAGES[@]}"; do
         filename=""
