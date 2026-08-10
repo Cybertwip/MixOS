@@ -62,7 +62,7 @@ def read_sources(drivers: Path) -> dict[str, str]:
     return result
 
 
-def parse_int(text: str, name: str) -> int:
+def parse_int(text: str, name: str, _depth: int = 0) -> int:
     patterns = (
         rf"\b{name}\s*=\s*(-?(?:0x[0-9a-fA-F]+|[0-9]+))u?\b",
         rf"#define\s+{name}\s+(-?(?:0x[0-9a-fA-F]+|[0-9]+))u?\b",
@@ -71,6 +71,14 @@ def parse_int(text: str, name: str) -> int:
         match = re.search(pattern, text)
         if match:
             return int(match.group(1), 0)
+    # One constant may be defined as another's name. The board header writes
+    # MT6592_J36_KPD_STROBE2_GPIO = MT6592_J36_KPD_PAD_UNMAPPED, because this
+    # board spent KPROW2's pad on the D-pad UP EINT, so an alias is a fact about
+    # the wiring and not a parse failure. Followed, with a depth cap so a typo
+    # that makes a constant refer to itself still fails loudly.
+    alias = re.search(rf"\b{name}\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\b", text)
+    if alias and _depth < 4:
+        return parse_int(text, alias.group(1), _depth + 1)
     raise SystemExit(f"could not parse {name} from MVII J36 drivers")
 
 
@@ -97,6 +105,55 @@ def parse_jd9365_records(text: str) -> list[tuple[int, int, int, int]]:
 
 def matrix_key(row: int, column: int, code: int) -> int:
     return (row << 24) | (column << 16) | code
+
+
+def check_kpd_pads(
+    strobes: list[tuple[int, int]],
+    senses: list[tuple[int, int]],
+    reserved: list[tuple[int, int]],
+    direct_keys: list[tuple[str, int, int]],
+    gpio_max: int,
+) -> None:
+    """Refuse to emit a pad description that the board header calls a regression.
+
+    Every rule here is one that hardware has already broken once, so the
+    generator is the place to catch it rather than the console:
+
+      * a keypad pad claimed twice, or claimed by a button as well -- the wire
+        scan once claimed pads 11, 12 and 2, and row 3 plus columns 3 and 4
+        stopped scanning;
+      * the reserved pad appearing among the strobes -- pad 93 is D-pad UP's
+        EINT here, and muxing it as KPROW2 buys a matrix row whose keys this
+        board does not have and costs UP;
+      * a pad above MT6592_J36_GPIO_MAX, which the preloader's own
+        mt_set_gpio_mode rejects before it touches a register.
+    """
+    owned: dict[int, str] = {}
+    for label, pads in (("strobe", strobes), ("sense", senses)):
+        for pad, mode in pads:
+            if pad in owned:
+                raise SystemExit(
+                    f"KPD pad {pad} is claimed as both {owned[pad]} and {label}"
+                )
+            if pad > gpio_max:
+                raise SystemExit(f"KPD {label} pad {pad} is above GPIO_MAX {gpio_max}")
+            if mode == 0:
+                raise SystemExit(f"KPD {label} pad {pad} wants mode 0, which is plain GPIO")
+            owned[pad] = label
+    for pad, mode in reserved:
+        if pad in owned:
+            raise SystemExit(f"pad {pad} is reserved for a button but muxed as {owned[pad]}")
+        if mode != 0:
+            raise SystemExit(f"reserved pad {pad} must stay mode 0, not {mode}")
+    for name, gpio, _code in direct_keys:
+        if gpio in owned:
+            raise SystemExit(f"{name} is on pad {gpio}, which the keypad block owns as {owned[gpio]}")
+        if gpio > gpio_max:
+            raise SystemExit(f"{name} is on pad {gpio}, above GPIO_MAX {gpio_max}")
+
+
+def format_pad_pairs(pads: list[tuple[int, int]], indent: str = "\t\t\t") -> str:
+    return ",\n".join(f"{indent}<{pad} {mode}>" for pad, mode in pads)
 
 
 def format_cells(values: list[int], per_line: int = 4, indent: str = "\t\t\t") -> str:
@@ -175,6 +232,45 @@ def generate(sources: dict[str, str]) -> str:
         row, column = divmod(bit, 9)
         keymap.append(matrix_key(row, column, code))
         matrix_bit_map.extend((bit, code))
+
+    # The nine pads the MT6592 keypad block owns on this board, each paired with
+    # the mux mode it needs. The mode is a per-pad fact: mode 1 is the keypad
+    # function on the five pads the preloader already muxes, but pad 11 (KPROW3)
+    # and pad 12 (KPCOL3) land there at mode 3 and pad 2 (KPCOL4) at mode 6, all
+    # three measured with `kpdmode <pad>` in the LK console. KPROW2 has no pad on
+    # this board, so its entry is the header's UNMAPPED alias and drops out.
+    kpd_unmapped = parse_int(board, "MT6592_J36_KPD_PAD_UNMAPPED")
+    kpd_mode = parse_int(board, "MT6592_J36_KPD_MUX_MODE")
+    gpio_max = parse_int(board, "MT6592_J36_GPIO_MAX")
+    strobe_pads = [
+        (parse_int(board, "MT6592_J36_KPD_STROBE0_GPIO"), kpd_mode),
+        (parse_int(board, "MT6592_J36_KPD_STROBE1_GPIO"), kpd_mode),
+        (parse_int(board, "MT6592_J36_KPD_STROBE2_GPIO"), kpd_mode),
+        (
+            parse_int(board, "MT6592_J36_KPD_STROBE3_GPIO"),
+            parse_int(board, "MT6592_J36_KPD_STROBE3_MUX_MODE"),
+        ),
+    ]
+    sense_pads = [
+        (parse_int(board, "MT6592_J36_KPD_SENSE0_GPIO"), kpd_mode),
+        (parse_int(board, "MT6592_J36_KPD_SENSE1_GPIO"), kpd_mode),
+        (parse_int(board, "MT6592_J36_KPD_SENSE2_GPIO"), kpd_mode),
+        (
+            parse_int(board, "MT6592_J36_KPD_SENSE3_GPIO"),
+            parse_int(board, "MT6592_J36_KPD_SENSE3_MUX_MODE"),
+        ),
+        (
+            parse_int(board, "MT6592_J36_KPD_SENSE4_GPIO"),
+            parse_int(board, "MT6592_J36_KPD_SENSE4_MUX_MODE"),
+        ),
+    ]
+    strobe_pads = [pair for pair in strobe_pads if pair[0] != kpd_unmapped]
+    sense_pads = [pair for pair in sense_pads if pair[0] != kpd_unmapped]
+    reserved_pads = [(parse_int(board, "MT6592_J36_KPD_ROW2_PAD_TAKEN_BY_DPAD_UP"), 0)]
+    check_kpd_pads(strobe_pads, sense_pads, reserved_pads, direct_keys, gpio_max)
+    strobe_pad_cells = format_pad_pairs(strobe_pads)
+    sense_pad_cells = format_pad_pairs(sense_pads)
+    reserved_pad_cells = format_pad_pairs(reserved_pads)
 
     joy_x = parse_int(keys, "AUXADC_JOY_X")
     joy_y = parse_int(keys, "AUXADC_JOY_Y")
@@ -347,6 +443,50 @@ def generate(sources: dict[str, str]) -> str:
 \t\t\tmediatek,matrix-bit-map = <
 {matrix_map_cells}
 \t\t\t>;
+
+\t\t\t/*
+\t\t\t * THE PADS THIS BLOCK OWNS, as <pad mux-mode> pairs, and they are not
+\t\t\t * optional. The boot chain hands over only five of the eight muxed:
+\t\t\t * KPROW3 (11), KPCOL3 (12) and KPCOL4 (2) arrive parked as plain GPIO,
+\t\t\t * and with them parked the block only ever scans matrix bits
+\t\t\t * {{0,1,2,9,10,11}} -- so VOL-, VOL+, SELECT, START, MENU, R2 and A read
+\t\t\t * as never pressed no matter how correct the keymap above is.
+\t\t\t *
+\t\t\t * The mode differs per pad and every value here was measured, not
+\t\t\t * assumed (`kpdmode <pad>` in the MVII LK console sweeps one pad through
+\t\t\t * all eight modes with a button held). Mode 1 is the keypad function on
+\t\t\t * 74/92/75/167/168; pad 11 and pad 12 need mode 3 and pad 2 needs mode
+\t\t\t * 6. Writing mode 1 to pad 11 turns it into a STATIC LOW rather than a
+\t\t\t * strobed row, which drags its column low in all eight rows at once --
+\t\t\t * SELECT then lights bits 2, 11, 20, 29, 38, 47, 56 and 65 together.
+\t\t\t *
+\t\t\t * Strobes are outputs and keep whatever pull they have; senses are
+\t\t\t * inputs with a pull-up. A pad already in its wanted mode must be left
+\t\t\t * exactly as found, floating sense lines included: 167 and 168 sit in
+\t\t\t * mode 1 with no pull at all and Y and B read fine through them.
+\t\t\t */
+\t\t\tj36,kpd-strobe-pads =
+{strobe_pad_cells};
+\t\t\tj36,kpd-sense-pads =
+{sense_pad_cells};
+
+\t\t\t/*
+\t\t\t * KPROW2's pad, which this board spent on the D-pad UP EINT instead --
+\t\t\t * which is the whole reason matrix row 2 is dead here. It must stay a
+\t\t\t * mode-0 GPIO input; muxing it buys a matrix row whose keys this board
+\t\t\t * does not have and costs UP. Listed so the driver can prove on every
+\t\t\t * boot that it is still mode 0 and put it back if something took it.
+\t\t\t *
+\t\t\t * It also will not idle high: it reads 0 with the internal pull-up armed
+\t\t\t * and verified in the register readback, held or released, because
+\t\t\t * something on the board loads it harder than that resistor can fight.
+\t\t\t * Driven high instead it behaves perfectly. The driver measures this at
+\t\t\t * probe rather than trusting the list -- see the driven-read path in
+\t\t\t * j36_mt6592_input.c -- so a board revision that populates the missing
+\t\t\t * pull-up simply never takes it.
+\t\t\t */
+\t\t\tj36,kpd-reserved-pads =
+{reserved_pad_cells};
 \t\t\tstatus = \"okay\";
 \t\t}};
 
