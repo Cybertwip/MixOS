@@ -1105,6 +1105,18 @@ README
         echo "display=stock-lk-simple-framebuffer"
         echo "native_dsi=disabled"
         echo "input_adapter=j36_mt6592_input.ko"
+        if [[ -f sd-boot/j36/doom ]]; then
+            echo "fbdoom=sd-boot/j36/doom ($(stat -c %s sd-boot/j36/doom) bytes, static ARMv7, 640x400 in 640x480)"
+            echo "fbdoom_commit=$DOOM_COMMIT"
+            if [[ -n "$DOOM_WAD" ]]; then
+                echo "fbdoom_iwad=j36/$(basename "$DOOM_WAD")"
+            else
+                echo "fbdoom_iwad=none (drop one into j36/ on the card)"
+            fi
+            echo "fbdoom_start=j36.doom=1 on the command line, /init runs it before switch_root"
+        else
+            echo "fbdoom=not staged"
+        fi
     } > manifest.txt
 )
 
