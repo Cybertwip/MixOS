@@ -439,7 +439,9 @@ namespace Renderer
 		// masking against a buffer that is not there.
 		SDL_GL_GetAttribute(SDL_GL_STENCIL_SIZE, &stencilBits);
 		if(stencilBits == 0)
+		{
 			LOG(LogInfo) << "GLES2: no stencil buffer in the chosen config, corners will not be rounded";
+		}
 
 		p_glEnableVertexAttribArray(ATTRIB_POS);
 		p_glEnableVertexAttribArray(ATTRIB_TEX);
