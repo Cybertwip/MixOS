@@ -109,6 +109,9 @@ private:
 
     int m_page = 0;
     int m_armed = InternalNone;
+    /* The exe of a confirm-first card that has been pressed once.  Keyed on the path
+     * rather than on a bool so two such cards cannot arm each other. */
+    QString m_armedExe;
 };
 
 #endif /* MIXDASH_DASHBOARD_H */

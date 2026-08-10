@@ -39,12 +39,19 @@
  * nodes is lima's.
  *
  * It probes the display node and the render node separately, because on this SoC
- * they are different chips: /dev/dri/card0 is mtk_drm (display, no GPU) and
- * /dev/dri/renderD128 is lima (GPU, no scanout), and Mesa bridges them with
- * kmsro.  If contexts come up on the render node but not on the display node,
- * the kmsro pairing is what is broken; if they fail on both, lima's context
- * creation is.  That distinction is the whole reason this file exists and it is
- * not observable from ES's abort.
+ * they are different chips: one is mtk_drm (display, no GPU) and one is lima (GPU,
+ * no scanout), and Mesa bridges them with kmsro.  If contexts come up on the render
+ * node but not on the display node, the kmsro pairing is what is broken; if they
+ * fail on both, lima's context creation is.  That distinction is the whole reason
+ * this file exists and it is not observable from ES's abort.
+ *
+ * WHICH node is which is asked, not assumed.  This file used to hard-code card0 as
+ * the display, and on the kernel we ship that is lima: -p answered "GETRESOURCES:
+ * Operation not supported", which is what a driver registered without
+ * DRIVER_MODESET returns, and every -p run before this one therefore measured the
+ * GPU's inability to scan out rather than anything about the panel.  Minor numbers
+ * go by probe order, so display_node() names every node and picks the one that has
+ * a CRTC and a connector.  -i prints that table and does nothing else.
  *
  * Which API is asked for matters as much as whether it works.  ES is a pure
  * GLES1 fixed-function renderer -- glMatrixMode, glVertexPointer -- but it asks
@@ -760,6 +767,24 @@ struct drm_event {
 #define DRM_IOCTL_MODE_ADDFB2       J36_IOWR(0xB8, struct drm_mode_fb_cmd2)
 #define DRM_IOCTL_MODE_PAGE_FLIP    J36_IOWR(0xB0, struct drm_mode_crtc_page_flip)
 
+/*
+ * DRM_IOCTL_VERSION, so a node can be named instead of guessed at.  The lengths are
+ * __kernel_size_t, which is unsigned long -- 32 bits here -- and the kernel's
+ * drm_copy_field() copies min(strlen, len) bytes and does NOT terminate, so every
+ * buffer below is zeroed first and asked for one byte less than it has.
+ */
+struct drm_version {
+    int           version_major, version_minor, version_patchlevel;
+    unsigned long name_len;
+    char         *name;
+    unsigned long date_len;
+    char         *date;
+    unsigned long desc_len;
+    char         *desc;
+};
+
+#define DRM_IOCTL_VERSION           J36_IOWR(0x00, struct drm_version)
+
 #define GL_COLOR_BUFFER_BIT        0x00004000
 
 /* How long each frame is held up.  Long enough to see, short enough that five of
@@ -778,6 +803,124 @@ static int drm_ioctl(unsigned long req, void *arg)
         r = ioctl(paint_fd, req, arg);
     } while (r < 0 && (errno == EINTR || errno == EAGAIN));
     return r;
+}
+
+/* ── which node drives the panel ───────────────────────────────────────────────
+ *
+ * This file assumed /dev/dri/card0 was mtk_drm.  On the kernel we ship it is not,
+ * and -p said so exactly:
+ *
+ *     GETRESOURCES: Operation not supported
+ *
+ * drm_mode_getresources() returns EOPNOTSUPP for one reason and no other: the
+ * driver behind that node was registered without DRIVER_MODESET.  lima is
+ * registered that way on purpose -- a Mali-450 has no scanout, it rasterises into
+ * memory and something else puts that memory on a wire -- so card0 there is the
+ * GPU, and that message was never a fault in the display path.  It was this probe
+ * aimed at the wrong chip, and every -p run so far measured nothing.
+ *
+ * Which minor number each driver gets is decided by probe order, so it is not a
+ * thing to hard-code on either side of a kernel change.  Ask instead: name every
+ * node, test each for modesetting, and take the first that has both a CRTC and a
+ * connector.  The table is printed whatever the outcome, because "card0 is lima and
+ * card1 is mediatek" is the single line that would have saved the week this cost.
+ */
+
+static char display_path[32];
+static int  display_looked;
+
+static int node_report(const char *path)
+{
+    struct drm_version v;
+    struct drm_mode_card_res res;
+    char name[32], desc[64];
+    int fd, modeset, usable = 0;
+
+    fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        printf("dri: %s: %m\n", path);
+        return 0;
+    }
+
+    memset(name, 0, sizeof(name));
+    memset(desc, 0, sizeof(desc));
+    memset(&v, 0, sizeof(v));
+    v.name_len = sizeof(name) - 1;
+    v.name = name;
+    v.desc_len = sizeof(desc) - 1;
+    v.desc = desc;
+    if (ioctl(fd, DRM_IOCTL_VERSION, &v) < 0)
+        snprintf(name, sizeof(name), "?");
+
+    memset(&res, 0, sizeof(res));
+    modeset = ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) == 0;
+
+    if (!modeset) {
+        printf("dri: %s \"%s\" %d.%d.%d -- no modesetting (%m): a render-only "
+               "driver, so it can rasterise but cannot scan out\n",
+               path, name, v.version_major, v.version_minor, v.version_patchlevel);
+    } else {
+        printf("dri: %s \"%s\" %d.%d.%d -- %u crtc, %u connector, %u encoder, "
+               "%ux%u..%ux%u%s\n",
+               path, name, v.version_major, v.version_minor, v.version_patchlevel,
+               res.count_crtcs, res.count_connectors, res.count_encoders,
+               res.min_width, res.min_height, res.max_width, res.max_height,
+               (res.count_crtcs && res.count_connectors) ? "" :
+                   " -- modesets, but has nothing to modeset");
+        usable = res.count_crtcs > 0 && res.count_connectors > 0;
+    }
+    if (desc[0])
+        printf("dri: %s is \"%s\"\n", path, desc);
+
+    close(fd);
+    return usable;
+}
+
+/*
+ * NULL means no node on this board can scan out, which is a finding and not an
+ * error to be retried: it says mediatek-drm never bound, and the picture currently
+ * on the panel is the LK's framebuffer through simple-framebuffer, untouched by
+ * anything in DRM.
+ */
+static const char *display_node(void)
+{
+    char path[32];
+    int i;
+
+    if (display_looked)
+        return display_path[0] ? display_path : NULL;
+    display_looked = 1;
+
+    printf("dri: naming every node, because which minor a driver gets is probe "
+           "order and not a property of the SoC\n");
+
+    for (i = 0; i < 8; i++) {
+        snprintf(path, sizeof(path), "/dev/dri/card%d", i);
+        if (access(path, F_OK) != 0)
+            continue;
+        if (node_report(path) && !display_path[0])
+            snprintf(display_path, sizeof(display_path), "%s", path);
+    }
+    /* Reported but never chosen: a render node is what lima is reached through, and
+     * seeing its name here is what confirms the kmsro pairing has both halves. */
+    for (i = 128; i < 132; i++) {
+        snprintf(path, sizeof(path), "/dev/dri/renderD%d", i);
+        if (access(path, F_OK) == 0)
+            node_report(path);
+    }
+
+    if (display_path[0]) {
+        printf("dri: the display is %s\n", display_path);
+        return display_path;
+    }
+
+    printf("dri: no node in /dev/dri modesets, so nothing can be scanned out "
+           "through DRM on this boot.\n");
+    printf("dri: mediatek-drm did not bind.  What is on the panel right now is the "
+           "framebuffer the LK left at 0x82700000, through simple-framebuffer, and "
+           "it is not DRM's.  In dmesg: \"mediatek-drm\", \"mtk_dsi\", the panel's "
+           "own compatible, and any -EPROBE_DEFER that never resolved.\n");
+    return NULL;
 }
 
 /*

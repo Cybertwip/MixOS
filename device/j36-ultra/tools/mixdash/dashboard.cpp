@@ -210,6 +210,7 @@ Dashboard::Dashboard(QWidget *parent)
          * would leave a button that shuts the board down on the next press, minutes
          * later, with no warning on screen. */
         m_armed = InternalNone;
+        m_armedExe.clear();
     });
 
     connect(m_apps, &CardGrid::activated, this, &Dashboard::onAppActivated);
@@ -308,17 +309,30 @@ void Dashboard::buildPages()
     video.available = !video.exe.isEmpty();
     apps.append(video);
 
-    AppEntry probe;
-    probe.title = "Display test";
-    probe.accent = Theme::purple();
-    probe.glyph = GlyphDisplay;
-    probe.exe = firstExisting(QStringList() << "/run/j36/eglprobe"
-                                            << "/opt/mixos/bin/eglprobe");
-    probe.args = QStringList() << "-p";
-    probe.subtitle = probe.exe.isEmpty() ? QString("eglprobe is not on this card.")
-                                         : QString("eglprobe -p, the EGL and KMS\npath, end to end.");
-    probe.available = !probe.exe.isEmpty();
-    apps.append(probe);
+    /*
+     * The GPU, and the only thing on this card that asks it to rasterise anything.
+     * eglprobe's five paint phases are all clears -- a driver that could do nothing
+     * but clear a buffer would pass every one -- so -c is the card that compiles two
+     * shaders and turns a cube, and its result is the one that says whether lima
+     * works.  It finds the modesetting node itself now rather than assuming card0,
+     * which is what the "Operation not supported" run was really reporting.
+     *
+     * It asks twice because it cannot give the panel back: setting a mode of its own
+     * moves the scanout off the LK's framebuffer, this dashboard keeps drawing into
+     * that framebuffer, and nothing puts it back on screen short of a reboot.
+     */
+    AppEntry cube;
+    cube.title = "3D cube";
+    cube.accent = Theme::purple();
+    cube.glyph = GlyphDisplay;
+    cube.exe = firstExisting(QStringList() << "/run/j36/eglprobe"
+                                           << "/opt/mixos/bin/eglprobe");
+    cube.args = QStringList() << "-c" << "20";
+    cube.subtitle = cube.exe.isEmpty() ? QString("eglprobe is not on this card.")
+                                       : QString("GLES2 through lima, flipped.\nKeeps the panel: reboot after.");
+    cube.available = !cube.exe.isEmpty();
+    cube.confirm = true;
+    apps.append(cube);
 
     AppEntry system;
     system.title = "System";
@@ -479,6 +493,15 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
 void Dashboard::activate(const AppEntry &entry)
 {
     if (!entry.exe.isEmpty() || entry.internal == InternalNone) {
+        /* Same two-press gate as Power off, and for the same reason: what it does
+         * cannot be undone from here.  The warning has to be shown before the child
+         * starts, because after it starts the panel is no longer ours to draw on. */
+        if (entry.confirm && m_armedExe != entry.exe) {
+            m_armedExe = entry.exe;
+            toast(entry.title + " takes the panel for good.\nPress A again to run it.", 6000);
+            return;
+        }
+        m_armedExe.clear();
         launch(entry.title, entry.exe, entry.args);
         return;
     }

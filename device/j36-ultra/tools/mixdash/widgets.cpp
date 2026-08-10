@@ -667,14 +667,45 @@ void InfoPage::refresh()
                                 ? QString("controlC0")
                                 : QString("no /dev/snd/controlC0 -- add j36.audio=1")));
 
-    QStringList dri;
-    if (QFileInfo::exists("/dev/dri/card0"))
-        dri << "card0";
-    if (QFileInfo::exists("/dev/dri/renderD128"))
-        dri << "renderD128";
-    m_rows.append(qMakePair(QString("DRM"),
-                            dri.isEmpty() ? QString("nothing in /dev/dri -- the dashboard does not need it")
-                                          : dri.join(", ")));
+    /*
+     * The DRI nodes, classified rather than counted.  eglprobe answered
+     * "GETRESOURCES: Operation not supported" on card0, and that error means one
+     * thing exactly: the driver behind that node registered without DRIVER_MODESET.
+     * lima is such a driver -- it is a GPU and has no scanout of its own -- so on
+     * this SoC the node that rasterises and the node that drives the panel are not
+     * the same node, and which is card0 is a probe-order accident.  Assuming card0
+     * was the display cost this bring-up a week, so the answer belongs on the glass:
+     * a node with a connector under it modesets, a node without one cannot.
+     *
+     * All of it from sysfs, so nothing here opens a DRM device, takes master or
+     * risks a modeset from inside the dashboard.
+     */
+    const QDir cls("/sys/class/drm");
+    const QStringList nodes =
+        cls.entryList(QStringList() << "card[0-9]", QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    if (nodes.isEmpty()) {
+        m_rows.append(qMakePair(QString("DRM"),
+                                QString("nothing in /sys/class/drm -- the dashboard does not need it")));
+    }
+    for (int i = 0; i < nodes.size(); ++i) {
+        const QString node = nodes.at(i);
+        const QString driver =
+            QFileInfo("/sys/class/drm/" + node + "/device/driver").symLinkTarget().section('/', -1);
+
+        QStringList conns;
+        for (const QString &c : cls.entryList(QStringList() << node + "-*",
+                                              QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)) {
+            const QString status = readTrimmed("/sys/class/drm/" + c + "/status");
+            conns << c.section('-', 1) + (status.isEmpty() ? QString() : " " + status);
+        }
+
+        m_rows.append(qMakePair(i == 0 ? QString("DRM") : QString(),
+                                QString("%1 %2 -- %3")
+                                    .arg(node, driver.isEmpty() ? QString("?") : driver,
+                                         conns.isEmpty()
+                                             ? QString("render only, no connector, no modesetting")
+                                             : conns.join(", "))));
+    }
 
     if (!m_inputs.isEmpty())
         m_rows.append(qMakePair(QString("Input"), m_inputs));
