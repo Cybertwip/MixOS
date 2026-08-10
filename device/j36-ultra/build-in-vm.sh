@@ -2010,6 +2010,212 @@ build_eglprobe() {
 
     ESPROBE_BIN="$out"
     log "gl: eglprobe is $(stat -c %s "$out") bytes, dynamic ARM, needs $needed"
+
+    return 0
+}
+
+# ── EmulationStation, rebuilt with a GLES 2.0 renderer ────────────────────────
+#
+# The one thing the GL payload above cannot fix.  The binary in the shared rootfs
+# was compiled -DUSE_OPENGLES_10, and GLES1 is the single API this stack cannot
+# provide: eglCreateContext for an ES1 context returns 0x3003 EGL_BAD_ALLOC on
+# lima, on llvmpipe AND on softpipe, because Debian's armhf Mesa 25.0.7 is a
+# -Dgles1=disabled build.  That is the package and not this SoC, so there is no
+# driver work that would make the stock binary run and no MESA_GL_VERSION_OVERRIDE
+# that would help -- BAD_ALLOC is __DRI_CTX_ERROR_NO_MEMORY, the driver's own
+# create returning NULL, not the BAD_MATCH an unadvertised API gives.
+#
+# ES2 is what does come up on lima here, measured with j36-eglprobe:
+# "OpenGL ES 2.0 Mesa 25.0.7-2+deb13u1", context created and made current.  So the
+# renderer is a third one, es/Renderer_GLES20.cpp, and this is where it is compiled.
+# Everything else about the binary is upstream at the same commit the rootfs's own
+# copy was built from, so the only difference between the two is the renderer.
+#
+# THREE THINGS ABOUT THIS BUILD ARE DELIBERATE AND NOT CONVENIENCES:
+#
+#   - It links no GL library at all, and es/patch-gles20.py exists to take `EGL'
+#     off the link line.  Every unversioned GL name in this rootfs -- libEGL.so,
+#     libGLESv2.so, libGLESv2.so.2, libGLESv1_CM.so* -- is a symlink to an
+#     SONAME-less ARMv8-A libMali.so, so linking any of them records a DT_NEEDED
+#     that is SIGILL on a Cortex-A7.  The renderer resolves all 43 entry points
+#     through SDL_GL_GetProcAddress instead, and the assertion at the end of this
+#     function is what keeps it that way.  One binary is then correct on both
+#     machines -- the R36S blob and this board's Mesa -- with no LD_PRELOAD.
+#   - It builds in an armhf chroot rather than cross-compiling, because ES needs
+#     SDL2, SDL2_mixer, FreeImage, FreeType, cURL, VLC, ALSA and RapidJSON headers
+#     and Debian trixie armhf has all of them at the versions the target runs.
+#     Its SDL2 is 2.32.4, the same as the rootfs's.
+#   - It never touches the rootfs image.  The binary is staged onto the vfat BOOT
+#     partition and /init bind-mounts it over /usr/bin/emulationstation/
+#     emulationstation, so the card stays byte-identical for the R36S.
+#
+# Non-fatal, like everything else in this file: if it does not build the kernel
+# artifacts still ship, /init finds no j36/es, says so, and the rootfs's own binary
+# runs and fails in the way it already fails.
+ES_URL="https://github.com/christianhaitian/EmulationStation-fcamod"
+# The rootfs's own ES commit, read out of the dArkOS package cache's
+# emulationstation_351v_armhf.commit.  Pinned rather than tracking the branch so
+# that the renderer patch's anchors stay valid and the only difference from the
+# installed binary stays the renderer.
+ES_COMMIT="74498be31cd016af6a42d00310f876d7256eff52"
+ES_RENDERER="$ROOT/device/j36-ultra/es/Renderer_GLES20.cpp"
+ES_PATCH="$ROOT/device/j36-ultra/es/patch-gles20.py"
+ES_CHROOT="$WORK/es-chroot"
+ES_BIN=""
+
+# Debian trixie armhf has all of ES's dependencies.  --no-install-recommends
+# because the recommends of libvlc-dev alone pull a desktop in.
+ES_BUILD_DEPS=(build-essential cmake git pkg-config ca-certificates
+               libsdl2-dev libsdl2-mixer-dev libfreeimage-dev libfreetype-dev
+               libcurl4-openssl-dev libvlc-dev libasound2-dev rapidjson-dev)
+
+es_chroot_run() {
+    sudo chroot "$ES_CHROOT" bash -c "$1"
+}
+
+# The chroot is built once and kept.  Preferred base is dArkOS's own armhf rootfs
+# cache, because if the R36 base build has run then it is already on disk and it is
+# the same debootstrap the target was made from; debootstrap is the fallback for a
+# machine where only this build has ever run.
+ensure_es_chroot() {
+    local suite="${DEBIAN_RELEASE:-trixie}" base m
+    base="$ROOT/Arkbuild_package_cache/debian_${suite}_userspace-armhf_rootfs.tar.gz"
+
+    if [[ ! -f "$ES_CHROOT/.j36-base" ]]; then
+        sudo rm -rf "$ES_CHROOT" "$WORK/es-chroot-x"
+        mkdir -p "$WORK/es-chroot-x"
+        if [[ -f "$base" ]]; then
+            log "es: unpacking the armhf $suite rootfs from the dArkOS package cache"
+            sudo tar -xpzf "$base" -C "$WORK/es-chroot-x" || return 1
+            # The cache tarball carries dArkOS's own chroot name at the top.
+            sudo mv "$WORK/es-chroot-x/Arkbuild" "$ES_CHROOT" || return 1
+        else
+            log "es: no armhf rootfs in the package cache, debootstrapping one"
+            command -v qemu-arm-static >/dev/null || {
+                log "es: qemu-arm-static is not installed and there is no cached rootfs"; return 1; }
+            sudo eatmydata debootstrap --no-check-gpg --include=eatmydata \
+                --resolve-deps --arch=armhf --foreign "$suite" "$ES_CHROOT" \
+                "${J36_DEBIAN_MIRROR:-http://deb.debian.org/debian}" || return 1
+            sudo cp /usr/bin/qemu-arm-static "$ES_CHROOT/usr/bin/" || return 1
+            sudo chroot "$ES_CHROOT" /debootstrap/debootstrap --second-stage || return 1
+        fi
+        sudo rm -rf "$WORK/es-chroot-x"
+        sudo touch "$ES_CHROOT/.j36-base"
+    fi
+
+    # /dev, /proc and /sys are bound for apt's maintainer scripts and for nproc.
+    # They are unmounted in es_chroot_teardown when the build is done: a bind mount
+    # of /sys left inside a directory tree is something the next rsync of this
+    # machine trips over, with an unlink() permission denied that names a sysfs
+    # file and explains nothing.
+    for m in dev proc sys; do
+        mountpoint -q "$ES_CHROOT/$m" || sudo mount --bind "/$m" "$ES_CHROOT/$m" || return 1
+    done
+    printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | \
+        sudo tee "$ES_CHROOT/etc/resolv.conf" >/dev/null
+    printf 'exit 101\n' | sudo tee "$ES_CHROOT/usr/sbin/policy-rc.d" >/dev/null
+    sudo chmod 0755 "$ES_CHROOT/usr/sbin/policy-rc.d"
+
+    if [[ ! -f "$ES_CHROOT/.j36-deps" ]]; then
+        log "es: installing ${#ES_BUILD_DEPS[@]} build dependencies into the armhf chroot"
+        es_chroot_run "eatmydata apt-get -y update" || return 1
+        es_chroot_run "DEBIAN_FRONTEND=noninteractive eatmydata apt-get -y \
+            --no-install-recommends install ${ES_BUILD_DEPS[*]}" || return 1
+        sudo touch "$ES_CHROOT/.j36-deps"
+    fi
+    return 0
+}
+
+es_chroot_teardown() {
+    local m
+    for m in dev/pts dev proc sys; do
+        mountpoint -q "$ES_CHROOT/$m" && sudo umount -l "$ES_CHROOT/$m"
+    done
+    return 0
+}
+
+build_es_gles20() {
+    local src="$ES_CHROOT/home/build/es" out="$CACHE/emulationstation-gles20"
+    local stamp="$CACHE/emulationstation-gles20.stamp" want header needed lib
+
+    [[ -f "$ES_RENDERER" ]] || { log "es: $ES_RENDERER is missing"; return 1; }
+    [[ -f "$ES_PATCH" ]]    || { log "es: $ES_PATCH is missing"; return 1; }
+
+    # Keyed on the commit and on both files that shape the build, so editing the
+    # renderer rebuilds and re-running the script does not.
+    want="$ES_COMMIT $(sha256sum "$ES_RENDERER" | awk '{print $1}') \
+$(sha256sum "$ES_PATCH" | awk '{print $1}')"
+    if [[ -x "$out" && "$(cat "$stamp" 2>/dev/null)" == "$want" ]]; then
+        ES_BIN="$out"
+        log "es: reusing $out ($(stat -c %s "$out") bytes)"
+        return 0
+    fi
+
+    ensure_es_chroot || { es_chroot_teardown; return 1; }
+
+    # Cloned from outside the chroot: git over TLS under qemu-arm is minutes of
+    # emulated crypto for no reason.  --depth 1 of one SHA rather than of a branch,
+    # because the pin has to be in the clone and GitHub serves a reachable SHA.
+    if [[ ! -d "$src/.git" ]]; then
+        log "es: cloning EmulationStation-fcamod at $ES_COMMIT"
+        sudo rm -rf "$src"
+        sudo mkdir -p "$src"
+        sudo chown "$(id -u):$(id -g)" "$ES_CHROOT/home/build" "$src" || true
+        git -C "$src" init -q || return 1
+        git -C "$src" remote add origin "$ES_URL" || return 1
+        git -C "$src" fetch -q --depth 1 origin "$ES_COMMIT" || return 1
+        git -C "$src" checkout -q FETCH_HEAD || return 1
+        # external/pugixml is the tree's one submodule; nanosvg is vendored.
+        git -C "$src" submodule update --init --depth 1 || return 1
+    fi
+
+    cp "$ES_RENDERER" "$src/es-core/src/renderers/" || return 1
+    # Patched from a clean copy every time, so a re-run cannot stack the patch on
+    # top of itself and so a moved upstream fails in patch-gles20.py's anchor
+    # check rather than halfway through cmake.
+    git -C "$src" checkout -- CMakeLists.txt es-core/CMakeLists.txt || return 1
+    python3 "$ES_PATCH" "$src" || return 1
+
+    # CMAKE_POLICY_VERSION_MINIMUM because upstream's cmake_minimum_required is
+    # 2.8 and trixie's cmake is 3.31, which makes anything under 3.5 an error.
+    log "es: configuring and building EmulationStation for armhf (emulated; this is slow)"
+    es_chroot_run "cd /home/build/es && rm -rf CMakeCache.txt CMakeFiles && \
+        cmake -DGLES20=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release ." \
+        || { es_chroot_teardown; return 1; }
+    es_chroot_run "cd /home/build/es && make -j\$(nproc)" \
+        || { es_chroot_teardown; return 1; }
+    es_chroot_teardown
+
+    [[ -f "$src/emulationstation" ]] || { log "es: make left no binary"; return 1; }
+
+    mkdir -p "$CACHE"
+    # Stripped, because this goes on a 100 MB vfat partition beside the kernel, the
+    # initrd, Doom and the module payloads, and ES's debug info is most of its size.
+    arm-linux-gnueabihf-strip -o "$out" "$src/emulationstation" || return 1
+    chmod 0755 "$out"
+
+    # The assertion the whole design rests on: no GL library in DT_NEEDED.  A
+    # regression here does not fail to build, it builds a binary that dlopens the
+    # RK3326 Mali blob on a Cortex-A7 and dies with SIGILL before main().
+    header="$(readelf -hd "$out" 2>/dev/null)" || return 1
+    grep -q 'Class:.*ELF32' <<<"$header" || { log "es: not a 32-bit ELF"; return 1; }
+    grep -q 'Machine:.*ARM' <<<"$header" || { log "es: not an ARM ELF"; return 1; }
+    needed="$(sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p' <<<"$header" | tr '\n' ' ')"
+    for lib in $needed; do
+        case "$lib" in
+            libEGL*|libGL*|libGLES*|libMali*|libmali*|libgbm*)
+                log "es: the binary links $lib -- patch-gles20.py did not take the GL"
+                log "    library off the link line, and every one of those names on this"
+                log "    rootfs is a symlink to an ARMv8-A libMali.so.  Refusing to stage it."
+                return 1
+                ;;
+        esac
+    done
+
+    printf '%s\n' "$want" >"$stamp"
+    ES_BIN="$out"
+    log "es: $(stat -c %s "$out") bytes, stripped ARM, no GL in DT_NEEDED"
+    log "es: needs $needed"
     return 0
 }
 
