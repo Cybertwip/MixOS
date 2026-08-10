@@ -199,16 +199,77 @@ if [[ ! -d "$BUSYBOX_SRC/.git" ]]; then
     log "Cloning BusyBox $BUSYBOX_BRANCH once for the ARM bring-up initramfs"
     git clone --depth=1 --branch "$BUSYBOX_BRANCH" "$BUSYBOX_URL" "$BUSYBOX_SRC"
 fi
+# Two helpers instead of a bare sed, because a symbol can appear in .config in
+# either of two forms -- `CONFIG_X=y' or `# CONFIG_X is not set' -- and a sed that
+# only knows one of them silently does nothing when defconfig flips a default.
+bb_enable() {
+    local sym="$1" cfg="$BUSYBOX_SRC/.config"
+    if grep -q "^# $sym is not set\$" "$cfg"; then
+        sed -i "s|^# $sym is not set\$|$sym=y|" "$cfg"
+    elif ! grep -q "^$sym=y\$" "$cfg"; then
+        printf '%s=y\n' "$sym" >>"$cfg"
+    fi
+}
+bb_disable() {
+    local sym="$1" cfg="$BUSYBOX_SRC/.config"
+    sed -i "s|^$sym=y\$|# $sym is not set|" "$cfg"
+}
+
 if [[ ! -x "$BUSYBOX_SRC/busybox" || "${J36_REBUILD_BUSYBOX:-0}" == 1 ]]; then
     log "Building the static ARMv7 BusyBox once"
     make -C "$BUSYBOX_SRC" distclean
     make -C "$BUSYBOX_SRC" defconfig
-    sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' "$BUSYBOX_SRC/.config"
+    bb_enable CONFIG_STATIC
+
+    # ── APPLETS WHOSE KERNEL INTERFACE NO LONGER EXISTS ──────────────────────
+    #
+    # `tc' is compiled against the target libc's copy of <linux/pkt_sched.h>, and
+    # Linux 6.3 retired the CBQ qdisc: TCA_CBQ_MAX, TCA_CBQ_RATE, TCA_CBQ_LSSOPT,
+    # struct tc_cbq_lssopt, struct tc_cbq_wrropt, TCF_CBQ_LSS_BOUNDED and the rest
+    # were deleted from the uapi header outright. BusyBox 1.36 still prints CBQ
+    # options, so networking/tc.c cannot compile at all on any modern header set,
+    # which is why the build stopped at `TCA_CBQ_MAX undeclared'. Not a toolchain
+    # fault and not fixable by a flag: the declarations are gone.
+    #
+    # Disabled rather than patched. Traffic control has no part in a bring-up
+    # initramfs whose whole job is to insmod one input driver and hand over a
+    # shell, so carrying a local patch against upstream's copy of a utility we do
+    # not run would be maintaining a fork for nothing.
+    #
+    # If a later busybox breaks this way on another applet, add it here with the
+    # same note -- what was removed, and which kernel removed it.
+    bb_disable CONFIG_TC
+    bb_disable CONFIG_FEATURE_TC_INGRESS
+
     yes '' | make -C "$BUSYBOX_SRC" oldconfig >/dev/null || true
+
+    # oldconfig has the last word on all of the above -- it re-derives every
+    # symbol from its dependencies -- so the checks come after it, not before.
+    grep -q '^CONFIG_STATIC=y$' "$BUSYBOX_SRC/.config" || \
+        die "busybox CONFIG_STATIC did not survive oldconfig; the initramfs needs a static binary"
+    ! grep -q '^CONFIG_TC=y$' "$BUSYBOX_SRC/.config" || \
+        die "busybox CONFIG_TC is still on and it cannot build against Linux 6.3+ headers"
+
+    # And the applets /init actually invokes. defconfig has all of them today;
+    # asserting it turns a future defconfig change into a build failure here
+    # instead of an init that dies on the device with `sh: not found'.
+    for sym in CONFIG_ASH CONFIG_SH_IS_ASH CONFIG_MOUNT CONFIG_MKDIR CONFIG_MKNOD \
+               CONFIG_CAT CONFIG_ECHO CONFIG_SLEEP CONFIG_DMESG CONFIG_INSMOD \
+               CONFIG_LS CONFIG_HEXDUMP CONFIG_SETSID CONFIG_CTTYHACK CONFIG_HALT \
+               CONFIG_UNAME; do
+        grep -q "^$sym=y\$" "$BUSYBOX_SRC/.config" || \
+            die "busybox $sym is off; /init uses that applet"
+    done
+
     make -C "$BUSYBOX_SRC" CROSS_COMPILE=arm-linux-gnueabihf- -j"$(nproc)"
 fi
 BUSYBOX="$BUSYBOX_SRC/busybox"
 [[ -x "$BUSYBOX" ]] || die "static ARM BusyBox was not produced"
+# The kernel and the module are checked for their machine type; this was not, and
+# it is the one binary in the initramfs that the SoC executes first. A busybox
+# built for the host is a perfectly valid ELF that this board cannot run, and the
+# symptom on the device would be an unhelpful `/init: not found' at hand-over.
+verify_arm_elf "$BUSYBOX" "the initramfs BusyBox"
 
 rm -rf "$INITROOT"
 mkdir -p "$INITROOT"/{bin,dev,etc,lib/modules/$KERNEL_RELEASE/extra,proc,root,sbin,sys,tmp}
