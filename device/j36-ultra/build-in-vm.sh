@@ -119,10 +119,16 @@ for symbol in ARCH_MULTIPLATFORM ARCH_MULTI_V7 ARCH_MULTI_V6_V7 ARCH_MEDIATEK MA
 done
 
 # Keep this first-stage image below the fixed 9 MiB BOOTIMG partition.
-# Networking, audio and native DRM/DSI are added only after the serial/fb/input
-# bring-up is proven. Storage is no longer in that list -- see below.
+# Audio and native DRM/DSI are added only after the serial/fb/input bring-up is
+# proven. Storage is no longer in that list, and neither is NET -- see below.
+#
+# WIRELESS, WLAN and BT stay off, and they are disabled here rather than left
+# out: all three live inside `if NET' in net/Kconfig and WIRELESS defaults to y,
+# so once NET is on they would come back by default. Both the =y for NET and the
+# "is not set" lines for these are in .config before the single olddefconfig
+# below, which is what makes the explicit n stick.
 for symbol in \
-    DRM SOUND SND MEDIA_SUPPORT NET WIRELESS WLAN BT USB_SUPPORT SCSI ATA \
+    DRM SOUND SND MEDIA_SUPPORT WIRELESS WLAN BT USB_SUPPORT SCSI ATA \
     DEBUG_INFO DEBUG_KERNEL KALLSYMS LOGO; do
     config_n "$symbol"
 done
@@ -151,6 +157,40 @@ for symbol in \
     config_y "$symbol"
 done
 
+# ── What the shared rootfs's PID 1 needs to exist at all ──────────────────────
+#
+# The card mounts, switch_root succeeds, and then systemd 257 aborts:
+#
+#   systemd[1]: Failed to find module 'unix'
+#   systemd[1]: Failed to open netlink, ignoring: Function not implemented
+#   systemd[1]: Failed to allocate device monitor: Function not implemented
+#   systemd[1]: Failed to allocate notification socket: Function not implemented
+#   systemd[1]: Assertion '...' failed at src/core/device.c:64, function
+#               device_unset_sysfs(). Aborting.
+#   systemd[1]: Freezing execution.
+#
+# ENOSYS from socket(2) three times over. NET was in the disable list above and
+# UNIX was in the enable list at the top -- CONFIG_UNIX lives under `if NET', so
+# olddefconfig dropped it, along with INET, PACKET, POSIX_MQUEUE and
+# SECCOMP_FILTER (which depends on NET as well as HAVE_ARCH_SECCOMP_FILTER).
+# systemd cannot open an AF_UNIX notification socket or an AF_NETLINK uevent
+# monitor, so its device objects never get a sysfs path, and the assertion that
+# every .device unit has one takes PID 1 down with it. Nothing was wrong with the
+# storage or the switch_root; the kernel simply had no sockets.
+#
+# NAMESPACES is here for the same class of reason, found by auditing the shipped
+# kernel.config rather than by another boot: it was =n, which also removes
+# NET_NS/PID_NS/IPC_NS/UTS_NS, and Debian's own units use PrivateMounts,
+# PrivateTmp and ProtectSystem. Those services fail to start without it.
+#
+# The two POSIX_ACL symbols matter because the rootfs is btrfs and systemd sets
+# ACLs on the journal. FS_POSIX_ACL was already y; the per-filesystem ones were
+# not, so the generic support was there with nothing able to use it.
+for symbol in \
+    NET UNIX INET NAMESPACES BTRFS_FS_POSIX_ACL EXT4_FS_POSIX_ACL; do
+    config_y "$symbol"
+done
+
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
     CROSS_COMPILE=arm-linux-gnueabihf- olddefconfig
 
@@ -158,12 +198,33 @@ make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
 # word on all of the above; the checks come after it, not before. MMC_MTK is
 # asserted =y and not =m on purpose: a module for the driver that mounts the
 # filesystem the modules live on cannot be loaded.
+#
+# This list is the real fix for the systemd freeze, not the NET=y above. UNIX was
+# already in the enable list and had been silently dropped for being under `if
+# NET' while NET was in the disable list -- a config_y whose result nothing
+# checked. So everything PID 1 cannot start without is asserted here, including
+# the symbols that come along by dependency: if a future prune takes NET out
+# again, or turns SECCOMP off, the build fails here instead of the board
+# freezing at 15 s with the reason four screens up.
 for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 FB_SIMPLE SERIAL_8250_MT6577 BLK_DEV_INITRD MODULES \
                 MMC MMC_BLOCK MMC_MTK REGULATOR_FIXED_VOLTAGE \
-                EXT4_FS BTRFS_FS; do
+                EXT4_FS BTRFS_FS \
+                NET UNIX INET SECCOMP_FILTER NAMESPACES NET_NS PID_NS \
+                CGROUPS FHANDLE INOTIFY_USER SIGNALFD TIMERFD EPOLL \
+                DEVTMPFS DEVTMPFS_MOUNT TMPFS TMPFS_XATTR TMPFS_POSIX_ACL \
+                PROC_FS PROC_SYSCTL SYSFS BTRFS_FS_POSIX_ACL; do
     grep -q "^CONFIG_${required}=y$" "$CONFIG" || \
         die "required kernel option CONFIG_${required}=y was not selected"
+done
+
+# Off on purpose, and worth failing over: WIRELESS defaults to y under NET, and
+# an accidental =y here drags cfg80211 and a WLAN menu into an image with 2.5 MiB
+# of slack in a fixed partition.
+for refused in WIRELESS BT; do
+    if grep -q "^CONFIG_${refused}=y$" "$CONFIG"; then
+        die "CONFIG_${refused}=y came back after olddefconfig; it must stay off until the WiFi driver lands"
+    fi
 done
 
 log "Building the incremental ARMv7 kernel and its symbol table"
