@@ -3577,11 +3577,32 @@ j36.dash=1
     symlink there.  All of it is in tmpfs and none of it survives a reboot.
 
     The dashboard is not on this partition: /init looks for opt/mixos/bin/mixdash in
-    the rootfs first and then on every other partition of the card, read-only.  With
-    nothing found it says so on the console and still does not start
-    EmulationStation, because that binary aborts with status 134 on this board and
-    its unit restarts it -- six identical stack traces over the message explaining
+    the rootfs first and then on every other partition of the card, read-only.  Every
+    partition it tries is named on the console -- as carrying no opt/mixos, or as
+    unmountable, which is what a btrfs data partition looks like here because the
+    initramfs carries no modules.  With nothing found it says so and still does not
+    start EmulationStation, because that binary aborts with status 134 on this board
+    and its unit restarts it -- six identical stack traces over the message explaining
     the fault is worse than the message.
+
+    And because those lines are printed from the initramfs, where a hundred lines of
+    kernel and systemd output push them off a 640x480 panel long before anybody reads
+    them, a boot that finds nothing also gets mixdash-missing.service: it prints the
+    reason, the inventory of partitions and the tar command that fixes it, six times,
+    twenty seconds apart, after the boot has gone quiet.  A board with no keyboard has
+    no other diagnostic interface.  If what you see instead is a console that simply
+    stops -- typically at hostnamed deactivating -- then j36.dash=1 never reached
+    /proc/cmdline, and /init says that too: without the word nothing is staged and
+    whatever the rootfs starts by itself is what you get, which on a rootfs whose
+    EmulationStation is not enabled is nothing at all.
+
+    One more thing it mounts: the first non-root, non-BOOT ext4 or btrfs partition,
+    read-only, at /run/j36/card, which is where the dashboard's Files page opens.
+    That is not a convenience -- with no keyboard there is no way to mount it by hand,
+    and a file browser rooted in an empty home directory is a file browser showing
+    nothing.  Read-only on purpose: the operator writes that partition from a PC, and
+    a data partition mounted rw by an initramfs is one that replays dirty the first
+    time the cell gives out mid-write.
 
     Why ES was dropped rather than fixed: the rootfs's binary was compiled with the
     fixed-function renderer, and GLES1 is the one API this stack cannot supply.
@@ -4531,7 +4552,10 @@ fi
             echo "shell_payload=sd-root.tar.gz ($(stat -c %s sd-root.tar.gz) bytes), unpacked onto the second partition as /opt/mixos"
             echo "shell_start=j36.dash=1; /init writes /run/systemd/system/mixdash.service and wants it from multi-user.target"
             echo "shell_es=emulationstation.service is masked in /run/systemd/system.control (the one runtime dir that outranks the /etc its unit is in), plus a drop-in that resets ExecStart to an echo in case the mask is ignored"
-            echo "shell_find=/init looks in the rootfs first, then mounts every other partition read-only looking for opt/mixos/bin/mixdash"
+            echo "shell_find=/init looks in the rootfs first, then mounts every other partition read-only looking for opt/mixos/bin/mixdash (or mixos/bin/mixdash, for a tarball unpacked one level down); every partition it tries is named on the console, mounted or unreadable"
+            echo "shell_missing=when nothing is found, /init also writes /run/systemd/system/mixdash-missing.service, which repeats the reason and the fix on the console six times at 20 s -- because the initramfs lines have scrolled off by then and a boot that ends at hostnamed looks the same as ten other faults"
+            echo "shell_card=the first non-root, non-BOOT ext4/btrfs partition is mounted read-only at /run/j36/card, and that is what the dashboard's Files page opens on (there is no keyboard on this board to mount it by hand)"
+            echo "shell_nodash=without j36.dash=1 nothing is staged at all and /init says so, naming the word to add -- a rootfs whose EmulationStation is not even enabled otherwise boots to nothing and explains nothing"
             echo "shell_render=Qt5 raster into /dev/fb0, which is simplefb's window onto the framebuffer the LK lit -- no EGL, no GBM, no DRM master, no modeset"
             echo "shell_input=evdev directly, QT_QPA_FB_DISABLE_INPUT=1 (gpio-keys plus the keypad, per the device tree)"
             if [[ -f sd-root/opt/mixos/bin/doom ]]; then
