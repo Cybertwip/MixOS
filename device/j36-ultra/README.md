@@ -278,14 +278,104 @@ and `switch_root`s in. Failing that it scans the other `mmcblk` partitions, and
 failing *that* it prints `/proc/partitions` and gives you a shell. Delete `root=`
 from `mvii/boot.conf` and the card stops at the initramfs exactly as it used to.
 
-## Where the shell appears
+## Where the shell appears, and why the boot went quiet
 
-`/dev/console` is whichever `console=` came **last** on the command line. With
-`console=tty0 console=ttyS0,115200n8` that is the UART, so a bare
-`exec setsid cttyhack sh` puts the prompt on a serial port that may have nothing
-plugged into it while the panel shows only a blinking cursor. `/init` therefore
-echoes progress to both, starts a background shell on `/dev/ttyS0`, and execs the
-interactive one on `/dev/tty1` explicitly.
+`/dev/console` is whichever `console=` came **last** on the command line. It used
+to be `console=tty0 console=ttyS0,115200n8` — the UART — so a bare
+`exec setsid cttyhack sh` put the prompt on a serial port that may have nothing
+plugged into it while the panel showed only a blinking cursor. `/init` works
+around that by echoing progress to both, starting a background shell on
+`/dev/ttyS0`, and exec'ing the interactive one on `/dev/tty1` explicitly.
+
+Userspace has no such workaround, and it showed. A boot that had in fact
+succeeded looked like this on the panel:
+
+```
+[   26.120898] systemd-journald[146]: Received client request to flush runtime journal.
+[   27.951283] random: crng init done
+```
+
+…and nothing more, for minutes. That is not a hang. systemd's log target is
+*journal-or-kmsg*: until journald is up it writes to `/dev/kmsg`, which the
+kernel echoes to every console including the framebuffer, and once journald takes
+over it stops. Everything after 26 s went to the journal and to `/dev/console`,
+which was the UART. The last kernel line on the panel is simply the last thing
+the *kernel* said.
+
+So `mvii/boot.conf` now puts `console=tty0` last and adds
+`systemd.journald.forward_to_console=1`. Both consoles still receive every
+`printk` — only `/dev/console` moved — and the service log follows it onto the
+panel. Drop the forward once there is a shell or a network to read the journal
+with; it costs a framebuffer redraw per line.
+
+## Rebooting, which the kernel could not do
+
+A clean shutdown that ends in a halt:
+
+```
+systemd-shutdown[1]: All filesystems unmounted.
+systemd-shutdown[1]: Rebooting.
+reboot: Restarting system
+Reboot failed -- System halted
+```
+
+`machine_restart()` had no handler to call. On MediaTek the reset is the TOPRGU
+watchdog, and `watchdog_core.c` registers a restart handler for any watchdog whose
+ops provide `.restart` — which `mtk_wdt` does. `CONFIG_MEDIATEK_WATCHDOG` was
+already `=y`, inherited from `multi_v7_defconfig` under `ARCH_MEDIATEK`: the driver
+was built in the whole time and had nothing to probe, because the device tree
+described no watchdog. The node is a three-liner:
+
+```
+watchdog: watchdog@10007000 {
+        compatible = "mediatek,mt6589-wdt";
+        reg = <0x10007000 0x100>;
+};
+```
+
+`0x10007000` comes from three sources that agree — the mtkclient chip table
+(`watchdog=0x10007000` for MT6592), its stage1 payload for this family, which
+reboots by writing `RESTART 0x1971`, `MODE 0x22000014` and `SWRST 0x1209`, and
+PowerEngine's own bare-metal `Standalone/src/hello.c`. `mtk_wdt_restart()` writes
+that same `SWRST` key at offset `0x14`. `mediatek,mt6589-wdt` is used alone, with
+no invented `mt6592` string in front of it: `mt6589-wdt` is the plain variant of
+this block in the driver's OF table (no reset controller, no clock), and a leading
+compatible that matches nothing only risks the node not binding. No interrupt is
+needed, and probe calls `mtk_wdt_stop()`, so the hardware timer stays disarmed —
+nothing in the dArkOS rootfs opens `/dev/watchdog`, and the board already ran for
+minutes with no node at all.
+
+This is not only about a user pressing reboot. dArkOS expands its partitions in
+two stages *with a reboot between them*, so a reboot that halts turns first boot
+into a sequence of power cycles by hand. `poweroff` still ends in a halt, because
+nothing drives the PMIC yet.
+
+## The R36S first boot, on a card that has no tars
+
+`firstboot.service` is masked from the command line
+(`systemd.mask=firstboot.service`). The script is `scripts/expandtoexfat.sh.rk3326`
+and this configuration cannot finish it: it grows ROOTFS, converts EASYROMS to
+exfat, and then untars `/roms.tar` and `/tempthemes`, which a GUI-mode build does
+not ship. With the tars missing, `pv` fails, its two progress loops never see
+`100`, and each spins 15 000 iterations — a `tail` subshell apiece — before giving
+up. That is the several minutes of dead panel, twice, ending in the reboot that
+halted.
+
+Masking is a bring-up decision, not a fix: delete the `systemd.mask=` word to let
+it run on a card that does carry the tars. What the kernel side needed either way
+is `EXFAT_FS` and `VFAT_FS`, because the fstab the script installs as its last act
+is
+
+```
+LABEL=BOOT /boot vfat defaults 0 2
+LABEL=EASYROMS /roms exfat defaults,auto,umask=000,uid=1000,gid=1000,noatime 0 0
+```
+
+Neither entry carries `nofail`. A filesystem this kernel does not know is
+therefore not a missing ROMs directory — `local-fs.target` fails, and systemd
+takes a machine with no usable keyboard into emergency mode. Both are now built
+in and asserted, along with `NLS_UTF8` and `NLS_CODEPAGE_437`, the charsets those
+two mounts imply.
 
 ## What used to cost ten seconds of every boot
 

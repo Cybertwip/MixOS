@@ -698,9 +698,11 @@ initrd=initrd.img
 
 # root= is a hint /init verifies, not an order to the kernel.  console=tty0 comes
 # last so /dev/console is the panel and not a serial port with nothing plugged
-# into it.  firstboot.service is dArkOS's RK3326 expansion script, which a
-# GUI-mode build has no tars for.  Any of the three can be deleted here.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.journald.forward_to_console=1
+# into it.  The two masked units are RK3326-only: firstboot is dArkOS's expansion
+# script, which a GUI-mode build has no tars for, and batt_led is the battery LED
+# daemon, which restarts forever on hardware this kernel does not describe.  Any
+# of them can be deleted here.
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1
 CONF
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
