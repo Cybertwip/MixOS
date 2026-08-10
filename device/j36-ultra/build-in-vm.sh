@@ -680,38 +680,26 @@ cp "$ARTIFACTS/initramfs-j36-ultra.cpio.gz" "$SDBOOT/initrd.img"
 # root= it could not honour can no longer panic it.  /init does the mounting, and
 # treats root= as a hint it verifies before switching -- delete the root= below
 # and the card boots to the initramfs shell exactly as it did before.
+#
+# The prose that used to explain each bootargs word lives in README.txt now.  The
+# LK reads boot.conf into a fixed 2 KiB buffer, comments included, and the file
+# had grown to 2003 bytes of it: 45 bytes from being silently truncated mid-line
+# by the next sentence anybody added.
 cat > "$SDBOOT/mvii/boot.conf" <<'CONF'
 # MVII LK SD hand-off, J36 Ultra (MT6592, ARMv7).
 #
 # Read after the card's own boot.ini, so these override it.  A dArkOS boot.ini
-# names the RK3326 arm64 kernel, which this SoC cannot execute.
+# names the RK3326 arm64 kernel, which this SoC cannot execute.  Keep this file
+# short: the LK reads it into a fixed 2 KiB buffer.  ../README.txt is the long
+# form, and explains every word of bootargs below.
 kernel=zImage
 dtb=mt6592-j36-ultra.dtb
 initrd=initrd.img
 
-# root= is a hint for /init, not an order to the kernel: rdinit keeps the kernel
-# out of root mounting entirely.  /init mounts this partition read-only first and
-# switches into it only if it really holds /sbin/init, otherwise it scans the
-# other mmcblk partitions, otherwise it gives you a shell.  mmcblk0p2 is the
-# dArkOS ROOTFS partition, and microSD is mmcblk0 because MSDC1 is the only MMC
-# host in the device tree.  Remove root= to stop at the initramfs.
-#
-# The panel is the LAST console= on purpose.  /dev/console is whichever came
-# last, and with the UART last the boot appears to stop dead at "random: crng
-# init done": systemd logs to /dev/kmsg only until journald takes over, and
-# everything it said after that went to a serial port with nothing plugged into
-# it.  Both consoles still receive every printk; only /dev/console moves.
-# systemd.journald.forward_to_console=1 is the other half -- it puts the service
-# log on the panel too, which is the difference between watching a boot and
-# watching a blinking cursor.
-#
-# firstboot.service is masked because it is dArkOS's RK3326 first-boot script and
-# this configuration cannot finish it.  It expands the partitions in two stages
-# with a reboot in between, then untars /roms.tar and /tempthemes, which a
-# GUI-mode build does not ship; with the tars missing its two progress loops spin
-# 15000 subshells apiece before giving up, which is the several minutes of dead
-# panel before it reboots again.  Delete the systemd.mask= word to let it run on a
-# card that does carry the tars.
+# root= is a hint /init verifies, not an order to the kernel.  console=tty0 comes
+# last so /dev/console is the panel and not a serial port with nothing plugged
+# into it.  firstboot.service is dArkOS's RK3326 expansion script, which a
+# GUI-mode build has no tars for.  Any of the three can be deleted here.
 bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.journald.forward_to_console=1
 CONF
 
@@ -742,6 +730,46 @@ read-only and looking for /sbin/init, then switch_roots into it.  If nothing
 qualifies -- or if you delete root= from mvii/boot.conf -- it stops at a busybox
 shell on the panel and on the serial port instead, and prints /proc/partitions so
 you can see what the kernel did find.
+
+The command line, word by word
+------------------------------
+
+console=ttyS0,115200n8 console=tty0
+    Both consoles receive every printk; what the order decides is /dev/console,
+    which is whichever came LAST.  With the UART last, a boot appears to stop
+    dead at "random: crng init done" -- systemd logs to /dev/kmsg only until
+    journald takes over, and from then on everything it says goes to a serial
+    port that may have nothing plugged into it.  tty0 last puts /dev/console on
+    the panel.
+
+systemd.journald.forward_to_console=1
+    The other half of the same problem: it copies the service log to
+    /dev/console, so the panel shows services starting and failing instead of a
+    blinking cursor.  Drop it once there is a shell or a network to read the
+    journal with -- it costs a redraw per line on a 640x480 framebuffer.
+
+systemd.mask=firstboot.service
+    dArkOS's first-boot script is written for the RK3326 image and this
+    configuration cannot finish it.  It expands the partitions in two stages with
+    a reboot between them, then untars /roms.tar and /tempthemes -- which a
+    GUI-mode build does not ship.  With the tars missing, its two progress loops
+    spin 15000 subshells apiece before giving up, which is minutes of dead panel,
+    and then it reboots.  Delete this word to let it run on a card that does
+    carry the tars; it converts EASYROMS to exfat and grows ROOTFS to fill the
+    card, and this kernel now has exfat and vfat built in for the result.
+
+rdinit=/init root=/dev/mmcblk0p2 rw rootwait
+    See above: /init does the mounting, so root= cannot panic the kernel.
+
+Rebooting
+---------
+
+`reboot' works from here on: the device tree describes the TOPRGU watchdog at
+0x10007000, and mtk_wdt registers the restart handler that machine_restart()
+calls.  Without that node userspace shuts down cleanly and then prints "Reboot
+failed -- System halted", which is a halt, not a crash -- the card is safe to
+pull at that point.  `poweroff' still ends the same way, because nothing drives
+the PMIC yet; hold the power button instead.
 README
 
 (
