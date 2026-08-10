@@ -89,6 +89,7 @@ fi
 CONFIG="$KERNEL_OUT/.config"
 SC="$KERNEL_SRC/scripts/config"
 config_y() { "$SC" --file "$CONFIG" -e "$1"; }
+config_m() { "$SC" --file "$CONFIG" -m "$1"; }
 config_n() { "$SC" --file "$CONFIG" -d "$1" || true; }
 config_v() { "$SC" --file "$CONFIG" --set-val "$1" "$2"; }
 config_s() { "$SC" --file "$CONFIG" --set-str "$1" "$2"; }
@@ -125,8 +126,9 @@ for symbol in ARCH_MULTIPLATFORM ARCH_MULTI_V7 ARCH_MULTI_V6_V7 ARCH_MEDIATEK MA
 done
 
 # Keep this first-stage image below the fixed 9 MiB BOOTIMG partition.
-# Audio and native DRM/DSI are added only after the serial/fb/input bring-up is
-# proven. Storage is no longer in that list, and neither is NET -- see below.
+# Audio and a native DSI/display driver are added only after the serial/fb/input
+# bring-up is proven. Storage is no longer in that list, and neither is NET --
+# see below -- and DRM has now left it too, for the GPU section further down.
 #
 # WIRELESS, WLAN and BT stay off, and they are disabled here rather than left
 # out: all three live inside `if NET' in net/Kconfig and WIRELESS defaults to y,
@@ -134,7 +136,7 @@ done
 # "is not set" lines for these are in .config before the single olddefconfig
 # below, which is what makes the explicit n stick.
 for symbol in \
-    DRM SOUND SND MEDIA_SUPPORT WIRELESS WLAN BT USB_SUPPORT SCSI ATA \
+    SOUND SND MEDIA_SUPPORT WIRELESS WLAN BT USB_SUPPORT SCSI ATA \
     DEBUG_INFO DEBUG_KERNEL KALLSYMS LOGO; do
     config_n "$symbol"
 done
@@ -209,6 +211,62 @@ for symbol in \
     config_y "$symbol"
 done
 
+# ── The GPU: DRM core built in, lima built as a module on purpose ──────────────
+#
+# The MT6592 carries a Mali-450 MP4 and DRM lima drives that generation.  The
+# register map is not a guess: the stock kernel's own `struct resource' array,
+# read out of its .data at VA 0xc0b71de4, names all eighteen blocks -- Mali_GP at
+# 0x13040000 IRQ 234, GP_MMU 0x13043000/235, PP0..PP3 at 0x13048000, 0x1304a000,
+# 0x1304c000, 0x1304e000 with 236/238/240/242, their MMUs 0x13044000..0x13047000
+# with 237/239/241/243, both L2s at 0x13041000 and 0x13050000, Broadcast 0x13053000,
+# DLBU 0x13054000, PP_Broadcast 0x13056000/244 -- and every offset from that base
+# matches lima's own mali450 column in lima_device.c block for block.  The device
+# tree node generate_dts.py emits carries all of it; that comment has the table.
+#
+# THE MODULE IS THE WHOLE POINT.  MT6592 power-gates the MFG domain through the
+# SPM, and nothing on this boot path un-gates it: the MVII LK has a working
+# mfg_power_on(), but its only callers are in the MVII kernel, not in the LK's
+# hand-off to Linux.  Reading an unpowered MTK subsystem stalls the AXI bus, so a
+# built-in lima would probe during boot and take the board into a watchdog reset
+# with nothing in any log to say why -- and it would do that on every boot,
+# destroying the serial console, the input bring-up and the fbdoom test with it.
+# As a module it is loaded from /init only after tools/mfgpower.c has powered the
+# domain and read back the GP and PP product IDs, and only when the command line
+# asks for it.  A default boot is byte-identical to the one before this section.
+#
+# DRM itself is =y rather than =m because lima's helper symbols (DRM_SCHED,
+# DRM_GEM_SHMEM_HELPER) are tristate and follow lima to =m, so the core is the
+# only piece that has to be resident, and a modular DRM core would mean loading
+# four more .ko in a fixed order from a shell that has no modprobe.
+#
+# The prune matters more here than in the ARCH loop above: multi_v7_defconfig
+# turns on a dozen other DRM drivers, and one of them, DRM_SIMPLEDRM, matches the
+# very `simple-framebuffer' node FB_SIMPLE is driving.  Two drivers bidding for
+# one panel is a lottery, and simpledrm wins it by calling
+# drm_aperture_acquire_from_firmware() and evicting simplefb -- which is the
+# working display.  So every DRM_* symbol that is not lima is turned off, by
+# enumeration rather than by name, and DRM_SIMPLEDRM is then refused outright
+# after olddefconfig.  The helper symbols lima `select's are swept up by this too;
+# that is harmless, because a selected symbol's value is computed from the select
+# and olddefconfig puts them back.
+config_y DRM
+while IFS='=' read -r option _value; do
+    symbol="${option#CONFIG_}"
+    case "$symbol" in
+        DRM|DRM_LIMA) ;;
+        DRM_*) config_n "$symbol" ;;
+    esac
+done < <(grep -E '^CONFIG_DRM_[A-Z0-9_]+=(y|m)$' "$CONFIG")
+config_m DRM_LIMA
+# lima registers no CRTC, so there is no framebuffer for DRM to emulate; this
+# symbol is `default FB' and would otherwise arrive on the back of FB_SIMPLE and
+# drag DRM_KMS_HELPER in for nothing.
+config_n DRM_FBDEV_EMULATION
+# mfgpower reaches the SPM through /dev/mem.  STRICT_DEVMEM may stay on: it
+# blocks RAM, not MMIO, and mem.c maps a non-RAM pfn opened O_SYNC as
+# pgprot_noncached, which is exactly what a register window needs.
+config_y DEVMEM
+
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
     CROSS_COMPILE=arm-linux-gnueabihf- olddefconfig
 
@@ -241,9 +299,20 @@ for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 NET UNIX INET SECCOMP_FILTER NAMESPACES NET_NS PID_NS \
                 CGROUPS FHANDLE INOTIFY_USER SIGNALFD TIMERFD EPOLL \
                 DEVTMPFS DEVTMPFS_MOUNT TMPFS TMPFS_XATTR TMPFS_POSIX_ACL \
-                PROC_FS PROC_SYSCTL SYSFS BTRFS_FS_POSIX_ACL; do
+                PROC_FS PROC_SYSCTL SYSFS BTRFS_FS_POSIX_ACL \
+                DRM DEVMEM; do
     grep -q "^CONFIG_${required}=y$" "$CONFIG" || \
         die "required kernel option CONFIG_${required}=y was not selected"
+done
+
+# =m and not =y, and the difference is the whole design: see the GPU section.
+# lima's two tristate helpers are asserted alongside it because they are what
+# `select' produces at module scope, and a lima.ko whose dependencies were built
+# into vmlinux instead would still load -- it is the modules-not-built case that
+# is silent, leaving /init with a load.order naming files that do not exist.
+for wanted_module in DRM_LIMA DRM_SCHED DRM_GEM_SHMEM_HELPER; do
+    grep -q "^CONFIG_${wanted_module}=m$" "$CONFIG" || \
+        die "CONFIG_${wanted_module}=m was not selected; lima must be a module because the MFG power domain is gated until /init runs mfgpower"
 done
 
 # Off on purpose, and worth failing over: WIRELESS defaults to y under NET, and
@@ -254,6 +323,21 @@ for refused in WIRELESS BT; do
         die "CONFIG_${refused}=y came back after olddefconfig; it must stay off until the WiFi driver lands"
     fi
 done
+
+# DRM_SIMPLEDRM binds `simple-framebuffer' -- the same node FB_SIMPLE is driving
+# and the only working display on this board -- and evicts the incumbent when it
+# does. Either value is a refusal, including =m, because /init loads modules by
+# filename from a text file on a FAT partition and a stray one would be loadable.
+for refused in DRM_SIMPLEDRM; do
+    if grep -qE "^CONFIG_${refused}=(y|m)$" "$CONFIG"; then
+        die "CONFIG_${refused} came back after olddefconfig; it claims the same simple-framebuffer node as FB_SIMPLE and would take the panel"
+    fi
+done
+
+# Print the whole DRM set rather than trusting the assertions above to have named
+# everything that matters. This is the line to read when a kernel bump changes
+# what `select' pulls in: it is four symbols today.
+log "DRM configuration: $(grep -E '^CONFIG_DRM.*=(y|m)$' "$CONFIG" | tr '\n' ' ')"
 
 log "Building the incremental ARMv7 kernel and its symbol table"
 export CCACHE_DIR="${CCACHE_DIR:-$ROOT/Arkbuild_ccache}"
@@ -484,10 +568,14 @@ insmod /lib/modules/*/extra/j36_mt6592_input.ko || say "input module load failed
 # which is strictly better than the kernel panicking on a root= it cannot honour.
 root_hint=""
 want_doom=0
+want_lima=0
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         j36.doom|j36.doom=1)
             want_doom=1
+            ;;
+        j36.lima|j36.lima=1)
+            want_lima=1
             ;;
         root=/dev/*)
             root_hint="${arg#root=}"
@@ -548,25 +636,51 @@ while : ; do
     sleep 1
 done
 
-# ── Doom, if the card carries it and the command line asks ───────────────────
+# ── Optional payloads on the FAT BOOT partition ──────────────────────────────
 #
-# Run here, after the wait loop and before the hand-over, for two reasons: the
-# card is known to be up by now, and nothing of the rootfs is mounted yet, so
-# systemd, journald and the RK3326 units are not competing for the panel.  The
-# binary and the IWAD live in j36/ on the FAT BOOT partition -- see the fbdoom
-# section of build-in-vm.sh for why they are not in this initramfs.
+# Two of them now -- Doom and the Mali/lima bring-up -- and both are run here,
+# after the wait loop and before the hand-over, for the same two reasons: the card
+# is known to be up by now, and nothing of the rootfs is mounted yet, so systemd,
+# journald and the RK3326 units are not competing for the panel.  Neither payload
+# lives in this initramfs; see the fbdoom section of build-in-vm.sh for why.
 #
 # The partition is found the way try_root() finds the rootfs: by mounting
 # candidates and looking inside, because partition numbering follows whichever
 # MMC host attached first and this initramfs has no blkid.  Read-only, since
-# nothing here writes to the card.  vfat gives every file mode 0755, so the
-# binary is executable straight off the mount.
+# nothing here writes to the card.  vfat gives every file mode 0755, so anything
+# on it is executable straight off the mount.
+#
+# The probe looks for the j36 DIRECTORY and not for one file in it, so that a card
+# carrying only the lima payload and a card carrying only Doom are found by the
+# same code.  It runs at most once even when both are asked for.
+bootfs_mounted=0
+mount_bootfs() {
+    if [ "$bootfs_mounted" = 1 ]; then return 0; fi
+    mkdir -p /bootfs
+    for dev in /dev/mmcblk*p*; do
+        if [ ! -b "$dev" ]; then continue; fi
+        if ! mount -t vfat -o ro "$dev" /bootfs 2>/dev/null; then continue; fi
+        if [ -d /bootfs/j36 ]; then
+            bootfs_mounted=1
+            say "boot partition: $dev"
+            return 0
+        fi
+        umount /bootfs
+    done
+    say "no FAT partition on this card carries a j36/ directory"
+    return 1
+}
+
 #
 # Doom's own stdout goes to the serial port when there is one: /dev/console is
 # the panel, and the panel is in KD_GRAPHICS while Doom holds it, so anything
 # printed there would be invisible anyway.  MENU quits, and then this script
 # carries on with the boot exactly as if it had never run.
 run_doom() {
+    if [ ! -x /bootfs/j36/doom ]; then
+        say "doom: j36.doom was asked for but j36/doom is not on the card"
+        return 1
+    fi
     wad=""
     for cand in freedoom1.wad freedoom2.wad doom.wad doom1.wad doom2.wad; do
         if [ -f "/bootfs/j36/$cand" ]; then wad="/bootfs/j36/$cand"; break; fi
@@ -585,20 +699,61 @@ run_doom() {
     return 0
 }
 
-if [ "$want_doom" = 1 ]; then
-    mkdir -p /bootfs
-    doom_found=0
-    for dev in /dev/mmcblk*p*; do
-        if [ ! -b "$dev" ]; then continue; fi
-        if ! mount -t vfat -o ro "$dev" /bootfs 2>/dev/null; then continue; fi
-        if [ -x /bootfs/j36/doom ]; then doom_found=1; break; fi
+# ── The Mali-450, if the command line asks ───────────────────────────────────
+#
+# CONFIG_DRM_LIMA is =m and this is the only thing that loads it, because the MFG
+# power domain is gated when Linux starts and a read into an unpowered MTK
+# subsystem stalls the AXI bus -- a built-in lima would probe during boot and
+# take the board into a silent watchdog reset.  So mfgpower runs first: it powers
+# the domain through the SPM and reads back the GP and PP product IDs, and its
+# exit status is the gate.  Nothing is insmod'ed unless a Mali-450 answered.
+#
+# Its output goes through a file and show(), not straight to stdout, because
+# stdout is /dev/console and that is one of the two places this needs to be
+# readable -- the register values it prints are the whole diagnostic when the
+# domain does not come up.
+#
+# load.order is written by the build from `modinfo -F depends', so the order here
+# is the dependency order and not a guess.  insmod failures are reported and not
+# fatal: a module that is already built in returns EEXIST-ish noise, and the boot
+# should continue either way.
+run_lima() {
+    if [ ! -x /bootfs/j36/mfgpower ]; then
+        say "lima: j36.lima was asked for but j36/mfgpower is not on the card"
+        return 1
+    fi
+    if [ ! -f /bootfs/j36/modules/load.order ]; then
+        say "lima: j36/modules/load.order is missing; nothing to load"
+        return 1
+    fi
+    /bootfs/j36/mfgpower >/tmp/mfgpower.log 2>&1
+    rc=$?
+    show /tmp/mfgpower.log
+    if [ "$rc" != 0 ]; then
+        say "lima: mfgpower exited $rc; leaving the GPU alone"
+        return 1
+    fi
+    while IFS= read -r ko; do
+        case "$ko" in ''|'#'*) continue ;; esac
+        if insmod "/bootfs/j36/modules/$ko" >/tmp/insmod.log 2>&1; then
+            say "lima: loaded $ko"
+        else
+            say "lima: FAILED to load $ko"
+            show /tmp/insmod.log
+        fi
+    done < /bootfs/j36/modules/load.order
+    say "DRM devices:"
+    ls -l /dev/dri 2>/dev/null || say "  none"
+    return 0
+}
+
+if [ "$want_doom" = 1 ] || [ "$want_lima" = 1 ]; then
+    if mount_bootfs; then
+        # Doom first: it owns the panel while it runs, and lima leaves a driver
+        # loaded that has no reason to be disturbed by a game exiting.
+        if [ "$want_doom" = 1 ]; then run_doom; fi
+        if [ "$want_lima" = 1 ]; then run_lima; fi
         umount /bootfs
-    done
-    if [ "$doom_found" = 1 ]; then
-        run_doom
-        umount /bootfs
-    else
-        say "doom: j36.doom was asked for but no FAT partition carries j36/doom"
     fi
 fi
 
@@ -872,6 +1027,134 @@ else
     log "fbdoom: J36_DOOM=0, skipping the Doom payload"
 fi
 
+# ── The lima payload: one helper and the module set it gates ──────────────────
+#
+# CONFIG_DRM_LIMA is =m, so the driver is not in the kernel and not in the
+# initramfs either.  It goes on the FAT BOOT partition beside Doom, with the
+# userspace helper that has to run before it, for the reasons the GPU section of
+# the kernel configuration gives: the MFG power domain is gated when Linux starts,
+# and a driver that probes an unpowered MTK subsystem stalls the AXI bus into a
+# watchdog reset.  Staging it here means the whole GPU experiment is a directory
+# on a card and one word in boot.conf -- removable from any machine that can read
+# an SD card, with no reflash and no rebuild.
+#
+# THE LOAD ORDER IS READ OUT OF THE MODULES, NOT WRITTEN HERE.  lima.ko needs
+# gpu-sched.ko and drm_shmem_helper.ko, which need nothing more, and the
+# initramfs has insmod and not modprobe -- it resolves nothing itself and fails on
+# an unresolved symbol.  So the set is walked transitively from lima with
+# `modinfo -F depends' and emitted dependency-first into j36/modules/load.order,
+# which /init reads line by line.  A dependency whose .ko is absent is not an
+# error: it means that symbol's owner is built into vmlinux, which is exactly what
+# DRM=y produces for the drm core itself.
+#
+# Non-fatal, like fbdoom: the GPU must never cost the user the kernel artifacts.
+MFGPOWER_SRC="$ROOT/device/j36-ultra/tools/mfgpower.c"
+MFGPOWER_BIN=""
+LIMA_MODULE_PATHS=()
+LIMA_MODULE_ORDER=()
+
+build_mfgpower() {
+    local out="$WORK/mfgpower" header
+
+    [[ -f "$MFGPOWER_SRC" ]] || { log "lima: $MFGPOWER_SRC is missing"; return 1; }
+    # Static for the same reason Doom is: this runs from the initramfs, before
+    # switch_root, where there is no ld.so and no /lib.
+    arm-linux-gnueabihf-gcc -O2 -std=gnu11 -Wall -Wextra -static \
+        -o "$out" "$MFGPOWER_SRC" || return 1
+
+    header="$(readelf -hd "$out" 2>/dev/null)" || return 1
+    grep -q 'Class:.*ELF32' <<<"$header" || { log "lima: mfgpower is not a 32-bit ELF"; return 1; }
+    grep -q 'Machine:.*ARM' <<<"$header" || { log "lima: mfgpower is not an ARM ELF"; return 1; }
+    if grep -q 'NEEDED' <<<"$header"; then
+        log "lima: mfgpower wants shared libraries and the initramfs has none"
+        return 1
+    fi
+    MFGPOWER_BIN="$out"
+    log "lima: mfgpower is $(stat -c %s "$out") bytes, static ARM"
+    return 0
+}
+
+collect_lima_modules() {
+    local -A ko_path=() ko_deps=() emitted=()
+    local -a pending=(lima) deplist=()
+    local name path deps dep ready progress header
+
+    while (( ${#pending[@]} )); do
+        name="${pending[0]}"
+        pending=("${pending[@]:1}")
+        if [[ -n "${ko_path[$name]:-}" ]]; then continue; fi
+        path="$(find "$KERNEL_OUT" -name "$name.ko" -print -quit 2>/dev/null)"
+        if [[ -z "$path" ]]; then
+            log "lima: $name.ko was not built; its symbols must be in vmlinux"
+            continue
+        fi
+        header="$(readelf -h "$path" 2>/dev/null)" || { log "lima: cannot read $path"; return 1; }
+        grep -q 'Machine:.*ARM' <<<"$header" || { log "lima: $name.ko is not an ARM object"; return 1; }
+        ko_path[$name]="$path"
+        deps="$(modinfo -F depends "$path" 2>/dev/null || true)"
+        ko_deps[$name]="$deps"
+        read -ra deplist <<<"${deps//,/ }"
+        for dep in "${deplist[@]}"; do pending+=("$dep"); done
+    done
+
+    if [[ -z "${ko_path[lima]:-}" ]]; then
+        log "lima: lima.ko was not built even though CONFIG_DRM_LIMA=m was asserted"
+        return 1
+    fi
+
+    # Emit dependency-first.  Repeated passes rather than a recursive walk: the
+    # set is four modules deep at most, and a cycle -- which the module loader
+    # could not resolve either -- shows up as a pass that emits nothing.
+    while (( ${#LIMA_MODULE_ORDER[@]} < ${#ko_path[@]} )); do
+        progress=0
+        for name in "${!ko_path[@]}"; do
+            if [[ -n "${emitted[$name]:-}" ]]; then continue; fi
+            ready=1
+            read -ra deplist <<<"${ko_deps[$name]//,/ }"
+            for dep in "${deplist[@]}"; do
+                if [[ -n "${ko_path[$dep]:-}" && -z "${emitted[$dep]:-}" ]]; then ready=0; fi
+            done
+            if (( ready )); then
+                emitted[$name]=1
+                LIMA_MODULE_ORDER+=("$name.ko")
+                LIMA_MODULE_PATHS+=("${ko_path[$name]}")
+                progress=1
+            fi
+        done
+        if (( progress == 0 )); then
+            log "lima: circular dependency among ${!ko_path[*]}"
+            return 1
+        fi
+    done
+
+    log "lima: load order ${LIMA_MODULE_ORDER[*]}"
+    return 0
+}
+
+if [[ "${J36_LIMA:-1}" == 1 ]]; then
+    set +e
+    build_mfgpower
+    mfg_rc=$?
+    set -e
+    if (( mfg_rc != 0 )); then
+        MFGPOWER_BIN=""
+        log "lima: mfgpower not staged, see the error above -- the kernel payload is unaffected"
+    else
+        set +e
+        collect_lima_modules
+        lima_rc=$?
+        set -e
+        if (( lima_rc != 0 )); then
+            MFGPOWER_BIN=""
+            LIMA_MODULE_ORDER=()
+            LIMA_MODULE_PATHS=()
+            log "lima: modules not staged; the helper is withheld too, since it has nothing to gate"
+        fi
+    fi
+else
+    log "lima: J36_LIMA=0, skipping the GPU payload"
+fi
+
 # ── The SD BOOT payload ───────────────────────────────────────────────────────
 #
 # Copy this tree onto the FAT partition labelled BOOT and the MVII LK boots the
@@ -904,6 +1187,22 @@ if [[ -n "$DOOM_BIN" ]]; then
     fi
 fi
 
+# The same rule for the GPU payload, and the same consequence: remove
+# j36/mfgpower or j36/modules and j36.lima=1 finds nothing, says so, and the boot
+# continues.  load.order is written from the walk above, one module per line in
+# the order insmod needs them.
+if [[ -n "$MFGPOWER_BIN" && ${#LIMA_MODULE_ORDER[@]} -gt 0 ]]; then
+    mkdir -p "$SDBOOT/j36/modules"
+    cp "$MFGPOWER_BIN" "$SDBOOT/j36/mfgpower"
+    chmod 0755 "$SDBOOT/j36/mfgpower"
+    : > "$SDBOOT/j36/modules/load.order"
+    for i in "${!LIMA_MODULE_ORDER[@]}"; do
+        cp "${LIMA_MODULE_PATHS[$i]}" "$SDBOOT/j36/modules/${LIMA_MODULE_ORDER[$i]}"
+        printf '%s\n' "${LIMA_MODULE_ORDER[$i]}" >> "$SDBOOT/j36/modules/load.order"
+    done
+    log "lima: staged ${#LIMA_MODULE_ORDER[@]} modules and mfgpower into j36/"
+fi
+
 # rdinit=/init stays even though root= is now present, and the two do not
 # conflict: rdinit means the kernel never mounts a root filesystem itself, so a
 # root= it could not honour can no longer panic it.  /init does the mounting, and
@@ -932,8 +1231,10 @@ initrd=initrd.img
 # daemon, which restarts forever on hardware this kernel does not describe.  Any
 # of them can be deleted here.  j36.doom=1 runs j36/doom off this partition
 # before the hand-over, as the panel and pad test; MENU quits it and the boot
-# carries on.  Delete that word, or the j36 directory, to boot straight through.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.doom=1
+# carries on.  j36.lima=1 powers the Mali-450 and loads the DRM driver, but only
+# if j36/mfgpower reads the right GPU back.  Delete either word, or the j36
+# directory, to boot straight through.
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.doom=1 j36.lima=1
 CONF
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
