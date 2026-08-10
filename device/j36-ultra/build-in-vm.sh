@@ -1803,9 +1803,13 @@ rdinit=/init root=/dev/mmcblk0p2 rw rootwait
     See above: /init does the mounting, so root= cannot panic the kernel.
 
 j36.doom=1
-    Run j36/doom off this partition after the card comes up and before the
-    hand-over.  Delete the word, or the j36 directory, and the boot is exactly
-    what it was: /init says so on the panel and carries on.
+    NOT on by default any more; add it to run j36/doom off this partition after
+    the card comes up and before the hand-over.  It was the way to find out
+    whether anything could drive this panel and read this pad, and now that
+    EmulationStation starts there is a better answer to that question.  It still
+    works, and it is still the quickest thing to reach for when the GL path breaks:
+    Doom needs no DRM, no GL and no rootfs, so if Doom draws and ES does not, the
+    panel is fine and the fault is above it.
 
 j36.lima=1
     Power the Mali-450 and load the DRM lima driver, in that order and only in
@@ -1818,6 +1822,14 @@ j36.mtkdrm=1
     /dev/dri/card0.  Same removal story again: delete the word or the directory and
     not one line of it is loaded.  Loading it is visually a no-op, and that is by
     construction rather than by luck: see below.
+
+j36.es=1
+    Point EmulationStation at Mesa instead of the RK3326's Mali blob, by staging
+    j36/gl/ into a tmpfs and writing a systemd drop-in into another one.  Nothing
+    on the shared rootfs is written -- see below -- so this word is the whole
+    difference between an ES that cannot start and one that can.  It needs
+    j36.lima=1 and j36.mtkdrm=1 to be any use: without them there is no render node
+    and no card node for Mesa to open.
 
 Doom, and what it is for
 ------------------------
