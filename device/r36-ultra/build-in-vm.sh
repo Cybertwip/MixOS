@@ -443,7 +443,7 @@ if [[ -f "${DISK}.7z.001" ]]; then
             "$STATE_DIR"/image.done
     else
         log "Existing completed archive found; verifying it"
-        7z t "${DISK}.7z.001"
+        bash device/r36-ultra/verify_archive.sh "$DISK" "$STATE_DIR"
         mark complete
         printf '%s\n' "$DISK" > "$STATE_DIR/latest-image"
         exit 0
