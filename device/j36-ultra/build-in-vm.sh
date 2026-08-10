@@ -341,10 +341,7 @@ make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
 # again, or turns SECCOMP off, the build fails here instead of the board
 # freezing at 15 s with the reason four screens up.
 #
-# MODULE_COMPRESS_NONE is in the list for the lima payload: /init loads modules by
-# filename with busybox insmod, which decompresses nothing, and turning module
-# compression on would rename every .ko to .ko.xz and leave load.order naming
-# files that are not there. DEVMEM is what mfgpower reaches the SPM through.
+# DEVMEM is what mfgpower reaches the SPM through.
 for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 FB_SIMPLE SERIAL_8250_MT6577 BLK_DEV_INITRD MODULES \
                 MMC MMC_BLOCK MMC_MTK REGULATOR_FIXED_VOLTAGE \
@@ -354,10 +351,25 @@ for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 CGROUPS FHANDLE INOTIFY_USER SIGNALFD TIMERFD EPOLL \
                 DEVTMPFS DEVTMPFS_MOUNT TMPFS TMPFS_XATTR TMPFS_POSIX_ACL \
                 PROC_FS PROC_SYSCTL SYSFS BTRFS_FS_POSIX_ACL \
-                DRM DEVMEM MODULE_COMPRESS_NONE; do
+                DRM DEVMEM; do
     grep -q "^CONFIG_${required}=y$" "$CONFIG" || \
         die "required kernel option CONFIG_${required}=y was not selected"
 done
+
+# Module compression has to be OFF, and it is asserted as an absence rather than as
+# a symbol because of a Kconfig change this build tripped over. Up to 6.11 the
+# choice had a MODULE_COMPRESS_NONE member and asserting =y on it worked; 6.12's
+# kernel/module/Kconfig replaced that with a plain `config MODULE_COMPRESS' bool
+# that the GZIP/XZ/ZSTD choice now depends on, so MODULE_COMPRESS_NONE no longer
+# exists as a symbol at all and the old assertion could never pass -- it failed on
+# a kernel that was configured exactly right.
+#
+# Why it matters either way: /init loads modules by filename with busybox insmod,
+# which decompresses nothing, and modules_install with compression on renames every
+# .ko to .ko.xz -- leaving both load.order files naming modules that are not there.
+if grep -q "^CONFIG_MODULE_COMPRESS=y$" "$CONFIG"; then
+    die "CONFIG_MODULE_COMPRESS=y came back after olddefconfig; busybox insmod cannot read a compressed .ko and load.order names uncompressed filenames"
+fi
 
 # =m and not =y, and the difference is the whole design: see the GPU section.
 # lima's two tristate helpers are asserted alongside it because they are what
@@ -1311,7 +1323,7 @@ if [[ "${J36_LIMA:-1}" == 1 ]]; then
         log "lima: mfgpower not staged, see the error above -- the kernel payload is unaffected"
     else
         set +e
-        collect_lima_modules
+        collect_modules lima LIMA_MODULE_ORDER LIMA_MODULE_PATHS lima
         lima_rc=$?
         set -e
         if (( lima_rc != 0 )); then
@@ -1323,6 +1335,34 @@ if [[ "${J36_LIMA:-1}" == 1 ]]; then
     fi
 else
     log "lima: J36_LIMA=0, skipping the GPU payload"
+fi
+
+# The display set, collected the same way and staged just as removably.  There is
+# no mfgpower equivalent here and none is needed: the DISP domain is already
+# powered and already scanning out, because the LK left it that way, so there is no
+# unpowered-bus-stall class of failure to gate against.  What makes this payload
+# safe is elsewhere -- DRM_FBDEV_EMULATION=n means mediatek-drm binds, registers
+# card0 and programs not one display register until userspace opens the node.
+#
+# All five names are roots, and the two that matter are the last two: mediatek-drm
+# reaches phy-mtk-mipi-dsi-drv through the generic phy API and the panel through
+# the DSI host bus, neither of which is a symbol relationship, so a dependency walk
+# cannot find either from mediatek-drm alone.
+MTKDRM_MODULE_PATHS=()
+MTKDRM_MODULE_ORDER=()
+if [[ "${J36_MTKDRM:-1}" == 1 ]]; then
+    set +e
+    collect_modules mtkdrm MTKDRM_MODULE_ORDER MTKDRM_MODULE_PATHS \
+        phy-mtk-mipi-dsi-drv mtk-mmsys mtk-mutex mediatek-drm j36_jd9365_panel
+    mtkdrm_rc=$?
+    set -e
+    if (( mtkdrm_rc != 0 )); then
+        MTKDRM_MODULE_ORDER=()
+        MTKDRM_MODULE_PATHS=()
+        log "mtkdrm: modules not staged, see the error above -- the kernel payload is unaffected"
+    fi
+else
+    log "mtkdrm: J36_MTKDRM=0, skipping the display payload"
 fi
 
 # ── The SD BOOT payload ───────────────────────────────────────────────────────
@@ -1373,6 +1413,21 @@ if [[ -n "$MFGPOWER_BIN" && ${#LIMA_MODULE_ORDER[@]} -gt 0 ]]; then
     log "lima: staged ${#LIMA_MODULE_ORDER[@]} modules and mfgpower into j36/"
 fi
 
+# j36/mtkdrm/ is the display set, in its own directory and with its own load.order
+# rather than merged into j36/modules/, because the two payloads answer to different
+# command-line words and fail independently.  Deleting this one directory takes the
+# whole mtk_drm experiment off the card and leaves lima and Doom exactly as they
+# were; j36.mtkdrm=1 then finds nothing, says so, and the boot carries on.
+if (( ${#MTKDRM_MODULE_ORDER[@]} > 0 )); then
+    mkdir -p "$SDBOOT/j36/mtkdrm"
+    : > "$SDBOOT/j36/mtkdrm/load.order"
+    for i in "${!MTKDRM_MODULE_ORDER[@]}"; do
+        cp "${MTKDRM_MODULE_PATHS[$i]}" "$SDBOOT/j36/mtkdrm/${MTKDRM_MODULE_ORDER[$i]}"
+        printf '%s\n' "${MTKDRM_MODULE_ORDER[$i]}" >> "$SDBOOT/j36/mtkdrm/load.order"
+    done
+    log "mtkdrm: staged ${#MTKDRM_MODULE_ORDER[@]} modules into j36/mtkdrm/"
+fi
+
 # rdinit=/init stays even though root= is now present, and the two do not
 # conflict: rdinit means the kernel never mounts a root filesystem itself, so a
 # root= it could not honour can no longer panic it.  /init does the mounting, and
@@ -1402,9 +1457,10 @@ initrd=initrd.img
 # of them can be deleted here.  j36.doom=1 runs j36/doom off this partition
 # before the hand-over, as the panel and pad test; MENU quits it and the boot
 # carries on.  j36.lima=1 powers the Mali-450 and loads the DRM driver, but only
-# if j36/mfgpower reads the right GPU back.  Delete either word, or the j36
-# directory, to boot straight through.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.doom=1 j36.lima=1
+# if j36/mfgpower reads the right GPU back.  j36.mtkdrm=1 loads the MT6592 display
+# driver, which adds /dev/dri/card0 and touches no register until something opens
+# it.  Delete any word, or the j36 directory, to boot straight through.
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.doom=1 j36.lima=1 j36.mtkdrm=1
 CONF
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
@@ -1429,6 +1485,7 @@ at the ARMv7 payload instead.
   j36/freedoom1.wad         the game data it loads (Freedoom, freely licensed)
   j36/mfgpower              powers the Mali-450 and reads its ID back; the gate
   j36/modules/              lima and its dependencies, plus load.order
+  j36/mtkdrm/               the MT6592 display driver set, plus load.order
 
 The R36S kernel on the same card is arm64 and stays there for the R36S.  The
 armhf Debian rootfs is shared, and this kernel can now mount it: MSDC1, the
@@ -1500,6 +1557,13 @@ j36.lima=1
     Power the Mali-450 and load the DRM lima driver, in that order and only in
     that order -- see below.  Same removal story as j36.doom: delete the word, or
     j36/mfgpower, or j36/modules, and the GPU is never touched.
+
+j36.mtkdrm=1
+    Load the MT6592 display driver set from j36/mtkdrm/ -- mtk_drm, the DDP
+    components, the MIPI-TX PHY and the panel -- which is what produces
+    /dev/dri/card0.  Same removal story again: delete the word or the directory and
+    not one line of it is loaded.  Loading it is visually a no-op, and that is by
+    construction rather than by luck: see below.
 
 Doom, and what it is for
 ------------------------
@@ -1573,34 +1637,85 @@ the boot carries on untouched.
 If it works you get /dev/dri/renderD128 and no /dev/dri/card0.  That is not a
 fault: lima is a render-only driver.  It rasterises; it does not own a display.
 
+The MT6592 display, and why loading it changes nothing on screen
+---------------------------------------------------------------
+
+j36/mtkdrm/ is a DRM/KMS driver for this SoC's display path, which is the piece
+lima cannot supply: lima rasterises and owns no display, so without this there is
+a render node and nothing to present through.  It is mainline's mediatek-drm with
+an MT6592 entry added, and it is mainline's because MT6592's display block IS the
+mt2701/mt8173 generation -- that was checked register by register against the MVII
+LK's own display code rather than assumed from the family name:
+
+  - The DDP path the LK builds is OVL0 -> RDMA0 -> COLOR0 -> DSI0, which is the
+    component list the patch adds.  BLS stays out of the mutex, as in the LK.
+  - MUTEX0_MOD in the LK is 0x488.  mainline's mt2701 mutex table puts OVL0 at
+    bit 3, COLOR0 at 7 and RDMA0 at 10: 0x488 exactly.  MUTEX0_SOF is 1 in both.
+  - The MIPI-TX PLL arithmetic agrees to the quotient.  mainline computes
+    pcw = (data_rate * 2 * txdiv << 24) / 26000000; the LK computes
+    data_rate * txdiv / 13.  Same number, same txdiv ladder.  What decided
+    mt2701 over mt8173 was one field: mppll_preserve is 3 in the mt2701 data and
+    3 is what the LK writes to PLL_TOP bits 9:8.  mt8173's is 0.
+
+The one measured divergence is the data rate: mtk_dsi computes 192 MHz where the
+LK programmed 214, because it derives it from the pixel clock and no device-tree
+or panel hook can override it.  It is left alone deliberately -- it lands on the
+same txdiv, the porch budget has an order of magnitude of margin, and the refresh
+rate comes out the same 62.5 Hz -- but it is the first thing to suspect if the
+panel ever tears after a modeset.
+
+Loading these modules is a no-op on screen, and that is by construction:
+
+  - Every piece is a module, including mtk-mmsys and mtk-mutex.  Those two are
+    `default ARCH_MEDIATEK' in Kconfig, so they were silently =y here and would
+    have bound the new device-tree nodes on every boot; the build now forces them
+    =m and fails if the assertion ever comes back the other way.  With j36.mtkdrm
+    absent, nothing in this set is in memory.
+  - DRM_FBDEV_EMULATION is off, so mediatek-drm registers no /dev/fb.  /dev/fb0
+    stays simplefb's window onto the framebuffer the LK is scanning out.
+  - mediatek-drm programs its first display register in atomic commit, which is to
+    say when userspace opens card0 and sets a mode.  Until then it has enumerated
+    hardware and touched none of it.
+
+The panel module is out of tree and small, and it is worth knowing why it exists:
+mtk_dsi calls component_add from inside mtk_dsi_host_attach, and host_attach only
+runs when a mipi_dsi_driver has probed on the panel node.  No panel driver means no
+DRM master and no card0, however correct everything else is.  All four of its power
+callbacks are empty on purpose -- the LK has already powered the panel, released
+reset, pushed 155 init records and lit the backlight -- and it refuses to probe
+without j36,preserve-lk-state in the tree rather than pretend it can bring a dark
+panel up.  Cold start is not implemented; the device tree keeps the init table,
+the PMIC sequence and the GPIO sequence so that it can be.
+
 EmulationStation, and what is still missing
 -------------------------------------------
 
-ES on this card cannot start yet, and no combination of flags reaches it.  The
-chain, each link measured rather than assumed:
+ES on this card cannot start yet.  The chain, each link measured rather than
+assumed, and two of the four now closed:
 
-  1. lima gives a render node and no KMS device, because a Mali-450 has no
-     display controller.  The panel is driven by simplefb, which is a framebuffer
-     and not a DRM device.
+  1. CLOSED.  There is a KMS device: j36.mtkdrm=1 gives /dev/dri/card0 for the
+     display and lima gives /dev/dri/renderD128 for rendering.  Before this, the
+     panel was simplefb only -- a framebuffer, not a DRM device.
   2. SDL2's video backends are KMSDRM, X11, Wayland, offscreen and dummy.  There
      is no fbdev backend, so /dev/fb0 is of no use to it, and KMSDRM needs a card
-     node -- the one thing step 1 does not produce.
-  3. simpledrm could produce that node, and it is deliberately disabled: it binds
-     the same `simple-framebuffer' the working display is on and evicts simplefb
-     when it does.  Even enabled it would not help, because Mesa's renderonly
-     driver table has no simpledrm entry, so there would be no GBM and no EGL to
-     put on top of it.
-  4. The GL stack in the shared rootfs is the RK3326's Mali-G31 Bifrost blob, and
-     emulationstation.service forces it with SDL_VIDEO_EGL_DRIVER=libEGL.so.
-     Bifrost is a different architecture from this Utgard part; that library
-     cannot drive this GPU whatever else is true.
+     node -- which step 1 now produces.
+  3. CLOSED, and this is why mediatek-drm specifically.  Mesa's renderonly table
+     has a mediatek entry, so lima's render node can be presented through an
+     mtk_drm card via kmsro.  simpledrm has no such entry, which is one reason it
+     was never the answer -- the other being that it binds the same
+     `simple-framebuffer' the working display is on and evicts simplefb.
+  4. STILL OPEN, and now the only link.  The GL stack in the shared rootfs is the
+     RK3326's Mali-G31 Bifrost blob, and emulationstation.service forces it with
+     SDL_VIDEO_EGL_DRIVER=libEGL.so.  Bifrost is a different architecture from
+     this Utgard part; that library cannot drive this GPU whatever else is true.
 
-What closes it is a real MT6592 display driver -- a DRM/KMS device for the
-DISP/OVL/DSI path, so there is a card0 for KMSDRM to open and something for
-Mesa's lima driver to present through.  That is the next piece of work, not a
-setting.  ES is left enabled and failing on purpose: its unit is Restart=on-failure
-under the default 5-starts-in-10-s limit, so it gives up on its own and the log
-says why.  Add systemd.mask=emulationstation.service to bootargs to silence it.
+So what closes it is an armhf Mesa carrying lima and kmsro, installed on a library
+path only this board looks at -- the shared rootfs's libEGL/libGLESv2/libgbm
+symlinks belong to the R36S's blob and must not move.  That is the next piece of
+work, not a setting.  ES is left enabled and failing on purpose: its unit is
+Restart=on-failure under the default 5-starts-in-10-s limit, so it gives up on its
+own and the log says why.  Add systemd.mask=emulationstation.service to bootargs
+to silence it.
 
 Rebooting
 ---------
@@ -1630,6 +1745,12 @@ README
         while IFS= read -r ko; do
             sums+=("sd-boot/j36/modules/$ko")
         done < sd-boot/j36/modules/load.order
+    fi
+    if [[ -f sd-boot/j36/mtkdrm/load.order ]]; then
+        sums+=(sd-boot/j36/mtkdrm/load.order)
+        while IFS= read -r ko; do
+            sums+=("sd-boot/j36/mtkdrm/$ko")
+        done < sd-boot/j36/mtkdrm/load.order
     fi
     sha256sum "${sums[@]}" > SHA256SUMS
     {

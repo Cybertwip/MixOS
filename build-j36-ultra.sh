@@ -157,6 +157,7 @@ multipass exec "$VM_NAME" -- env \
     J36_DOOM_URL="${J36_DOOM_URL:-https://github.com/ozkl/doomgeneric}" \
     J36_DOOM_COMMIT="${J36_DOOM_COMMIT:-dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284}" \
     J36_LIMA="${J36_LIMA:-1}" \
+    J36_MTKDRM="${J36_MTKDRM:-1}" \
     bash "$VM_BUILD_DIR/device/j36-ultra/build-in-vm.sh"
 
 darkos_log "J36 Ultra artifacts are ready: $ARTIFACT_DIR"
