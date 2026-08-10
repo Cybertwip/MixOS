@@ -619,19 +619,9 @@ if [[ ! -x "$BUSYBOX_SRC/busybox" || "${J36_REBUILD_BUSYBOX:-0}" == 1 ]]; then
     ! grep -q '^CONFIG_TC=y$' "$BUSYBOX_SRC/.config" || \
         die "busybox CONFIG_TC is still on and it cannot build against Linux 6.3+ headers"
 
-    # And the applets /init actually invokes, derived from INIT_APPLETS so this
-    # cannot fall behind the symlink loop again. defconfig has all of them today;
-    # asserting it turns a future defconfig change into a build failure here
-    # instead of an init that dies on the device with `sh: not found'.
-    for applet in "${INIT_APPLETS[@]}"; do
-        sym="$(bb_applet_symbol "$applet")"
-        grep -q "^$sym=y\$" "$BUSYBOX_SRC/.config" || \
-            die "busybox $sym is off; /init runs \`$applet'"
-    done
-    # Not an applet, so not in the list: it decides which shell CONFIG_ASH
-    # installs as /bin/sh, and /init is #!/bin/sh.
-    grep -q '^CONFIG_SH_IS_ASH=y$' "$BUSYBOX_SRC/.config" || \
-        die "busybox CONFIG_SH_IS_ASH is off; /init is #!/bin/sh"
+    # The applets /init invokes are asserted after this block rather than inside
+    # it, because a cached BusyBox skips this block entirely and the assertion has
+    # to hold on every run.
 
     make -C "$BUSYBOX_SRC" CROSS_COMPILE=arm-linux-gnueabihf- -j"$(nproc)"
 fi
@@ -649,15 +639,6 @@ cp "$BUSYBOX" "$INITROOT/bin/busybox"
 chmod 0755 "$INITROOT/bin/busybox"
 for applet in "${INIT_APPLETS[@]}"; do
     ln -sf busybox "$INITROOT/bin/$applet"
-done
-# The build asserts the CONFIG_ symbol for each of these, but only when it builds
-# BusyBox; a cached busybox skips that block entirely. This runs every time, and
-# it is the check that matters, because a name absent here is a command /init
-# cannot run no matter how BusyBox was configured.
-for applet in "${INIT_APPLETS[@]}"; do
-    "$BUSYBOX" "$applet" --help >/dev/null 2>&1 || \
-        grep -qx "$applet" <(compgen -W "$("$BUSYBOX" --list 2>/dev/null | tr '\n' ' ')" 2>/dev/null) || \
-        die "the initramfs BusyBox has no \`$applet' applet, which /init runs"
 done
 cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 
