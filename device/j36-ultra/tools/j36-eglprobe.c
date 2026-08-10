@@ -196,6 +196,62 @@ static void (*p_gbm_surface_release_buffer)(struct gbm_surface *, struct gbm_bo 
 static union gbm_bo_handle (*p_gbm_bo_get_handle)(struct gbm_bo *);
 static uint32_t (*p_gbm_bo_get_stride)(struct gbm_bo *);
 
+/*
+ * GLES2 by hand as well, and for the same reason: -c needs twenty-odd entry
+ * points to draw a cube, and linking them would mean libGLESv2.so.2 in DT_NEEDED
+ * -- which on this card's shared rootfs is a symlink to the R36S's ARMv8-A
+ * libMali.so, so the loader would refuse this binary before main().  Resolved
+ * through eglGetProcAddress, they come from whichever Mesa the caller's
+ * LD_LIBRARY_PATH found, which is the one being measured.
+ *
+ * These are the GL types on this ABI: GLsizei and GLint are int, GLenum and
+ * GLuint are unsigned, GLchar is char.  Written out rather than typedef'd so that
+ * each prototype below reads as the spec writes it.
+ */
+#define GL_NO_ERROR                0x0000
+#define GL_DEPTH_BUFFER_BIT        0x00000100
+#define GL_TRIANGLES               0x0004
+#define GL_LESS                    0x0201
+#define GL_CULL_FACE               0x0B44
+#define GL_DEPTH_TEST              0x0B71
+#define GL_VENDOR                  0x1F00
+#define GL_RENDERER                0x1F01
+#define GL_FLOAT                   0x1406
+#define GL_FRAGMENT_SHADER         0x8B30
+#define GL_VERTEX_SHADER           0x8B31
+#define GL_COMPILE_STATUS          0x8B81
+#define GL_LINK_STATUS             0x8B82
+#define GL_INFO_LOG_LENGTH         0x8B84
+#define GL_SHADING_LANGUAGE_VERSION 0x8B8C
+
+static void (*p_glViewport)(int, int, int, int);
+static void (*p_glEnable)(unsigned int);
+static void (*p_glDepthFunc)(unsigned int);
+static void (*p_glClearColor)(float, float, float, float);
+static void (*p_glClear)(unsigned int);
+static void (*p_glFinish)(void);
+static unsigned int (*p_glGetError)(void);
+static const unsigned char *(*p_glGetString)(unsigned int);
+static unsigned int (*p_glCreateShader)(unsigned int);
+static void (*p_glShaderSource)(unsigned int, int, const char *const *, const int *);
+static void (*p_glCompileShader)(unsigned int);
+static void (*p_glGetShaderiv)(unsigned int, unsigned int, int *);
+static void (*p_glGetShaderInfoLog)(unsigned int, int, int *, char *);
+static void (*p_glDeleteShader)(unsigned int);
+static unsigned int (*p_glCreateProgram)(void);
+static void (*p_glAttachShader)(unsigned int, unsigned int);
+static void (*p_glLinkProgram)(unsigned int);
+static void (*p_glGetProgramiv)(unsigned int, unsigned int, int *);
+static void (*p_glGetProgramInfoLog)(unsigned int, int, int *, char *);
+static void (*p_glUseProgram)(unsigned int);
+static int (*p_glGetAttribLocation)(unsigned int, const char *);
+static int (*p_glGetUniformLocation)(unsigned int, const char *);
+static void (*p_glUniformMatrix4fv)(int, int, unsigned char, const float *);
+static void (*p_glVertexAttribPointer)(unsigned int, int, unsigned int,
+                                       unsigned char, int, const void *);
+static void (*p_glEnableVertexAttribArray)(unsigned int);
+static void (*p_glDrawArrays)(unsigned int, int, int);
+
 static const char *eglerr(EGLint e)
 {
     switch (e) {

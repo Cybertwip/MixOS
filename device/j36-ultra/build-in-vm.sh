@@ -4088,7 +4088,15 @@ fi
 )
 
 mkdir -p "$EXPORT_DIR"
-rsync -a --delete "$ARTIFACTS/" "$EXPORT_DIR/"
+#
+# --omit-link-times, because $EXPORT_DIR is a share and not a filesystem.  The Qt
+# payload is the first artifact tree with symlinks in it -- lib/libQt5Core.so.5 and
+# its thirty-odd SONAME aliases -- and utimensat(AT_SYMLINK_NOFOLLOW) on the host
+# share answers EOVERFLOW, which rsync reports as "failed to set times ... Value
+# too large for defined data type" once per link and then exits 23.  The links
+# themselves copy correctly; it is only their mtime that cannot be set, and nothing
+# reads a symlink's mtime.  Timestamps on the regular files are still preserved.
+rsync -a --omit-link-times --delete "$ARTIFACTS/" "$EXPORT_DIR/"
 
 log "J36 Ultra incremental bring-up artifacts are ready"
 printf '  %s\n' \
