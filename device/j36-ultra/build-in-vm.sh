@@ -1607,6 +1607,10 @@ DROPINPROBE
 # than /opt/mixos work at all: ld.so searches DT_RPATH first, misses, and falls
 # through to this.
 mixos_root=""
+# One word per partition considered -- mmcblk0p1:vfat:none, mmcblk0p3:unreadable --
+# collected so that the notice unit can repeat it at the end of the boot, after the
+# kernel's own output has scrolled these lines off a 640x480 panel.
+dash_seen=""
 find_mixos() {
     # Extracted into the rootfs: the documented way, and the only one that needs no
     # mount of its own, since /init has already mounted that partition as /newroot.
@@ -1615,32 +1619,56 @@ find_mixos() {
         say "dash: /opt/mixos is in the rootfs"
         return 0
     fi
+    dash_seen="${rootdev##*/}:rootfs:no-opt-mixos"
 
     # Anywhere else on the card.  Read-only, because this is somebody's data
     # partition and nothing here has any business writing to it, and under /run so
     # that the mount lives in a tmpfs directory rather than in a directory this
     # script would have to create on the shared rootfs.
+    #
+    # Every partition it tries is named on the console whether or not the payload is
+    # there, and that is the point: with no keyboard on this board, "nothing loaded"
+    # and "the tarball was never unpacked onto the card" look identical, and this is
+    # the line that tells them apart.
     mkdir -p /newroot/run/j36/mixos
     for dev in /dev/mmcblk*p* /dev/sd*; do
         if [ ! -b "$dev" ]; then continue; fi
         if [ "$dev" = "$rootdev" ]; then continue; fi
+        dash_mounted=0
         for fs in btrfs ext4 vfat; do
             if ! mount -t "$fs" -o ro "$dev" /newroot/run/j36/mixos 2>/dev/null; then continue; fi
-            if [ -x /newroot/run/j36/mixos/opt/mixos/bin/mixdash ]; then
-                mixos_root=/run/j36/mixos/opt/mixos
-                say "dash: /opt/mixos is on $dev ($fs), mounted read-only at /run/j36/mixos"
-                # vfat holds no symlinks, and the Qt payload is thirty-odd SONAME
-                # symlinks -- libQt5Core.so.5 and friends.  Without them the loader
-                # cannot resolve mixdash's own DT_NEEDED and it dies before main().
-                if [ ! -e "/newroot$mixos_root/qt/lib/libQt5Core.so.5" ]; then
-                    say "dash: that copy has no qt/lib/libQt5Core.so.5 -- if it was"
-                    say "      unpacked onto a vfat partition the SONAME symlinks are"
-                    say "      gone, and mixdash will not start.  Use ext4 or btrfs."
+            dash_mounted=1
+            # opt/mixos is what the tarball unpacks to at a partition root; mixos/ is
+            # what unpacking it one level down produces, and it is a mistake worth
+            # tolerating rather than reporting.
+            for sub in opt/mixos mixos; do
+                if [ -x "/newroot/run/j36/mixos/$sub/bin/mixdash" ]; then
+                    mixos_root="/run/j36/mixos/$sub"
+                    say "dash: found $sub on $dev ($fs), mounted read-only at /run/j36/mixos"
+                    # vfat holds no symlinks, and the Qt payload is thirty-odd SONAME
+                    # symlinks -- libQt5Core.so.5 and friends.  Without them the loader
+                    # cannot resolve mixdash's own DT_NEEDED and it dies before main().
+                    if [ ! -e "/newroot$mixos_root/qt/lib/libQt5Core.so.5" ]; then
+                        say "dash: that copy has no qt/lib/libQt5Core.so.5 -- if it was"
+                        say "      unpacked onto a vfat partition the SONAME symlinks are"
+                        say "      gone, and mixdash will not start.  Use ext4 or btrfs."
+                    fi
+                    return 0
                 fi
-                return 0
-            fi
+            done
+            say "dash: $dev ($fs) carries no opt/mixos"
+            dash_seen="$dash_seen ${dev##*/}:$fs:none"
             umount /newroot/run/j36/mixos
+            break
         done
+        # Not a footnote: a partition none of the three drivers will mount is the one
+        # shape of this failure that no amount of looking in the right directory
+        # fixes.  btrfs in particular is a module on this kernel and the initramfs has
+        # no modules, so a btrfs data partition lands here.
+        if [ "$dash_mounted" = 0 ]; then
+            say "dash: $dev would not mount as btrfs, ext4 or vfat"
+            dash_seen="$dash_seen ${dev##*/}:unreadable"
+        fi
     done
     return 1
 }
@@ -1663,6 +1691,7 @@ setup_dash() {
         say "      stack traces on it instead of this message.  A readable console"
         say "      is the better failure."
         neuter_es
+        dash_notice
         return 1
     fi
 
@@ -1786,6 +1815,56 @@ ExecStart=/bin/echo "j36: EmulationStation is not started in this build -- mixda
 # scrolling a 640x480 panel.  Nothing here can fail, but it is stated anyway.
 Restart=no
 DROPINDASH
+    return 0
+}
+
+# ── the failure, said where it can be read ────────────────────────────────────
+#
+# WHY THIS UNIT EXISTS.  find_mixos already prints why it found nothing, but it prints
+# it from the initramfs -- and then the kernel and systemd put a hundred lines of
+# their own on a 640x480 panel, the last of them typically hostnamed deactivating
+# thirty seconds in.  What the operator sees is a console that stopped, which is
+# indistinguishable from a dashboard that crashed, from a unit that was never enabled,
+# and from a panel that went black.  So the reason is repeated by a unit that runs
+# after all of that, several times, and it names what the initramfs actually saw.
+#
+# There is no keyboard on this board and no getty worth logging into, so a message on
+# the panel is the whole of the diagnostic interface.  Type=simple with the loop
+# inside a shell rather than Restart=always: a restart loop would be journalled as a
+# failing unit, and this is not a failure of this unit.
+dash_notice() {
+    mkdir -p /newroot/run/systemd/system
+    cat > /newroot/run/systemd/system/mixdash-missing.service <<UNITNOTICE
+# Written by the J36 Ultra initramfs, into a tmpfs.  Exists only when the dashboard
+# payload was not found; a boot that finds it never writes this file.
+[Unit]
+Description=MixOS dashboard payload not found (report only)
+# Late, but not last-by-target: ordering after the target that wants it is a knot.
+After=systemd-user-sessions.service
+
+[Service]
+Type=simple
+StandardOutput=journal+console
+StandardError=journal+console
+ExecStart=/bin/sh -c 'n=0; while [ \$n -lt 6 ]; do \\
+  echo ""; \\
+  echo "j36: MixOS dashboard did not start -- its payload is not on this card."; \\
+  echo "j36: the initramfs looked in the rootfs /opt/mixos and on every other"; \\
+  echo "j36: partition it could mount read-only, and saw:"; \\
+  echo "j36:   $dash_seen"; \\
+  echo "j36: fix it on a PC, with the card in a reader:"; \\
+  echo "j36:   sudo tar -C /media/<data-partition> -xzf sd-root.tar.gz"; \\
+  echo "j36: that partition must be ext4 or btrfs.  vfat drops the ~30 Qt SONAME"; \\
+  echo "j36: symlinks and mixdash then dies before main()."; \\
+  echo "j36: EmulationStation is masked in this build on purpose and is not a"; \\
+  echo "j36: fallback: it aborts in Renderer_GLES10.cpp on this board."; \\
+  n=\$((n+1)); sleep 20; \\
+done'
+UNITNOTICE
+    mkdir -p /newroot/run/systemd/system/multi-user.target.wants
+    ln -sf ../mixdash-missing.service \
+           /newroot/run/systemd/system/multi-user.target.wants/mixdash-missing.service
+    say "dash: mixdash-missing.service will repeat that on the console after boot"
     return 0
 }
 
@@ -3417,24 +3496,45 @@ j36.audio=speaker
     board that will not stay up is to delete j36/audio from the card, or this word
     from mvii/boot.conf, from any machine that reads SD cards.
 
-j36.es=1
-    Point EmulationStation at Mesa instead of the RK3326's Mali blob, by staging
-    j36/gl/ into a tmpfs and writing a systemd drop-in into another one.  Nothing
-    on the shared rootfs is written -- see below -- so this word is the whole
-    difference between an ES that cannot start and one that can.  It needs
-    j36.lima=1 and j36.mtkdrm=1 to be any use: without them there is no render node
-    and no card node for Mesa to open.
+j36.gl=1  (j36.es=1 is the old spelling of the same word)
+    Stage j36/gl/ -- Debian's armhf Mesa -- into a tmpfs, so that a program looking
+    for libEGL.so.1 finds it there instead of at the RK3326's Mali blob, which is
+    what /usr/lib on the shared rootfs points those names at and which is an
+    ARMv8-A object on this Cortex-A7.  Nothing on the shared rootfs is written; see
+    below.  It needs j36.lima=1 to be any use, and j36.mtkdrm=1 as well before
+    anything can reach the panel through DRM.
 
-    It also mounts j36/es/emulationstation over the rootfs's own, if the card
-    carries one, and that is the second half of the fix.  The rootfs's binary was
-    compiled with the fixed-function renderer, and GLES1 is the one API this stack
-    cannot supply: Debian's armhf Mesa 25.0.7 is a -Dgles1=disabled build, so an ES1
-    context is 0x3003 EGL_BAD_ALLOC on lima, on llvmpipe and on softpipe alike.
+    The dashboard itself does not need this: it is Qt drawing with the CPU into
+    /dev/fb0.  What needs it is the "3D cube" card, which runs eglprobe -c.
+
+    j36.gl=debug adds Mesa's own EGL trace and runs the node probes before the
+    dashboard starts, so the journal names every /dev/dri node and says which one
+    can modeset.  eglprobe -f runs either way.
+
+j36.dash=1
+    Run the MixOS dashboard as the shell, and take EmulationStation out of the boot:
+    the unit is masked in /run/systemd/system.control -- the one runtime directory
+    that outranks the /etc its unit file lives in -- and its ExecStart is reset to an
+    echo as well, in case a systemd ever ignores the mask.  mixdash.service is
+    written into /run/systemd/system and wanted from multi-user.target through a
+    symlink there.  All of it is in tmpfs and none of it survives a reboot.
+
+    The dashboard is not on this partition: /init looks for opt/mixos/bin/mixdash in
+    the rootfs first and then on every other partition of the card, read-only.  With
+    nothing found it says so on the console and still does not start
+    EmulationStation, because that binary aborts with status 134 on this board and
+    its unit restarts it -- six identical stack traces over the message explaining
+    the fault is worse than the message.
+
+    Why ES was dropped rather than fixed: the rootfs's binary was compiled with the
+    fixed-function renderer, and GLES1 is the one API this stack cannot supply.
+    Debian's armhf Mesa 25.0.7 is a -Dgles1=disabled build, so an ES1 context is
+    0x3003 EGL_BAD_ALLOC on lima, on llvmpipe and on softpipe alike.
     Renderer_GLES10.cpp then reads glGetString(GL_EXTENSIONS) without having checked
     SDL_GL_CreateContext, so a context that was never created arrives as
-    std::string(NULL) and aborts with status 134.  The binary in j36/es/ is the same
-    upstream commit with a GLES 2.0 renderer instead, and ES2 is what lima does
-    give: "OpenGL ES 2.0 Mesa 25.0.7-2+deb13u1".
+    std::string(NULL) -- abort, 134.  A GLES 2.0 rebuild did get a context ("OpenGL
+    ES 2.0 Mesa 25.0.7-2+deb13u1") and still drew a black panel, through five
+    silent layers -- ES, SDL, KMSDRM, EGL, GBM.  The dashboard removes all five.
 
 Doom, what it was for, and why it is no longer on the card
 ----------------------------------------------------------
