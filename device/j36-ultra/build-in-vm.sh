@@ -1533,44 +1533,58 @@ DROPINPROBE
 
 # ── The dashboard, in place of EmulationStation ───────────────────────────────
 #
-# A UNIT OF OUR OWN, AND WHY THE OBVIOUS WAY TO REMOVE ES DOES NOT WORK HERE.
-# EmulationStation should not be an autostart service in these builds at all, and
-# the normal way to say that is to mask it -- ln -s /dev/null over the unit name.
-# That cannot work on this card, and the reason is a precedence rule rather than an
-# opinion: build_emulationstation.sh installs the unit as
-# /etc/systemd/system/emulationstation.service, /etc outranks /run for unit FILES,
-# and /etc is on the shared rootfs that nothing here is allowed to write.  A mask
-# dropped in /run/systemd/system would be silently ignored, and a build that thought
-# it had removed ES while ES was still starting is worse than one that never tried.
+# A UNIT OF OUR OWN, AND WHERE A MASK HAS TO GO ON THIS CARD.  EmulationStation
+# should not be an autostart service in these builds at all, and the way to say that
+# is to mask it -- a symlink to /dev/null over the unit name.  The catch is which
+# directory: build_emulationstation.sh installs the unit as
+# /etc/systemd/system/emulationstation.service, and /etc/systemd/system OUTRANKS
+# /run/systemd/system, so the obvious mask would be silently ignored and this build
+# would think it had removed ES while ES was still starting.
 #
-# So the removal is done with the two levers /run does still win:
+# systemd.unit(5)'s precedence list has one runtime directory above /etc, and it is
+# the one `systemctl mask --runtime' writes into:
 #
-#   1  mixdash.service, a unit of ours in /run/systemd/system, wanted by
-#      multi-user.target through a symlink in /run/systemd/system/
-#      multi-user.target.wants/.  Unit files do not merge across the three trees but
-#      dependency directories DO -- .wants is additive -- so a want written in /run
-#      is honoured for a target that lives in /usr/lib.  This is the only thing that
-#      starts the dashboard, so there is exactly one of it however the rest of this
-#      resolves.
-#   2  a drop-in on emulationstation.service that resets ExecStart to an echo.
-#      Drop-ins from /run ARE merged into a unit in /etc, so this is what actually
-#      stops the EmulationStation binary from ever being executed: the unit may
-#      still be pulled in by multi-user.target and it may still reach "active", but
-#      what it runs is one line of text explaining that the dashboard replaced it.
-#      Type=oneshot and Restart=no as well, because the unit's own Restart=on-failure
-#      is what turned a single 134 into six identical stack traces on the panel.
+#     /etc/systemd/system.control/     highest
+#     /run/systemd/system.control/     <-- this is where the mask goes
+#     /run/systemd/transient/
+#     /run/systemd/generator.early/
+#     /etc/systemd/system/             <-- where the ES unit is
+#     /run/systemd/system/             <-- where mixdash.service goes
+#     /usr/lib/systemd/system/         lowest
 #
-# It matters that (2) does not launch mixdash even though it could.  If it did, then
-# on a card where the mask in (1) is not needed the dashboard would be started twice
-# -- once by each unit -- and two processes drawing into /dev/fb0 and both reading
-# the same evdev nodes is a fault that looks like a broken dashboard.  One owner.
+# So the removal is three writes, all of them into the tmpfs mounted a few lines up,
+# and all of them gone on the next boot:
+#
+#   1  /run/systemd/system.control/emulationstation.service -> /dev/null.  The real
+#      mask.  The unit becomes unloadable, so multi-user.target cannot pull it in and
+#      nothing can start it by hand either.
+#   2  mixdash.service in /run/systemd/system, wanted by multi-user.target through a
+#      symlink in /run/systemd/system/multi-user.target.wants/.  Unit FILES do not
+#      merge across the trees but dependency DIRECTORIES do -- .wants is additive --
+#      so a want written in /run is honoured for a target whose unit is in /usr/lib.
+#      This is the only thing that starts the dashboard.
+#   3  a drop-in on emulationstation.service that resets ExecStart to an echo.
+#      Redundant if (1) took, and it is there for the case where it did not: a
+#      systemd without system.control in its search path, or a derived image that
+#      moved the unit somewhere with even higher precedence.  Drop-ins from /run are
+#      merged into a unit in /etc, so this still stops the binary from being
+#      executed even when the mask is ignored.  Type=oneshot and Restart=no as well,
+#      because the unit's own Restart=on-failure is what turned a single 134 into six
+#      identical stack traces scrolling a 640x480 panel.
+#
+# It matters that (3) does not launch mixdash even though it could.  If it did, then
+# on a boot where the mask was ignored the dashboard would start twice -- once from
+# each unit -- and two processes drawing into /dev/fb0 while both read the same evdev
+# nodes is a fault that looks exactly like a broken dashboard.  One owner.
+#
+# The units that name ES in ordering -- ogage.service After=, welcome-message and
+# wifi_importer Before= -- are ordering only, with no Requires anywhere, so a masked
+# ES drops out of their dependency graph without failing them.  That was read out of
+# the unit files, not assumed.
 #
 # Nothing here writes to the card, and the whole arrangement is gone on the next
 # boot: /run/systemd/system is the tmpfs mounted a few lines up.
 #
-# The units that name ES in ordering -- ogage.service After=, welcome-message and
-# wifi_importer Before= -- are all ordering only, no Requires, so none of them fails
-# or hangs whether ES starts, echoes or is skipped.  That was checked, not assumed.
 #
 # WHERE THE PAYLOAD IS, asked rather than assumed.  find_mixos() looks for it in the
 # rootfs first, because extracting sd-root.tar.gz there is what the artifact README
@@ -1653,6 +1667,13 @@ setup_dash() {
     fi
 
     # ── the dashboard's own unit ─────────────────────────────────────────────────
+    #
+    # The directory is made here and not assumed: setup_es_gl used to be the only
+    # thing that created it, and with the dashboard as the shell that function returns
+    # before it gets there -- and on a card with no j36/ directory at all it never
+    # runs.  A `cat >' into a directory that does not exist would take the dashboard
+    # out of the boot for the sake of one mkdir.
+    mkdir -p /newroot/run/systemd/system
     cat > /newroot/run/systemd/system/mixdash.service <<UNITDASH
 # Written by the J36 Ultra initramfs, into a tmpfs.  Not on the card, not in the
 # rootfs: it exists only for as long as this boot does.
@@ -1734,18 +1755,28 @@ UNITDBG
 
 # ── EmulationStation, taken out of the boot ───────────────────────────────────
 #
-# ExecStart= with nothing after it resets the list; the echo is what replaces it.
-# This is the lever that actually stops the binary from running, because the unit
-# file itself is in /etc and out of reach -- see the comment above setup_dash.
-#
-# Called on the failure path too, and that is deliberate: a card with no dashboard on
-# it should show the reason on the console, not six copies of ES's abort.
+# The mask and the drop-in described above setup_dash.  Called on the failure path
+# too, and that is deliberate: a card with no dashboard on it should show the reason
+# on the console, not six copies of ES's abort over the top of it.
 neuter_es() {
+    # /run/systemd/system.control, because that is the one runtime directory that
+    # outranks the /etc the unit lives in.  ln -sf and not a file: a mask IS a
+    # symlink to /dev/null, and systemd tests for exactly that.
+    mkdir -p /newroot/run/systemd/system.control
+    if ln -sf /dev/null \
+              /newroot/run/systemd/system.control/emulationstation.service; then
+        say "es: emulationstation.service is masked in /run/systemd/system.control"
+    else
+        say "es: could not mask emulationstation.service; the drop-in below is what"
+        say "    stops it, and it is why that drop-in exists"
+    fi
+
     mkdir -p /newroot/run/systemd/system/emulationstation.service.d
     cat > /newroot/run/systemd/system/emulationstation.service.d/zz-j36-dash.conf <<'DROPINDASH'
 # Written by the J36 Ultra initramfs, into a tmpfs.  EmulationStation is not part of
-# these builds: mixdash.service is the shell, and this drop-in is what keeps the unit
-# in /etc/systemd/system from starting the binary anyway.
+# these builds: mixdash.service is the shell, the unit is masked in
+# /run/systemd/system.control, and this drop-in is the belt to that braces -- if the
+# mask is ever ignored, what starts here is an echo and not EmulationStation.
 [Service]
 Type=oneshot
 RemainAfterExit=yes
@@ -1755,7 +1786,6 @@ ExecStart=/bin/echo "j36: EmulationStation is not started in this build -- mixda
 # scrolling a 640x480 panel.  Nothing here can fail, but it is stated anyway.
 Restart=no
 DROPINDASH
-    say "es: emulationstation.service is neutered for this boot (ExecStart reset)"
     return 0
 }
 
@@ -3205,9 +3235,11 @@ initrd=initrd.img
 # deliberate step, and it needs a cell fitted, because the amp hangs off VBAT --
 # the system node -- and battery-less it pulls the board under its own lockout.
 #
-# j36.gl=debug adds Mesa's EGL trace and runs eglprobe first, so the journal names
-# every DRI node and says which one can modeset; j36.gl=1 is the quiet form.  j36.es
-# is the old name for it.  Delete j36.dash=1 and EmulationStation starts instead.
+# j36.gl=debug adds Mesa's EGL trace and the node probes before the dashboard, so the
+# journal names every DRI node and says which one can modeset; j36.gl=1 is the quiet
+# form, and eglprobe -f still runs either way because it costs a second and answers
+# "is the panel in the fault at all".  j36.es is the old name for j36.gl.  Delete
+# j36.dash=1 and EmulationStation is neither masked nor replaced.
 bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=debug j36.dash=1 j36.audio=1
 CONF
 
@@ -3234,12 +3266,22 @@ at the ARMv7 payload instead.
   j36/mtkdrm/               the MT6592 display driver set, plus load.order
   j36/audio/                the ALSA core and the MT6592 AFE driver, plus load.order
   j36/gl/                   Mesa's GL front end, plus links (vfat has no symlinks)
-  j36/eglprobe              what can create a GL context, and why not, and with
-                            -p whether a frame reaches the glass; j36.es=debug
-  j36/es/emulationstation   the same EmulationStation with a GLES 2.0 renderer,
-                            bind-mounted over the rootfs's fixed-function one
+  j36/eglprobe              -f reports and paints /dev/fb0 with no DRM at all and
+                            runs on every boot; the other modes say what can create
+                            a GL context, and why not, and whether a frame reaches
+                            the glass.  See "j36/eglprobe -f" below.
   LICENSE.txt               which licence covers which file above, and where the
                             GPL-2.0-only source is; keep it with the payload
+
+The shell is NOT on this partition.  sd-root.tar.gz beside this directory unpacks
+as /opt/mixos onto the second partition -- the dashboard, its Qt and its cards --
+because the Qt closure is 50 MB and BOOT is 64 MiB of vfat that also holds a
+kernel, a device tree and four module payloads.  ext4 or btrfs, not vfat: the
+payload is thirty-odd SONAME symlinks and vfat cannot hold one.  /init finds it on
+any partition of the card, read-only, and needs no keyboard to do it.
+
+EmulationStation is not part of these builds and is not started.  There is no
+j36/es/ directory any more.
 
 The R36S kernel on the same card is arm64 and stays there for the R36S.  The
 armhf Debian rootfs is shared, and this kernel can now mount it: MSDC1, the
@@ -3913,16 +3955,60 @@ panel scanning out nothing while ES renders perfectly into buffers nobody reads 
 and the two things ES's own log cannot see: whether a modeset reaches the glass at
 all, and whether the OVL blends per-pixel alpha.
 
+j36/eglprobe -f, and the colour bars
+------------------------------------
+
+Before any of that, the cheap question: is the panel in the fault at all?  -f is
+the only mode here that opens no DRM node.  It opens /dev/fb0 -- simple-framebuffer
+over the memory the LK lit, which is also exactly what the dashboard draws through
+-- and it answers in three parts.
+
+First a census, taken before it writes anything: how many of 4096 sampled pixels
+carry colour.  All black means nothing has drawn into the framebuffer and the
+display path is not implicated at all; a picture in memory with a black panel in
+front of it means the opposite, that something took the scanout away from
+simple-framebuffer, and -i then names the node it would have been.
+
+Then the two states that are black on purpose and are one write to undo: a backlight
+at brightness 0, and /dev/tty0 left in KD_GRAPHICS by an SDL or a Qt that died
+without restoring it.  Both are reported; both are undone.  Either one is a working
+display showing nothing, and neither is distinguishable by eye from a dead panel.
+
+Then eight colour bars, a one-pixel white border and a corner-to-corner diagonal,
+written with the CPU.  The border and the diagonal are not decoration: a wrong
+line_length shears a vertical bar into a diagonal one and slides the border off the
+edge, which is the one display fault that looks like working hardware.
+
+It runs as mixdash.service's first ExecStartPre on every boot, for one second, and
+that makes it a handover signal:
+
+  bars, then the dashboard    both halves work
+  bars that stay              mixdash never started -- read the journal, not the
+                              display stack
+  no bars at all              nothing userspace draws will ever be seen, and the
+                              dashboard is not the thing to debug
+
+Nothing in -f has to be given back, which is what makes it safe to run at boot.
+That is not true of what follows.
+
 j36/eglprobe -p, and the five colours
 -------------------------------------
 
-So that is measured instead of argued.  Everything in the probe's other modes asks
-whether a context can be built; -p paints, and it takes ES, then SDL, then GL, then
-gbm out of the path one step at a time.  It runs under j36.es=debug as the last
-thing before ES starts, holding each frame three seconds because the instrument for
-this one is an eye.  It speaks DRM with raw ioctls -- the uapi structs are ABI and
-libdrm would be a fourth library that can be missing -- and prints the connector,
-the mode it was given, the CRTC and whatever framebuffer was already on it.
+Everything in the probe's other modes asks whether a context can be built; -p
+paints, and it takes ES, then SDL, then GL, then gbm out of the path one step at a
+time, holding each frame three seconds because the instrument for this one is an
+eye.  It speaks DRM with raw ioctls -- the uapi structs are ABI and libdrm would be
+a fourth library that can be missing -- and prints the connector, the mode it was
+given, the CRTC and whatever framebuffer was already on it.
+
+It is NOT run at boot, and the reason is worth knowing before running it by hand.
+A DRM client that sets a mode and exits leaves the panel black: on close the kernel
+runs drm_fb_release() over that client's framebuffers, and removing the framebuffer
+a CRTC is scanning out disables the CRTC.  This kernel is built
+CONFIG_DRM_FBDEV_EMULATION=n on purpose, so there is no in-kernel fbdev client for
+drm_client_dev_restore() to hand the pipe back to.  -p and -c therefore hold the
+panel until the next reboot, and /dev/fb0 keeps accepting writes that are no longer
+seen.  Run -f first, not after.
 
   1  RED, XR24, filled with memset()          modeset + DSI + panel + OVL, no
                                               alpha and no Mesa anywhere
@@ -3953,12 +4039,14 @@ Read it as four verdicts:
                            ES's own drawing -- fault 1 or 2, and the self test and
                            per-frame draw count above are the evidence.
 
-`/run/j36/eglprobe -p' by hand does the same thing from a console at any time; it
-takes DRM master for the fifteen seconds it runs and gives it back, and the console
-framebuffer comes back with it.
+`/run/j36/eglprobe -p' by hand does the same thing from a console at any time, and
+it keeps the panel afterwards for the reason above -- reboot when it is done.  The
+dashboard's own "3D cube" card runs -c the same way, which is why that card asks
+twice before it starts.
 
-Add systemd.mask=emulationstation.service to bootargs to get the machine back to a
-console.
+EmulationStation is not started in these builds at all: /init masks the unit in
+/run/systemd/system.control and resets its ExecStart as well.  To get it back for
+one boot, drop j36.dash=1 from the bootargs in mvii/boot.conf.
 
 Rebooting
 ---------
@@ -4284,7 +4372,8 @@ fi
         if [[ -f sd-root/opt/mixos/bin/mixdash ]]; then
             echo "shell=mixdash ($(stat -c %s sd-root/opt/mixos/bin/mixdash) bytes, Qt5 Widgets on linuxfb)"
             echo "shell_payload=sd-root.tar.gz ($(stat -c %s sd-root.tar.gz) bytes), unpacked onto the second partition as /opt/mixos"
-            echo "shell_start=j36.dash=1; /init writes a drop-in that resets emulationstation.service's ExecStart"
+            echo "shell_start=j36.dash=1; /init writes /run/systemd/system/mixdash.service and wants it from multi-user.target"
+            echo "shell_es=emulationstation.service is masked in /run/systemd/system.control (the one runtime dir that outranks the /etc its unit is in), plus a drop-in that resets ExecStart to an echo in case the mask is ignored"
             echo "shell_find=/init looks in the rootfs first, then mounts every other partition read-only looking for opt/mixos/bin/mixdash"
             echo "shell_render=Qt5 raster into /dev/fb0, which is simplefb's window onto the framebuffer the LK lit -- no EGL, no GBM, no DRM master, no modeset"
             echo "shell_input=evdev directly, QT_QPA_FB_DISABLE_INPUT=1 (gpio-keys plus the keypad, per the device tree)"
@@ -4301,7 +4390,7 @@ fi
                 echo "fbdoom=not staged (J36_DOOM=1 builds it into the second partition)"
             fi
         else
-            echo "shell=not staged; without /opt/mixos the rootfs's own EmulationStation starts"
+            echo "shell=not staged; /init says so on the console and still does not start EmulationStation (it aborts 134 here and its unit restarts it)"
         fi
         if [[ -f sd-boot/j36/mfgpower ]]; then
             echo "gpu=mali-450 mp4 at 0x13040000 (gp irq 234..pp_bcast 244, GIC_SPI 202..212)"
@@ -4346,7 +4435,7 @@ fi
             echo "gl_load_bearing=libgbm.so.1 -- libEGL_mesa.so.0 needs it, so mesa's own EGL cannot load without this payload"
             echo "gl_install=tmpfs on the rootfs /run plus a systemd drop-in; nothing is written to the card"
             echo "gl_boot_word=$(grep -o 'j36\.gl=[a-z0-9]*' sd-boot/mvii/boot.conf)"
-            echo "gl_users=mixdash's 3D cube card, and EmulationStation if j36.dash=1 is removed"
+            echo "gl_users=mixdash's 3D cube card only; with j36.dash=1 no ES drop-in is written and the GLES 2.0 binary is not staged either"
             if [[ -f sd-boot/j36/es/emulationstation ]]; then
                 echo "es_binary=j36/es/emulationstation ($(stat -c %s sd-boot/j36/es/emulationstation) bytes, stripped ARMv7)"
                 echo "es_commit=$ES_COMMIT (the rootfs's own EmulationStation commit)"
@@ -4360,15 +4449,16 @@ fi
             fi
             if [[ -f sd-boot/j36/eglprobe ]]; then
                 echo "gl_probe=j36/eglprobe ($(stat -c %s sd-boot/j36/eglprobe) bytes, dynamic ARMv7, dlopens libEGL.so.1 and libgbm.so.1)"
-                echo "gl_probe_run=j36.gl=debug only, as ExecStartPre and again as ExecStopPost; the display node and renderD128 separately, then -s with LIBGL_ALWAYS_SOFTWARE=1 as the control"
+                echo "gl_probe_run=-f 1 as mixdash's first ExecStartPre on every boot; under j36.gl=debug also the node probes and -s with LIBGL_ALWAYS_SOFTWARE=1 as the control, replayed by ExecStopPost"
+                echo "gl_probe_fb=-f opens /dev/fb0 and nothing else: it counts the pixels already there (all black = nothing drew, a picture = something took the scanout), undoes a backlight at brightness 0 and a tty0 left in KD_GRAPHICS, then paints eight colour bars with the CPU. Bars then a dashboard = both halves work; bars that stay = mixdash never started; no bars = nothing userspace draws will be seen."
                 echo "gl_probe_nodes=-i names every /dev/dri node and says which one modesets; nothing here hard-codes card0 any more, because on this kernel card0 is lima and GETRESOURCES on it returns EOPNOTSUPP"
-                echo "gl_probe_paint=-p (five CPU and lima frames) and -c (a rotating cube, GLES2 through lima, page-flipped) are NOT run at boot: both modeset, and with no fbdev emulation nothing hands the panel back to the dashboard afterwards. The 3D cube card starts -c on request, after asking twice."
+                echo "gl_probe_paint=-p (five CPU and lima frames) and -c (a rotating cube, GLES2 through lima, page-flipped) are NOT run at boot: both modeset, and on close the kernel releases their framebuffer and disables the CRTC, which with CONFIG_DRM_FBDEV_EMULATION=n nothing re-enables -- so either one holds the panel until the next reboot. The 3D cube card starts -c on request, after asking twice."
             else
                 echo "gl_probe=not staged; j36.gl=debug will report only what Mesa says"
             fi
         else
             echo "gl=not staged"
-            echo "emulationstation=enabled but will fail; without j36/gl it runs against the RK3326 blob"
+            echo "gl_users=none; the dashboard needs no GL, and its 3D cube card will report that libEGL is absent"
         fi
     } > manifest.txt
 )
