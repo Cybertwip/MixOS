@@ -18,9 +18,10 @@ KERNEL_OUT="$WORK/kernel-build"
 BUSYBOX_URL="${J36_BUSYBOX_URL:-https://git.busybox.net/busybox}"
 BUSYBOX_BRANCH="${J36_BUSYBOX_BRANCH:-1_36_stable}"
 BUSYBOX_SRC="$WORK/busybox"
-# fbdoom: the first thing that draws a moving picture on this panel.  Pinned to a
-# commit rather than a branch because the build recipe below derives its source
-# list from the layout of that tree -- see the fbdoom section for why.
+# fbdoom: the first thing that drew a moving picture on this panel, and off by
+# default now that EmulationStation draws on it -- J36_DOOM=1 stages it again.
+# Pinned to a commit rather than a branch because the build recipe below derives
+# its source list from the layout of that tree -- see the fbdoom section for why.
 DOOM_URL="${J36_DOOM_URL:-https://github.com/ozkl/doomgeneric}"
 DOOM_COMMIT="${J36_DOOM_COMMIT:-dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284}"
 DOOM_SRC="$WORK/doomgeneric"
@@ -1562,7 +1563,12 @@ fetch_fbdoom_wad() {
     return 0
 }
 
-if [[ "${J36_DOOM:-1}" == 1 ]]; then
+# Off by default.  fbdoom did its job -- it proved the panel, the pads and the
+# framebuffer before there was a GPU stack to prove them with -- and everything it
+# proved is now proved again, further along, by EmulationStation on mtk_drm + lima.
+# Keeping it would put a game and a 35 MiB IWAD on the BOOT partition, which is for
+# the boot payload, not for userland software.  J36_DOOM=1 brings it back verbatim.
+if [[ "${J36_DOOM:-0}" == 1 ]]; then
     set +e
     build_fbdoom
     doom_rc=$?
@@ -1587,7 +1593,7 @@ fi
 # ── The lima payload: one helper and the module set it gates ──────────────────
 #
 # CONFIG_DRM_LIMA is =m, so the driver is not in the kernel and not in the
-# initramfs either.  It goes on the FAT BOOT partition beside Doom, with the
+# initramfs either.  It goes on the FAT BOOT partition beside the kernel, with the
 # userspace helper that has to run before it, for the reasons the GPU section of
 # the kernel configuration gives: the MFG power domain is gated when Linux starts,
 # and a driver that probes an unpowered MTK subsystem stalls the AXI bus into a
@@ -2196,7 +2202,7 @@ $(sha256sum "$ES_PATCH" | awk '{print $1}')"
 
     mkdir -p "$CACHE"
     # Stripped, because this goes on a 100 MB vfat partition beside the kernel, the
-    # initrd, Doom and the module payloads, and ES's debug info is most of its size.
+    # initrd and the module payloads, and ES's debug info is most of its size.
     arm-linux-gnueabihf-strip -o "$out" "$src/emulationstation" || return 1
     chmod 0755 "$out"
 
@@ -2318,8 +2324,8 @@ fi
 # j36/mtkdrm/ is the display set, in its own directory and with its own load.order
 # rather than merged into j36/modules/, because the two payloads answer to different
 # command-line words and fail independently.  Deleting this one directory takes the
-# whole mtk_drm experiment off the card and leaves lima and Doom exactly as they
-# were; j36.mtkdrm=1 then finds nothing, says so, and the boot carries on.
+# whole mtk_drm experiment off the card and leaves the lima payload exactly as it
+# was; j36.mtkdrm=1 then finds nothing, says so, and the boot carries on.
 if (( ${#MTKDRM_MODULE_ORDER[@]} > 0 )); then
     mkdir -p "$SDBOOT/j36/mtkdrm"
     : > "$SDBOOT/j36/mtkdrm/load.order"
@@ -2400,9 +2406,9 @@ initrd=initrd.img
 # in dependency order: lima gives a render node, mtkdrm gives /dev/dri/card0, es
 # points EmulationStation at Mesa instead of the RK3326 blob.  Delete any of them,
 # or the matching directory under j36/, and the boot carries straight on.
-# j36.doom=1 is the panel and pad test and is no longer on by default; add it back
-# to run j36/doom before the hand-over -- MENU quits it.  ../README.txt explains
-# every word.
+# j36.doom=1 was the panel and pad test.  It is not built and not staged any more,
+# so the word does nothing unless the card was written by a J36_DOOM=1 build.
+# ../README.txt explains every word.
 #
 # j36.es=debug is the same as j36.es=1 plus EmulationStation's --debug, Mesa's EGL
 # trace and one start attempt instead of six, all on the panel.  It is the default
@@ -2429,8 +2435,6 @@ at the ARMv7 payload instead.
   mt6592-j36-ultra.dtb      the tree the LK loads separately and patches
   initrd.img                bring-up initramfs (busybox + the input module)
   mvii/boot.conf            filenames and command line for the MVII LK
-  j36/doom                  framebuffer Doom, static ARMv7, run before hand-over
-  j36/freedoom1.wad         the game data it loads (Freedoom, freely licensed)
   j36/mfgpower              powers the Mali-450 and reads its ID back; the gate
   j36/modules/              lima and its dependencies, plus load.order
   j36/mtkdrm/               the MT6592 display driver set, plus load.order
@@ -2501,17 +2505,20 @@ rdinit=/init root=/dev/mmcblk0p2 rw rootwait
     See above: /init does the mounting, so root= cannot panic the kernel.
 
 j36.doom=1
-    NOT on by default any more; add it to run j36/doom off this partition after
-    the card comes up and before the hand-over.  It was the way to find out
-    whether anything could drive this panel and read this pad, and now that
-    EmulationStation starts there is a better answer to that question.  It still
-    works, and it is still the quickest thing to reach for when the GL path breaks:
-    Doom needs no DRM, no GL and no rootfs, so if Doom draws and ES does not, the
-    panel is fine and the fault is above it.
+    Does nothing on this card: j36/doom and its IWAD are not built and not staged
+    any more.  They proved the panel and the pad before there was a GPU stack to
+    prove them with, and EmulationStation on mtk_drm + lima now proves the same
+    thing further along -- so the BOOT partition carries the boot payload and not
+    a game.  /init still reads the word and still runs j36/doom if it is there, so
+    rebuilding with J36_DOOM=1 (or copying a static doomgeneric and any IWAD
+    d_iwad.c knows into j36/ by hand) brings it back unchanged.  It is still the
+    quickest thing to reach for when the GL path breaks: Doom needs no DRM, no GL
+    and no rootfs, so if Doom draws and ES does not, the panel is fine and the
+    fault is above it.
 
 j36.lima=1
     Power the Mali-450 and load the DRM lima driver, in that order and only in
-    that order -- see below.  Same removal story as j36.doom: delete the word, or
+    that order -- see below.  Same removal story as the rest: delete the word, or
     j36/mfgpower, or j36/modules, and the GPU is never touched.
 
 j36.mtkdrm=1
@@ -2540,11 +2547,17 @@ j36.es=1
     upstream commit with a GLES 2.0 renderer instead, and ES2 is what lima does
     give: "OpenGL ES 2.0 Mesa 25.0.7-2+deb13u1".
 
-Doom, and what it is for
-------------------------
+Doom, what it was for, and why it is no longer on the card
+----------------------------------------------------------
 
-It answers a question the boot itself does not: whether a program can drive this
-panel and read this pad.  Nothing already on the card can ask it -- SDL2 has no
+It answered a question the boot itself does not: whether a program can drive this
+panel and read this pad.  It did, the answer was yes, and EmulationStation now
+answers the same question further up the stack -- so J36_DOOM defaults to 0 and
+neither j36/doom nor an IWAD is written to this partition.  Everything below is
+what a J36_DOOM=1 build stages, kept because /init still runs it and because it
+is the fastest way to split "the panel is broken" from "GL is broken".
+
+Nothing already on the card can ask that question -- SDL2 has no
 fbdev backend, so gzdoom, lzdoom and EmulationStation all need DRM/KMS or GL,
 this kernel has no DRM driver bound yet, and the GL stack in the shared rootfs is
 the RK3326's Mali-G31 blob for a GPU this SoC has not got.  doomgeneric needs
