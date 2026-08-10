@@ -651,7 +651,7 @@ show() {
 
 say ""
 say "J36 Ultra ARMv7 bring-up initramfs"
-say "Display: the LK's framebuffer on /dev/fb0. mtk_drm loads only with j36.mtkdrm=1."
+say "Display: the LK's framebuffer on /dev/fb0 until something opens /dev/dri/card0."
 insmod /lib/modules/*/extra/j36_mt6592_input.ko || say "input module load failed"
 
 # ── Hand over to the rootfs on the card, if there is one ─────────────────────
