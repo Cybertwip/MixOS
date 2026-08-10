@@ -1,0 +1,145 @@
+MixOS -- J36 Ultra (MediaTek MT6592, ARMv7) device support
+Copyright (c) 2025-2026 the MixOS project and contributors
+
+The Microsoft Public License (Ms-PL), reproduced in full below, governs the
+original MixOS work in this directory.
+
+
+WHAT Ms-PL COVERS HERE, AND WHAT IT DOES NOT
+============================================
+
+This directory is not licensed uniformly, and saying otherwise would be a false
+statement about other people's code.  A device port is a small amount of new work
+threaded through a large amount of existing work, and the existing work keeps its
+own terms.
+
+Ms-PL, the licence below:
+
+    build-in-vm.sh              the incremental bring-up builder
+    generate_dts.py             the DTS generator
+    create_boot_image.py        the MT6592 Android boot.img writer
+    fetch_freedoom.py           the optional Freedoom fetcher
+    sync-mvii-board.sh          the by-hand MVII driver refresh
+    es/patch-gles20.py          the EmulationStation CMake patch generator
+    tools/j36-eglprobe.c        the EGL/GBM/DRM scanout probe
+    tools/mfgpower.c            the MFG power-domain bring-up probe
+    README.md, this file        the documentation
+
+GPL-2.0-only, and deliberately NOT relicensed:
+
+    linux/j36_mt6592_input.c    keypad and GPIO key adapter
+    linux/j36_mt6592_audio.c    MT6592 AFE ASoC card
+    linux/j36_jd9365_panel.c    the JD9365 panel that adopts LK's state
+    linux/0001-mtk-sd-mt6592.patch
+    linux/0002-drm-mediatek-mt6592.patch
+
+    These are Linux kernel modules and Linux kernel patches.  They carry
+    `SPDX-License-Identifier: GPL-2.0-only' and `MODULE_LICENSE("GPL v2")', they
+    are derivative of and link against GPL-2.0-only kernel internals, and the two
+    patches are diffs against GPL-2.0-only files.  Ms-PL is not GPL-compatible --
+    its section 3(D) imposes a condition GPLv2 section 6 forbids adding -- so
+    relicensing them is not something this project is free to do, and it does not
+    try.  Send changes to them upstream; they are GPL either way.
+
+EmulationStation's own terms:
+
+    es/Renderer_GLES20.cpp      a renderer for EmulationStation-fcamod, written to
+                                drop into that project's es-core/src/renderers/
+                                directory alongside its two existing renderers.
+                                It is a derivative of that tree and follows its
+                                licence, not this one.
+
+Vendor material, redistributed unmodified for provenance:
+
+    mvii-board/                 five verbatim MediaTek/MVII board headers and
+                                driver sources, listed with a SHA-256 each in
+                                mvii-board/PROVENANCE.txt.  They are inputs the
+                                DTS generator parses, not MixOS work, and they
+                                carry whatever terms their authors set.
+
+Nothing in this file changes the licence of anything a build downloads or stages:
+the Linux kernel, Mesa, SDL, EmulationStation, busybox, the Debian rootfs and the
+Freedoom IWAD are each obtained under their own terms and are not covered here.
+A card built by `build-in-vm.sh' is an aggregate of many licences; Ms-PL applies
+to the MixOS scripts and probes that assembled it.
+
+
+Microsoft Public License (Ms-PL)
+
+This license governs use of the accompanying software. If you use the software,
+you accept this license. If you do not accept the license, do not use the
+software.
+
+1. Definitions
+
+The terms "reproduce," "reproduction," "derivative works," and "distribution"
+have the same meaning here as under U.S. copyright law.
+
+A "contribution" is the original software, or any additions or changes to the
+software.
+
+A "contributor" is any person that distributes its contribution under this
+license.
+
+"Licensed patents" are a contributor's patent claims that read directly on its
+contribution.
+
+2. Grant of Rights
+
+(A) Copyright Grant- Subject to the terms of this license, including the license
+conditions and limitations in section 3, each contributor grants you a
+non-exclusive, worldwide, royalty-free copyright license to reproduce its
+contribution, prepare derivative works of its contribution, and distribute its
+contribution or any derivative works that you create.
+
+(B) Patent Grant- Subject to the terms of this license, including the license
+conditions and limitations in section 3, each contributor grants you a
+non-exclusive, worldwide, royalty-free license under its licensed patents to make,
+have made, use, sell, offer for sale, import, and/or otherwise dispose of its
+contribution in the software or derivative works of the contribution in the
+software.
+
+3. Conditions and Limitations
+
+(A) No Trademark License- This license does not grant you rights to use any
+contributors' name, logo, or trademarks.
+
+(B) If you bring a patent claim against any contributor over patents that you
+claim are infringed by the software, your patent license from such contributor to
+the software ends automatically.
+
+(C) If you distribute any portion of the software, you must retain all copyright,
+patent, trademark, and attribution notices that are present in the software.
+
+(D) If you distribute any portion of the software in source code form, you may do
+so only under this license by including a complete copy of this license with your
+distribution. If you distribute any portion of the software in compiled or binary
+form, you may do so only under a license that complies with this license.
+
+(E) The software is licensed "as-is." You bear the risk of using it. The
+contributors give no express warranties, guarantees, or conditions. You may have
+additional consumer rights under your local laws which this license cannot change.
+To the extent permitted under your local laws, the contributors exclude the
+implied warranties of merchantability, fitness for a particular purpose and
+non-infringement.
+
+
+ATTRIBUTION
+===========
+
+MixOS is a divergent fork of dArkOS, which is itself a Debian-based continuation
+of ArkOS.  Neither project asked for this port, neither endorses it, and neither
+is responsible for it.  Full attribution and thanks are in ../../LICENSES.md and
+../../README.md at the top of this repository; the short form is:
+
+  * Debian -- the operating system underneath all of it.  The rootfs a MixOS card
+    boots is Debian, built with Debian's own tools, and every package outside
+    this directory that is not the kernel came from Debian.  https://www.debian.org
+  * ArkOS, by christianhaitian -- the original handheld distribution and the
+    source of the layout, the tools menu and the EmulationStation integration.
+  * dArkOS -- the Debian rebuild of ArkOS this repository was forked from, and
+    the origin of everything outside device/j36-ultra/ and device/r36-ultra/.
+  * MediaTek -- the MT6592 register-level documentation and the vendor driver
+    sources this port reads, via the MVII tree in mvii-board/.
+  * The Linux kernel, Mesa (lima and kmsro), SDL, EmulationStation, busybox,
+    doomgeneric and Freedoom, without any of which there would be no port.
