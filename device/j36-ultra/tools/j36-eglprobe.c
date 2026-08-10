@@ -72,6 +72,16 @@
  * gets.  So this measures the libraries ES will use, not the ones Debian
  * shipped.
  *
+ * With -f it looks at the panel instead of at a driver, and this is the mode to
+ * reach for first when the report is "the screen is black".  Black is what every
+ * layer produces when it fails -- a disabled CRTC, a backlight at zero, a console
+ * left in KD_GRAPHICS, a framebuffer nothing has drawn into -- and -f is the only
+ * mode here that can tell those four apart, because it counts the pixels in
+ * /dev/fb0 before touching it and then draws colour bars into it with the CPU.
+ * No DRM node is opened, so unlike -p it cannot take the panel away from anything;
+ * it is safe on every boot, and run just before the shell the bars are a handover
+ * signal.  See fb_report().
+ *
  * With -p it stops asking and paints.  Everything above measures whether a
  * context can be built, and none of it can answer the question this board is
  * actually stuck on: ES2 comes up on lima, ES runs, and the panel is black.  A
@@ -86,11 +96,26 @@
  * shaders, hands over 36 vertices and page-flips the result, which is the
  * smallest thing that cannot be faked -- see cube() for what that adds.
  *
- * Usage: eglprobe [-i | -s | -p | -c [seconds] | /dev/dri/node ...].  With no
- * arguments it probes the display node and renderD128.  Exit status: 0 if some API
+ * WHAT -p AND -c COST, because it is not obvious and it is not undoable.  A DRM
+ * client that sets a mode and then exits leaves the panel black: on close the
+ * kernel runs drm_fb_release() over the client's framebuffers, and removing the
+ * framebuffer a CRTC is scanning out disables that CRTC.  Nothing turns it back on,
+ * because this kernel is built CONFIG_DRM_FBDEV_EMULATION=n on purpose -- there is
+ * no in-kernel fbdev client for drm_client_dev_restore() to hand the pipe back to.
+ * So -p and -c hold the panel until the next reboot, and /dev/fb0 -- which is
+ * simple-framebuffer over the LK's memory, a different path to the same glass --
+ * stops being visible even though writes to it still succeed.  That is why neither
+ * one runs at boot any more, why the dashboard's cube card asks twice, and why -f
+ * exists: everything -p was being used to prove about the panel, -f proves without
+ * spending the panel to do it.
+ *
+ * Usage: eglprobe [-f [seconds] | -i | -s | -p | -c [seconds] | /dev/dri/node ...].
+ * With no arguments it reports /dev/fb0 read-only and then probes the display node
+ * and renderD128.  -f runs alone and needs no library.  Exit status: 0 if some API
  * created a context on some display (for -p, if the mode was set; for -c, if a frame
- * was drawn; for -i, if a modesetting node exists at all), 1 otherwise.  Nothing is
- * written anywhere; stdout is the whole output.
+ * was drawn; for -i, if a modesetting node exists at all; for -f, if there was a
+ * framebuffer to look at), 1 otherwise.  Apart from -f's bars, an unblank and a
+ * backlight that measured zero, nothing is written anywhere; stdout is the output.
  */
 
 #define _GNU_SOURCE
@@ -101,6 +126,7 @@
  * ask for the 64-bit one.
  */
 #define _FILE_OFFSET_BITS 64
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -653,6 +679,415 @@ static int probe_surfaceless(void)
 
     p_eglTerminate(dpy);
     return wins;
+}
+
+/* ── -f: the panel, with no DRM anywhere in the path ───────────────────────────
+ *
+ * Everything above asks a driver a question.  Not one of them can answer the
+ * question this board is actually stuck on -- "the screen is black" -- and the
+ * reason is that black is what EVERY layer produces when it fails.  It is what a
+ * disabled CRTC looks like, and a backlight at zero, and a console left in
+ * KD_GRAPHICS, and a framebuffer nobody has drawn into yet.  Four causes, one
+ * symptom, and up to now this probe could not tell them apart because it never
+ * looked at the framebuffer that is on the glass.
+ *
+ * So this mode opens /dev/fb0 and nothing else.  No DRM node, no master, no
+ * modeset, no gbm, no EGL.  On this board /dev/fb0 is simple-framebuffer over the
+ * memory the LK left at 0x82700000 -- the fix.smem_start line below is where that
+ * is confirmed rather than believed -- and it is also the exact path mixdash draws
+ * through, so what happens here is what will happen to the dashboard.
+ *
+ * It answers in three parts, in the order that splits the four causes:
+ *
+ *   1  the census.  Sample the framebuffer BEFORE touching it and count the
+ *      pixels that carry any colour.  All black means nothing has drawn and the
+ *      display path is not implicated at all.  A picture in memory with a black
+ *      panel in front of it means the opposite: something has taken the scanout
+ *      away from simple-framebuffer, and -i says who.
+ *   2  the two states that are black on purpose.  A backlight at brightness 0 and
+ *      a console in KD_GRAPHICS are both "working perfectly, showing nothing", and
+ *      both are one write to undo.  They are undone here, because a probe that can
+ *      see the cause of a black panel and leaves it black has not finished.
+ *   3  the bars.  Eight colour bars, a one-pixel border and a corner-to-corner
+ *      diagonal, written with the CPU straight into the mapping.  Nothing here can
+ *      be given back the way a modeset cannot -- the next thing to draw simply
+ *      draws over it -- so unlike -p this is safe to run on every boot, and when
+ *      it runs just before the dashboard the bars are the handover: bars then a
+ *      dashboard means both work, bars that stay means mixdash never started, and
+ *      no bars at all means nothing userspace draws will ever be seen and the
+ *      dashboard is not the thing to debug.
+ *
+ * The border and the diagonal are not decoration.  A wrong line_length shears a
+ * vertical bar into a diagonal one and slides the border off the edge, which is
+ * the one display fault that looks like working hardware.
+ */
+
+/* fbdev and console ABI by hand, for the reason EGL and GBM are: these numbers
+ * are uapi, and linux/fb.h in the cross sysroot is a package that can be absent
+ * from a build that otherwise needs no headers at all. */
+#define FBIOGET_VSCREENINFO 0x4600u
+#define FBIOGET_FSCREENINFO 0x4602u
+#define FBIOBLANK           0x4611u
+#define FB_BLANK_UNBLANK    0
+
+#define KDGETMODE           0x4B3Bu
+#define KDSETMODE           0x4B3Au
+#define KD_TEXT             0x00
+#define KD_GRAPHICS         0x01
+
+struct fb_bitfield {
+    uint32_t offset, length, msb_right;
+};
+
+/* 160 bytes on this ABI, and the whole of it is copied by the ioctl, so it is
+ * declared in full even though six fields are read. */
+struct fb_var_screeninfo {
+    uint32_t xres, yres, xres_virtual, yres_virtual, xoffset, yoffset;
+    uint32_t bits_per_pixel, grayscale;
+    struct fb_bitfield red, green, blue, transp;
+    uint32_t nonstd, activate, height, width, accel_flags;
+    uint32_t pixclock, left_margin, right_margin, upper_margin, lower_margin;
+    uint32_t hsync_len, vsync_len, sync, vmode, rotate, colorspace;
+    uint32_t reserved[4];
+};
+
+struct fb_fix_screeninfo {
+    char          id[16];
+    unsigned long smem_start;
+    uint32_t      smem_len, type, type_aux, visual;
+    uint16_t      xpanstep, ypanstep, ywrapstep;
+    uint32_t      line_length;
+    unsigned long mmio_start;
+    uint32_t      mmio_len, accel;
+    uint16_t      capabilities, reserved[2];
+};
+
+static int read_long_file(const char *path, long *out)
+{
+    char buf[32];
+    int fd, n;
+
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    n = (int)read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = 0;
+    *out = strtol(buf, NULL, 10);
+    return 0;
+}
+
+static int write_long_file(const char *path, long v)
+{
+    char buf[32];
+    int fd, n;
+
+    fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    n = snprintf(buf, sizeof(buf), "%ld\n", v);
+    n = (int)write(fd, buf, (size_t)n);
+    close(fd);
+    return n > 0 ? 0 : -1;
+}
+
+/*
+ * A backlight at zero is a working display showing nothing, and on this board it
+ * is one PWM register.  Reported always; written only when it is measurably the
+ * cause, which is what "brightness 0" is.
+ */
+static void backlight_report(int repair)
+{
+    DIR *d;
+    struct dirent *e;
+    int seen = 0;
+
+    d = opendir("/sys/class/backlight");
+    if (!d) {
+        printf("fb: no /sys/class/backlight, so the panel's brightness is whatever "
+               "the LK left in DISP_PWM\n");
+        return;
+    }
+    while ((e = readdir(d)) != NULL) {
+        char path[256];
+        long b = -1, mx = -1, pw = -1;
+
+        if (e->d_name[0] == '.')
+            continue;
+        seen++;
+        snprintf(path, sizeof(path), "/sys/class/backlight/%s/max_brightness", e->d_name);
+        read_long_file(path, &mx);
+        snprintf(path, sizeof(path), "/sys/class/backlight/%s/bl_power", e->d_name);
+        read_long_file(path, &pw);
+        snprintf(path, sizeof(path), "/sys/class/backlight/%s/brightness", e->d_name);
+        read_long_file(path, &b);
+
+        printf("fb: backlight %s brightness %ld of %ld, bl_power %ld\n",
+               e->d_name, b, mx, pw);
+        if (b == 0 && mx > 0) {
+            printf("fb: that is a lit panel with the lamp off -- brightness 0 is "
+                   "black whatever the framebuffer holds\n");
+            if (repair) {
+                if (write_long_file(path, mx) == 0)
+                    printf("fb: set %s to %ld\n", e->d_name, mx);
+                else
+                    printf("fb: could not write %s: %m\n", path);
+            }
+        }
+        if (pw > 0) {
+            snprintf(path, sizeof(path), "/sys/class/backlight/%s/bl_power", e->d_name);
+            printf("fb: bl_power %ld is FB_BLANK_* and not unblanked\n", pw);
+            if (repair && write_long_file(path, 0) == 0)
+                printf("fb: set %s bl_power to 0\n", e->d_name);
+        }
+    }
+    closedir(d);
+    if (!seen)
+        printf("fb: /sys/class/backlight is empty -- no driver claims the lamp\n");
+}
+
+/*
+ * KD_GRAPHICS is the other honest black.  Qt's linuxfb plugin sets it so the
+ * kernel console stops drawing over the dashboard, and SDL sets it too; either one
+ * that dies without restoring it leaves a panel with no text and no picture, which
+ * is indistinguishable by eye from a dead display.  This is also the reason a boot
+ * that "renders black with no output at all" can still be a working framebuffer.
+ */
+static void tty_report(int repair)
+{
+    int fd, mode = -1;
+
+    fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        printf("fb: /dev/tty0: %m -- cannot say whether the console is in graphics "
+               "mode\n");
+        return;
+    }
+    if (ioctl(fd, KDGETMODE, &mode) < 0) {
+        printf("fb: KDGETMODE: %m\n");
+        close(fd);
+        return;
+    }
+    if (mode == KD_GRAPHICS) {
+        printf("fb: /dev/tty0 is in KD_GRAPHICS, so the kernel console is not "
+               "drawing anything at all.  Something put it there and did not put it "
+               "back -- SDL, Qt's linuxfb or a plymouth -- and a black panel with no "
+               "text is exactly what that looks like.\n");
+        if (repair) {
+            if (ioctl(fd, KDSETMODE, KD_TEXT) == 0)
+                printf("fb: put /dev/tty0 back into KD_TEXT; the console will "
+                       "repaint over anything drawn before this line\n");
+            else
+                printf("fb: KDSETMODE(KD_TEXT): %m\n");
+        }
+    } else {
+        printf("fb: /dev/tty0 is in KD_TEXT, the console is drawing\n");
+    }
+    close(fd);
+}
+
+static uint32_t fb_colour(const struct fb_var_screeninfo *var,
+                          unsigned r, unsigned g, unsigned b)
+{
+    /* Built from the driver's own bitfields rather than assumed to be XRGB8888:
+     * simplefb takes its format from the DT and a 16bpp panel would otherwise
+     * come out as noise that looks like a broken GPU. */
+    uint32_t px = 0;
+    px |= (uint32_t)(r >> (8 - var->red.length))   << var->red.offset;
+    px |= (uint32_t)(g >> (8 - var->green.length)) << var->green.offset;
+    px |= (uint32_t)(b >> (8 - var->blue.length))  << var->blue.offset;
+    if (var->transp.length)
+        px |= (uint32_t)((1u << var->transp.length) - 1u) << var->transp.offset;
+    return px;
+}
+
+static void fb_put(unsigned char *base, uint32_t stride, uint32_t bpp,
+                   uint32_t x, uint32_t y, uint32_t px)
+{
+    unsigned char *p = base + (size_t)y * stride + (size_t)x * (bpp / 8u);
+
+    if (bpp == 32)
+        *(volatile uint32_t *)p = px;
+    else if (bpp == 16)
+        *(volatile uint16_t *)p = (uint16_t)px;
+    else if (bpp == 8)
+        *(volatile uint8_t *)p = (uint8_t)px;
+}
+
+static uint32_t fb_get(const unsigned char *base, uint32_t stride, uint32_t bpp,
+                       uint32_t x, uint32_t y)
+{
+    const unsigned char *p = base + (size_t)y * stride + (size_t)x * (bpp / 8u);
+
+    if (bpp == 32)
+        return *(const volatile uint32_t *)p;
+    if (bpp == 16)
+        return *(const volatile uint16_t *)p;
+    if (bpp == 8)
+        return *(const volatile uint8_t *)p;
+    return 0;
+}
+
+/*
+ * repair: undo the two states that are black on purpose.  paint_it: leave the
+ * bars.  Returns 0 if there was a framebuffer to look at, 1 if there was not.
+ */
+static int fb_report(int repair, int paint_it, int secs)
+{
+    struct fb_var_screeninfo var;
+    struct fb_fix_screeninfo fix;
+    unsigned char *base;
+    uint32_t mask, stride, bpp, w, h;
+    size_t len;
+    int fd, x, y, lit = 0, sampled = 0;
+
+    fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        printf("fb: /dev/fb0: %m\n");
+        printf("fb: with no framebuffer device there is nothing for the kernel "
+               "console or for Qt's linuxfb to draw into, and the panel can only be "
+               "black.  simple-framebuffer comes from the framebuffer@82700000 node "
+               "in the DT and needs CONFIG_FB_SIMPLE; in dmesg: \"simple-framebuffer\".\n");
+        return 1;
+    }
+
+    memset(&var, 0, sizeof(var));
+    memset(&fix, 0, sizeof(fix));
+    if (ioctl(fd, FBIOGET_VSCREENINFO, &var) < 0 ||
+        ioctl(fd, FBIOGET_FSCREENINFO, &fix) < 0) {
+        printf("fb: FBIOGET_?SCREENINFO: %m\n");
+        close(fd);
+        return 1;
+    }
+
+    fix.id[sizeof(fix.id) - 1] = 0;
+    bpp = var.bits_per_pixel;
+    stride = fix.line_length;
+    w = var.xres;
+    h = var.yres;
+    printf("fb: /dev/fb0 \"%s\" %ux%u %ubpp, stride %u, %u bytes at 0x%08lx, "
+           "visual %u\n", fix.id, w, h, bpp, stride, fix.smem_len,
+           fix.smem_start, fix.visual);
+    printf("fb: r%u+%u g%u+%u b%u+%u a%u+%u\n",
+           var.red.offset, var.red.length, var.green.offset, var.green.length,
+           var.blue.offset, var.blue.length, var.transp.offset, var.transp.length);
+
+    {
+        long blank = -1;
+        if (read_long_file("/sys/class/graphics/fb0/blank", &blank) == 0 && blank != 0) {
+            printf("fb: /sys/class/graphics/fb0/blank is %ld, so the framebuffer is "
+                   "blanked -- another black that is not a fault\n", blank);
+            if (repair) {
+                if (ioctl(fd, FBIOBLANK, FB_BLANK_UNBLANK) == 0)
+                    printf("fb: unblanked it\n");
+                else
+                    printf("fb: FBIOBLANK: %m\n");
+            }
+        }
+    }
+
+    if (bpp != 32 && bpp != 16 && bpp != 8) {
+        printf("fb: %ubpp is not a depth this probe writes, so the census and the "
+               "bars are skipped\n", bpp);
+        close(fd);
+        return 0;
+    }
+    if (!w || !h || stride < w * (bpp / 8u)) {
+        printf("fb: %ux%u at stride %u cannot be right, so nothing is written into "
+               "it\n", w, h, stride);
+        close(fd);
+        return 0;
+    }
+
+    len = (size_t)stride * h;
+    if (fix.smem_len && len > fix.smem_len)
+        len = fix.smem_len;
+    base = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+        printf("fb: mmap %u bytes: %m -- the geometry is readable but the memory is "
+               "not, so nothing in userspace can draw here\n", (unsigned)len);
+        close(fd);
+        return 1;
+    }
+
+    /* The census, before a single pixel of ours goes in. */
+    mask = ((var.red.length   ? ((1u << var.red.length)   - 1u) << var.red.offset   : 0u) |
+            (var.green.length ? ((1u << var.green.length) - 1u) << var.green.offset : 0u) |
+            (var.blue.length  ? ((1u << var.blue.length)  - 1u) << var.blue.offset  : 0u));
+    for (y = 0; y < 64; y++) {
+        for (x = 0; x < 64; x++) {
+            uint32_t px = fb_get(base, stride, bpp,
+                                 (uint32_t)x * w / 64u, (uint32_t)y * h / 64u);
+            sampled++;
+            if (px & mask)
+                lit++;
+        }
+    }
+    printf("fb: %d of %d sampled pixels carry colour\n", lit, sampled);
+    if (lit == 0)
+        printf("fb: the framebuffer itself is black.  Nothing has drawn into it, so "
+               "a black panel here is not a scanout fault and not a GPU one: it is "
+               "the absence of a shell.  Whatever was supposed to draw did not.\n");
+    else
+        printf("fb: there is a picture in the framebuffer.  If the panel is still "
+               "black in front of it then something took the scanout away from "
+               "simple-framebuffer -- a DRM client that modeset and exited leaves the "
+               "CRTC disabled, and -i names the node it would have been.\n");
+
+    /* Both of these can repaint the screen, so they run before the bars. */
+    backlight_report(repair);
+    tty_report(repair);
+
+    if (paint_it) {
+        static const unsigned char bars[8][3] = {
+            { 255, 255, 255 }, { 255, 255,   0 }, {   0, 255, 255 },
+            {   0, 255,   0 }, { 255,   0, 255 }, { 255,   0,   0 },
+            {   0,   0, 255 }, {   0,   0,   0 },
+        };
+        uint32_t px[8], white, i, ux, uy;
+
+        for (i = 0; i < 8; i++)
+            px[i] = fb_colour(&var, bars[i][0], bars[i][1], bars[i][2]);
+        white = px[0];
+
+        for (uy = 0; uy < h; uy++)
+            for (ux = 0; ux < w; ux++)
+                fb_put(base, stride, bpp, ux, uy, px[ux * 8u / w]);
+        /* One-pixel border: it says where the visible extent really is. */
+        for (ux = 0; ux < w; ux++) {
+            fb_put(base, stride, bpp, ux, 0, white);
+            fb_put(base, stride, bpp, ux, h - 1, white);
+        }
+        for (uy = 0; uy < h; uy++) {
+            fb_put(base, stride, bpp, 0, uy, white);
+            fb_put(base, stride, bpp, w - 1, uy, white);
+        }
+        /* And the diagonal, which is what shears if line_length is wrong. */
+        for (uy = 0; uy < h; uy++) {
+            ux = uy * w / h;
+            if (ux < w)
+                fb_put(base, stride, bpp, ux, uy, white);
+        }
+        msync(base, len, MS_SYNC);
+
+        printf("fb: eight bars, white border, one diagonal, straight into "
+               "/dev/fb0 with no DRM in the path.  Left to right: white, yellow, "
+               "cyan, green, magenta, red, blue, black.\n");
+        printf("fb: if the panel shows that, then the LK's display pipe, the panel "
+               "and simple-framebuffer all work and anything black after this line "
+               "is the thing that draws, not the thing that scans out.\n");
+        if (fb_get(base, stride, bpp, w / 2u, h / 2u) != px[4])
+            printf("fb: read-back at the centre does not match what was written, so "
+                   "the mapping is not the scanned-out memory\n");
+        if (secs > 0)
+            sleep((unsigned)secs);
+    }
+
+    munmap(base, len);
+    close(fd);
+    return 0;
 }
 
 /* ── -p: the scanout test ──────────────────────────────────────────────────────
@@ -1420,8 +1855,16 @@ static int paint(const char *path)
     printf("paint: %d of the 5 phases reached the CRTC without an error.  In "
            "order, the panel should have shown: red, magenta, magenta (or black, "
            "if alpha is blended), magenta, green.\n", ok);
-    printf("paint: master is dropped now, so the console framebuffer comes back "
-           "and ES gets the panel next.\n");
+    /* Not "the console comes back": it does not, and saying so here was wrong.
+     * Dropping master gives up the right to modeset, not the mode.  The CRTC keeps
+     * scanning our last framebuffer, and when this process exits and the kernel
+     * releases that framebuffer the CRTC is disabled instead -- with
+     * CONFIG_DRM_FBDEV_EMULATION=n there is no in-kernel client to restore
+     * anything.  Either way /dev/fb0 is no longer what is on the glass. */
+    printf("paint: the panel belongs to this modeset until the next reboot.  "
+           "Master is dropped, but nothing hands the pipe back to "
+           "simple-framebuffer, so writes to /dev/fb0 still succeed and are no "
+           "longer seen.  Run eglprobe -f before this, not after.\n");
 
 out:
     drm_ioctl(DRM_IOCTL_DROP_MASTER, NULL);
@@ -2187,8 +2630,30 @@ int main(int argc, char **argv)
 {
     int wins = 0, painted = -1, cubed = -1, listed = -1, i;
     const char *node;
+    int fb_secs = 3;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
+
+    /*
+     * -f is handled here, before load(), and it runs alone.  It is the one mode
+     * that needs no library at all -- no EGL, no gbm, no DRM -- and the boot where
+     * the panel is black is exactly the boot where the GL payload may be the thing
+     * that is missing.  A probe that cannot say "the framebuffer works, nothing
+     * drew into it" because libEGL.so.1 was absent would be useless precisely when
+     * it is needed.
+     */
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-f"))
+            continue;
+        if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+            fb_secs = atoi(argv[i + 1]);
+        return fb_report(1, 1, fb_secs) ? 1 : 0;
+    }
+
+    /* And read-only on the default run, first of all, because it is two ioctls and
+     * it says whether the panel is even in the question. */
+    if (argc == 1)
+        fb_report(0, 0, 0);
 
     if (load())
         return 1;

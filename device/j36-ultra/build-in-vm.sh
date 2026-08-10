@@ -4213,11 +4213,12 @@ fi
                 echo "es_gl_driver=SDL_VIDEO_GL_DRIVER=libGL.so.1 with LD_PRELOAD=libGL.so.1 (the fallback)"
             fi
             if [[ -f sd-boot/j36/eglprobe ]]; then
-                echo "es_probe=j36/eglprobe ($(stat -c %s sd-boot/j36/eglprobe) bytes, dynamic ARMv7, dlopens libEGL.so.1 and libgbm.so.1)"
-                echo "es_probe_run=j36.es=debug only, as ExecStartPre and again as ExecStopPost; card0 and renderD128 separately, then -s with LIBGL_ALWAYS_SOFTWARE=1 as the control"
-                echo "es_probe_paint=-p as a third ExecStartPre, run as root for DRM master: five 3s frames -- XR24 red, AR24 opaque magenta, AR24 transparent magenta, all three CPU-filled, then two lima frames through gbm"
+                echo "gl_probe=j36/eglprobe ($(stat -c %s sd-boot/j36/eglprobe) bytes, dynamic ARMv7, dlopens libEGL.so.1 and libgbm.so.1)"
+                echo "gl_probe_run=j36.gl=debug only, as ExecStartPre and again as ExecStopPost; the display node and renderD128 separately, then -s with LIBGL_ALWAYS_SOFTWARE=1 as the control"
+                echo "gl_probe_nodes=-i names every /dev/dri node and says which one modesets; nothing here hard-codes card0 any more, because on this kernel card0 is lima and GETRESOURCES on it returns EOPNOTSUPP"
+                echo "gl_probe_paint=-p (five CPU and lima frames) and -c (a rotating cube, GLES2 through lima, page-flipped) are NOT run at boot: both modeset, and with no fbdev emulation nothing hands the panel back to the dashboard afterwards. The 3D cube card starts -c on request, after asking twice."
             else
-                echo "es_probe=not staged; j36.es=debug will report only what Mesa says"
+                echo "gl_probe=not staged; j36.gl=debug will report only what Mesa says"
             fi
         else
             echo "gl=not staged"
