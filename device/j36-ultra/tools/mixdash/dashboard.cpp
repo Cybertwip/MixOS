@@ -28,9 +28,17 @@
 FilesPage::FilesPage(QWidget *parent)
     : QWidget(parent)
 {
-    m_base = QFileInfo::exists("/home/ark") ? QString("/home/ark")
-           : QFileInfo::exists("/root")     ? QString("/root")
-                                            : QString("/");
+    /*
+     * /run/j36/card first: that is the card's data partition, mounted read-only by
+     * the initramfs because there is no keyboard on this board and no other way to
+     * reach it.  It is also the only directory here whose contents the operator put
+     * there, which makes it the useful place to open on.  The home directories are
+     * the fallback for a boot without that mount, and / for a rootfs with neither.
+     */
+    m_base = QFileInfo::exists("/run/j36/card") ? QString("/run/j36/card")
+           : QFileInfo::exists("/home/ark")     ? QString("/home/ark")
+           : QFileInfo::exists("/root")         ? QString("/root")
+                                                : QString("/");
 
     m_model = new QFileSystemModel(this);
     m_model->setFilter(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden);

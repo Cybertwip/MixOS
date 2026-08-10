@@ -955,6 +955,10 @@ done
 # carrying only the lima payload and a card carrying only Doom are found by the
 # same code.  It runs at most once even when both are asked for.
 bootfs_mounted=0
+# Remembered so that the data-partition automount below can leave the BOOT partition
+# alone: it is already reachable, it is the one partition the operator edits from a
+# PC, and it is not what "show me the card" means.
+bootdev=""
 mount_bootfs() {
     if [ "$bootfs_mounted" = 1 ]; then return 0; fi
     mkdir -p /bootfs
@@ -963,6 +967,7 @@ mount_bootfs() {
         if ! mount -t vfat -o ro "$dev" /bootfs 2>/dev/null; then continue; fi
         if [ -d /bootfs/j36 ]; then
             bootfs_mounted=1
+            bootdev="$dev"
             say "boot partition: $dev"
             return 0
         fi
@@ -1673,6 +1678,40 @@ find_mixos() {
     return 1
 }
 
+# ── the card, mounted because nobody can mount it by hand ─────────────────────
+#
+# There is no keyboard on this board and the dashboard is the only shell, so a data
+# partition that systemd does not mount is a partition that cannot be reached at all.
+# The rootfs's own fstab mounts what it knows about; this covers the rest, and it is
+# what makes the Files page show something other than an empty home directory.
+#
+# Read-only, and that is a decision rather than caution: the operator writes this
+# partition from a PC, the dashboard only reads it, and a data partition mounted rw by
+# an initramfs is a partition that gets replayed dirty the next time the battery gives
+# out mid-write.  ext4 and btrfs only -- the vfat one is BOOT, which is skipped.
+mount_card() {
+    # /newroot and not /run: this runs before switch_root, so that is the path the
+    # kernel has recorded for the mount.
+    if grep -q " /newroot/run/j36/card " /proc/mounts 2>/dev/null; then return 0; fi
+    mkdir -p /newroot/run/j36/card
+    for dev in /dev/mmcblk*p* /dev/sd*; do
+        if [ ! -b "$dev" ]; then continue; fi
+        if [ "$dev" = "$rootdev" ] || [ "$dev" = "$bootdev" ]; then continue; fi
+        for fs in ext4 btrfs; do
+            if ! mount -t "$fs" -o ro "$dev" /newroot/run/j36/card 2>/dev/null; then
+                continue
+            fi
+            say "dash: $dev ($fs) mounted read-only at /run/j36/card"
+            return 0
+        done
+    done
+    # Removed rather than left empty: mixdash opens its Files page on /run/j36/card
+    # when that directory exists, and an empty directory would read as an empty card.
+    rmdir /newroot/run/j36/card 2>/dev/null
+    say "dash: no data partition to mount at /run/j36/card"
+    return 1
+}
+
 setup_dash() {
     if [ -z "$rootdev" ]; then
         say "dash: no rootfs was found, so there is no systemd to configure"
@@ -1694,6 +1733,10 @@ setup_dash() {
         dash_notice
         return 1
     fi
+
+    # The card, before the unit, so that the dashboard's Files page has it from its
+    # first paint rather than after a rescan the operator has no way to trigger.
+    mount_card
 
     # ── the dashboard's own unit ─────────────────────────────────────────────────
     #
@@ -1846,7 +1889,10 @@ After=systemd-user-sessions.service
 Type=simple
 StandardOutput=journal+console
 StandardError=journal+console
-ExecStart=/bin/sh -c 'n=0; while [ \$n -lt 6 ]; do \\
+# The loop counts with `for' and not with a variable on purpose: systemd expands \$FOO
+# in a command line even inside quotes, and whether \$\$ escapes it depends on the
+# version.  Six words and no dollar sign is the same loop with nothing to get wrong.
+ExecStart=/bin/sh -c 'for i in 1 2 3 4 5 6; do \\
   echo ""; \\
   echo "j36: MixOS dashboard did not start -- its payload is not on this card."; \\
   echo "j36: the initramfs looked in the rootfs /opt/mixos and on every other"; \\
@@ -1858,7 +1904,7 @@ ExecStart=/bin/sh -c 'n=0; while [ \$n -lt 6 ]; do \\
   echo "j36: symlinks and mixdash then dies before main()."; \\
   echo "j36: EmulationStation is masked in this build on purpose and is not a"; \\
   echo "j36: fallback: it aborts in Renderer_GLES10.cpp on this board."; \\
-  n=\$((n+1)); sleep 20; \\
+  sleep 20; \\
 done'
 UNITNOTICE
     mkdir -p /newroot/run/systemd/system/multi-user.target.wants
@@ -1891,7 +1937,18 @@ fi
 # BOOT partition has nothing to do with it, so a card whose j36/ directory was
 # deleted still comes up in the dashboard rather than in EmulationStation.  Last of
 # all, so that the drop-in it writes has the final word on ExecStart.
-if [ "$want_dash" = 1 ]; then setup_dash; fi
+#
+# The else branch is not noise.  A card still carrying a boot.conf written before
+# j36.dash existed boots to a rootfs whose EmulationStation may not even be enabled,
+# and then nothing at all starts and nothing says why -- which is precisely the
+# failure this line names in one word instead of an evening.
+if [ "$want_dash" = 1 ]; then
+    setup_dash
+else
+    say "dash: j36.dash is not in the kernel command line, so no shell is staged"
+    say "      and whatever the rootfs starts by itself is what you get.  Add"
+    say "      j36.dash=1 to bootargs in mvii/boot.conf on the BOOT partition."
+fi
 
 if [ -n "$rootdev" ]; then
     say "switching root into $rootdev"
