@@ -985,12 +985,14 @@ run_mtkdrm() {
 #                     needs -- SDL2, freetype, VLC, and Mesa's own back end,
 #                     libgallium and dri/lima_dri.so and dri/mediatek_dri.so --
 #                     still comes from the rootfs, untouched.
-#   LD_PRELOAD        EmulationStation's 29 undefined GL symbols are GLES1
-#                     fixed-function calls, and it names only libEGL.so as a
-#                     dependency because the blob it was linked against exported
-#                     both from one object. glvnd's libEGL does not export a single
-#                     gl* entry point, so the GLES1 library has to be forced into
-#                     the global scope or the binary will not start.
+#   LD_PRELOAD        Only for the rootfs's own binary, and only as a fallback:
+#                     its 29 undefined GL symbols are GLES1 fixed-function calls
+#                     and it names only libEGL.so as a dependency, because the blob
+#                     it was linked against exported both from one object. glvnd's
+#                     libEGL does not export a single gl* entry point, so the GLES1
+#                     library has to be forced into the global scope or the binary
+#                     will not start. The GLES 2.0 binary staged below needs none
+#                     of this -- it has no GL library in its DT_NEEDED.
 #   SDL_VIDEODRIVER   kmsdrm. SDL2 here has KMSDRM, wayland, offscreen and dummy
 #                     and no fbdev at all, so this is the only backend that can
 #                     drive this panel, and naming it stops SDL trying wayland
@@ -1030,6 +1032,55 @@ setup_es_gl() {
         ln -sf "$target" "/newroot/run/j36/gl/$name"
     done < /bootfs/j36/gl/links
 
+    # ── The GLES 2.0 EmulationStation ────────────────────────────────────────────
+    #
+    # j36/es/emulationstation is built from the same upstream commit as the one in
+    # the rootfs, with one difference: -DUSE_OPENGLES_20 and Renderer_GLES20.cpp
+    # instead of -DUSE_OPENGLES_10 and Renderer_GLES10.cpp.
+    #
+    # Why a different renderer at all, measured rather than assumed: GLES1 is the
+    # one API this stack cannot give. eglCreateContext for an ES1 context returns
+    # EGL_BAD_ALLOC on lima, on llvmpipe and on softpipe alike, because Debian's
+    # Mesa 25.0.7 is a -Dgles1=disabled build -- the package, not this SoC. ES2 is
+    # what does come up on lima, as "OpenGL ES 2.0 Mesa 25.0.7-2+deb13u1". The
+    # rootfs's binary cannot ask for it: its renderer is fixed-function, and
+    # Renderer_GLES10.cpp does
+    #     std::string glExts = (const char *)glGetString(GL_EXTENSIONS);
+    # at line 129 without ever checking SDL_GL_CreateContext, so a context that was
+    # never created arrives as std::string(NULL) -- abort, status 134, reason
+    # discarded. That 134 is the whole reason this file exists.
+    #
+    # It goes in over the rootfs's copy as a BIND MOUNT, which is the only way to
+    # replace it without writing to a card the R36S also boots: the mount table is
+    # in memory, the file underneath is untouched, and switch_root moves the mount
+    # across with everything else under /newroot. Pull this card into an R36S and
+    # its own binary is the one that runs.
+    #
+    # /run/j36/es and not /run/j36/gl, for the same reason the probe is kept out of
+    # there: /run/j36/gl is an ld.so search path and an executable in it is a name
+    # the loader has to stat and skip.
+    es_gles20=0
+    if [ -f /bootfs/j36/es/emulationstation ]; then
+        mkdir -p /newroot/run/j36/es
+        if cp /bootfs/j36/es/emulationstation /newroot/run/j36/es/emulationstation; then
+            chmod 0755 /newroot/run/j36/es/emulationstation
+            if [ ! -f /newroot/usr/bin/emulationstation/emulationstation ]; then
+                say "es: the rootfs has no emulationstation to mount over"
+            # -o bind rather than --bind: this is BusyBox's mount.
+            elif mount -o bind /newroot/run/j36/es/emulationstation \
+                               /newroot/usr/bin/emulationstation/emulationstation; then
+                es_gles20=1
+                say "es: the GLES 2.0 binary is mounted over the rootfs's"
+            else
+                say "es: could not bind-mount the GLES 2.0 binary; the rootfs's GLES1 one will run"
+            fi
+        else
+            say "es: could not copy the GLES 2.0 binary"
+        fi
+    else
+        say "es: no j36/es/emulationstation on the card, so the rootfs's GLES1 binary will run"
+    fi
+
     # The EGL probe rides in beside the libraries, not among them: /run/j36/gl is
     # a loader search path and a binary in it would be a name ld.so has to skip.
     # It is only ever run by the j36.es=debug drop-in below.
@@ -1052,17 +1103,33 @@ setup_es_gl() {
 
     # Nothing above is allowed to fail quietly, because of what the fallback is.
     # The drop-in tells the loader to look in this directory; if the directory is
-    # empty the loader simply misses and resolves ES's bare `libEGL.so' in
-    # /usr/lib, where dArkOS has pointed that name at the RK3326's libMali.so --
-    # an ARMv8-A object on a Cortex-A7. The failure is SIGILL before main(), which
-    # names neither this directory nor the blob, so it has to be caught here.
+    # empty the loader simply misses and finds the same names in /usr/lib, where
+    # dArkOS has pointed them at the RK3326's libMali.so -- an ARMv8-A object on a
+    # Cortex-A7. For the rootfs's binary that is SIGILL before main(), which names
+    # neither this directory nor the blob; for the GLES 2.0 one it is SDL dlopening
+    # the blob and reporting no EGL. Neither message points here, so it has to be
+    # caught here.
     #
-    # These three are the load-bearing names: libEGL.so is the only GL string in
-    # ES's DT_NEEDED, libgbm.so.1 is a clobbered SONAME that libEGL_mesa.so.0
-    # itself needs, and libGL.so.1 is the LD_PRELOAD that supplies the
-    # fixed-function entry points ES calls.
+    # Which three are load-bearing depends on which binary is going to run, and
+    # they are not the same three:
+    #
+    #   GLES 2.0 binary.  It has no GL library in its DT_NEEDED at all, so the bare
+    #     libEGL.so alias stops mattering.  What matters is the pair SDL dlopens:
+    #     libEGL.so.1 for the context and libGLESv2.so.2 for the entry points
+    #     SDL_GL_GetProcAddress hands back.
+    #   Rootfs's GLES1 binary.  libEGL.so is the literal string in its DT_NEEDED,
+    #     and libGL.so.1 is the LD_PRELOAD that supplies the fixed-function calls.
+    #
+    # libgbm.so.1 is load-bearing either way, and twice over: SDL2's KMSDRM backend
+    # dlopens it and libEGL_mesa.so.0 carries it in its own DT_NEEDED, so without it
+    # Mesa's EGL pulls the RK3326 blob in as its gbm and cannot initialise.
     missing=""
-    for need in libEGL.so libgbm.so.1 libGL.so.1; do
+    if [ "$es_gles20" = 1 ]; then
+        needs="libEGL.so.1 libgbm.so.1 libGLESv2.so.2"
+    else
+        needs="libEGL.so libgbm.so.1 libGL.so.1"
+    fi
+    for need in $needs; do
         [ -e "/newroot/run/j36/gl/$need" ] || missing="$missing $need"
     done
     if [ -n "$missing" ]; then
