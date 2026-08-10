@@ -1739,6 +1739,7 @@ at the ARMv7 payload instead.
   j36/mfgpower              powers the Mali-450 and reads its ID back; the gate
   j36/modules/              lima and its dependencies, plus load.order
   j36/mtkdrm/               the MT6592 display driver set, plus load.order
+  j36/gl/                   Mesa's GL front end, plus links (vfat has no symlinks)
 
 The R36S kernel on the same card is arm64 and stays there for the R36S.  The
 armhf Debian rootfs is shared, and this kernel can now mount it: MSDC1, the
