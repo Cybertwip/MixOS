@@ -195,7 +195,9 @@ read -r IMAGE < "$STATE_DIR/latest-image"
 cd "$BUILD_DIR"
 [[ -s "$IMAGE" ]] || { echo "missing image: $IMAGE" >&2; exit 1; }
 [[ -f "${IMAGE}.7z.001" ]] || { echo "missing archive: ${IMAGE}.7z.001" >&2; exit 1; }
-7z t "${IMAGE}.7z.001"
+# Shares its stamp with the in-VM build, which has usually just tested the same
+# bytes; see device/r36-ultra/verify_archive.sh for why this is cached at all.
+bash device/r36-ultra/verify_archive.sh "$IMAGE" "$STATE_DIR"
 sudo parted -s "$IMAGE" print
 cp -f -- "${IMAGE}.7z."* "$ARTIFACT_DIR/"
 cp -f -- "$STATE_DIR/resume.log" "$ARTIFACT_DIR/build-r36-ultra-resume.log"
