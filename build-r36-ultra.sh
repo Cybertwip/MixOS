@@ -135,14 +135,8 @@ darkos_vm_remount "$VM_NAME" \
     "$SCRIPT_DIR:$VM_SOURCE_MOUNT" \
     "$ARTIFACT_DIR:$VM_ARTIFACT_MOUNT"
 
-darkos_log "Preparing the Ubuntu build environment"
-multipass exec "$VM_NAME" -- bash -lc "
-set -Eeuo pipefail
-sudo apt-get update
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git make rsync tmux
-printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\\n' \"\$(id -un)\" | sudo tee /etc/sudoers.d/darkos-build >/dev/null
-sudo chmod 0440 /etc/sudoers.d/darkos-build
-"
+darkos_vm_prepare_once "$VM_NAME" /home/ubuntu/darkos-r36-state/vm-tools.done \
+    git make rsync tmux
 darkos_vm_sync_checkout "$VM_NAME" "$VM_SOURCE_MOUNT" "$VM_BUILD_DIR"
 
 # The reference BOOT payload is read with sudo by install_boot.sh, and a

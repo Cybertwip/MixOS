@@ -118,6 +118,51 @@ if [[ -d /usr/lib/ccache ]]; then export PATH="/usr/lib/ccache:$PATH"; fi
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
     CROSS_COMPILE=arm-linux-gnueabihf- -j"$(nproc)" zImage
 
+# ── The one mistake this layer exists to prevent ──────────────────────────────
+#
+# The other half of this repository builds an aarch64 kernel for the RK3326, the
+# two boot chains now share an SD card, and an MT6592 is ARMv7.  The MVII LK
+# refuses an arm64 payload at the last moment by reading the arm64 boot magic at
+# offset 0x38 -- see sd_kernel_is_armv7() in mvii_lk_main.c.  Run that same test
+# here, on the build machine, where "no" is a build failure rather than a board
+# that silently fell back to the eMMC.
+blob_le32() { od -An -t x4 -j "$1" -N 4 "$2" | tr -d ' \n'; }
+
+verify_arm_elf() {
+    local file="$1" what="$2" header
+    header="$(readelf -h "$file")" || die "could not read the ELF header of $what"
+    grep -q 'Class:.*ELF32' <<<"$header" || die "$what is not a 32-bit ELF object"
+    grep -q 'Machine:.*ARM' <<<"$header" || die "$what is not an ARM ELF object"
+}
+
+# The LK's byte tests, on the raw binary the LK will actually read.
+verify_armv7_kernel() {
+    local file="$1" what="$2" size
+    size="$(stat -c %s "$file")"
+    (( size >= 64 )) || die "$what is too short to be a kernel"
+    [[ "$(blob_le32 0x38 "$file")" != 644d5241 ]] || \
+        die "$what carries the arm64 boot magic at 0x38; this SoC is ARMv7"
+    [[ "$(blob_le32 0x24 "$file")" == 016f2818 ]] || \
+        die "$what carries no zImage magic at 0x24"
+}
+
+# The LK's own load windows: kernel 24 MiB at 0x80008000, device tree 256 KiB at
+# 0x83000000, initramfs 96 MiB at 0x84000000.  A payload that does not fit is
+# rejected by sd_read_into() at boot, so reject it here instead.
+fits_in() {
+    local file="$1" limit="$2" what="$3" size
+    size="$(stat -c %s "$file")"
+    (( size <= limit )) || \
+        die "$what is $size bytes and the LK load window is $limit bytes"
+}
+
+ZIMAGE="$KERNEL_OUT/arch/arm/boot/zImage"
+[[ -s "$ZIMAGE" ]] || die "zImage was not produced"
+verify_arm_elf "$KERNEL_OUT/vmlinux" "the kernel"
+verify_armv7_kernel "$ZIMAGE" "the zImage"
+fits_in "$ZIMAGE" $((0x01800000)) "the zImage"
+log "Verified a 32-bit ARMv7 zImage: $(stat -c %s "$ZIMAGE") bytes"
+
 log "Regenerating the J36 DTB from the current PowerEngine Drivers"
 J36_DRIVERS_DIR="$DRIVERS" J36_DTB_OUT_DIR="$DTB_OUT" \
     "$ROOT/build-j36-ultra-dtb.sh"
@@ -131,6 +176,8 @@ KERNEL_RELEASE="$(make -s -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
     CROSS_COMPILE=arm-linux-gnueabihf- kernelrelease)"
 MODULE="$MODULE_SRC/j36_mt6592_input.ko"
 [[ -s "$MODULE" ]] || die "input module was not produced"
+verify_arm_elf "$MODULE" "the input module"
+fits_in "$DTB_OUT/mt6592-j36-ultra.dtb" $((0x00040000)) "the device tree"
 
 if [[ ! -d "$BUSYBOX_SRC/.git" ]]; then
     log "Cloning BusyBox $BUSYBOX_BRANCH once for the ARM bring-up initramfs"
@@ -186,9 +233,24 @@ log "Packing the bring-up initramfs"
     find . -print0 | cpio --null -o --format=newc --owner=0:0 2>/dev/null | gzip -9
 ) > "$ARTIFACTS/initramfs-j36-ultra.cpio.gz"
 
-cat "$KERNEL_OUT/arch/arm/boot/zImage" \
-    "$DTB_OUT/mt6592-j36-ultra.dtb" \
-    > "$ARTIFACTS/zImage-j36-ultra"
+fits_in "$ARTIFACTS/initramfs-j36-ultra.cpio.gz" $((0x06000000)) "the initramfs"
+
+# TWO KERNEL PAYLOADS, AND THEY ARE NOT INTERCHANGEABLE.
+#
+# The eMMC BOOTIMG path enters the kernel the way the stock LK does, with an ATAG
+# list in r2 and no device tree anywhere, so that payload carries its tree
+# appended to the zImage and CONFIG_ARM_ATAG_DTB_COMPAT folds the ATAGs into it.
+#
+# The SD hand-off path passes the tree itself in r2 and patches /chosen first --
+# bootargs, linux,initrd-start and linux,initrd-end.  An appended tree would
+# silently win that argument: arch/arm/boot/compressed/head.S takes the appended
+# DTB whenever its magic is present and only consults r2 to fold ATAGs in, so a
+# DTB in r2 is discarded, and with it the initramfs range.  The kernel would boot
+# and then fail to find /init.  So the SD payload is the PLAIN zImage with the
+# tree beside it as a separate file, which is also what the LK's built-in
+# defaults and the boot.conf below name.
+cat "$ZIMAGE" "$DTB_OUT/mt6592-j36-ultra.dtb" > "$ARTIFACTS/zImage-j36-ultra"
+cp "$ZIMAGE" "$ARTIFACTS/zImage"
 cp "$DTB_OUT/mt6592-j36-ultra.dtb" "$ARTIFACTS/"
 cp "$MODULE" "$ARTIFACTS/"
 cp "$CONFIG" "$ARTIFACTS/kernel.config"
@@ -199,15 +261,82 @@ python3 "$ROOT/device/j36-ultra/create_boot_image.py" \
     --ramdisk "$ARTIFACTS/initramfs-j36-ultra.cpio.gz" \
     --output "$ARTIFACTS/boot.img"
 
+# ── The SD BOOT payload ───────────────────────────────────────────────────────
+#
+# Copy this tree onto the FAT partition labelled BOOT and the MVII LK boots the
+# card instead of the eMMC.  /mvii/boot.conf is written because a dArkOS card
+# already carries a boot.ini, and that boot.ini names the RK3326's arm64 `Image`
+# and an rk3326 device tree.  The LK parses boot.ini first and boot.conf second
+# precisely so this file gets the last word; without it the LK would load the
+# arm64 kernel, refuse it at the magic check, and fall back to the eMMC.
+#
+# Load addresses are deliberately absent.  They are the LK's business -- it knows
+# this SoC's DRAM map and the address of the framebuffer the DTB hands to
+# simple-framebuffer -- and boot.conf can only get them wrong.
+log "Staging the SD card BOOT payload"
+SDBOOT="$ARTIFACTS/sd-boot"
+rm -rf "$SDBOOT"
+mkdir -p "$SDBOOT/mvii"
+cp "$ZIMAGE" "$SDBOOT/zImage"
+cp "$DTB_OUT/mt6592-j36-ultra.dtb" "$SDBOOT/"
+cp "$ARTIFACTS/initramfs-j36-ultra.cpio.gz" "$SDBOOT/initrd.img"
+
+# This kernel has no MMC, block, SCSI or network support: the bring-up profile
+# turns them off to fit the 9 MiB BOOTIMG slot.  There is therefore no root=
+# here, and there must not be -- a root= this kernel cannot honour is a panic
+# instead of a shell.  It boots to the initramfs.  When native MSDC lands, add
+# `root=LABEL=ROOTFS rootwait rw` and drop rdinit=.
+cat > "$SDBOOT/mvii/boot.conf" <<'CONF'
+# MVII LK SD hand-off, J36 Ultra (MT6592, ARMv7).
+#
+# Read after the card's own boot.ini, so these override it.  A dArkOS boot.ini
+# names the RK3326 arm64 kernel, which this SoC cannot execute.
+kernel=zImage
+dtb=mt6592-j36-ultra.dtb
+initrd=initrd.img
+
+# No root= : this bring-up kernel has no storage drivers and boots its initramfs.
+bootargs=console=tty0 console=ttyS0,115200n8 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init
+CONF
+
+# The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
+# truncated mid-line.
+(( $(stat -c %s "$SDBOOT/mvii/boot.conf") <= 2048 )) || \
+    die "boot.conf exceeds the LK's 2048-byte read buffer"
+verify_armv7_kernel "$SDBOOT/zImage" "the SD payload kernel"
+
+cat > "$SDBOOT/README.txt" <<'README'
+J36 Ultra (MT6592, ARMv7) SD card BOOT payload.
+
+Copy the contents of this directory into the root of the FAT partition labelled
+BOOT.  Existing files are not disturbed: an R36S dArkOS card keeps its Image,
+uInitrd, rk3326 device trees and boot.ini, and mvii/boot.conf points the MVII LK
+at the ARMv7 payload instead.
+
+  zImage                    plain 32-bit ARM kernel, no appended device tree
+  mt6592-j36-ultra.dtb      the tree the LK loads separately and patches
+  initrd.img                bring-up initramfs (busybox + the input module)
+  mvii/boot.conf            filenames and command line for the MVII LK
+
+The R36S kernel on the same card is arm64 and stays there for the R36S.  The
+armhf Debian rootfs is shared; this kernel cannot mount it yet, because storage
+drivers are not in the bring-up profile.
+README
+
 (
     cd "$ARTIFACTS"
-    sha256sum boot.img zImage-j36-ultra mt6592-j36-ultra.dtb \
-        j36_mt6592_input.ko initramfs-j36-ultra.cpio.gz > SHA256SUMS
+    sha256sum boot.img zImage zImage-j36-ultra mt6592-j36-ultra.dtb \
+        j36_mt6592_input.ko initramfs-j36-ultra.cpio.gz \
+        sd-boot/zImage sd-boot/mvii/boot.conf > SHA256SUMS
     {
         echo "kernel_branch=$KERNEL_BRANCH"
         echo "kernel_release=$KERNEL_RELEASE"
+        echo "kernel_arch=arm (ARMv7, 32-bit)"
+        echo "zimage_size=$(stat -c %s zImage)"
         echo "dtb_sha256=$(sha256sum mt6592-j36-ultra.dtb | awk '{print $1}')"
         echo "bootimg_size=$(stat -c %s boot.img)"
+        echo "bootimg_kernel=zImage-j36-ultra (device tree appended, ATAG path)"
+        echo "sd_kernel=sd-boot/zImage (plain, LK passes the tree in r2)"
         echo "display=stock-lk-simple-framebuffer"
         echo "native_dsi=disabled"
         echo "input_adapter=j36_mt6592_input.ko"
@@ -222,4 +351,5 @@ printf '  %s\n' \
     "$EXPORT_DIR/boot.img" \
     "$EXPORT_DIR/mt6592-j36-ultra.dtb" \
     "$EXPORT_DIR/j36_mt6592_input.ko" \
+    "$EXPORT_DIR/sd-boot/ (copy onto the BOOT partition)" \
     "$EXPORT_DIR/manifest.txt"

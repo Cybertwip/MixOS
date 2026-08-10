@@ -1,0 +1,114 @@
+# R36 Ultra (RK3326) base build
+
+```sh
+./build-r36-ultra.sh
+```
+
+One native **armhf** Debian userspace with EmulationStation, on the existing
+**arm64** RK3326 kernel and boot chain. On macOS it builds inside a persistent
+Ubuntu 24.04 Multipass VM (`darkos-r36`); on Linux the same checkpointed build
+runs directly.
+
+## The architecture split, and why it is deliberate
+
+| | value | asserted by |
+| --- | --- | --- |
+| kernel | arm64 (`Image`) | `verify_boot_kernel_arch` — arm64 magic at 0x38 |
+| userspace | armhf, no foreign arch | `verify_native_userspace` — `dpkg --print-architecture` |
+| GUI binary | ELF32 / ARM | `verify_gui_architecture` — `readelf -h` |
+
+The mix is the point. The RK3326 is arm64 and its kernel has to be; the userspace
+is 32-bit so the **same rootfs also runs on the ARMv7 J36 Ultra**. What is never
+shared is the kernel: the MVII LK reads the arm64 boot magic and refuses this
+`Image` on an MT6592 by design. A J36 card gets its own 32-bit `zImage` from
+`device/j36-ultra/`; see that README.
+
+## The BOOT partition
+
+`install_boot.sh` owns partition 1 end to end, because it used to be a side
+effect and that shipped an image with an all-zero BPB. It formats
+`mkfs.vfat -F 32 -n BOOT`, installs the reference payload, then overwrites it
+with the freshly built kernel payload, and leaves the partition mounted with
+`LOOP_BOOT` exported so `finishing_touches.sh` can write `boot.ini` and detach it.
+
+What ends up there:
+
+```text
+Image                    arm64 kernel        from BOOT_STASH (this build)
+uInitrd                  initramfs           from BOOT_STASH (this build)
+rk3326-r36s-linux.dtb    device tree         built if the tree has it, else reference
+rk3326-rg351mp-linux.dtb                     built
+rg351mp-uboot.dtb / rg351v-uboot.dtb         reference (u-boot panel variants)
+boot.ini                 u-boot script       finishing_touches.sh
+logo.bmp, charge bitmaps                     reference
+```
+
+`Image` and `uInitrd` are always this build's: a reference kernel would not match
+the modules installed into this rootfs. The kernel payload is kept in
+`$STATE_DIR/boot` rather than only inside the disk image, because `image_setup.sh`
+recreates `$DISK` with a plain `dd` — the partition contents vanish while a
+kernel checkpoint in the state directory survives.
+
+### `DARKOS_R36_BOOT_PAYLOAD`
+
+The BOOT partition of a working dArkOS R36 image, which supplies what this
+pipeline never produced: the R36S device tree, the u-boot panel variants, the
+off-charging bitmaps and the dtb selector. It defaults to
+`<artifacts>/Reference/BOOT`, and on macOS it **must** live under the artifact
+directory — that is the only host path the build VM can read. Point it elsewhere
+and you get a warning plus a boot partition holding only what the build made.
+
+### `verify_boot.py`
+
+Reads the MBR and the FAT of the finished image directly, without a loop device,
+so it sees what is actually inside the archived artifact rather than what an
+earlier stage believed it wrote:
+
+```sh
+python3 device/r36-ultra/verify_boot.py IMAGE --require Image --require uInitrd --require boot.ini
+```
+
+The resume runner runs it before trusting an existing archive. An image that
+archived cleanly with an unformatted BOOT partition is now discarded and rebuilt
+rather than released.
+
+## Resuming, and what is not redone
+
+Stages stamp `$STATE_DIR/<name>.done`, where `$STATE_DIR` is keyed by Debian
+release, userspace architecture and profile. A failed build resumes at the first
+incomplete stage; userspace components stamp individually, so a retry skips the
+ones that finished.
+
+Three things used to be redone anyway, and are not any more:
+
+- **The VM's own apt setup** ran on every invocation of either wrapper.
+  `darkos_vm_prepare_once` stamps it inside the VM instead
+  (`DARKOS_FORCE_HOST_PREP=1` to run it anyway).
+- **Debian, unpacked twice.** `clean_mounts.sh` deletes `$FILESYSTEM` at the end
+  of a successful run to give back the working copy's disk, which meant the next
+  build from a changed profile or a deleted image had to debootstrap and
+  reinstall every chroot build dependency from scratch. The rootfs is now copied
+  once immediately before finalization — the last moment it is still a usable
+  build root, since `cleanup_filesystem.sh` strips it and `write_rootfs.sh`
+  shrinks it — and a later run whose `$FILESYSTEM` is gone restores that copy and
+  keeps its bootstrap/userspace checkpoints. `DARKOS_R36_SNAPSHOT_ROOTFS=0`
+  disables it; it is skipped automatically when the disk cannot spare the space.
+- **The kernel.** A kernel checkpoint means the kernel was compiled, not that its
+  output still exists. `boot_stash_ready` checks, and a checkpoint with no payload
+  behind it is cleared rather than believed.
+
+The copy is crash-consistent rather than quiesced: `Arkbuild` is still mounted, so
+it is synced and then copied. That is what btrfs' log replay is for, and a build
+root is not a database.
+
+## Overrides
+
+```sh
+BUILD_JOBS=8 ./build-r36-ultra.sh
+USERSPACE_ARCH=arm64 BUILD_BUNDLED_APPS=y ./build-r36-ultra.sh   # full app set
+DARKOS_COPY_RAW_IMAGE=1 ./build-r36-ultra.sh                     # copy the .img out
+DARKOS_VM_CPUS=4 DARKOS_VM_MEMORY=8G ./build-r36-ultra.sh
+```
+
+`BUILD_BUNDLED_APPS=y` is rejected on an armhf userspace: the emulator and
+application list is maintained for the arm64 profile only.

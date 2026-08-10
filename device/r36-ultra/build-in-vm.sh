@@ -171,6 +171,75 @@ stash_boot_payload() {
     ls -l "$BOOT_STASH"
 }
 
+# ── Not unpacking Debian twice ────────────────────────────────────────────────
+#
+# clean_mounts.sh deletes $FILESYSTEM at the end of a successful run, to give back
+# the working copy's disk.  The consequence was that the *next* run -- a changed
+# profile, a deleted image, a bumped STATE_KEY -- had to debootstrap Debian and
+# reinstall every chroot build dependency from scratch, which is the bulk of the
+# build and the "it sets up the whole system again" the log makes it look like.
+#
+# So the rootfs is copied once, immediately before finalization, which is the last
+# moment it is still a usable build root: cleanup_filesystem.sh strips it and
+# write_rootfs.sh shrinks it to fit the image.  A later run whose $FILESYSTEM is
+# gone restores that copy and keeps its bootstrap/userspace checkpoints.
+#
+# The copy is crash-consistent rather than quiesced -- Arkbuild is still mounted,
+# so it is synced and then copied.  That is what btrfs' log replay is for, and a
+# build root is not a database.  --sparse=always keeps the 52 GiB image's holes.
+ROOTFS_SNAPSHOT="$STATE_DIR/rootfs-prefinal.img"
+SNAPSHOT_ROOTFS="${DARKOS_R36_SNAPSHOT_ROOTFS:-1}"
+
+snapshot_rootfs() {
+    local need avail
+    [[ "$SNAPSHOT_ROOTFS" == 1 ]] || return 0
+    [[ -f "$FILESYSTEM" ]] || return 0
+    [[ ! -s "$ROOTFS_SNAPSHOT" ]] || return 0
+
+    # Allocated bytes, not the 52 GiB apparent size: du's default is disk usage.
+    need="$(du -B1 "$FILESYSTEM" 2>/dev/null | cut -f1)"
+    need="${need:-0}"
+    avail=$(( $(df -Pk "$STATE_DIR" | awk 'NR == 2 { print $4 }') * 1024 ))
+    if (( need == 0 || avail < need + 4294967296 )); then
+        log "Not snapshotting the build root: it needs $need bytes and $avail are free"
+        log "The next build from a deleted filesystem will bootstrap Debian again"
+        return 0
+    fi
+
+    log "Snapshotting the build root so a later run need not bootstrap Debian again"
+    sync
+    mountpoint -q Arkbuild && sudo btrfs filesystem sync Arkbuild 2>/dev/null || true
+    if ! sudo cp --reflink=auto --sparse=always "$FILESYSTEM" "$ROOTFS_SNAPSHOT.part"; then
+        log "Snapshot failed; continuing without one"
+        sudo rm -f "$ROOTFS_SNAPSHOT.part"
+        return 0
+    fi
+    sudo chown "$(id -u):$(id -g)" "$ROOTFS_SNAPSHOT.part"
+    mv -f "$ROOTFS_SNAPSHOT.part" "$ROOTFS_SNAPSHOT"
+    log "Build root snapshot: $(du -h "$ROOTFS_SNAPSHOT" | cut -f1)"
+}
+
+# Only ever called when $FILESYSTEM is missing, which is the one case where a
+# snapshot is not a stale copy of something that already exists.
+restore_rootfs_snapshot() {
+    [[ -s "$ROOTFS_SNAPSHOT" ]] || return 1
+    [[ ! -f "$FILESYSTEM" ]] || return 1
+    # A finished archive is about to be verified and returned; copying ten
+    # gigabytes to then exit immediately would be pure waste.
+    [[ ! -f "${DISK}.7z.001" ]] || return 1
+    log "Restoring the pre-finalization build root; Debian will not be unpacked again"
+    if ! cp --reflink=auto --sparse=always "$ROOTFS_SNAPSHOT" "$FILESYSTEM.part"; then
+        rm -f "$FILESYSTEM.part"
+        return 1
+    fi
+    mv -f "$FILESYSTEM.part" "$FILESYSTEM"
+    # Finalization is destructive and its checkpoint describes a rootfs that no
+    # longer exists in that state.  Everything before it is exactly what the
+    # snapshot holds.
+    rm -f "$STATE_DIR/finalization.done" "$STATE_DIR/complete.done"
+    return 0
+}
+
 boot_stash_ready() {
     [[ -s "$BOOT_STASH/Image" && -s "$BOOT_STASH/uInitrd" ]] || return 1
     compgen -G "$BOOT_STASH/*.dtb" >/dev/null
@@ -264,6 +333,25 @@ run_stage() {
     mark "$name"
 }
 
+# Which architecture is which, asserted rather than remembered.
+#
+# This image is deliberately mixed: an arm64 kernel, because an RK3326 is arm64,
+# on a native armhf userspace, because 32-bit is what the R36 profile ships and
+# what makes the same rootfs usable on the ARMv7 J36 Ultra.  The consequence is
+# worth stating where it is checked: the MVII LK's SD hand-off reads the arm64
+# boot magic at offset 0x38 and refuses this kernel by design.  A J36 card gets
+# its own 32-bit zImage from device/j36-ultra; it shares the rootfs, not the
+# kernel.  If this assertion ever fails, one of those two facts has moved.
+verify_boot_kernel_arch() {
+    local image="$BOOT_STASH/Image" magic
+    [[ -s "$image" ]] || fail "no kernel image to check in $BOOT_STASH"
+    magic="$(od -An -t x4 -j 0x38 -N 4 "$image" | tr -d ' \n')"
+    [[ "$magic" == 644d5241 ]] || \
+        fail "the RK3326 kernel does not carry the arm64 boot magic (0x38 reads $magic)"
+    log "Verified an arm64 RK3326 kernel on an ${USERSPACE_ARCH} userspace"
+    log "The MVII LK will refuse this kernel on a J36 Ultra; that card boots device/j36-ultra/sd-boot"
+}
+
 verify_native_userspace() {
     local actual foreign
     actual="$(sudo chroot Arkbuild dpkg --print-architecture)" || \
@@ -296,6 +384,9 @@ verify_gui_architecture() {
 # sure a mount left by the other profile cannot contaminate this build.
 clear_foreign_rootfs_mount
 clear_legacy_multiarch_root
+
+# Before any checkpoint is inferred: a missing build root may be recoverable.
+restore_rootfs_snapshot || true
 
 # Infer checkpoints made by the original monolithic build that failed before
 # this resume runner existed.
@@ -377,6 +468,7 @@ if ! marked kernel; then
 else
     ensure_boot_mount
 fi
+verify_boot_kernel_arch
 maybe_stop kernel
 
 # A failed userspace phase can be safely retried.  The default GUI profile only
@@ -475,6 +567,7 @@ verify_gui_architecture
 # and unmount the root filesystem. If it fails, the log identifies the exact
 # final script rather than silently starting over.
 if ! marked finalization; then
+    snapshot_rootfs
     final_scripts=(
         device/r36-ultra/install_boot.sh
         finishing_touches.sh

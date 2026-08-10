@@ -104,6 +104,36 @@ DARKOS_SYNC_EXCLUDES=(
     'device/r36-ultra/boot-payload/'
 )
 
+# darkos_vm_prepare_once NAME STAMP PACKAGE...
+#
+# Install the VM's own build tools once and remember it.  This used to run
+# `apt-get update` plus an install on every single invocation of either wrapper,
+# which is most of what "it sets up the system every time" was: minutes of apt
+# before any build work, on a VM where nothing had changed.  The stamp lives in
+# the VM rather than on the host so that recreating the VM redoes it.
+# DARKOS_FORCE_HOST_PREP=1 runs it anyway.
+darkos_vm_prepare_once() {
+    local name=$1 stamp=$2
+    shift 2
+
+    if [[ "${DARKOS_FORCE_HOST_PREP:-0}" != 1 ]] &&
+        multipass exec "$name" -- test -f "$stamp" 2>/dev/null; then
+        darkos_log "Build tools already installed in $name; skipping apt"
+        return 0
+    fi
+
+    darkos_log "Installing the VM build tools once"
+    multipass exec "$name" -- bash -lc "
+set -Eeuo pipefail
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y $*
+printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\\n' \"\$(id -un)\" | sudo tee /etc/sudoers.d/darkos-build >/dev/null
+sudo chmod 0440 /etc/sudoers.d/darkos-build
+mkdir -p \"\$(dirname '$stamp')\"
+touch '$stamp'
+"
+}
+
 # darkos_vm_sync_checkout NAME SOURCE_MOUNT BUILD_DIR
 darkos_vm_sync_checkout() {
     local name=$1 source_mount=$2 build_dir=$3

@@ -81,29 +81,90 @@ with its before and after. See `linux/README.md`.
 
 It touches no MMSYS, DSI, MIPI-TX, panel, or backlight register.
 
-## Incremental build
+## 32-bit, and where that is enforced
 
-After the R36 baseline build has finished, run:
+An MT6592 is ARMv7. An RK3326 is arm64. The two boot chains in this repository
+now share an SD card, so neither architecture is left to memory:
+
+| | R36 Ultra (RK3326) | J36 Ultra (MT6592) |
+| --- | --- | --- |
+| kernel | arm64 `Image` | ARMv7 `zImage` |
+| toolchain | `aarch64-linux-gnu-` | `arm-linux-gnueabihf-` |
+| userspace | armhf (32-bit) | armhf (32-bit), shared |
+
+The rootfs is shared; the kernel never is. `build-r36-ultra.sh` asserts both
+halves — `verify_native_userspace` for the armhf rootfs, `verify_gui_architecture`
+for an ELF32/ARM EmulationStation, and `verify_boot_kernel_arch` for the arm64
+boot magic in its own kernel. `device/j36-ultra/build-in-vm.sh` runs the MVII LK's
+own test on its own artifact: `readelf` for ELF32/ARM, then the arm64 magic at
+offset 0x38 and the zImage magic at 0x24, on the exact bytes the LK will read.
+That check is the LK's `sd_kernel_is_armv7()`, moved to the build machine so "no"
+is a build failure instead of a board that quietly fell back to the eMMC.
+
+## Two kernel payloads, and they are not interchangeable
+
+The **eMMC BOOTIMG** path is entered the way the stock LK enters a kernel: an
+ATAG list in `r2` and no device tree anywhere. That payload
+(`zImage-j36-ultra`) therefore carries its tree **appended**, and
+`CONFIG_ARM_ATAG_DTB_COMPAT` folds the ATAGs into it.
+
+The **SD hand-off** path passes the tree itself in `r2` and patches `/chosen`
+first: `bootargs`, `linux,initrd-start`, `linux,initrd-end`. An appended tree
+would silently win that argument — `arch/arm/boot/compressed/head.S` takes the
+appended DTB whenever its magic is present and consults `r2` only to fold ATAGs
+in, so a DTB in `r2` is discarded along with the initramfs range, and the kernel
+boots and then cannot find `/init`. The SD payload is therefore the **plain**
+`zImage` with the tree beside it as a separate file.
+
+## Incremental build
 
 ```sh
 ./build-j36-ultra.sh
 ```
 
-This reuses the existing `darkos-r36` Multipass VM but does **not** rerun
-`make rg351mp`. The first J36 run creates a persistent ARMv7 Linux 6.12 LTS
-workspace. Later runs reuse it and incrementally rebuild only changed kernel,
-DTB, input-module, initramfs, and `boot.img` files.
+This is an extension of `build-r36-ultra.sh` rather than a second build system.
+It regenerates the DTB on the host first — so a keymap or pad-mux regression
+fails in a second — then resumes the checkpointed R36 base build (already
+finished ones cost seconds; `J36_RESUME_R36=0` skips it), then builds the J36
+layer in the same `darkos-r36` VM. The first J36 run creates a persistent ARMv7
+Linux 6.12 LTS workspace; later runs rebuild only changed kernel, DTB,
+input-module, initramfs and `boot.img` files.
 
 Artifacts are copied to:
 
 ```text
-../dArkOS-artifacts/j36-ultra/boot.img
+../dArkOS-artifacts/j36-ultra/boot.img            eMMC BOOTIMG payload (9 MiB slot)
+../dArkOS-artifacts/j36-ultra/zImage              plain 32-bit ARM kernel
 ../dArkOS-artifacts/j36-ultra/mt6592-j36-ultra.dtb
 ../dArkOS-artifacts/j36-ultra/j36_mt6592_input.ko
+../dArkOS-artifacts/j36-ultra/sd-boot/            copy onto the BOOT partition
 ../dArkOS-artifacts/j36-ultra/manifest.txt
 ```
 
-The generated `boot.img` is a first-stage serial/framebuffer/input bring-up
-image sized for the stock 9 MiB BOOTIMG partition. It is not yet a complete
-dArkOS image: native MT6592 MSDC/eMMC or SD storage must be ported before a
-persistent Debian root filesystem can be mounted.
+## The SD BOOT payload
+
+Copy `sd-boot/` into the root of the FAT partition labelled `BOOT` and the MVII
+LK boots the card instead of the eMMC. Nothing already there is disturbed: an
+R36S card keeps its `Image`, `uInitrd`, rk3326 trees and `boot.ini`.
+
+```text
+zImage                 plain ARMv7 kernel, no appended tree
+mt6592-j36-ultra.dtb   the tree the LK loads separately and patches
+initrd.img             bring-up initramfs (busybox + the input module)
+mvii/boot.conf         filenames and command line for the MVII LK
+```
+
+`mvii/boot.conf` exists because a dArkOS card already carries a `boot.ini`, and
+that `boot.ini` names the arm64 `Image` and an rk3326 tree. The LK parses
+`boot.ini` first and `/mvii/boot.conf` second precisely so this file gets the
+last word; without it the LK would load the arm64 kernel, refuse it at the magic
+check, and fall back to the eMMC. Load addresses are deliberately absent from
+it: those are the LK's business, and it knows this SoC's DRAM map and the
+address of the framebuffer the DTB hands to `simple-framebuffer`.
+
+The command line carries no `root=`, and must not yet. This bring-up profile has
+no MMC, block or network drivers — they are off so the payload fits the 9 MiB
+BOOTIMG slot — so a `root=` this kernel cannot honour is a panic instead of a
+shell. It boots to its initramfs. When native MT6592 MSDC lands, add
+`root=LABEL=ROOTFS rootwait rw` and drop `rdinit=`; the armhf rootfs the R36
+build produces is the one it will mount.

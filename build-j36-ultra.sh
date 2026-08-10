@@ -127,3 +127,5 @@ printf '  %s\n' \
     "$ARTIFACT_DIR/mt6592-j36-ultra.dtb" \
     "$ARTIFACT_DIR/j36_mt6592_input.ko" \
     "$ARTIFACT_DIR/manifest.txt"
+darkos_log "Copy $ARTIFACT_DIR/sd-boot/ onto the card's BOOT partition"
+darkos_warn "The R36 base image kernel is arm64 and this SoC is ARMv7; only the armhf rootfs is shared. sd-boot/mvii/boot.conf is what points the MVII LK at the 32-bit kernel."
