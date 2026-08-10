@@ -33,6 +33,36 @@ done
 }
 
 mkdir -p "$OUT_DIR"
+
+# ── Stage once, restage on change ─────────────────────────────────────────────
+#
+# This ran on every invocation, including every J36 build that changed nothing but
+# a kernel config symbol.  The generator is a pure function of the five board
+# files plus its own source plus this script, so hash exactly those and skip when
+# the hash and all three outputs are already in place.
+#
+# Hashed, not compared by mtime: an rsync into the VM or a git checkout rewrites
+# mtimes wholesale, and mtime ordering would then rebuild on every sync while a
+# hand-edited generator restored from a backup with an older mtime would silently
+# not rebuild at all.  J36_FORCE_DTB=1 regenerates regardless.
+STAMP="$OUT_DIR/.inputs.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+    hash_files() { sha256sum "$@"; }
+else
+    hash_files() { shasum -a 256 "$@"; }
+fi
+want_stamp="$(hash_files "$GENERATOR" "${BASH_SOURCE[0]}" "$DRIVERS"/* | awk '{print $1}' | hash_files - | awk '{print $1}')"
+
+if [[ "${J36_FORCE_DTB:-0}" != 1 && -f "$STAMP" && -s "$DTS" && -s "$DTB" && -s "$ROUNDTRIP" ]] &&
+   [[ "$(cat "$STAMP")" == "$want_stamp" ]]; then
+    printf '%s\n' \
+        "J36 Ultra bring-up DTB is up to date; nothing to regenerate." \
+        "  DTB: $DTB" \
+        "  Source: $DRIVERS" \
+        "  Force a rebuild with J36_FORCE_DTB=1"
+    exit 0
+fi
+
 python3 "$GENERATOR" --drivers "$DRIVERS" --output "$DTS"
 dtc -Wno-unit_address_vs_reg -I dts -O dtb -o "$DTB" "$DTS"
 dtc -I dtb -O dts -o "$ROUNDTRIP" "$DTB"
@@ -58,6 +88,10 @@ kpd="$(fdtget -t u "$DTB" /soc/keypad@10011000 j36,kpd-sense-pads)"
 [[ "$kpd" == "75 1 167 1 168 1 12 3 2 6" ]] || { echo "error: KPD sense pads are '$kpd'" >&2; exit 1; }
 kpd="$(fdtget -t u "$DTB" /soc/keypad@10011000 j36,kpd-reserved-pads)"
 [[ "$kpd" == "93 0" ]] || { echo "error: KPD reserved pads are '$kpd'" >&2; exit 1; }
+
+# Last, and only now: a stamp written before the assertions above would let a
+# failed validation be skipped on the next run instead of failing again.
+printf '%s' "$want_stamp" > "$STAMP"
 
 printf '%s\n' \
     "J36 Ultra bring-up DTB built successfully." \

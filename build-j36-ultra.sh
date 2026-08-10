@@ -20,6 +20,14 @@
 # Set J36_RESUME_R36=0 to skip it and build the J36 layer against whatever base
 # is already in the VM.
 
+# `sh ./build-j36-ultra.sh' is the natural thing to type and it is not what this
+# script is.  It uses arrays, [[ ]] and set -E, and it sources a helper that does
+# too; macOS /bin/sh is bash 3.2 in POSIX mode and will not run all of it.  Rather
+# than document that, re-exec under bash and let either invocation work.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
 set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
