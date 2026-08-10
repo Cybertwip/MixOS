@@ -1463,10 +1463,23 @@ DROPINDBG
         # all -- and a row that works there but returns BAD_ALLOC on the nodes
         # above is lima's, not the payload's.  It appends to the same log so the
         # repeat after ES exits carries both.
+        #
+        # The third line is the one that answers the black panel, and it is last
+        # so that its five colours are the last thing on the glass before ES
+        # takes over: -p stops asking EGL questions and drives the scanout chain
+        # itself, in five phases that remove ES, then SDL, then GL, then gbm from
+        # the path.  The README section "j36/eglprobe -p, and the five colours"
+        # has the verdicts.
+        #
+        # -+ and not -: the + runs it as root.  A modeset needs DRM master, and
+        # SET_MASTER for a client that was never master is CAP_SYS_ADMIN, so as
+        # User=ark this would have been fifteen seconds of EACCES.  Still
+        # non-fatal, because a probe is not a precondition.
         if [ -x /newroot/run/j36/eglprobe ]; then
             cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINPROBE'
 ExecStartPre=-/bin/sh -c '/run/j36/eglprobe 2>&1 | tee /run/j36/eglprobe.log'
 ExecStartPre=-/bin/sh -c 'LIBGL_ALWAYS_SOFTWARE=1 /run/j36/eglprobe -s 2>&1 | tee -a /run/j36/eglprobe.log'
+ExecStartPre=-+/bin/sh -c '/run/j36/eglprobe -p 2>&1 | tee -a /run/j36/eglprobe.log'
 ExecStopPost=-/bin/sh -c 'echo "--- eglprobe, repeated now that ES has exited ---"; cat /run/j36/eglprobe.log'
 DROPINPROBE
         fi
@@ -2668,7 +2681,8 @@ at the ARMv7 payload instead.
   j36/mtkdrm/               the MT6592 display driver set, plus load.order
   j36/audio/                the ALSA core and the MT6592 AFE driver, plus load.order
   j36/gl/                   Mesa's GL front end, plus links (vfat has no symlinks)
-  j36/eglprobe              what can create a GL context, and why not; j36.es=debug
+  j36/eglprobe              what can create a GL context, and why not, and with
+                            -p whether a frame reaches the glass; j36.es=debug
   j36/es/emulationstation   the same EmulationStation with a GLES 2.0 renderer,
                             bind-mounted over the rootfs's fixed-function one
 
@@ -3331,13 +3345,62 @@ j36.es=1:
       KMSDRM backend's own account of the modeset: which connector, which CRTC,
       which plane format, and what drmModeAddFB2 or drmModePageFlip said.
 
-Two candidates worth naming for fault 3, because this renderer is what introduced
-the first of them: it asks for SDL_GL_ALPHA_SIZE 8 where the fixed-function one
-asked for no alpha, which makes SDL pick an ARGB8888 gbm surface, and a display
-driver whose plane advertises only XR24 refuses that framebuffer at flip time.
-Dropping ALPHA_SIZE to 0 is the one-line experiment.  The second is fbcon: if the
-console was released without the CRTC being handed over, the panel is scanning out
-nothing while ES renders perfectly into buffers nobody reads.
+One candidate for fault 3 has to be withdrawn before it costs a boot.  This
+renderer asks for SDL_GL_ALPHA_SIZE 8 where the fixed-function one asked for no
+alpha, and that reads like the cause of an ARGB8888 framebuffer a plane might
+refuse -- but SDL is not choosing: KMSDRM_CreateSurfaces hardcodes
+GBM_FORMAT_ARGB8888 for its gbm surface (SDL_kmsdrmvideo.c:1197) and then pins
+that visual with SDL_EGL_SetRequiredVisualId whatever was asked for.  Dropping
+ALPHA_SIZE to 0 changes which EGL config is chosen and not one byte of the buffer
+that is scanned out, so it is not the experiment it looks like.  What remains for
+fault 3 is fbcon -- a console released without the CRTC handed over leaves the
+panel scanning out nothing while ES renders perfectly into buffers nobody reads --
+and the two things ES's own log cannot see: whether a modeset reaches the glass at
+all, and whether the OVL blends per-pixel alpha.
+
+j36/eglprobe -p, and the five colours
+-------------------------------------
+
+So that is measured instead of argued.  Everything in the probe's other modes asks
+whether a context can be built; -p paints, and it takes ES, then SDL, then GL, then
+gbm out of the path one step at a time.  It runs under j36.es=debug as the last
+thing before ES starts, holding each frame three seconds because the instrument for
+this one is an eye.  It speaks DRM with raw ioctls -- the uapi structs are ABI and
+libdrm would be a fourth library that can be missing -- and prints the connector,
+the mode it was given, the CRTC and whatever framebuffer was already on it.
+
+  1  RED, XR24, filled with memset()          modeset + DSI + panel + OVL, no
+                                              alpha and no Mesa anywhere
+  2  MAGENTA, AR24 alpha ff, memset()         the same, in the format SDL uses
+  3  MAGENTA, AR24 alpha 00, memset()         the same buffer, transparent
+  4  MAGENTA, lima into a gbm surface         ES's path with ES, SDL and the
+                                              renderer removed
+  5  GREEN, lima's second frame               the swap chain rotating
+
+Read it as four verdicts:
+
+  nothing at all           the modeset does not reach the glass, and no part of
+                           EGL is involved.  Look at mtk_dsi against the state the
+                           LK left, and at the mode the panel driver reports:
+                           j36_jd9365_panel.c adopts a live panel and sends it no
+                           init table, so a DSI re-initialised to a different
+                           timing has nothing that puts it back.
+  1 and 2 but not 3        the OVL blends per-pixel alpha against a black
+                           background.  That alone explains a black ES, and the
+                           fix is in the renderer, not the kernel:
+                           Renderer_GLES20.cpp clears to (0, 0, 0, 0) and every
+                           pixel ES does not overdraw is transparent black.
+  1, 2 and 3 but not 4/5   the display path is sound and the gbm/kmsro pairing is
+                           the fault: lima renders into a buffer the OVL never
+                           fetches.  The ADDFB2 line names the handle and stride
+                           it refused.
+  all five                 the display path is sound end to end and a black ES is
+                           ES's own drawing -- fault 1 or 2, and the self test and
+                           per-frame draw count above are the evidence.
+
+`/run/j36/eglprobe -p' by hand does the same thing from a console at any time; it
+takes DRM master for the fifteen seconds it runs and gives it back, and the console
+framebuffer comes back with it.
 
 Add systemd.mask=emulationstation.service to bootargs to get the machine back to a
 console.
@@ -3490,6 +3553,7 @@ README
             if [[ -f sd-boot/j36/eglprobe ]]; then
                 echo "es_probe=j36/eglprobe ($(stat -c %s sd-boot/j36/eglprobe) bytes, dynamic ARMv7, dlopens libEGL.so.1 and libgbm.so.1)"
                 echo "es_probe_run=j36.es=debug only, as ExecStartPre and again as ExecStopPost; card0 and renderD128 separately, then -s with LIBGL_ALWAYS_SOFTWARE=1 as the control"
+                echo "es_probe_paint=-p as a third ExecStartPre, run as root for DRM master: five 3s frames -- XR24 red, AR24 opaque magenta, AR24 transparent magenta, all three CPU-filled, then two lima frames through gbm"
             else
                 echo "es_probe=not staged; j36.es=debug will report only what Mesa says"
             fi

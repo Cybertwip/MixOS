@@ -62,18 +62,38 @@
  * gets.  So this measures the libraries ES will use, not the ones Debian
  * shipped.
  *
- * Usage: eglprobe [-s | /dev/dri/node ...].  With no arguments it probes card0
- * and renderD128.  Exit status: 0 if some API created a context on some display,
- * 1 otherwise.  Nothing is written anywhere; stdout is the whole output.
+ * With -p it stops asking and paints.  Everything above measures whether a
+ * context can be built, and none of it can answer the question this board is
+ * actually stuck on: ES2 comes up on lima, ES runs, and the panel is black.  A
+ * config table says nothing about whether a frame reaches the glass.  So -p
+ * drives the whole scanout chain itself, in five phases that remove ES, then
+ * SDL, then GL, then gbm from the picture -- see paint() for what each one
+ * proves and for the four verdicts the sequence can return.  It holds each
+ * frame for three seconds, because the instrument for this one is an eye.
+ *
+ * Usage: eglprobe [-s | -p | /dev/dri/node ...].  With no arguments it probes
+ * card0 and renderD128.  Exit status: 0 if some API created a context on some
+ * display (or, for -p, if the mode was set), 1 otherwise.  Nothing is written
+ * anywhere; stdout is the whole output.
  */
 
 #define _GNU_SOURCE
+/*
+ * The dumb buffer's mmap offset is a DRM fake offset, and on a 32-bit kernel
+ * those start at 0x10000000 and run up from there.  A signed 32-bit off_t would
+ * be a silent limit on a call whose failure looks like "the panel is black", so
+ * ask for the 64-bit one.
+ */
+#define _FILE_OFFSET_BITS 64
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 /*
@@ -125,6 +145,20 @@ typedef int32_t EGLint;
 
 struct gbm_device;
 struct gbm_surface;
+struct gbm_bo;
+
+/*
+ * Returned by value, and it is eight bytes wide, so it has to be declared
+ * honestly: AAPCS returns a composite of this size through a hidden pointer, and
+ * a uint64_t stand-in would be returned in r0/r1 instead and read back rubbish.
+ */
+union gbm_bo_handle {
+    void    *ptr;
+    int32_t  s32;
+    uint32_t u32;
+    int64_t  s64;
+    uint64_t u64;
+};
 
 static EGLDisplay (*p_eglGetDisplay)(void *);
 static EGLDisplay (*p_eglGetPlatformDisplayEXT)(EGLenum, void *, const EGLint *);
@@ -147,11 +181,17 @@ static EGLBoolean (*p_eglMakeCurrent)(EGLDisplay, EGLSurface, EGLSurface, EGLCon
 static EGLint (*p_eglGetError)(void);
 static void *(*p_eglGetProcAddress)(const char *);
 
+static EGLBoolean (*p_eglSwapBuffers)(EGLDisplay, EGLSurface);
+
 static struct gbm_device *(*p_gbm_create_device)(int);
 static void (*p_gbm_device_destroy)(struct gbm_device *);
 static struct gbm_surface *(*p_gbm_surface_create)(struct gbm_device *, uint32_t,
                                                    uint32_t, uint32_t, uint32_t);
 static void (*p_gbm_surface_destroy)(struct gbm_surface *);
+static struct gbm_bo *(*p_gbm_surface_lock_front_buffer)(struct gbm_surface *);
+static void (*p_gbm_surface_release_buffer)(struct gbm_surface *, struct gbm_bo *);
+static union gbm_bo_handle (*p_gbm_bo_get_handle)(struct gbm_bo *);
+static uint32_t (*p_gbm_bo_get_stride)(struct gbm_bo *);
 
 static const char *eglerr(EGLint e)
 {
@@ -262,6 +302,19 @@ static int load(void)
     SYM(gbm, gbm_device_destroy);
     SYM(gbm, gbm_surface_create);
     SYM(gbm, gbm_surface_destroy);
+
+    /*
+     * The five -p needs, optional on purpose: the question modes above work
+     * without them, so a libgbm that lacks one should cost the GL phase of -p and
+     * nothing else.  paint() checks for NULL and says which name was missing.
+     */
+    *(void **)(&p_eglSwapBuffers) = dlsym(egl, "eglSwapBuffers");
+    *(void **)(&p_gbm_surface_lock_front_buffer) =
+        dlsym(gbm, "gbm_surface_lock_front_buffer");
+    *(void **)(&p_gbm_surface_release_buffer) =
+        dlsym(gbm, "gbm_surface_release_buffer");
+    *(void **)(&p_gbm_bo_get_handle) = dlsym(gbm, "gbm_bo_get_handle");
+    *(void **)(&p_gbm_bo_get_stride) = dlsym(gbm, "gbm_bo_get_stride");
     return 0;
 }
 #undef SYM
@@ -527,9 +580,600 @@ static int probe_surfaceless(void)
     return wins;
 }
 
+/* ── -p: the scanout test ──────────────────────────────────────────────────────
+ *
+ * Everything above measures whether a context can be built.  None of it can
+ * answer the question the board is stuck on -- ES2 comes up on lima, ES runs,
+ * and the panel is black -- because a config table says nothing about whether a
+ * frame reaches the glass.
+ *
+ * DRM is spoken to with raw ioctls rather than through libdrm, for the reason EGL
+ * and GBM are declared by hand at the top of this file: the uapi structures are
+ * ABI, drm_ioctl() deliberately tolerates a caller whose struct is shorter than
+ * the kernel's (it allocates max(user, driver), copies the user's size in and
+ * zero-fills the rest), and dlopening libdrm.so.2 would add a fourth library
+ * that can be absent.
+ */
+
+#define J36_IOC(dir, nr, sz) (((unsigned)(dir) << 30) | ('d' << 8) | \
+                              (unsigned)(nr) | ((unsigned)(sz) << 16))
+#define J36_IO(nr)           J36_IOC(0u, nr, 0)
+#define J36_IOWR(nr, type)   J36_IOC(3u, nr, sizeof(type))
+
+struct drm_mode_modeinfo {
+    uint32_t clock;
+    uint16_t hdisplay, hsync_start, hsync_end, htotal, hskew;
+    uint16_t vdisplay, vsync_start, vsync_end, vtotal, vscan;
+    uint32_t vrefresh;
+    uint32_t flags;
+    uint32_t type;
+    char     name[32];
+};
+
+struct drm_mode_card_res {
+    uint64_t fb_id_ptr, crtc_id_ptr, connector_id_ptr, encoder_id_ptr;
+    uint32_t count_fbs, count_crtcs, count_connectors, count_encoders;
+    uint32_t min_width, max_width, min_height, max_height;
+};
+
+struct drm_mode_get_connector {
+    uint64_t encoders_ptr, modes_ptr, props_ptr, prop_values_ptr;
+    uint32_t count_modes, count_props, count_encoders;
+    uint32_t encoder_id, connector_id, connector_type, connector_type_id;
+    uint32_t connection, mm_width, mm_height, subpixel;
+    uint32_t pad;
+};
+
+struct drm_mode_get_encoder {
+    uint32_t encoder_id, encoder_type, crtc_id, possible_crtcs, possible_clones;
+};
+
+struct drm_mode_crtc {
+    uint64_t set_connectors_ptr;
+    uint32_t count_connectors, crtc_id, fb_id, x, y, gamma_size, mode_valid;
+    struct drm_mode_modeinfo mode;
+};
+
+struct drm_mode_fb_cmd2 {
+    uint32_t fb_id, width, height, pixel_format, flags;
+    uint32_t handles[4], pitches[4], offsets[4];
+    uint64_t modifier[4];
+};
+
+struct drm_mode_create_dumb {
+    uint32_t height, width, bpp, flags, handle, pitch;
+    uint64_t size;
+};
+
+struct drm_mode_map_dumb {
+    uint32_t handle, pad;
+    uint64_t offset;
+};
+
+struct drm_mode_destroy_dumb {
+    uint32_t handle;
+};
+
+#define DRM_IOCTL_SET_MASTER        J36_IO(0x1e)
+#define DRM_IOCTL_DROP_MASTER       J36_IO(0x1f)
+#define DRM_IOCTL_MODE_GETRESOURCES J36_IOWR(0xA0, struct drm_mode_card_res)
+#define DRM_IOCTL_MODE_GETCRTC      J36_IOWR(0xA1, struct drm_mode_crtc)
+#define DRM_IOCTL_MODE_SETCRTC      J36_IOWR(0xA2, struct drm_mode_crtc)
+#define DRM_IOCTL_MODE_GETENCODER   J36_IOWR(0xA6, struct drm_mode_get_encoder)
+#define DRM_IOCTL_MODE_GETCONNECTOR J36_IOWR(0xA7, struct drm_mode_get_connector)
+#define DRM_IOCTL_MODE_RMFB         J36_IOWR(0xAF, unsigned int)
+#define DRM_IOCTL_MODE_CREATE_DUMB  J36_IOWR(0xB2, struct drm_mode_create_dumb)
+#define DRM_IOCTL_MODE_MAP_DUMB     J36_IOWR(0xB3, struct drm_mode_map_dumb)
+#define DRM_IOCTL_MODE_DESTROY_DUMB J36_IOWR(0xB4, struct drm_mode_destroy_dumb)
+#define DRM_IOCTL_MODE_ADDFB2       J36_IOWR(0xB8, struct drm_mode_fb_cmd2)
+
+#define GL_COLOR_BUFFER_BIT        0x00004000
+
+/* How long each frame is held up.  Long enough to see, short enough that five of
+ * them do not look like a hang on a board whose next line is ES starting. */
+#define HOLD_SECONDS 3
+
+static int      paint_fd = -1;
+static uint32_t paint_crtc, paint_conn;
+static struct   drm_mode_modeinfo paint_mode;
+static int      paint_phase;
+
+static int drm_ioctl(unsigned long req, void *arg)
+{
+    int r;
+    do {
+        r = ioctl(paint_fd, req, arg);
+    } while (r < 0 && (errno == EINTR || errno == EAGAIN));
+    return r;
+}
+
+/*
+ * Put a framebuffer on the CRTC with a full modeset every time, rather than
+ * page-flipping after the first.  A flip needs the event loop and tells us less:
+ * SETCRTC is what SDL's KMSDRM backend does for its first frame and it is the one
+ * call that exercises the DSI and the panel as well as the OVL.
+ */
+static int show(uint32_t fb, const char *what)
+{
+    struct drm_mode_crtc c;
+    uint32_t conn = paint_conn;
+
+    memset(&c, 0, sizeof(c));
+    c.crtc_id = paint_crtc;
+    c.fb_id = fb;
+    c.set_connectors_ptr = (uint64_t)(uintptr_t)&conn;
+    c.count_connectors = 1;
+    c.mode = paint_mode;
+    c.mode_valid = 1;
+
+    paint_phase++;
+    if (drm_ioctl(DRM_IOCTL_MODE_SETCRTC, &c) < 0) {
+        printf("paint %d: SETCRTC for %s: %m\n", paint_phase, what);
+        return -1;
+    }
+    printf("paint %d: the panel should be %s for %ds now\n",
+           paint_phase, what, HOLD_SECONDS);
+    sleep(HOLD_SECONDS);
+    return 0;
+}
+
+/*
+ * A CPU-filled dumb buffer: no GL, no gbm, no lima, no Mesa at all.  This is the
+ * half of the question that the GL phases cannot separate out -- if a solid
+ * colour written with memset() does not appear, nothing about EGL is involved and
+ * the fault is the modeset, the DSI or the panel.
+ */
+static int paint_dumb(uint32_t fourcc, uint32_t pixel, const char *what)
+{
+    struct drm_mode_create_dumb cd;
+    struct drm_mode_map_dumb md;
+    struct drm_mode_destroy_dumb dd;
+    struct drm_mode_fb_cmd2 fb;
+    uint32_t *p, x, n;
+    void *map;
+    int ret = -1;
+
+    memset(&cd, 0, sizeof(cd));
+    cd.width = paint_mode.hdisplay;
+    cd.height = paint_mode.vdisplay;
+    cd.bpp = 32;
+    if (drm_ioctl(DRM_IOCTL_MODE_CREATE_DUMB, &cd) < 0) {
+        printf("paint %d: CREATE_DUMB for %s: %m\n", paint_phase + 1, what);
+        return -1;
+    }
+
+    memset(&md, 0, sizeof(md));
+    md.handle = cd.handle;
+    if (drm_ioctl(DRM_IOCTL_MODE_MAP_DUMB, &md) < 0) {
+        printf("paint %d: MAP_DUMB for %s: %m\n", paint_phase + 1, what);
+        goto out_handle;
+    }
+    map = mmap(NULL, (size_t)cd.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+               paint_fd, (off_t)md.offset);
+    if (map == MAP_FAILED) {
+        printf("paint %d: mmap of %llu bytes for %s: %m\n", paint_phase + 1,
+               (unsigned long long)cd.size, what);
+        goto out_handle;
+    }
+
+    /* Row by row, because pitch is not width*4 on every allocator. */
+    for (n = 0; n < cd.height; n++) {
+        p = (uint32_t *)((char *)map + (size_t)n * cd.pitch);
+        for (x = 0; x < cd.width; x++)
+            p[x] = pixel;
+    }
+    munmap(map, (size_t)cd.size);
+
+    memset(&fb, 0, sizeof(fb));
+    fb.width = cd.width;
+    fb.height = cd.height;
+    fb.pixel_format = fourcc;
+    fb.handles[0] = cd.handle;
+    fb.pitches[0] = cd.pitch;
+    if (drm_ioctl(DRM_IOCTL_MODE_ADDFB2, &fb) < 0) {
+        printf("paint %d: ADDFB2 %c%c%c%c for %s: %m -- this format is not "
+               "scanout-capable on this plane\n", paint_phase + 1,
+               fourcc & 0xff, (fourcc >> 8) & 0xff, (fourcc >> 16) & 0xff,
+               (fourcc >> 24) & 0xff, what);
+        goto out_handle;
+    }
+
+    /* show() is what numbers the phase, so that a phase number in the log always
+     * means a frame that was actually put on the CRTC. */
+    ret = show(fb.fb_id, what);
+    drm_ioctl(DRM_IOCTL_MODE_RMFB, &fb.fb_id);
+
+out_handle:
+    memset(&dd, 0, sizeof(dd));
+    dd.handle = cd.handle;
+    drm_ioctl(DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
+    return ret;
+}
+
+/*
+ * The same colour, this time drawn by lima into a gbm surface and scanned out of
+ * the buffer EGL hands back -- which is the whole of ES's path with ES, SDL and
+ * the renderer taken out of it.  ARGB8888 because that is the format SDL's KMSDRM
+ * backend hardcodes for its gbm surface (SDL_kmsdrmvideo.c:1197) whatever
+ * SDL_GL_ALPHA_SIZE was asked for, so it is the format ES will use.
+ *
+ * Two frames, in two colours.  The second one comes out of the other buffer of
+ * the swap chain, so it says whether the chain rotates: a first frame that
+ * appears and a second that does not is a buffer that was never imported.
+ */
+static int paint_gl(struct gbm_device *gbm)
+{
+    static const struct { float r, g, b; const char *name; } FRAMES[] = {
+        { 1.0f, 0.0f, 1.0f, "MAGENTA, drawn by lima into an AR24 gbm surface" },
+        { 0.0f, 1.0f, 0.0f, "GREEN, lima's second frame, the other buffer of the chain" },
+    };
+    void (*gl_clear_color)(float, float, float, float);
+    void (*gl_clear)(unsigned int);
+    void (*gl_finish)(void);
+    EGLDisplay dpy = NULL;
+    EGLConfig pick[64], cfg;
+    EGLContext ctx;
+    EGLSurface surf;
+    struct gbm_surface *gs;
+    struct gbm_bo *held = NULL;
+    uint32_t held_fb = 0;
+    EGLint count = 0, i, e;
+    EGLint attr[] = {
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_NONE
+    };
+    EGLint cattr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    size_t f;
+    int shown = 0;
+
+    if (!p_eglSwapBuffers || !p_gbm_surface_lock_front_buffer ||
+        !p_gbm_surface_release_buffer || !p_gbm_bo_get_handle ||
+        !p_gbm_bo_get_stride) {
+        printf("paint: the GL phases need eglSwapBuffers, "
+               "gbm_surface_lock_front_buffer, gbm_surface_release_buffer, "
+               "gbm_bo_get_handle and gbm_bo_get_stride, and this payload is "
+               "missing at least one of them\n");
+        return 0;
+    }
+
+    if (p_eglGetPlatformDisplayEXT)
+        dpy = p_eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR, gbm, NULL);
+    if (!dpy && p_eglGetPlatformDisplay)
+        dpy = p_eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm, NULL);
+    if (!dpy)
+        dpy = p_eglGetDisplay(gbm);
+    if (!dpy || !p_eglInitialize(dpy, NULL, NULL)) {
+        printf("paint: no EGL on this device, so the GL phases cannot run\n");
+        return 0;
+    }
+
+    eglclear();
+    if (!p_eglBindAPI(EGL_OPENGL_ES_API) ||
+        !p_eglChooseConfig(dpy, attr, pick, 64, &count) || count == 0) {
+        printf("paint: no ES2 window config\n");
+        goto out_dpy;
+    }
+    cfg = pick[0];
+    for (i = 0; i < count; i++) {
+        EGLint vis = 0;
+        p_eglGetConfigAttrib(dpy, pick[i], EGL_NATIVE_VISUAL_ID, &vis);
+        if ((uint32_t)vis == FOURCC_ARGB8888) {
+            cfg = pick[i];
+            break;
+        }
+    }
+
+    gs = p_gbm_surface_create(gbm, paint_mode.hdisplay, paint_mode.vdisplay,
+                              FOURCC_ARGB8888,
+                              GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+    if (!gs) {
+        printf("paint: gbm_surface_create %ux%u AR24 SCANOUT|RENDERING failed -- "
+               "kmsro cannot pair lima with this display device\n",
+               paint_mode.hdisplay, paint_mode.vdisplay);
+        goto out_dpy;
+    }
+
+    ctx = p_eglCreateContext(dpy, cfg, NULL, cattr);
+    surf = ctx ? p_eglCreateWindowSurface(dpy, cfg, gs, NULL) : NULL;
+    if (!ctx || !surf || !p_eglMakeCurrent(dpy, surf, surf, ctx)) {
+        e = p_eglGetError();
+        printf("paint: no current ES2 context on that surface: 0x%04x %s\n",
+               e, eglerr(e));
+        goto out_gs;
+    }
+
+    *(void **)(&gl_clear_color) = p_eglGetProcAddress("glClearColor");
+    *(void **)(&gl_clear) = p_eglGetProcAddress("glClear");
+    *(void **)(&gl_finish) = p_eglGetProcAddress("glFinish");
+    if (!gl_clear_color || !gl_clear) {
+        printf("paint: eglGetProcAddress has no glClear\n");
+        goto out_current;
+    }
+
+    for (f = 0; f < sizeof(FRAMES) / sizeof(FRAMES[0]); f++) {
+        struct gbm_bo *bo;
+        struct drm_mode_fb_cmd2 fb;
+        union gbm_bo_handle h;
+
+        /*
+         * Alpha 1.  A clear to alpha 0 is the other experiment and the CPU phases
+         * above run it without a GPU in the way; here the point is a frame that
+         * cannot be blended away, so that a black panel means the frame did not
+         * arrive rather than that it arrived transparent.
+         */
+        gl_clear_color(FRAMES[f].r, FRAMES[f].g, FRAMES[f].b, 1.0f);
+        gl_clear(GL_COLOR_BUFFER_BIT);
+        if (gl_finish)
+            gl_finish();
+        if (!p_eglSwapBuffers(dpy, surf)) {
+            e = p_eglGetError();
+            printf("paint: eglSwapBuffers: 0x%04x %s\n", e, eglerr(e));
+            break;
+        }
+
+        bo = p_gbm_surface_lock_front_buffer(gs);
+        if (!bo) {
+            printf("paint: gbm_surface_lock_front_buffer returned nothing after "
+                   "a swap -- there is no front buffer to scan out\n");
+            break;
+        }
+        h = p_gbm_bo_get_handle(bo);
+
+        memset(&fb, 0, sizeof(fb));
+        fb.width = paint_mode.hdisplay;
+        fb.height = paint_mode.vdisplay;
+        fb.pixel_format = FOURCC_ARGB8888;
+        fb.handles[0] = h.u32;
+        fb.pitches[0] = p_gbm_bo_get_stride(bo);
+        if (drm_ioctl(DRM_IOCTL_MODE_ADDFB2, &fb) < 0) {
+            printf("paint %d: ADDFB2 on lima's buffer (handle %u, stride %u): %m "
+                   "-- lima rendered it but the display device will not scan it "
+                   "out\n", paint_phase + 1, fb.handles[0], fb.pitches[0]);
+            p_gbm_surface_release_buffer(gs, bo);
+            break;
+        }
+
+        if (show(fb.fb_id, FRAMES[f].name) == 0)
+            shown++;
+
+        /* Only now is the previous frame off the CRTC and safe to give back. */
+        if (held) {
+            drm_ioctl(DRM_IOCTL_MODE_RMFB, &held_fb);
+            p_gbm_surface_release_buffer(gs, held);
+        }
+        held = bo;
+        held_fb = fb.fb_id;
+    }
+
+    if (held) {
+        drm_ioctl(DRM_IOCTL_MODE_RMFB, &held_fb);
+        p_gbm_surface_release_buffer(gs, held);
+    }
+
+out_current:
+    p_eglMakeCurrent(dpy, NULL, NULL, NULL);
+    if (surf)
+        p_eglDestroySurface(dpy, surf);
+    if (ctx)
+        p_eglDestroyContext(dpy, ctx);
+out_gs:
+    p_gbm_surface_destroy(gs);
+out_dpy:
+    /* eglTerminate takes the context and the surface with it on the paths that
+     * jump past their destructors. */
+    p_eglTerminate(dpy);
+    return shown;
+}
+
+/*
+ * Five phases, in the order that narrows the fault:
+ *
+ *   1  RED, XR24, CPU-filled       modeset + DSI + panel + OVL, no alpha anywhere
+ *   2  MAGENTA, AR24 alpha ff      the same with the format SDL will hand it
+ *   3  MAGENTA, AR24 alpha 00      the same buffer, transparent
+ *   4  MAGENTA, lima into gbm      the ES path with ES, SDL and the renderer out
+ *   5  GREEN, lima's second frame  the swap chain rotating
+ *
+ * and four verdicts:
+ *
+ *   nothing at all          the modeset does not reach the glass.  Nothing about
+ *                           EGL is involved: it is the DSI being re-initialised
+ *                           under the panel, or the mode the panel driver
+ *                           reports, and the place to look is mtk_dsi against the
+ *                           state the LK left.
+ *   1 and 2 but not 3       the OVL blends per-pixel alpha against a black
+ *                           background.  Then ES is invisible for one reason and
+ *                           it is in the renderer, not the kernel:
+ *                           Renderer_GLES20.cpp clears to (0,0,0,0) and every
+ *                           pixel it does not overdraw is transparent black.
+ *   1, 2, 3 but not 4 or 5  the display path is sound and the fault is the
+ *                           gbm/kmsro pairing -- lima's buffer imports but never
+ *                           becomes what the OVL fetches.
+ *   all five               the display path is sound end to end, and a black ES
+ *                           is ES's own drawing.  The GLES2 self-test line and
+ *                           the per-frame draw count are then the evidence.
+ */
+static int paint(const char *path)
+{
+    struct drm_mode_card_res res;
+    uint32_t crtcs[8], conns[16], encs[16];
+    struct drm_mode_get_connector conn;
+    struct drm_mode_modeinfo modes[64];
+    struct drm_mode_get_encoder enc;
+    struct drm_mode_crtc old;
+    struct gbm_device *gbm;
+    uint32_t i, j, k;
+    int found = 0, ok = 0;
+
+    printf("== %s, scanout test\n", path);
+
+    paint_fd = open(path, O_RDWR | O_CLOEXEC);
+    if (paint_fd < 0) {
+        printf("open: %m\n");
+        return 1;
+    }
+
+    /*
+     * Ask for master explicitly.  Opening the only open of the device makes us
+     * master implicitly, but ES may have been here first on a re-run and the
+     * error is worth naming: EBUSY here means something else owns the display and
+     * every SETCRTC below would have failed with EACCES instead.
+     */
+    if (drm_ioctl(DRM_IOCTL_SET_MASTER, NULL) < 0)
+        printf("paint: SET_MASTER: %m (a modeset may not be permitted)\n");
+
+    memset(&res, 0, sizeof(res));
+    res.count_crtcs = 8;
+    res.count_connectors = 16;
+    res.crtc_id_ptr = (uint64_t)(uintptr_t)crtcs;
+    res.connector_id_ptr = (uint64_t)(uintptr_t)conns;
+    if (drm_ioctl(DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) {
+        printf("GETRESOURCES: %m -- this node has no modesetting at all "
+               "(a render node, or a driver without DRIVER_MODESET)\n");
+        goto out;
+    }
+    printf("paint: %u crtc, %u connector, %u encoder, %ux%u..%ux%u\n",
+           res.count_crtcs, res.count_connectors, res.count_encoders,
+           res.min_width, res.min_height, res.max_width, res.max_height);
+
+    for (i = 0; i < res.count_connectors && i < 16 && !found; i++) {
+        memset(&conn, 0, sizeof(conn));
+        conn.connector_id = conns[i];
+        /* Zero counts first: that is what makes the kernel probe the connector
+         * and fill the counts in, and it is the only way to learn count_modes. */
+        if (drm_ioctl(DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0) {
+            printf("paint: connector %u: %m\n", conns[i]);
+            continue;
+        }
+        printf("paint: connector %u type %u, connection %u, %u modes\n",
+               conn.connector_id, conn.connector_type, conn.connection,
+               conn.count_modes);
+        if (conn.connection != 1 || conn.count_modes == 0)
+            continue;
+
+        /*
+         * The counts go back unchanged, not clamped.  drm_mode_getconnector only
+         * copies a list when the caller's count is >= the kernel's, so asking for
+         * fewer than there are is not a truncated read -- it is no read at all,
+         * with the count returned and the array left as it was.  A panel with more
+         * than 64 modes is not a thing, but a garbage modes[0] would be a modeset
+         * to a garbage timing, so it is refused rather than clamped.
+         */
+        if (conn.count_modes > 64) {
+            printf("paint: connector %u reports %u modes, more than this probe "
+                   "will read\n", conn.connector_id, conn.count_modes);
+            continue;
+        }
+        conn.modes_ptr = (uint64_t)(uintptr_t)modes;
+        if (conn.count_encoders > 16)
+            conn.count_encoders = 0;   /* fall back to conn.encoder_id alone */
+        else
+            conn.encoders_ptr = (uint64_t)(uintptr_t)encs;
+        conn.count_props = 0;
+        conn.props_ptr = 0;
+        conn.prop_values_ptr = 0;
+        if (drm_ioctl(DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0) {
+            printf("paint: connector %u second pass: %m\n", conns[i]);
+            continue;
+        }
+        if (conn.count_modes == 0 || conn.count_modes > 64) {
+            printf("paint: connector %u's mode list moved between the two "
+                   "passes\n", conn.connector_id);
+            continue;
+        }
+
+        paint_conn = conn.connector_id;
+        paint_mode = modes[0];
+        printf("paint: mode \"%s\" %ux%u, %u kHz, flags 0x%x, type 0x%x\n",
+               paint_mode.name, paint_mode.hdisplay, paint_mode.vdisplay,
+               paint_mode.clock, paint_mode.flags, paint_mode.type);
+
+        /* The encoder's current CRTC if it has one, otherwise the first CRTC any
+         * of this connector's encoders can drive. */
+        for (j = 0; j < conn.count_encoders + 1 && !paint_crtc; j++) {
+            memset(&enc, 0, sizeof(enc));
+            enc.encoder_id = j == 0 ? conn.encoder_id : encs[j - 1];
+            if (!enc.encoder_id)
+                continue;
+            if (drm_ioctl(DRM_IOCTL_MODE_GETENCODER, &enc) < 0)
+                continue;
+            if (enc.crtc_id) {
+                paint_crtc = enc.crtc_id;
+                break;
+            }
+            for (k = 0; k < res.count_crtcs && k < 8; k++) {
+                if (enc.possible_crtcs & (1u << k)) {
+                    paint_crtc = crtcs[k];
+                    break;
+                }
+            }
+        }
+        if (!paint_crtc) {
+            printf("paint: connector %u has no CRTC to drive it\n", paint_conn);
+            continue;
+        }
+        found = 1;
+    }
+
+    if (!found) {
+        printf("paint: no connected connector with a mode -- the panel bridge "
+               "never attached, so there is nothing to scan out to\n");
+        goto out;
+    }
+
+    /*
+     * What is on that CRTC right now, before anything of ours is.  A non-zero
+     * fb_id means the kernel's own fbdev client is scanning out and the console
+     * is visible, which is worth knowing: it means the pipe works and only the
+     * frames are in question.
+     */
+    memset(&old, 0, sizeof(old));
+    old.crtc_id = paint_crtc;
+    if (drm_ioctl(DRM_IOCTL_MODE_GETCRTC, &old) == 0)
+        printf("paint: crtc %u currently has fb %u, mode_valid %u \"%s\"\n",
+               paint_crtc, old.fb_id, old.mode_valid, old.mode.name);
+
+    printf("paint: five phases, %ds each.  Watch the panel and note which of "
+           "them you see.\n", HOLD_SECONDS);
+
+    if (paint_dumb(FOURCC_XRGB8888, 0xffff0000u,
+                   "RED, no alpha channel (XR24), written by the CPU") == 0)
+        ok++;
+    if (paint_dumb(FOURCC_ARGB8888, 0xffff00ffu,
+                   "MAGENTA, opaque (AR24, alpha ff), written by the CPU") == 0)
+        ok++;
+    if (paint_dumb(FOURCC_ARGB8888, 0x00ff00ffu,
+                   "MAGENTA, transparent (AR24, alpha 00), written by the CPU -- "
+                   "black here and colour above means the OVL blends alpha") == 0)
+        ok++;
+
+    gbm = p_gbm_create_device(paint_fd);
+    if (!gbm) {
+        printf("paint: gbm_create_device on the display node failed, so the two "
+               "GL phases cannot run\n");
+    } else {
+        ok += paint_gl(gbm);
+        p_gbm_device_destroy(gbm);
+    }
+
+    printf("paint: %d of the 5 phases reached the CRTC without an error.  In "
+           "order, the panel should have shown: red, magenta, magenta (or black, "
+           "if alpha is blended), magenta, green.\n", ok);
+    printf("paint: master is dropped now, so the console framebuffer comes back "
+           "and ES gets the panel next.\n");
+
+out:
+    drm_ioctl(DRM_IOCTL_DROP_MASTER, NULL);
+    close(paint_fd);
+    paint_fd = -1;
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
-    int wins = 0, i;
+    int wins = 0, painted = -1, i;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
 
@@ -540,6 +1184,8 @@ int main(int argc, char **argv)
         for (i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "-s"))
                 wins += probe_surfaceless();
+            else if (!strcmp(argv[i], "-p"))
+                painted = paint("/dev/dri/card0");
             else
                 wins += probe(argv[i], strstr(argv[i], "/card") != NULL);
         }
@@ -548,6 +1194,9 @@ int main(int argc, char **argv)
         wins += probe("/dev/dri/card0", 1);
         wins += probe("/dev/dri/renderD128", 0);
     }
+
+    if (painted >= 0)
+        return painted;
 
     printf("eglprobe: %s\n", wins ? "a context came up, see which API above"
                                   : "no API created a context on any node");

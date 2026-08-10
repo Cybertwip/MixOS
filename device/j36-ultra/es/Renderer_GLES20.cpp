@@ -492,10 +492,13 @@ namespace Renderer
 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
 
-		// Alpha is not optional here even though nothing reads it: SDL's KMSDRM
-		// backend hands the chosen config's EGL_NATIVE_VISUAL_ID to
-		// gbm_surface_create, so a config without alpha is a scanout format the
-		// display half of this stack does not have.
+		// Alpha is not optional here, and not because anything reads it: SDL's
+		// KMSDRM backend hardcodes GBM_FORMAT_ARGB8888 for its gbm surface
+		// (SDL_kmsdrmvideo.c:1197) and then pins that visual with
+		// SDL_EGL_SetRequiredVisualId, so a config with no alpha channel is a config
+		// SDL will not accept for this window whatever is asked for here. Which also
+		// means the framebuffer that gets scanned out has an alpha channel that this
+		// renderer is responsible for -- see the clear colour in createContext().
 		SDL_GL_SetAttribute(SDL_GL_RED_SIZE,     8);
 		SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE,   8);
 		SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE,    8);
@@ -585,7 +588,18 @@ namespace Renderer
 			p_glClearColor(1.0f, 0.0f, 1.0f, 1.0f);
 		}
 		else
-			p_glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+			// Opaque black, and the fourth argument is the whole point of the line.
+			// The other renderers in this tree clear to (0, 0, 0, 0) and get away with
+			// it because a desktop compositor throws destination alpha away; here the
+			// buffer this clears IS the scanout buffer, and it is ARGB8888 because
+			// SDL's KMSDRM backend allows nothing else. On a display controller that
+			// blends per-pixel alpha against its background -- which MT6592's OVL does
+			// for an AR24 layer -- a frame cleared to alpha 0 is composited to the
+			// background colour, and a correct frame that has been blended away is
+			// indistinguishable from a frame that never arrived. Whether this board
+			// blends it is what `eglprobe -p' phase 3 measures; alpha 1 is right either
+			// way, since nothing downstream of ES wants a transparent UI.
+			p_glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 
 	} // createContext
 
