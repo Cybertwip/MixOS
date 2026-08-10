@@ -656,6 +656,12 @@ done
 # /bin/sh, and /init is #!/bin/sh.
 grep -q '^CONFIG_SH_IS_ASH=y$' "$BUSYBOX_SRC/.config" || \
     die "busybox CONFIG_SH_IS_ASH is off; /init is #!/bin/sh"
+# Nor is this one, and without it `mount -o bind' silently becomes a mount attempt
+# with a filesystem type of "bind": busybox parses -o flag words only when
+# FEATURE_MOUNT_FLAGS is on.  /init bind-mounts the GLES 2.0 EmulationStation over
+# the rootfs's, which is the one place in the boot that needs it.
+grep -q '^CONFIG_FEATURE_MOUNT_FLAGS=y$' "$BUSYBOX_SRC/.config" || \
+    die "busybox CONFIG_FEATURE_MOUNT_FLAGS is off; /init needs \`mount -o bind'"
 
 rm -rf "$INITROOT"
 mkdir -p "$INITROOT"/{bin,dev,etc,lib/modules/$KERNEL_RELEASE/extra,proc,root,sbin,sys,tmp}
