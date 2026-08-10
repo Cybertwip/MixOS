@@ -129,6 +129,53 @@ KERNEL_DTB=rk3326-rg351mp-linux.dtb
 mountpoint=mnt/boot
 export KERNEL_SRC DEF_CONFIG SCREEN_ROTATION KERNEL_DTB mountpoint
 
+# The three files u-boot loads live in the FAT boot partition, and that
+# partition does not survive the image stage: image_setup.sh recreates $DISK
+# with a plain `dd`, which truncates the file, while a kernel checkpoint -- a
+# stamp in this state directory -- survives.  Keeping a copy of the kernel
+# payload outside the image is what lets the boot partition be rebuilt without
+# a two-hour kernel rebuild, and its absence is how we know a kernel checkpoint
+# is describing something that no longer exists.
+BOOT_STASH="$STATE_DIR/boot"
+# What the pipeline never wrote at all: the R36S device tree, the u-boot panel
+# variants, the off-charging bitmaps and the dtb selector.  Taken from the BOOT
+# partition of a working dArkOS R36 image.
+BOOT_PAYLOAD="${DARKOS_R36_BOOT_PAYLOAD:-}"
+# LABEL=ROOTFS rather than /dev/mmcblk0p2: an R36S has two card slots and no
+# eMMC, so the mmcblk index depends on which slot enumerates first, while the
+# label is written by mkfs and matches the fstab this build installs.
+BOOT_ROOT_SPEC="LABEL=ROOTFS"
+export BOOT_STASH BOOT_PAYLOAD BOOT_ROOT_SPEC
+
+# Image and uInitrd come out of the boot partition; the device trees are worth
+# stashing too so a rebuild does not depend on the kernel source tree, which
+# clean_mounts.sh deletes.
+stash_boot_payload() {
+    local artifact
+    mkdir -p "$BOOT_STASH"
+    for artifact in Image uInitrd "$KERNEL_DTB" rk3326-r36s-linux.dtb \
+        rg351mp-uboot.dtb rg351v-uboot.dtb; do
+        if [[ -s "$mountpoint/$artifact" ]]; then
+            sudo cp -f "$mountpoint/$artifact" "$BOOT_STASH/$artifact"
+        fi
+    done
+    # An R36S is not an RG351MP.  If the vendor tree carries its device tree,
+    # prefer that over any reference blob; the build_kernel.sh copy step only
+    # knows about $KERNEL_DTB.
+    if [[ -s "$KERNEL_SRC/arch/arm64/boot/dts/rockchip/rk3326-r36s-linux.dtb" ]]; then
+        sudo cp -f "$KERNEL_SRC/arch/arm64/boot/dts/rockchip/rk3326-r36s-linux.dtb" \
+            "$BOOT_STASH/rk3326-r36s-linux.dtb"
+    fi
+    sudo chown -R "$(id -u):$(id -g)" "$BOOT_STASH"
+    log "Boot payload stashed in $BOOT_STASH:"
+    ls -l "$BOOT_STASH"
+}
+
+boot_stash_ready() {
+    [[ -s "$BOOT_STASH/Image" && -s "$BOOT_STASH/uInitrd" ]] || return 1
+    compgen -G "$BOOT_STASH/*.dtb" >/dev/null
+}
+
 ensure_rootfs_mounts() {
     [[ -f "$FILESYSTEM" ]] || return 0
     mkdir -p Arkbuild
@@ -161,7 +208,16 @@ ensure_boot_mount() {
         offset=$((SYSTEM_PART_START * 512))
         size=$(( (SYSTEM_PART_END - SYSTEM_PART_START + 1) * 512 ))
         loop="$(sudo losetup --find --show --offset "$offset" --sizelimit "$size" "$DISK")"
-        sudo mount "$loop" "$mountpoint"
+        # A disk the image stage has just recreated has no filesystem here yet.
+        # Mounting it is not possible and not needed: install_boot.sh formats and
+        # fills this partition during the finalization stage.  Failing quietly
+        # here, and detaching the loop, is what keeps a stale /dev/loop from
+        # being mounted over the real partition later.
+        if ! sudo mount "$loop" "$mountpoint" 2>/dev/null; then
+            log "The boot partition carries no filesystem yet; the finalization stage builds it"
+            sudo losetup -d "$loop" 2>/dev/null || true
+            return 0
+        fi
     fi
 }
 
@@ -257,13 +313,50 @@ if [[ -s "$mountpoint/Image" && -s "$mountpoint/$KERNEL_DTB" && -s "$mountpoint/
     mark kernel
 fi
 
-# If a complete split archive already exists, verify and stop immediately.
+# clean_mounts.sh deletes the build filesystem at the end of a successful run,
+# so a state directory outlives the rootfs its checkpoints describe.  Every
+# rootfs stage has to run again in that case; leaving the stamps in place would
+# skip straight past an empty Debian tree and package an image with no userspace.
+if [[ ! -f "$FILESYSTEM" ]] && marked bootstrap; then
+    log "The build filesystem is gone; clearing the rootfs checkpoints that described it"
+    rm -f "$STATE_DIR"/partition.done "$STATE_DIR"/bootstrap.done \
+        "$STATE_DIR"/userspace.done "$STATE_DIR"/finalization.done \
+        "$STATE_DIR"/component-*.done
+fi
+
+# A kernel checkpoint means the kernel was compiled, not that its output is
+# still anywhere.  Recover the payload from a boot partition that happens to be
+# mounted; otherwise the checkpoint is stale and the kernel has to be rebuilt.
+if marked kernel && ! boot_stash_ready; then
+    if [[ -s "$mountpoint/Image" && -s "$mountpoint/uInitrd" ]]; then
+        log "Recovering the boot payload from the mounted boot partition"
+        stash_boot_payload
+    fi
+fi
+if marked kernel && ! boot_stash_ready; then
+    log "The kernel checkpoint has no boot payload left to install; the kernel will be rebuilt"
+    rm -f "$STATE_DIR/kernel.done"
+fi
+
+# If a complete split archive already exists, verify and stop immediately -- but
+# only if the image it was made from can actually boot.  The 08042026 GUI image
+# archived cleanly with an unformatted BOOT partition, and accepting that here is
+# what turned a build bug into a released artifact.
 if [[ -f "${DISK}.7z.001" ]]; then
-    log "Existing completed archive found; verifying it"
-    7z t "${DISK}.7z.001"
-    mark complete
-    printf '%s\n' "$DISK" > "$STATE_DIR/latest-image"
-    exit 0
+    if [[ -f "$DISK" ]] && \
+        ! python3 device/r36-ultra/verify_boot.py "$DISK" \
+            --require Image --require uInitrd --require boot.ini; then
+        log "The finished image has no bootable BOOT partition; discarding it and rebuilding"
+        rm -f "$DISK" "${DISK}".7z.*
+        rm -f "$STATE_DIR"/complete.done "$STATE_DIR"/finalization.done \
+            "$STATE_DIR"/image.done
+    else
+        log "Existing completed archive found; verifying it"
+        7z t "${DISK}.7z.001"
+        mark complete
+        printf '%s\n' "$DISK" > "$STATE_DIR/latest-image"
+        exit 0
+    fi
 fi
 
 run_stage prepare prepare.sh
@@ -280,6 +373,7 @@ run_stage image image_setup.sh
 if ! marked kernel; then
     clear_stale_boot_mount
     run_stage kernel build_kernel.sh
+    stash_boot_payload
 else
     ensure_boot_mount
 fi
@@ -382,10 +476,12 @@ verify_gui_architecture
 # final script rather than silently starting over.
 if ! marked finalization; then
     final_scripts=(
+        device/r36-ultra/install_boot.sh
         finishing_touches.sh
         cleanup_filesystem.sh
         write_rootfs.sh
         clean_mounts.sh
+        device/r36-ultra/verify_boot.sh
         create_image.sh
     )
     for script in "${final_scripts[@]}"; do

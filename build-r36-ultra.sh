@@ -14,6 +14,14 @@
 #   DARKOS_UBUNTU_IMAGE=24.04
 #   DARKOS_ARTIFACT_DIR=/path/to/output
 #   DARKOS_COPY_RAW_IMAGE=0       # Set to 1 to copy the raw .img to macOS.
+#   DARKOS_R36_BOOT_PAYLOAD=<artifacts>/Reference/BOOT
+#                                 # The BOOT partition of a working dArkOS R36
+#                                 # image.  Supplies what this pipeline never
+#                                 # produced: the R36S device tree, the u-boot
+#                                 # panel variants, the off-charging bitmaps and
+#                                 # the dtb selector.  On macOS it has to live
+#                                 # under the artifact directory, which is the
+#                                 # only host path the build VM can read.
 #   DEBIAN_CODE_NAME=trixie
 #   USERSPACE_ARCH=armhf          # armhf (default) or arm64; never multiarch.
 #   BUILD_JOBS=4
@@ -30,6 +38,7 @@ VM_DISK="${DARKOS_VM_DISK:-160G}"
 UBUNTU_IMAGE="${DARKOS_UBUNTU_IMAGE:-24.04}"
 ARTIFACT_DIR="${DARKOS_ARTIFACT_DIR:-${SCRIPT_DIR}-artifacts}"
 COPY_RAW_IMAGE="${DARKOS_COPY_RAW_IMAGE:-0}"
+BOOT_PAYLOAD_DIR="${DARKOS_R36_BOOT_PAYLOAD:-${ARTIFACT_DIR}/Reference/BOOT}"
 DEBIAN_RELEASE="${DEBIAN_CODE_NAME:-trixie}"
 USERSPACE_ARCH="${USERSPACE_ARCH:-armhf}"
 BUILD_JOBS="${BUILD_JOBS:-4}"
@@ -109,6 +118,7 @@ run_make() {
         BUILD_BUNDLED_APPS="$BUNDLED_APPS" \
         ENABLE_CACHE="$CACHE" \
         DARKOS_R36_STATE_DIR="${DARKOS_R36_STATE_DIR:-$HOME/darkos-r36-state}" \
+        DARKOS_R36_BOOT_PAYLOAD="$BOOT_PAYLOAD_DIR" \
         bash device/r36-ultra/build-in-vm.sh
 }
 
@@ -195,8 +205,41 @@ rsync -a --delete \\
     --exclude='build.log*' \\
     --exclude='*.img' \\
     --exclude='*.img.7z*' \\
+    --exclude='device/r36-ultra/boot-payload/' \\
     '$VM_SOURCE_MOUNT/' '$VM_BUILD_DIR/'
 "
+
+# The reference BOOT payload is read with sudo by install_boot.sh, and a
+# Multipass host mount belongs to the ubuntu user rather than to root.  Copy it
+# into the build directory as that user first; from there root can read it.
+# Image and uInitrd are deliberately left behind: the reference kernel would not
+# match the modules this build installs into the rootfs.
+VM_BOOT_PAYLOAD=""
+if [[ -d "$BOOT_PAYLOAD_DIR" ]]; then
+    if [[ "$BOOT_PAYLOAD_DIR" == "$ARTIFACT_DIR"/* ]]; then
+        payload_relative="${BOOT_PAYLOAD_DIR#"$ARTIFACT_DIR"/}"
+        VM_BOOT_PAYLOAD="$VM_BUILD_DIR/device/r36-ultra/boot-payload"
+        log "Staging the reference boot payload from ${BOOT_PAYLOAD_DIR}"
+        multipass exec "$VM_NAME" -- bash -lc "
+set -Eeuo pipefail
+mkdir -p '$VM_BOOT_PAYLOAD'
+rsync -rt --delete \\
+    --exclude='Image' \\
+    --exclude='uInitrd' \\
+    --exclude='initrd.img' \\
+    --exclude='.DS_Store' \\
+    --exclude='.fseventsd' \\
+    --exclude='.Spotlight-V100' \\
+    --exclude='.Trashes' \\
+    '$VM_ARTIFACT_MOUNT/$payload_relative/' '$VM_BOOT_PAYLOAD/'
+du -sh '$VM_BOOT_PAYLOAD'
+"
+    else
+        warn "DARKOS_R36_BOOT_PAYLOAD is outside ${ARTIFACT_DIR}, which the build VM cannot read; the R36S device tree and the off-charging bitmaps will not be installed."
+    fi
+else
+    warn "No reference boot payload at ${BOOT_PAYLOAD_DIR}; the boot partition will get only the files this build produces."
+fi
 
 log "Starting or resuming the checkpointed R36/RG351MP build"
 log "Completed partition, Debian bootstrap, U-Boot and kernel stages are preserved across retries."
@@ -208,6 +251,7 @@ multipass exec "$VM_NAME" -- env \
     BUILD_BUNDLED_APPS="$BUNDLED_APPS" \
     ENABLE_CACHE="$CACHE" \
     DARKOS_R36_STATE_DIR="/home/ubuntu/darkos-r36-state" \
+    DARKOS_R36_BOOT_PAYLOAD="$VM_BOOT_PAYLOAD" \
     bash "$VM_BUILD_DIR/device/r36-ultra/build-in-vm.sh"
 
 multipass exec "$VM_NAME" -- bash -lc '

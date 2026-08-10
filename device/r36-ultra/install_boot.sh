@@ -28,7 +28,6 @@ boot_fail() { printf '\n[r36-boot] ERROR: %s\n' "$*" >&2; exit 1; }
 mountpoint="${mountpoint:-mnt/boot}"
 BOOT_STASH="${BOOT_STASH:-}"
 BOOT_PAYLOAD="${BOOT_PAYLOAD:-}"
-VERIFY_BOOT="device/r36-ultra/verify_boot.py"
 
 [[ -n "$DISK" && -f "$DISK" ]] || boot_fail "the disk image is missing: ${DISK:-<unset>}"
 [[ -n "$SYSTEM_PART_START" && -n "$SYSTEM_PART_END" ]] || \

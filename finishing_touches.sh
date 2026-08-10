@@ -11,7 +11,7 @@ fi
 cat <<EOF | sudo tee ${mountpoint}/boot.ini
 odroidgoa-uboot-config
 
-setenv bootargs "root=/dev/mmcblk0p2 rootwait rw fsck.repair=yes net.ifnames=0 fbcon=rotate:${SCREEN_ROTATION} console=/dev/ttyFIQ0 quiet splash consoleblank=0 vt.global_cursor_default=0"
+setenv bootargs "root=${BOOT_ROOT_SPEC:-/dev/mmcblk0p2} rootwait rw fsck.repair=yes net.ifnames=0 fbcon=rotate:${SCREEN_ROTATION} console=/dev/ttyFIQ0 quiet splash consoleblank=0 vt.global_cursor_default=0"
 
 # Booting
 setenv loadaddr "0x02000000"
@@ -21,7 +21,7 @@ setenv dtb_loadaddr "0x01f00000"
 load mmc 1:1 \${loadaddr} Image
 load mmc 1:1 \${initrd_loadaddr} uInitrd
 
-load mmc 1:1 \${dtb_loadaddr} ${KERNEL_DTB}
+load mmc 1:1 \${dtb_loadaddr} ${BOOT_KERNEL_DTB:-${KERNEL_DTB}}
 
 booti \${loadaddr} \${initrd_loadaddr} \${dtb_loadaddr}
 EOF
