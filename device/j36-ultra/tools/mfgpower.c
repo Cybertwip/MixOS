@@ -84,13 +84,23 @@
 /*
  * The Mali-450 MP4 itself.  0x10000 is mapped rather than the 0x30000 the device
  * tree claims, because the only registers read here are the GP version at
- * +0x0006c and the four PP version registers at +0x0900c, +0x0b00c, +0x0d00c and
- * +0x0f00c (PPn base + 0x1000 + 0xc).  Nothing is written to the GPU at all.
+ * +0x0006c and the four PP version registers at +0x09000, +0x0b000, +0x0d000 and
+ * +0x0f000 (PPn base + 0x1000).  Nothing is written to the GPU at all.
+ *
+ * The PP offset had a +0xc on it and that was wrong.  The GP's version register
+ * is at 0x6c, so a stray 0xc looks plausible, but the two blocks are not laid out
+ * alike: drivers/gpu/drm/lima/lima_regs.h has LIMA_GP_VERSION 0x6C and
+ * LIMA_PP_VERSION 0x1000, and PPn base + 0x100c is LIMA_PP_CTRL.  So this read
+ * the control register of each pixel processor, got 0 four times, decided the
+ * silicon was not a Mali-450 and exited 1 -- while the GP, whose offset was
+ * right, reported product 0x0d07 in the same breath.  A GP that answers next to
+ * four PPs that read as zero is the signature of this bug, not of a GPU that is
+ * powered down: an unpowered Utgard core aborts the access, it does not return 0.
  */
 #define MALI_BASE 0x13040000u
 #define MALI_SIZE 0x10000u
 #define MALI_GP_VERSION 0x0006cu
-#define MALI_PP_VERSION_AT(n) (0x08000u + (n) * 0x2000u + 0x1000u + 0x0cu)
+#define MALI_PP_VERSION_AT(n) (0x08000u + (n) * 0x2000u + 0x1000u)
 
 /* Product IDs the LK's probe already verified against this silicon. */
 #define MALI450_GP_PRODUCT 0x0d07u
