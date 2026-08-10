@@ -2237,6 +2237,26 @@ if [[ "${J36_ES:-1}" == 1 ]]; then
         ESPROBE_BIN=""
         log "gl: eglprobe was not built, see the error above -- j36.es=debug will just be quieter"
     fi
+
+    # J36_ES_BUILD=0 skips the rebuild and leaves the rootfs's GLES1 binary in
+    # place.  Worth having as its own switch because this is the one step in the
+    # file measured in tens of minutes, and a boot that is only exercising the GL
+    # payload or the kernel does not need it.
+    if [[ "${J36_ES_BUILD:-1}" == 1 ]]; then
+        set +e
+        build_es_gles20
+        es_rc=$?
+        set -e
+        if (( es_rc != 0 )); then
+            ES_BIN=""
+            es_chroot_teardown
+            log "es: the GLES 2.0 binary was not built, see the error above -- the card"
+            log "    will carry no j36/es and the rootfs's own EmulationStation will run,"
+            log "    which on this board is the status 134"
+        fi
+    else
+        log "es: J36_ES_BUILD=0, the rootfs's own EmulationStation will run"
+    fi
 else
     log "gl: J36_ES=0, skipping the GL front end"
 fi
