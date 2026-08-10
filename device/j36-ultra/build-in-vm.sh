@@ -826,18 +826,15 @@ insmod /lib/modules/*/extra/j36_mt6592_input.ko || say "input module load failed
 # before the machine is handed to it.  Failing that we stay here with a shell,
 # which is strictly better than the kernel panicking on a root= it cannot honour.
 root_hint=""
-want_doom=0
 want_lima=0
 want_mtkdrm=0
-want_es=0
-es_debug=0
+want_gl=0
+gl_debug=0
+want_dash=0
 want_audio=0
 audio_speaker=0
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
-        j36.doom|j36.doom=1)
-            want_doom=1
-            ;;
         j36.audio|j36.audio=1)
             want_audio=1
             ;;
@@ -858,17 +855,28 @@ for arg in $(cat /proc/cmdline); do
         j36.mtkdrm|j36.mtkdrm=1)
             want_mtkdrm=1
             ;;
-        j36.es|j36.es=1)
-            want_es=1
+        # Mesa, staged where the loader will find it ahead of the RK3326 blob.
+        # j36.es is the name this word had while EmulationStation was the thing
+        # that used it; cards written before the dashboard existed still say it,
+        # and they still boot.
+        j36.gl|j36.gl=1|j36.es|j36.es=1)
+            want_gl=1
             ;;
-        # Same payload, plus the three things that make a failed GL bring-up say
-        # why: EmulationStation's --debug, Mesa's EGL loader trace, and one
-        # attempt instead of six.  It is a separate word rather than a build
-        # option because boot.conf is on the vfat partition, so it can be turned
-        # off from any machine that can read the card.
-        j36.es=debug)
-            want_es=1
-            es_debug=1
+        # Same payload, plus the things that make a failed GL bring-up say why:
+        # Mesa's EGL loader trace, and eglprobe run before the shell starts.  It
+        # is a separate word rather than a build option because boot.conf is on
+        # the vfat partition, so it can be turned off from any machine that can
+        # read the card.
+        j36.gl=debug|j36.es=debug)
+            want_gl=1
+            gl_debug=1
+            ;;
+        # The dashboard, in place of EmulationStation.  A word of its own because
+        # the two are alternatives: this one writes a drop-in that resets the
+        # unit's ExecStart, so with it the shell is mixdash and without it the
+        # rootfs's own EmulationStation still starts.
+        j36.dash|j36.dash=1)
+            want_dash=1
             ;;
         root=/dev/*)
             root_hint="${arg#root=}"
@@ -964,34 +972,13 @@ mount_bootfs() {
     return 1
 }
 
-# ── Doom, if the card carries it and the command line asks ───────────────────
-#
-# Doom's own stdout goes to the serial port when there is one: /dev/console is
-# the panel, and the panel is in KD_GRAPHICS while Doom holds it, so anything
-# printed there would be invisible anyway.  MENU quits, and then this script
-# carries on with the boot exactly as if it had never run.
-run_doom() {
-    if [ ! -x /bootfs/j36/doom ]; then
-        say "doom: j36.doom was asked for but j36/doom is not on the card"
-        return 1
-    fi
-    wad=""
-    for cand in freedoom1.wad freedoom2.wad doom.wad doom1.wad doom2.wad; do
-        if [ -f "/bootfs/j36/$cand" ]; then wad="/bootfs/j36/$cand"; break; fi
-    done
-    if [ -z "$wad" ]; then
-        say "doom: no IWAD in j36/ on the BOOT partition"
-        return 1
-    fi
-    say "doom: $wad -- MENU quits and the boot continues"
-    if [ -c /dev/ttyS0 ]; then
-        HOME=/root /bootfs/j36/doom -iwad "$wad" >/dev/ttyS0 2>&1
-    else
-        HOME=/root /bootfs/j36/doom -iwad "$wad"
-    fi
-    say "doom: exited"
-    return 0
-}
+# Doom used to run from here, off the BOOT partition, before the dashboard existed.
+# It does not any more and there is no j36.doom word: that partition is 64 MiB of
+# vfat that also holds the kernel, the device tree and four module payloads, and a
+# 26 MiB IWAD is the one thing in the image that could be somewhere else.  A
+# J36_DOOM=1 build now puts doomgeneric and its IWAD in the second partition's
+# /opt/mixos tree, where the dashboard's Doom card launches them -- after the boot,
+# from a shell, rather than in the middle of an initramfs.
 
 # ── The Mali-450, if the command line asks ───────────────────────────────────
 #
@@ -1170,18 +1157,33 @@ run_audio() {
 #                     first on a machine with no compositor.
 #   SDL_VIDEO_*_DRIVER  the versioned SONAMEs, because SDL dlopens by name and the
 #                     unversioned ones in /usr/lib are the blob's symlinks.
+# One tmpfs, two callers.  The GL payload and the dashboard both put their files
+# and their drop-in under /newroot/run, and both are optional, so whichever runs
+# first mounts it -- and mounting a second one over the top would hide the first
+# one's work.  It has to be a tmpfs and not the rootfs's own /run because of the
+# invariant this whole card is built on: nothing on the shared rootfs is written.
+run_tmpfs=0
+ensure_run_tmpfs() {
+    if [ "$run_tmpfs" = 1 ]; then return 0; fi
+    if mount -t tmpfs -o mode=0755 tmpfs /newroot/run 2>/dev/null; then
+        run_tmpfs=1
+        return 0
+    fi
+    return 1
+}
+
 setup_es_gl() {
     if [ ! -f /bootfs/j36/gl/links ]; then
-        say "es: j36.es was asked for but j36/gl/ is not on the card"
+        say "gl: j36.gl was asked for but j36/gl/ is not on the card"
         return 1
     fi
     if [ -z "$rootdev" ]; then
-        say "es: no rootfs was found, so there is no systemd to configure"
+        say "gl: no rootfs was found, so there is no systemd to configure"
         return 1
     fi
 
-    if ! mount -t tmpfs -o mode=0755 tmpfs /newroot/run 2>/dev/null; then
-        say "es: could not mount a tmpfs on the rootfs /run"
+    if ! ensure_run_tmpfs; then
+        say "gl: could not mount a tmpfs on the rootfs /run"
         return 1
     fi
 
@@ -1430,7 +1432,7 @@ DROPINGL
     #                    to read it off the panel, so it is stated rather than
     #                    inherited.  StandardOutput joins it because the probe
     #                    below writes to stdout.
-    if [ "$es_debug" = 1 ]; then
+    if [ "$gl_debug" = 1 ]; then
         cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINDBG'
 
 # j36.es=debug
@@ -1465,54 +1467,176 @@ DROPINDBG
         # everywhere, so it says whether this Mesa can build those contexts at
         # all -- and a row that works there but returns BAD_ALLOC on the nodes
         # above is lima's, not the payload's.  It appends to the same log so the
-        # repeat after ES exits carries both.
+        # repeat after the shell exits carries both.
         #
-        # The third line is the one that answers the black panel, and it is last
-        # so that its five colours are the last thing on the glass before ES
-        # takes over: -p stops asking EGL questions and drives the scanout chain
-        # itself, in five phases that remove ES, then SDL, then GL, then gbm from
-        # the path.  The README section "j36/eglprobe -p, and the five colours"
-        # has the verdicts.
-        #
-        # -+ and not -: the + runs it as root.  A modeset needs DRM master, and
-        # SET_MASTER for a client that was never master is CAP_SYS_ADMIN, so as
-        # User=ark this would have been fifteen seconds of EACCES.  Still
-        # non-fatal, because a probe is not a precondition.
+        # WHAT IS NOT HERE ANY MORE IS -p, and the reason is worth writing down.
+        # -p sets a mode of its own, and on a board with no fbdev emulation
+        # nothing puts the scanout back afterwards: the panel keeps showing -p's
+        # last frame and the shell that starts next -- which draws into the LK's
+        # framebuffer through /dev/fb0 -- is never seen again.  Run before
+        # EmulationStation that cost five colours and nothing else, because ES
+        # would have taken the panel with a modeset of its own.  Run before
+        # mixdash it would hide the dashboard for the whole boot.  So it is a
+        # thing the dashboard's own 3D cube card starts, on purpose, after asking
+        # twice -- and the first line below already prints what -p's opening
+        # lines were the useful part of: which node is lima and which one, if
+        # any, can modeset at all.
         if [ -x /newroot/run/j36/eglprobe ]; then
             cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINPROBE'
 ExecStartPre=-/bin/sh -c '/run/j36/eglprobe 2>&1 | tee /run/j36/eglprobe.log'
 ExecStartPre=-/bin/sh -c 'LIBGL_ALWAYS_SOFTWARE=1 /run/j36/eglprobe -s 2>&1 | tee -a /run/j36/eglprobe.log'
-ExecStartPre=-+/bin/sh -c '/run/j36/eglprobe -p 2>&1 | tee -a /run/j36/eglprobe.log'
-ExecStopPost=-/bin/sh -c 'echo "--- eglprobe, repeated now that ES has exited ---"; cat /run/j36/eglprobe.log'
+ExecStopPost=-/bin/sh -c 'echo "--- eglprobe, repeated now that the shell has exited ---"; cat /run/j36/eglprobe.log'
 DROPINPROBE
         fi
     fi
 
-    say "es: GL front end in /run/j36/gl, drop-in in /run/systemd/system"
+    say "gl: front end in /run/j36/gl, drop-in in /run/systemd/system"
     say "    $(ls /newroot/run/j36/gl | tr '\n' ' ')"
     return 0
 }
 
-if [ "$want_doom" = 1 ] || [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || \
-   [ "$want_es" = 1 ] || [ "$want_audio" = 1 ]; then
+# ── The dashboard, in place of EmulationStation ───────────────────────────────
+#
+# WHY A DROP-IN AND NOT A UNIT OF ITS OWN.  emulationstation.service is what starts
+# a shell on this rootfs, and the rootfs is the shared one, so it cannot be edited.
+# A drop-in under /run/systemd/system/<unit>.d/ is read after the unit file and an
+# `ExecStart=' with nothing after it RESETS the list, so this unit ends up running
+# mixdash and never running EmulationStation -- with nothing written to the card and
+# nothing left behind on the next boot.  Masking the unit and adding our own was the
+# alternative; this way is the one already proved on this board by j36-gl.conf.
+#
+# zz- so that it sorts last.  systemd merges drop-ins in name order, so zz-j36-dash
+# has the last word on ExecStart even though j36-gl.conf set an ExecStart of its own
+# under j36.gl=debug.  ExecStartPre is deliberately NOT reset: the two probe lines
+# j36-gl.conf adds are the payload's own measurements and neither of them takes the
+# panel.
+#
+# WHERE THE PAYLOAD IS, asked rather than assumed.  find_mixos() looks for it in the
+# rootfs first, because extracting sd-root.tar.gz there is what the artifact README
+# says to do, and then on every other partition of the card -- a tree extracted onto
+# a data partition works, read-only mounted, without a keyboard and without a shell.
+#
+# WHY User=root.  The unit is User=ark.  Qt's linuxfb plugin puts /dev/tty0 into
+# KD_GRAPHICS so the kernel's console stops drawing over the dashboard, and that is
+# an ioctl on a device ark cannot open; the Restart and Power off cards call reboot
+# and poweroff; and the 3D cube card needs DRM master for its modeset.  All three
+# are root, and none of them is worth a polkit rule on a card that cannot be edited.
+#
+# WHY LD_LIBRARY_PATH NAMES BOTH DIRECTORIES.  mixdash finds its own Qt through
+# RPATH -- built with --disable-new-dtags, so it is DT_RPATH and it covers the
+# platform plugin's dependencies too -- but RPATH is not inherited by children, and
+# the cube it launches resolves libEGL and libgbm by dlopen at runtime.  This is
+# what points that child at Mesa in /run/j36/gl instead of at the RK3326 Mali blob
+# /usr/lib's symlinks name.  It is also what makes a payload found somewhere other
+# than /opt/mixos work at all: ld.so searches DT_RPATH first, misses, and falls
+# through to this.
+mixos_root=""
+find_mixos() {
+    # Extracted into the rootfs: the documented way, and the only one that needs no
+    # mount of its own, since /init has already mounted that partition as /newroot.
+    if [ -x /newroot/opt/mixos/bin/mixdash ]; then
+        mixos_root=/opt/mixos
+        say "dash: /opt/mixos is in the rootfs"
+        return 0
+    fi
+
+    # Anywhere else on the card.  Read-only, because this is somebody's data
+    # partition and nothing here has any business writing to it, and under /run so
+    # that the mount lives in a tmpfs directory rather than in a directory this
+    # script would have to create on the shared rootfs.
+    mkdir -p /newroot/run/j36/mixos
+    for dev in /dev/mmcblk*p* /dev/sd*; do
+        if [ ! -b "$dev" ]; then continue; fi
+        if [ "$dev" = "$rootdev" ]; then continue; fi
+        for fs in btrfs ext4 vfat; do
+            if ! mount -t "$fs" -o ro "$dev" /newroot/run/j36/mixos 2>/dev/null; then continue; fi
+            if [ -x /newroot/run/j36/mixos/opt/mixos/bin/mixdash ]; then
+                mixos_root=/run/j36/mixos/opt/mixos
+                say "dash: /opt/mixos is on $dev ($fs), mounted read-only at /run/j36/mixos"
+                # vfat holds no symlinks, and the Qt payload is thirty-odd SONAME
+                # symlinks -- libQt5Core.so.5 and friends.  Without them the loader
+                # cannot resolve mixdash's own DT_NEEDED and it dies before main().
+                if [ ! -e "/newroot$mixos_root/qt/lib/libQt5Core.so.5" ]; then
+                    say "dash: that copy has no qt/lib/libQt5Core.so.5 -- if it was"
+                    say "      unpacked onto a vfat partition the SONAME symlinks are"
+                    say "      gone, and mixdash will not start.  Use ext4 or btrfs."
+                fi
+                return 0
+            fi
+            umount /newroot/run/j36/mixos
+        done
+    done
+    return 1
+}
+
+setup_dash() {
+    if [ -z "$rootdev" ]; then
+        say "dash: no rootfs was found, so there is no systemd to configure"
+        return 1
+    fi
+    if ! ensure_run_tmpfs; then
+        say "dash: could not mount a tmpfs on the rootfs /run"
+        return 1
+    fi
+    if ! find_mixos; then
+        say "dash: no opt/mixos/bin/mixdash on any partition of this card."
+        say "      The drop-in is deliberately NOT written, so the rootfs's own"
+        say "      EmulationStation starts instead of nothing at all.  Unpack"
+        say "      sd-root.tar.gz onto the second partition: see its README.txt."
+        return 1
+    fi
+
+    mkdir -p /newroot/run/systemd/system/emulationstation.service.d
+    cat > /newroot/run/systemd/system/emulationstation.service.d/zz-j36-dash.conf <<DROPINDASH
+# Written by the J36 Ultra initramfs, into a tmpfs.  Not on the card, not in the
+# rootfs: it exists only for as long as this boot does.  It resets ExecStart, so
+# this unit runs the dashboard and EmulationStation is not started.
+[Service]
+User=root
+Group=root
+WorkingDirectory=$mixos_root/bin
+ExecStart=
+ExecStart=$mixos_root/bin/mixdash
+Restart=on-failure
+RestartSec=2
+Environment="LD_LIBRARY_PATH=/run/j36/gl:$mixos_root/qt/lib"
+Environment="QT_QPA_PLATFORM=linuxfb"
+Environment="QT_QPA_PLATFORM_PLUGIN_PATH=$mixos_root/qt/plugins/platforms"
+Environment="QT_QPA_FB_DISABLE_INPUT=1"
+Environment="QT_QPA_FONTDIR=$mixos_root/qt/fonts"
+StandardOutput=journal+console
+StandardError=journal+console
+DROPINDASH
+
+    say "dash: mixdash will run instead of EmulationStation"
+    say "      $mixos_root/bin/mixdash, linuxfb on /dev/fb0"
+    return 0
+}
+
+if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || \
+   [ "$want_gl" = 1 ] || [ "$want_audio" = 1 ]; then
     if mount_bootfs; then
-        # Doom first: it owns the panel while it runs, and the two driver payloads
-        # leave modules loaded that have no reason to be disturbed by a game
-        # exiting.  mtkdrm after those, so that if it does disturb the panel the
-        # two things that were already proved have already run.  Audio next: it
-        # touches nothing any of the others touch, and it has to be in place
-        # before systemd looks for a controlC0 to restore into.  The GL front end
-        # last, because it is the only one of the five that is not finished when
-        # this script ends -- it is a message to systemd, and systemd has not
-        # started yet.
-        if [ "$want_doom" = 1 ]; then run_doom; fi
+        # lima first: it is the one payload with a hardware gate in front of it, and
+        # nothing else should be loaded if the MFG domain does not come up.  mtkdrm
+        # after it, so that if it does disturb the panel the thing that was already
+        # proved has already run.  Audio next: it touches nothing the others touch,
+        # and it has to be in place before systemd looks for a controlC0 to restore
+        # into.  The GL front end last, because it is the only one of the four that
+        # is not finished when this script ends -- it is a message to systemd, and
+        # systemd has not started yet.
         if [ "$want_lima" = 1 ]; then run_lima; fi
         if [ "$want_mtkdrm" = 1 ]; then run_mtkdrm; fi
         if [ "$want_audio" = 1 ]; then run_audio; fi
-        if [ "$want_es" = 1 ]; then setup_es_gl; fi
+        if [ "$want_gl" = 1 ]; then setup_es_gl; fi
         umount /bootfs
     fi
 fi
+
+# Outside that block on purpose: the dashboard is in the second partition and the
+# BOOT partition has nothing to do with it, so a card whose j36/ directory was
+# deleted still comes up in the dashboard rather than in EmulationStation.  Last of
+# all, so that the drop-in it writes has the final word on ExecStart.
+if [ "$want_dash" = 1 ]; then setup_dash; fi
 
 if [ -n "$rootdev" ]; then
     say "switching root into $rootdev"
@@ -2927,16 +3051,18 @@ initrd=initrd.img
 #
 # Every j36 word is removable on its own: delete one, or the matching directory
 # under j36/, and the boot carries straight on.  lima gives a render node, mtkdrm
-# gives /dev/dri/card0, es points EmulationStation at Mesa instead of the RK3326
-# blob, audio gives the ALSA core and a sound card.  j36.doom=1 is no longer built.
+# gives a display node, gl puts Mesa where the loader finds it ahead of the RK3326
+# blob, dash runs the MixOS dashboard instead of EmulationStation, audio gives the
+# ALSA core and a sound card.  j36.doom=1 is gone: Doom is a dashboard card now.
 #
 # j36.audio=speaker rather than =1 also powers the class-D amp: a second and
 # deliberate step, and it needs a cell fitted, because the amp hangs off VBAT --
 # the system node -- and battery-less it pulls the board under its own lockout.
 #
-# j36.es=debug adds ES's --debug, Mesa's EGL trace and one start attempt instead
-# of six.  Change it to j36.es=1, here, from any machine, once ES draws.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.es=debug j36.audio=1
+# j36.gl=debug adds Mesa's EGL trace and runs eglprobe first, so the journal names
+# every DRI node and says which one can modeset; j36.gl=1 is the quiet form.  j36.es
+# is the old name for it.  Delete j36.dash=1 and EmulationStation starts instead.
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=debug j36.dash=1 j36.audio=1
 CONF
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
@@ -4006,17 +4132,30 @@ fi
         echo "display=stock-lk-simple-framebuffer"
         echo "native_dsi=disabled"
         echo "input_adapter=j36_mt6592_input.ko"
-        if [[ -f sd-boot/j36/doom ]]; then
-            echo "fbdoom=sd-boot/j36/doom ($(stat -c %s sd-boot/j36/doom) bytes, static ARMv7, 640x400 in 640x480)"
-            echo "fbdoom_commit=$DOOM_COMMIT"
-            if [[ -n "$DOOM_WAD" ]]; then
-                echo "fbdoom_iwad=j36/$(basename "$DOOM_WAD")"
+        # The shell, and the payload it lives in.  Second partition, not BOOT: the Qt
+        # closure is 50 MB and BOOT is 64 MiB of vfat that also holds the kernel, the
+        # tree and four module payloads.
+        if [[ -f sd-root/opt/mixos/bin/mixdash ]]; then
+            echo "shell=mixdash ($(stat -c %s sd-root/opt/mixos/bin/mixdash) bytes, Qt5 Widgets on linuxfb)"
+            echo "shell_payload=sd-root.tar.gz ($(stat -c %s sd-root.tar.gz) bytes), unpacked onto the second partition as /opt/mixos"
+            echo "shell_start=j36.dash=1; /init writes a drop-in that resets emulationstation.service's ExecStart"
+            echo "shell_find=/init looks in the rootfs first, then mounts every other partition read-only looking for opt/mixos/bin/mixdash"
+            echo "shell_render=Qt5 raster into /dev/fb0, which is simplefb's window onto the framebuffer the LK lit -- no EGL, no GBM, no DRM master, no modeset"
+            echo "shell_input=evdev directly, QT_QPA_FB_DISABLE_INPUT=1 (gpio-keys plus the keypad, per the device tree)"
+            if [[ -f sd-root/opt/mixos/bin/doom ]]; then
+                echo "fbdoom=sd-root/opt/mixos/bin/doom ($(stat -c %s sd-root/opt/mixos/bin/doom) bytes, static ARMv7, 640x400 in 640x480)"
+                echo "fbdoom_commit=$DOOM_COMMIT"
+                if [[ -n "$DOOM_WAD" ]]; then
+                    echo "fbdoom_iwad=opt/mixos/share/doom/$(basename "$DOOM_WAD")"
+                else
+                    echo "fbdoom_iwad=none (drop one into /opt/mixos/share/doom on the card)"
+                fi
+                echo "fbdoom_start=the dashboard's Doom card; there is no j36.doom word any more"
             else
-                echo "fbdoom_iwad=none (drop one into j36/ on the card)"
+                echo "fbdoom=not staged (J36_DOOM=1 builds it into the second partition)"
             fi
-            echo "fbdoom_start=j36.doom=1 on the command line, /init runs it before switch_root"
         else
-            echo "fbdoom=not staged"
+            echo "shell=not staged; without /opt/mixos the rootfs's own EmulationStation starts"
         fi
         if [[ -f sd-boot/j36/mfgpower ]]; then
             echo "gpu=mali-450 mp4 at 0x13040000 (gp irq 234..pp_bcast 244, GIC_SPI 202..212)"
