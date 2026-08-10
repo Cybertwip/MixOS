@@ -377,6 +377,35 @@ takes a machine with no usable keyboard into emergency mode. Both are now built
 in and asserted, along with `NLS_UTF8` and `NLS_CODEPAGE_437`, the charsets those
 two mounts imply.
 
+## The one RK3326 daemon that never gives up
+
+With the log forwarded to the panel, the first thing it showed was this, on a
+loop:
+
+```
+batt_life_warning.py[829]: FileNotFoundError: [Errno 2] No such file or
+  directory: '/sys/class/power_supply/battery/capacity'
+batt_led.service: Main process exited, code=exited, status=1/FAILURE
+batt_led.service: Scheduled restart job, restart counter is at 21.
+```
+
+`batt_led.service` reads that capacity file and writes
+`/sys/class/gpio/gpio77/value`, and this kernel has neither — no `power_supply`
+driver for the MT6592 PMIC, and no sysfs GPIO export. What makes it worth a
+command-line word is the unit, not the script: `Restart=always`, `RestartSec=2`
+and `StartLimitIntervalSec=0`, which is systemd's way of spelling *never give up*.
+It is a traceback on the console every 2.3 seconds for as long as the board is on.
+Fitting a cell does not help: the file is missing because the driver is missing,
+not because the bay is empty. A `power_supply` for the MT6592 PMIC is the real
+fix, and it would make this daemon work unmodified.
+
+The other RK3326-only units are deliberately left running. `351mp.service` (power
+LED, backlight, `amixer`), `audiopath`, `audiostate` and `wifi_importer` are all
+`Type=oneshot`: they fail once and stay failed. `emulationstation.service` is
+`Restart=on-failure` under the default five-starts-in-ten-seconds limit, so
+systemd stops it by itself — and its failure is the thing we still need to read.
+Bounded noise is evidence; only the unbounded one had to go.
+
 ## What used to cost ten seconds of every boot
 
 The `backlight` node is `status = "disabled"`. It is a `pwm-backlight` consuming

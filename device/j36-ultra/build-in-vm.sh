@@ -760,6 +760,28 @@ systemd.mask=firstboot.service
     carry the tars; it converts EASYROMS to exfat and grows ROOTFS to fill the
     card, and this kernel now has exfat and vfat built in for the result.
 
+systemd.mask=batt_led.service
+    The RK3326 battery LED daemon, and the first unit the forwarded log caught:
+
+      batt_life_warning.py[829]: FileNotFoundError: [Errno 2] No such file or
+        directory: '/sys/class/power_supply/battery/capacity'
+      batt_led.service: Scheduled restart job, restart counter is at 21.
+
+    It reads that capacity file and writes /sys/class/gpio/gpio77/value, and this
+    kernel has neither: no power_supply driver for the MT6592 PMIC, and no sysfs
+    GPIO export.  Its unit is Restart=always, RestartSec=2 and
+    StartLimitIntervalSec=0 -- explicitly unbounded -- so it is a Python
+    traceback on the console every 2.3 s for as long as the machine is up.
+    Fitting a cell does not change it; the file is missing because the driver is,
+    and the fix is a power_supply for the MT6592 PMIC, which is also what would
+    make the LED daemon work unmodified.
+
+    Other RK3326-only units are left alone on purpose: 351mp.service (power LED,
+    backlight, amixer), audiopath, audiostate and wifi_importer are all
+    Type=oneshot, so they fail once and stay failed, and emulationstation is
+    Restart=on-failure under the default 5-starts-in-10-s limit.  Bounded noise
+    is evidence; only the unbounded one had to go.
+
 rdinit=/init root=/dev/mmcblk0p2 rw rootwait
     See above: /init does the mounting, so root= cannot panic the kernel.
 
@@ -793,6 +815,7 @@ README
         echo "reboot=mtk_wdt via watchdog@10007000 (mediatek,mt6589-wdt)"
         echo "console=tty0 last, journald forwarded to it"
         echo "firstboot=masked (RK3326 script, no /roms.tar in a GUI-mode build)"
+        echo "batt_led=masked (Restart=always on a power_supply this kernel has not got)"
         echo "bootimg_kernel=zImage-j36-ultra (device tree appended, ATAG path)"
         echo "sd_kernel=sd-boot/zImage (plain, LK passes the tree in r2)"
         echo "display=stock-lk-simple-framebuffer"
