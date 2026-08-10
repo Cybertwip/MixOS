@@ -1242,6 +1242,23 @@ DROPINGL
     #                    dri/mediatek_dri.so and dri/lima_dri.so are both symlinks
     #                    to one megadriver here, and a failure to find either
     #                    looks identical to a failure to find a GPU.
+    #   J36_ES_GL_PROBE  read by the GLES 2.0 renderer only.  It turns the clear
+    #                    colour magenta and, either way, that renderer logs a
+    #                    startup self test -- one magenta quad drawn straight in
+    #                    NDC and read back with glReadPixels -- plus a draw count
+    #                    per frame.  Between them they split the one symptom that
+    #                    has three causes:
+    #                      magenta panel      the swap chain reaches the CRTC, so a
+    #                                         black UI on top of it is ES's drawing
+    #                      black panel, self
+    #                      test pixel ff00ff  GL is correct and the frames never
+    #                                         reach the panel -- a display problem,
+    #                                         not a GL one
+    #                      self test black    the pipeline swallows the draw; the
+    #                                         compile and link lines say why
+    #                      frame N, 0 draws   ES asked for nothing; a theme or a
+    #                                         gamelist, not a shader
+    #                    The fixed-function binary ignores it entirely.
     #   Restart=no       the unit restarts on failure, and six identical stack
     #                    traces scroll the first one off a 640x480 panel before it
     #                    can be read.  One attempt, one trace.
@@ -1256,6 +1273,7 @@ DROPINGL
 Environment="EGL_LOG_LEVEL=debug"
 Environment="MESA_DEBUG=1"
 Environment="LIBGL_DEBUG=verbose"
+Environment="J36_ES_GL_PROBE=1"
 ExecStart=
 ExecStart=/usr/bin/emulationstation/emulationstation.sh --debug
 Restart=no

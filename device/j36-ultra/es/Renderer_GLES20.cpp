@@ -50,6 +50,8 @@
 
 #include <SDL_opengles2.h>
 #include <SDL.h>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <map>
@@ -103,7 +105,9 @@ namespace Renderer
 	X(void,           UniformMatrix4fv,        (GLint, GLsizei, GLboolean, const GLfloat*))                \
 	X(void,           EnableVertexAttribArray, (GLuint))                                                   \
 	X(void,           VertexAttribPointer,     (GLuint, GLint, GLenum, GLboolean, GLsizei, const void*))   \
-	X(void,           DrawArrays,              (GLenum, GLint, GLsizei))
+	X(void,           DrawArrays,              (GLenum, GLint, GLsizei))                              \
+	X(void,           Finish,                  (void))                                                \
+	X(void,           ReadPixels,              (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*))
 
 #define J36_GLES2_DECLARE(ret, name, args) static ret (GL_APIENTRY *p_gl##name) args = nullptr;
 	J36_GLES2_ENTRY_POINTS(J36_GLES2_DECLARE)
@@ -138,6 +142,17 @@ namespace Renderer
 	static Texture::Type boundType     = Texture::RGBA;
 	static int           stencilBits   = 0;
 	static bool          ready         = false;
+
+	// A black panel has three causes that look identical from the outside: this
+	// renderer drew nothing (no program, or geometry outside the frustum), ES asked
+	// for nothing to be drawn, or everything was drawn and the buffers never reached
+	// the CRTC. These four counters and J36_ES_GL_PROBE separate them; see selfTest()
+	// and swapBuffers().
+	static bool          probeMode     = false;
+	static bool          selfTesting   = false;
+	static unsigned long drawCalls     = 0;
+	static unsigned long frames        = 0;
+	static unsigned long drawsReported = 0;
 
 	static std::map<unsigned int, Texture::Type> textureTypes;
 
@@ -184,10 +199,19 @@ namespace Renderer
 		"}\n";
 
 	// GLSL ES 1.00 has no default precision for float in a fragment shader and
-	// refuses to link without one; desktop GLSL 1.20 has no precision keyword at
+	// refuses to compile without one; desktop GLSL 1.20 has no precision keyword at
 	// all. Which of the two this context speaks is read off GL_VERSION, so one set
 	// of sources compiles on either context this stack can produce.
-	static std::string fragmentPrologue;
+	//
+	// It goes on the vertex shader as well, which is not decoration. In GLSL ES 1.00
+	// the default float precision is highp in a vertex shader and undeclared in a
+	// fragment shader, so declaring mediump in only one of them leaves v_tex and
+	// v_col with a different precision on each side of the link -- and ESSL 1.00
+	// requires a varying's qualifiers to match, so a strict linker is entitled to
+	// reject the program. A rejected program is a black panel and one line in a log,
+	// which is exactly the failure that is hardest to tell from the others. Both
+	// sides at mediump also matches the hardware: Utgard's fragment core is mediump.
+	static std::string shaderPrologue;
 
 	static const char* safeGetString(const GLenum _name)
 	{
@@ -221,7 +245,7 @@ namespace Renderer
 
 	static bool buildProgram(Program& _program, const GLuint _vs, const char* _fs, const bool _textured)
 	{
-		const GLuint fs     = compileShader(GL_FRAGMENT_SHADER, fragmentPrologue + _fs);
+		const GLuint fs     = compileShader(GL_FRAGMENT_SHADER, shaderPrologue + _fs);
 		GLint        status = GL_FALSE;
 
 		if(fs == 0)
@@ -257,7 +281,7 @@ namespace Renderer
 
 	static bool buildShaders()
 	{
-		const GLuint vs = compileShader(GL_VERTEX_SHADER, gles20_vs);
+		const GLuint vs = compileShader(GL_VERTEX_SHADER, shaderPrologue + gles20_vs);
 
 		if(vs == 0)
 			return false;
@@ -322,6 +346,26 @@ namespace Renderer
 
 		const Program& program = currentProgram();
 
+		// Once, on the first draw of the process: how many vertices, where the first
+		// one is in ES's own pixel coordinates, and what the projection is doing to
+		// it. The two scales and the two translations are enough to recognise the
+		// classic shader-port failure -- a projection left at identity, which puts
+		// every one of ES's 0..640 coordinates hundreds of units outside the frustum
+		// and clips the entire UI away without one GL error being raised.
+		if(++drawCalls == 1 && !selfTesting)
+		{
+			const float* p = (const float*)&projection;
+			char         line[192];
+
+			snprintf(line, sizeof(line),
+				"GLES2: first draw, program %u, %u verts, v0 (%.1f, %.1f), proj sx %.5f sy %.5f tx %.2f ty %.2f",
+				(unsigned int)program.id, _numVertices,
+				(double)_vertices[0].pos.x(), (double)_vertices[0].pos.y(),
+				(double)p[0], (double)p[5], (double)p[12], (double)p[13]);
+
+			LOG(LogInfo) << line;
+		}
+
 		p_glEnable(GL_BLEND);
 		p_glBlendFunc(convertBlendFactor(_srcBlendFactor), convertBlendFactor(_dstBlendFactor));
 
@@ -341,6 +385,69 @@ namespace Renderer
 		p_glDisable(GL_BLEND);
 
 	} // drawClientArrays
+
+	// Draw one magenta quad straight in NDC, with both matrices at identity, and read
+	// the centre pixel back. It runs once, before ES has drawn anything, and it is
+	// the only measurement that separates the three faults behind a black panel:
+	//
+	//   pixel is magenta          the context, the shaders, the attribute arrays and
+	//                             the draw all work. Whatever is black after this is
+	//                             ES's geometry, ES's own logic, or the scanout.
+	//   pixel is black, no error  the pipeline swallows the draw. The compile and
+	//                             link lines above say why.
+	//   glGetError is set         named here rather than at the next unrelated call.
+	//
+	// It costs one clear and one four-vertex draw at startup, and Renderer::init()
+	// clears and swaps immediately afterwards, so nothing of it survives to frame 1.
+	// glReadPixels of a single pixel is a full pipeline flush on a tiler, which is
+	// exactly why it is here and not in the frame loop.
+	static void selfTest()
+	{
+		const int w = getWindowWidth();
+		const int h = getWindowHeight();
+
+		// 0xFFFF00FF is ABGR, which is what convertColor() produces and what the
+		// GL_UNSIGNED_BYTE/GL_TRUE colour array reads back as r,g,b,a in memory.
+		Vertex        quad[4];
+		unsigned char px[4] = { 0, 0, 0, 0 };
+		char          line[192];
+
+		quad[0] = Vertex(Vector2f(-1.0f, -1.0f), Vector2f(0.0f, 0.0f), 0xFFFF00FF);
+		quad[1] = Vertex(Vector2f(-1.0f,  1.0f), Vector2f(0.0f, 0.0f), 0xFFFF00FF);
+		quad[2] = Vertex(Vector2f( 1.0f, -1.0f), Vector2f(0.0f, 0.0f), 0xFFFF00FF);
+		quad[3] = Vertex(Vector2f( 1.0f,  1.0f), Vector2f(0.0f, 0.0f), 0xFFFF00FF);
+
+		projection = Transform4x4f::Identity();
+		modelview  = Transform4x4f::Identity();
+
+		p_glViewport(0, 0, w, h);
+		p_glDisable(GL_SCISSOR_TEST);
+		p_glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+		p_glClear(GL_COLOR_BUFFER_BIT);
+
+		bindTexture(0);
+		selfTesting = true;
+		drawClientArrays(GL_TRIANGLE_STRIP, quad, 4, Blend::ONE, Blend::ZERO);
+		selfTesting = false;
+
+		p_glFinish();
+		p_glReadPixels(w / 2, h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+
+		snprintf(line, sizeof(line),
+			"GLES2: self test %dx%d, centre pixel %02x %02x %02x %02x (expect ff 00 ff ..), glGetError 0x%04x",
+			w, h, px[0], px[1], px[2], px[3], (unsigned int)p_glGetError());
+
+		LOG(LogInfo) << line;
+
+		if(px[0] != 0xFF || px[1] != 0x00 || px[2] != 0xFF)
+			LOG(LogError) << "GLES2: the self test quad did not reach the framebuffer -- nothing this renderer draws will either";
+
+		// Back to the state createContext() would have left, and drop the counter so
+		// the "first draw" line below reports ES's first draw and not this one.
+		drawCalls = 0;
+		p_glClear(GL_COLOR_BUFFER_BIT);
+
+	} // selfTest
 
 	unsigned int convertColor(const unsigned int _color)
 	{
@@ -427,7 +534,7 @@ namespace Renderer
 		LOG(LogInfo) << "GLES2: non-power-of-two textures: "
 			<< ((exts.find("texture_npot") != std::string::npos || exts.find("texture_non_power_of_two") != std::string::npos) ? "ok" : "MISSING");
 
-		fragmentPrologue = (version.find("OpenGL ES") != std::string::npos) ? "precision mediump float;\n" : "";
+		shaderPrologue = (version.find("OpenGL ES") != std::string::npos) ? "precision mediump float;\n" : "";
 
 		if(!buildShaders())
 			return;
@@ -447,9 +554,26 @@ namespace Renderer
 		p_glEnableVertexAttribArray(ATTRIB_TEX);
 		p_glEnableVertexAttribArray(ATTRIB_COL);
 
-		p_glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-
 		ready = true;
+
+		selfTest();
+
+		// J36_ES_GL_PROBE turns the clear colour magenta, which answers the one
+		// question a log cannot: whether the buffers this renderer swaps are the
+		// buffers the panel is scanning out. A magenta panel means the swap chain
+		// works and anything still black on top of it is ES's own drawing; a panel
+		// that stays black while the self test above passes means the frames are
+		// correct and never reach the CRTC. /init sets it under j36.es=debug only --
+		// on a board that works, this would be a magenta flash at every startup.
+		probeMode = (getenv("J36_ES_GL_PROBE") != nullptr);
+
+		if(probeMode)
+		{
+			LOG(LogInfo) << "GLES2: J36_ES_GL_PROBE is set, clearing to magenta instead of black";
+			p_glClearColor(1.0f, 0.0f, 1.0f, 1.0f);
+		}
+		else
+			p_glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
 
 	} // createContext
 
@@ -623,6 +747,23 @@ namespace Renderer
 	void swapBuffers()
 	{
 		SDL_GL_SwapWindow(getSDLWindow());
+
+		// The first three frames and then one line every ten seconds or so. This is
+		// the counter that says whether a black panel is this renderer's fault at all:
+		// a frame with zero draws is ES deciding there is nothing to show, which is a
+		// theme or a gamelist, not a shader.
+		++frames;
+
+		if(frames <= 3 || (frames % 600) == 0)
+		{
+			char line[128];
+
+			snprintf(line, sizeof(line), "GLES2: frame %lu, %lu draws since the last line",
+				frames, drawCalls - drawsReported);
+
+			drawsReported = drawCalls;
+			LOG(LogInfo) << line;
+		}
 
 		if(ready)
 			p_glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
