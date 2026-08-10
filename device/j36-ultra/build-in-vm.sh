@@ -1727,18 +1727,26 @@ fi
 #     50_mesa.json, dlopens Mesa's EGL vendor, and that pulls the RK3326 blob into
 #     the process as its gbm. Mesa's EGL cannot initialise on this board without
 #     this payload -- the point is not merely that ES fails to link.
-#   - libGLESv1_CM.so.1 is what EmulationStation actually calls: its 29 undefined
-#     GL symbols are glMatrixMode, glLoadMatrixf, glEnableClientState -- fixed
-#     function GLES1, not ES2. Intact on the rootfs today.
+#   - libGL.so.1 is what supplies the entry points EmulationStation calls. Its 29
+#     undefined GL symbols are glMatrixMode, glLoadMatrixf, glEnableClientState --
+#     fixed function, which reads as GLES1 and is equally desktop GL compat, and
+#     all 29 are exported by glvnd's libGL.so.1. libGLESv1_CM.so.1 is the obvious
+#     choice and it is the wrong one: Debian's Mesa is built without GLES1, so an
+#     ES1 context is EGL_BAD_ALLOC on every driver including llvmpipe, and a stub
+#     with no context under it returns NULL. libGL.so.1 brings libGLX.so.0 with it
+#     (its DT_NEEDED), which wants libX11.so.6 -- present on this rootfs; nothing
+#     here opens a display, it is glvnd's one-library-for-both-APIs shape.
 #   - libGLESv2.so.2 is for when SDL's context request comes out as ES2, and
 #     libGLdispatch.so.0 is glvnd's own dependency and the only DT_NEEDED any of
-#     these five have on each other.
+#     these have on each other. It is also what makes the libGL preload work at
+#     all: glvnd's libEGL and libGL share one current-dispatch table, so a context
+#     created through eglMakeCurrent is the one libGL's stubs dispatch into.
 #
 # The intact ones are shipped anyway. Which names survive is an accident of which
 # utils.sh path ran on the day the image was built, and a payload that depends on
-# an accident is not a payload. Shipping all five costs 1.4 MB and removes the
-# question.
-GL_PACKAGES=(libgbm1 libglvnd0 libegl1 libgles1 libgles2)
+# an accident is not a payload. Shipping all of them costs about 2.5 MB and
+# removes the question.
+GL_PACKAGES=(libgbm1 libglvnd0 libegl1 libgl1 libglx0 libgles1 libgles2)
 GL_PAYLOAD=""
 GL_MIRROR="${J36_DEBIAN_MIRROR:-http://deb.debian.org/debian}"
 GL_SUITES=("${DEBIAN_RELEASE:-trixie}" "${DEBIAN_RELEASE:-trixie}-updates")
