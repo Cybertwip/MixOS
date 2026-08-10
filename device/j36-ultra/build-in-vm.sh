@@ -930,8 +930,10 @@ initrd=initrd.img
 # into it.  The two masked units are RK3326-only: firstboot is dArkOS's expansion
 # script, which a GUI-mode build has no tars for, and batt_led is the battery LED
 # daemon, which restarts forever on hardware this kernel does not describe.  Any
-# of them can be deleted here.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1
+# of them can be deleted here.  j36.doom=1 runs j36/doom off this partition
+# before the hand-over, as the panel and pad test; MENU quits it and the boot
+# carries on.  Delete that word, or the j36 directory, to boot straight through.
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.doom=1
 CONF
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
