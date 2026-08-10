@@ -1,0 +1,132 @@
+mmc: mtk-sd: support MT6592, and make pinctrl optional
+
+Two changes, both needed before the J36 Ultra's microSD slot can carry a
+root filesystem on a mainline kernel.
+
+1. A compatible for MT6592.
+
+   MT6592's MSDC is a 12-bit-divider part. The MVII LK's own MSDC driver --
+   which reads this exact card on this exact board -- writes CKDIV into
+   MSDC_CFG[19:8], CKMOD into [21:20] and HS400_CK_MODE at bit 22. That is
+   mtk-sd's clk_div_bits == 12 register layout; the 8-bit layout used by
+   mt8135/mt7620 puts CKDIV at [15:8] and CKMOD at [17:16], so claiming
+   mt8135-mmc would divide the clock wrongly and set reserved bits.
+
+   No existing compatible fits, because every clk_div_bits == 12 entry in
+   this driver also asserts async_fifo, data_tune and the newer
+   MSDC_PAD_TUNE0 register. MT6592 is the one combination not yet present:
+   a 12-bit divider with this generation's MSDC_PAD_TUNE at 0xec and no
+   async FIFO. Hence its own entry rather than borrowing mt2701's.
+
+2. Pinctrl becomes optional.
+
+   probe() currently fails unless the device supplies both a "default" and
+   a "state_uhs" pinctrl state. That is unsatisfiable on a SoC with no
+   pinctrl driver at all, which MT6592 is -- nothing in mainline claims its
+   pad mux. The pads are already muxed, driven and pulled by the bootloader
+   before Linux starts, and the two states exist only to retune pads across
+   a 1.8 V signal switch that a no-1-8-v host never performs. Devices that
+   do describe pinctrl are unaffected: the acquisition path is entered
+   exactly as before whenever pinctrl-0 is present.
+
+Applies to linux-6.12.y.
+---
+diff --git a/drivers/mmc/host/mtk-sd.c b/drivers/mmc/host/mtk-sd.c
+index be9954f5b..11e02a93a 100644
+--- a/drivers/mmc/host/mtk-sd.c
++++ b/drivers/mmc/host/mtk-sd.c
+@@ -508,6 +508,19 @@ static const struct mtk_mmc_compatible mt2712_compat = {
+ 	.support_64g = true,
+ };
+ 
++static const struct mtk_mmc_compatible mt6592_compat = {
++	.clk_div_bits = 12,
++	.recheck_sdio_irq = false,
++	.hs400_tune = false,
++	.pad_tune_reg = MSDC_PAD_TUNE,
++	.async_fifo = false,
++	.data_tune = false,
++	.busy_check = false,
++	.stop_clk_fix = false,
++	.enhance_rx = false,
++	.support_64g = false,
++};
++
+ static const struct mtk_mmc_compatible mt6779_compat = {
+ 	.clk_div_bits = 12,
+ 	.recheck_sdio_irq = false,
+@@ -626,6 +639,7 @@ static const struct mtk_mmc_compatible mt8516_compat = {
+ static const struct of_device_id msdc_of_ids[] = {
+ 	{ .compatible = "mediatek,mt2701-mmc", .data = &mt2701_compat},
+ 	{ .compatible = "mediatek,mt2712-mmc", .data = &mt2712_compat},
++	{ .compatible = "mediatek,mt6592-mmc", .data = &mt6592_compat},
+ 	{ .compatible = "mediatek,mt6779-mmc", .data = &mt6779_compat},
+ 	{ .compatible = "mediatek,mt6795-mmc", .data = &mt6795_compat},
+ 	{ .compatible = "mediatek,mt7620-mmc", .data = &mt7620_compat},
+@@ -1520,10 +1534,12 @@ static int msdc_ops_switch_volt(struct mmc_host *mmc, struct mmc_ios *ios)
+ 		}
+ 
+ 		/* Apply different pinctrl settings for different signal voltage */
+-		if (ios->signal_voltage == MMC_SIGNAL_VOLTAGE_180)
+-			pinctrl_select_state(host->pinctrl, host->pins_uhs);
+-		else
+-			pinctrl_select_state(host->pinctrl, host->pins_default);
++		if (host->pinctrl) {
++			if (ios->signal_voltage == MMC_SIGNAL_VOLTAGE_180)
++				pinctrl_select_state(host->pinctrl, host->pins_uhs);
++			else
++				pinctrl_select_state(host->pinctrl, host->pins_default);
++		}
+ 	}
+ 	return 0;
+ }
+@@ -2808,21 +2824,35 @@ static int msdc_drv_probe(struct platform_device *pdev)
+ 	if (host->irq < 0)
+ 		return host->irq;
+ 
+-	host->pinctrl = devm_pinctrl_get(&pdev->dev);
+-	if (IS_ERR(host->pinctrl))
+-		return dev_err_probe(&pdev->dev, PTR_ERR(host->pinctrl),
+-				     "Cannot find pinctrl");
+-
+-	host->pins_default = pinctrl_lookup_state(host->pinctrl, "default");
+-	if (IS_ERR(host->pins_default)) {
+-		dev_err(&pdev->dev, "Cannot find pinctrl default!\n");
+-		return PTR_ERR(host->pins_default);
+-	}
++	/*
++	 * Pinctrl is optional, because a SoC can have no pinctrl driver at all.
++	 * MT6592 is such a SoC: nothing in mainline claims its pad mux, and the
++	 * bootloader has already muxed and driven the six MSDC1 pads before this
++	 * driver is reached. The two named states exist only to retune pads
++	 * across a 1.8 V signal switch, which a device marked no-1-8-v never
++	 * performs, so demanding them would reject a host that works.
++	 */
++	if (device_property_present(&pdev->dev, "pinctrl-0")) {
++		host->pinctrl = devm_pinctrl_get(&pdev->dev);
++		if (IS_ERR(host->pinctrl))
++			return dev_err_probe(&pdev->dev, PTR_ERR(host->pinctrl),
++					     "Cannot find pinctrl");
++
++		host->pins_default = pinctrl_lookup_state(host->pinctrl, "default");
++		if (IS_ERR(host->pins_default)) {
++			dev_err(&pdev->dev, "Cannot find pinctrl default!\n");
++			return PTR_ERR(host->pins_default);
++		}
+ 
+-	host->pins_uhs = pinctrl_lookup_state(host->pinctrl, "state_uhs");
+-	if (IS_ERR(host->pins_uhs)) {
+-		dev_err(&pdev->dev, "Cannot find pinctrl uhs!\n");
+-		return PTR_ERR(host->pins_uhs);
++		host->pins_uhs = pinctrl_lookup_state(host->pinctrl, "state_uhs");
++		if (IS_ERR(host->pins_uhs)) {
++			dev_err(&pdev->dev, "Cannot find pinctrl uhs!\n");
++			return PTR_ERR(host->pins_uhs);
++		}
++	} else {
++		host->pinctrl = NULL;
++		host->pins_default = NULL;
++		host->pins_uhs = NULL;
+ 	}
+ 
+ 	/* Support for SDIO eint irq ? */

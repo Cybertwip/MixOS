@@ -616,12 +616,133 @@ def generate(sources: dict[str, str]) -> str:
 \t\tclock-frequency = <26000000>;
 \t}};
 
+\t/*
+\t * MSDC1 source and bus clocks.
+\t *
+\t * MT6592 has no clock driver in mainline, so these are fixed-clocks that
+\t * describe what the bootloader already left running rather than anything
+\t * this kernel can change. 200 MHz is the rate the MVII LK's own MSDC
+\t * driver divides from (MSDC_SRC_CLK_HZ in mt6592_msdc_sd.c), and that
+\t * driver reads this card on this board, so the number is measured and not
+\t * a datasheet guess. The LK also ungates the gate this kernel cannot
+\t * touch: PERI_PDN0 bit 13 for MSDC30_1, plus the CLK_CFG_3 mux and the
+\t * six pad mode/drive settings. Nothing here re-does any of that.
+\t *
+\t * mtk-sd only takes the rate of \"source\" into its divider arithmetic;
+\t * \"hclk\" it merely enables, so its declared frequency is inert.
+\t */
+\tmsdc1_src_clk: clock-msdc1-source {{
+\t\tcompatible = \"fixed-clock\";
+\t\t#clock-cells = <0>;
+\t\tclock-frequency = <200000000>;
+\t}};
+
+\tmsdc1_h_clk: clock-msdc1-hclk {{
+\t\tcompatible = \"fixed-clock\";
+\t\t#clock-cells = <0>;
+\t\tclock-frequency = <200000000>;
+\t}};
+
+\t/*
+\t * The card's 3.3 V rail, as a fixed regulator.
+\t *
+\t * This is not decoration. mmc_regulator_get_supply() is the ONLY thing in
+\t * the MMC core that ever assigns mmc->ocr_avail (drivers/mmc/core/
+\t * regulator.c), and mtk-sd never sets it itself. With no vmmc-supply the
+\t * host comes up with ocr_avail == 0, mmc_power_up() offers the card no
+\t * voltage at all, and the SD attach fails with nothing in the log that
+\t * points at the cause.
+\t *
+\t * always-on/boot-on because the rail is genuinely already up: MT6323's
+\t * VMC/VMCH were switched on by the LK before it read /mvii/boot.conf off
+\t * this same card. There is no MT6323 regulator driver in this profile to
+\t * turn it off, and describing it as switchable would be a lie.
+\t */
+\tmsdc1_vmmc: regulator-msdc1-vmmc {{
+\t\tcompatible = \"regulator-fixed\";
+\t\tregulator-name = \"vmc-3v3\";
+\t\tregulator-min-microvolt = <3300000>;
+\t\tregulator-max-microvolt = <3300000>;
+\t\tregulator-always-on;
+\t\tregulator-boot-on;
+\t}};
+
+\t/*
+\t * MSDC1 -- the microSD slot, and the only path to the shared rootfs.
+\t *
+\t * Every number here was measured, not assumed:
+\t *
+\t *   reg 0x11240000  The MVII LK's SD driver drives this base and reads
+\t *                   this card (mt6592_msdc_sd.c). MSDC0 at 0x11230000 is
+\t *                   the eMMC and is deliberately left out of this tree.
+\t *
+\t *   interrupts 40   The stock MT6592 kernel carries a platform resource
+\t *                   array in .data at 0xc0b33050..0xc0b331c4 holding
+\t *                   {{start, end, name, IORESOURCE_MEM}} followed by
+\t *                   {{irq, 0, name, IORESOURCE_IRQ}}. It gives MSDC0 IRQ
+\t *                   103, MSDC1 104, MSDC2 105, and -- in the same array,
+\t *                   which is what makes it usable -- UART0..UART3 as
+\t *                   115..118. Mainline's own mt6592.dtsi puts those four
+\t *                   UARTs at GIC_SPI 51..54, so MediaTek's IRQ IDs run
+\t *                   64 above the GIC SPI number on this SoC. 104 - 64 = 40.
+\t *
+\t *   compatible      mt6592-mmc, added by 0001-mtk-sd-mt6592.patch. MT6592
+\t *                   is a 12-bit-divider part: the LK writes CKDIV in
+\t *                   MSDC_CFG[19:8] and CKMOD in [21:20], which is mtk-sd's
+\t *                   clk_div_bits == 12 layout, not the 8-bit mt8135 one.
+\t *                   No existing compatible pairs a 12-bit divider with
+\t *                   this generation's pad-tune register, hence the patch.
+\t *
+\t * 25 MHz to start with: default speed, no high-speed timing to get wrong
+\t * while the pad tuning is unproven. The LK runs the same card at 13 MHz.
+\t * Raise to 50 MHz with cap-sd-highspeed once a filesystem has survived
+\t * real traffic here.
+\t *
+\t * non-removable is a statement about this kernel, not about the slot: card
+\t * detect is a GPIO, MT6592 has no pinctrl/GPIO driver in mainline, and
+\t * root lives on this card anyway. There is nothing useful to do if it goes
+\t * away mid-run.
+\t */
+\tmmc1: mmc@11240000 {{
+\t\tcompatible = \"mediatek,mt6592-mmc\";
+\t\treg = <0x11240000 0x1000>;
+\t\tinterrupts = <0 40 8>; /* GIC_SPI 40, IRQ_TYPE_LEVEL_LOW */
+\t\tclocks = <&msdc1_src_clk>, <&msdc1_h_clk>;
+\t\tclock-names = \"source\", \"hclk\";
+\t\tvmmc-supply = <&msdc1_vmmc>;
+\t\tmax-frequency = <25000000>;
+\t\tbus-width = <4>;
+\t\tno-1-8-v;
+\t\tno-mmc;
+\t\tno-sdio;
+\t\tnon-removable;
+\t\tdisable-wp;
+\t\tstatus = \"okay\";
+\t}};
+
+\t/*
+\t * Disabled, and it must stay disabled while this profile has no GPIO or
+\t * PWM driver.
+\t *
+\t * pwm-backlight consumes two providers that do not exist here: &disp_pwm
+\t * (j36,mt6592-disp-pwm, no driver) and &gpio (j36,mt6592-gpio, no driver).
+\t * An enabled consumer with an unresolvable provider does not fail -- it
+\t * defers, and keeps deferring until driver_deferred_probe_timeout expires.
+\t * That is the ten-second gap between the last input message at 0.87 s and
+\t *
+\t *   [ 11.381612] platform backlight: deferred probe pending:
+\t *                pwm-backlight: failed to acquire enable GPIO
+\t *
+\t * on a board whose backlight the LK already switched on before Linux
+\t * started. The node bought nothing and cost ten seconds of every boot.
+\t */
 \tbacklight: backlight {{
 \t\tcompatible = \"pwm-backlight\";
 \t\tpwms = <&disp_pwm 0 30000 0>;
 \t\tbrightness-levels = <0 64 128 256 384 512 640 768 896 1023>;
 \t\tdefault-brightness-level = <7>;
 \t\tenable-gpios = <&gpio {backlight_gpio} 0>;
+\t\tstatus = \"disabled\";
 \t}};
 
 \tframebuffer@{fb_addr:08x} {{
