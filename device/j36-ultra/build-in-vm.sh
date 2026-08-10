@@ -1462,12 +1462,19 @@ fi
 # J36-only library path". Two thirds of that had already happened without anyone
 # arranging it, which measuring the built rootfs is the only way to find out:
 #
-#   /usr/lib/arm-linux-gnueabihf/dri/lima_dri.so       present
-#   /usr/lib/arm-linux-gnueabihf/dri/mediatek_dri.so   present
+#   /usr/lib/arm-linux-gnueabihf/dri/lima_dri.so       -> libdril_dri.so
+#   /usr/lib/arm-linux-gnueabihf/dri/mediatek_dri.so   -> libdril_dri.so
+#   /usr/lib/arm-linux-gnueabihf/dri/libdril_dri.so    present, 132 KB
 #   libgallium-25.0.7-2+deb13u1.so                     present, 25 MB
-#   libEGL_mesa.so.0.0.0                               present
+#   libEGL_mesa.so.0.0.0                               present, 265 KB
 #   libdrm.so.2.124.0                                  present
-#   /usr/share/glvnd/egl_vendor.d/50_mesa.json          present
+#   /usr/share/glvnd/egl_vendor.d/50_mesa.json          present, names libEGL_mesa.so.0
+#
+# The two _dri.so entries being symlinks is not a broken install, it is Mesa's
+# current layout: one megadriver, libdril_dri.so, with a symlink per kernel driver
+# name, and the loader picks by the name it looked up. So mediatek_dri.so existing
+# is what makes an mtk_drm card usable as a kmsro display device, and lima_dri.so
+# existing is what makes the Mali-450 render node the renderer behind it.
 #
 # Debian trixie's armhf Mesa is 25.0.7 and it ships both halves of the pair this
 # board needs: lima for the Mali-450 render node and mediatek for kmsro, which is
@@ -1483,14 +1490,44 @@ fi
 # libMali.so symlinks exactly as they are, which it has to, because that blob is
 # the only thing that drives its GPU.
 #
-# Why these five and not fewer: libgbm and libEGL are what SDL2's KMSDRM backend
-# dlopens, libGLESv1_CM is what EmulationStation actually calls (its 29 undefined
-# GL symbols are glMatrixMode, glLoadMatrixf, glEnableClientState -- fixed-function
-# GLES1, not ES2), libGLESv2 is there because SDL asks for it when a context
-# request comes out as ES2, and libGLdispatch is glvnd's own dependency. Four of
-# the five are currently intact on the rootfs and the payload ships them anyway:
-# utils.sh's clobber list names all four, so which ones survive is an accident of
-# which code path ran, and a payload that depends on an accident is not a payload.
+# Which names it actually took over, read off the built image rather than off
+# utils.sh, because the two do not agree -- utils.sh names four libraries and what
+# it leaves behind is this:
+#
+#   libEGL.so             -> libMali.so     clobbered   ES's only GL DT_NEEDED
+#   libgbm.so             -> libMali.so     clobbered
+#   libgbm.so.1           -> libMali.so     clobbered   an SONAME, see below
+#   libgbm.so.1.0.0       -> libMali.so     clobbered
+#   libGLESv1_CM.so       -> libMali.so     clobbered
+#   libGLESv1_CM.so.1.1.0 -> libMali.so     clobbered   stale SONAME, unused
+#   libEGL.so.1           -> libEGL.so.1.1.0        intact, real glvnd
+#   libGLESv1_CM.so.1     -> libGLESv1_CM.so.1.2.0  intact, real glvnd
+#
+# The versioned SONAMEs of libEGL and libGLESv1_CM survive; the bare development
+# names do not, and all three libgbm names do not. That split is what decides which
+# payload entries are load-bearing, and the answer is not the obvious one:
+#
+#   - libEGL.so is load-bearing because it is the literal string in
+#     emulationstation's DT_NEEDED. Not libEGL.so.1 -- the bare name, which is
+#     normally a -dev symlink no runtime binary should reference, and which here
+#     resolves to a Mali blob for a GPU that is not on this board.
+#   - libgbm.so.1 is load-bearing TWICE, and the second time is the one that would
+#     have been missed: SDL2's KMSDRM backend dlopens it, and libEGL_mesa.so.0
+#     carries it in its own DT_NEEDED. So with the rootfs as it stands, glvnd reads
+#     50_mesa.json, dlopens Mesa's EGL vendor, and that pulls the RK3326 blob into
+#     the process as its gbm. Mesa's EGL cannot initialise on this board without
+#     this payload -- the point is not merely that ES fails to link.
+#   - libGLESv1_CM.so.1 is what EmulationStation actually calls: its 29 undefined
+#     GL symbols are glMatrixMode, glLoadMatrixf, glEnableClientState -- fixed
+#     function GLES1, not ES2. Intact on the rootfs today.
+#   - libGLESv2.so.2 is for when SDL's context request comes out as ES2, and
+#     libGLdispatch.so.0 is glvnd's own dependency and the only DT_NEEDED any of
+#     these five have on each other.
+#
+# The intact ones are shipped anyway. Which names survive is an accident of which
+# utils.sh path ran on the day the image was built, and a payload that depends on
+# an accident is not a payload. Shipping all five costs 1.4 MB and removes the
+# question.
 GL_PACKAGES=(libgbm1 libglvnd0 libegl1 libgles1 libgles2)
 GL_PAYLOAD=""
 GL_MIRROR="${J36_DEBIAN_MIRROR:-http://deb.debian.org/debian}"
@@ -1988,15 +2025,24 @@ than assumed, and it is worth keeping the list because it is also the fault tree
      one reason it was never the answer -- the other being that it binds the same
      `simple-framebuffer' the working display is on and evicts simplefb.
   4. A GL front end that is Mesa's.  Debian's Mesa was in the rootfs all along;
-     what was not was its front door.  dArkOS replaces libEGL.so, libGLESv2.so*,
-     libGLESv1_CM.so* and libgbm.so* with symlinks to the RK3326's Mali-G31 blob,
-     and emulationstation.service pins SDL to it with
-     SDL_VIDEO_EGL_DRIVER=libEGL.so.  Bifrost is a different architecture from
-     this SoC's Utgard part, so that library cannot drive this GPU whatever else
-     is true.  j36.es=1 closes it: see the next section.
+     what was not was its front door.  dArkOS points libEGL.so, libgbm.so{,.1,.1.0.0}
+     and libGLESv1_CM.so at the RK3326's Mali-G31 blob, and
+     emulationstation.service pins SDL to it with SDL_VIDEO_EGL_DRIVER=libEGL.so.
+     Bifrost is a different architecture from this SoC's Utgard part, so that
+     library cannot drive this GPU whatever else is true.  j36.es=1 closes it:
+     see the next section.
 
 So there was no Mesa to cross-compile.  The whole of step 4 is five small
-libraries -- about 1.5 MB, most of it glvnd's dispatch table -- and an environment.
+libraries -- about 1.4 MB, most of it glvnd's dispatch table -- and an environment.
+
+Worth knowing before reading further, because it is the one that decides whether
+any of this can work: libgbm.so.1 is a name the blob took over, and
+libEGL_mesa.so.0 -- Mesa's own EGL vendor, the library /usr/share/glvnd/
+egl_vendor.d/50_mesa.json names -- carries libgbm.so.1 in its DT_NEEDED.  So on
+the rootfs as it stands, asking for EGL loads glvnd, glvnd loads Mesa's vendor,
+and Mesa's vendor pulls the Mali-G31 blob in as its GBM.  Mesa's EGL cannot come
+up on this board without the payload.  That is a stronger statement than "ES will
+not link", and it is why the fix is a library path rather than a rebuild.
 
 The GL front end, and why it is a tmpfs
 ---------------------------------------
