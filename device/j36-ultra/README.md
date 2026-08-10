@@ -235,6 +235,41 @@ Three things had to be true before that worked, and none of them are guesses:
 dArkOS's own `scripts/setup_partition.sh` sets `ROOT_FILESYSTEM_FORMAT="btrfs"`.
 `CONFIG_EXT4_FS` too, because a hand-made card usually is not.
 
+## What PID 1 needs, and why the size prune took it away
+
+With the card mounting and `switch_root` succeeding, systemd 257 aborted at 15 s:
+
+```
+systemd[1]: Failed to find module 'unix'
+systemd[1]: Failed to open netlink, ignoring: Function not implemented
+systemd[1]: Failed to allocate device monitor: Function not implemented
+systemd[1]: Failed to allocate notification socket: Function not implemented
+systemd[1]: Assertion '...' failed at src/core/device.c:64, function
+            device_unset_sysfs(). Aborting.
+systemd[1]: Freezing execution.
+```
+
+`ENOSYS` from `socket(2)`, three times. `CONFIG_NET` was in the size-prune
+disable list while `CONFIG_UNIX` was in the enable list — and `UNIX` lives under
+`if NET`, so `olddefconfig` dropped it, together with `INET`, `PACKET`,
+`POSIX_MQUEUE` and `SECCOMP_FILTER` (which depends on `NET` as well as
+`HAVE_ARCH_SECCOMP_FILTER`). With no `AF_UNIX` notification socket and no
+`AF_NETLINK` uevent monitor, systemd's `.device` units never get a sysfs path and
+the assertion that they have one kills PID 1. Nothing was wrong with the storage
+or the hand-off; the kernel had no sockets.
+
+`CONFIG_NAMESPACES` was `=n` for the same reason and was found by auditing the
+shipped `kernel.config` instead of by another boot — it also removes
+`NET_NS`/`PID_NS`/`IPC_NS`/`UTS_NS`, and Debian's units use `PrivateMounts`,
+`PrivateTmp` and `ProtectSystem`.
+
+The fix that matters is not `NET=y`, it is that **everything PID 1 cannot start
+without is now asserted after `olddefconfig`**, including the symbols that arrive
+by dependency. `UNIX` had been requested all along; what was missing was any
+check that the request survived. `WIRELESS` and `BT` are asserted *off* for the
+mirror-image reason: `WIRELESS` defaults to `y` under `NET`, and this image has
+2.5 MiB of slack in a fixed 9 MiB partition.
+
 `root=` on the command line is a **hint that `/init` verifies**, not an order to
 the kernel: `rdinit=/init` keeps the kernel out of root mounting entirely, so a
 `root=` that turns out to be wrong can no longer panic it. `/init` mounts each
