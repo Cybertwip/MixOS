@@ -48,6 +48,28 @@ elif [[ "${J36_UPDATE_KERNEL:-0}" == 1 ]]; then
     git -C "$KERNEL_SRC" reset --hard FETCH_HEAD
 fi
 
+# ── The one change this build makes to the kernel itself ──────────────────────
+#
+# mtk-sd carries no compatible for MT6592 and refuses to probe without pinctrl;
+# linux/0001-mtk-sd-mt6592.patch fixes both, and its header records why neither
+# can be worked around from the device tree instead.
+#
+# Applied idempotently rather than from a stamp file, because this checkout
+# persists across runs and a stamp can outlive the tree it describes -- a
+# J36_UPDATE_KERNEL reset above throws the patch away and would leave the stamp
+# claiming otherwise.  `apply --reverse --check' succeeds only when the change is
+# already present, so the tree is asked instead of a bookkeeping file.
+MTKSD_PATCH="$ROOT/device/j36-ultra/linux/0001-mtk-sd-mt6592.patch"
+[[ -f "$MTKSD_PATCH" ]] || die "missing kernel patch: $MTKSD_PATCH"
+if git -C "$KERNEL_SRC" apply --reverse --check "$MTKSD_PATCH" 2>/dev/null; then
+    log "The mtk-sd MT6592 patch is already applied"
+elif git -C "$KERNEL_SRC" apply --check "$MTKSD_PATCH" 2>/dev/null; then
+    log "Applying the mtk-sd MT6592 patch"
+    git -C "$KERNEL_SRC" apply "$MTKSD_PATCH"
+else
+    die "0001-mtk-sd-mt6592.patch neither applies to nor is applied in $KERNEL_SRC; refresh it against $KERNEL_BRANCH"
+fi
+
 mkdir -p "$KERNEL_OUT"
 if [[ ! -f "$KERNEL_OUT/.config" ]]; then
     log "Creating the initial MT6592 ARMv7 kernel configuration"
@@ -93,20 +115,50 @@ for symbol in ARCH_MULTIPLATFORM ARCH_MULTI_V7 ARCH_MULTI_V6_V7 ARCH_MEDIATEK MA
     config_y "$symbol"
 done
 
-# Keep this first-stage image below the fixed 9 MiB BOOTIMG partition. Storage,
-# networking, audio and native DRM/DSI are added only after the serial/fb/input
-# bring-up is proven.
+# Keep this first-stage image below the fixed 9 MiB BOOTIMG partition.
+# Networking, audio and native DRM/DSI are added only after the serial/fb/input
+# bring-up is proven. Storage is no longer in that list -- see below.
 for symbol in \
     DRM SOUND SND MEDIA_SUPPORT NET WIRELESS WLAN BT USB_SUPPORT SCSI ATA \
     DEBUG_INFO DEBUG_KERNEL KALLSYMS LOGO; do
     config_n "$symbol"
 done
 
+# ── Storage: the microSD card this kernel is already being loaded from ────────
+#
+# MSDC1 at 0x11240000 is the microSD slot. That is not a guess: it is the base
+# the MVII LK's own mt6592_msdc_sd.c programs to read the card this kernel comes
+# off, alongside MSDC0 at 0x11230000 for the eMMC. mmc@11240000 in the generated
+# device tree claims it with `mediatek,mt6592-mmc', which the patch above adds to
+# mtk-sd. No eMMC node is described, so the card is the only host and its
+# partitions land on mmcblk0.
+#
+# REGULATOR_FIXED_VOLTAGE is not padding. mmc->ocr_avail is assigned in exactly
+# one place in the whole MMC core -- drivers/mmc/core/regulator.c, from the vmmc
+# regulator -- and mtk-sd never sets it itself. With no driver behind
+# vmmc-supply the host advertises no voltage at all, and card init then fails
+# with nothing in the log pointing at the reason.
+#
+# BTRFS because the rootfs this card already carries is btrfs: dArkOS's own
+# scripts/setup_partition.sh sets ROOT_FILESYSTEM_FORMAT="btrfs". EXT4 because a
+# hand-made card usually is not, and /init tries both.
+for symbol in \
+    BLOCK BLK_DEV MMC MMC_BLOCK MMC_MTK REGULATOR REGULATOR_FIXED_VOLTAGE \
+    EXT4_FS BTRFS_FS; do
+    config_y "$symbol"
+done
+
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
     CROSS_COMPILE=arm-linux-gnueabihf- olddefconfig
 
+# olddefconfig re-derives every symbol from its dependencies, so it has the last
+# word on all of the above; the checks come after it, not before. MMC_MTK is
+# asserted =y and not =m on purpose: a module for the driver that mounts the
+# filesystem the modules live on cannot be loaded.
 for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
-                FB_SIMPLE SERIAL_8250_MT6577 BLK_DEV_INITRD MODULES; do
+                FB_SIMPLE SERIAL_8250_MT6577 BLK_DEV_INITRD MODULES \
+                MMC MMC_BLOCK MMC_MTK REGULATOR_FIXED_VOLTAGE \
+                EXT4_FS BTRFS_FS; do
     grep -q "^CONFIG_${required}=y$" "$CONFIG" || \
         die "required kernel option CONFIG_${required}=y was not selected"
 done
@@ -241,6 +293,13 @@ if [[ ! -x "$BUSYBOX_SRC/busybox" || "${J36_REBUILD_BUSYBOX:-0}" == 1 ]]; then
     bb_disable CONFIG_TC
     bb_disable CONFIG_FEATURE_TC_INGRESS
 
+    # /init now hands the machine over to the rootfs on the card, which needs the
+    # applet that does it and the one that backs out of a candidate partition
+    # that turned out not to be a root filesystem.
+    bb_enable CONFIG_SWITCH_ROOT
+    bb_enable CONFIG_UMOUNT
+    bb_enable CONFIG_SYNC
+
     yes '' | make -C "$BUSYBOX_SRC" oldconfig >/dev/null || true
 
     # oldconfig has the last word on all of the above -- it re-derives every
@@ -256,7 +315,7 @@ if [[ ! -x "$BUSYBOX_SRC/busybox" || "${J36_REBUILD_BUSYBOX:-0}" == 1 ]]; then
     for sym in CONFIG_ASH CONFIG_SH_IS_ASH CONFIG_MOUNT CONFIG_MKDIR CONFIG_MKNOD \
                CONFIG_CAT CONFIG_ECHO CONFIG_SLEEP CONFIG_DMESG CONFIG_INSMOD \
                CONFIG_LS CONFIG_HEXDUMP CONFIG_SETSID CONFIG_CTTYHACK CONFIG_HALT \
-               CONFIG_UNAME; do
+               CONFIG_UNAME CONFIG_SWITCH_ROOT CONFIG_UMOUNT CONFIG_SYNC; do
         grep -q "^$sym=y\$" "$BUSYBOX_SRC/.config" || \
             die "busybox $sym is off; /init uses that applet"
     done
@@ -275,8 +334,8 @@ rm -rf "$INITROOT"
 mkdir -p "$INITROOT"/{bin,dev,etc,lib/modules/$KERNEL_RELEASE/extra,proc,root,sbin,sys,tmp}
 cp "$BUSYBOX" "$INITROOT/bin/busybox"
 chmod 0755 "$INITROOT/bin/busybox"
-for applet in sh mount mkdir mknod cat echo sleep dmesg insmod ls hexdump \
-              setsid cttyhack poweroff reboot uname; do
+for applet in sh mount umount mkdir mknod cat echo sleep dmesg insmod ls hexdump \
+              setsid cttyhack switch_root sync poweroff reboot uname; do
     ln -sf busybox "$INITROOT/bin/$applet"
 done
 cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
@@ -290,16 +349,117 @@ mount -t sysfs sysfs /sys
 mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts
 
-echo
-echo "J36 Ultra ARMv7 bring-up initramfs"
-echo "Display must remain on the stock-LK framebuffer; native DSI is disabled."
-insmod /lib/modules/*/extra/j36_mt6592_input.ko || echo "input module load failed"
-echo "Framebuffer devices:"
-ls -l /dev/fb* 2>/dev/null || true
-echo "Input devices:"
-ls -l /dev/input 2>/dev/null || true
-echo "Use: hexdump -C /dev/input/event0"
-echo
+# ── Say it on the panel, not only on the cable ────────────────────────────────
+#
+# /dev/console is whichever console= came LAST on the kernel command line, so
+# with `console=tty0 console=ttyS0,115200n8' every word of this script goes to
+# the UART and the panel shows a bare blinking cursor.  say() writes to both, and
+# the interactive shell at the bottom is exec'd on /dev/tty1 explicitly for the
+# same reason -- `exec setsid cttyhack sh' alone inherits /dev/console and puts
+# the prompt on a serial port that may have nothing plugged into it.
+say() {
+    echo "$@"
+    if [ -c /dev/tty1 ]; then echo "$@" >/dev/tty1; fi
+    return 0
+}
+
+say ""
+say "J36 Ultra ARMv7 bring-up initramfs"
+say "Display stays on the stock-LK framebuffer; native DSI is disabled."
+insmod /lib/modules/*/extra/j36_mt6592_input.ko || say "input module load failed"
+
+# ── Hand over to the rootfs on the card, if there is one ─────────────────────
+#
+# root= is treated as a hint and nothing more.  Partition numbering follows
+# whichever MMC host attached first, and a card can be repartitioned between
+# boots, so every candidate is proved by mounting it and looking for /sbin/init
+# before the machine is handed to it.  Failing that we stay here with a shell,
+# which is strictly better than the kernel panicking on a root= it cannot honour.
+root_hint=""
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        root=/dev/*)
+            root_hint="${arg#root=}"
+            ;;
+        root=*)
+            # LABEL=/UUID= needs blkid, which this initramfs does not carry; the
+            # scan below finds the same partition by looking inside it.
+            say "root ${arg#root=} is not a device path; scanning instead"
+            ;;
+    esac
+done
+
+mkdir -p /newroot
+
+# btrfs first because that is what dArkOS formats ROOTFS as, ext4 second because
+# a hand-made card usually is not.  Mounted read-only to test, so a candidate
+# that is not the root filesystem is never written to.
+try_root() {
+    dev="$1"
+    if [ ! -b "$dev" ]; then return 1; fi
+    for fs in btrfs ext4; do
+        if ! mount -t "$fs" -o ro "$dev" /newroot 2>/dev/null; then continue; fi
+        if [ -x /newroot/sbin/init ] || [ -L /newroot/sbin/init ]; then
+            umount /newroot
+            if mount -t "$fs" "$dev" /newroot; then
+                say "root: $dev ($fs)"
+                return 0
+            fi
+            return 1
+        fi
+        umount /newroot
+    done
+    return 1
+}
+
+rootdev=""
+if [ -n "$root_hint" ] && try_root "$root_hint"; then
+    rootdev="$root_hint"
+else
+    if [ -n "$root_hint" ]; then
+        say "root=$root_hint holds no filesystem with /sbin/init; scanning"
+    fi
+    for dev in /dev/mmcblk*p* /dev/mmcblk*; do
+        if try_root "$dev"; then rootdev="$dev"; break; fi
+    done
+fi
+
+if [ -n "$rootdev" ]; then
+    say "switching root into $rootdev"
+    # Carried across rather than left behind: the real init inherits them
+    # already mounted, and if the move is refused it mounts its own.
+    mount --move /dev /newroot/dev 2>/dev/null
+    mount --move /proc /newroot/proc 2>/dev/null
+    mount --move /sys /newroot/sys 2>/dev/null
+    sync
+    exec switch_root /newroot /sbin/init
+    # Only reached if switch_root itself failed, and by then /dev, /proc and /sys
+    # have moved out from under us -- put them back before saying so, or say()
+    # has no /dev/tty1 to write to and the failure is invisible.
+    mount -t devtmpfs devtmpfs /dev 2>/dev/null
+    mount -t proc proc /proc 2>/dev/null
+    mount -t sysfs sysfs /sys 2>/dev/null
+    say "switch_root failed; staying in the initramfs"
+fi
+
+say ""
+say "Block devices seen by this kernel:"
+cat /proc/partitions
+say "Framebuffer devices:"
+ls -l /dev/fb* 2>/dev/null || say "  none"
+say "Input devices:"
+ls -l /dev/input 2>/dev/null || say "  none"
+say "Use: hexdump -C /dev/input/event0"
+say ""
+
+# A shell on each console, because either cable may be the only one attached:
+# the serial one in the background, the panel one as pid 1's replacement.
+if [ -c /dev/ttyS0 ]; then
+    setsid cttyhack sh </dev/ttyS0 >/dev/ttyS0 2>&1 &
+fi
+if [ -c /dev/tty1 ]; then
+    exec setsid cttyhack sh </dev/tty1 >/dev/tty1 2>&1
+fi
 exec setsid cttyhack sh
 INIT
 chmod 0755 "$INITROOT/init"
@@ -338,6 +498,13 @@ python3 "$ROOT/device/j36-ultra/create_boot_image.py" \
     --ramdisk "$ARTIFACTS/initramfs-j36-ultra.cpio.gz" \
     --output "$ARTIFACTS/boot.img"
 
+# Every comment in this file that says "the fixed 9 MiB BOOTIMG slot" is quoting
+# the stock scatter: BOOTIMG is partition SYS9 at 0x1f40000 with
+# partition_size 0x900000, and RECOVERY begins at 0x2840000, exactly 9 MiB later.
+# Assert it, because the kernel config above just grew MMC, btrfs and ext4 and
+# nothing else in this build would notice the payload crossing into RECOVERY.
+fits_in "$ARTIFACTS/boot.img" $((0x00900000)) "the BOOTIMG payload"
+
 # ── The SD BOOT payload ───────────────────────────────────────────────────────
 #
 # Copy this tree onto the FAT partition labelled BOOT and the MVII LK boots the
@@ -358,11 +525,11 @@ cp "$ZIMAGE" "$SDBOOT/zImage"
 cp "$DTB_OUT/mt6592-j36-ultra.dtb" "$SDBOOT/"
 cp "$ARTIFACTS/initramfs-j36-ultra.cpio.gz" "$SDBOOT/initrd.img"
 
-# This kernel has no MMC, block, SCSI or network support: the bring-up profile
-# turns them off to fit the 9 MiB BOOTIMG slot.  There is therefore no root=
-# here, and there must not be -- a root= this kernel cannot honour is a panic
-# instead of a shell.  It boots to the initramfs.  When native MSDC lands, add
-# `root=LABEL=ROOTFS rootwait rw` and drop rdinit=.
+# rdinit=/init stays even though root= is now present, and the two do not
+# conflict: rdinit means the kernel never mounts a root filesystem itself, so a
+# root= it could not honour can no longer panic it.  /init does the mounting, and
+# treats root= as a hint it verifies before switching -- delete the root= below
+# and the card boots to the initramfs shell exactly as it did before.
 cat > "$SDBOOT/mvii/boot.conf" <<'CONF'
 # MVII LK SD hand-off, J36 Ultra (MT6592, ARMv7).
 #
@@ -372,8 +539,13 @@ kernel=zImage
 dtb=mt6592-j36-ultra.dtb
 initrd=initrd.img
 
-# No root= : this bring-up kernel has no storage drivers and boots its initramfs.
-bootargs=console=tty0 console=ttyS0,115200n8 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init
+# root= is a hint for /init, not an order to the kernel: rdinit keeps the kernel
+# out of root mounting entirely.  /init mounts this partition read-only first and
+# switches into it only if it really holds /sbin/init, otherwise it scans the
+# other mmcblk partitions, otherwise it gives you a shell.  mmcblk0p2 is the
+# dArkOS ROOTFS partition, and microSD is mmcblk0 because MSDC1 is the only MMC
+# host in the device tree.  Remove root= to stop at the initramfs.
+bootargs=console=tty0 console=ttyS0,115200n8 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait
 CONF
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
@@ -396,8 +568,13 @@ at the ARMv7 payload instead.
   mvii/boot.conf            filenames and command line for the MVII LK
 
 The R36S kernel on the same card is arm64 and stays there for the R36S.  The
-armhf Debian rootfs is shared; this kernel cannot mount it yet, because storage
-drivers are not in the bring-up profile.
+armhf Debian rootfs is shared, and this kernel can now mount it: MSDC1, the
+microSD host, is driven by mtk-sd through a mediatek,mt6592-mmc node, and btrfs
+and ext4 are both built in.  /init verifies a candidate partition by mounting it
+read-only and looking for /sbin/init, then switch_roots into it.  If nothing
+qualifies -- or if you delete root= from mvii/boot.conf -- it stops at a busybox
+shell on the panel and on the serial port instead, and prints /proc/partitions so
+you can see what the kernel did find.
 README
 
 (
@@ -411,7 +588,8 @@ README
         echo "kernel_arch=arm (ARMv7, 32-bit)"
         echo "zimage_size=$(stat -c %s zImage)"
         echo "dtb_sha256=$(sha256sum mt6592-j36-ultra.dtb | awk '{print $1}')"
-        echo "bootimg_size=$(stat -c %s boot.img)"
+        echo "bootimg_size=$(stat -c %s boot.img) (slot 0x900000)"
+        echo "storage=msdc1 mtk-sd mediatek,mt6592-mmc (btrfs, ext4)"
         echo "bootimg_kernel=zImage-j36-ultra (device tree appended, ATAG path)"
         echo "sd_kernel=sd-boot/zImage (plain, LK passes the tree in r2)"
         echo "display=stock-lk-simple-framebuffer"
