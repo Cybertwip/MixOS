@@ -172,11 +172,16 @@ zImage                 plain ARMv7 kernel, no appended tree
 mt6592-j36-ultra.dtb   the tree the LK loads separately and patches
 initrd.img             bring-up initramfs (busybox + the input module)
 mvii/boot.conf         filenames and command line for the MVII LK
-j36/doom               framebuffer Doom, static ARMv7 (j36.doom=1)
-j36/freedoom1.wad      the game data it loads
 j36/mfgpower           powers the Mali-450 and reads its ID back (j36.lima=1)
 j36/modules/           lima.ko and its dependencies, plus load.order
+j36/mtkdrm/            the MT6592 display set, plus load.order (j36.mtkdrm=1)
+j36/gl/                Mesa's GL front end, plus links (vfat has no symlinks)
+j36/eglprobe           what can create a GL context, and why not
+j36/es/emulationstation  the same ES with a GLES 2.0 renderer (j36.es=1)
 ```
+
+`j36/doom` and `j36/freedoom1.wad` are no longer staged — see the fbdoom section
+below. `J36_DOOM=1` puts them back.
 
 Everything under `j36/` is read by `/init` and by nothing else — no LK load
 window, no size limit, no partition table entry. Deleting the directory, or the
@@ -425,6 +430,13 @@ deferring until `driver_deferred_probe_timeout` expires. That was the whole gap
 between 0.87 s and 11.38 s, plus an error on the panel.
 
 ## fbdoom: proving a program can drive the panel and the pad
+
+**Not staged any more.** `J36_DOOM` defaults to `0`: nothing is compiled, no IWAD
+is downloaded, and neither file reaches the BOOT partition, which carries the boot
+payload and not userland software. `/init` still runs `j36/doom` when `j36.doom=1`
+and the file is there, so `J36_DOOM=1` brings all of the below back unchanged. It
+is still the fastest way to split "the panel is broken" from "GL is broken", since
+Doom needs no DRM, no GL and no rootfs.
 
 Booting proves the machine runs. It does not prove a *program* can drive this
 display or read this gamepad, and the cheapest honest answer to that is
