@@ -954,6 +954,8 @@ at the ARMv7 payload instead.
   mt6592-j36-ultra.dtb      the tree the LK loads separately and patches
   initrd.img                bring-up initramfs (busybox + the input module)
   mvii/boot.conf            filenames and command line for the MVII LK
+  j36/doom                  framebuffer Doom, static ARMv7, run before hand-over
+  j36/freedoom1.wad         the game data it loads (Freedoom, freely licensed)
 
 The R36S kernel on the same card is arm64 and stays there for the R36S.  The
 armhf Debian rootfs is shared, and this kernel can now mount it: MSDC1, the
@@ -1016,6 +1018,51 @@ systemd.mask=batt_led.service
 rdinit=/init root=/dev/mmcblk0p2 rw rootwait
     See above: /init does the mounting, so root= cannot panic the kernel.
 
+j36.doom=1
+    Run j36/doom off this partition after the card comes up and before the
+    hand-over.  Delete the word, or the j36 directory, and the boot is exactly
+    what it was: /init says so on the panel and carries on.
+
+Doom, and what it is for
+------------------------
+
+It answers a question the boot itself does not: whether a program can drive this
+panel and read this pad.  Nothing already on the card can ask it -- SDL2 has no
+fbdev backend, so gzdoom, lzdoom and EmulationStation all need DRM/KMS or GL,
+this kernel has no DRM driver bound yet, and the GL stack in the shared rootfs is
+the RK3326's Mali-G31 blob for a GPU this SoC has not got.  doomgeneric needs
+none of that: it writes 32-bit pixels into /dev/fb0, which is the framebuffer the
+MVII LK was already scanning out when it jumped to the kernel, and reads
+/dev/input/event0 from j36_mt6592_input.ko.
+
+It runs from the initramfs, before switch_root, so it touches nothing on the
+shared rootfs and competes with no systemd unit for the panel.  It takes the VT
+into KD_GRAPHICS while it runs, which is what stops kernel messages painting
+over the frame, and puts it back on the way out -- including out through a
+signal, so a crash cannot leave the panel frozen on the last frame.
+
+  D-pad, left stick   turn and walk        640x400 centred in the 640x480 panel,
+  A                   fire                 which is a clean 2x of Doom's 320x200
+  B                   use, open doors      with 40 black lines top and bottom
+  X                   run
+  Y                   automap
+  L1, R1              strafe left, right
+  L2, R2              weapons 3 and 4
+  stick clicks        weapons 1 and 2
+  START               enter (menu select)
+  SELECT              escape (menu)
+  VOL-, VOL+          smaller, larger view
+  MENU                quit, and the boot continues
+
+The WAD is Freedoom 0.13.0, which is freely redistributable; the engine has no
+game data of its own.  Any IWAD works in its place, as long as the filename is
+one doomgeneric's d_iwad.c recognises -- doom.wad, doom1.wad, doom2.wad,
+freedoom1.wad, freedoom2.wad, freedm.wad, plutonia.wad, tnt.wad, chex.wad or
+hacx.wad.  /init takes the first of those it finds in j36/.
+
+There is no sound: doomgeneric is built with sound compiled out, which is honest
+about this kernel, since nothing drives the MT6592 audio path yet.
+
 Rebooting
 ---------
 
@@ -1029,9 +1076,15 @@ README
 
 (
     cd "$ARTIFACTS"
-    sha256sum boot.img zImage zImage-j36-ultra mt6592-j36-ultra.dtb \
-        j36_mt6592_input.ko initramfs-j36-ultra.cpio.gz \
-        sd-boot/zImage sd-boot/mvii/boot.conf > SHA256SUMS
+    # The Doom payload is optional, and sha256sum takes a missing operand as an
+    # error, so it is named only when it was staged.
+    sums=(boot.img zImage zImage-j36-ultra mt6592-j36-ultra.dtb
+          j36_mt6592_input.ko initramfs-j36-ultra.cpio.gz
+          sd-boot/zImage sd-boot/mvii/boot.conf)
+    if [[ -f sd-boot/j36/doom ]]; then
+        sums+=(sd-boot/j36/doom)
+    fi
+    sha256sum "${sums[@]}" > SHA256SUMS
     {
         echo "kernel_branch=$KERNEL_BRANCH"
         echo "kernel_release=$KERNEL_RELEASE"
