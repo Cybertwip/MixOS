@@ -633,6 +633,24 @@ BUSYBOX="$BUSYBOX_SRC/busybox"
 # symptom on the device would be an unhelpful `/init: not found' at hand-over.
 verify_arm_elf "$BUSYBOX" "the initramfs BusyBox"
 
+# And every applet /init runs has to be in that binary. This is outside the build
+# block on purpose: J36_REBUILD_BUSYBOX defaults to 0, so on all but the first run
+# the block above does not execute, and an assertion that only fires when BusyBox
+# is compiled is an assertion that never fires. The .config survives in the cached
+# source tree, which is what makes checking a cached build possible at all.
+#
+# It cannot be checked by running the binary: that busybox is static ARMv7 and this
+# builder is not ARM.
+for applet in "${INIT_APPLETS[@]}"; do
+    sym="$(bb_applet_symbol "$applet")"
+    grep -q "^$sym=y\$" "$BUSYBOX_SRC/.config" || \
+        die "busybox $sym is off but /init runs \`$applet'; rebuild with J36_REBUILD_BUSYBOX=1"
+done
+# Not an applet, so not in the list: it decides which shell CONFIG_ASH installs as
+# /bin/sh, and /init is #!/bin/sh.
+grep -q '^CONFIG_SH_IS_ASH=y$' "$BUSYBOX_SRC/.config" || \
+    die "busybox CONFIG_SH_IS_ASH is off; /init is #!/bin/sh"
+
 rm -rf "$INITROOT"
 mkdir -p "$INITROOT"/{bin,dev,etc,lib/modules/$KERNEL_RELEASE/extra,proc,root,sbin,sys,tmp}
 cp "$BUSYBOX" "$INITROOT/bin/busybox"
