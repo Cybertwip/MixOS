@@ -138,9 +138,10 @@ for symbol in ARCH_MULTIPLATFORM ARCH_MULTI_V7 ARCH_MULTI_V6_V7 ARCH_MEDIATEK MA
 done
 
 # Keep this first-stage image below the fixed 9 MiB BOOTIMG partition.
-# Audio and a native DSI/display driver are added only after the serial/fb/input
-# bring-up is proven. Storage is no longer in that list, and neither is NET --
-# see below -- and DRM has now left it too, for the GPU section further down.
+# Each thing that leaves this list leaves it because its bring-up is proven and
+# it earned the bytes: storage went first, then NET -- see below -- then DRM, for
+# the GPU section further down, and now SOUND and SND, for the audio section
+# after it. A native DSI/display driver is still on the outside.
 #
 # WIRELESS, WLAN and BT stay off, and they are disabled here rather than left
 # out: all three live inside `if NET' in net/Kconfig and WIRELESS defaults to y,
@@ -148,7 +149,7 @@ done
 # "is not set" lines for these are in .config before the single olddefconfig
 # below, which is what makes the explicit n stick.
 for symbol in \
-    SOUND SND MEDIA_SUPPORT WIRELESS WLAN BT USB_SUPPORT SCSI ATA \
+    MEDIA_SUPPORT WIRELESS WLAN BT USB_SUPPORT SCSI ATA \
     DEBUG_INFO DEBUG_KERNEL KALLSYMS LOGO; do
     config_n "$symbol"
 done
@@ -317,6 +318,60 @@ config_n DRM_FBDEV_EMULATION
 # pgprot_noncached, which is exactly what a register window needs.
 config_y DEVMEM
 
+# ── Audio: the ALSA core, modular, and one driver for the MT6592 AFE ───────────
+#
+# Until now SOUND and SND were in the disable list above, so this kernel had no
+# ALSA core, no /dev/snd and no controlC0 -- which is worth writing down because
+# the missing card was mistaken for the `90-alsa-restore.rules:1 GOTO has no
+# matching label' warning in the boot log.  That warning is unrelated: it comes
+# out of the shared Debian rootfs, whose first two rule lines are early-exit
+# GOTOs whose LABEL is in a file udev is not reading here.  It is still there
+# after this section; it was never the reason there was no sound.
+#
+# SOUND=y, everything else =m.  SOUND alone puts soundcore in vmlinux, which is
+# ten kilobytes of char-device registration -- the BOOTIMG budget does not
+# notice it -- and leaves snd, snd-timer, snd-pcm and our own driver on the vfat
+# BOOT partition, loaded from /init only when the command line asks.  Same
+# containment as lima and mtk_drm: a boot with no j36.audio word loads nothing,
+# binds nothing and is byte-identical to the one before this section.
+#
+# SND_DUMMY is the load-bearing oddity.  CONFIG_SND_PCM has no prompt of its own
+# -- it exists only to be `select'ed by a card driver -- so writing SND_PCM=m
+# into .config is silently dropped by olddefconfig, exactly the way CONFIG_UNIX
+# was dropped under `if NET' further up, and the assertion below would then fail
+# with nothing to point at.  An in-tree card that selects it is the way to ask
+# for it, and snd-dummy is the smallest.  It is built and then deliberately not
+# staged: nothing in j36/audio/ carries it, so it never loads, never registers
+# and never takes card0 from the AFE.
+#
+# The prune is not optional.  multi_v7_defconfig carries SND_SOC=y and dozens of
+# SND_SOC_* codecs behind it, all invisible today only because SND is off; the
+# moment SND comes back they would come back with it, every one of them building
+# into a kernel whose only sound hardware has no ASoC driver anywhere upstream.
+# So the same enumerate-and-disable idiom as DRM above, with an allowlist of
+# exactly what this board uses, and an outright refusal of SND_SOC after
+# olddefconfig -- because a stray `select SND_SOC_*' from some codec that
+# survives would be a silent 300 KiB and a second sound card.
+config_y SOUND
+while IFS='=' read -r option _value; do
+    symbol="${option#CONFIG_}"
+    case "$symbol" in
+        SOUND|SND|SND_TIMER|SND_PCM|SND_DRIVERS|SND_DUMMY) ;;
+        SOUND_*|SND_*) config_n "$symbol" ;;
+    esac
+done < <(grep -E '^CONFIG_(SOUND|SND)[A-Z0-9_]*=(y|m)$' "$CONFIG")
+config_m SND
+config_y SND_DRIVERS
+config_m SND_DUMMY
+# OSS emulation, sequencer and procfs: all three are `default y' once SND is on,
+# and all three are dead weight here.  Nothing in the dArkOS rootfs opens
+# /dev/dsp or /dev/sequencer, and /proc/asound duplicates what the card already
+# reports through sysfs.
+for symbol in SND_SUPPORT_OLD_API SND_PCM_OSS SND_MIXER_OSS SND_SEQUENCER \
+    SND_PROC_FS SND_VERBOSE_PROCFS SND_DEBUG; do
+    config_n "$symbol"
+done
+
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
     CROSS_COMPILE=arm-linux-gnueabihf- olddefconfig
 
@@ -352,7 +407,7 @@ for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 CGROUPS FHANDLE INOTIFY_USER SIGNALFD TIMERFD EPOLL \
                 DEVTMPFS DEVTMPFS_MOUNT TMPFS TMPFS_XATTR TMPFS_POSIX_ACL \
                 PROC_FS PROC_SYSCTL SYSFS BTRFS_FS_POSIX_ACL \
-                DRM DEVMEM; do
+                DRM DEVMEM SOUND; do
     grep -q "^CONFIG_${required}=y$" "$CONFIG" || \
         die "required kernel option CONFIG_${required}=y was not selected"
 done
@@ -392,6 +447,28 @@ for wanted_module in DRM_MEDIATEK MTK_MMSYS PHY_MTK_MIPI_DSI; do
         die "CONFIG_${wanted_module}=m was not selected; the mtk_drm display path must be modular so the default boot binds none of it"
 done
 
+# The ALSA core, and the reason this list exists at all is SND_PCM: it has no
+# prompt, so it cannot be asked for directly, and if the SND_DUMMY select above
+# ever stops reaching it the build has to fail here rather than produce an
+# initramfs whose load.order names a snd-pcm.ko that was never built. All three
+# =m, because that is what puts them on the BOOT partition instead of in the
+# 9 MiB image.
+for wanted_module in SND SND_TIMER SND_PCM SND_DUMMY; do
+    grep -q "^CONFIG_${wanted_module}=m$" "$CONFIG" || \
+        die "CONFIG_${wanted_module}=m was not selected; the ALSA core must be modular and SND_PCM has no prompt of its own, so it only arrives by select (SND_DUMMY is what selects it here)"
+done
+
+# SND_SOC is a refusal and not a preference. multi_v7_defconfig turns it on with
+# dozens of SND_SOC_* codecs behind it, none of which is this board -- there is no
+# MT6592 ASoC driver anywhere upstream, which is why j36_mt6592_audio.ko is a
+# native ALSA card instead. =m is refused along with =y: the ASoC core registers
+# nothing by itself, but a codec that came back with it can bind a node.
+for refused in SND_SOC; do
+    if grep -qE "^CONFIG_${refused}=(y|m)$" "$CONFIG"; then
+        die "CONFIG_${refused} came back after olddefconfig; MT6592 has no ASoC driver upstream and the SND_SOC_* set behind this symbol is hundreds of kilobytes of codecs for other boards"
+    fi
+done
+
 # Off on purpose, and worth failing over: WIRELESS defaults to y under NET, and
 # an accidental =y here drags cfg80211 and a WLAN menu into an image with 2.5 MiB
 # of slack in a fixed partition.
@@ -427,6 +504,12 @@ done
 # prefix -- mediatek-drm is useless without mtk-mmsys, mtk-mutex and the MIPI-TX
 # PHY, and none of those three is a DRM_ symbol.
 log "DRM configuration: $(grep -E '^CONFIG_(DRM|MTK_|PHY_MTK_).*=(y|m)$' "$CONFIG" | tr '\n' ' ')"
+
+# The same for sound, and for the same reason: the prune above is an allowlist, so
+# this line is where anything a kernel bump adds behind SND shows up. A short line
+# -- SOUND=y and four =m -- is the expected shape; a long one means a codec came
+# back and the allowlist needs a look.
+log "Sound configuration: $(grep -E '^CONFIG_(SOUND|SND)[A-Z0-9_]*=(y|m)$' "$CONFIG" | tr '\n' ' ')"
 
 log "Building the incremental ARMv7 kernel and its symbol table"
 export CCACHE_DIR="${CCACHE_DIR:-$ROOT/Arkbuild_ccache}"
@@ -500,7 +583,7 @@ log "Regenerating the J36 DTB from the current PowerEngine Drivers"
 J36_DRIVERS_DIR="$DRIVERS" J36_DTB_OUT_DIR="$DTB_OUT" \
     "$ROOT/build-j36-ultra-dtb.sh"
 
-log "Building the out-of-tree J36 modules: the input adapter and the panel"
+log "Building the out-of-tree J36 modules: the input adapter, the panel and the AFE"
 mkdir -p "$MODULE_SRC"
 rsync -a --delete "$ROOT/device/j36-ultra/linux/" "$MODULE_SRC/"
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
@@ -517,6 +600,13 @@ verify_arm_elf "$MODULE" "the input module"
 PANEL_MODULE="$MODULE_SRC/j36_jd9365_panel.ko"
 [[ -s "$PANEL_MODULE" ]] || die "panel module was not produced"
 verify_arm_elf "$PANEL_MODULE" "the panel module"
+# Likewise the AFE adapter: staged with the audio payload, never in the initramfs.
+# It is the one out-of-tree module that links against symbols the kernel only
+# exports when the ALSA core is configured, so a missing .ko here usually means
+# the sound section above lost SND rather than that this file failed to compile.
+AUDIO_MODULE="$MODULE_SRC/j36_mt6592_audio.ko"
+[[ -s "$AUDIO_MODULE" ]] || die "audio module was not produced"
+verify_arm_elf "$AUDIO_MODULE" "the audio module"
 fits_in "$DTB_OUT/mt6592-j36-ultra.dtb" $((0x00040000)) "the device tree"
 
 if [[ ! -d "$BUSYBOX_SRC/.git" ]]; then
@@ -729,10 +819,26 @@ want_lima=0
 want_mtkdrm=0
 want_es=0
 es_debug=0
+want_audio=0
+audio_speaker=0
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         j36.doom|j36.doom=1)
             want_doom=1
+            ;;
+        j36.audio|j36.audio=1)
+            want_audio=1
+            ;;
+        # The class-D amp, and it is a separate word because it is the only thing
+        # in this payload that can switch the board off.  The amp hangs off VBAT,
+        # which on this PMIC is the system node: with no cell fitted VBAT is held
+        # up only by the charger's current source, and the amp at output pulls it
+        # under the undervoltage lockout.  So a card configured for audio still
+        # boots silent, and this word is the deliberate second step -- on a board
+        # with a cell in it.
+        j36.audio=speaker)
+            want_audio=1
+            audio_speaker=1
             ;;
         j36.lima|j36.lima=1)
             want_lima=1
@@ -963,6 +1069,52 @@ run_mtkdrm() {
     done < /bootfs/j36/mtkdrm/load.order
     say "DRM devices:"
     ls -l /dev/dri 2>/dev/null || say "  none"
+    return 0
+}
+
+# ── The AFE, if the command line asks ─────────────────────────────────────────
+#
+# Same containment as the two above, for one reason of its own: this is the first
+# thing on this board that ungates the AFE's functional clocks, so nobody has yet
+# seen the DL1 DMA cursor advance.  Taking that measurement is what the payload is
+# for, and putting it behind a word means a card that ends up wedged by it is
+# fixed by deleting a directory rather than by a reflash.
+#
+# Loaded before the hand-over, like the others, so the card is known to be up and
+# the modules are in place before systemd starts looking for a controlC0.  The
+# module's own dmesg lines are the output that matters and they are not repeated
+# here -- CLK_CFG_AUD before and after, AUDIO_TOP_CON0, and then, on the first
+# stream, either "AFE DL1 DMA is live" or the cursor warning.
+#
+# The speaker parameter is passed as a module parameter and not compiled in, so
+# the same .ko serves both words.
+run_audio() {
+    if [ ! -f /bootfs/j36/audio/load.order ]; then
+        say "audio: j36.audio was asked for but j36/audio/load.order is not on the card"
+        return 1
+    fi
+    while IFS= read -r ko; do
+        case "$ko" in ''|'#'*) continue ;; esac
+        params=""
+        if [ "$audio_speaker" = 1 ]; then
+            case "$ko" in j36_mt6592_audio.ko) params="speaker=1" ;; esac
+        fi
+        if insmod "/bootfs/j36/audio/$ko" $params >/tmp/insmod.log 2>&1; then
+            say "audio: loaded $ko $params"
+        else
+            say "audio: FAILED to load $ko"
+            show /tmp/insmod.log
+        fi
+    done < /bootfs/j36/audio/load.order
+    if [ -d /dev/snd ]; then
+        say "sound devices:"
+        ls -l /dev/snd 2>/dev/null
+    else
+        say "audio: no /dev/snd; the card did not register"
+    fi
+    if [ "$audio_speaker" != 1 ]; then
+        say "audio: the speaker amp is off -- add j36.audio=speaker with a cell fitted"
+    fi
     return 0
 }
 
@@ -1316,18 +1468,22 @@ DROPINPROBE
     return 0
 }
 
-if [ "$want_doom" = 1 ] || [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_es" = 1 ]; then
+if [ "$want_doom" = 1 ] || [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || \
+   [ "$want_es" = 1 ] || [ "$want_audio" = 1 ]; then
     if mount_bootfs; then
         # Doom first: it owns the panel while it runs, and the two driver payloads
         # leave modules loaded that have no reason to be disturbed by a game
         # exiting.  mtkdrm after those, so that if it does disturb the panel the
-        # two things that were already proved have already run.  The GL front end
-        # last, because it is the only one of the four that is not finished when
+        # two things that were already proved have already run.  Audio next: it
+        # touches nothing any of the others touch, and it has to be in place
+        # before systemd looks for a controlC0 to restore into.  The GL front end
+        # last, because it is the only one of the five that is not finished when
         # this script ends -- it is a message to systemd, and systemd has not
         # started yet.
         if [ "$want_doom" = 1 ]; then run_doom; fi
         if [ "$want_lima" = 1 ]; then run_lima; fi
         if [ "$want_mtkdrm" = 1 ]; then run_mtkdrm; fi
+        if [ "$want_audio" = 1 ]; then run_audio; fi
         if [ "$want_es" = 1 ]; then setup_es_gl; fi
         umount /bootfs
     fi
@@ -1798,6 +1954,36 @@ if [[ "${J36_MTKDRM:-1}" == 1 ]]; then
     fi
 else
     log "mtkdrm: J36_MTKDRM=0, skipping the display payload"
+fi
+
+# The ALSA core and the AFE adapter, collected the same way and staged the same
+# way.  Two roots and only two: snd-pcm brings snd and snd-timer with it through
+# `modinfo -F depends', and j36_mt6592_audio is a root because it is out-of-tree
+# and nothing in the kernel tree points at it.
+#
+# snd-dummy is deliberately NOT a root and is deliberately not staged.  It was
+# built for one reason -- CONFIG_SND_PCM has no prompt and only exists to be
+# selected, and snd-dummy is the smallest in-tree card that selects it -- and
+# staging it would register a second sound card that would race the AFE for card0.
+#
+# The one failure this cannot report is the interesting one: whether the AFE's DMA
+# actually runs.  That is a measurement, it needs the board, and the driver makes
+# it on the first stream and puts the verdict in dmesg.
+AUDIO_MODULE_PATHS=()
+AUDIO_MODULE_ORDER=()
+if [[ "${J36_AUDIO:-1}" == 1 ]]; then
+    set +e
+    collect_modules audio AUDIO_MODULE_ORDER AUDIO_MODULE_PATHS \
+        snd-pcm j36_mt6592_audio
+    audio_rc=$?
+    set -e
+    if (( audio_rc != 0 )); then
+        AUDIO_MODULE_ORDER=()
+        AUDIO_MODULE_PATHS=()
+        log "audio: modules not staged, see the error above -- the kernel payload is unaffected"
+    fi
+else
+    log "audio: J36_AUDIO=0, skipping the audio payload"
 fi
 
 # ── The GL runtime, which turned out not to need building ─────────────────────
@@ -2354,6 +2540,23 @@ if (( ${#MTKDRM_MODULE_ORDER[@]} > 0 )); then
     log "mtkdrm: staged ${#MTKDRM_MODULE_ORDER[@]} modules into j36/mtkdrm/"
 fi
 
+# j36/audio/ is the ALSA core and the AFE adapter, on the same terms: its own
+# directory, its own load.order, its own command-line word, and deleting it takes
+# the sound experiment off the card without touching anything else.  That matters
+# more here than for the other payloads, because this is the one whose failure
+# mode is the board switching off: j36.audio=speaker powers a class-D amp on VBAT,
+# which is the system node, and a board with no cell fitted cannot hold it up.
+# Removing this directory is the recovery, from any machine that reads SD cards.
+if (( ${#AUDIO_MODULE_ORDER[@]} > 0 )); then
+    mkdir -p "$SDBOOT/j36/audio"
+    : > "$SDBOOT/j36/audio/load.order"
+    for i in "${!AUDIO_MODULE_ORDER[@]}"; do
+        cp "${AUDIO_MODULE_PATHS[$i]}" "$SDBOOT/j36/audio/${AUDIO_MODULE_ORDER[$i]}"
+        printf '%s\n' "${AUDIO_MODULE_ORDER[$i]}" >> "$SDBOOT/j36/audio/load.order"
+    done
+    log "audio: staged ${#AUDIO_MODULE_ORDER[@]} modules into j36/audio/"
+fi
+
 # j36/gl/ is the GL front end plus the links file that stands in for the symlinks
 # vfat cannot hold. Same removal contract as the other three: delete the directory
 # and j36.es=1 finds nothing, says so, and EmulationStation starts against the
@@ -2406,33 +2609,31 @@ fi
 cat > "$SDBOOT/mvii/boot.conf" <<'CONF'
 # MVII LK SD hand-off, J36 Ultra (MT6592, ARMv7).
 #
-# Read after the card's own boot.ini, so these override it.  A dArkOS boot.ini
+# Read after the card's own boot.ini, so these override it: a dArkOS boot.ini
 # names the RK3326 arm64 kernel, which this SoC cannot execute.  Keep this file
-# short: the LK reads it into a fixed 2 KiB buffer.  ../README.txt is the long
-# form, and explains every word of bootargs below.
+# short -- the LK reads it into a fixed 2 KiB buffer.  ../README.txt is the long
+# form and explains every word below.
 kernel=zImage
 dtb=mt6592-j36-ultra.dtb
 initrd=initrd.img
 
 # root= is a hint /init verifies, not an order to the kernel.  console=tty0 comes
-# last so /dev/console is the panel and not a serial port with nothing plugged
-# into it.  The two masked units are RK3326-only: firstboot is dArkOS's expansion
-# script, which a GUI-mode build has no tars for, and batt_led is the battery LED
-# daemon, which restarts forever on hardware this kernel does not describe.
+# last so /dev/console is the panel, not a serial port with nothing plugged in.
+# The two masked units are RK3326-only: firstboot has no tars in a GUI-mode build,
+# and batt_led restarts forever on hardware this kernel does not describe.
 #
-# The three j36 words are the GPU, the display and the GL front end, and they are
-# in dependency order: lima gives a render node, mtkdrm gives /dev/dri/card0, es
-# points EmulationStation at Mesa instead of the RK3326 blob.  Delete any of them,
-# or the matching directory under j36/, and the boot carries straight on.
-# j36.doom=1 was the panel and pad test.  It is not built and not staged any more,
-# so the word does nothing unless the card was written by a J36_DOOM=1 build.
-# ../README.txt explains every word.
+# Every j36 word is removable on its own: delete one, or the matching directory
+# under j36/, and the boot carries straight on.  lima gives a render node, mtkdrm
+# gives /dev/dri/card0, es points EmulationStation at Mesa instead of the RK3326
+# blob, audio gives the ALSA core and a sound card.  j36.doom=1 is no longer built.
 #
-# j36.es=debug is the same as j36.es=1 plus EmulationStation's --debug, Mesa's EGL
-# trace and one start attempt instead of six, all on the panel.  It is the default
-# only while ES still fails to open a GL context; change this word to j36.es=1 --
-# here, on this partition, from any machine -- once it draws.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.es=debug
+# j36.audio=speaker rather than =1 also powers the class-D amp: a second and
+# deliberate step, and it needs a cell fitted, because the amp hangs off VBAT --
+# the system node -- and battery-less it pulls the board under its own lockout.
+#
+# j36.es=debug adds ES's --debug, Mesa's EGL trace and one start attempt instead
+# of six.  Change it to j36.es=1, here, from any machine, once ES draws.
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.es=debug j36.audio=1
 CONF
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
@@ -2456,6 +2657,7 @@ at the ARMv7 payload instead.
   j36/mfgpower              powers the Mali-450 and reads its ID back; the gate
   j36/modules/              lima and its dependencies, plus load.order
   j36/mtkdrm/               the MT6592 display driver set, plus load.order
+  j36/audio/                the ALSA core and the MT6592 AFE driver, plus load.order
   j36/gl/                   Mesa's GL front end, plus links (vfat has no symlinks)
   j36/eglprobe              what can create a GL context, and why not; j36.es=debug
   j36/es/emulationstation   the same EmulationStation with a GLES 2.0 renderer,
@@ -2519,6 +2721,15 @@ systemd.mask=batt_led.service
     Restart=on-failure under the default 5-starts-in-10-s limit.  Bounded noise
     is evidence; only the unbounded one had to go.
 
+    The three audio units are worth watching now that j36.audio=1 registers a card:
+    they were failing on a machine with no /dev/snd at all, and with one present
+    their amixer calls will look for RK3326 control names -- "Playback", "HP", a
+    dozen SoC-specific ones -- that this card does not have.  A oneshot that fails
+    on a missing control is the same bounded noise as before and is left alone; what
+    would not be bounded is a control this card DOES have being set to something
+    unwanted, so "Master Playback Switch" and "Master Playback Volume" are the two
+    names to check against those scripts if the sound ever changes by itself.
+
 rdinit=/init root=/dev/mmcblk0p2 rw rootwait
     See above: /init does the mounting, so root= cannot panic the kernel.
 
@@ -2545,6 +2756,46 @@ j36.mtkdrm=1
     /dev/dri/card0.  Same removal story again: delete the word or the directory and
     not one line of it is loaded.  Loading it is visually a no-op, and that is by
     construction rather than by luck: see below.
+
+j36.audio=1
+    Load the ALSA core and the AFE driver from j36/audio/, which is what gives this
+    kernel a /dev/snd and a controlC0 at all -- CONFIG_SOUND and CONFIG_SND were off
+    until now.  Independent of the three words above: nothing here touches DRM, GL
+    or the panel, and it is loaded before switch_root so systemd finds a card to
+    restore into.  Same removal story as the rest.
+
+    It is SILENT, and that is deliberate rather than a shortfall.  What this word
+    switches on is the digital half: the AFE's DL1 memif, the interconnect route to
+    the I2S DAC, the MT6323 ABB downlink, and one 16-bit stereo playback PCM at
+    8-48 kHz.  What it does not switch on is the class-D speaker amp -- see the next
+    word.  So a stream opens, is accepted and is paced, and nothing comes out.
+
+    The one line to read afterwards is the driver's own:
+
+      j36-mt6592-audio ...: AFE DL1 DMA is live (cursor moving)
+
+    on the first stream.  This is the first thing on this board ever to ungate the
+    AFE's functional clocks -- MVII has the sequence and compiles it out -- so
+    whether the DMA runs at all was an open question until that line appeared.  If
+    instead you get "AFE DL1 cursor has not moved in 250 ms", the memif is not
+    fetching and the driver falls back to pacing the stream from the wall clock, so
+    audio applications keep running rather than blocking on a period that never
+    completes.  CLK_CFG_AUD, printed before and after at probe, is the next thing to
+    read: bits 31 and 23 must both be 0 afterwards.
+
+j36.audio=speaker
+    Everything j36.audio=1 does, and then the class-D amp, once the DL1 cursor has
+    been seen advancing -- never before, because an amp fed by an unclocked DAC
+    drives the coil with DC.
+
+    FIT A CELL FIRST.  The amp is the largest load on this board and it hangs off
+    VBAT, which on this PMIC is the system node, not a battery-only rail.  With no
+    cell fitted VBAT is held up by the charger's current source alone, and MVII
+    measured the amp at output pulling it under the PMIC's undervoltage lockout: the
+    board switches off a few seconds into playback.  The driver opens at level 8 of
+    11 rather than at the vendor's maximum for the same reason.  Recovery from a
+    board that will not stay up is to delete j36/audio from the card, or this word
+    from mvii/boot.conf, from any machine that reads SD cards.
 
 j36.es=1
     Point EmulationStation at Mesa instead of the RK3326's Mali blob, by staging
@@ -2608,8 +2859,11 @@ one doomgeneric's d_iwad.c recognises -- doom.wad, doom1.wad, doom2.wad,
 freedoom1.wad, freedoom2.wad, freedm.wad, plutonia.wad, tnt.wad, chex.wad or
 hacx.wad.  /init takes the first of those it finds in j36/.
 
-There is no sound: doomgeneric is built with sound compiled out, which is honest
-about this kernel, since nothing drives the MT6592 audio path yet.
+There is no sound from Doom: doomgeneric is built with sound compiled out.  That
+was honest about the kernel when it was written -- nothing drove the MT6592 audio
+path at all -- and it is now merely a build option that was never revisited.  The
+audio path is j36.audio=1 above, and it goes through ALSA, which this build of
+doomgeneric was not linked against.
 
 The Mali-450, and why a helper runs before the driver
 -----------------------------------------------------
@@ -2692,6 +2946,54 @@ reset, pushed 155 init records and lit the backlight -- and it refuses to probe
 without j36,preserve-lk-state in the tree rather than pretend it can bring a dark
 panel up.  Cold start is not implemented; the device tree keeps the init table,
 the PMIC sequence and the GPIO sequence so that it can be.
+
+Sound, and the two things about it that are not yet measured
+------------------------------------------------------------
+
+j36/audio/ is the ALSA core plus one driver, j36_mt6592_audio.ko, and the driver is
+ours: sound/soc/mediatek starts at MT2701, so there has never been an MT6592 audio
+driver upstream, and the vendor path is an Android HAL talking to a kernel
+interface this kernel does not have.  What the driver does have is the register
+sequences, taken from the freestanding MVII driver written against this board --
+PowerEngine OS/MVII/Kernel/ARM/MediaTek/J36Ultra/Drivers/mt6592_audio.c -- which in
+turn distilled them from the reference HAL under External/MediaTek/Audio/MT6592.
+
+It is a native ALSA card and not an ASoC machine driver.  ASoC is the right shape
+for a SoC with a codec on a bus, and this is that, but the whole point of the
+exercise is one measurement on one memif; snd_pcm_new plus five callbacks gets
+there against an API that has not moved in years, where the 6.12 ASoC specifics
+would have cost several rebuilds for the same result.
+
+It runs with no interrupt, which is a deliberate choice and not a gap.  The AFE's
+IRQ block is not in the reference material at all, and a period wakeup does not
+need it: DL1's read cursor is a register, so a delayed work item polls it at 5 ms
+and calls snd_pcm_period_elapsed, exactly as MVII paces its own playback.
+
+Two things it does are NOT proven on this board, and they are the reason it exists:
+
+  1. The AFE functional clock.  MVII has the ungate sequence -- two power-down bits
+     in TOPCKGEN CLK_CFG_3 and one in INFRACFG -- and compiles it out; its audio is
+     soft-paced silence.  So nobody has ever seen AFE_DL1_CUR advance on this SoC.
+     This driver ungates, logs CLK_CFG_AUD before and after, and reports on the
+     first stream whether the cursor moved.  That log line is the deliverable.
+  2. The class-D speaker.  It is off unless j36.audio=speaker asks for it, and even
+     then it is powered only after the cursor has been seen moving.  VBAT is the
+     system node on this PMIC, the amp is the largest load on the board, and MVII
+     recorded it pulling VBAT under the undervoltage lockout with no cell fitted.
+     The driver opens at level 8 of 11 and steps up one at a time.
+
+So with the default word this card is silent by construction.  What it gains is
+/dev/snd, a PCM that accepts and paces audio, a controlC0 with a Master volume and
+switch, and one line in dmesg that says whether the hardware consumed any of it.
+
+One thing that is NOT related, because it looked like it was: the boot log's
+
+  /usr/lib/udev/rules.d/90-alsa-restore.rules:1 GOTO="alsa_restore_std" has no
+  matching label, ignoring.
+
+comes out of the shared Debian rootfs and has nothing to do with any of this.  Its
+first two lines are early-exit GOTOs whose LABEL is in a file udev is not reading
+here; it was there when there was no ALSA core at all, and it is still there now.
 
 EmulationStation
 ----------------
@@ -3066,6 +3368,12 @@ README
             sums+=("sd-boot/j36/mtkdrm/$ko")
         done < sd-boot/j36/mtkdrm/load.order
     fi
+    if [[ -f sd-boot/j36/audio/load.order ]]; then
+        sums+=(sd-boot/j36/audio/load.order)
+        while IFS= read -r ko; do
+            sums+=("sd-boot/j36/audio/$ko")
+        done < sd-boot/j36/audio/load.order
+    fi
     if [[ -f sd-boot/j36/gl/links ]]; then
         sums+=(sd-boot/j36/gl/links)
         # Glob here and not a manifest walk, because links names the SONAMEs and
@@ -3135,6 +3443,21 @@ README
             echo "display_fbdev=CONFIG_DRM_FBDEV_EMULATION=n, so /dev/fb0 stays simplefb's"
         else
             echo "display_drm=not staged"
+        fi
+        if [[ -f sd-boot/j36/audio/load.order ]]; then
+            echo "audio=mt6592 afe at 0x11220000, dl1 memif -> i2s dac -> mt6323 abb"
+            echo "audio_driver=j36_mt6592_audio.ko, native ALSA (no MT6592 ASoC driver exists upstream)"
+            echo "audio_reference=PowerEngine OS/MVII/.../mt6592_audio.c, from the MT6592 HAL"
+            echo "audio_pcm=1 playback, S16_LE stereo 8k-48k, 64 KiB ring, cursor polled at 5 ms, no IRQ"
+            echo "audio_modules=$(tr '\n' ' ' < sd-boot/j36/audio/load.order)"
+            echo "audio_core=CONFIG_SOUND=y (soundcore only); snd, snd-timer, snd-pcm are =m and staged here"
+            echo "audio_snd_pcm=selected by SND_DUMMY=m, which is built and deliberately not staged"
+            echo "audio_start=$(grep -o 'j36\.audio=[a-z0-9]*' sd-boot/mvii/boot.conf)"
+            echo "audio_clock=UNPROVEN: this is the first ungate of AFE_CG on this board; dmesg says whether DL1_CUR advances"
+            echo "audio_speaker=off unless j36.audio=speaker, and then only after the cursor moves"
+            echo "audio_speaker_hazard=class-D amp on VBAT, which is the system node; battery-less it trips the PMIC UVLO"
+        else
+            echo "audio=not staged"
         fi
         if [[ -f sd-boot/j36/gl/links ]]; then
             echo "gl=debian armhf mesa 25.0.7 from the shared rootfs (lima_dri.so + mediatek_dri.so)"

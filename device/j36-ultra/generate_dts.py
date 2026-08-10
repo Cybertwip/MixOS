@@ -504,6 +504,47 @@ def generate(sources: dict[str, str]) -> str:
 \t\t\treg = <0x10003000 0x1000>;
 \t\t}};
 
+\t\t/*
+\t\t * The two clock blocks, as syscons rather than clock providers. There is
+\t\t * no MT6592 entry in drivers/clk/mediatek, so nothing here can hand out a
+\t\t * struct clk; the consumers that need a gate released reach the register
+\t\t * through a phandle and clear one documented bit. Same shape and same
+\t\t * reason as pericfg above, which is how the input adapter reaches the
+\t\t * keypad's peripheral gate.
+\t\t */
+\t\ttopckgen: syscon@10000000 {{
+\t\t\tcompatible = \"j36,mt6592-topckgen\", \"syscon\";
+\t\t\treg = <0x10000000 0x1000>;
+\t\t}};
+
+\t\tinfracfg: syscon@10001000 {{
+\t\t\tcompatible = \"j36,mt6592-infracfg\", \"syscon\";
+\t\t\treg = <0x10001000 0x1000>;
+\t\t}};
+
+\t\t/*
+\t\t * The AFE. Not mediatek,mt6592-audio and not an ASoC card: nothing
+\t\t * upstream binds either name -- sound/soc/mediatek starts at MT2701 --
+\t\t * so this is our own compatible for our own adapter, and it stays a
+\t\t * j36, prefix precisely so it can never collide with a real binding.
+\t\t *
+\t\t * reg is the AFE window alone. The three phandles are the blocks the
+\t\t * driver has to reach but does not own: two clock gates it clears, and
+\t\t * the PMIC wrapper it programs the MT6323 analog downlink through.
+\t\t *
+\t\t * status is \"okay\" and this costs nothing on a boot that does not ask
+\t\t * for audio: the driver is a module on the boot partition, so with no
+\t\t * j36.audio word nothing is ever loaded to bind to this node.
+\t\t */
+\t\taudio: audio@11220000 {{
+\t\t\tcompatible = \"j36,j36-ultra-audio\";
+\t\t\treg = <0x11220000 0x1000>;
+\t\t\tj36,topckgen-controller = <&topckgen>;
+\t\t\tj36,infracfg-controller = <&infracfg>;
+\t\t\tj36,pwrap-controller = <&pwrap>;
+\t\t\tstatus = \"okay\";
+\t\t}};
+
 \t\tauxadc: adc@11001000 {{
 \t\t\tcompatible = \"j36,mt6592-auxadc\";
 \t\t\treg = <0x11001000 0x1000>;
