@@ -1024,6 +1024,17 @@ setup_es_gl() {
         ln -sf "$target" "/newroot/run/j36/gl/$name"
     done < /bootfs/j36/gl/links
 
+    # The EGL probe rides in beside the libraries, not among them: /run/j36/gl is
+    # a loader search path and a binary in it would be a name ld.so has to skip.
+    # It is only ever run by the j36.es=debug drop-in below.
+    if [ -f /bootfs/j36/eglprobe ]; then
+        if cp /bootfs/j36/eglprobe /newroot/run/j36/eglprobe; then
+            chmod 0755 /newroot/run/j36/eglprobe
+        else
+            say "es: could not copy the EGL probe"
+        fi
+    fi
+
     # Nothing above is allowed to fail quietly, because of what the fallback is.
     # The drop-in tells the loader to look in this directory; if the directory is
     # empty the loader simply misses and resolves ES's bare `libEGL.so' in
@@ -1102,7 +1113,8 @@ DROPIN
     #                    can be read.  One attempt, one trace.
     #   StandardError    the trace is on stderr, and this boot's whole purpose is
     #                    to read it off the panel, so it is stated rather than
-    #                    inherited.
+    #                    inherited.  StandardOutput joins it because the probe
+    #                    below writes to stdout.
     if [ "$es_debug" = 1 ]; then
         cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINDBG'
 
@@ -1113,8 +1125,31 @@ Environment="LIBGL_DEBUG=verbose"
 ExecStart=
 ExecStart=/usr/bin/emulationstation/emulationstation.sh --debug
 Restart=no
+StandardOutput=journal+console
 StandardError=journal+console
 DROPINDBG
+
+        # And the probe, if it was staged.  Written separately so that a card
+        # without it produces a drop-in that does not mention it, rather than a
+        # tolerated failure the reader has to recognise as harmless.
+        #
+        # ExecStartPre inherits this unit's Environment, which is the point: the
+        # probe resolves libEGL.so.1 and libgbm.so.1 through LD_LIBRARY_PATH the
+        # same way ES will, so it reports on the payload rather than on Debian's
+        # copies.  It is prefixed with - because a probe is not a precondition:
+        # whatever it says, ES still gets its attempt.
+        #
+        # It runs before ES and is repeated after ES exits because of the panel:
+        # ES with --debug prints more than 30 lines and the probe's verdict would
+        # scroll away before it could be photographed.  The second copy comes
+        # from the log rather than a second run, so it cannot disagree with the
+        # first.
+        if [ -x /newroot/run/j36/eglprobe ]; then
+            cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINPROBE'
+ExecStartPre=-/bin/sh -c '/run/j36/eglprobe 2>&1 | tee /run/j36/eglprobe.log'
+ExecStopPost=-/bin/sh -c 'echo "--- eglprobe, repeated now that ES has exited ---"; cat /run/j36/eglprobe.log'
+DROPINPROBE
+        fi
     fi
 
     say "es: GL front end in /run/j36/gl, drop-in in /run/systemd/system"
@@ -1787,6 +1822,55 @@ collect_gl_payload() {
     return 0
 }
 
+# The one question a status 134 does not answer: which API, on which node, and
+# with which EGL error.  tools/j36-eglprobe.c asks it directly -- the reasoning is
+# at the top of that file.  Built here rather than downloaded because nothing in
+# Debian answers it: eglinfo pulls libX11 and a dev stack into the image, and this
+# pulls nothing.
+#
+# Dynamic, unlike mfgpower, because it dlopens the very libraries the payload
+# above stages -- so it runs after switch_root, where there is an ld.so.  Nothing
+# beyond libc and the interpreter may be needed: dlopen moved into libc in glibc
+# 2.34 and both the VM's and the rootfs's are past that, so -ldl would add nothing
+# but a stub.  That is asserted rather than assumed, because a probe that cannot
+# load is worse than no probe -- it would look like the GL payload is what failed.
+# armhf gcc names the interpreter in DT_NEEDED as well as in PT_INTERP, so
+# ld-linux-armhf.so.3 is expected there and is not a dependency this has to ship.
+#
+# Non-fatal, like fbdoom and mfgpower: a diagnostic must never cost the user the
+# kernel artifacts.  Hence the local readelf tests instead of verify_arm_elf,
+# which dies.
+ESPROBE_SRC="$ROOT/device/j36-ultra/tools/j36-eglprobe.c"
+ESPROBE_BIN=""
+
+build_eglprobe() {
+    local out="$WORK/j36-eglprobe" header needed
+
+    [[ -f "$ESPROBE_SRC" ]] || { log "gl: $ESPROBE_SRC is missing"; return 1; }
+    arm-linux-gnueabihf-gcc -O2 -std=gnu11 -Wall -Wextra \
+        -o "$out" "$ESPROBE_SRC" || return 1
+
+    header="$(readelf -hd "$out" 2>/dev/null)" || return 1
+    grep -q 'Class:.*ELF32' <<<"$header" || { log "gl: eglprobe is not a 32-bit ELF"; return 1; }
+    grep -q 'Machine:.*ARM' <<<"$header" || { log "gl: eglprobe is not an ARM ELF"; return 1; }
+    needed="$(sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p' <<<"$header" | tr '\n' ' ')"
+    local unexpected="" lib
+    for lib in $needed; do
+        case "$lib" in
+            libc.so.6|ld-linux-armhf.so.3) ;;
+            *) unexpected="$unexpected $lib" ;;
+        esac
+    done
+    if [[ -n "$unexpected" ]]; then
+        log "gl: eglprobe needs libraries the rootfs may not have:$unexpected"
+        return 1
+    fi
+
+    ESPROBE_BIN="$out"
+    log "gl: eglprobe is $(stat -c %s "$out") bytes, dynamic ARM, needs $needed"
+    return 0
+}
+
 if [[ "${J36_ES:-1}" == 1 ]]; then
     set +e
     collect_gl_payload
@@ -1795,6 +1879,15 @@ if [[ "${J36_ES:-1}" == 1 ]]; then
     if (( gl_rc != 0 )); then
         GL_PAYLOAD=""
         log "gl: the GL front end was not staged, see the error above -- the kernel payload is unaffected"
+    fi
+
+    set +e
+    build_eglprobe
+    probe_rc=$?
+    set -e
+    if (( probe_rc != 0 )); then
+        ESPROBE_BIN=""
+        log "gl: eglprobe was not built, see the error above -- j36.es=debug will just be quieter"
     fi
 else
     log "gl: J36_ES=0, skipping the GL front end"
@@ -1875,6 +1968,16 @@ if [[ -n "$GL_PAYLOAD" ]]; then
     log "gl: staged $(ls -1 "$SDBOOT/j36/gl" | wc -l) files into j36/gl/"
 fi
 
+# The probe sits beside the payload rather than inside j36/gl/, because that
+# directory is copied wholesale into the loader's search path and a binary is not
+# a library. j36.es=debug runs it; j36.es=1 never touches it. Deleting it is the
+# same contract as the rest: the debug boot simply loses this report.
+if [[ -n "$ESPROBE_BIN" ]]; then
+    cp "$ESPROBE_BIN" "$SDBOOT/j36/eglprobe"
+    chmod 0755 "$SDBOOT/j36/eglprobe"
+    log "gl: staged j36/eglprobe ($(stat -c %s "$SDBOOT/j36/eglprobe") bytes)"
+fi
+
 # rdinit=/init stays even though root= is now present, and the two do not
 # conflict: rdinit means the kernel never mounts a root filesystem itself, so a
 # root= it could not honour can no longer panic it.  /init does the mounting, and
@@ -1941,6 +2044,7 @@ at the ARMv7 payload instead.
   j36/modules/              lima and its dependencies, plus load.order
   j36/mtkdrm/               the MT6592 display driver set, plus load.order
   j36/gl/                   Mesa's GL front end, plus links (vfat has no symlinks)
+  j36/eglprobe              what can create a GL context, and why not; j36.es=debug
 
 The R36S kernel on the same card is arm64 and stays there for the R36S.  The
 armhf Debian rootfs is shared, and this kernel can now mount it: MSDC1, the
@@ -2258,22 +2362,67 @@ one line of upstream ES, es-core/src/renderers/Renderer_GLES10.cpp:129:
 Neither return value is checked, so when the context cannot be created the next GL
 call goes to glvnd's no-op dispatch, returns NULL, and std::string(NULL) throws.
 The abort is therefore a report that eglCreateContext failed and that the reason
-was discarded one line earlier.  Two details about this board make it worth
-knowing which reason: ES sets SDL_GL_CONTEXT_MAJOR_VERSION twice in setupWindow()
-(to 1, then to 0) and never sets SDL_GL_CONTEXT_PROFILE_MASK, so SDL asks EGL for
-a DESKTOP OpenGL config and calls eglBindAPI(EGL_OPENGL_API) -- not GLES1, despite
-every gl* symbol in the binary being fixed-function GLES1.  Mesa answers that on
-lima and glvnd shares one dispatch table across APIs, so it is not on its own
-fatal; it does mean an EGL failure here is not the one a GLES-only device would
-have.
+was discarded one line earlier.
 
-So: boot with j36.es=debug (it is the default in boot.conf) and read the panel.
-That adds ES's --debug -- which reaches stderr even with LogLevel=disabled in
-es_settings.cfg, because Log::~Log() writes to stderr at LogDebug while Log::init()
-never opens the file -- plus EGL_LOG_LEVEL=debug, MESA_DEBUG=1, LIBGL_DEBUG=verbose
-and Restart=no, so there is one trace to read instead of six.  Mesa's line names
-the vendor, the dri module and the failure.  Add
-systemd.mask=emulationstation.service to bootargs to get the machine back to a
+j36.es=debug asks for the reason.  It adds ES's --debug -- which reaches stderr
+even with LogLevel=disabled in es_settings.cfg, because Log::~Log() writes to
+stderr at LogDebug while Log::init() never opens the file -- plus
+EGL_LOG_LEVEL=debug, MESA_DEBUG=1, LIBGL_DEBUG=verbose and Restart=no, so there is
+one trace to read instead of six.  What that boot showed, in order:
+
+  libGL: Can't open configuration file /home/ark/.drirc: No such file
+  libEGL debug: No DRI config supports native format <name>          (repeatedly)
+  libEGL debug: EGL user error <code> in dri2_create_context
+  what():  basic_string: construction from null is not valid
+
+Only the third line is a failure.  The .drirc lines are Mesa looking for tuning
+files that were never written, and the "No DRI config supports native format"
+lines come from Mesa's own per-visual walk at eglInitialize: libEGL_mesa.so.0
+carries that literal next to dri2_create_context and DRI2: failed to validate
+config, it prints a pipe-format name, and it says one line for every format in
+Mesa's visual table that this driver pair does not expose.  A kmsro display device
+exposes few, so most of the table misses and the noise is expected.
+
+The third line is eglCreateContext being rejected inside Mesa, and the order of
+SDL's calls narrows it a long way before anything is measured.  SDL's KMSDRM
+backend chooses a config, creates a gbm surface, calls eglCreateWindowSurface and
+only then creates a context (SDL_kmsdrmvideo.c: KMSDRM_CreateSurfaces at 1190,
+SDL_EGL_SetRequiredVisualId with GBM_FORMAT_ARGB8888 at 1236).  So by the time
+dri2_create_context runs, eglChooseConfig has already matched and the window
+surface has already been created:
+
+  - a config was found for EGL_RENDERABLE_TYPE=EGL_OPENGL_BIT, and Mesa sets a
+    config's RenderableType from the display's supported client APIs, so this
+    driver pair does advertise desktop OpenGL;
+  - the surface came up on an ARGB8888 gbm surface, and surface creation performs
+    the same surface-type/colorspace pairing check that the context path does and
+    fails with its own message -- so the config, the visual and the missing alpha
+    channel are all cleared.
+
+That leaves the driver refusing the context itself, and the EGL error code says
+which way: BAD_MATCH is the DRI layer rejecting the API or version, BAD_ALLOC is
+the driver's own context creation returning NULL.  Those have different fixes and
+the same 134.
+
+Which is what j36/eglprobe is for.  It runs before ES under j36.es=debug and is
+repeated after ES exits, so it survives the scroll, and it prints per DRM node:
+the EGL version and client APIs, the config table summarised (how many configs
+carry each renderable bit, and how many window configs are AR24 and XR24), then
+one row of GL / ES1 / ES2 each showing either a created context taken all the way
+to glGetString on a current ARGB8888 window surface, or the exact EGL error.  It
+probes /dev/dri/card0 and /dev/dri/renderD128 separately because those are two
+different chips here -- mtk_drm displays, lima renders, Mesa bridges them with
+kmsro -- so contexts on the render node but not the display node means the kmsro
+pairing, and failures on both mean lima.  It also settles the API question the
+same boot: ES asks for desktop GL, because setupWindow() sets
+SDL_GL_CONTEXT_MAJOR_VERSION twice (1, then 0), never sets
+SDL_GL_CONTEXT_PROFILE_MASK, and this SDL2 has no RPI video driver -- so
+KMSDRM_GLES_DefaultProfileConfig, the one thing that would have made the default
+profile GLES, is compiled out to an empty function.  Every gl* symbol ES imports
+is fixed-function GLES1.  If the ES1 row works and the GL row does not, that
+mismatch is the bug and it is in the profile, not in the driver.
+
+Add systemd.mask=emulationstation.service to bootargs to get the machine back to a
 console.
 
 Rebooting
@@ -2318,6 +2467,11 @@ README
         for gl in sd-boot/j36/gl/*.so*; do
             [[ -f "$gl" ]] && sums+=("$gl")
         done
+    fi
+    # An if, not a && -- this runs under set -e and a card built without the probe
+    # would make the AND-list fail and take the manifest with it.
+    if [[ -f sd-boot/j36/eglprobe ]]; then
+        sums+=(sd-boot/j36/eglprobe)
     fi
     sha256sum "${sums[@]}" > SHA256SUMS
     {
@@ -2381,6 +2535,12 @@ README
             echo "gl_install=tmpfs on the rootfs /run plus a systemd drop-in; nothing is written to the card"
             echo "emulationstation=default; j36.es=1 supplies the GL front end"
             echo "es_boot_word=$(grep -o 'j36\.es=[a-z0-9]*' sd-boot/mvii/boot.conf)"
+            if [[ -f sd-boot/j36/eglprobe ]]; then
+                echo "es_probe=j36/eglprobe ($(stat -c %s sd-boot/j36/eglprobe) bytes, dynamic ARMv7, dlopens libEGL.so.1 and libgbm.so.1)"
+                echo "es_probe_run=j36.es=debug only, as ExecStartPre and again as ExecStopPost; card0 and renderD128 separately"
+            else
+                echo "es_probe=not staged; j36.es=debug will report only what Mesa says"
+            fi
         else
             echo "gl=not staged"
             echo "emulationstation=enabled but will fail; without j36/gl it runs against the RK3326 blob"
