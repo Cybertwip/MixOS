@@ -548,6 +548,60 @@ while : ; do
     sleep 1
 done
 
+# ── Doom, if the card carries it and the command line asks ───────────────────
+#
+# Run here, after the wait loop and before the hand-over, for two reasons: the
+# card is known to be up by now, and nothing of the rootfs is mounted yet, so
+# systemd, journald and the RK3326 units are not competing for the panel.  The
+# binary and the IWAD live in j36/ on the FAT BOOT partition -- see the fbdoom
+# section of build-in-vm.sh for why they are not in this initramfs.
+#
+# The partition is found the way try_root() finds the rootfs: by mounting
+# candidates and looking inside, because partition numbering follows whichever
+# MMC host attached first and this initramfs has no blkid.  Read-only, since
+# nothing here writes to the card.  vfat gives every file mode 0755, so the
+# binary is executable straight off the mount.
+#
+# Doom's own stdout goes to the serial port when there is one: /dev/console is
+# the panel, and the panel is in KD_GRAPHICS while Doom holds it, so anything
+# printed there would be invisible anyway.  MENU quits, and then this script
+# carries on with the boot exactly as if it had never run.
+run_doom() {
+    wad=""
+    for cand in freedoom1.wad freedoom2.wad doom.wad doom1.wad doom2.wad; do
+        if [ -f "/bootfs/j36/$cand" ]; then wad="/bootfs/j36/$cand"; break; fi
+    done
+    if [ -z "$wad" ]; then
+        say "doom: no IWAD in j36/ on the BOOT partition"
+        return 1
+    fi
+    say "doom: $wad -- MENU quits and the boot continues"
+    if [ -c /dev/ttyS0 ]; then
+        HOME=/root /bootfs/j36/doom -iwad "$wad" >/dev/ttyS0 2>&1
+    else
+        HOME=/root /bootfs/j36/doom -iwad "$wad"
+    fi
+    say "doom: exited"
+    return 0
+}
+
+if [ "$want_doom" = 1 ]; then
+    mkdir -p /bootfs
+    doom_found=0
+    for dev in /dev/mmcblk*p*; do
+        if [ ! -b "$dev" ]; then continue; fi
+        if ! mount -t vfat -o ro "$dev" /bootfs 2>/dev/null; then continue; fi
+        if [ -x /bootfs/j36/doom ]; then doom_found=1; break; fi
+        umount /bootfs
+    done
+    if [ "$doom_found" = 1 ]; then
+        run_doom
+        umount /bootfs
+    else
+        say "doom: j36.doom was asked for but no FAT partition carries j36/doom"
+    fi
+fi
+
 if [ -n "$rootdev" ]; then
     say "switching root into $rootdev"
     # Carried across rather than left behind: the real init inherits them
