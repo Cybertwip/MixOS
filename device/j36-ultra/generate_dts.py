@@ -727,6 +727,36 @@ def generate(sources: dict[str, str]) -> str:
 \t}};
 
 \t/*
+\t * The Mali-450's two clocks, and their rate is honestly zero.
+\t *
+\t * lima requires \"bus\" and \"core\": lima_clk_init() returns the error from
+\t * devm_clk_get() for either, so a node without them does not probe. What it
+\t * does with them is clk_prepare_enable -- a no-op on a fixed-clock -- and
+\t * two dev_info lines, \"bus rate\" and \"mod rate\". Nothing else reads the
+\t * rate, because devfreq is skipped outright when operating-points-v2 is
+\t * absent (lima_devfreq_init returns 0 on !device_property_present), and this
+\t * node has no OPP table.
+\t *
+\t * So there is nothing here to get right and nothing to measure: MT6592 has
+\t * no clock driver in mainline, the MFG clock is ungated by writing bit 0 of
+\t * MFG_CG_CLR at 0x13000008 and no rate is ever programmed by anything in
+\t * this boot path, and the frequency of that gate's parent mux is not known.
+\t * A plausible-looking megahertz number would be an invention, so these say
+\t * 0 -- which lima prints and never uses.
+\t */
+\tmali_bus_clk: clock-mali-bus {{
+\t\tcompatible = \"fixed-clock\";
+\t\t#clock-cells = <0>;
+\t\tclock-frequency = <0>;
+\t}};
+
+\tmali_core_clk: clock-mali-core {{
+\t\tcompatible = \"fixed-clock\";
+\t\t#clock-cells = <0>;
+\t\tclock-frequency = <0>;
+\t}};
+
+\t/*
 \t * The card's 3.3 V rail, as a fixed regulator.
 \t *
 \t * This is not decoration. mmc_regulator_get_supply() is the ONLY thing in
@@ -811,6 +841,86 @@ def generate(sources: dict[str, str]) -> str:
 \t\tno-sdio;
 \t\tnon-removable;
 \t\tdisable-wp;
+\t\tstatus = \"okay\";
+\t}};
+
+\t/*
+\t * The Mali-450 MP4, for DRM lima.
+\t *
+\t * Every number here was read out of hardware descriptions this board
+\t * already carries, and the base address happens to be attested twice by
+\t * sources that never saw each other:
+\t *
+\t *   The stock MT6592 kernel carries the same kind of platform resource array
+\t *   in .data that MSDC1's interrupt above came from, at
+\t *   0xc0b71de4..0xc0b720f3 (28-byte {{start, end, name, flags}} entries,
+\t *   IORESOURCE_MEM 0x200 / IORESOURCE_IRQ 0x400). Named, it reads:
+\t *
+\t *     Mali_L2           0x13050000  Mali_GP            0x13040000  IRQ 234
+\t *     Mali_GP_MMU       0x13043000  IRQ 235             Mali_L2     0x13041000
+\t *     Mali_PP0          0x13048000  IRQ 236             Mali_PP0_MMU 0x13044000  IRQ 237
+\t *     Mali_PP1          0x1304a000  IRQ 238             Mali_PP1_MMU 0x13045000  IRQ 239
+\t *     Mali_PP2          0x1304c000  IRQ 240             Mali_PP2_MMU 0x13046000  IRQ 241
+\t *     Mali_PP3          0x1304e000  IRQ 242             Mali_PP3_MMU 0x13047000  IRQ 243
+\t *     Mali_Broadcast    0x13053000  Mali_DLBU          0x13054000
+\t *     Mali_PP_Broadcast 0x13056000  IRQ 244             Mali_PP_MMU_Broadcast 0x13055000
+\t *     Mali_DMA          0x13052000
+\t *
+\t *   The MVII LK's own bare-metal Utgard driver -- mt6592_gpu_offload.c,
+\t *   which powers this GPU, submits a PLBU job and renders a self-test on
+\t *   PP0 -- declares MALI_BASE = 0x13040000 with GP at +0x00000, the GP MMU
+\t *   at +0x03000, PP0 at +0x08000, PP0's MMU at +0x04000 and the two L2s at
+\t *   +0x10000 and +0x01000. Silicon, not a datasheet reading.
+\t *
+\t * Both agree with lima's own mali450 offset column in lima_device.c, block
+\t * for block: gp 0x00000, l2_cache1 0x01000, pmu 0x02000, gpmmu 0x03000,
+\t * ppmmu0..3 0x04000..0x07000, pp0..3 0x08000/0x0a000/0x0c000/0x0e000,
+\t * l2_cache0 0x10000, bcast 0x13000, dlbu 0x14000, ppmmu_bcast 0x15000,
+\t * pp_bcast 0x16000. That is the whole of what this driver maps for a 450,
+\t * and 0x30000 covers it with room past the vendor map's last register at
+\t * +0x17100.
+\t *
+\t * The interrupt numbers are those INTIDs minus 32, the same conversion the
+\t * MSDC1 node above documents and this board is already fielding: GP 234-32
+\t * = 202 through PP_Broadcast 244-32 = 212. IRQ_TYPE_LEVEL_LOW for the same
+\t * reason every other node here uses it.
+\t *
+\t * lima insists on five of these by name -- gp, gpmmu, pp0, ppmmu0 and pp
+\t * (the PP broadcast) are must_have for a 450 and take the whole probe down
+\t * if platform_get_irq_byname fails; the rest go through
+\t * platform_get_irq_byname_optional. All eleven the hardware has are here.
+\t *
+\t * status is okay and yet nothing probes at boot: CONFIG_DRM_LIMA is =m on
+\t * purpose. The MFG power domain is gated when Linux starts -- nothing on
+\t * this boot path calls the LK's mfg_power_on() -- and the first register
+\t * read into an unpowered MTK subsystem stalls the bus rather than returning
+\t * anything, which is a silent watchdog reboot with no log. So the module is
+\t * loaded from /init only after j36/mfgpower has powered the domain and read
+\t * back the GP and PP version registers. See the lima section of
+\t * build-in-vm.sh.
+\t */
+\tgpu: gpu@13040000 {{
+\t\tcompatible = \"arm,mali-450\";
+\t\treg = <0x13040000 0x30000>;
+\t\tinterrupts = <0 202 8>, /* GIC_SPI 202 = INTID 234, Mali_GP */
+\t\t\t     <0 203 8>, /* 235, Mali_GP_MMU */
+\t\t\t     <0 204 8>, /* 236, Mali_PP0 */
+\t\t\t     <0 205 8>, /* 237, Mali_PP0_MMU */
+\t\t\t     <0 206 8>, /* 238, Mali_PP1 */
+\t\t\t     <0 207 8>, /* 239, Mali_PP1_MMU */
+\t\t\t     <0 208 8>, /* 240, Mali_PP2 */
+\t\t\t     <0 209 8>, /* 241, Mali_PP2_MMU */
+\t\t\t     <0 210 8>, /* 242, Mali_PP3 */
+\t\t\t     <0 211 8>, /* 243, Mali_PP3_MMU */
+\t\t\t     <0 212 8>; /* 244, Mali_PP_Broadcast */
+\t\tinterrupt-names = \"gp\", \"gpmmu\",
+\t\t\t\t  \"pp0\", \"ppmmu0\",
+\t\t\t\t  \"pp1\", \"ppmmu1\",
+\t\t\t\t  \"pp2\", \"ppmmu2\",
+\t\t\t\t  \"pp3\", \"ppmmu3\",
+\t\t\t\t  \"pp\";
+\t\tclocks = <&mali_bus_clk>, <&mali_core_clk>;
+\t\tclock-names = \"bus\", \"core\";
 \t\tstatus = \"okay\";
 \t}};
 
