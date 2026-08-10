@@ -91,12 +91,14 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 /*
@@ -713,6 +715,31 @@ struct drm_mode_destroy_dumb {
     uint32_t handle;
 };
 
+/*
+ * The flip, for -c.  A modeset per frame is what -p does and it is right there --
+ * five frames, three seconds each, and SETCRTC is the call that exercises the DSI.
+ * An animation cannot pay for that: SETCRTC tears down and re-commits the whole
+ * pipe, so a cube driven by it runs at the rate the DSI can be re-initialised
+ * rather than at the rate the panel scans.  PAGE_FLIP swaps the plane's buffer at
+ * the next vblank and answers with an event on the DRM fd, which is both the
+ * cheap path and the paced one.
+ *
+ * user_data is a __u64 at offset 16 after four __u32, so this is 24 bytes on ARM
+ * as it is in the kernel -- no padding to get wrong.
+ */
+struct drm_mode_crtc_page_flip {
+    uint32_t crtc_id, fb_id, flags, reserved;
+    uint64_t user_data;
+};
+
+/* What read() returns on the DRM fd: a header, then length-8 bytes of body. */
+struct drm_event {
+    uint32_t type, length;
+};
+
+#define DRM_MODE_PAGE_FLIP_EVENT  0x01
+#define DRM_EVENT_FLIP_COMPLETE   2
+
 #define DRM_IOCTL_SET_MASTER        J36_IO(0x1e)
 #define DRM_IOCTL_DROP_MASTER       J36_IO(0x1f)
 #define DRM_IOCTL_MODE_GETRESOURCES J36_IOWR(0xA0, struct drm_mode_card_res)
@@ -725,6 +752,7 @@ struct drm_mode_destroy_dumb {
 #define DRM_IOCTL_MODE_MAP_DUMB     J36_IOWR(0xB3, struct drm_mode_map_dumb)
 #define DRM_IOCTL_MODE_DESTROY_DUMB J36_IOWR(0xB4, struct drm_mode_destroy_dumb)
 #define DRM_IOCTL_MODE_ADDFB2       J36_IOWR(0xB8, struct drm_mode_fb_cmd2)
+#define DRM_IOCTL_MODE_PAGE_FLIP    J36_IOWR(0xB0, struct drm_mode_crtc_page_flip)
 
 #define GL_COLOR_BUFFER_BIT        0x00004000
 
@@ -752,7 +780,7 @@ static int drm_ioctl(unsigned long req, void *arg)
  * SETCRTC is what SDL's KMSDRM backend does for its first frame and it is the one
  * call that exercises the DSI and the panel as well as the OVL.
  */
-static int show(uint32_t fb, const char *what)
+static int setcrtc(uint32_t fb)
 {
     struct drm_mode_crtc c;
     uint32_t conn = paint_conn;
@@ -765,8 +793,13 @@ static int show(uint32_t fb, const char *what)
     c.mode = paint_mode;
     c.mode_valid = 1;
 
+    return drm_ioctl(DRM_IOCTL_MODE_SETCRTC, &c);
+}
+
+static int show(uint32_t fb, const char *what)
+{
     paint_phase++;
-    if (drm_ioctl(DRM_IOCTL_MODE_SETCRTC, &c) < 0) {
+    if (setcrtc(fb) < 0) {
         printf("paint %d: SETCRTC for %s: %m\n", paint_phase, what);
         return -1;
     }
@@ -1027,61 +1060,23 @@ out_dpy:
 }
 
 /*
- * Five phases, in the order that narrows the fault:
- *
- *   1  RED, XR24, CPU-filled       modeset + DSI + panel + OVL, no alpha anywhere
- *   2  MAGENTA, AR24 alpha ff      the same with the format SDL will hand it
- *   3  MAGENTA, AR24 alpha 00      the same buffer, transparent
- *   4  MAGENTA, lima into gbm      the ES path with ES, SDL and the renderer out
- *   5  GREEN, lima's second frame  the swap chain rotating
- *
- * and four verdicts:
- *
- *   nothing at all          the modeset does not reach the glass.  Nothing about
- *                           EGL is involved: it is the DSI being re-initialised
- *                           under the panel, or the mode the panel driver
- *                           reports, and the place to look is mtk_dsi against the
- *                           state the LK left.
- *   1 and 2 but not 3       the OVL blends per-pixel alpha against a black
- *                           background.  Then ES is invisible for one reason and
- *                           it is in the renderer, not the kernel:
- *                           Renderer_GLES20.cpp clears to (0,0,0,0) and every
- *                           pixel it does not overdraw is transparent black.
- *   1, 2, 3 but not 4 or 5  the display path is sound and the fault is the
- *                           gbm/kmsro pairing -- lima's buffer imports but never
- *                           becomes what the OVL fetches.
- *   all five               the display path is sound end to end, and a black ES
- *                           is ES's own drawing.  The GLES2 self-test line and
- *                           the per-frame draw count are then the evidence.
+ * Which connector, which mode, which CRTC.  -p and -c need exactly the same
+ * answer, so they ask the same function for it: the first connected connector
+ * that reports a mode, its mode 0, and a CRTC one of its encoders can drive.
+ * Fills paint_conn, paint_mode and paint_crtc; returns 0 when this device has
+ * nothing to scan out to.
  */
-static int paint(const char *path)
+static int find_crtc(void)
 {
     struct drm_mode_card_res res;
     uint32_t crtcs[8], conns[16], encs[16];
     struct drm_mode_get_connector conn;
     struct drm_mode_modeinfo modes[64];
     struct drm_mode_get_encoder enc;
-    struct drm_mode_crtc old;
-    struct gbm_device *gbm;
     uint32_t i, j, k;
-    int found = 0, ok = 0;
+    int found = 0;
 
-    printf("== %s, scanout test\n", path);
-
-    paint_fd = open(path, O_RDWR | O_CLOEXEC);
-    if (paint_fd < 0) {
-        printf("open: %m\n");
-        return 1;
-    }
-
-    /*
-     * Ask for master explicitly.  Opening the only open of the device makes us
-     * master implicitly, but ES may have been here first on a re-run and the
-     * error is worth naming: EBUSY here means something else owns the display and
-     * every SETCRTC below would have failed with EACCES instead.
-     */
-    if (drm_ioctl(DRM_IOCTL_SET_MASTER, NULL) < 0)
-        printf("paint: SET_MASTER: %m (a modeset may not be permitted)\n");
+    paint_crtc = 0;
 
     memset(&res, 0, sizeof(res));
     res.count_crtcs = 8;
@@ -1091,7 +1086,7 @@ static int paint(const char *path)
     if (drm_ioctl(DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) {
         printf("GETRESOURCES: %m -- this node has no modesetting at all "
                "(a render node, or a driver without DRIVER_MODESET)\n");
-        goto out;
+        return 0;
     }
     printf("paint: %u crtc, %u connector, %u encoder, %ux%u..%ux%u\n",
            res.count_crtcs, res.count_connectors, res.count_encoders,
@@ -1176,11 +1171,66 @@ static int paint(const char *path)
         found = 1;
     }
 
-    if (!found) {
+    if (!found)
         printf("paint: no connected connector with a mode -- the panel bridge "
                "never attached, so there is nothing to scan out to\n");
-        goto out;
+
+    return found;
+}
+
+/*
+ * Five phases, in the order that narrows the fault:
+ *
+ *   1  RED, XR24, CPU-filled       modeset + DSI + panel + OVL, no alpha anywhere
+ *   2  MAGENTA, AR24 alpha ff      the same with the format SDL will hand it
+ *   3  MAGENTA, AR24 alpha 00      the same buffer, transparent
+ *   4  MAGENTA, lima into gbm      the ES path with ES, SDL and the renderer out
+ *   5  GREEN, lima's second frame  the swap chain rotating
+ *
+ * and four verdicts:
+ *
+ *   nothing at all          the modeset does not reach the glass.  Nothing about
+ *                           EGL is involved: it is the DSI being re-initialised
+ *                           under the panel, or the mode the panel driver
+ *                           reports, and the place to look is mtk_dsi against the
+ *                           state the LK left.
+ *   1 and 2 but not 3       the OVL blends per-pixel alpha against a black
+ *                           background.  Then ES is invisible for one reason and
+ *                           it is in the renderer, not the kernel:
+ *                           Renderer_GLES20.cpp clears to (0,0,0,0) and every
+ *                           pixel it does not overdraw is transparent black.
+ *   1, 2, 3 but not 4 or 5  the display path is sound and the fault is the
+ *                           gbm/kmsro pairing -- lima's buffer imports but never
+ *                           becomes what the OVL fetches.
+ *   all five               the display path is sound end to end, and a black ES
+ *                           is ES's own drawing.  The GLES2 self-test line and
+ *                           the per-frame draw count are then the evidence.
+ */
+static int paint(const char *path)
+{
+    struct drm_mode_crtc old;
+    struct gbm_device *gbm;
+    int ok = 0;
+
+    printf("== %s, scanout test\n", path);
+
+    paint_fd = open(path, O_RDWR | O_CLOEXEC);
+    if (paint_fd < 0) {
+        printf("open: %m\n");
+        return 1;
     }
+
+    /*
+     * Ask for master explicitly.  Opening the only open of the device makes us
+     * master implicitly, but ES may have been here first on a re-run and the
+     * error is worth naming: EBUSY here means something else owns the display and
+     * every SETCRTC below would have failed with EACCES instead.
+     */
+    if (drm_ioctl(DRM_IOCTL_SET_MASTER, NULL) < 0)
+        printf("paint: SET_MASTER: %m (a modeset may not be permitted)\n");
+
+    if (!find_crtc())
+        goto out;
 
     /*
      * What is on that CRTC right now, before anything of ours is.  A non-zero
