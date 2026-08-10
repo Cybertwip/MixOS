@@ -2975,6 +2975,59 @@ SDL's request were the same call.  The GLES 2.0 binary does not depend on it: it
 sets PROFILE_MASK_ES and MAJOR 2 / MINOR 0, so its row is the ES2 one, which is
 measured working.
 
+The black panel, and the three faults it can be
+-----------------------------------------------
+
+Where this stands: the GLES 2.0 binary starts, does not abort, and the panel goes
+black.  That is progress and not a new failure -- 134 is gone, so a context was
+created and made current, and the console text disappearing means something took
+the CRTC.  But "black" is the one symptom that three unrelated faults share, and
+guessing between them costs a boot each:
+
+  1. this renderer draws nothing -- a program that did not link, or a projection
+     that puts ES's 0..640 pixel coordinates outside the frustum;
+  2. ES asks for nothing to be drawn -- a theme that did not parse, a gamelist
+     that is empty, a resource that did not load;
+  3. everything is drawn correctly and the buffers never reach the panel -- the
+     format the KMSDRM backend chose for its gbm surface, the connector or the
+     CRTC it picked, or a page flip the display driver refused.
+
+j36.es=debug now separates all three in one boot, and none of it is on in
+j36.es=1:
+
+  GLES2: self test 640x480, centre pixel ff 00 ff ff ..., glGetError 0x0000
+      One magenta quad, drawn straight in NDC with both matrices at identity,
+      read back with glReadPixels before ES has drawn anything.  ff 00 ff means
+      the context, the three programs, the attribute arrays and the draw path all
+      work, which retires fault 1 outright.  Black here, or a shader/link error
+      logged just above it, is fault 1 and the log says which line of GLSL.
+
+  GLES2: first draw, program N, 4 verts, v0 (0.0, 0.0), proj sx 0.00312 sy -0.00417
+      ES's first real draw.  sx should be 2/screenWidth and sy -2/screenHeight;
+      sx 1.00000 sy 1.00000 is a projection left at identity, which clips the
+      whole UI away without raising one GL error.
+
+  GLES2: frame 1, 37 draws since the last line
+      Frames 1-3 and then one line every 600.  A frame with 0 draws is fault 2:
+      ES decided there was nothing to show, and no shader will change that.
+
+  A magenta panel
+      The clear colour under J36_ES_GL_PROBE.  If the panel is magenta, the
+      buffers this renderer swaps are the buffers being scanned out -- fault 3 is
+      retired and anything still black on top of the magenta is ES's drawing.  If
+      the panel stays black while the self test reads ff 00 ff, that is fault 3
+      exactly, and the SDL_LOG_PRIORITY_VERBOSE lines from the same boot carry the
+      KMSDRM backend's own account of the modeset: which connector, which CRTC,
+      which plane format, and what drmModeAddFB2 or drmModePageFlip said.
+
+Two candidates worth naming for fault 3, because this renderer is what introduced
+the first of them: it asks for SDL_GL_ALPHA_SIZE 8 where the fixed-function one
+asked for no alpha, which makes SDL pick an ARGB8888 gbm surface, and a display
+driver whose plane advertises only XR24 refuses that framebuffer at flip time.
+Dropping ALPHA_SIZE to 0 is the one-line experiment.  The second is fbcon: if the
+console was released without the CRTC being handed over, the panel is scanning out
+nothing while ES renders perfectly into buffers nobody reads.
+
 Add systemd.mask=emulationstation.service to bootargs to get the machine back to a
 console.
 

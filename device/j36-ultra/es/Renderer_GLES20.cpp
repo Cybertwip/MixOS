@@ -440,7 +440,9 @@ namespace Renderer
 		LOG(LogInfo) << line;
 
 		if(px[0] != 0xFF || px[1] != 0x00 || px[2] != 0xFF)
+		{
 			LOG(LogError) << "GLES2: the self test quad did not reach the framebuffer -- nothing this renderer draws will either";
+		}
 
 		// Back to the state createContext() would have left, and drop the counter so
 		// the "first draw" line below reports ES's first draw and not this one.
@@ -469,6 +471,18 @@ namespace Renderer
 
 	void setupWindow()
 	{
+		// Read here rather than in createContext() because this is the last hook
+		// before SDL_CreateWindow, and the KMSDRM backend's own account of the
+		// modeset -- which connector, which CRTC, which plane format, and what
+		// drmModeAddFB2 or drmModePageFlip said if it refused -- is all logged during
+		// that call. SDL's default priority hides everything below SDL_LOG_ERROR, and
+		// ES never raises it, so that account is thrown away on a normal run. It is
+		// the half of a black panel that no amount of GL instrumentation can see.
+		probeMode = (getenv("J36_ES_GL_PROBE") != nullptr);
+
+		if(probeMode)
+			SDL_LogSetAllPriority(SDL_LOG_PRIORITY_VERBOSE);
+
 		// Asked for explicitly, all of it. The fixed-function renderers set
 		// SDL_GL_CONTEXT_MAJOR_VERSION twice -- 1 then 0, and 2 then 1 -- which is a
 		// typo for MINOR in both, and a major version of 0 makes SDL send no context
@@ -558,15 +572,13 @@ namespace Renderer
 
 		selfTest();
 
-		// J36_ES_GL_PROBE turns the clear colour magenta, which answers the one
-		// question a log cannot: whether the buffers this renderer swaps are the
-		// buffers the panel is scanning out. A magenta panel means the swap chain
-		// works and anything still black on top of it is ES's own drawing; a panel
-		// that stays black while the self test above passes means the frames are
-		// correct and never reach the CRTC. /init sets it under j36.es=debug only --
-		// on a board that works, this would be a magenta flash at every startup.
-		probeMode = (getenv("J36_ES_GL_PROBE") != nullptr);
-
+		// The other half of J36_ES_GL_PROBE (setupWindow() read it): a magenta clear
+		// colour, which answers the one question a log cannot. A magenta panel means
+		// the buffers this renderer swaps are the buffers the panel scans out, so
+		// anything still black on top of it is ES's own drawing. A panel that stays
+		// black while the self test above passed means the frames are correct and
+		// never reach the CRTC. /init sets it under j36.es=debug only -- on a board
+		// that works this would be a magenta flash at every startup.
 		if(probeMode)
 		{
 			LOG(LogInfo) << "GLES2: J36_ES_GL_PROBE is set, clearing to magenta instead of black";
