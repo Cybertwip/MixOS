@@ -366,6 +366,14 @@ say() {
     return 0
 }
 
+# And the same for a file's contents.  `cat /proc/interrupts' goes to stdout
+# only, which is the console, which is the serial port -- exactly the output that
+# is invisible on a board being debugged from the panel.
+show() {
+    while IFS= read -r line; do say "  $line"; done < "$1"
+    return 0
+}
+
 say ""
 say "J36 Ultra ARMv7 bring-up initramfs"
 say "Display stays on the stock-LK framebuffer; native DSI is disabled."
@@ -415,17 +423,30 @@ try_root() {
     return 1
 }
 
-rootdev=""
-if [ -n "$root_hint" ] && try_root "$root_hint"; then
-    rootdev="$root_hint"
-else
-    if [ -n "$root_hint" ]; then
-        say "root=$root_hint holds no filesystem with /sbin/init; scanning"
+find_root() {
+    if [ -n "$root_hint" ] && try_root "$root_hint"; then
+        rootdev="$root_hint"
+        return 0
     fi
     for dev in /dev/mmcblk*p* /dev/mmcblk*; do
-        if try_root "$dev"; then rootdev="$dev"; break; fi
+        if try_root "$dev"; then rootdev="$dev"; return 0; fi
     done
-fi
+    return 1
+}
+
+# Waiting is this script's job.  `rootwait' on the command line is honoured by
+# the kernel's own root mount, and rdinit= runs instead of that -- so a single
+# scan here races the card: MSDC1 runs card identification on a workqueue, and
+# an mmc host that is still deferred when /init starts has no block device yet.
+rootdev=""
+waited=0
+while : ; do
+    if find_root; then break; fi
+    if [ "$waited" -ge 10 ]; then break; fi
+    if [ "$waited" = 0 ]; then say "waiting for the microSD card"; fi
+    waited=$((waited + 1))
+    sleep 1
+done
 
 if [ -n "$rootdev" ]; then
     say "switching root into $rootdev"
@@ -446,8 +467,40 @@ if [ -n "$rootdev" ]; then
 fi
 
 say ""
+if [ -n "$root_hint" ] && [ "$root_hint" != "$rootdev" ]; then
+    say "root=$root_hint held no filesystem with /sbin/init"
+fi
+say "No rootfs after ${waited}s; staying in the initramfs."
+say ""
+
+# ── Why the card did not come up ──────────────────────────────────────────────
+#
+# /proc/interrupts is the measurement that tells the two failure modes apart, so
+# print it rather than leaving it to be typed -- the panel is the only output
+# here and the J36 input driver emits gamepad events, not keystrokes.
+#
+# The mmc line's count is the answer:
+#
+#   absent      mtk-sd never bound.  Look for its probe error in dmesg, not here.
+#   present, 0  The controller is being driven and nothing is coming back, which
+#               means the interrupt is misrouted: every request then dies on
+#               mtk-sd's 5 s software watchdog with host->error=0x2 REQ_CMD_TMO,
+#               and a card that merely fails to answer would instead raise
+#               MSDC_INT_CMDTMO in milliseconds.  That was the SPI-40 bug; the
+#               DT now says 72, from INTID 104 - 32.
+#   present, >0 The interrupt works.  The card, the pad tuning or the clock is
+#               the problem -- read the mtk-sd errors in dmesg.
+#
+# mt6592-gpt is the control: it is the clockevent, so its count is always large,
+# and if the mmc line reads 0 while that one climbs, interrupt delivery as such
+# is fine and only this SPI number is in question.
+say "Interrupts (compare the mmc count against mt6592-gpt):"
+show /proc/interrupts
+say "MMC hosts:"
+ls /sys/class/mmc_host 2>/dev/null || say "  none"
+say ""
 say "Block devices seen by this kernel:"
-cat /proc/partitions
+show /proc/partitions
 say "Framebuffer devices:"
 ls -l /dev/fb* 2>/dev/null || say "  none"
 say "Input devices:"
