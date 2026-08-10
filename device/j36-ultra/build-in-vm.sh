@@ -2346,6 +2346,23 @@ if [[ -n "$ESPROBE_BIN" ]]; then
     log "gl: staged j36/eglprobe ($(stat -c %s "$SDBOOT/j36/eglprobe") bytes)"
 fi
 
+# j36/es/ is the GLES 2.0 EmulationStation, and it is the one payload here that
+# REPLACES something rather than adding to it -- /init bind-mounts it over
+# /usr/bin/emulationstation/emulationstation.  The removal contract is therefore
+# the interesting one: delete this directory and the rootfs's own binary runs
+# instead, which is the status-134 abort this exists to fix, so /init says which of
+# the two it mounted and the drop-in it writes differs accordingly.
+#
+# Its own directory and not j36/ directly, so that the one file that has to be
+# deleted to go back to the old behaviour is a directory a reader can see the
+# purpose of.
+if [[ -n "$ES_BIN" ]]; then
+    mkdir -p "$SDBOOT/j36/es"
+    cp "$ES_BIN" "$SDBOOT/j36/es/emulationstation"
+    chmod 0755 "$SDBOOT/j36/es/emulationstation"
+    log "es: staged j36/es/emulationstation ($(stat -c %s "$SDBOOT/j36/es/emulationstation") bytes)"
+fi
+
 # rdinit=/init stays even though root= is now present, and the two do not
 # conflict: rdinit means the kernel never mounts a root filesystem itself, so a
 # root= it could not honour can no longer panic it.  /init does the mounting, and
