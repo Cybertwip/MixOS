@@ -715,6 +715,7 @@ want_doom=0
 want_lima=0
 want_mtkdrm=0
 want_es=0
+es_debug=0
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         j36.doom|j36.doom=1)
@@ -728,6 +729,15 @@ for arg in $(cat /proc/cmdline); do
             ;;
         j36.es|j36.es=1)
             want_es=1
+            ;;
+        # Same payload, plus the three things that make a failed GL bring-up say
+        # why: EmulationStation's --debug, Mesa's EGL loader trace, and one
+        # attempt instead of six.  It is a separate word rather than a build
+        # option because boot.conf is on the vfat partition, so it can be turned
+        # off from any machine that can read the card.
+        j36.es=debug)
+            want_es=1
+            es_debug=1
             ;;
         root=/dev/*)
             root_hint="${arg#root=}"
@@ -1051,6 +1061,61 @@ Environment="SDL_VIDEODRIVER=kmsdrm"
 Environment="SDL_VIDEO_EGL_DRIVER=libEGL.so.1"
 Environment="SDL_VIDEO_GL_DRIVER=libGLESv1_CM.so.1"
 DROPIN
+
+    # j36.es=debug appends the diagnostics.  Kept out of the default drop-in
+    # because it is noise on a board that works, and kept in the same file
+    # because systemd merges drop-ins in name order and one file cannot be
+    # overridden by half of itself.
+    #
+    # What each line buys, and why this particular set:
+    #
+    #   --debug          EmulationStation's log is normally a file that is never
+    #                    written.  Log::init() sees LogLevel=disabled in
+    #                    es_settings.cfg, deletes the file and returns, so
+    #                    es_log.txt does not exist -- but Log::~Log() also writes
+    #                    to stderr whenever the reporting level is LogDebug or
+    #                    above, and --debug sets exactly that.  So this puts ES's
+    #                    whole trace on the panel without touching the rootfs, and
+    #                    the launcher passes "$@" through to the binary.
+    #   EGL_LOG_LEVEL    Mesa's EGL prints which vendor it loaded, which DRI
+    #                    driver it paired the card with, and the reason
+    #                    eglInitialize or eglCreateContext failed.  This is the
+    #                    one that matters most, because of what ES does NOT do:
+    #                    Renderer_GLES10.cpp calls SDL_GL_CreateContext and
+    #                    SDL_GL_MakeCurrent and checks neither return value, then
+    #                    at line 129 does
+    #                        std::string glExts = (const char *)glGetString(GL_EXTENSIONS);
+    #                    With no current context glvnd's GLESv1 stub returns NULL,
+    #                    and std::string(NULL) throws std::logic_error
+    #                    "basic_string: construction from null is not valid" --
+    #                    abort, status 134.  So a 134 means the context failed and
+    #                    the reason was thrown away.  Mesa is the only party left
+    #                    that still knows it.
+    #   MESA_DEBUG       Mesa's own GL error stream, in case a context is created
+    #                    and then something inside it is rejected.
+    #   LIBGL_DEBUG      names the dri module it tried to dlopen when it cannot.
+    #                    dri/mediatek_dri.so and dri/lima_dri.so are both symlinks
+    #                    to one megadriver here, and a failure to find either
+    #                    looks identical to a failure to find a GPU.
+    #   Restart=no       the unit restarts on failure, and six identical stack
+    #                    traces scroll the first one off a 640x480 panel before it
+    #                    can be read.  One attempt, one trace.
+    #   StandardError    the trace is on stderr, and this boot's whole purpose is
+    #                    to read it off the panel, so it is stated rather than
+    #                    inherited.
+    if [ "$es_debug" = 1 ]; then
+        cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINDBG'
+
+# j36.es=debug
+Environment="EGL_LOG_LEVEL=debug"
+Environment="MESA_DEBUG=1"
+Environment="LIBGL_DEBUG=verbose"
+ExecStart=
+ExecStart=/usr/bin/emulationstation/emulationstation.sh --debug
+Restart=no
+StandardError=journal+console
+DROPINDBG
+    fi
 
     say "es: GL front end in /run/j36/gl, drop-in in /run/systemd/system"
     say "    $(ls /newroot/run/j36/gl | tr '\n' ' ')"
@@ -1844,7 +1909,12 @@ initrd=initrd.img
 # j36.doom=1 is the panel and pad test and is no longer on by default; add it back
 # to run j36/doom before the hand-over -- MENU quits it.  ../README.txt explains
 # every word.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.es=1
+#
+# j36.es=debug is the same as j36.es=1 plus EmulationStation's --debug, Mesa's EGL
+# trace and one start attempt instead of six, all on the panel.  It is the default
+# only while ES still fails to open a GL context; change this word to j36.es=1 --
+# here, on this partition, from any machine -- once it draws.
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.es=debug
 CONF
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
@@ -2169,12 +2239,42 @@ not take, and the loader fell back to /usr/lib.  Check for "es: GL front end in
 /run/j36/gl" in the boot log, and `ls /run/j36/gl` on the device: if libEGL.so is
 not in there, nothing else in this section matters yet.
 
-If it does not come up, the order to check things in is: /dev/dri (step 1),
-then `SDL_VIDEODRIVER=kmsdrm` with any SDL program (step 2), then
-`EGL_LOG_LEVEL=debug MESA_DEBUG=1` in the drop-in (steps 3 and 4).  ES's own log is
-/home/ark/.emulationstation/es_log.txt, and its LogLevel is `disabled` in
-es_settings.cfg until you change it.  Add systemd.mask=emulationstation.service to
-bootargs to get the machine back to a console.
+The other signature is the one after that one is fixed:
+
+  emulationstation.sh[878]: terminate called after throwing an instance of
+                            'std::logic_error'
+  emulationstation.sh[878]:   what():  basic_string: construction from null is not valid
+  emulationstation.service: Main process exited, code=exited, status=134/n/a
+
+134 is 128+6, SIGABRT from an uncaught C++ exception, and it is NOT a missing
+EmulationStation -- a missing binary is status 127 and a different message.  It is
+one line of upstream ES, es-core/src/renderers/Renderer_GLES10.cpp:129:
+
+  sdlContext = SDL_GL_CreateContext(getSDLWindow());
+  SDL_GL_MakeCurrent(getSDLWindow(), sdlContext);
+  ...
+  std::string glExts = (const char *)glGetString(GL_EXTENSIONS);
+
+Neither return value is checked, so when the context cannot be created the next GL
+call goes to glvnd's no-op dispatch, returns NULL, and std::string(NULL) throws.
+The abort is therefore a report that eglCreateContext failed and that the reason
+was discarded one line earlier.  Two details about this board make it worth
+knowing which reason: ES sets SDL_GL_CONTEXT_MAJOR_VERSION twice in setupWindow()
+(to 1, then to 0) and never sets SDL_GL_CONTEXT_PROFILE_MASK, so SDL asks EGL for
+a DESKTOP OpenGL config and calls eglBindAPI(EGL_OPENGL_API) -- not GLES1, despite
+every gl* symbol in the binary being fixed-function GLES1.  Mesa answers that on
+lima and glvnd shares one dispatch table across APIs, so it is not on its own
+fatal; it does mean an EGL failure here is not the one a GLES-only device would
+have.
+
+So: boot with j36.es=debug (it is the default in boot.conf) and read the panel.
+That adds ES's --debug -- which reaches stderr even with LogLevel=disabled in
+es_settings.cfg, because Log::~Log() writes to stderr at LogDebug while Log::init()
+never opens the file -- plus EGL_LOG_LEVEL=debug, MESA_DEBUG=1, LIBGL_DEBUG=verbose
+and Restart=no, so there is one trace to read instead of six.  Mesa's line names
+the vendor, the dri module and the failure.  Add
+systemd.mask=emulationstation.service to bootargs to get the machine back to a
+console.
 
 Rebooting
 ---------
@@ -2280,6 +2380,7 @@ README
             echo "gl_load_bearing=libgbm.so.1 -- libEGL_mesa.so.0 needs it, so mesa's own EGL cannot load without this payload"
             echo "gl_install=tmpfs on the rootfs /run plus a systemd drop-in; nothing is written to the card"
             echo "emulationstation=default; j36.es=1 supplies the GL front end"
+            echo "es_boot_word=$(grep -o 'j36\.es=[a-z0-9]*' sd-boot/mvii/boot.conf)"
         else
             echo "gl=not staged"
             echo "emulationstation=enabled but will fail; without j36/gl it runs against the RK3326 blob"
