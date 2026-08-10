@@ -1,0 +1,179 @@
+drm/mediatek: support the MT6592 display pipe
+
+MT6592's DDP is the MT2701/MT8173 generation, and almost all of what this
+board needs is already here.  Verified against the MVII bootloader that
+lights this panel today, register by register: MMSYS at 0x14000000, OVL0
+at 0x14007000, RDMA0 at 0x14008000, COLOR0 at 0x1400b000, DSI0 at
+0x1400c000, MUTEX at 0x1400e000, and every offset inside those blocks
+matches the mt2701 tables in this driver.  So MMSYS, MUTEX, RDMA, COLOR,
+DSI and the MIPI-TX PHY need no code at all -- the device tree gives each
+node "mediatek,mt6592-<block>" followed by "mediatek,mt2701-<block>",
+__of_match_node() scores the first compatible higher where a mt6592 entry
+exists and falls through to the second where none does, and those five
+drivers bind unchanged on driver data that is already exact:
+
+  - mt2701_mutex_mod[] gives OVL0 = 3, COLOR0 = 7, RDMA0 = 10, so the
+    mutex this driver programs for the path below is MOD = 0x488 and
+    SOF = MUTEX_SOF_DSI0 = 1.  The bootloader's own MUTEX0_MOD is 0x488
+    and its MUTEX0_SOF is 1.
+  - mt2701_rdma_driver_data.fifo_size is SZ_4K, and SZ_4K is what the
+    stock 3.4 kernel measures: its RDMA config writes 0x81000010 to
+    RDMA_FIFO_CON (0x14008040), whose pseudo-size field is
+    (4096 / 16) << 16.
+  - mt2701_dsi_driver_data's reg_cmdq_off (0x180) and reg_vm_cmd_off
+    (0x130) are the bootloader's, and reg_shadow_dbg_off is never read
+    because has_shadow_ctl is false.
+  - mt2701_color_driver_data.color_offset is DISP_COLOR_START_MT2701,
+    which is the bootloader's COLOR start offset.
+
+Two things are genuinely MT6592's own, and they are the whole patch.
+
+1. The path.
+
+   mt2701_mtk_ddp_main[] is OVL0, RDMA0, COLOR0, BLS, DSI0.  This board's
+   is OVL0, RDMA0, COLOR0, DSI0, with the BLS used only as the backlight
+   PWM and deliberately outside the mutex -- see the comment on
+   mt6592_mtk_ddp_main[] for why that also means no mt6592 row is needed
+   in mmsys_default_routing_table[], and why the one mux write this path
+   performs is byte for byte the one the bootloader already made.
+
+2. The OVL colour format enumeration.
+
+   MT6592 numbers OVL_CON's input formats RGB565 = 0, RGB888 = 1,
+   ARGB8888 = 2, which is what fmt_rgb565_is_0 selects.  MT2701 numbers
+   the first two the other way round, so mt2701_ovl_driver_data cannot be
+   reused as is even though every other field of it is right.
+
+One measured difference is recorded here rather than changed.  The stock
+kernel writes 0x20402040 to DISP_RDMA_MEM_GMC_SETTING_0 (0x14008030);
+this driver writes the RDMA_MEM_GMC constant 0x40402020 there on every
+SoC, MT2701 and MT8173 included.  The two differ in the ultra/pre-ultra
+threshold bytes.  Nothing suggests the mainline value is wrong for this
+part -- it drives the same block on the same generation -- so it is left
+alone, but it is the first register to look at if the panel shows RDMA
+underflow lines under load.
+
+The interrupt numbers the new device tree nodes carry were taken from the
+stock kernel too, not derived from mainline's mt6592.dtsi: its "mtk_disp"
+platform_driver at 0xc0b4fc70 gives a probe at 0xc035bd24 that calls
+request_threaded_irq() eight times, and the shared handler's jump table
+identifies each one by the register base its branch reads.  RDMA0 = 216,
+OVL0 = 217, RDMA1 = 218, BLS = 219, COLOR0 = 220, DSI0 = 221, DPI0 = 222,
+MUTEX = 225.  Those are GIC INTIDs, so the device tree's GIC_SPI cell is
+each one less 32.
+
+Applies to linux-6.12.y.
+---
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_ovl.c b/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
+index ca4a9a60b..aacfdfbd2 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
+@@ -673,6 +673,26 @@ static const struct mtk_disp_ovl_data mt2701_ovl_driver_data = {
+ 	.num_formats = ARRAY_SIZE(mt8173_formats),
+ };
+ 
++/*
++ * MT6592's OVL is MT2701's -- the same source address register at 0x40, the same
++ * eight GMC bits, the same four layers -- with one enumeration the other way
++ * round.  The bootloader that drives this panel programs OVL_CON with RGB565 =
++ * 0, RGB888 = 1, ARGB8888 = 2, and OVL_CON_CLRFMT_RGB565() keys precisely that
++ * off fmt_rgb565_is_0.  MT2701 numbers those two the other way about, so
++ * borrowing its driver data would transpose the 16- and 24-bit formats.  The
++ * boot path itself is unaffected either way, since XRGB8888 lands on
++ * OVL_CON_CLRFMT_ARGB8888 in both encodings; this is for the first client that
++ * asks for DRM_FORMAT_RGB565.
++ */
++static const struct mtk_disp_ovl_data mt6592_ovl_driver_data = {
++	.addr = DISP_REG_OVL_ADDR_MT2701,
++	.gmc_bits = 8,
++	.layer_nr = 4,
++	.fmt_rgb565_is_0 = true,
++	.formats = mt8173_formats,
++	.num_formats = ARRAY_SIZE(mt8173_formats),
++};
++
+ static const struct mtk_disp_ovl_data mt8173_ovl_driver_data = {
+ 	.addr = DISP_REG_OVL_ADDR_MT8173,
+ 	.gmc_bits = 8,
+@@ -744,6 +764,8 @@ static const struct mtk_disp_ovl_data mt8195_ovl_driver_data = {
+ static const struct of_device_id mtk_disp_ovl_driver_dt_match[] = {
+ 	{ .compatible = "mediatek,mt2701-disp-ovl",
+ 	  .data = &mt2701_ovl_driver_data},
++	{ .compatible = "mediatek,mt6592-disp-ovl",
++	  .data = &mt6592_ovl_driver_data},
+ 	{ .compatible = "mediatek,mt8173-disp-ovl",
+ 	  .data = &mt8173_ovl_driver_data},
+ 	{ .compatible = "mediatek,mt8183-disp-ovl",
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+index e169e67e3..d5aa750d2 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -71,6 +71,37 @@ static const unsigned int mt2701_mtk_ddp_ext[] = {
+ 	DDP_COMPONENT_DPI0,
+ };
+ 
++/*
++ * MT6592's display block is this generation: the register offsets, the OVL
++ * layout, the RDMA FIFO and the MUTEX mod/sof encodings all agree with MT2701.
++ * What differs is the path, and mt2701_mtk_ddp_main[] cannot be reused because
++ * of it -- that array puts DDP_COMPONENT_BLS between COLOR0 and DSI0, and the
++ * bootloader that lights this panel does not.  It routes
++ *
++ *	OVL0 -> RDMA0 -> COLOR0 -> DSI0
++ *
++ * with BLS driven separately as the backlight PWM and left out of the mutex.
++ * Its MUTEX0_MOD is 0x488 = bits 3, 7 and 10, which is exactly OVL0 | COLOR0 |
++ * RDMA0 out of mt2701_mutex_mod[] and has bit 9 (BLS) clear; its MUTEX0_SOF is
++ * 1, which is MUTEX_SOF_DSI0.  Adding BLS here would set that ninth bit and
++ * rewrite DISP_REG_CONFIG_OUT_SEL, neither of which the working hand-off has.
++ *
++ * Leaving BLS out is also why there is no mt6592 entry in
++ * mmsys_default_routing_table[].  That table has no row for RDMA0 -> COLOR0 and
++ * none for COLOR0 -> DSI0, and mtk_mmsys_ddp_connect() writes nothing for a pair
++ * it cannot find, so the only mux write this path performs is
++ * DISP_REG_CONFIG_DISP_OVL_MOUT_EN (0x030) = OVL_MOUT_EN_RDMA -- byte for byte
++ * what the bootloader already wrote.  OUT_SEL (0x04c) and DSI_SEL (0x050) keep
++ * the values it left, which is the point: on this SoC OUT_SEL = 0 is what puts
++ * COLOR0 through to DSI0 with the BLS bypassed.
++ */
++static const unsigned int mt6592_mtk_ddp_main[] = {
++	DDP_COMPONENT_OVL0,
++	DDP_COMPONENT_RDMA0,
++	DDP_COMPONENT_COLOR0,
++	DDP_COMPONENT_DSI0,
++};
++
+ static const unsigned int mt7623_mtk_ddp_main[] = {
+ 	DDP_COMPONENT_OVL0,
+ 	DDP_COMPONENT_RDMA0,
+@@ -239,6 +270,21 @@ static const struct mtk_mmsys_driver_data mt2701_mmsys_driver_data = {
+ 	.mmsys_dev_num = 1,
+ };
+ 
++/*
++ * No ext path.  MT6592 has an RDMA1 and a DPI0, but nothing is wired to them on
++ * this board and mtk_crtc_create() would decline the path anyway once its
++ * components have no device tree node.  shadow_register is MT2701's, and it is
++ * what the bootloader does: mtk_crtc_update_config() then takes MUTEX0,
++ * programs the pipe and releases it, which is the same acquire/configure/release
++ * the bootloader's own commit performs.
++ */
++static const struct mtk_mmsys_driver_data mt6592_mmsys_driver_data = {
++	.main_path = mt6592_mtk_ddp_main,
++	.main_len = ARRAY_SIZE(mt6592_mtk_ddp_main),
++	.shadow_register = true,
++	.mmsys_dev_num = 1,
++};
++
+ static const struct mtk_mmsys_driver_data mt7623_mmsys_driver_data = {
+ 	.main_path = mt7623_mtk_ddp_main,
+ 	.main_len = ARRAY_SIZE(mt7623_mtk_ddp_main),
+@@ -329,6 +375,8 @@ static const struct mtk_mmsys_driver_data mt8195_vdosys1_driver_data = {
+ static const struct of_device_id mtk_drm_of_ids[] = {
+ 	{ .compatible = "mediatek,mt2701-mmsys",
+ 	  .data = &mt2701_mmsys_driver_data},
++	{ .compatible = "mediatek,mt6592-mmsys",
++	  .data = &mt6592_mmsys_driver_data},
+ 	{ .compatible = "mediatek,mt7623-mmsys",
+ 	  .data = &mt7623_mmsys_driver_data},
+ 	{ .compatible = "mediatek,mt2712-mmsys",
