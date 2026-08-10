@@ -111,12 +111,28 @@ for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
         die "required kernel option CONFIG_${required}=y was not selected"
 done
 
-log "Building the incremental ARMv7 kernel"
+log "Building the incremental ARMv7 kernel and its symbol table"
 export CCACHE_DIR="${CCACHE_DIR:-$ROOT/Arkbuild_ccache}"
 mkdir -p "$CCACHE_DIR"
 if [[ -d /usr/lib/ccache ]]; then export PATH="/usr/lib/ccache:$PATH"; fi
+# `modules' is not optional here even though this configuration selects almost no
+# in-tree modules.  It is the target that runs modpost over vmlinux.o and writes
+# $KERNEL_OUT/Module.symvers, and the out-of-tree J36 input adapter below is
+# resolved against that file.  Building only zImage leaves it absent, and modpost
+# then reports every core symbol the adapter uses -- __platform_driver_register,
+# devm_kmalloc, memset, __aeabi_unwind_cpp_pr0 -- as "undefined!".
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
-    CROSS_COMPILE=arm-linux-gnueabihf- -j"$(nproc)" zImage
+    CROSS_COMPILE=arm-linux-gnueabihf- -j"$(nproc)" zImage modules
+
+# Kbuild runs modpost in two passes and the first one writes vmlinux.symvers: the
+# vmlinux exports alone, which is exactly what an external module needs.  If the
+# second pass produced nothing because this tree has no modules of its own, that
+# first-pass output is still the right symbol table to link against.
+if [[ ! -s "$KERNEL_OUT/Module.symvers" && -s "$KERNEL_OUT/vmlinux.symvers" ]]; then
+    cp "$KERNEL_OUT/vmlinux.symvers" "$KERNEL_OUT/Module.symvers"
+fi
+[[ -s "$KERNEL_OUT/Module.symvers" ]] || \
+    die "the kernel build produced no Module.symvers; an out-of-tree module cannot be resolved against it"
 
 # ── The one mistake this layer exists to prevent ──────────────────────────────
 #
