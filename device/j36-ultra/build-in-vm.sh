@@ -291,6 +291,11 @@ make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
 # the symbols that come along by dependency: if a future prune takes NET out
 # again, or turns SECCOMP off, the build fails here instead of the board
 # freezing at 15 s with the reason four screens up.
+#
+# MODULE_COMPRESS_NONE is in the list for the lima payload: /init loads modules by
+# filename with busybox insmod, which decompresses nothing, and turning module
+# compression on would rename every .ko to .ko.xz and leave load.order naming
+# files that are not there. DEVMEM is what mfgpower reaches the SPM through.
 for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 FB_SIMPLE SERIAL_8250_MT6577 BLK_DEV_INITRD MODULES \
                 MMC MMC_BLOCK MMC_MTK REGULATOR_FIXED_VOLTAGE \
@@ -300,7 +305,7 @@ for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 CGROUPS FHANDLE INOTIFY_USER SIGNALFD TIMERFD EPOLL \
                 DEVTMPFS DEVTMPFS_MOUNT TMPFS TMPFS_XATTR TMPFS_POSIX_ACL \
                 PROC_FS PROC_SYSCTL SYSFS BTRFS_FS_POSIX_ACL \
-                DRM DEVMEM; do
+                DRM DEVMEM MODULE_COMPRESS_NONE; do
     grep -q "^CONFIG_${required}=y$" "$CONFIG" || \
         die "required kernel option CONFIG_${required}=y was not selected"
 done

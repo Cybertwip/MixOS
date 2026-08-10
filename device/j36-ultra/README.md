@@ -172,7 +172,17 @@ zImage                 plain ARMv7 kernel, no appended tree
 mt6592-j36-ultra.dtb   the tree the LK loads separately and patches
 initrd.img             bring-up initramfs (busybox + the input module)
 mvii/boot.conf         filenames and command line for the MVII LK
+j36/doom               framebuffer Doom, static ARMv7 (j36.doom=1)
+j36/freedoom1.wad      the game data it loads
+j36/mfgpower           powers the Mali-450 and reads its ID back (j36.lima=1)
+j36/modules/           lima.ko and its dependencies, plus load.order
 ```
+
+Everything under `j36/` is read by `/init` and by nothing else — no LK load
+window, no size limit, no partition table entry. Deleting the directory, or the
+matching word from `bootargs`, restores the previous boot exactly, from any
+machine that can read an SD card and with no reflash. `/init` says on the panel
+what it found and carries on either way.
 
 `mvii/boot.conf` exists because a dArkOS card already carries a `boot.ini`, and
 that `boot.ini` names the arm64 `Image` and an rk3326 tree. The LK parses
