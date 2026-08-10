@@ -1645,15 +1645,18 @@ fits_in "$ARTIFACTS/boot.img" $((0x00900000)) "the BOOTIMG payload"
 # GL stack on that card is the RK3326's Mali-G31 Bifrost blob for a SoC whose GPU
 # is a Mali-450.  doomgeneric needs none of it: no SDL, no X11, no GL, no DRM.
 #
-# WHERE IT LIVES, AND WHY NOT IN THE INITRAMFS.  The initramfs goes into both
-# payloads, and boot.img is capped at the 9 MiB BOOTIMG slot asserted just above.
-# A static ARM Doom is around 2 MiB and the IWAD is 24 MiB more, so putting
-# either there would push the eMMC payload into RECOVERY.  Both go on the FAT
-# BOOT partition instead, under j36/, where there is no size limit worth
-# worrying about and no rule about what may be executed from a vfat mount: the
-# default mount gives every file mode 0755.  /init mounts that partition, runs
-# Doom, and carries on with the boot when it exits, so this costs the normal boot
-# path nothing but a mount and an exec.
+# WHERE IT LIVES, AND WHY NOT IN THE INITRAMFS OR ON BOOT.  The initramfs goes
+# into both payloads, and boot.img is capped at the 9 MiB BOOTIMG slot asserted
+# just above.  A static ARM Doom is around 2 MiB and the IWAD is 24 MiB more, so
+# putting either there would push the eMMC payload into RECOVERY.  It used to go
+# on the FAT BOOT partition and /init used to run it before the hand-over; both
+# have changed, because BOOT is a small vfat partition shared with an R36S's own
+# boot files and 26 MiB of game is not boot payload.  Doom is userland software
+# now: it ships in the second partition's /opt/mixos tree beside the dashboard,
+# and the dashboard launches it.  That is a better fit than it sounds -- fbdoom
+# writes 32-bit pixels into /dev/fb0 and reads evdev, which is exactly the layer
+# mixdash draws in, so it is the one thing on this card guaranteed to be able to
+# take the panel and hand it back.
 #
 # THE SOURCE LIST IS CHECKED, NOT WRITTEN.  doomgeneric's own Makefile is a
 # hand-maintained object list for its X11 front end.  Deriving ours from the tree
@@ -2361,14 +2364,23 @@ ensure_armhf_chroot() {
         sudo tee "$ARMHF_CHROOT/etc/resolv.conf" >/dev/null
     printf 'exit 101\n' | sudo tee "$ARMHF_CHROOT/usr/sbin/policy-rc.d" >/dev/null
     sudo chmod 0755 "$ARMHF_CHROOT/usr/sbin/policy-rc.d"
+    return 0
+}
 
-    if [[ ! -f "$ARMHF_CHROOT/.j36-deps" ]]; then
-        log "es: installing ${#ES_BUILD_DEPS[@]} build dependencies into the armhf chroot"
-        armhf_chroot_run "eatmydata apt-get -y update" || return 1
-        armhf_chroot_run "DEBIAN_FRONTEND=noninteractive eatmydata apt-get -y \
-            --no-install-recommends install ${ES_BUILD_DEPS[*]}" || return 1
-        sudo touch "$ARMHF_CHROOT/.j36-deps"
-    fi
+# chroot_install_deps <stamp-name> <package>...
+#
+# One stamp per set, so the two builds do not install each other's dependencies and
+# neither reinstalls on a re-run.  The stamp names are part of the chroot's state and
+# not of this file's: .j36-deps is the name the ES set has always had, and keeping it
+# is what stops an existing chroot from doing twenty emulated minutes of apt again.
+chroot_install_deps() {
+    local stamp="$ARMHF_CHROOT/.j36-deps${1:+-$1}" ; shift
+    [[ -f "$stamp" ]] && return 0
+    log "chroot: installing $# build dependencies into the armhf chroot"
+    armhf_chroot_run "eatmydata apt-get -y update" || return 1
+    armhf_chroot_run "DEBIAN_FRONTEND=noninteractive eatmydata apt-get -y \
+        --no-install-recommends install $*" || return 1
+    sudo touch "$stamp"
     return 0
 }
 
@@ -2398,6 +2410,8 @@ $(sha256sum "$ES_PATCH" | awk '{print $1}')"
     fi
 
     ensure_armhf_chroot || { armhf_chroot_teardown; return 1; }
+    # The empty stamp name is .j36-deps, which is what this set has always used.
+    chroot_install_deps "" "${ES_BUILD_DEPS[@]}" || { armhf_chroot_teardown; return 1; }
 
     # Cloned from outside the chroot: git over TLS under qemu-arm is minutes of
     # emulated crypto for no reason.  --depth 1 of one SHA rather than of a branch,
@@ -2465,7 +2479,240 @@ $(sha256sum "$ES_PATCH" | awk '{print $1}')"
     return 0
 }
 
-if [[ "${J36_ES:-1}" == 1 ]]; then
+# ── mixdash: the dashboard, and what it does not need ─────────────────────────
+#
+# WHY THIS EXISTS.  EmulationStation reaches the panel through SDL's KMSDRM
+# backend, so EGL, so GBM, so Mesa's lima on a Mali-450 -- and it stayed black with
+# no error past eglCreateContext.  mixdash reaches the panel through none of them:
+# Qt5 Widgets on the `linuxfb' platform plugin writes into /dev/fb0, and on this
+# board /dev/fb0 is the framebuffer the LK already lit.  That is not a hope, it is
+# the consequence of two decisions further up this file: FB_SIMPLE binds the device
+# tree's simple-framebuffer at 0x82700000, and CONFIG_DRM_FBDEV_EMULATION=n means
+# mediatek-drm never takes /dev/fb0 away from it.  The kernel console drawing on
+# this panel already proved the path end to end.
+#
+# WHAT IS BUILT.  Five files in device/j36-ultra/tools/mixdash, against Debian's own
+# qtbase5-dev in the same armhf chroot EmulationStation used.  Nothing is
+# cross-compiled, no Qt is built from source, and QT does not include opengl.
+#
+# WHERE IT GOES, AND WHY NOT ONTO BOOT.  Qt's runtime closure for the linuxfb path
+# is 14 MB of Qt plus 35 MB of ICU -- libQt5Core.so.5 carries libicui18n.so.76 and
+# libicuuc.so.76 in its DT_NEEDED and there is no build option here that drops them.
+# The BOOT partition is vfat, shared with an R36S's own boot files, and already
+# carries a kernel, an initramfs, three module payloads and Mesa.  So the Qt payload
+# and the dashboard go on the SECOND partition instead, under /opt/mixos, which is a
+# directory neither ArkOS nor the R36S has ever had: nothing on the shared rootfs is
+# overwritten, and an R36S booting the same card never looks in it.  That also buys
+# real symlinks, so this payload needs no `links' file the way j36/gl does.
+#
+# ONE UNUSED DEPENDENCY WORTH KNOWING ABOUT.  Debian's libQt5Gui.so.5 links
+# libGLESv2.so.2 whether or not anything asks for GL, so the loader must resolve that
+# name before main() runs -- and on this shared rootfs /usr/lib's copy is a symlink
+# to the RK3326's ARMv8-A libMali.so.  The payload therefore carries glvnd's own
+# libGLESv2.so.2, which is a dispatch stub that dlopens a driver only when a context
+# is made current, and mixdash never makes one.  The binary's RPATH puts /run/j36/gl
+# first all the same, so anything launched FROM the dashboard that does want GL gets
+# Mesa from the boot payload rather than this stub.
+MIXDASH_SRC="$ROOT/device/j36-ultra/tools/mixdash"
+MIXDASH_BIN=""
+QT_PAYLOAD=""
+
+# No t64 package names here on purpose.  trixie's armhf Qt is libqt5core5t64,
+# libqt5gui5t64 and so on, forkward's rename is suite-specific, and qtbase5-dev
+# depends on whichever names the suite actually uses -- including libqt5gui5t64,
+# which is the package that ships platforms/libqlinuxfb.so.  So the -dev package is
+# named and the runtime set is left to apt.
+MIXDASH_BUILD_DEPS=(build-essential pkg-config qtbase5-dev fonts-dejavu-core)
+
+# The eight names that must come from the card's own rootfs and never from this
+# chroot: the ELF interpreter, the C library's set, and the two GCC runtimes.  Every
+# other library the closure names is staged, because "the rootfs surely has this one"
+# is an assumption that costs a boot to disprove, and 40 MB of SD card to avoid.
+QT_PAYLOAD_SKIP='ld-linux|libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|libgcc_s\.so\.1|libstdc\+\+\.so\.6'
+
+build_mixdash() {
+    local src="$ARMHF_CHROOT/home/build/mixdash" out="$CACHE/mixdash"
+    local stamp="$CACHE/mixdash.stamp" want f header needed lib
+
+    [[ -d "$MIXDASH_SRC" ]] || { log "mixdash: $MIXDASH_SRC is missing"; return 1; }
+
+    want="$(cat "$MIXDASH_SRC"/*.cpp "$MIXDASH_SRC"/*.h "$MIXDASH_SRC"/mixdash.pro | sha256sum | awk '{print $1}')"
+    if [[ -x "$out" && "$(cat "$stamp" 2>/dev/null)" == "$want" ]]; then
+        MIXDASH_BIN="$out"
+        log "mixdash: reusing $out ($(stat -c %s "$out") bytes)"
+        return 0
+    fi
+
+    ensure_armhf_chroot || { armhf_chroot_teardown; return 1; }
+    chroot_install_deps qt "${MIXDASH_BUILD_DEPS[@]}" || { armhf_chroot_teardown; return 1; }
+
+    sudo rm -rf "$src"
+    sudo mkdir -p "$src"
+    for f in "$MIXDASH_SRC"/*.cpp "$MIXDASH_SRC"/*.h "$MIXDASH_SRC"/mixdash.pro; do
+        sudo cp "$f" "$src/" || { armhf_chroot_teardown; return 1; }
+    done
+
+    # RPATH and not RUNPATH: --disable-new-dtags makes ld emit DT_RPATH, which glibc
+    # searches for the whole dependency chain rather than only for this object's
+    # direct dependencies -- and the chain here is real, because libQt5Core reaches
+    # ICU and the linuxfb plugin reaches libinput.  It is what makes
+    #     /opt/mixos/bin/mixdash --probe
+    # work from a plain shell with no environment set, which is how this will be run
+    # the first time.  /run/j36/gl comes first so the Mesa payload wins for the GL
+    # names; /opt/mixos/qt/lib is where everything Qt lives.
+    log "mixdash: building the dashboard for armhf (emulated)"
+    armhf_chroot_run "cd /home/build/mixdash && \
+        q=\$(command -v qmake || true); \
+        [ -n \"\$q\" ] || q=\$(ls /usr/lib/*/qt5/bin/qmake 2>/dev/null | head -1); \
+        [ -n \"\$q\" ] || { echo 'no qmake in this chroot'; exit 1; }; \
+        QT_SELECT=qt5 \"\$q\" \
+            QMAKE_LFLAGS+='-Wl,--disable-new-dtags' \
+            QMAKE_LFLAGS+='-Wl,-rpath,/run/j36/gl' \
+            QMAKE_LFLAGS+='-Wl,-rpath,/opt/mixos/qt/lib' && \
+        make -j\$(nproc) && strip mixdash" \
+        || { armhf_chroot_teardown; return 1; }
+
+    [[ -f "$src/mixdash" ]] || { log "mixdash: make left no binary"; armhf_chroot_teardown; return 1; }
+
+    mkdir -p "$CACHE"
+    sudo cp "$src/mixdash" "$out" || { armhf_chroot_teardown; return 1; }
+    sudo chown "$(id -u):$(id -g)" "$out"
+    chmod 0755 "$out"
+
+    header="$(readelf -hd "$out" 2>/dev/null)" || return 1
+    grep -q 'Class:.*ELF32' <<<"$header" || { log "mixdash: not a 32-bit ELF"; return 1; }
+    grep -q 'Machine:.*ARM' <<<"$header" || { log "mixdash: not an ARM ELF"; return 1; }
+    grep -q 'Library rpath' <<<"$header" || {
+        log "mixdash: the binary carries no RPATH, so it would only run with"
+        log "    LD_LIBRARY_PATH set -- and the first thing anybody does is run it by hand"
+        return 1
+    }
+    needed="$(sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p' <<<"$header" | tr '\n' ' ')"
+    for lib in $needed; do
+        case "$lib" in
+            libQt5Widgets.so.5|libQt5Gui.so.5|libQt5Core.so.5) ;;
+            libGL.so*|libEGL*|libMali*|libmali*)
+                log "mixdash: the binary links $lib.  QT does not include opengl in"
+                log "    mixdash.pro, and every one of those names on this rootfs is a"
+                log "    symlink to an ARMv8-A libMali.so.  Refusing to stage it."
+                return 1
+                ;;
+        esac
+    done
+
+    printf '%s\n' "$want" >"$stamp"
+    MIXDASH_BIN="$out"
+    log "mixdash: $(stat -c %s "$out") bytes, stripped ARM"
+    log "mixdash: needs $needed"
+    return 0
+}
+
+# The runtime closure, measured rather than listed.  ldd inside the chroot resolves
+# exactly what the loader will resolve on the board -- the same suite, the same
+# architecture -- for the binary AND for libqlinuxfb.so, which Qt dlopens and whose
+# own dependencies (libinput, libmtdev, libxkbcommon, libdrm, glib, fontconfig,
+# freetype) are not in the binary's DT_NEEDED at all.  Miss the plugin out of this
+# walk and the dashboard starts, finds no platform plugin, and aborts with the
+# "This application failed to start because no Qt platform plugin could be
+# initialized" message that says nothing about which library was missing.
+collect_qt_payload() {
+    local out="$CACHE/qt-payload" plugin list p base real n=0 ttf
+    QT_PAYLOAD=""
+
+    [[ -x "$MIXDASH_BIN" ]] || { log "qt: no dashboard binary to walk"; return 1; }
+
+    # Keyed on nothing but its own completeness, because what shapes this payload is
+    # the chroot's Qt rather than anything in this tree.  Delete $CACHE/qt-payload to
+    # pick up a Qt that apt has upgraded since.
+    if [[ -e "$out/lib/libQt5Core.so.5" && -e "$out/plugins/platforms/libqlinuxfb.so" ]]; then
+        QT_PAYLOAD="$out"
+        log "qt: reusing $out ($(du -sh "$out" | awk '{print $1}'))"
+        return 0
+    fi
+
+    ensure_armhf_chroot || { armhf_chroot_teardown; return 1; }
+    # Put the binary where ldd can see it whichever path got us here -- build_mixdash
+    # may have reused a cached one and never entered the chroot at all.
+    sudo mkdir -p "$ARMHF_CHROOT/home/build/mixdash"
+    sudo cp "$MIXDASH_BIN" "$ARMHF_CHROOT/home/build/mixdash/mixdash" || return 1
+
+    plugin="$(armhf_chroot_run 'ls /usr/lib/*/qt5/plugins/platforms/libqlinuxfb.so 2>/dev/null | head -1')"
+    [[ -n "$plugin" ]] || {
+        log "qt: this chroot's Qt has no platforms/libqlinuxfb.so, which is the whole"
+        log "    reason Qt was chosen -- libqt5gui5t64 is the package that ships it"
+        return 1
+    }
+
+    list="$(armhf_chroot_run "ldd /home/build/mixdash/mixdash $plugin 2>/dev/null | \
+        sed -n 's|.*=> \\(/[^ ]*\\).*|\\1|p' | sort -u")" || return 1
+    [[ -n "$list" ]] || { log "qt: ldd resolved nothing in the chroot"; return 1; }
+
+    rm -rf "$out"
+    mkdir -p "$out/lib" "$out/plugins/platforms" "$out/fonts"
+
+    while read -r p; do
+        [[ -n "$p" ]] || continue
+        base="${p##*/}"
+        [[ "$base" =~ ^($QT_PAYLOAD_SKIP) ]] && continue
+        real="$(sudo readlink -f "$ARMHF_CHROOT$p" 2>/dev/null)" || continue
+        [[ -f "$real" ]] || continue
+        sudo cp "$real" "$out/lib/${real##*/}" || return 1
+        # The SONAME the loader asks for, when the file it lands on is named after a
+        # version.  ext4 and btrfs hold symlinks, which is half of why this payload
+        # is on the second partition and not on the vfat one.
+        [[ "${real##*/}" == "$base" ]] || ln -sf "${real##*/}" "$out/lib/$base"
+        n=$((n + 1))
+    done <<<"$list"
+
+    sudo cp "$ARMHF_CHROOT$plugin" "$out/plugins/platforms/libqlinuxfb.so" || return 1
+    sudo chown -R "$(id -u):$(id -g)" "$out"
+    chmod -R u+rw "$out"
+
+    # Two faces of one family, and no more: 640x480 shows about 24 rows of text and
+    # a font family is a megabyte.  DejaVu because Debian's fontconfig defaults to it
+    # and because main.cpp prefers the payload's copy, so the dashboard looks the
+    # same on a rootfs with no fonts installed at all.
+    for ttf in DejaVuSans.ttf DejaVuSans-Bold.ttf; do
+        if [[ -f "$ARMHF_CHROOT/usr/share/fonts/truetype/dejavu/$ttf" ]]; then
+            cp "$ARMHF_CHROOT/usr/share/fonts/truetype/dejavu/$ttf" "$out/fonts/" || return 1
+        fi
+    done
+
+    # qt.conf next to the binary, because Qt reads it from the executable's own
+    # directory before it looks at any environment.  It is what makes the dashboard
+    # find its plugins when it is run by hand from a shell, with no unit file and no
+    # variables set.
+    mkdir -p "$out/bin"
+    cat > "$out/bin/qt.conf" <<'QTCONF'
+# Read by Qt from the directory the executable is in, before QT_PLUGIN_PATH and
+# before any compiled-in path.  Without it Qt looks in /usr/lib/<triplet>/qt5/
+# plugins, which on this card is a directory that does not exist.
+[Paths]
+Plugins=/opt/mixos/qt/plugins
+QTCONF
+
+    # The three names the loader must find before main(), asserted here rather than
+    # discovered on the board: a Qt payload missing one of them fails with a message
+    # that names the file and nothing else.
+    for base in libQt5Widgets.so.5 libQt5Gui.so.5 libQt5Core.so.5; do
+        [[ -e "$out/lib/$base" ]] || { log "qt: the payload has no $base"; return 1; }
+    done
+    ls "$out"/lib/libicuuc.so.* >/dev/null 2>&1 || {
+        log "qt: the payload has no ICU, and libQt5Core.so.5 names libicuuc in its"
+        log "    DT_NEEDED -- the closure walk missed it, which means ldd did"
+        return 1
+    }
+
+    QT_PAYLOAD="$out"
+    log "qt: staged $n libraries, libqlinuxfb.so and $(ls -1 "$out/fonts" | wc -l) fonts ($(du -sh "$out" | awk '{print $1}'))"
+    return 0
+}
+
+# J36_GL is the GL front end and the probe, and it is worth keeping even now that
+# the dashboard needs no GL: eglprobe is still the only thing here that says whether
+# a frame reaches the glass, and anything launched from the dashboard that does want
+# GL resolves it out of this payload.  J36_ES is the name that word used to have.
+if [[ "${J36_GL:-${J36_ES:-1}}" == 1 ]]; then
     set +e
     collect_gl_payload
     gl_rc=$?
@@ -2481,30 +2728,55 @@ if [[ "${J36_ES:-1}" == 1 ]]; then
     set -e
     if (( probe_rc != 0 )); then
         ESPROBE_BIN=""
-        log "gl: eglprobe was not built, see the error above -- j36.es=debug will just be quieter"
-    fi
-
-    # J36_ES_BUILD=0 skips the rebuild and leaves the rootfs's GLES1 binary in
-    # place.  Worth having as its own switch because this is the one step in the
-    # file measured in tens of minutes, and a boot that is only exercising the GL
-    # payload or the kernel does not need it.
-    if [[ "${J36_ES_BUILD:-1}" == 1 ]]; then
-        set +e
-        build_es_gles20
-        es_rc=$?
-        set -e
-        if (( es_rc != 0 )); then
-            ES_BIN=""
-            armhf_chroot_teardown
-            log "es: the GLES 2.0 binary was not built, see the error above -- the card"
-            log "    will carry no j36/es and the rootfs's own EmulationStation will run,"
-            log "    which on this board is the status 134"
-        fi
-    else
-        log "es: J36_ES_BUILD=0, the rootfs's own EmulationStation will run"
+        log "gl: eglprobe was not built, see the error above -- j36.gl=debug will just be quieter"
     fi
 else
-    log "gl: J36_ES=0, skipping the GL front end"
+    log "gl: J36_GL=0, skipping the GL front end"
+fi
+
+# The dashboard, and it is on by default: it is what takes over the panel now.
+if [[ "${J36_DASH:-1}" == 1 ]]; then
+    set +e
+    build_mixdash
+    dash_rc=$?
+    if (( dash_rc == 0 )); then
+        collect_qt_payload
+        dash_rc=$?
+    fi
+    armhf_chroot_teardown
+    set -e
+    if (( dash_rc != 0 )); then
+        MIXDASH_BIN=""
+        QT_PAYLOAD=""
+        log "mixdash: the dashboard was not built, see the error above -- the card will"
+        log "    carry no /opt/mixos payload, /init will find none, and the rootfs's own"
+        log "    emulationstation.service will run unmodified"
+    fi
+else
+    log "mixdash: J36_DASH=0, skipping the dashboard"
+fi
+
+# EmulationStation, and it is off by default now.  Not because the GLES 2.0 renderer
+# was wrong -- it is still here, and the reasoning above it still holds -- but because
+# it never drew: the last measurement was a context that was created, a frame that was
+# submitted and a panel that stayed black, with nothing in EGL, in SDL or in Mesa
+# saying why.  Five layers deep is a bad place to be stuck, and the dashboard reaches
+# the same panel through none of them.  J36_ES_BUILD=1 brings it back verbatim, and it
+# is worth keeping buildable: it is the only real GL application on this board, so the
+# day mtk_drm and lima do land a frame, this is what proves it.
+if [[ "${J36_ES_BUILD:-0}" == 1 ]]; then
+    set +e
+    build_es_gles20
+    es_rc=$?
+    set -e
+    if (( es_rc != 0 )); then
+        ES_BIN=""
+        armhf_chroot_teardown
+        log "es: the GLES 2.0 binary was not built, see the error above -- the card"
+        log "    will carry no j36/es"
+    fi
+else
+    log "es: J36_ES_BUILD=0, EmulationStation is not built (the dashboard replaces it)"
 fi
 
 # ── The SD BOOT payload ───────────────────────────────────────────────────────
