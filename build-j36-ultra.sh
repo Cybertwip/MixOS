@@ -9,8 +9,12 @@
 # R36 wrapper owns the VM and the base image, this script resumes it, and what is
 # left here is only what is J36-specific:
 #
-#   - the DTB, generated on the host from the current MVII drivers;
+#   - the DTB, generated on the host from the vendored MVII board sources;
 #   - the ARMv7 kernel workspace, input module and boot.img built in the VM.
+#
+# It is self-contained: no PowerEngine checkout is needed.  The five MVII board
+# files the DTB generator parses are committed at device/j36-ultra/mvii-board and
+# refreshed by device/j36-ultra/sync-mvii-board.sh, which is run by hand.
 #
 # The R36 base build is checkpointed, so resuming a finished one costs seconds.
 # Set J36_RESUME_R36=0 to skip it and build the J36 layer against whatever base
@@ -28,12 +32,16 @@ VM_CPUS="${DARKOS_VM_CPUS:-8}"
 VM_MEMORY="${DARKOS_VM_MEMORY:-16G}"
 VM_DISK="${DARKOS_VM_DISK:-160G}"
 UBUNTU_IMAGE="${DARKOS_UBUNTU_IMAGE:-24.04}"
+# The MVII board sources are vendored at device/j36-ultra/mvii-board and ride
+# into the VM with the checkout, so this build needs no PowerEngine tree.
+# POWERENGINE_ROOT is still honoured, but only to notice that the vendored copies
+# have drifted -- see the check below -- never as a build input.
+BOARD_SRC="$ROOT/device/j36-ultra/mvii-board"
 POWERENGINE_ROOT="${POWERENGINE_ROOT:-$(dirname "$ROOT")/PowerEngineV3/PowerEngine}"
 DRIVERS_HOST="${J36_DRIVERS_DIR:-$POWERENGINE_ROOT/OS/MVII/Kernel/ARM/MediaTek/J36Ultra/Drivers}"
 ARTIFACT_DIR="${J36_ARTIFACT_DIR:-${ROOT}-artifacts/j36-ultra}"
 RESUME_R36="${J36_RESUME_R36:-1}"
 VM_SOURCE_MOUNT="/mnt/darkos-host"
-VM_DRIVERS_MOUNT="/mnt/j36-drivers-host"
 VM_ARTIFACT_MOUNT="/mnt/j36-artifacts"
 VM_BUILD_DIR="/home/ubuntu/dArkOS"
 VM_WORK_DIR="/home/ubuntu/j36-ultra-work"
@@ -73,14 +81,32 @@ fi
 
 [[ "$(uname -s)" == "Darwin" ]] || darkos_die "run this wrapper on macOS"
 [[ "$RESUME_R36" == "0" || "$RESUME_R36" == "1" ]] || darkos_die "J36_RESUME_R36 must be 0 or 1."
-[[ -d "$DRIVERS_HOST" ]] || darkos_die "PowerEngine J36 Drivers not found: $DRIVERS_HOST"
+[[ -d "$BOARD_SRC" ]] || darkos_die "vendored MVII board sources are missing: $BOARD_SRC
+run ./device/j36-ultra/sync-mvii-board.sh to restore them from a PowerEngine checkout"
 
-# The DTB is generated on the host from the MVII drivers, and its generator
+# A warning, not a failure.  This build is self-contained by design, so a
+# PowerEngine tree that happens to be newer than the vendored copies must not stop
+# it -- but silently building last week's keymap is worse than being told.
+if [[ -d "$DRIVERS_HOST" ]]; then
+    drifted=()
+    while read -r want file; do
+        [[ -n "${file:-}" ]] || continue
+        [[ -f "$DRIVERS_HOST/$file" ]] || continue
+        have="$(shasum -a 256 "$DRIVERS_HOST/$file" | awk '{print $1}')"
+        [[ "$have" == "$want" ]] || drifted+=("$file")
+    done < <(grep -E '^[0-9a-f]{64}  ' "$BOARD_SRC/PROVENANCE.txt" 2>/dev/null || true)
+    if (( ${#drifted[@]} )); then
+        darkos_warn "MVII drivers have moved since mvii-board/ was vendored: ${drifted[*]}"
+        darkos_warn "run ./device/j36-ultra/sync-mvii-board.sh to pick the changes up"
+    fi
+fi
+
+# The DTB is generated on the host from those board sources, and its generator
 # asserts on the panel record table and on the keypad pad mux.  Run it before
 # anything slow: a keymap or pad-mux regression should fail in a second, not after
 # the base image has been rebuilt.
-darkos_log "Regenerating the DTB from the current MVII drivers"
-J36_DRIVERS_DIR="$DRIVERS_HOST" "$ROOT/build-j36-ultra-dtb.sh"
+darkos_log "Regenerating the DTB from the vendored MVII board sources"
+"$ROOT/build-j36-ultra-dtb.sh"
 
 if [[ "$RESUME_R36" == "1" ]]; then
     darkos_log "Resuming the R36 Ultra base build; completed stages are skipped"
@@ -95,24 +121,16 @@ else
 fi
 
 # The checkout is already in the VM either way, and device/j36-ultra rode along
-# with it.  What is still missing is J36-only: the MVII driver sources the in-VM
-# build reads its board constants from, and somewhere to put the results.
+# with it -- board sources, kernel patch, input module and all.  The only mount
+# still needed is somewhere to put the results.  There used to be a second one,
+# /mnt/j36-drivers-host, plus an rsync into the VM to stage the PowerEngine
+# drivers; vendoring them removed both.
 mkdir -p "$ARTIFACT_DIR"
-darkos_vm_remount "$VM_NAME" \
-    "$DRIVERS_HOST:$VM_DRIVERS_MOUNT" \
-    "$ARTIFACT_DIR:$VM_ARTIFACT_MOUNT"
-
-darkos_log "Staging the MVII driver sources into the VM"
-multipass exec "$VM_NAME" -- bash -lc "
-set -Eeuo pipefail
-mkdir -p '$VM_WORK_DIR/powerengine-drivers'
-rsync -a --delete '$VM_DRIVERS_MOUNT/' '$VM_WORK_DIR/powerengine-drivers/'
-"
+darkos_vm_remount "$VM_NAME" "$ARTIFACT_DIR:$VM_ARTIFACT_MOUNT"
 
 darkos_log "Building the J36 Ultra layer"
 multipass exec "$VM_NAME" -- env \
     J36_WORK_DIR="$VM_WORK_DIR" \
-    J36_DRIVERS_DIR="$VM_WORK_DIR/powerengine-drivers" \
     J36_EXPORT_DIR="$VM_ARTIFACT_MOUNT" \
     J36_KERNEL_BRANCH="${J36_KERNEL_BRANCH:-linux-6.12.y}" \
     J36_KERNEL_URL="${J36_KERNEL_URL:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}" \

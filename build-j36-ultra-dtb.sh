@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Generate and compile the J36 Ultra MT6592 bring-up DTB directly from the
-# PowerEngine MVII J36Ultra Drivers tree. Existing dArkOS/PowerEngine sources
-# are read-only inputs; generated files stay under device/j36-ultra/generated.
+# Generate and compile the J36 Ultra MT6592 bring-up DTB from the MVII board
+# sources vendored under device/j36-ultra/mvii-board. Those are read-only inputs;
+# generated files stay under device/j36-ultra/generated.
+#
+# This needs no PowerEngine checkout. The five files the generator parses are
+# committed here, refreshed by device/j36-ultra/sync-mvii-board.sh when the MVII
+# drivers move; point J36_DRIVERS_DIR at a live Drivers tree to build against it
+# directly without vendoring first.
 
 set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-POWERENGINE_ROOT="${POWERENGINE_ROOT:-$(dirname "$ROOT")/PowerEngineV3/PowerEngine}"
-DRIVERS="${J36_DRIVERS_DIR:-$POWERENGINE_ROOT/OS/MVII/Kernel/ARM/MediaTek/J36Ultra/Drivers}"
+DRIVERS="${J36_DRIVERS_DIR:-$ROOT/device/j36-ultra/mvii-board}"
 OUT_DIR="${J36_DTB_OUT_DIR:-$ROOT/device/j36-ultra/generated}"
 DTS="$OUT_DIR/mt6592-j36-ultra.dts"
 DTB="$OUT_DIR/mt6592-j36-ultra.dtb"
@@ -22,8 +26,9 @@ for tool in python3 dtc fdtget; do
 done
 
 [[ -d "$DRIVERS" ]] || {
-    echo "error: J36 Ultra Drivers directory not found: $DRIVERS" >&2
-    echo "set POWERENGINE_ROOT or J36_DRIVERS_DIR to override it" >&2
+    echo "error: J36 Ultra board sources not found: $DRIVERS" >&2
+    echo "these are committed; run device/j36-ultra/sync-mvii-board.sh to restore" >&2
+    echo "them from a PowerEngine checkout, or set J36_DRIVERS_DIR" >&2
     exit 1
 }
 

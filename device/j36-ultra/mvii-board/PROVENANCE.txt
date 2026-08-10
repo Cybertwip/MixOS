@@ -1,0 +1,14 @@
+# Vendored MVII J36 Ultra board sources.
+#
+# Copied by device/j36-ultra/sync-mvii-board.sh; do not edit here.  These are
+# read-only inputs to generate_dts.py, which parses the board constants,
+# the JD9365 panel init table and the keypad pad mux out of them.
+#
+# Upstream: PowerEngine OS/MVII/Kernel/ARM/MediaTek/J36Ultra/Drivers
+source_commit=10067a30187340f0433422d258266097970e23a8
+source_describe=10067a3018
+de10b52cfa6c9cdf6a2778c15819e6ed294347bd218f391a08b7ce1af2d0e846  mt6592_board_j36.h
+aaf05654d44f3c262a8fb9e9d5960e26a7dd62bbc7c704a97a8bbe5a6b1cdb57  mt6592_disp_hw.h
+ad0ce6e257474cbeb14f94f2e68fe95314fa95153259b4b450d859baac26642a  panel_bringup.h
+277785973a0438079decc7d828320a1c9f44ef984b09f0b3a6d6a33a1475f297  dsi_drv.c
+a204b6e5b26a9af0bf0c749b19c151cc4731fc4fefcdbcd75292014c33e33db3  mt6592_keys.c

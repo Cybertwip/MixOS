@@ -6,15 +6,35 @@ Build from the repository root:
 ./build-j36-ultra-dtb.sh
 ```
 
-The generator reads only the canonical MVII J36 Ultra driver directory:
+No PowerEngine checkout is required. The five MVII board files the generator
+parses are vendored here, and they are the only ones it opens:
 
 ```text
-PowerEngine/OS/MVII/Kernel/ARM/MediaTek/J36Ultra/Drivers
+device/j36-ultra/mvii-board/mt6592_board_j36.h
+device/j36-ultra/mvii-board/mt6592_disp_hw.h
+device/j36-ultra/mvii-board/panel_bringup.h
+device/j36-ultra/mvii-board/dsi_drv.c
+device/j36-ultra/mvii-board/mt6592_keys.c
+device/j36-ultra/mvii-board/PROVENANCE.txt
 ```
 
-It extracts the board constants and the exact compact 155-record JD9365 table
-from `mt6592_board_j36.h`, `panel_bringup.h`, `mt6592_disp_hw.h`,
-`mt6592_keys.c`, and `dsi_drv.c`.
+That is 244 KB out of a 2.9 MB, 113-file driver tree. From them the generator
+extracts the board constants, the exact compact 155-record JD9365 table, and the
+keypad pad mux, and asserts on all three.
+
+`PROVENANCE.txt` records the upstream commit and a SHA-256 per file.
+`./device/j36-ultra/sync-mvii-board.sh` refreshes the copies from a PowerEngine
+checkout and rewrites that record; it is run **by hand**, never by the build. If
+a PowerEngine tree does happen to sit beside dArkOS, `build-j36-ultra.sh`
+re-checks those hashes and warns when they have drifted — a warning and not a
+failure, because a missing or older sibling repository must not be able to stop
+this build.
+
+The values could have been frozen into a JSON instead, which would be smaller
+again, but that moves the numbers one copy further from the code that drives the
+hardware. The generator's assertions are what turn an MVII pad-mux change into a
+build failure here rather than seven dead keys on the device, and they only mean
+something while they are reading real driver source.
 
 Outputs:
 
@@ -162,9 +182,61 @@ check, and fall back to the eMMC. Load addresses are deliberately absent from
 it: those are the LK's business, and it knows this SoC's DRAM map and the
 address of the framebuffer the DTB hands to `simple-framebuffer`.
 
-The command line carries no `root=`, and must not yet. This bring-up profile has
-no MMC, block or network drivers — they are off so the payload fits the 9 MiB
-BOOTIMG slot — so a `root=` this kernel cannot honour is a panic instead of a
-shell. It boots to its initramfs. When native MT6592 MSDC lands, add
-`root=LABEL=ROOTFS rootwait rw` and drop `rdinit=`; the armhf rootfs the R36
-build produces is the one it will mount.
+## Storage: mounting the shared armhf rootfs
+
+The microSD host is **MSDC1 at `0x11240000`** — the base the MVII LK's own
+`mt6592_msdc_sd.c` programs to read the card this kernel is loaded from, with
+MSDC0 at `0x11230000` being the eMMC. `mmc@11240000` claims it with
+`mediatek,mt6592-mmc`, and no eMMC node is described, so the card is the only MMC
+host and its partitions land on `mmcblk0`.
+
+Three things had to be true before that worked, and none of them are guesses:
+
+- **The interrupt is GIC_SPI 40, level-low.** MediaTek IRQ IDs on MT6592 run 64
+  above the GIC SPI number. That offset comes from a `struct resource` array in
+  the stock kernel's `.data` (file offsets `0xb2b050`–`0xb2b1c4`), which gives
+  MSDC0/1/2 → 103/104/105 and UART0..3 → 115..118; mainline `mt6592.dtsi` places
+  those same UARTs at GIC_SPI 51..54. Four independent confirmations of −64, so
+  MSDC1's 104 is SPI 40. The node's parent is `sysirq`, which is where the
+  level-low inversion is handled.
+- **`mtk-sd` needed a compatible.** MT6592 is a 12-bit-divider part: the LK writes
+  CKDIV into `MSDC_CFG[19:8]` and CKMOD into `[21:20]`, which is `clk_div_bits ==
+  12`, not the 8-bit mt8135 layout. No in-tree entry pairs a 12-bit divider with
+  this generation's `MSDC_PAD_TUNE` and no async FIFO, so `linux/0001-mtk-sd-mt6592.patch`
+  adds `mt6592_compat` rather than borrowing mt2701's. The same patch makes
+  pinctrl optional, because probe otherwise refuses a SoC that has no pinctrl
+  driver at all — and the pads are already muxed by the bootloader.
+- **`vmmc-supply` is mandatory, not decoration.** `mmc->ocr_avail` is assigned in
+  exactly one place in the whole MMC core — `drivers/mmc/core/regulator.c`, from
+  the vmmc regulator — and `mtk-sd` never sets it. Without a fixed regulator
+  behind `vmmc-supply` the host advertises no voltage and card init fails with
+  nothing in the log pointing at why.
+
+`CONFIG_BTRFS_FS` is built in because that is what the shared rootfs is:
+dArkOS's own `scripts/setup_partition.sh` sets `ROOT_FILESYSTEM_FORMAT="btrfs"`.
+`CONFIG_EXT4_FS` too, because a hand-made card usually is not.
+
+`root=` on the command line is a **hint that `/init` verifies**, not an order to
+the kernel: `rdinit=/init` keeps the kernel out of root mounting entirely, so a
+`root=` that turns out to be wrong can no longer panic it. `/init` mounts each
+candidate read-only, looks for `/sbin/init`, and only then remounts it writable
+and `switch_root`s in. Failing that it scans the other `mmcblk` partitions, and
+failing *that* it prints `/proc/partitions` and gives you a shell. Delete `root=`
+from `mvii/boot.conf` and the card stops at the initramfs exactly as it used to.
+
+## Where the shell appears
+
+`/dev/console` is whichever `console=` came **last** on the command line. With
+`console=tty0 console=ttyS0,115200n8` that is the UART, so a bare
+`exec setsid cttyhack sh` puts the prompt on a serial port that may have nothing
+plugged into it while the panel shows only a blinking cursor. `/init` therefore
+echoes progress to both, starts a background shell on `/dev/ttyS0`, and execs the
+interactive one on `/dev/tty1` explicitly.
+
+## What used to cost ten seconds of every boot
+
+The `backlight` node is `status = "disabled"`. It is a `pwm-backlight` consuming
+`&disp_pwm` and `&gpio`, and neither has a driver in this profile. An *enabled* DT
+consumer whose provider has no driver does not fail — it defers, and keeps
+deferring until `driver_deferred_probe_timeout` expires. That was the whole gap
+between 0.87 s and 11.38 s, plus an error on the panel.

@@ -6,7 +6,10 @@ set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 WORK="${J36_WORK_DIR:-$HOME/j36-ultra-work}"
-DRIVERS="${J36_DRIVERS_DIR:-$WORK/powerengine-drivers}"
+# The MVII board sources are vendored in this checkout, so nothing here reaches
+# outside it. They used to be rsynced into the VM from a PowerEngine tree on the
+# host, which made a dArkOS build depend on a sibling repository being present.
+DRIVERS="${J36_DRIVERS_DIR:-$ROOT/device/j36-ultra/mvii-board}"
 EXPORT_DIR="${J36_EXPORT_DIR:-$WORK/export}"
 KERNEL_URL="${J36_KERNEL_URL:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
 KERNEL_BRANCH="${J36_KERNEL_BRANCH:-linux-6.12.y}"
