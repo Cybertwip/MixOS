@@ -58,7 +58,9 @@
 #include <linux/io.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
@@ -527,7 +529,7 @@ static int j36_speaker_on(struct j36_afe *afe)
 	if (afe->amp_on || afe->mute)
 		return 0;
 
-	guard(mutex)(&afe->pmic_lock);
+	mutex_lock(&afe->pmic_lock);
 
 	ret = j36_pmic_write(afe, J36_PMIC_AUDTOP_CON7, 0x2400);
 	if (ret)
@@ -557,10 +559,12 @@ static int j36_speaker_on(struct j36_afe *afe)
 	}
 
 	afe->amp_on = true;
+	mutex_unlock(&afe->pmic_lock);
 	dev_info(afe->dev, "class-D speaker amp live at level %u\n", afe->level);
 	return 0;
 
 fail:
+	mutex_unlock(&afe->pmic_lock);
 	dev_warn(afe->dev, "class-D power-up failed (%d)\n", ret);
 	return ret;
 }
@@ -572,7 +576,7 @@ static void j36_speaker_off(struct j36_afe *afe)
 	if (!afe->amp_on)
 		return;
 
-	guard(mutex)(&afe->pmic_lock);
+	mutex_lock(&afe->pmic_lock);
 
 	/* Down from wherever the level currently is, never up to the vendor's
 	 * ramp-down start: stepping up first would raise the load on the way to
@@ -593,6 +597,7 @@ static void j36_speaker_off(struct j36_afe *afe)
 	j36_pmic_write(afe, J36_PMIC_AUDTOP_CON6, 0x37e2);
 
 	afe->amp_on = false;
+	mutex_unlock(&afe->pmic_lock);
 }
 
 /* ---- the cursor, and what to do when it does not move -------------------- */
@@ -729,8 +734,9 @@ static int j36_afe_pcm_prepare(struct snd_pcm_substream *substream)
 	/* Everything that can sleep happens here and not in .trigger, which ALSA
 	 * calls with the stream lock held: the PWRAP poll loops and the amp's
 	 * sequenced delays have no business in atomic context. */
-	scoped_guard(mutex, &afe->pmic_lock)
-		j36_pmic_downlink(afe, afe->rate);
+	mutex_lock(&afe->pmic_lock);
+	j36_pmic_downlink(afe, afe->rate);
+	mutex_unlock(&afe->pmic_lock);
 
 	dev_dbg(afe->dev, "prepare: %u Hz, ring 0x%08x+%u, period %u\n",
 		afe->rate, (u32)afe->dma_addr, afe->dma_bytes,
@@ -828,9 +834,11 @@ static int j36_volume_put(struct snd_kcontrol *kcontrol,
 	/* Written through only while the amp is actually powered. With the amp
 	 * down this is a remembered setting and not a PMIC transaction, which
 	 * matters on a board where every PMIC write is on the power path. */
-	if (afe->amp_on)
-		scoped_guard(mutex, &afe->pmic_lock)
-			j36_speaker_level(afe, level);
+	if (afe->amp_on) {
+		mutex_lock(&afe->pmic_lock);
+		j36_speaker_level(afe, level);
+		mutex_unlock(&afe->pmic_lock);
+	}
 	return 1;
 }
 

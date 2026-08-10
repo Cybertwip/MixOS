@@ -352,23 +352,32 @@ config_y DEVMEM
 # exactly what this board uses, and an outright refusal of SND_SOC after
 # olddefconfig -- because a stray `select SND_SOC_*' from some codec that
 # survives would be a silent 300 KiB and a second sound card.
+#
+# SND_PCM_TIMER is in the allowlist and is not a feature request: SND_PCM's line
+# in sound/core/Kconfig is `select SND_TIMER if SND_PCM_TIMER', so pruning this
+# one bool -- which is `default y' and matches SND_* like everything else --
+# quietly takes snd-timer.ko out of the build, and the assertion below that says
+# it must be =m would then fail on a configuration that was otherwise right.
 config_y SOUND
 while IFS='=' read -r option _value; do
     symbol="${option#CONFIG_}"
     case "$symbol" in
-        SOUND|SND|SND_TIMER|SND_PCM|SND_DRIVERS|SND_DUMMY) ;;
+        SOUND|SND|SND_TIMER|SND_PCM|SND_PCM_TIMER|SND_PROC_FS|SND_DRIVERS|SND_DUMMY) ;;
         SOUND_*|SND_*) config_n "$symbol" ;;
     esac
 done < <(grep -E '^CONFIG_(SOUND|SND)[A-Z0-9_]*=(y|m)$' "$CONFIG")
 config_m SND
 config_y SND_DRIVERS
 config_m SND_DUMMY
-# OSS emulation, sequencer and procfs: all three are `default y' once SND is on,
-# and all three are dead weight here.  Nothing in the dArkOS rootfs opens
-# /dev/dsp or /dev/sequencer, and /proc/asound duplicates what the card already
-# reports through sysfs.
+# SND_PROC_FS is kept for one reason: `cat /proc/asound/cards' is the first thing
+# anyone reaches for on a board with no aplay, and this initramfs has no aplay.
+# It is a few kilobytes inside snd.ko, which is on the BOOT partition.
+#
+# The rest are dead weight, and named explicitly rather than left to the prune so
+# that the intent survives a kernel bump that renames one of them.  Nothing in the
+# dArkOS rootfs opens /dev/dsp or /dev/sequencer.
 for symbol in SND_SUPPORT_OLD_API SND_PCM_OSS SND_MIXER_OSS SND_SEQUENCER \
-    SND_PROC_FS SND_VERBOSE_PROCFS SND_DEBUG; do
+    SND_VERBOSE_PROCFS SND_DEBUG; do
     config_n "$symbol"
 done
 
