@@ -2430,6 +2430,8 @@ at the ARMv7 payload instead.
   j36/mtkdrm/               the MT6592 display driver set, plus load.order
   j36/gl/                   Mesa's GL front end, plus links (vfat has no symlinks)
   j36/eglprobe              what can create a GL context, and why not; j36.es=debug
+  j36/es/emulationstation   the same EmulationStation with a GLES 2.0 renderer,
+                            bind-mounted over the rootfs's fixed-function one
 
 The R36S kernel on the same card is arm64 and stays there for the R36S.  The
 armhf Debian rootfs is shared, and this kernel can now mount it: MSDC1, the
