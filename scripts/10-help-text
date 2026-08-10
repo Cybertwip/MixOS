@@ -1,5 +1,6 @@
 #!/bin/bash
 printf "\n"
-printf " * dArkOS Documentation:          https://github.com/christianhaitian/darkos/wiki\n"
+printf " * MixOS: a divergent fork of dArkOS, with MediaTek support\n"
+printf " * Upstream dArkOS docs:          https://github.com/christianhaitian/darkos/wiki\n"
 printf " * Debian Reference:             https://www.debian.org/doc/manuals/debian-reference/index.en.html\n"
 printf "\n"
