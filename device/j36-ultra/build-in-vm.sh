@@ -4199,8 +4199,8 @@ fi
             echo "gl_reason=the shared rootfs points libEGL.so, libgbm.so{,.1,.1.0.0} and libGLESv1_CM.so at the RK3326 Mali blob"
             echo "gl_load_bearing=libgbm.so.1 -- libEGL_mesa.so.0 needs it, so mesa's own EGL cannot load without this payload"
             echo "gl_install=tmpfs on the rootfs /run plus a systemd drop-in; nothing is written to the card"
-            echo "emulationstation=default; j36.es=1 supplies the GL front end"
-            echo "es_boot_word=$(grep -o 'j36\.es=[a-z0-9]*' sd-boot/mvii/boot.conf)"
+            echo "gl_boot_word=$(grep -o 'j36\.gl=[a-z0-9]*' sd-boot/mvii/boot.conf)"
+            echo "gl_users=mixdash's 3D cube card, and EmulationStation if j36.dash=1 is removed"
             if [[ -f sd-boot/j36/es/emulationstation ]]; then
                 echo "es_binary=j36/es/emulationstation ($(stat -c %s sd-boot/j36/es/emulationstation) bytes, stripped ARMv7)"
                 echo "es_commit=$ES_COMMIT (the rootfs's own EmulationStation commit)"
