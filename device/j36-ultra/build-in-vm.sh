@@ -997,9 +997,14 @@ setup_es_gl() {
     fi
 
     mkdir -p /newroot/run/j36/gl
+    staged=0
     for so in /bootfs/j36/gl/*.so*; do
         [ -f "$so" ] || continue
-        cp "$so" /newroot/run/j36/gl/ || say "es: could not copy $so"
+        if cp "$so" /newroot/run/j36/gl/; then
+            staged=$((staged + 1))
+        else
+            say "es: could not copy $so"
+        fi
     done
     # The links file stands in for symlinks vfat cannot store: "name target", one
     # pair per line, targets relative to this directory except libEGL.so's, which
@@ -1008,6 +1013,32 @@ setup_es_gl() {
         case "$name" in ''|'#'*) continue ;; esac
         ln -sf "$target" "/newroot/run/j36/gl/$name"
     done < /bootfs/j36/gl/links
+
+    # Nothing above is allowed to fail quietly, because of what the fallback is.
+    # The drop-in tells the loader to look in this directory; if the directory is
+    # empty the loader simply misses and resolves ES's bare `libEGL.so' in
+    # /usr/lib, where dArkOS has pointed that name at the RK3326's libMali.so --
+    # an ARMv8-A object on a Cortex-A7. The failure is SIGILL before main(), which
+    # names neither this directory nor the blob, so it has to be caught here.
+    #
+    # These three are the load-bearing names: libEGL.so is the only GL string in
+    # ES's DT_NEEDED, libgbm.so.1 is a clobbered SONAME that libEGL_mesa.so.0
+    # itself needs, and libGLESv1_CM.so.1 is the LD_PRELOAD that supplies the
+    # fixed-function entry points ES calls.
+    missing=""
+    for need in libEGL.so libgbm.so.1 libGLESv1_CM.so.1; do
+        [ -e "/newroot/run/j36/gl/$need" ] || missing="$missing $need"
+    done
+    if [ -n "$missing" ]; then
+        say "es: the GL payload is incomplete, missing:$missing"
+        say "    ($staged of the libraries copied.)  The drop-in is deliberately"
+        say "    NOT written: pointing LD_LIBRARY_PATH at a directory that cannot"
+        say "    satisfy libEGL.so sends ES to /usr/lib and the RK3326 Mali blob,"
+        say "    which is ARMv8-A on this Cortex-A7 -- SIGILL, status 132, before"
+        say "    main().  Leaving the environment alone fails in the same place"
+        say "    but without this initramfs having claimed to fix it."
+        return 1
+    fi
 
     mkdir -p /newroot/run/systemd/system/emulationstation.service.d
     cat > /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPIN'
@@ -2123,6 +2154,20 @@ libEGL.so.  That works against a vendor blob, where one object exports EGL and
 GLES1 and GLES2 together.  glvnd's libEGL exports no gl* entry point at all, so the
 GLES1 library has to be in the global scope before the binary starts or it does not
 start.  Mesa implements GLES1 over any gallium driver, lima included.
+
+One failure has a signature worth knowing on sight:
+
+  emulationstation.sh: line 27: NNN Illegal instruction "$esdir/emulationstation"
+  emulationstation.service: Main process exited, code=exited, status=132/n/a
+
+Status 132 is 128+4, SIGILL, and it happens before main().  It means the process
+loaded the RK3326 Mali blob: libMali.so is an ARMv8-A object (readelf -A says
+Tag_CPU_arch: v8) and the MT6592 is a Cortex-A7, so the first instruction the blob
+executes is one this SoC does not have.  EmulationStation itself is v7 and fine.
+So SIGILL is never an ES bug and never a Mesa bug -- it means the GL payload did
+not take, and the loader fell back to /usr/lib.  Check for "es: GL front end in
+/run/j36/gl" in the boot log, and `ls /run/j36/gl` on the device: if libEGL.so is
+not in there, nothing else in this section matters yet.
 
 If it does not come up, the order to check things in is: /dev/dri (step 1),
 then `SDL_VIDEODRIVER=kmsdrm` with any SDL program (step 2), then
