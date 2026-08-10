@@ -754,11 +754,18 @@ build_fbdoom() {
         printf '%s\n' "$want" >"$stamp"
     fi
 
-    # Static on purpose: this runs from the initramfs, before switch_root, so
-    # there is no ld.so and no /lib to link against.
-    verify_arm_elf "$DOOM_BIN" "the fbdoom binary" || return 1
-    readelf -d "$DOOM_BIN" 2>/dev/null | grep -q NEEDED &&
-        { log "fbdoom: $DOOM_BIN wants shared libraries and the initramfs has none"; return 1; }
+    # The same two tests verify_arm_elf makes, spelled out rather than called:
+    # that helper reports through die(), and a failure here must not take the
+    # kernel artifacts down with it.  Static on purpose -- this runs from the
+    # initramfs, before switch_root, so there is no ld.so and no /lib.
+    local header
+    header="$(readelf -hd "$DOOM_BIN" 2>/dev/null)" || return 1
+    grep -q 'Class:.*ELF32' <<<"$header" || { log "fbdoom: not a 32-bit ELF"; return 1; }
+    grep -q 'Machine:.*ARM' <<<"$header" || { log "fbdoom: not an ARM ELF"; return 1; }
+    if grep -q 'NEEDED' <<<"$header"; then
+        log "fbdoom: the binary wants shared libraries and the initramfs has none"
+        return 1
+    fi
 
     log "fbdoom: $(stat -c %s "$DOOM_BIN") bytes, static ARM"
     return 0
