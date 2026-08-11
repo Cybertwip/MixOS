@@ -161,7 +161,10 @@ multipass exec "$VM_NAME" -- env \
     J36_DOOM_COMMIT="${J36_DOOM_COMMIT:-dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284}" \
     J36_LIMA="${J36_LIMA:-1}" \
     J36_MTKDRM="${J36_MTKDRM:-1}" \
-    J36_ES="${J36_ES:-1}" \
+    J36_AUDIO="${J36_AUDIO:-1}" \
+    J36_GL="${J36_GL:-${J36_ES:-1}}" \
+    J36_MIXDASH="${J36_MIXDASH:-1}" \
+    J36_PAYLOAD_ON="${J36_PAYLOAD_ON:-root}" \
     bash "$VM_BUILD_DIR/device/j36-ultra/build-in-vm.sh"
 
 darkos_log "J36 Ultra artifacts are ready: $ARTIFACT_DIR"
@@ -170,5 +173,14 @@ printf '  %s\n' \
     "$ARTIFACT_DIR/mt6592-j36-ultra.dtb" \
     "$ARTIFACT_DIR/j36_mt6592_input.ko" \
     "$ARTIFACT_DIR/manifest.txt"
-darkos_log "Copy $ARTIFACT_DIR/sd-boot/ onto the card's BOOT partition"
+# Two halves, two filesystems, and the split is not cosmetic: the MVII LK reads FAT32
+# and nothing else, so BOOT carries the launcher and the OS partition carries the rest.
+# Unpacking sd-root.tar.gz onto BOOT instead would drop the ~30 Qt SONAME symlinks and
+# every execute bit, and mixdash would then fail before main().
+darkos_log "Copy $ARTIFACT_DIR/sd-boot/ onto the card's FAT32 BOOT partition (the launcher: zImage, the DTB, initrd.img, mvii/boot.conf)"
+if [[ -f "$ARTIFACT_DIR/sd-root.tar.gz" ]]; then
+    darkos_log "Then, as root: sudo tar -C /path/to/the/mounted/ROOTFS -xzf $ARTIFACT_DIR/sd-root.tar.gz  (the ext2 OS partition -- gives /opt/mixos)"
+else
+    darkos_warn "No sd-root.tar.gz was produced, so nothing will be on the OS partition: no dashboard, no lima, no Mesa. Check the sd-root lines in the build log."
+fi
 darkos_warn "The R36 base image kernel is arm64 and this SoC is ARMv7; only the armhf rootfs is shared. sd-boot/mvii/boot.conf is what points the MVII LK at the 32-bit kernel."

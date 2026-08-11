@@ -74,9 +74,17 @@ sudo chroot Arkbuild/ eatmydata apt-get install -y libdrm-dev libgbm1
 setup_ark_user
 sleep 10
 echo -e "Generating /etc/fstab"
+# p3 is ext2 labelled DATA, not vfat labelled EASYROMS -- see setup_partition.sh.  No
+# umask/uid/gid on that line: mount refuses them on ext2, so carrying them over would
+# have been a home partition that never comes up.  Ownership is real instead, set once
+# by finishing_touches.sh to the ark user setup_ark_user just created.
+#
+# ${DATA_MOUNT_POINT} is /home/virtua and is that user's home directory, so a login
+# lands on p3.  It carries nofail: the home partition is not worth holding
+# local-fs.target for, and a card whose p3 is missing still has to reach a shell.
 echo -e "LABEL=ROOTFS / ${ROOT_FILESYSTEM_FORMAT} ${ROOT_FILESYSTEM_MOUNT_OPTIONS} 0 1
 LABEL=BOOT /boot vfat defaults 0 0
-LABEL=EASYROMS /roms vfat defaults,auto,umask=000,uid=1000,gid=1000,noatime 0 0" | sudo tee Arkbuild/etc/fstab
+LABEL=${DATA_LABEL} ${DATA_MOUNT_POINT} ${DATA_FILESYSTEM_FORMAT} ${DATA_MOUNT_OPTIONS} 0 2" | sudo tee Arkbuild/etc/fstab
 echo -e "Generating 10-standard.rules for udev"
 echo -e "# Rules
 KERNEL==\"mali0\", GROUP=\"video\", MODE=\"0660\"

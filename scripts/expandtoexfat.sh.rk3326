@@ -15,7 +15,7 @@ fi
 if [ ! -f /boot/doneit ]; then
   sudo echo ", +" | sudo sfdisk -N 3 --force /dev/mmcblk0 &> /dev/null
   sudo touch "/boot/doneit"
-  dialog --infobox "EASYROMS partition expansion and conversion to exfat in process.  The device will now reboot to continue the process..." $height $width 2>&1 > /dev/tty1
+  dialog --infobox "DATA partition expansion in process.  The device will now reboot to continue the process..." $height $width 2>&1 > /dev/tty1
   sleep 5
   sudo reboot
 fi
@@ -43,25 +43,42 @@ fi
 	  ext4endSector=$(sudo sfdisk -l /dev/mmcblk0 | grep mmcblk0p2 | awk '{print $3}')
 	  exfatstartSector=$(echo print 1+$ext4endSector | perl)
 	  echo 30
-	  printf "n\np\n3\n$exfatstartSector\n\nt\n3\n11\nw\n" | sudo fdisk /dev/mmcblk0 &> /dev/null
+	  # Type 83, Linux: p3 is ext2 now.  Creating it as 11 (W95 FAT32) and correcting
+	  # it further down left a window in which a card pulled mid-firstboot reads as a
+	  # FAT partition with an ext2 superblock on it, which is what a PC offers to
+	  # reformat.  One type, set once.
+	  printf "n\np\n3\n$exfatstartSector\n\nt\n3\n83\nw\n" | sudo fdisk /dev/mmcblk0 &> /dev/null
 	  echo 45
 	fi
 
-	sudo mkfs.exfat -c 16K -L EASYROMS /dev/mmcblk0p3 &> /dev/null
+	# p3 is ext2 labelled DATA now, not exfat labelled EASYROMS.  The block above
+	# deleted and recreated the partition to move its start sector, so its contents are
+	# gone either way and it does have to be formatted -- but as the filesystem it
+	# already was, so nothing on the device ever has to convert it again.  -b 1024
+	# matches setup_partition.sh: many small files in 300 MB and up.
+	sudo mkfs.ext2 -F -b 1024 -L DATA /dev/mmcblk0p3 &> /dev/null
 	sync
 	echo 50
 	sleep 2
-	sudo fsck.exfat -a /dev/mmcblk0p3 &> /dev/null
+	sudo e2fsck -fy /dev/mmcblk0p3 &> /dev/null
 	sync
 	echo 55
-	printf "t\n3\n7\nw\n" | sudo fdisk /dev/mmcblk0 &> /dev/null
+	# 83, Linux, and not 7 (HPFS/NTFS/exFAT).  fdisk's type is advisory for Linux --
+	# the kernel probes the superblock -- but a partition table that says exFAT over an
+	# ext2 filesystem is what makes a PC offer to reformat the card.
+	printf "t\n3\n83\nw\n" | sudo fdisk /dev/mmcblk0 &> /dev/null
 	echo 60
-	sudo mount -t exfat -w /dev/mmcblk0p3 /roms &> /dev/null
+	sudo mount -t ext2 -w /dev/mmcblk0p3 /roms &> /dev/null
 	exitcode=$?
 	echo $exitcode > /tmp/code.txt
 	sleep 2
+	# --same-owner and --same-permissions now, where the old code passed the opposite:
+	# the destination was exfat, which stores neither, and the fstab line handed the
+	# whole partition to uid 1000 with umask=000 instead.  ext2 stores both, the archive
+	# carries 1000:1000 from finishing_touches.sh, and without these two options /roms
+	# would come out owned by root and read-only to the ark user that has to write it.
 	#sudo tar -xf /roms.tar -C / &> /dev/null
-	(pv -n /roms.tar | tar --no-same-permissions --no-same-owner --warning=no-timestamp -xf - -C /) &> /tmp/tar_stat.txt &
+	(pv -n /roms.tar | tar --same-permissions --same-owner --warning=no-timestamp -xf - -C /) &> /tmp/tar_stat.txt &
 	let COUNT=1
 	while true; do
 	  VAL=$(tail -n 1 /tmp/tar_stat.txt)
@@ -118,6 +135,11 @@ fi
 	  fi
 	done
 	sleep 2
+	# One sweep at the end, belt and braces: the themes above still come out of a tar
+	# that drops ownership, and /roms on ext2 has to be writable by the ark user or
+	# EmulationStation cannot save a gamelist.  vfat and exfat never needed this --
+	# they have no ownership and the fstab line gave it away with umask=000.
+	sudo chown -R 1000:1000 /roms &> /dev/null
 	sudo cp -f /boot/fstab.exfat /etc/fstab &> /dev/null
 	sync
 	sudo rm -f /boot/doneit* &> /dev/null
@@ -126,17 +148,17 @@ fi
 	fi
 	sudo rm -f /boot/fstab.exfat &> /dev/null
 	echo 100
-) | dialog --title "Firstboot setup of dArkOS" --gauge "Expanding rootfs and exfat partitions.  Please wait..." $height $width 0 2>&1 > /dev/tty1
+) | dialog --title "Firstboot setup of MixOS" --gauge "Expanding the ROOTFS and DATA partitions.  Please wait..." $height $width 0 2>&1 > /dev/tty1
 
 exitcode=$(cat /tmp/code.txt)
 if [ "$exitcode" == "0" ]; then
-  dialog --infobox "Completed expansion of root filesystem and EASYROMS partition and conversion to exfat. The system will now reboot and load dArkOS." $height $width 2>&1 > /dev/tty1 | sleep 10
+  dialog --infobox "Completed expansion of the root filesystem and the DATA partition. The system will now reboot and load MixOS." $height $width 2>&1 > /dev/tty1 | sleep 10
   systemctl disable firstboot.service &> /dev/null
   sudo rm /boot/firstboot.sh &> /dev/null
   sudo rm -- "$0"
   reboot
 else
-  dialog --infobox "EASYROMS partition expansion and conversion to exfat failed for an unknown reason.  Please expand the partition using an alternative tool such as Minitool Partition Wizard.  System will reboot and load dArkOS now." $height $width 2>&1 > /dev/tty1 | sleep 10
+  dialog --infobox "DATA partition expansion failed for an unknown reason.  Please expand the partition using an alternative tool such as Minitool Partition Wizard.  System will reboot and load MixOS now." $height $width 2>&1 > /dev/tty1 | sleep 10
   systemctl disable firstboot.service &> /dev/null
   sudo rm /boot/firstboot.sh &> /dev/null
   sudo rm -- "$0"

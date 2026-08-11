@@ -97,7 +97,17 @@ sudo chroot Arkbuild/ bash -c "systemctl disable killer_daemon"
 # Add amiga script
 sudo cp amiga/amiga.sh Arkbuild/usr/local/bin/
 
-#Generate fstab to be used after EASYROMS expansion
+# Generate the fstab firstboot installs after it has grown the partitions.  Still
+# called fstab.exfat because that is the name expandtoexfat.sh copies from /boot, and
+# renaming a file two scripts agree on is not worth the churn -- but nothing about it is
+# exfat any more: p3 is ext2 labelled DATA, mounted with real ownership rather than
+# vfat's umask/uid/gid, which mount would refuse on ext2 outright.
+#
+# It is mounted at ${DATA_MOUNT_POINT} -- /home/virtua, the login user's home directory
+# -- and not at /roms.  The tools bind mount below therefore reaches one level further
+# in, at the legacy roms/ tree inside that partition, and names the real path rather
+# than going through the /roms compatibility symlink: a bind mount is the one place
+# where resolving through a symlink to a not-yet-mounted partition can order wrong.
 if [ "$ROOT_FILESYSTEM_FORMAT" == "btrfs" ]; then
   ROOT_FILESYSTEM_MOUNT_OPTIONS="${ROOT_FILESYSTEM_MOUNT_OPTIONS},ssd_spread"
 fi
@@ -105,8 +115,8 @@ cat <<EOF | sudo tee ${mountpoint}/fstab.exfat
 LABEL=ROOTFS / ${ROOT_FILESYSTEM_FORMAT} ${ROOT_FILESYSTEM_MOUNT_OPTIONS} 0 0
 
 LABEL=BOOT /boot vfat defaults 0 2
-LABEL=EASYROMS /roms exfat defaults,auto,umask=000,uid=1000,gid=1000,noatime 0 0
-/roms/tools /opt/system/Tools none nofail,x-systemd.device-timeout=7,bind
+LABEL=${DATA_LABEL} ${DATA_MOUNT_POINT} ${DATA_FILESYSTEM_FORMAT} ${DATA_MOUNT_OPTIONS} 0 2
+${DATA_MOUNT_POINT}/roms/tools /opt/system/Tools none nofail,x-systemd.device-timeout=7,bind
 EOF
 
 # Disable getty on tty0 and tty1
@@ -454,11 +464,40 @@ if [ -z "$LOOP_ROM" ]; then
   echo "ROM_PART_SIZE_BYTES: $ROM_PART_SIZE_BYTES"
   exit 1
 fi
-sudo mkfs.vfat -F 32 -n EASYROMS ${LOOP_ROM}
-fat32_mountpoint=mnt/roms
-mkdir -p ${fat32_mountpoint}
-sudo mount ${LOOP_ROM} ${fat32_mountpoint}
-sudo mkdir -p Arkbuild/roms
+# ext2 and labelled DATA, not vfat and EASYROMS.  This partition holds Linux content --
+# roms, bios, themes, tools, and whatever is dropped on it from a PC -- and the old flow
+# formatted it vfat here only for firstboot to reformat it exfat on the device and untar
+# /roms.tar back onto it.  Formatting it as its final filesystem here removes that whole
+# round trip.  ${DATA_FILESYSTEM_FORMAT_PARAMETERS} carries the label.
+sudo mkfs.${DATA_FILESYSTEM_FORMAT} ${DATA_FILESYSTEM_FORMAT_PARAMETERS} ${LOOP_ROM}
+# The partition mounts at ${DATA_MOUNT_POINT} -- /home/virtua -- on the device, so its
+# root is a home directory and the rom library is one directory inside it.  Here it is
+# mounted at mnt/data and ${fat32_mountpoint} points one level in, at that library:
+# every line below writes through that variable and none of them has to change.
+#
+# The variable name is left alone on purpose: it is read a few dozen times below and
+# renaming it would be churn in exchange for nothing.  It is not fat32 any more, and it
+# is not the partition root either.
+data_mountpoint=mnt/data
+mkdir -p ${data_mountpoint}
+sudo mount -t ${DATA_FILESYSTEM_FORMAT} ${LOOP_ROM} ${data_mountpoint}
+fat32_mountpoint=${data_mountpoint}/roms
+sudo mkdir -p ${fat32_mountpoint}
+
+# /roms on the rootfs becomes a symlink into the home partition.  Some 200 lines across
+# the RK3326 scripts, the EmulationStation config and the PortMaster tooling say /roms,
+# and they keep resolving through this; nothing has to be renamed to move the partition.
+# If an earlier stage already put real files in Arkbuild/roms they are moved onto the
+# partition rather than lost, because replacing a populated directory with a symlink
+# would silently drop whatever was in it.
+if [[ -d Arkbuild/roms && ! -L Arkbuild/roms ]]; then
+  if [[ -n "$(sudo ls -A Arkbuild/roms 2>/dev/null)" ]]; then
+    echo -e "Moving the existing Arkbuild/roms contents onto the DATA partition\n"
+    sudo cp -a Arkbuild/roms/. ${fat32_mountpoint}/
+  fi
+  sudo rm -rf Arkbuild/roms
+fi
+sudo ln -sfn "${DATA_MOUNT_POINT}/roms" Arkbuild/roms
 if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
   while read GAME_SYSTEM; do
     if [[ ! "$GAME_SYSTEM" =~ ^# ]]; then
@@ -531,12 +570,47 @@ if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
 fi
 sync
 
-# Create roms.tar for use after exfat partition creation
-sudo tar -C mnt/ -cvf Arkbuild/roms.tar roms
-
-# Remove and cleanup fat32 roms mountpoint
-sudo chmod -R 755 ${fat32_mountpoint}
+# The home directory itself.  useradd -m in setup_ark_user built this tree on the ROOTFS,
+# under what is about to become a mount point: the skeleton, .config, .emulationstation
+# and the two locale lines in .bashrc.  Once p3 mounts over it none of that is reachable,
+# so the same tree is copied onto the partition and the mounted and unmounted cases look
+# alike.  Anything an emulator build dropped in /home/ark came here too -- that path is a
+# symlink to this directory now, so those builds wrote into this very tree.
+if [[ -d "Arkbuild${DATA_MOUNT_POINT}" ]]; then
+  echo -e "Seeding ${DATA_MOUNT_POINT} on the DATA partition from the rootfs copy\n"
+  sudo cp -a "Arkbuild${DATA_MOUNT_POINT}/." ${data_mountpoint}/ || \
+    echo "⚠️  Could not copy the whole home tree onto p3 -- ${ROM_PART_SIZE:-300} MB may be too small for what is in it"
+fi
 sync
-sudo umount ${fat32_mountpoint}
+
+# Ownership and modes, BEFORE roms.tar is made, so the tar carries them too.
+#
+# chown is new here and vfat never needed it: vfat has no ownership at all, and the old
+# fstab line handed the whole partition to uid 1000 with umask=000.  ext2 does have
+# ownership, so it has to be set once, here, while the partition is a loop device --
+# no mount option will do it afterwards.  1000:1000 is the ark user, created by
+# setup_ark_user in bootstrap_rootfs.sh; numeric because this is the host's mount and
+# the host has no such user.  775 so the ark group can write and everyone can read.
+#
+# The whole partition and not just the rom library: its root is $HOME, and a home
+# directory owned by root is a login that cannot write its own dotfiles.  chmod skips
+# lost+found on purpose -- it is left at whatever mkfs made it.
+sudo chown -R 1000:1000 ${data_mountpoint}
+sudo find ${data_mountpoint} -mindepth 1 -name lost+found -prune -o -print0 | \
+  sudo xargs -0 --no-run-if-empty chmod 775
+sync
+
+# roms.tar, kept for firstboot on a card whose p3 it had to recreate.  With p3 already
+# ext2 there is nothing to restore in the normal case, and firstboot only reaches for
+# this if it repartitioned.  Run as root, so the 1000:1000 set above is what goes into
+# the archive; the matching half is on the extract side, in expandtoexfat.sh, which used
+# to pass --no-same-owner because the destination was exfat and could not hold it.
+#
+# The archive is now the whole partition -- the home directory with roms/ inside it --
+# rather than a single roms/ top level, so firstboot extracts it AT ${DATA_MOUNT_POINT}
+# and not at /.  lost+found is excluded: the recreated filesystem has its own.
+sudo tar -C ${data_mountpoint} --exclude=./lost+found -cvf Arkbuild/roms.tar .
+
+sudo umount ${data_mountpoint}
 sudo losetup -d ${LOOP_ROM}
-sudo rm -rf ${fat32_mountpoint}
+sudo rm -rf ${data_mountpoint}

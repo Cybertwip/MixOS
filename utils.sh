@@ -72,7 +72,24 @@ function setup_ark_user() {
   else
     CHROOT_DIR="Arkbuild"
   fi
-  sudo chroot ${CHROOT_DIR}/ useradd ark -k /etc/skel -d /home/ark -m -s /bin/bash
+  # The home directory is the DATA partition's mount point, /home/virtua, and not
+  # /home/ark: p3 is where the user's files are meant to live, so a login has to land
+  # on it or every file the operator creates goes onto the rootfs instead.  bash starts
+  # in $HOME, so this one field is what makes a shell open on the writable partition.
+  #
+  # -m creates it on the ROOTFS as well, under what will be the mount point, and that
+  # is deliberate: it is the fallback.  A card with no p3, or a p3 that failed its
+  # fsck, still has a home directory with these dotfiles in it -- nofail in the fstab
+  # line means such a boot carries on, and it would otherwise carry on into a $HOME
+  # that does not exist.  finishing_touches.sh copies this tree onto p3 so the mounted
+  # and unmounted cases look the same.
+  ARK_HOME="${DATA_MOUNT_POINT:-/home/virtua}"
+  sudo chroot ${CHROOT_DIR}/ useradd ark -k /etc/skel -d "${ARK_HOME}" -m -s /bin/bash
+  # /home/ark is a symlink to it.  Around 800 lines of the emulator build scripts write
+  # into /home/ark, and dozens of runtime scripts read from it; the symlink means all of
+  # them keep working, at build time inside the chroot and on the device, without a
+  # rename that would touch every one of those files.
+  sudo chroot ${CHROOT_DIR}/ ln -sfnv "${ARK_HOME}" /home/ark
   sudo chroot ${CHROOT_DIR}/ bash -c "echo ark:ark | chpasswd"
   sudo chroot ${CHROOT_DIR}/ chage -I -1 -m 0 -M 99999 -E -1 ark
   sudo mkdir -p ${CHROOT_DIR}/etc/sudoers.d
@@ -83,11 +100,15 @@ function setup_ark_user() {
   sudo chroot ${CHROOT_DIR}/ usermod -G video,sudo,render,netdev,input,audio,adm,ark ark
   directories=(".config" ".emulationstation")
   for dir in "${directories[@]}"; do
-    sudo mkdir -p "${CHROOT_DIR}/home/ark/${dir}"
+    # ${ARK_HOME} and not /home/ark: the symlink above resolves inside the chroot, but
+    # only for chroot'd commands.  These mkdirs run on the HOST against a path in the
+    # build tree, where /home/ark points at an absolute path that means something quite
+    # different on the host -- so they name the real directory.
+    sudo mkdir -p "${CHROOT_DIR}${ARK_HOME}/${dir}"
   done
-  echo -e "export LC_All=en_US.UTF-8" | sudo tee -a ${CHROOT_DIR}/home/ark/.bashrc > /dev/null
-  echo -e "export LC_CTYPE=en_US.UTF-8" | sudo tee -a ${CHROOT_DIR}/home/ark/.bashrc > /dev/null
-  sudo chroot ${CHROOT_DIR}/ chown -R ark:ark /home/ark/
+  echo -e "export LC_All=en_US.UTF-8" | sudo tee -a ${CHROOT_DIR}${ARK_HOME}/.bashrc > /dev/null
+  echo -e "export LC_CTYPE=en_US.UTF-8" | sudo tee -a ${CHROOT_DIR}${ARK_HOME}/.bashrc > /dev/null
+  sudo chroot ${CHROOT_DIR}/ chown -R ark:ark "${ARK_HOME}/"
 }
 
 function setup_arkbuild32() {

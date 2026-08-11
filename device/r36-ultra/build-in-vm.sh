@@ -128,6 +128,20 @@ ROOT_FILESYSTEM_FORMAT=ext2
 # 1 KiB-block filesystem would cap the rootfs at 16 GB after expansion.
 ROOT_FILESYSTEM_FORMAT_PARAMETERS="-F -b 4096 -L ROOTFS"
 ROOT_FILESYSTEM_MOUNT_OPTIONS="defaults,noatime"
+# p3, the data partition: ext2 and labelled DATA rather than vfat and EASYROMS.  The
+# long form of why is in setup_partition.sh, which sets the same four values; the short
+# form is that it holds Linux content, and the old flow formatted it vfat here only for
+# firstboot to reformat it to exfat and untar /roms.tar back onto it on the device.
+DATA_LABEL="DATA"
+DATA_FILESYSTEM_FORMAT="ext2"
+DATA_FILESYSTEM_FORMAT_PARAMETERS="-F -b 1024 -L ${DATA_LABEL}"
+# Deliberately no umask/uid/gid: mount refuses them on ext2, and an fstab line that
+# carries them is a partition that does not mount at all.  Ownership is set once, in
+# finishing_touches.sh, while the partition is still a loop device.  nofail because this
+# partition is the home directory now, and a card without it must still reach a shell.
+DATA_MOUNT_OPTIONS="defaults,auto,noatime,nofail"
+# The mount point is a home directory, not a rom library -- see setup_partition.sh.
+DATA_MOUNT_POINT="/home/virtua"
 SYSTEM_SIZE=100
 STORAGE_SIZE=7500
 ROM_PART_SIZE=300
@@ -142,6 +156,8 @@ DISK_START_PADDING=$(( (SYSTEM_PART_START + 2048 - 1) / 2048 ))
 DISK_SIZE=$(( DISK_START_PADDING + SYSTEM_SIZE + STORAGE_SIZE + ROM_PART_SIZE + 1 ))
 DISK="${IMAGE_PREFIX}_${DEBIAN_CODE_NAME}_${BUILD_DATE}.img"
 export ROOT_FILESYSTEM_FORMAT ROOT_FILESYSTEM_FORMAT_PARAMETERS
+export DATA_LABEL DATA_FILESYSTEM_FORMAT DATA_FILESYSTEM_FORMAT_PARAMETERS
+export DATA_MOUNT_OPTIONS DATA_MOUNT_POINT
 export ROOT_FILESYSTEM_MOUNT_OPTIONS SYSTEM_PART_START SYSTEM_PART_END
 export STORAGE_PART_START STORAGE_PART_END ROM_PART_START ROM_PART_END
 export DISK_SIZE FILESYSTEM DISK

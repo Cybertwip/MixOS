@@ -1019,12 +1019,12 @@ find_payload() {
 }
 
 # Doom used to run from here, off the BOOT partition, before the dashboard existed.
-# It does not any more and there is no j36.doom word: that partition is 64 MiB of
-# vfat that also holds the kernel, the device tree and four module payloads, and a
-# 26 MiB IWAD is the one thing in the image that could be somewhere else.  A
-# J36_DOOM=1 build now puts doomgeneric and its IWAD in the second partition's
-# /opt/mixos tree, where the dashboard's Doom card launches them -- after the boot,
-# from a shell, rather than in the middle of an initramfs.
+# It does not any more and there is no j36.doom word.  A 26 MiB IWAD was the first
+# thing that obviously did not belong on a 100 MB vfat launcher partition shared with
+# an R36S card's own boot files, and moving it is what started the layout the rest of
+# the payload now follows.  A J36_DOOM=1 build puts doomgeneric and its IWAD in
+# /opt/mixos on the ext2 OS partition, where the dashboard's Doom card launches them
+# -- after the boot, from a shell, rather than in the middle of an initramfs.
 
 # ── The Mali-450, if the command line asks ───────────────────────────────────
 #
@@ -1790,8 +1790,9 @@ setup_dash() {
     fi
     if ! find_mixos; then
         say "dash: no opt/mixos/bin/mixdash on any partition of this card."
-        say "      Unpack sd-root.tar.gz onto the second partition: see its"
-        say "      README.txt.  EmulationStation is NOT started as a fallback --"
+        say "      Unpack sd-root.tar.gz at the root of the ext2 ROOTFS partition,"
+        say "      not on BOOT -- BOOT is FAT and would lose Qt's symlinks."
+        say "      EmulationStation is NOT started as a fallback --"
         say "      it aborts at Renderer_GLES10.cpp:129 on this board and its unit"
         say "      restarts it, so the panel would end up black with six identical"
         say "      stack traces on it instead of this message.  A readable console"
@@ -3397,7 +3398,7 @@ if (( ${#MTKDRM_MODULE_ORDER[@]} > 0 )); then
         cp "${MTKDRM_MODULE_PATHS[$i]}" "$PAYDIR/mtkdrm/${MTKDRM_MODULE_ORDER[$i]}"
         printf '%s\n' "${MTKDRM_MODULE_ORDER[$i]}" >> "$PAYDIR/mtkdrm/load.order"
     done
-    log "mtkdrm: staged ${#MTKDRM_MODULE_ORDER[@]} modules into j36/mtkdrm/"
+    log "mtkdrm: staged ${#MTKDRM_MODULE_ORDER[@]} modules into $PAYREL/mtkdrm/"
 fi
 
 # j36/audio/ is the ALSA core and the AFE adapter, on the same terms: its own
@@ -3414,7 +3415,7 @@ if (( ${#AUDIO_MODULE_ORDER[@]} > 0 )); then
         cp "${AUDIO_MODULE_PATHS[$i]}" "$PAYDIR/audio/${AUDIO_MODULE_ORDER[$i]}"
         printf '%s\n' "${AUDIO_MODULE_ORDER[$i]}" >> "$PAYDIR/audio/load.order"
     done
-    log "audio: staged ${#AUDIO_MODULE_ORDER[@]} modules into j36/audio/"
+    log "audio: staged ${#AUDIO_MODULE_ORDER[@]} modules into $PAYREL/audio/"
 fi
 
 # j36/gl/ is the GL front end plus the links file that stands in for symlinks.  On the
@@ -3466,9 +3467,11 @@ fi
 # and the card boots to the initramfs shell exactly as it did before.
 #
 # The prose that used to explain each bootargs word lives in README.txt now.  The
-# LK reads boot.conf into a fixed 2 KiB buffer, comments included, and the file
-# had grown to 2003 bytes of it: 45 bytes from being silently truncated mid-line
-# by the next sentence anybody added.
+# LK reads boot.conf into a fixed 2 KiB buffer, comments included, and this file
+# has already been over it once -- rewriting the /opt/mixos paragraph took it to
+# 2109 bytes, which the assertion below turns into a failed build rather than a
+# silently truncated bootargs line.  Keep the comments terse; README.txt is where
+# the explanations belong.
 cat > "$SDBOOT/mvii/boot.conf" <<'CONF'
 # MVII LK SD hand-off, J36 Ultra (MT6592, ARMv7).
 #
@@ -3481,26 +3484,21 @@ dtb=mt6592-j36-ultra.dtb
 initrd=initrd.img
 
 # root= is a hint /init verifies, not an order to the kernel.  console=tty0 comes
-# last so /dev/console is the panel, not a serial port with nothing plugged in.
-# The two masked units are RK3326-only: firstboot has no tars in a GUI-mode build,
-# and batt_led restarts forever on hardware this kernel does not describe.
+# last so /dev/console is the panel.  Both masked units are RK3326-only.
 #
 # Every j36 word is removable on its own: delete one, or the matching directory
-# under /opt/mixos/j36 on the OS partition, and the boot carries straight on.  lima
-# gives a render node, mtkdrm gives a display node, gl puts Mesa where the loader
-# finds it ahead of the RK3326 blob, dash runs the MixOS dashboard instead of
-# EmulationStation, audio gives the ALSA core and a sound card.  Only these four
-# files are on BOOT; the rest of the payload is in sd-root.tar.gz.
+# under /opt/mixos/j36 on the OS partition, and the boot carries straight on.
+# lima gives a render node, mtkdrm a display node, gl puts Mesa ahead of the
+# RK3326 blob, dash runs the MixOS dashboard, audio gives a sound card.
 #
-# j36.audio=speaker rather than =1 also powers the class-D amp: a second and
-# deliberate step, and it needs a cell fitted, because the amp hangs off VBAT --
-# the system node -- and battery-less it pulls the board under its own lockout.
+# Only the four files the LK itself reads are on BOOT.  Everything else is in
+# sd-root.tar.gz, unpacked as /opt/mixos on the ext2 OS partition.
 #
-# j36.gl=debug adds Mesa's EGL trace and the node probes before the dashboard, so the
-# journal names every DRI node and says which one can modeset; j36.gl=1 is the quiet
-# form, and eglprobe -f still runs either way because it costs a second and answers
-# "is the panel in the fault at all".  j36.es is the old name for j36.gl.  Delete
-# j36.dash=1 and EmulationStation is neither masked nor replaced.
+# j36.audio=speaker also powers the class-D amp, which hangs off VBAT -- the
+# system node -- so battery-less it pulls the board under its own lockout.
+# j36.gl=debug adds Mesa's EGL trace and the node probes; =1 is the quiet form.
+# j36.es is the old name for j36.gl.  Drop j36.dash=1 and EmulationStation is
+# neither masked nor replaced.
 bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=debug j36.dash=1 j36.audio=1
 CONF
 
@@ -3745,7 +3743,7 @@ j36.dash=1
     and a file browser rooted in an empty home directory is a file browser showing
     nothing.  exfat and vfat are tried first because that is what the data partition
     actually is: EASYROMS is made vfat and firstboot converts it to exfat, so on a
-    stock card the only ext4/btrfs partition is the rootfs.  This partition is
+    stock card the only ext2 partition is the rootfs.  This partition is
     recognised and skipped by carrying j36/ or mvii/ rather than by its device name,
     which is only known on a boot that had reason to mount it.  Read-only on purpose:
     the operator writes the data partition from a PC, and one mounted rw by an
@@ -4399,22 +4397,33 @@ README
 # its notices with it.  It is not added to SHA256SUMS, for the same reason
 # README.txt is not -- the sums cover what the machine executes.
 cat > "$SDBOOT/LICENSE.txt" <<'LICENCE'
-MixOS -- J36 Ultra (MediaTek MT6592, ARMv7) SD BOOT payload
+MixOS -- J36 Ultra (MediaTek MT6592, ARMv7) SD card payload
 Copyright (c) 2025-2026 the MixOS project and contributors
 
 MixOS supports the MediaTek line of processors.  This card is that support: a
 32-bit ARM kernel, an mtk_drm display path, mtk-sd storage, the MT6592 AFE, a
 keypad adapter and Mesa's lima/kmsro pair, on a Cortex-A7 from 2013.
 
+This file sits on the FAT32 BOOT partition, which is where a card is opened, but
+it covers everything MixOS put on the card.  Two partitions carry it, because the
+MVII LK reads FAT32 and nothing else:
+
+    BOOT, FAT32   the launcher, and only that: zImage, mt6592-j36-ultra.dtb,
+                  initrd.img, mvii/boot.conf, README.txt and this file.
+    ROOTFS, ext2  Debian, and MixOS's own tree at /opt/mixos -- unpacked there
+                  from sd-root.tar.gz.  Every "bin/", "qt/" and "j36/" path below
+                  means /opt/mixos/... on this partition.
+
 This payload is not licensed uniformly.  Saying otherwise would be a false
 statement about other people's code.
 
 Microsoft Public License (Ms-PL), in full below:
 
+    bin/mixdash             the MixOS dashboard (Qt5 Widgets on linuxfb)
     j36/eglprobe            the EGL/GBM/DRM scanout probe
     j36/mfgpower            the MFG power-domain bring-up probe
     mvii/boot.conf          the MVII LK hand-off
-    README.txt, this file   the documentation
+    README.txt on either partition, and this file -- the documentation
 
 GNU General Public License, version 2 only:
 
@@ -4433,6 +4442,12 @@ GNU General Public License, version 2 only:
 Their own terms:
 
     j36/gl/*.so*            Mesa, from Debian (MIT and others)
+    qt/lib, qt/plugins      Qt 5.15 and its runtime closure, from Debian: LGPL-3
+                            with Qt's own exceptions, and GPL/LGPL/MIT/others for
+                            the libraries it needs
+    qt/fonts                DejaVu Sans, under the Bitstream Vera licence
+    bin/doom, share/doom    doomgeneric and Doom's engine source, id Software's
+                            under the GPL, as Debian and doomgeneric ship them
     j36/es/emulationstation EmulationStation-fcamod, under its own licence, with a
                             third renderer added by MixOS that follows it
     the rootfs on ROOTFS    Debian.  Per-package terms are in
@@ -4441,7 +4456,9 @@ Their own terms:
 SOURCE.  Everything GPL-2.0-only here is built from public source: Linux 6.12 LTS
 from kernel.org with the two patches in the MixOS repository under
 device/j36-ultra/linux/, the three MixOS modules in the same directory, and
-busybox, Mesa and EmulationStation as Debian packages them.  The MixOS build
+busybox, Mesa, Qt, the fonts, doomgeneric and EmulationStation as Debian packages
+them.  The MixOS work is in the same repository: the dashboard in
+device/j36-ultra/tools/mixdash, eglprobe and mfgpower beside it.  The MixOS build
 script that assembled this card is device/j36-ultra/build-in-vm.sh, and it is the
 complete recipe -- nothing here was produced by hand.
 
@@ -4581,17 +4598,35 @@ if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" ]]; then
         fi
         log "dash: staged doom into opt/mixos/bin/"
     fi
+fi
 
-    # Ms-PL 3(C) again: mixdash is MixOS's own code, so the tree it ships in has to
-    # carry its notice.  Short, and pointing at the full text on the other partition
-    # rather than repeating 40 lines of licence in two places on one card.
+# Ms-PL 3(C) again: mixdash is MixOS's own code, so the tree it ships in has to carry
+# its notice.  Short, and pointing at the full text on BOOT rather than repeating 40
+# lines of licence in two places on one card.
+#
+# From here the test is the TREE and not the two binaries.  $SDROOT already holds
+# opt/mixos/j36 -- the lima and mtk_drm modules, mfgpower, the Mesa front end, the
+# probe -- staged about twelve hundred lines up, and that payload ships on its own
+# merits: with J36_MIXDASH=0 and no Doom the old guard fell straight to the else
+# below and wrote no tarball at all, leaving the payload it HAD built unreachable.
+if [[ -d "$SDROOT/opt" ]]; then
+    mkdir -p "$SDROOT/opt/mixos"
     cat > "$SDROOT/opt/mixos/README.txt" <<'MIXOSREADME'
-MixOS -- J36 Ultra (MediaTek MT6592, ARMv7) second-partition payload.
+MixOS -- J36 Ultra (MediaTek MT6592, ARMv7) OS-partition payload.
 
-Unpack this into the root of the card's second partition -- the shared armhf Debian
+This is everything the card carries that is not the launcher.  The BOOT partition is
+FAT32 because the MVII LK reads FAT32 and nothing else, and it holds only the four
+files the LK itself reads -- zImage, mt6592-j36-ultra.dtb, initrd.img and
+mvii/boot.conf.  Once /init has the rootfs mounted, nothing is loading off FAT any
+more, so the rest lives here, on the ext2 OS partition, where symlinks and execute
+bits survive and where 50 MB is not competing with an R36S card's own boot files.
+
+Unpack it into the root of the card's second partition -- the shared armhf Debian
 rootfs -- and nothing already on it is touched: everything here is under /opt/mixos,
 a directory neither Debian nor ArkOS nor dArkOS uses.  An R36S booting the same card
 is unaffected and never looks in it.
+
+The dashboard and the games:
 
   bin/mixdash          the dashboard.  Qt5 Widgets on the linuxfb platform plugin,
                        which writes into /dev/fb0 -- the framebuffer the MVII LK
@@ -4602,10 +4637,31 @@ is unaffected and never looks in it.
                        directory, so mixdash works from a plain shell.
   qt/lib               Qt 5.15 and its runtime closure, from Debian trixie armhf.
                        The dashboard's RPATH names this directory and /run/j36/gl.
+                       These are SONAME symlinks: unpack on ext2, not on the FAT
+                       BOOT partition, or the loader finds nothing to open.
   qt/plugins/platforms libqlinuxfb.so, the one plugin this needs.
   qt/fonts             DejaVu Sans, two faces.
   bin/doom             framebuffer Doom (doomgeneric), if the build staged it.
   share/doom           its IWAD.
+
+j36/ -- what /init loads, one directory per bootargs word.  Delete any of them and
+the matching j36. word finds nothing, says so on the console, and the boot carries
+straight on; that is the recovery path for all of them, from any machine that reads
+SD cards.
+
+  j36/modules          lima and its dependencies, plus modules/load.order naming
+                       them in the order insmod needs.        j36.lima=1
+  j36/mfgpower         static ARMv7 helper that brings the GPU power domain up
+                       through the SPM before lima probes.    j36.lima=1
+  j36/mtkdrm           the display set and its own load.order.  j36.mtkdrm=1
+  j36/audio            the ALSA core and the MT6592 AFE adapter.  j36.audio=1;
+                       j36.audio=speaker also powers the class-D amp, which hangs
+                       off VBAT and so needs a cell fitted.
+  j36/gl               Mesa's GL front end, bind-mounted at /run/j36/gl ahead of
+                       the rootfs's RK3326 Mali blob.  links/ records the SONAME
+                       aliases, kept from when this payload was on FAT.  j36.gl=1
+  j36/eglprobe         asks the DRI nodes what they can do and prints the answer.
+                       j36.gl=debug runs it; -f works from a shell at any time.
 
 The initramfs writes mixdash.service into /run/systemd/system -- in memory, never on
 the card -- and wants it from multi-user.target, so this payload does not depend on
@@ -4616,20 +4672,27 @@ were searched.  EmulationStation stays masked even then, because it aborts on th
 board; to hand the boot back to the rootfs's own shell, drop j36.dash=1 from the
 bootargs in mvii/boot.conf on the BOOT partition.
 
-Licence: the MixOS work here (bin/mixdash) is under the Microsoft Public License;
-the full text is in LICENSE.txt on the BOOT partition.  Qt, its dependencies and the
-fonts are Debian's packages under their own terms (LGPL-3 with Qt's exceptions for
-Qt itself; see /usr/share/doc on a Debian machine).  doomgeneric and Doom's engine
-source are id Software's under the GPL, as Debian and doomgeneric ship them.  MixOS
-is a divergent fork of dArkOS, which continues ArkOS; the operating system
-underneath is Debian.  MixOS supports the MediaTek line of processors.
+Licence: the MixOS work here -- bin/mixdash, j36/mfgpower, j36/eglprobe -- is under
+the Microsoft Public License; the full text is in LICENSE.txt on the BOOT partition.
+Qt, its dependencies and the fonts are Debian's packages under their own terms
+(LGPL-3 with Qt's exceptions for Qt itself; see /usr/share/doc on a Debian machine).
+The kernel modules under j36/ are GPL-2.0, from the Linux tree they were built from.
+Mesa in j36/gl is under the MIT licence.  doomgeneric and Doom's engine source are
+id Software's under the GPL, as Debian and doomgeneric ship them.  MixOS is a
+divergent fork of dArkOS, which continues ArkOS; the operating system underneath is
+Debian.  MixOS supports the MediaTek line of processors.
 MIXOSREADME
 
     ( cd "$SDROOT" && tar -czf "$ARTIFACTS/sd-root.tar.gz" \
         --owner=root --group=root --numeric-owner opt )
-    log "dash: sd-root.tar.gz is $(stat -c %s "$ARTIFACTS/sd-root.tar.gz") bytes"
+    log "sd-root: sd-root.tar.gz is $(stat -c %s "$ARTIFACTS/sd-root.tar.gz") bytes"
+    log "sd-root: $(find "$SDROOT/opt" -type f | wc -l) files, $(du -sh "$SDROOT/opt" | cut -f1) as a tree"
 else
-    log "dash: nothing for the second partition, so no sd-root payload"
+    # Only reachable with J36_PAYLOAD_ON=boot and no dashboard: everything went to
+    # $SDBOOT, and the OS partition needs nothing.  Worth saying out loud, because
+    # with the default J36_PAYLOAD_ON=root it would mean the whole j36/ payload
+    # failed to build.
+    log "sd-root: nothing staged for the OS partition, so no sd-root.tar.gz"
 fi
 
 (
@@ -4645,52 +4708,64 @@ fi
     if [[ -f sd-root/opt/mixos/bin/doom ]]; then
         sums+=(sd-root/opt/mixos/bin/doom)
     fi
-    if [[ -f sd-boot/j36/mfgpower ]]; then
-        sums+=(sd-boot/j36/mfgpower sd-boot/j36/modules/load.order)
+    # The tarball is what actually gets copied to the card, so it is what a reader
+    # wants to check before unpacking it.  The files under sd-root/ below are summed
+    # as well, because a mismatch there says which one went wrong.
+    if [[ -f sd-root.tar.gz ]]; then
+        sums+=(sd-root.tar.gz)
+    fi
+    # $PAYREL, not a literal path: the j36/ payload is sd-root/opt/mixos/j36 by
+    # default and sd-boot/j36 under J36_PAYLOAD_ON=boot, and this block is relative
+    # to $ARTIFACTS either way.
+    if [[ -f $PAYREL/mfgpower ]]; then
+        sums+=("$PAYREL/mfgpower" "$PAYREL/modules/load.order")
         # Named individually rather than by glob, so that a module that failed to
         # copy is a missing line here instead of a silently shorter list.
         while IFS= read -r ko; do
-            sums+=("sd-boot/j36/modules/$ko")
-        done < sd-boot/j36/modules/load.order
+            sums+=("$PAYREL/modules/$ko")
+        done < "$PAYREL/modules/load.order"
     fi
-    if [[ -f sd-boot/j36/mtkdrm/load.order ]]; then
-        sums+=(sd-boot/j36/mtkdrm/load.order)
+    if [[ -f $PAYREL/mtkdrm/load.order ]]; then
+        sums+=("$PAYREL/mtkdrm/load.order")
         while IFS= read -r ko; do
-            sums+=("sd-boot/j36/mtkdrm/$ko")
-        done < sd-boot/j36/mtkdrm/load.order
+            sums+=("$PAYREL/mtkdrm/$ko")
+        done < "$PAYREL/mtkdrm/load.order"
     fi
-    if [[ -f sd-boot/j36/audio/load.order ]]; then
-        sums+=(sd-boot/j36/audio/load.order)
+    if [[ -f $PAYREL/audio/load.order ]]; then
+        sums+=("$PAYREL/audio/load.order")
         while IFS= read -r ko; do
-            sums+=("sd-boot/j36/audio/$ko")
-        done < sd-boot/j36/audio/load.order
+            sums+=("$PAYREL/audio/$ko")
+        done < "$PAYREL/audio/load.order"
     fi
-    if [[ -f sd-boot/j36/gl/links ]]; then
-        sums+=(sd-boot/j36/gl/links)
+    if [[ -f $PAYREL/gl/links ]]; then
+        sums+=("$PAYREL/gl/links")
         # Glob here and not a manifest walk, because links names the SONAMEs and
         # not the files: the same library is one file and one or two names.
-        for gl in sd-boot/j36/gl/*.so*; do
+        for gl in "$PAYREL"/gl/*.so*; do
             [[ -f "$gl" ]] && sums+=("$gl")
         done
     fi
     # An if, not a && -- this runs under set -e and a card built without the probe
     # would make the AND-list fail and take the manifest with it.
-    if [[ -f sd-boot/j36/eglprobe ]]; then
-        sums+=(sd-boot/j36/eglprobe)
+    if [[ -f $PAYREL/eglprobe ]]; then
+        sums+=("$PAYREL/eglprobe")
     fi
-    if [[ -f sd-boot/j36/es/emulationstation ]]; then
-        sums+=(sd-boot/j36/es/emulationstation)
+    if [[ -f $PAYREL/es/emulationstation ]]; then
+        sums+=("$PAYREL/es/emulationstation")
     fi
     sha256sum "${sums[@]}" > SHA256SUMS
     {
-        echo "licence=Ms-PL for the MixOS bring-up work, GPL-2.0-only for the kernel and the three MixOS modules, per-payload in sd-boot/LICENSE.txt"
+        echo "licence=Ms-PL for the MixOS bring-up work, GPL-2.0-only for the kernel and the three MixOS modules, per-payload in sd-boot/LICENSE.txt and summarised in sd-root/opt/mixos/README.txt"
         echo "kernel_branch=$KERNEL_BRANCH"
         echo "kernel_release=$KERNEL_RELEASE"
         echo "kernel_arch=arm (ARMv7, 32-bit)"
         echo "zimage_size=$(stat -c %s zImage)"
         echo "dtb_sha256=$(sha256sum mt6592-j36-ultra.dtb | awk '{print $1}')"
         echo "bootimg_size=$(stat -c %s boot.img) (slot 0x900000)"
-        echo "storage=msdc1 mtk-sd mediatek,mt6592-mmc (btrfs, ext4, exfat, vfat)"
+        echo "storage=msdc1 mtk-sd mediatek,mt6592-mmc (ext2, ext4, btrfs, exfat, vfat)"
+        echo "card_layout=p1 BOOT vfat = launcher only (zImage, dtb, initrd.img, mvii/boot.conf, LICENSE.txt, README.txt); p2 ROOTFS ext2 = the OS and everything else"
+        echo "rootfs_format=ext2, set in setup_partition.sh and device/r36-ultra/build-in-vm.sh; the MVII LK reads FAT32 only, so BOOT is FAT and the OS partition is free to be the simplest filesystem both kernels on this card handle"
+        echo "payload=$PAYREL (J36_PAYLOAD_ON=$PAYLOAD_ON; /init looks in the rootfs /opt/mixos/j36 first, then j36/ on BOOT for a card written by an older build)"
         echo "msdc1_irq=GIC_SPI 72 (INTID 104 - 32)"
         echo "userspace=net+unix+namespaces (systemd 257 on the shared armhf rootfs)"
         echo "wireless=off"
@@ -4703,12 +4778,14 @@ fi
         echo "display=stock-lk-simple-framebuffer"
         echo "native_dsi=disabled"
         echo "input_adapter=j36_mt6592_input.ko"
-        # The shell, and the payload it lives in.  Second partition, not BOOT: the Qt
-        # closure is 50 MB and BOOT is 64 MiB of vfat that also holds the kernel, the
-        # tree and four module payloads.
+        # The shell, and the payload it lives in.  The ext2 OS partition, not BOOT: the
+        # Qt closure is 50 MB of SONAME symlinks, and BOOT is 100 MiB of vfat that holds
+        # neither symlinks nor execute bits and is shared with an R36S card's own
+        # launcher.  sd-root.tar.gz carries the whole tree now -- the dashboard, Qt,
+        # Doom and opt/mixos/j36 -- so this one line is what has to reach the card.
         if [[ -f sd-root/opt/mixos/bin/mixdash ]]; then
             echo "shell=mixdash ($(stat -c %s sd-root/opt/mixos/bin/mixdash) bytes, Qt5 Widgets on linuxfb)"
-            echo "shell_payload=sd-root.tar.gz ($(stat -c %s sd-root.tar.gz) bytes), unpacked onto the second partition as /opt/mixos"
+            echo "shell_payload=sd-root.tar.gz ($(stat -c %s sd-root.tar.gz) bytes), untarred at the root of the ext2 ROOTFS partition as /opt/mixos"
             echo "shell_start=j36.dash=1; /init writes /run/systemd/system/mixdash.service and wants it from multi-user.target"
             echo "shell_es=emulationstation.service is masked in /run/systemd/system.control (the one runtime dir that outranks the /etc its unit is in), plus a drop-in that resets ExecStart to an echo in case the mask is ignored"
             echo "shell_find=/init looks in the rootfs first, then mounts every other partition read-only looking for opt/mixos/bin/mixdash (or mixos/bin/mixdash, for a tarball unpacked one level down); every partition it tries is named on the console, mounted or unreadable"
@@ -4732,33 +4809,33 @@ fi
         else
             echo "shell=not staged; /init says so on the console and still does not start EmulationStation (it aborts 134 here and its unit restarts it)"
         fi
-        if [[ -f sd-boot/j36/mfgpower ]]; then
+        if [[ -f $PAYREL/mfgpower ]]; then
             echo "gpu=mali-450 mp4 at 0x13040000 (gp irq 234..pp_bcast 244, GIC_SPI 202..212)"
-            echo "gpu_driver=lima, CONFIG_DRM_LIMA=m ($(tr '\n' ' ' < sd-boot/j36/modules/load.order))"
-            echo "gpu_power=j36/mfgpower ($(stat -c %s sd-boot/j36/mfgpower) bytes, static ARMv7, SPM MTCMOS via /dev/mem)"
+            echo "gpu_driver=lima, CONFIG_DRM_LIMA=m ($(tr '\n' ' ' < $PAYREL/modules/load.order))"
+            echo "gpu_power=j36/mfgpower ($(stat -c %s $PAYREL/mfgpower) bytes, static ARMv7, SPM MTCMOS via /dev/mem)"
             echo "gpu_start=j36.lima=1 on the command line; /init loads the modules only if mfgpower exits 0"
             echo "gpu_nodes=renderD128 from lima; card0 comes from mtk_drm, not from lima"
         else
             echo "gpu=not staged"
         fi
-        if [[ -f sd-boot/j36/mtkdrm/load.order ]]; then
+        if [[ -f $PAYREL/mtkdrm/load.order ]]; then
             echo "display_drm=mediatek-drm, mt6592 via mt2701 fallback compatibles"
             echo "display_ddp=ovl0 0x14007000 -> rdma0 0x14008000 -> color0 0x1400b000 -> dsi0 0x1400c000"
             echo "display_mutex=mod 0x488, sof 1 (matches the LK register for register)"
             echo "display_phy=mediatek,mt2701-mipi-tx (mppll_preserve 3, as the LK writes)"
             echo "display_data_rate=192 MHz from the pixel clock; the LK programmed 214"
-            echo "display_modules=$(tr '\n' ' ' < sd-boot/j36/mtkdrm/load.order)"
+            echo "display_modules=$(tr '\n' ' ' < $PAYREL/mtkdrm/load.order)"
             echo "display_start=j36.mtkdrm=1; no register is programmed until card0 is opened"
             echo "display_fbdev=CONFIG_DRM_FBDEV_EMULATION=n, so /dev/fb0 stays simplefb's"
         else
             echo "display_drm=not staged"
         fi
-        if [[ -f sd-boot/j36/audio/load.order ]]; then
+        if [[ -f $PAYREL/audio/load.order ]]; then
             echo "audio=mt6592 afe at 0x11220000, dl1 memif -> i2s dac -> mt6323 abb"
             echo "audio_driver=j36_mt6592_audio.ko, native ALSA (no MT6592 ASoC driver exists upstream)"
             echo "audio_reference=PowerEngine OS/MVII/.../mt6592_audio.c, from the MT6592 HAL"
             echo "audio_pcm=1 playback, S16_LE stereo 8k-48k, 64 KiB ring, cursor polled at 5 ms, no IRQ"
-            echo "audio_modules=$(tr '\n' ' ' < sd-boot/j36/audio/load.order)"
+            echo "audio_modules=$(tr '\n' ' ' < $PAYREL/audio/load.order)"
             echo "audio_core=CONFIG_SOUND=y (soundcore only); snd, snd-timer, snd-pcm are =m and staged here"
             echo "audio_snd_pcm=selected by SND_DUMMY=m, which is built and deliberately not staged"
             echo "audio_start=$(grep -o 'j36\.audio=[a-z0-9]*' sd-boot/mvii/boot.conf)"
@@ -4768,16 +4845,16 @@ fi
         else
             echo "audio=not staged"
         fi
-        if [[ -f sd-boot/j36/gl/links ]]; then
+        if [[ -f $PAYREL/gl/links ]]; then
             echo "gl=debian armhf mesa 25.0.7 from the shared rootfs (lima_dri.so + mediatek_dri.so)"
-            echo "gl_front_end=$(ls sd-boot/j36/gl/*.so* | xargs -n1 basename | tr '\n' ' ')"
+            echo "gl_front_end=$(ls $PAYREL/gl/*.so* | xargs -n1 basename | tr '\n' ' ')"
             echo "gl_reason=the shared rootfs points libEGL.so, libgbm.so{,.1,.1.0.0} and libGLESv1_CM.so at the RK3326 Mali blob"
             echo "gl_load_bearing=libgbm.so.1 -- libEGL_mesa.so.0 needs it, so mesa's own EGL cannot load without this payload"
             echo "gl_install=tmpfs on the rootfs /run plus a systemd drop-in; nothing is written to the card"
             echo "gl_boot_word=$(grep -o 'j36\.gl=[a-z0-9]*' sd-boot/mvii/boot.conf)"
             echo "gl_users=mixdash's 3D cube card only; with j36.dash=1 no ES drop-in is written and the GLES 2.0 binary is not staged either"
-            if [[ -f sd-boot/j36/es/emulationstation ]]; then
-                echo "es_binary=j36/es/emulationstation ($(stat -c %s sd-boot/j36/es/emulationstation) bytes, stripped ARMv7)"
+            if [[ -f $PAYREL/es/emulationstation ]]; then
+                echo "es_binary=j36/es/emulationstation ($(stat -c %s $PAYREL/es/emulationstation) bytes, stripped ARMv7)"
                 echo "es_commit=$ES_COMMIT (the rootfs's own EmulationStation commit)"
                 echo "es_renderer=USE_OPENGLES_20, es/Renderer_GLES20.cpp, no GL library in DT_NEEDED"
                 echo "es_renderer_reason=ES1 is 0x3003 EGL_BAD_ALLOC everywhere (mesa built -Dgles1=disabled); ES2 is ctx/cur on lima"
@@ -4787,8 +4864,8 @@ fi
                 echo "es_binary=not staged; the rootfs's fixed-function one runs and aborts with status 134"
                 echo "es_gl_driver=SDL_VIDEO_GL_DRIVER=libGL.so.1 with LD_PRELOAD=libGL.so.1 (the fallback)"
             fi
-            if [[ -f sd-boot/j36/eglprobe ]]; then
-                echo "gl_probe=j36/eglprobe ($(stat -c %s sd-boot/j36/eglprobe) bytes, dynamic ARMv7, dlopens libEGL.so.1 and libgbm.so.1)"
+            if [[ -f $PAYREL/eglprobe ]]; then
+                echo "gl_probe=j36/eglprobe ($(stat -c %s $PAYREL/eglprobe) bytes, dynamic ARMv7, dlopens libEGL.so.1 and libgbm.so.1)"
                 echo "gl_probe_run=-f 1 as mixdash's first ExecStartPre on every boot; under j36.gl=debug also the node probes and -s with LIBGL_ALWAYS_SOFTWARE=1 as the control, replayed by ExecStopPost"
                 echo "gl_probe_fb=-f opens /dev/fb0 and nothing else: it counts the pixels already there (all black = nothing drew, a picture = something took the scanout), undoes a backlight at brightness 0 and a tty0 left in KD_GRAPHICS, then paints eight colour bars with the CPU. Bars then a dashboard = both halves work; bars that stay = mixdash never started; no bars = nothing userspace draws will be seen."
                 echo "gl_probe_nodes=-i names every /dev/dri node and says which one modesets; nothing here hard-codes card0 any more, because on this kernel card0 is lima and GETRESOURCES on it returns EOPNOTSUPP"
@@ -4802,6 +4879,122 @@ fi
         fi
     } > manifest.txt
 )
+
+# ── Folding both halves into the flashable image ──────────────────────────────
+#
+# WHY THIS EXISTS.  The instructions up to here read "copy sd-boot/ onto BOOT and untar
+# sd-root.tar.gz onto ROOTFS", and on a macOS workstation the second half is impossible:
+# macOS mounts FAT and exFAT and nothing else, so it can write BOOT and cannot write an
+# ext2 -- or btrfs -- OS partition at all.  That is not a documentation problem, it is
+# a card that can only ever be half-written from the machine the operator actually has.
+#
+# So the build does it.  This VM is Linux, the image is a file in this checkout, and
+# both partitions are a losetup away.  The result is one image that boots as flashed:
+# no copying, no ext2 driver on the workstation, no step that can be done wrong.
+#
+# The image is still only patched, never created here -- build-r36-ultra.sh owns it.
+# With J36_RESUME_R36=0 and no previous image there is simply nothing to patch, and
+# this section says so and leaves the two artifacts for a manual copy.
+inject_into_image() {
+    local img part_json p1_start p1_size p2_start p2_size loop mnt fstype rc=0
+
+    img="$(ls -1t "$ROOT"/dArkOS_R36_ULTRA_GUI_BASE_*_*.img \
+                  "$ROOT"/dArkOS_RG351MP_FULL_*_*.img 2>/dev/null | head -n 1 || true)"
+    if [[ -z "$img" ]]; then
+        log "image: no dArkOS_*.img in $ROOT, so nothing to fold the payload into."
+        log "image: run the R36 base build first (J36_RESUME_R36=1) or copy sd-boot/"
+        log "image: and sd-root.tar.gz onto the card by hand."
+        return 0
+    fi
+    log "image: folding both payloads into $(basename "$img")"
+
+    # sfdisk -J and not the arithmetic from setup_partition.sh: those values live in
+    # two other scripts and this one would be a third copy to keep in step.  The
+    # partition table in the image is the authority on where its partitions are.
+    part_json="$(sfdisk -J "$img" 2>/dev/null)" || {
+        log "image: sfdisk could not read the partition table; skipping"
+        return 0
+    }
+    p1_start="$(printf '%s' "$part_json" | python3 -c 'import json,sys; p=json.load(sys.stdin)["partitiontable"]["partitions"]; print(p[0]["start"])' 2>/dev/null || true)"
+    p1_size="$(printf '%s' "$part_json" | python3 -c 'import json,sys; p=json.load(sys.stdin)["partitiontable"]["partitions"]; print(p[0]["size"])' 2>/dev/null || true)"
+    p2_start="$(printf '%s' "$part_json" | python3 -c 'import json,sys; p=json.load(sys.stdin)["partitiontable"]["partitions"]; print(p[1]["start"])' 2>/dev/null || true)"
+    p2_size="$(printf '%s' "$part_json" | python3 -c 'import json,sys; p=json.load(sys.stdin)["partitiontable"]["partitions"]; print(p[1]["size"])' 2>/dev/null || true)"
+    if [[ -z "$p1_start" || -z "$p2_start" ]]; then
+        log "image: could not read p1/p2 geometry from the partition table; skipping"
+        return 0
+    fi
+
+    mnt="$WORK/image-mnt"
+    mkdir -p "$mnt"
+
+    # ── p1, the FAT32 launcher.  Added to, never replaced: the R36S's own Image,
+    # uInitrd, rk3326 trees and boot.ini are on this partition and stay there.
+    loop="$(sudo losetup --find --show \
+        --offset $((p1_start * 512)) --sizelimit $((p1_size * 512)) "$img")"
+    if sudo mount -t vfat "$loop" "$mnt"; then
+        sudo mkdir -p "$mnt/mvii"
+        sudo cp "$SDBOOT/zImage" "$SDBOOT/mt6592-j36-ultra.dtb" \
+                "$SDBOOT/initrd.img" "$mnt/"
+        sudo cp "$SDBOOT/mvii/boot.conf" "$mnt/mvii/boot.conf"
+        sudo cp "$SDBOOT/LICENSE.txt" "$SDBOOT/README.txt" "$mnt/"
+        sync
+        log "image: p1 (vfat) now carries the launcher and mvii/boot.conf"
+        sudo umount "$mnt"
+    else
+        log "image: p1 would not mount as vfat; the launcher was NOT written"
+        rc=1
+    fi
+    sudo losetup -d "$loop"
+
+    # ── p2, the OS partition.  Only if there is a tarball, and only if the
+    # filesystem is one this can write: an image left over from the btrfs era has
+    # to be rebuilt, and saying that is better than a mount error nobody reads.
+    if [[ -f "$ARTIFACTS/sd-root.tar.gz" ]]; then
+        loop="$(sudo losetup --find --show \
+            --offset $((p2_start * 512)) --sizelimit $((p2_size * 512)) "$img")"
+        fstype="$(sudo blkid -o value -s TYPE "$loop" 2>/dev/null || true)"
+        case "$fstype" in
+            ext2|ext3|ext4)
+                if sudo mount -t "$fstype" "$loop" "$mnt"; then
+                    # -p and --numeric-owner: the tarball was written --owner=root
+                    # --group=root, and /opt/mixos has to come out root-owned with
+                    # the execute bits and the ~30 Qt SONAME symlinks intact.
+                    sudo tar -C "$mnt" -xzpf "$ARTIFACTS/sd-root.tar.gz" --numeric-owner
+                    sync
+                    log "image: p2 ($fstype) now carries /opt/mixos -- the card boots as flashed"
+                    sudo umount "$mnt"
+                else
+                    log "image: p2 would not mount as $fstype; /opt/mixos was NOT written"
+                    rc=1
+                fi
+                ;;
+            btrfs)
+                log "image: p2 is btrfs -- this image predates the ext2 layout."
+                log "image: rebuild the base image; the payload was NOT written."
+                rc=1
+                ;;
+            *)
+                log "image: p2 reports filesystem '${fstype:-unknown}', which this does"
+                log "image: not write to.  The payload was NOT written."
+                rc=1
+                ;;
+        esac
+        sudo losetup -d "$loop"
+    else
+        log "image: no sd-root.tar.gz, so p2 was left alone"
+    fi
+
+    rmdir "$mnt" 2>/dev/null || true
+    return $rc
+}
+
+# Not fatal: the artifacts are complete either way, and a failure here costs the
+# operator a manual copy rather than the whole build.  It is loud, though.
+if ! inject_into_image; then
+    log "image: SOME OR ALL of the payload did not reach the image -- read the lines"
+    log "image: above.  sd-boot/ and sd-root.tar.gz are still in the artifacts and can"
+    log "image: be copied onto the card from a Linux machine."
+fi
 
 mkdir -p "$EXPORT_DIR"
 #
