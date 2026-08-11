@@ -5024,12 +5024,17 @@ print(p[0]["start"], p[0]["size"], p[1]["start"], p[1]["size"])
     #
     # The whole of $SDBOOT rather than a list of four filenames, because that list has
     # already changed twice in this refactor and a copy that names files is a copy that
-    # silently stops shipping the next one added.  cp -a keeps mvii/ nested and the
-    # modes; vfat flattens the modes anyway and the LK does not care.
+    # silently stops shipping the next one added.
+    #
+    # cp -r and NOT cp -a.  vfat has no ownership to preserve, so -a's chown fails on
+    # every single file with "Operation not permitted" and cp exits non-zero -- after
+    # copying the files perfectly well.  That turned a successful copy into a reported
+    # failure and a bogus "is p1 full?".  -r asks for none of it, which is all vfat can
+    # give; the LK reads these files and cares about neither owner nor mode.
     loop="$(sudo losetup --find --show \
         --offset $((p1_start * 512)) --sizelimit $((p1_size * 512)) "$img")"
     if sudo mount -t vfat "$loop" "$mnt"; then
-        if sudo cp -a "$SDBOOT/." "$mnt/"; then
+        if sudo cp -r "$SDBOOT/." "$mnt/"; then
             sync
             log "image: p1 (vfat) now carries $(find "$SDBOOT" -type f | wc -l) launcher files, mvii/boot.conf included"
         else
