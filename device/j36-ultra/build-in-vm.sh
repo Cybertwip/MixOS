@@ -4518,11 +4518,12 @@ implied warranties of merchantability, fitness for a particular purpose and
 non-infringement.
 LICENCE
 
-# ── The second-partition payload: /opt/mixos ──────────────────────────────────
+# ── The OS-partition payload: /opt/mixos, and the dashboard in it ─────────────
 #
-# Everything above goes on the vfat BOOT partition, where the LK and /init can reach
-# it before there is a rootfs.  This does not: it is userland software, it is 50 MB of
-# it, and BOOT is a small partition an R36S card shares with its own boot files.
+# The four files on BOOT are the ones something other than Linux has to read.  This is
+# everything else -- the dashboard, its Qt, Doom, and the j36/ tree staged further up --
+# and it goes on the ext2 OS partition, where symlinks and execute bits survive and
+# where 50 MB is not competing with an R36S card's own boot files.
 #
 # WHY A NEW DIRECTORY AND NOT /usr.  One Debian rootfs on this card serves two
 # machines -- this board and an R36S -- and the rule that has held all the way through
@@ -4531,12 +4532,12 @@ LICENCE
 # changes none: an R36S booting the same card gets its own libEGL.so symlink, its own
 # EmulationStation and its own units, and never looks in /opt.
 #
-# WHY IT IS A TARBALL AS WELL AS A TREE.  vfat cannot hold symlinks, which is why the
-# GL payload carries a `links' file; ext4 and btrfs can, and this payload uses them
-# for the SONAME aliases Qt's loader asks for.  A tarball is the copy that cannot lose
-# them -- or the modes, or the ownership -- whatever machine does the copying.
+# WHY IT IS A TARBALL AS WELL AS A TREE.  The SONAME aliases in qt/lib are symlinks and
+# mfgpower, eglprobe, mixdash and doom have to stay executable.  A tarball is the copy
+# that cannot lose either -- or the ownership -- whatever machine does the copying, and
+# the reason it is not simply a directory to drag across in a file manager.
 #
-#   sudo tar -xzf sd-root.tar.gz -C /path/to/the/mounted/second/partition
+#   sudo tar -C /path/to/the/mounted/ROOTFS -xzf sd-root.tar.gz
 #
 # It is not fatal for any of this to be absent, but it is not silent either, and that
 # is the lesson of a boot that ended at hostnamed with nothing on the panel: with no
@@ -4544,8 +4545,12 @@ LICENCE
 # the console what it looked for and where.  EmulationStation is still not started --
 # it aborts 134 on this board -- so a card with no payload comes up to a readable
 # console and not to a shell.
-SDROOT="$ARTIFACTS/sd-root"
-rm -rf "$SDROOT" "$ARTIFACTS/sd-root.tar.gz"
+# SDROOT was declared and cleared up beside SDBOOT, because the j36/ payload above is
+# staged into it.  So this section adds to a tree that may already have files in it,
+# and the tarball below is written whenever ANY of them are there -- not only when the
+# dashboard is.  With J36_MIXDASH=0 and no Doom, opt/mixos/j36 is still the modules,
+# mfgpower and the probe, and a build that silently shipped no tarball for them would
+# leave a card that boots to a dashboard-less console with no GPU either.
 if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" ]]; then
     mkdir -p "$SDROOT/opt/mixos/bin"
 
