@@ -1640,7 +1640,11 @@ find_mixos() {
         if [ ! -b "$dev" ]; then continue; fi
         if [ "$dev" = "$rootdev" ]; then continue; fi
         dash_mounted=0
-        for fs in btrfs ext4 vfat; do
+        # exfat is in the list because that is what firstboot converts EASYROMS to,
+        # and a payload unpacked there has to be reported as "found but crippled"
+        # rather than as "no such partition" -- the libQt5Core check below is what
+        # says which.
+        for fs in btrfs ext4 exfat vfat; do
             if ! mount -t "$fs" -o ro "$dev" /newroot/run/j36/mixos 2>/dev/null; then continue; fi
             dash_mounted=1
             # opt/mixos is what the tarball unpacks to at a partition root; mixos/ is
@@ -1666,12 +1670,12 @@ find_mixos() {
             umount /newroot/run/j36/mixos
             break
         done
-        # Not a footnote: a partition none of the three drivers will mount is the one
+        # Not a footnote: a partition none of these drivers will mount is the one
         # shape of this failure that no amount of looking in the right directory
-        # fixes.  btrfs in particular is a module on this kernel and the initramfs has
-        # no modules, so a btrfs data partition lands here.
+        # fixes.  All four are built into this kernel, so what lands here is an
+        # unformatted partition, or f2fs, or one whose superblock is damaged.
         if [ "$dash_mounted" = 0 ]; then
-            say "dash: $dev would not mount as btrfs, ext4 or vfat"
+            say "dash: $dev would not mount as btrfs, ext4, exfat or vfat"
             dash_seen="$dash_seen ${dev##*/}:unreadable"
         fi
     done
@@ -1688,7 +1692,13 @@ find_mixos() {
 # Read-only, and that is a decision rather than caution: the operator writes this
 # partition from a PC, the dashboard only reads it, and a data partition mounted rw by
 # an initramfs is a partition that gets replayed dirty the next time the battery gives
-# out mid-write.  ext4 and btrfs only -- the vfat one is BOOT, which is skipped.
+# out mid-write.
+#
+# exfat and vfat are in the list and are in fact the likely answer: EASYROMS is made
+# vfat and firstboot converts it to exfat, so on a stock card the only ext4/btrfs
+# partition is the rootfs -- which is skipped, being already mounted as /newroot.  BOOT
+# is skipped by what is in it rather than by its device name, because the name is only
+# known when mount_bootfs happened to run this boot.
 mount_card() {
     # /newroot and not /run: this runs before switch_root, so that is the path the
     # kernel has recorded for the mount.
@@ -1697,9 +1707,14 @@ mount_card() {
     for dev in /dev/mmcblk*p* /dev/sd*; do
         if [ ! -b "$dev" ]; then continue; fi
         if [ "$dev" = "$rootdev" ] || [ "$dev" = "$bootdev" ]; then continue; fi
-        for fs in ext4 btrfs; do
+        for fs in exfat vfat ext4 btrfs; do
             if ! mount -t "$fs" -o ro "$dev" /newroot/run/j36/card 2>/dev/null; then
                 continue
+            fi
+            if [ -d /newroot/run/j36/card/j36 ] || \
+               [ -d /newroot/run/j36/card/mvii ]; then
+                umount /newroot/run/j36/card
+                break
             fi
             say "dash: $dev ($fs) mounted read-only at /run/j36/card"
             return 0
@@ -1756,6 +1771,13 @@ Documentation=file:///opt/mixos/README.txt
 # partition and a dashboard that lists it should not race that.  A unit that is not
 # installed is simply not ordered against, so naming it costs nothing.
 After=firstboot.service systemd-user-sessions.service
+# Three tries a minute and then it stops.  EmulationStation's own unit had
+# Restart=on-failure against a binary that aborts in 200 ms, and what that produced on
+# a 640x480 panel was the same stack trace six times with the first line -- the only
+# one that said anything -- already scrolled away.  A dashboard that cannot start
+# should leave its last error on the glass.
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -1898,10 +1920,11 @@ ExecStart=/bin/sh -c 'for i in 1 2 3 4 5 6; do \\
   echo "j36: the initramfs looked in the rootfs /opt/mixos and on every other"; \\
   echo "j36: partition it could mount read-only, and saw:"; \\
   echo "j36:   $dash_seen"; \\
-  echo "j36: fix it on a PC, with the card in a reader:"; \\
-  echo "j36:   sudo tar -C /media/<data-partition> -xzf sd-root.tar.gz"; \\
-  echo "j36: that partition must be ext4 or btrfs.  vfat drops the ~30 Qt SONAME"; \\
-  echo "j36: symlinks and mixdash then dies before main()."; \\
+  echo "j36: fix it on a PC with the card in a reader, on the ROOTFS partition:"; \\
+  echo "j36:   sudo tar -C /mnt/ROOTFS -xzf sd-root.tar.gz"; \\
+  echo "j36: which gives /opt/mixos, the first place /init looks.  Not EASYROMS:"; \\
+  echo "j36: that one is vfat and becomes exfat, and neither holds the ~30 Qt"; \\
+  echo "j36: SONAME symlinks -- mixdash would then die before main()."; \\
   echo "j36: EmulationStation is masked in this build on purpose and is not a"; \\
   echo "j36: fallback: it aborts in Renderer_GLES10.cpp on this board."; \\
   sleep 20; \\
@@ -3596,13 +3619,17 @@ j36.dash=1
     whatever the rootfs starts by itself is what you get, which on a rootfs whose
     EmulationStation is not enabled is nothing at all.
 
-    One more thing it mounts: the first non-root, non-BOOT ext4 or btrfs partition,
-    read-only, at /run/j36/card, which is where the dashboard's Files page opens.
+    One more thing it mounts: the first partition that is neither the rootfs nor this
+    one, read-only, at /run/j36/card, which is where the dashboard's Files page opens.
     That is not a convenience -- with no keyboard there is no way to mount it by hand,
     and a file browser rooted in an empty home directory is a file browser showing
-    nothing.  Read-only on purpose: the operator writes that partition from a PC, and
-    a data partition mounted rw by an initramfs is one that replays dirty the first
-    time the cell gives out mid-write.
+    nothing.  exfat and vfat are tried first because that is what the data partition
+    actually is: EASYROMS is made vfat and firstboot converts it to exfat, so on a
+    stock card the only ext4/btrfs partition is the rootfs.  This partition is
+    recognised and skipped by carrying j36/ or mvii/ rather than by its device name,
+    which is only known on a boot that had reason to mount it.  Read-only on purpose:
+    the operator writes the data partition from a PC, and one mounted rw by an
+    initramfs is one that replays dirty the first time the cell gives out mid-write.
 
     Why ES was dropped rather than fixed: the rootfs's binary was compiled with the
     fixed-function renderer, and GLES1 is the one API this stack cannot supply.
@@ -4391,9 +4418,12 @@ LICENCE
 #
 #   sudo tar -xzf sd-root.tar.gz -C /path/to/the/mounted/second/partition
 #
-# It is not fatal for any of this to be absent.  With no /opt/mixos on the card /init
-# writes no drop-in, emulationstation.service runs whatever the rootfs has, and the
-# boot is exactly what it was.
+# It is not fatal for any of this to be absent, but it is not silent either, and that
+# is the lesson of a boot that ended at hostnamed with nothing on the panel: with no
+# /opt/mixos on the card /init writes mixdash-missing.service instead, which says on
+# the console what it looked for and where.  EmulationStation is still not started --
+# it aborts 134 on this board -- so a card with no payload comes up to a readable
+# console and not to a shell.
 SDROOT="$ARTIFACTS/sd-root"
 rm -rf "$SDROOT" "$ARTIFACTS/sd-root.tar.gz"
 if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" ]]; then
@@ -4452,10 +4482,14 @@ is unaffected and never looks in it.
   bin/doom             framebuffer Doom (doomgeneric), if the build staged it.
   share/doom           its IWAD.
 
-The initramfs writes a systemd drop-in in /run -- in memory, never on the card -- that
-points emulationstation.service at bin/mixdash.  Delete this directory and that
-drop-in is not written, so the rootfs's own EmulationStation runs and the card is
-exactly what it was.
+The initramfs writes mixdash.service into /run/systemd/system -- in memory, never on
+the card -- and wants it from multi-user.target, so this payload does not depend on
+any unit the rootfs happens to have installed or enabled.  EmulationStation is masked
+at the same time, in /run/systemd/system.control.  Delete this directory and neither
+is written: instead the console gets mixdash-missing.service, saying which partitions
+were searched.  EmulationStation stays masked even then, because it aborts on this
+board; to hand the boot back to the rootfs's own shell, drop j36.dash=1 from the
+bootargs in mvii/boot.conf on the BOOT partition.
 
 Licence: the MixOS work here (bin/mixdash) is under the Microsoft Public License;
 the full text is in LICENSE.txt on the BOOT partition.  Qt, its dependencies and the
@@ -4554,7 +4588,7 @@ fi
             echo "shell_es=emulationstation.service is masked in /run/systemd/system.control (the one runtime dir that outranks the /etc its unit is in), plus a drop-in that resets ExecStart to an echo in case the mask is ignored"
             echo "shell_find=/init looks in the rootfs first, then mounts every other partition read-only looking for opt/mixos/bin/mixdash (or mixos/bin/mixdash, for a tarball unpacked one level down); every partition it tries is named on the console, mounted or unreadable"
             echo "shell_missing=when nothing is found, /init also writes /run/systemd/system/mixdash-missing.service, which repeats the reason and the fix on the console six times at 20 s -- because the initramfs lines have scrolled off by then and a boot that ends at hostnamed looks the same as ten other faults"
-            echo "shell_card=the first non-root, non-BOOT ext4/btrfs partition is mounted read-only at /run/j36/card, and that is what the dashboard's Files page opens on (there is no keyboard on this board to mount it by hand)"
+            echo "shell_card=the first partition that is neither the rootfs nor BOOT (skipped by carrying j36/ or mvii/, not by name) is mounted read-only at /run/j36/card -- exfat and vfat first, since EASYROMS is made vfat and firstboot converts it to exfat -- and that is what the dashboard's Files page opens on, there being no keyboard here to mount it by hand"
             echo "shell_nodash=without j36.dash=1 nothing is staged at all and /init says so, naming the word to add -- a rootfs whose EmulationStation is not even enabled otherwise boots to nothing and explains nothing"
             echo "shell_render=Qt5 raster into /dev/fb0, which is simplefb's window onto the framebuffer the LK lit -- no EGL, no GBM, no DRM master, no modeset"
             echo "shell_input=evdev directly, QT_QPA_FB_DISABLE_INPUT=1 (gpio-keys plus the keypad, per the device tree)"
