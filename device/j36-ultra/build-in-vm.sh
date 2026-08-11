@@ -224,11 +224,16 @@ done
 # NET_NS/PID_NS/IPC_NS/UTS_NS, and Debian's own units use PrivateMounts,
 # PrivateTmp and ProtectSystem. Those services fail to start without it.
 #
-# The two POSIX_ACL symbols matter because the rootfs is btrfs and systemd sets
-# ACLs on the journal. FS_POSIX_ACL was already y; the per-filesystem ones were
-# not, so the generic support was there with nothing able to use it.
+# The POSIX_ACL symbols matter because systemd sets ACLs on the journal.
+# FS_POSIX_ACL was already y; the per-filesystem ones were not, so the generic
+# support was there with nothing able to use it.  EXT2_FS_POSIX_ACL is the one
+# that now matters -- the rootfs is ext2 -- and EXT2_FS_XATTR comes with it
+# because ext2's ACL support is gated on it in fs/ext2/Kconfig, unlike ext4's,
+# which is unconditional.  The btrfs and ext4 entries stay for the cards written
+# by earlier builds.
 for symbol in \
-    NET UNIX INET NAMESPACES BTRFS_FS_POSIX_ACL EXT4_FS_POSIX_ACL; do
+    NET UNIX INET NAMESPACES EXT2_FS_XATTR EXT2_FS_POSIX_ACL \
+    BTRFS_FS_POSIX_ACL EXT4_FS_POSIX_ACL; do
     config_y "$symbol"
 done
 
@@ -418,12 +423,14 @@ make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
 for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 FB_SIMPLE SERIAL_8250_MT6577 BLK_DEV_INITRD MODULES \
                 MMC MMC_BLOCK MMC_MTK REGULATOR_FIXED_VOLTAGE \
-                EXT4_FS BTRFS_FS EXFAT_FS VFAT_FS NLS_UTF8 NLS_CODEPAGE_437 \
+                EXT2_FS EXT4_FS BTRFS_FS EXFAT_FS VFAT_FS \
+                NLS_UTF8 NLS_CODEPAGE_437 \
                 WATCHDOG WATCHDOG_CORE MEDIATEK_WATCHDOG \
                 NET UNIX INET SECCOMP_FILTER NAMESPACES NET_NS PID_NS \
                 CGROUPS FHANDLE INOTIFY_USER SIGNALFD TIMERFD EPOLL \
                 DEVTMPFS DEVTMPFS_MOUNT TMPFS TMPFS_XATTR TMPFS_POSIX_ACL \
-                PROC_FS PROC_SYSCTL SYSFS BTRFS_FS_POSIX_ACL \
+                PROC_FS PROC_SYSCTL SYSFS \
+                EXT2_FS_XATTR EXT2_FS_POSIX_ACL BTRFS_FS_POSIX_ACL \
                 DRM DEVMEM SOUND; do
     grep -q "^CONFIG_${required}=y$" "$CONFIG" || \
         die "required kernel option CONFIG_${required}=y was not selected"
