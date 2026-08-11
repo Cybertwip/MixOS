@@ -181,17 +181,20 @@ done
 # EXT4 and BTRFS stay for the cards already in the field, written by the builds
 # that came before this one; /init tries all three.
 #
-# EXFAT and VFAT are not for /init -- they are the other two partitions on the
-# same card, and the rootfs mounts them itself.  finishing_touches.sh writes the
+# EXFAT and VFAT are not for /init -- they are for the other partitions on the same
+# card, and the rootfs mounts those itself.  finishing_touches.sh writes the
 # post-expansion fstab as
 #
 #   LABEL=BOOT /boot vfat defaults 0 2
-#   LABEL=EASYROMS /roms exfat defaults,auto,umask=000,... 0 0
+#   LABEL=DATA /home/virtua ext2 defaults,auto,noatime,nofail 0 2
 #
-# and firstboot installs it over /etc/fstab as its last act, so from the second
-# boot onwards this kernel is asked for both.  Neither entry carries nofail, so a
-# filesystem the kernel does not know is not a missing ROMs directory: local-fs
-# fails, and systemd takes a machine with no keyboard driver into emergency mode.
+# and firstboot installs it over /etc/fstab as its last act, so from the second boot
+# onwards this kernel is asked for both.  p3 is the login user's home directory now,
+# ext2 and labelled DATA -- it used to be exfat and called EASYROMS, and exfat stays
+# built in for the cards already written that way.  The BOOT entry carries no nofail,
+# so a vfat driver this kernel did not have would fail local-fs and take a machine
+# with no keyboard driver into emergency mode; the home entry does carry it, because
+# a card whose p3 is missing or unformatted still has to reach a shell.
 for symbol in \
     BLOCK BLK_DEV MMC MMC_BLOCK MMC_MTK REGULATOR REGULATOR_FIXED_VOLTAGE \
     EXT2_FS EXT4_FS BTRFS_FS EXFAT_FS VFAT_FS; do
@@ -1746,15 +1749,39 @@ find_mixos() {
 # an initramfs is a partition that gets replayed dirty the next time the battery gives
 # out mid-write.
 #
-# exfat and vfat are in the list and are in fact the likely answer: EASYROMS is made
-# vfat and firstboot converts it to exfat, so on a stock card the only ext2 partition
-# is the rootfs -- which is skipped, being already mounted as /newroot.  BOOT
-# is skipped by what is in it rather than by its device name, because the name is only
-# known when mount_bootfs happened to run this boot.
+# exfat and vfat are still in the list, for a card written before this layout: p3 used
+# to be made vfat here and converted to exfat by firstboot.  On a current card p3 is
+# ext2, labelled DATA, and it is the login user's HOME -- the rootfs fstab mounts it
+# rw at /home/virtua.  That partition is handled by pointing at systemd's mount instead
+# of making a second one, for the reason in the paragraph below.  BOOT is skipped by
+# what is in it rather than by its device name, because the name is only known when
+# mount_bootfs happened to run this boot.
+#
+# WHY THE HOME PARTITION IS NOT MOUNTED HERE.  A block device cannot be mounted ro and
+# rw at the same time: the ro mount holds the superblock, and systemd's fstab mount of
+# the same device comes back EBUSY.  With nofail on that fstab line -- which it needs,
+# so that a missing p3 still reaches a shell -- the failure is silent, and the symptom
+# is a home directory that is quietly the rootfs copy underneath the mount point while
+# everything the operator writes goes to the wrong partition.  So this identifies that
+# partition, unmounts it, and leaves /run/j36/card as a symlink to where systemd will
+# mount it a few seconds later.  One mount, writable, owned by systemd.
 mount_card() {
     # /newroot and not /run: this runs before switch_root, so that is the path the
     # kernel has recorded for the mount.
     if grep -q " /newroot/run/j36/card " /proc/mounts 2>/dev/null; then return 0; fi
+
+    # Where the rootfs intends to mount it, read out of its own fstab rather than
+    # assumed.  Pure shell: this initramfs has no awk, sed or cut -- see INIT_APPLETS.
+    home_mp=""
+    if [ -r /newroot/etc/fstab ]; then
+        while read -r fs_spec fs_mp fs_rest; do
+            case "$fs_spec" in
+                LABEL=DATA) home_mp="$fs_mp"; break ;;
+            esac
+        done < /newroot/etc/fstab
+    fi
+    [ -n "$home_mp" ] || home_mp=/home/virtua
+
     mkdir -p /newroot/run/j36/card
     for dev in /dev/mmcblk*p* /dev/sd*; do
         if [ ! -b "$dev" ]; then continue; fi
@@ -1767,6 +1794,20 @@ mount_card() {
                [ -d /newroot/run/j36/card/mvii ]; then
                 umount /newroot/run/j36/card
                 break
+            fi
+            # The stamp is written by finishing_touches.sh at the root of p3, next to
+            # the dotfiles it seeds there, and it is the only way this initramfs can
+            # recognise that partition: identifying it by LABEL would need blkid, which
+            # is not in this busybox.  A card without the stamp predates this layout
+            # and falls through to the read-only mount below, which is right for it.
+            if [ -f /newroot/run/j36/card/.mixos-home ]; then
+                umount /newroot/run/j36/card
+                rmdir /newroot/run/j36/card 2>/dev/null
+                ln -sfn "$home_mp" /newroot/run/j36/card
+                say "dash: $dev ($fs) is the home partition; /run/j36/card -> $home_mp"
+                say "      left to systemd to mount rw -- a read-only mount here would"
+                say "      make its fstab entry fail with EBUSY."
+                return 0
             fi
             say "dash: $dev ($fs) mounted read-only at /run/j36/card"
             return 0
@@ -1975,9 +2016,9 @@ ExecStart=/bin/sh -c 'for i in 1 2 3 4 5 6; do \\
   echo "j36:   $dash_seen"; \\
   echo "j36: fix it on a PC with the card in a reader, on the ROOTFS partition:"; \\
   echo "j36:   sudo tar -C /mnt/ROOTFS -xzf sd-root.tar.gz"; \\
-  echo "j36: which gives /opt/mixos, the first place /init looks.  Not EASYROMS:"; \\
-  echo "j36: that one is vfat and becomes exfat, and neither holds the ~30 Qt"; \\
-  echo "j36: SONAME symlinks -- mixdash would then die before main()."; \\
+  echo "j36: which gives /opt/mixos, the first place /init looks.  Not BOOT:"; \\
+  echo "j36: that one is FAT and holds none of the ~30 Qt SONAME symlinks --"; \\
+  echo "j36: mixdash would then die before main()."; \\
   echo "j36: EmulationStation is masked in this build on purpose and is not a"; \\
   echo "j36: fallback: it aborts in Renderer_GLES10.cpp on this board."; \\
   sleep 20; \\

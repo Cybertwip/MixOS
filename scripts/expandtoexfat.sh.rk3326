@@ -1,6 +1,11 @@
 #!/bin/bash
-if mountpoint -q /roms; then
-  sudo umount /roms
+# p3 is the home partition now, mounted at /home/virtua, and /roms is a symlink into it.
+# One variable, because this script both unmounts and repopulates it and the two have to
+# agree; the fstab this ships beside says the same thing, from ${DATA_MOUNT_POINT} in
+# setup_partition.sh.
+DATA_MOUNT_POINT=/home/virtua
+if mountpoint -q ${DATA_MOUNT_POINT}; then
+  sudo umount ${DATA_MOUNT_POINT}
 fi
 sudo chmod 666 /dev/tty1
 export TERM=linux
@@ -68,17 +73,23 @@ fi
 	# ext2 filesystem is what makes a PC offer to reformat the card.
 	printf "t\n3\n83\nw\n" | sudo fdisk /dev/mmcblk0 &> /dev/null
 	echo 60
-	sudo mount -t ext2 -w /dev/mmcblk0p3 /roms &> /dev/null
+	sudo mkdir -p ${DATA_MOUNT_POINT}
+	sudo mount -t ext2 -w /dev/mmcblk0p3 ${DATA_MOUNT_POINT} &> /dev/null
 	exitcode=$?
 	echo $exitcode > /tmp/code.txt
 	sleep 2
 	# --same-owner and --same-permissions now, where the old code passed the opposite:
 	# the destination was exfat, which stores neither, and the fstab line handed the
 	# whole partition to uid 1000 with umask=000 instead.  ext2 stores both, the archive
-	# carries 1000:1000 from finishing_touches.sh, and without these two options /roms
-	# would come out owned by root and read-only to the ark user that has to write it.
-	#sudo tar -xf /roms.tar -C / &> /dev/null
-	(pv -n /roms.tar | tar --same-permissions --same-owner --warning=no-timestamp -xf - -C /) &> /tmp/tar_stat.txt &
+	# carries 1000:1000 from finishing_touches.sh, and without these two options the home
+	# partition would come out root-owned and read-only to the user that has to write it.
+	#
+	# -C ${DATA_MOUNT_POINT} and not -C /: the archive is the partition's whole contents
+	# now -- the home directory, with roms/ inside it -- rather than a single roms/ top
+	# level, because the partition is a home directory and not a rom library.  Extracting
+	# it at / would scatter dotfiles across the root filesystem.
+	#sudo tar -xf /roms.tar -C ${DATA_MOUNT_POINT} &> /dev/null
+	(pv -n /roms.tar | tar --same-permissions --same-owner --warning=no-timestamp -xf - -C ${DATA_MOUNT_POINT}) &> /tmp/tar_stat.txt &
 	let COUNT=1
 	while true; do
 	  VAL=$(tail -n 1 /tmp/tar_stat.txt)
@@ -101,9 +112,10 @@ fi
 	done
 	#echo 80
 	sync
-	sudo rm -rf /roms/themes/es-theme-nes-box/ &> /dev/null
+	sudo rm -rf ${DATA_MOUNT_POINT}/roms/themes/es-theme-nes-box/ &> /dev/null
+	sudo mkdir -p ${DATA_MOUNT_POINT}/roms/themes
 	cd /tempthemes
-	(tar --no-same-permissions --no-same-owner --warning=no-timestamp -cf - . | pv -n -s $(du -sb /tempthemes/ | awk '{print $1}') | tar --no-same-permissions --no-same-owner -xf - -C /roms/themes/) &> /tmp/tar_stat.txt &
+	(tar --no-same-permissions --no-same-owner --warning=no-timestamp -cf - . | pv -n -s $(du -sb /tempthemes/ | awk '{print $1}') | tar --no-same-permissions --no-same-owner -xf - -C ${DATA_MOUNT_POINT}/roms/themes/) &> /tmp/tar_stat.txt &
 	let COUNT=1
 	while true; do
 	  VAL=$(tail -n 1 /tmp/tar_stat.txt)
@@ -136,10 +148,10 @@ fi
 	done
 	sleep 2
 	# One sweep at the end, belt and braces: the themes above still come out of a tar
-	# that drops ownership, and /roms on ext2 has to be writable by the ark user or
-	# EmulationStation cannot save a gamelist.  vfat and exfat never needed this --
-	# they have no ownership and the fstab line gave it away with umask=000.
-	sudo chown -R 1000:1000 /roms &> /dev/null
+	# that drops ownership, and this partition on ext2 has to be writable by uid 1000 or
+	# the login lands in a home directory it cannot write.  vfat and exfat never needed
+	# this -- they have no ownership and the fstab line gave it away with umask=000.
+	sudo chown -R 1000:1000 ${DATA_MOUNT_POINT} &> /dev/null
 	sudo cp -f /boot/fstab.exfat /etc/fstab &> /dev/null
 	sync
 	sudo rm -f /boot/doneit* &> /dev/null

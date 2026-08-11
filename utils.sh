@@ -89,7 +89,19 @@ function setup_ark_user() {
   # into /home/ark, and dozens of runtime scripts read from it; the symlink means all of
   # them keep working, at build time inside the chroot and on the device, without a
   # rename that would touch every one of those files.
-  sudo chroot ${CHROOT_DIR}/ ln -sfnv "${ARK_HOME}" /home/ark
+  #
+  # RELATIVE, and that is the whole trick.  Most of those 800 lines are host-side writes
+  # of the form `sudo tee Arkbuild/home/ark/.config/.DEVICE`, and an absolute symlink
+  # would send them to /home/virtua on the BUILD MACHINE -- outside the build tree
+  # entirely, failing if the path does not exist there and quietly writing to somebody's
+  # real home directory if it does.  A link to "virtua" resolves within whichever /home
+  # it is read from, so the same symlink is correct on the host, in the chroot, and on
+  # the device.  A mount point outside /home cannot have that and gets the absolute form.
+  if [[ "$(dirname "${ARK_HOME}")" == "/home" ]]; then
+    sudo chroot ${CHROOT_DIR}/ ln -sfnv "$(basename "${ARK_HOME}")" /home/ark
+  else
+    sudo chroot ${CHROOT_DIR}/ ln -sfnv "${ARK_HOME}" /home/ark
+  fi
   sudo chroot ${CHROOT_DIR}/ bash -c "echo ark:ark | chpasswd"
   sudo chroot ${CHROOT_DIR}/ chage -I -1 -m 0 -M 99999 -E -1 ark
   sudo mkdir -p ${CHROOT_DIR}/etc/sudoers.d

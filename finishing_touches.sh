@@ -342,11 +342,14 @@ echo "export SDL_VIDEO_EGL_DRIVER=libEGL.so" | sudo tee Arkbuild/etc/profile.d/S
 dNAME=`echo $NAME | tr '[:lower:]' '[:upper:]'`
 echo "$dNAME" | sudo tee Arkbuild/home/ark/.config/.DEVICE
 
-# Configure default samba share setup
+# Configure default samba share setup.  Real paths, not /roms and /home/ark: those are
+# symlinks into the DATA partition now, and samba defaults to "wide links = no" -- it
+# refuses to follow a symlink that leaves the share, so a share rooted on one is a share
+# that shows nothing.
 cat <<EOF | sudo tee -a Arkbuild/etc/samba/smb.conf
 [roms]
    comment = ROMS
-   path = /roms
+   path = ${DATA_MOUNT_POINT}/roms
    browsable = yes
    read only = no
    map archive = no
@@ -368,7 +371,7 @@ cat <<EOF | sudo tee -a Arkbuild/etc/samba/smb.conf
 
 [ark]
    comment = ark
-   path = /home/ark
+   path = ${DATA_MOUNT_POINT}
    browsable = yes
    read only = no
    map archive = no
@@ -497,7 +500,11 @@ if [[ -d Arkbuild/roms && ! -L Arkbuild/roms ]]; then
   fi
   sudo rm -rf Arkbuild/roms
 fi
-sudo ln -sfn "${DATA_MOUNT_POINT}/roms" Arkbuild/roms
+# Relative, for the same reason /home/ark is: an absolute target would make a host-side
+# `cp something Arkbuild/roms/...` write to /home/virtua/roms on the BUILD MACHINE.
+# Stripping the leading slash makes it relative to whatever root it is read from, so it
+# resolves to Arkbuild/home/virtua/roms here and /home/virtua/roms on the device.
+sudo ln -sfn "${DATA_MOUNT_POINT#/}/roms" Arkbuild/roms
 if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
   while read GAME_SYSTEM; do
     if [[ ! "$GAME_SYSTEM" =~ ^# ]]; then
@@ -546,8 +553,11 @@ if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
   sudo rm -rf ${fat32_mountpoint}/tools/ThemeMaster-master/
   rm -f master.zip
 
-  # Get some sample pico-8 games
-  sudo rm -rf /roms/pico-8/carts/*
+  # Get some sample pico-8 games.  ${fat32_mountpoint} and not /roms: this line named an
+  # absolute path, so it cleared the BUILD HOST's /roms rather than the partition being
+  # populated two lines below.  Harmless while no such directory existed on the host and
+  # not something to leave standing in a script that runs as root.
+  sudo rm -rf ${fat32_mountpoint}/pico-8/carts/*
   sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/1/15133.p8.png -O ${fat32_mountpoint}/pico-8/carts/celeste.p8.png
   sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/sc/scrap_boy-6.p8.png -O ${fat32_mountpoint}/pico-8/carts/scrap_boy-6.p8.png
   sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/di/dinkykong-0.p8.png -O ${fat32_mountpoint}/pico-8/carts/dinkykong-0.p8.png
@@ -581,6 +591,19 @@ if [[ -d "Arkbuild${DATA_MOUNT_POINT}" ]]; then
   sudo cp -a "Arkbuild${DATA_MOUNT_POINT}/." ${data_mountpoint}/ || \
     echo "⚠️  Could not copy the whole home tree onto p3 -- ${ROM_PART_SIZE:-300} MB may be too small for what is in it"
 fi
+
+# The stamp the J36's initramfs looks for.  /init has to recognise this partition to
+# leave it alone -- it is the one partition systemd mounts rw, and a read-only mount
+# from the initramfs would make that fstab entry fail with EBUSY -- and it cannot
+# identify it by label, having no blkid.  A file at the partition root is what it can
+# read.  Contents are for whoever finds it with a card reader; only the name matters.
+cat <<EOF | sudo tee ${data_mountpoint}/.mixos-home > /dev/null
+This partition is the MixOS home directory: it mounts at ${DATA_MOUNT_POINT}.
+Label ${DATA_LABEL}, ${DATA_FILESYSTEM_FORMAT}, owned by uid 1000.  roms/ inside it is
+the legacy EmulationStation tree, which /roms still points at.
+Do not delete this file: the J36 Ultra initramfs reads it to tell this partition apart
+from a plain data partition, and without it the boot mounts this one read-only.
+EOF
 sync
 
 # Ownership and modes, BEFORE roms.tar is made, so the tar carries them too.
