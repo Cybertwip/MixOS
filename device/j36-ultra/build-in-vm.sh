@@ -1673,8 +1673,10 @@ find_mixos() {
                     # cannot resolve mixdash's own DT_NEEDED and it dies before main().
                     if [ ! -e "/newroot$mixos_root/qt/lib/libQt5Core.so.5" ]; then
                         say "dash: that copy has no qt/lib/libQt5Core.so.5 -- if it was"
-                        say "      unpacked onto a vfat partition the SONAME symlinks are"
-                        say "      gone, and mixdash will not start.  Use ext4 or btrfs."
+                        say "      unpacked onto the vfat BOOT partition the SONAME"
+                        say "      symlinks are gone, and mixdash will not start."
+                        say "      Unpack it on the ext2 ROOTFS partition instead;"
+                        say "      BOOT only carries the kernel and the device tree."
                     fi
                     return 0
                 fi
@@ -1689,7 +1691,7 @@ find_mixos() {
         # fixes.  All four are built into this kernel, so what lands here is an
         # unformatted partition, or f2fs, or one whose superblock is damaged.
         if [ "$dash_mounted" = 0 ]; then
-            say "dash: $dev would not mount as btrfs, ext4, exfat or vfat"
+            say "dash: $dev would not mount as ext2, ext4, btrfs, exfat or vfat"
             dash_seen="$dash_seen ${dev##*/}:unreadable"
         fi
     done
