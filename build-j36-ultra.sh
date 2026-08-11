@@ -51,9 +51,14 @@ BOARD_SRC="$ROOT/device/j36-ultra/mvii-board"
 POWERENGINE_ROOT="${POWERENGINE_ROOT:-$(dirname "$ROOT")/PowerEngineV3/PowerEngine}"
 DRIVERS_HOST="${J36_DRIVERS_DIR:-$POWERENGINE_ROOT/OS/MVII/Kernel/ARM/MediaTek/J36Ultra/Drivers}"
 ARTIFACT_DIR="${J36_ARTIFACT_DIR:-${ROOT}-artifacts/j36-ultra}"
+# Where build-r36-ultra.sh puts the image archive and latest-image.txt.  Spelt the same
+# way it spells it, and honouring the same override, because the payload-carrying archive
+# has to land on top of the pre-payload one it wrote -- see the hand-over at the bottom.
+BASE_ARTIFACT_DIR="${DARKOS_ARTIFACT_DIR:-${ROOT}-artifacts}"
 RESUME_R36="${J36_RESUME_R36:-1}"
 VM_SOURCE_MOUNT="/mnt/darkos-host"
 VM_ARTIFACT_MOUNT="/mnt/j36-artifacts"
+VM_BASE_ARTIFACT_MOUNT="/mnt/darkos-artifacts"
 VM_BUILD_DIR="/home/ubuntu/dArkOS"
 VM_WORK_DIR="/home/ubuntu/j36-ultra-work"
 
@@ -76,6 +81,12 @@ Overrides:
   J36_REBUILD_BUSYBOX=1 ./build-j36-ultra.sh
   J36_KERNEL_BRANCH=linux-6.12.y ./build-j36-ultra.sh
   J36_ARTIFACT_DIR=/path/to/output ./build-j36-ultra.sh
+  J36_IMAGE_EXPORT=0 ./build-j36-ultra.sh    # still fold the payload into the image,
+                                             # but skip the minutes-long re-split of
+                                             # its .7z volumes.  Use when the card is
+                                             # already flashed and sd-boot/ -- which
+                                             # carries sd-root.tar.gz -- is how it is
+                                             # being updated.
 
 Anything build-r36-ultra.sh honours (BUILD_JOBS, USERSPACE_ARCH,
 DARKOS_R36_BOOT_PAYLOAD, ...) is inherited by the resumed base build.
@@ -165,7 +176,58 @@ multipass exec "$VM_NAME" -- env \
     J36_GL="${J36_GL:-${J36_ES:-1}}" \
     J36_MIXDASH="${J36_MIXDASH:-1}" \
     J36_PAYLOAD_ON="${J36_PAYLOAD_ON:-root}" \
+    J36_IMAGE_EXPORT="${J36_IMAGE_EXPORT:-archive}" \
     bash "$VM_BUILD_DIR/device/j36-ultra/build-in-vm.sh"
+
+# ── Handing over the image that actually carries the payload ──────────────────
+#
+# WHY THIS STEP EXISTS.  build-r36-ultra.sh, which ran above, copies ${IMAGE}.7z.* to
+# the workstation as its last act -- and that archive was written by create_image.sh
+# during the base build's finalization, BEFORE this layer injected anything.  So every
+# card flashed from it came up with no /opt/mixos and no sd-root.tar.gz on BOOT, no
+# matter what the injection reported: the operator was unpacking a snapshot of the image
+# taken before the payload went in.
+#
+# The in-VM script now rewrites the archive from the injected image under the same name.
+# This copies that rewrite out, on top of the volumes the base wrapper already put there.
+# Into $BASE_ARTIFACT_DIR and not $ARTIFACT_DIR on purpose: latest-image.txt, the
+# volumes and the per-file copy stamps are all there, and one image in one place is the
+# whole point -- two images of which only one boots is the mistake being fixed.  Sharing
+# copy_artifacts.sh's stamp directory with the base wrapper is also what keeps this to
+# one transfer per run: next run the wrapper finds the stamp written here and skips.
+FLASH_IMAGE=""
+FLASH_PAYLOAD=""
+if [[ -f "$ARTIFACT_DIR/flashable-image.txt" ]]; then
+    while IFS='=' read -r key value; do
+        case "$key" in
+            image)   FLASH_IMAGE="$value" ;;
+            payload) FLASH_PAYLOAD="$value" ;;
+        esac
+    done < "$ARTIFACT_DIR/flashable-image.txt"
+fi
+
+if [[ "$FLASH_PAYLOAD" == "in-image" && -n "$FLASH_IMAGE" && "$FLASH_IMAGE" != none ]]; then
+    mkdir -p "$BASE_ARTIFACT_DIR"
+    darkos_vm_remount "$VM_NAME" "$BASE_ARTIFACT_DIR:$VM_BASE_ARTIFACT_MOUNT"
+    darkos_log "Copying ${FLASH_IMAGE}.7z.* out: the archive with both payloads folded in"
+    multipass exec "$VM_NAME" -- bash -lc '
+set -Eeuo pipefail
+BUILD_DIR=$1
+DEST=$2
+IMAGE=$3
+cd "$BUILD_DIR"
+[[ -f "${IMAGE}.7z.001" ]] || { echo "missing archive: ${IMAGE}.7z.001" >&2; exit 1; }
+bash device/r36-ultra/copy_artifacts.sh "$DEST" "${IMAGE}.7z."*
+printf "%s\n" "$IMAGE" > "$DEST/latest-image.txt"
+sync "$DEST"
+' j36-image-copy "$VM_BUILD_DIR" "$VM_BASE_ARTIFACT_MOUNT" "$FLASH_IMAGE"
+elif [[ -n "$FLASH_IMAGE" && "$FLASH_IMAGE" != none ]]; then
+    darkos_warn "${FLASH_IMAGE}.7z.* in $BASE_ARTIFACT_DIR predates the payload and was NOT refreshed."
+    darkos_warn "Read the 'image:' lines in the build log; do not expect /opt/mixos on a card flashed from it."
+else
+    darkos_warn "No base image was found in the VM, so there is nothing flashable to hand over."
+    darkos_warn "Run without J36_RESUME_R36=0 so the base build produces one."
+fi
 
 darkos_log "J36 Ultra artifacts are ready: $ARTIFACT_DIR"
 printf '  %s\n' \
@@ -184,11 +246,25 @@ printf '  %s\n' \
 # box.  Unpacking sd-root.tar.gz onto BOOT instead of the OS partition is the one wrong
 # way to do it: FAT holds neither the ~30 Qt SONAME symlinks nor the execute bits, and
 # mixdash would fail before main().
-darkos_log "Flash the newest dArkOS_*.img in $PWD -- it already carries the launcher on BOOT and /opt/mixos on the OS partition"
+if [[ "$FLASH_PAYLOAD" == "in-image" ]]; then
+    darkos_log "Flash this, and nothing else has to be copied: $BASE_ARTIFACT_DIR/${FLASH_IMAGE}.7z.001"
+    darkos_log "  7z x ${FLASH_IMAGE}.7z.001   then dd the .img -- the launcher is already on BOOT and /opt/mixos on the OS partition"
+fi
 darkos_log "The card's three partitions: p1 BOOT vfat (launcher only), p2 ROOTFS ext2 (Debian + /opt/mixos), p3 DATA ext2 (your home, mounted at /home/virtua)"
-darkos_log "To update a card in place from a Linux machine instead: copy $ARTIFACT_DIR/sd-boot/ onto BOOT"
-if [[ -f "$ARTIFACT_DIR/sd-root.tar.gz" ]]; then
-    darkos_log "  and, as root: sudo tar -C /path/to/the/mounted/ROOTFS -xzf $ARTIFACT_DIR/sd-root.tar.gz  (the ext2 OS partition -- gives /opt/mixos)"
+# The in-place update channel, and it works FROM MACOS -- which the previous wording
+# denied.  sd-boot/ now contains sd-root.tar.gz, and /init unpacks it onto the ext2 OS
+# partition on the next boot, once per tarball.  Dragging the whole of sd-boot/ onto the
+# one partition macOS can mount is therefore a complete update, dashboard included; what
+# does not work is unpacking that tarball onto BOOT, because FAT holds neither the ~30 Qt
+# SONAME symlinks nor the execute bits and mixdash then dies before main() with
+# "invalid ELF header".
+darkos_log "To update an already-flashed card without reflashing: copy all of $ARTIFACT_DIR/sd-boot/ onto its BOOT partition"
+if [[ -f "$ARTIFACT_DIR/sd-boot/sd-root.tar.gz" ]]; then
+    darkos_log "  sd-root.tar.gz rides along on BOOT and /init unpacks it onto the OS partition on the next boot -- so this works from macOS, and only BOOT is written"
+    darkos_log "  Do NOT untar it onto BOOT itself: FAT loses the Qt symlinks and the execute bits, which is the 'invalid ELF header' from libQt5Widgets"
+elif [[ -f "$ARTIFACT_DIR/sd-root.tar.gz" ]]; then
+    darkos_warn "sd-root.tar.gz did not fit on BOOT alongside the launcher, so a card can only be updated by reflashing or from a Linux box:"
+    darkos_log "  as root: sudo tar -C /path/to/the/mounted/ROOTFS -xzpf $ARTIFACT_DIR/sd-root.tar.gz --numeric-owner   (the ext2 OS partition -- gives /opt/mixos)"
 else
     darkos_warn "No sd-root.tar.gz was produced, so nothing will be on the OS partition: no dashboard, no lima, no Mesa. Check the sd-root lines in the build log."
 fi

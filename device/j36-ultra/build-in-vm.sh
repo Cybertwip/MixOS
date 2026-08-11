@@ -1612,12 +1612,28 @@ Environment="EGL_LOG_LEVEL=debug"
 Environment="MESA_DEBUG=1"
 Environment="LIBGL_DEBUG=verbose"
 Environment="J36_ES_GL_PROBE=1"
-ExecStart=
-ExecStart=/usr/bin/emulationstation/emulationstation.sh --debug
 Restart=no
 StandardOutput=journal+console
 StandardError=journal+console
 DROPINDBG
+
+        # The `--debug' ExecStart override that used to be in that block is written
+        # only when EmulationStation is the shell, and that is not a tidiness point.
+        # neuter_es replaces emulationstation.service in the SAME directory with a
+        # unit that only echoes a line, and a drop-in beside it outranks nothing --
+        # it MERGES.  So `ExecStart=' followed by the real binary resurrected the
+        # very thing j36.dash=1 exists to keep out of the boot: under j36.gl=debug
+        # the stub's echo was cleared and ES ran, aborted at
+        # Renderer_GLES10.cpp:129, and did it while holding the panel.
+        if [ "$want_dash" != 1 ]; then
+            cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINDBGES'
+ExecStart=
+ExecStart=/usr/bin/emulationstation/emulationstation.sh --debug
+DROPINDBGES
+        else
+            say "gl: j36.dash=1, so the debug drop-in does not re-add an ExecStart --"
+            say "    a drop-in merges with the stub unit and would start ES anyway"
+        fi
 
         # And the probe, if it was staged.  Written separately so that a card
         # without it produces a drop-in that does not mention it, rather than a
@@ -1653,7 +1669,14 @@ DROPINDBG
         # twice -- and the first line below already prints what -p's opening
         # lines were the useful part of: which node is lima and which one, if
         # any, can modeset at all.
-        if [ -x /newroot/run/j36/eglprobe ]; then
+        #
+        # Same reasoning as the ExecStart above: this drop-in merges into whatever
+        # emulationstation.service is, stub included, so with the dashboard as the
+        # shell these lines were a SECOND full EGL probe in the boot -- one from the
+        # stub unit and one from mixdash's own ExecStartPre.  Every one of them
+        # creates contexts on lima, and this board does not survive many of those.
+        # The dashboard boot gets exactly one, from mixdash-probe.service.
+        if [ -x /newroot/run/j36/eglprobe ] && [ "$want_dash" != 1 ]; then
             cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINPROBE'
 ExecStartPre=-/bin/sh -c '/run/j36/eglprobe 2>&1 | tee /run/j36/eglprobe.log'
 ExecStartPre=-/bin/sh -c 'LIBGL_ALWAYS_SOFTWARE=1 /run/j36/eglprobe -s 2>&1 | tee -a /run/j36/eglprobe.log'
@@ -2003,24 +2026,61 @@ UNITDASH
     # is not the thing to debug.  It is NOT -p or -c: those two modeset, and on a
     # kernel with no fbdev emulation the CRTC is disabled when the client exits, so
     # either one would hide the dashboard for the rest of the boot.
+    # A UNIT OF ITS OWN, AND NOT ExecStartPre, AND THIS IS THE FIX FOR A HANG.
+    # ExecStartPre runs on every start ATTEMPT, restarts included.  mixdash.service is
+    # Restart=on-failure with StartLimitBurst=3, so a dashboard that fails to start ran
+    # these probes three times -- and under j36.gl=debug two of them are the full probe,
+    # which loads Mesa and creates EGL contexts on lima.  What that looked like on the
+    # glass was colour bars, then hundreds of libEGL debug lines, then the bars again,
+    # repeating until the kernel stopped answering: each cycle re-initialised the GPU
+    # while the previous attempt's error was still the only thing worth reading, and
+    # each cycle repainted the bars over it.
+    #
+    # Type=oneshot with RemainAfterExit=yes runs once per boot.  mixdash Wants= and
+    # After= it, so a mixdash restart finds it already active and does not re-run it:
+    # one EGL init per boot instead of three, and attempts two and three put their own
+    # stderr on a panel nothing has repainted.
     if [ "$probe_ready" = 1 ]; then
-        cat >> /newroot/run/systemd/system/mixdash.service <<'UNITPROBE'
+        cat >> /newroot/run/systemd/system/mixdash.service <<'UNITPROBEDEP'
+
+[Unit]
+Wants=mixdash-probe.service
+After=mixdash-probe.service
+UNITPROBEDEP
+        cat > /newroot/run/systemd/system/mixdash-probe.service <<'UNITPROBE'
+# Written by the J36 Ultra initramfs.  Once per boot, before the dashboard.
+[Unit]
+Description=MixOS panel probe (J36 Ultra)
+Before=mixdash.service
 
 [Service]
-ExecStartPre=-/bin/sh -c '/run/j36/eglprobe -f 1 2>&1 | tee /run/j36/eglprobe.log'
+Type=oneshot
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+# - because a probe is not a precondition: whatever it says, the dashboard still
+# gets its attempt.
+ExecStart=-/bin/sh -c '/run/j36/eglprobe -f 1 2>&1 | tee /run/j36/eglprobe.log'
 UNITPROBE
-        # And under j36.gl=debug the two library questions as well, plus the replay:
-        # the dashboard covers the panel with its own drawing, so the only way to
-        # read the probe's verdict is after the shell has exited.
+        # And under j36.gl=debug the two library questions as well.  The replay stays
+        # on mixdash.service, where it belongs: the dashboard covers the panel with its
+        # own drawing, so the only time the probe's verdict can be read is after the
+        # shell has exited.
         if [ "$gl_debug" = 1 ]; then
-            cat >> /newroot/run/systemd/system/mixdash.service <<'UNITDBG'
-ExecStartPre=-/bin/sh -c '/run/j36/eglprobe 2>&1 | tee -a /run/j36/eglprobe.log'
-ExecStartPre=-/bin/sh -c 'LIBGL_ALWAYS_SOFTWARE=1 /run/j36/eglprobe -s 2>&1 | tee -a /run/j36/eglprobe.log'
-ExecStopPost=-/bin/sh -c 'echo "--- eglprobe, repeated now that the shell has exited ---"; cat /run/j36/eglprobe.log'
+            cat >> /newroot/run/systemd/system/mixdash-probe.service <<'UNITDBG'
+ExecStart=-/bin/sh -c '/run/j36/eglprobe 2>&1 | tee -a /run/j36/eglprobe.log'
+ExecStart=-/bin/sh -c 'LIBGL_ALWAYS_SOFTWARE=1 /run/j36/eglprobe -s 2>&1 | tee -a /run/j36/eglprobe.log'
 Environment="EGL_LOG_LEVEL=debug"
 Environment="LIBGL_DEBUG=verbose"
 UNITDBG
+            cat >> /newroot/run/systemd/system/mixdash.service <<'UNITDBGREPLAY'
+
+[Service]
+ExecStopPost=-/bin/sh -c 'echo "--- eglprobe, repeated now that the shell has exited ---"; cat /run/j36/eglprobe.log'
+UNITDBGREPLAY
         fi
+        say "dash: mixdash-probe.service runs the probe once per boot, not once per"
+        say "      start attempt -- three restarts used to mean three EGL inits"
     fi
 
     neuter_es
@@ -3638,10 +3698,12 @@ initrd=initrd.img
 #
 # j36.audio=speaker also powers the class-D amp, which hangs off VBAT -- the
 # system node -- so battery-less it pulls the board under its own lockout.
-# j36.gl=debug adds Mesa's EGL trace and the node probes; =1 is the quiet form.
-# j36.es is the old name for j36.gl.  Drop j36.dash=1 and EmulationStation is
-# neither masked nor replaced.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=debug j36.dash=1 j36.audio=1
+# j36.gl=1 stages Mesa quietly.  j36.gl=debug adds Mesa's EGL trace and the full
+# node probes -- it is a diagnostic, not a default: those probes create EGL
+# contexts on lima, and a boot that ends with a frozen kernel and hundreds of
+# libEGL lines is that trace, not the dashboard.  j36.es is the old name for
+# j36.gl.  Drop j36.dash=1 and EmulationStation is neither masked nor replaced.
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1
 CONF
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
@@ -3852,6 +3914,13 @@ j36.gl=1  (j36.es=1 is the old spelling of the same word)
     j36.gl=debug adds Mesa's own EGL trace and runs the node probes before the
     dashboard starts, so the journal names every /dev/dri node and says which one
     can modeset.  eglprobe -f runs either way.
+
+    It is not the default, and was: those node probes create EGL contexts on
+    lima, EGL_LOG_LEVEL=debug turns each one into hundreds of libEGL lines on a
+    640x480 console, and the run they buried was the dashboard's own error.  On
+    this board a boot that did it repeatedly ended with the kernel not answering.
+    Ask for it when the question is GL; the bars from eglprobe -f already say
+    whether anything userspace draws can be seen at all.
 
 j36.dash=1
     Run the MixOS dashboard as the shell, and take EmulationStation out of the boot:
@@ -4454,8 +4523,11 @@ written with the CPU.  The border and the diagonal are not decoration: a wrong
 line_length shears a vertical bar into a diagonal one and slides the border off the
 edge, which is the one display fault that looks like working hardware.
 
-It runs as mixdash.service's first ExecStartPre on every boot, for one second, and
-that makes it a handover signal:
+It runs from mixdash-probe.service, once per boot, for one second, and that makes it
+a handover signal.  Once per BOOT and not once per start attempt: as mixdash's own
+ExecStartPre it re-ran on every restart, so a dashboard that could not start painted
+the bars over its own error message three times before systemd gave up -- and under
+j36.gl=debug it re-initialised lima three times with it.
 
   bars, then the dashboard    both halves work
   bars that stay              mixdash never started -- read the journal, not the
@@ -5062,7 +5134,7 @@ fi
             fi
             if [[ -f $PAYREL/eglprobe ]]; then
                 echo "gl_probe=j36/eglprobe ($(stat -c %s $PAYREL/eglprobe) bytes, dynamic ARMv7, dlopens libEGL.so.1 and libgbm.so.1)"
-                echo "gl_probe_run=-f 1 as mixdash's first ExecStartPre on every boot; under j36.gl=debug also the node probes and -s with LIBGL_ALWAYS_SOFTWARE=1 as the control, replayed by ExecStopPost"
+                echo "gl_probe_run=-f 1 from mixdash-probe.service, Type=oneshot RemainAfterExit=yes, so once per boot and NOT once per mixdash start attempt; under j36.gl=debug that unit also runs the node probes and -s with LIBGL_ALWAYS_SOFTWARE=1 as the control, and mixdash replays the log from ExecStopPost. As mixdash's own ExecStartPre these re-ran on all three restarts, which meant three EGL inits on lima and the bars repainted over each attempt's error"
                 echo "gl_probe_fb=-f opens /dev/fb0 and nothing else: it counts the pixels already there (all black = nothing drew, a picture = something took the scanout), undoes a backlight at brightness 0 and a tty0 left in KD_GRAPHICS, then paints eight colour bars with the CPU. Bars then a dashboard = both halves work; bars that stay = mixdash never started; no bars = nothing userspace draws will be seen."
                 echo "gl_probe_nodes=-i names every /dev/dri node and says which one modesets; nothing here hard-codes card0 any more, because on this kernel card0 is lima and GETRESOURCES on it returns EOPNOTSUPP"
                 echo "gl_probe_paint=-p (five CPU and lima frames) and -c (a rotating cube, GLES2 through lima, page-flipped) are NOT run at boot: both modeset, and on close the kernel releases their framebuffer and disables the CRTC, which with CONFIG_DRM_FBDEV_EMULATION=n nothing re-enables -- so either one holds the panel until the next reboot. The 3D cube card starts -c on request, after asking twice."
@@ -5091,17 +5163,67 @@ fi
 # The image is still only patched, never created here -- build-r36-ultra.sh owns it.
 # With J36_RESUME_R36=0 and no previous image there is simply nothing to patch, and
 # this section says so and leaves the two artifacts for a manual copy.
-inject_into_image() {
-    local img part_json p1_start p1_size p2_start p2_size loop mnt fstype rc=0
+R36_STATE_ROOT="${DARKOS_R36_STATE_DIR:-$HOME/darkos-r36-state}"
 
-    img="$(ls -1t "$ROOT"/dArkOS_R36_ULTRA_GUI_BASE_*_*.img \
-                  "$ROOT"/dArkOS_RG351MP_FULL_*_*.img 2>/dev/null | head -n 1 || true)"
-    if [[ -z "$img" ]]; then
-        log "image: no dArkOS_*.img in $ROOT, so nothing to fold the payload into."
-        log "image: run the R36 base build first (J36_RESUME_R36=1) or copy sd-boot/"
-        log "image: and sd-root.tar.gz onto the card by hand."
-        return 0
+# Which state directory the base build last finished in.  Its `latest-image' names the
+# image and its `archive-verified' stamp is what has to be refreshed when this script
+# rewrites the archive -- see refresh_image_archive.  Found rather than recomputed: the
+# key is built from DEBIAN_RELEASE/USERSPACE_ARCH/BUILD_PROFILE in two other scripts and
+# a third copy of that expression here would be a third thing to keep in step.
+r36_state_dir() {
+    local d newest=""
+    for d in "$R36_STATE_ROOT"/*/; do
+        [[ -f "${d}latest-image" ]] || continue
+        if [[ -z "$newest" || "${d}latest-image" -nt "${newest}/latest-image" ]]; then
+            newest="${d%/}"
+        fi
+    done
+    printf '%s\n' "$newest"
+}
+
+# The base build's own record first, the mtime glob only as a fallback: after a layout
+# change there can be two images in this checkout -- the current one and the one kept as
+# `-old-layout' to flash meanwhile -- and newest-mtime is not the same question as which
+# one the base build considers finished.
+find_base_image() {
+    local state name
+    state="$(r36_state_dir)"
+    if [[ -n "$state" && -f "$state/latest-image" ]]; then
+        read -r name < "$state/latest-image"
+        if [[ -n "$name" && -f "$ROOT/$name" ]]; then
+            printf '%s\n' "$ROOT/$name"
+            return 0
+        fi
     fi
+    ls -1t "$ROOT"/dArkOS_R36_ULTRA_GUI_BASE_*_*.img \
+           "$ROOT"/dArkOS_RG351MP_FULL_*_*.img \
+           "$ROOT"/MixOS_*_*_*.img 2>/dev/null | head -n 1 || true
+}
+
+# What the injected image is a function of: the image it was injected into, and the two
+# payloads.  Recorded after a successful injection so a re-run that changes neither can
+# skip both the injection and the re-archive -- which is the whole cost of this section.
+# The image's own size and mtime are enough for the first half because injection is the
+# only thing that writes to it here, and the recorded value is read back after that
+# write; a base rebuild moves both.
+image_export_signature() {
+    local img="$1"
+    {
+        stat -c 'image %s %Y' "$img"
+        if [[ -f "$ARTIFACTS/sd-root.tar.gz" ]]; then
+            stat -c 'sd-root %s %Y' "$ARTIFACTS/sd-root.tar.gz"
+        else
+            echo "sd-root absent"
+        fi
+        find "$SDBOOT" -type f -printf 'sd-boot %P %s %T@\n' 2>/dev/null | sort
+    } | md5sum | cut -d' ' -f1
+}
+
+IMAGE_STAMP="$WORK/.image-export"
+
+inject_into_image() {
+    local img="$1" part_json p1_start p1_size p2_start p2_size loop mnt fstype rc=0
+
     log "image: folding both payloads into $(basename "$img")"
 
     # sfdisk -J and not the arithmetic from setup_partition.sh: those values live in
@@ -5209,13 +5331,112 @@ print(p[0]["start"], p[0]["size"], p[1]["start"], p[1]["size"])
     return $rc
 }
 
+# ── Rebuilding the archive the operator actually flashes ──────────────────────
+#
+# WHY THIS EXISTS.  Injecting into $ROOT/<image>.img was only half the job, and the
+# missing half is why a freshly flashed card still had no /opt/mixos and no
+# sd-root.tar.gz on BOOT.  The image never reaches the workstation.  What reaches it
+# is <image>.img.7z.001/.002, and those volumes are written by create_image.sh during
+# the BASE build's finalization -- which finishes before this script starts.  So the
+# operator was unpacking and flashing a snapshot of the image taken before the payload
+# went into it, every time, no matter how loudly the injection above reported success.
+#
+# The archive is therefore rewritten here, from the injected image, under the same name.
+# Same name and not a J36-specific one on purpose: `latest-image', the archive-verified
+# stamp and the artifact-copy stamps all key off it, and a second name would mean two
+# images in the artifact directory of which only one boots -- which is the mistake this
+# is fixing, not a fix for it.
+#
+# create_image.sh is reused rather than open-coded so the volume size and the 7z flags
+# stay defined in one place.  It skips an archive that already exists, hence the rm.
+refresh_image_archive() {
+    local img="$1" state base identity
+    base="$(basename "$img")"
+
+    if ! command -v 7z >/dev/null 2>&1; then
+        log "image: 7z is not installed in this VM, so the archive could not be rebuilt."
+        log "image: The volumes next to $base predate the payload -- do not flash them."
+        return 1
+    fi
+
+    log "image: rebuilding ${base}.7z.* from the injected image"
+    log "image: (this is the minutes-long step; J36_IMAGE_EXPORT=0 skips it and leaves"
+    log "image: sd-boot/ + sd-root.tar.gz as the update channel instead)"
+    rm -f "$img".7z.*
+    ( cd "$ROOT" && DISK="$base" BUILD_JOBS="$(nproc)" bash create_image.sh ) \
+        || { log "image: 7z failed; ${base}.7z.* is now missing or partial"; return 1; }
+    [[ -f "$img.7z.001" ]] || { log "image: 7z produced no volumes"; return 1; }
+
+    # The base build tests the archive it makes and caches that result by name, size and
+    # mtime of every volume (device/r36-ultra/verify_archive.sh).  These volumes are new,
+    # so the next resume would spend twenty minutes decompressing 8 GiB to re-test bytes
+    # 7z has just written and CRC'd itself.  Restamping says "these are the ones that
+    # were checked"; DARKOS_FORCE_ARCHIVE_VERIFY=1 still re-tests on demand.
+    state="$(r36_state_dir)"
+    if [[ -n "$state" ]]; then
+        identity="$(stat -c '%n %s %Y' "$img".7z.* | sort)"
+        printf '%s' "$identity" > "$state/archive-verified"
+        log "image: archive-verified restamped in $(basename "$state")"
+    fi
+    return 0
+}
+
 # Not fatal: the artifacts are complete either way, and a failure here costs the
 # operator a manual copy rather than the whole build.  It is loud, though.
-if ! inject_into_image; then
-    log "image: SOME OR ALL of the payload did not reach the image -- read the lines"
-    log "image: above.  sd-boot/ and sd-root.tar.gz are still in the artifacts and can"
-    log "image: be copied onto the card from a Linux machine."
+BASE_IMAGE="$(find_base_image)"
+IMAGE_EXPORT="${J36_IMAGE_EXPORT:-archive}"
+
+if [[ -z "$BASE_IMAGE" ]]; then
+    log "image: no base image in $ROOT, so nothing to fold the payload into."
+    log "image: run the R36 base build first (J36_RESUME_R36=1) or copy sd-boot/"
+    log "image: and sd-root.tar.gz onto the card by hand."
+elif [[ -f "$IMAGE_STAMP" ]] && \
+     [[ "$(cat "$IMAGE_STAMP")" == "$(image_export_signature "$BASE_IMAGE")" ]] && \
+     [[ "$IMAGE_EXPORT" == 0 || -f "$BASE_IMAGE.7z.001" ]]; then
+    log "image: $(basename "$BASE_IMAGE") already carries this exact payload and its"
+    log "image: archive matches it -- nothing to inject and nothing to re-archive."
+else
+    if ! inject_into_image "$BASE_IMAGE"; then
+        log "image: SOME OR ALL of the payload did not reach the image -- read the lines"
+        log "image: above.  sd-boot/ and sd-root.tar.gz are still in the artifacts and can"
+        log "image: be copied onto the card from a Linux machine."
+        rm -f "$IMAGE_STAMP"
+    elif [[ "$IMAGE_EXPORT" == 0 ]]; then
+        log "image: J36_IMAGE_EXPORT=0, so ${BASE_IMAGE##*/}.7z.* was NOT rebuilt and"
+        log "image: still predates the payload.  Update an already-flashed card by"
+        log "image: copying sd-boot/ (sd-root.tar.gz included) onto its BOOT partition."
+        rm -f "$IMAGE_STAMP"
+    elif refresh_image_archive "$BASE_IMAGE"; then
+        # Written last, and only now: the signature has to describe an image whose
+        # archive exists, or a run interrupted between the two would take the fast path
+        # above and hand over volumes that were never rebuilt.
+        image_export_signature "$BASE_IMAGE" > "$IMAGE_STAMP"
+    else
+        rm -f "$IMAGE_STAMP"
+    fi
 fi
+
+# What build-j36-ultra.sh copies to the workstation, and what it says while doing it.
+# Written even when there is no image, because "there is no flashable image" is the
+# thing the operator most needs told.
+{
+    if [[ -n "$BASE_IMAGE" && -f "$BASE_IMAGE.7z.001" ]]; then
+        printf 'image=%s\n' "$(basename "$BASE_IMAGE")"
+        printf 'volumes=%s\n' "$(ls -1 "$BASE_IMAGE".7z.* | wc -l)"
+        # in-image only when the stamp is there, and the stamp is written only after
+        # both the injection and the re-archive succeeded.  Anything else means the
+        # volumes on disk predate the payload and must not be handed over as if they
+        # did not: that is exactly the bug this section exists for.
+        if [[ -f "$IMAGE_STAMP" ]]; then
+            printf 'payload=in-image\n'
+        else
+            printf 'payload=stale\n'
+        fi
+    else
+        printf 'image=none\n'
+        printf 'payload=stale\n'
+    fi
+} > "$ARTIFACTS/flashable-image.txt"
 
 mkdir -p "$EXPORT_DIR"
 #
@@ -5233,5 +5454,5 @@ printf '  %s\n' \
     "$EXPORT_DIR/boot.img" \
     "$EXPORT_DIR/mt6592-j36-ultra.dtb" \
     "$EXPORT_DIR/j36_mt6592_input.ko" \
-    "$EXPORT_DIR/sd-boot/ (copy onto the BOOT partition)" \
+    "$EXPORT_DIR/sd-boot/ (copy onto the BOOT partition; already in the image too)" \
     "$EXPORT_DIR/manifest.txt"
