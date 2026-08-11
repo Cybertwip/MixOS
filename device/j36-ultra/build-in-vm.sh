@@ -3486,10 +3486,11 @@ initrd=initrd.img
 # and batt_led restarts forever on hardware this kernel does not describe.
 #
 # Every j36 word is removable on its own: delete one, or the matching directory
-# under j36/, and the boot carries straight on.  lima gives a render node, mtkdrm
-# gives a display node, gl puts Mesa where the loader finds it ahead of the RK3326
-# blob, dash runs the MixOS dashboard instead of EmulationStation, audio gives the
-# ALSA core and a sound card.  j36.doom=1 is gone: Doom is a dashboard card now.
+# under /opt/mixos/j36 on the OS partition, and the boot carries straight on.  lima
+# gives a render node, mtkdrm gives a display node, gl puts Mesa where the loader
+# finds it ahead of the RK3326 blob, dash runs the MixOS dashboard instead of
+# EmulationStation, audio gives the ALSA core and a sound card.  Only these four
+# files are on BOOT; the rest of the payload is in sd-root.tar.gz.
 #
 # j36.audio=speaker rather than =1 also powers the class-D amp: a second and
 # deliberate step, and it needs a cell fitted, because the amp hangs off VBAT --
@@ -3510,7 +3511,7 @@ CONF
 verify_armv7_kernel "$SDBOOT/zImage" "the SD payload kernel"
 
 cat > "$SDBOOT/README.txt" <<'README'
-J36 Ultra (MT6592, ARMv7) SD card BOOT payload.
+J36 Ultra (MT6592, ARMv7) SD card BOOT payload -- the launcher.
 
 Copy the contents of this directory into the root of the FAT partition labelled
 BOOT.  Existing files are not disturbed: an R36S card keeps its Image,
@@ -3521,32 +3522,53 @@ at the ARMv7 payload instead.
   mt6592-j36-ultra.dtb      the tree the LK loads separately and patches
   initrd.img                bring-up initramfs (busybox + the input module)
   mvii/boot.conf            filenames and command line for the MVII LK
-  j36/mfgpower              powers the Mali-450 and reads its ID back; the gate
-  j36/modules/              lima and its dependencies, plus load.order
-  j36/mtkdrm/               the MT6592 display driver set, plus load.order
-  j36/audio/                the ALSA core and the MT6592 AFE driver, plus load.order
-  j36/gl/                   Mesa's GL front end, plus links (vfat has no symlinks)
-  j36/eglprobe              -f reports and paints /dev/fb0 with no DRM at all and
-                            runs on every boot; the other modes say what can create
-                            a GL context, and why not, and whether a frame reaches
-                            the glass.  See "j36/eglprobe -f" below.
   LICENSE.txt               which licence covers which file above, and where the
                             GPL-2.0-only source is; keep it with the payload
 
-The shell is NOT on this partition.  sd-root.tar.gz beside this directory unpacks
-as /opt/mixos onto the second partition -- the dashboard, its Qt and its cards --
-because the Qt closure is 50 MB and BOOT is 64 MiB of vfat that also holds a
-kernel, a device tree and four module payloads.  ext4 or btrfs, not vfat: the
-payload is thirty-odd SONAME symlinks and vfat cannot hold one.  /init finds it on
-any partition of the card, read-only, and needs no keyboard to do it.
+That is the whole partition, and the shortness is the design.  The MVII LK reads
+FAT32 and nothing else, so BOOT exists because the loader has to be able to open
+it -- which makes it the launcher and only the launcher: the four files something
+other than Linux has to read.  Everything else went to the OS partition, which is
+ext2, and therefore holds symlinks and execute bits and is not a 100 MB partition
+an R36S card shares with its own boot files.
+
+THE OTHER HALF: sd-root.tar.gz, beside this directory.  Unpack it into the root of
+the OS partition -- the shared armhf Debian rootfs -- and it adds /opt/mixos and
+changes nothing else:
+
+  sudo tar -C /path/to/the/mounted/ROOTFS -xzf sd-root.tar.gz
+
+  opt/mixos/bin/mixdash    the dashboard: Qt5 Widgets straight into /dev/fb0
+  opt/mixos/qt/            Qt 5.15 and its runtime closure, ~30 SONAME symlinks
+  opt/mixos/bin/doom       framebuffer Doom, and share/doom/ its IWAD
+  opt/mixos/j36/mfgpower   powers the Mali-450 and reads its ID back; the gate
+  opt/mixos/j36/modules/   lima and its dependencies, plus load.order
+  opt/mixos/j36/mtkdrm/    the MT6592 display driver set, plus load.order
+  opt/mixos/j36/audio/     the ALSA core and the MT6592 AFE driver, plus load.order
+  opt/mixos/j36/gl/        Mesa's GL front end, plus links
+  opt/mixos/j36/eglprobe   -f reports and paints /dev/fb0 with no DRM at all and
+                           runs on every boot; the other modes say what can create
+                           a GL context, and why not, and whether a frame reaches
+                           the glass.  See "j36/eglprobe -f" below.
+
+A TARBALL AND NOT A DIRECTORY, on purpose: this payload's symlinks, modes and
+ownership are load-bearing -- the Qt SONAME aliases are symlinks, mfgpower and the
+probe have to stay executable -- and a tarball is the copy that cannot lose them
+whatever machine does the copying.  Unpack it as root.
+
+Everywhere below, "j36/..." means /opt/mixos/j36/... on that partition.  A card
+written by a build from before this layout has the same directory on BOOT instead,
+and /init looks there second and says which one it found, so such a card still
+boots -- but the tarball above is where new payloads go.
 
 EmulationStation is not part of these builds and is not started.  There is no
 j36/es/ directory any more.
 
 The R36S kernel on the same card is arm64 and stays there for the R36S.  The
 armhf Debian rootfs is shared, and this kernel can now mount it: MSDC1, the
-microSD host, is driven by mtk-sd through a mediatek,mt6592-mmc node, and btrfs
-and ext4 are both built in.  /init verifies a candidate partition by mounting it
+microSD host, is driven by mtk-sd through a mediatek,mt6592-mmc node, and ext2 --
+which is what the rootfs is -- is built in, along with ext4 and btrfs for the
+cards earlier builds wrote.  /init verifies a candidate partition by mounting it
 read-only and looking for /sbin/init, then switch_roots into it.  If nothing
 qualifies -- or if you delete root= from mvii/boot.conf -- it stops at a busybox
 shell on the panel and on the serial port instead, and prints /proc/partitions so
@@ -3614,16 +3636,13 @@ rdinit=/init root=/dev/mmcblk0p2 rw rootwait
     See above: /init does the mounting, so root= cannot panic the kernel.
 
 j36.doom=1
-    Does nothing on this card: j36/doom and its IWAD are not built and not staged
-    any more.  They proved the panel and the pad before there was a GPU stack to
-    prove them with, and EmulationStation on mtk_drm + lima now proves the same
-    thing further along -- so the BOOT partition carries the boot payload and not
-    a game.  /init still reads the word and still runs j36/doom if it is there, so
-    rebuilding with J36_DOOM=1 (or copying a static doomgeneric and any IWAD
-    d_iwad.c knows into j36/ by hand) brings it back unchanged.  It is still the
-    quickest thing to reach for when the GL path breaks: Doom needs no DRM, no GL
-    and no rootfs, so if Doom draws and ES does not, the panel is fine and the
-    fault is above it.
+    Gone.  /init does not read this word any more and there is nothing on BOOT for
+    it to run: a J36_DOOM=1 build stages doomgeneric and its IWAD as
+    /opt/mixos/bin/doom and /opt/mixos/share/doom on the OS partition, and the
+    dashboard's Doom card launches them -- after the boot, from a shell, rather than
+    in the middle of an initramfs.  It is still the quickest thing to reach for when
+    the GL path breaks: Doom needs no DRM and no GL, so if Doom draws and the cube
+    does not, the panel is fine and the fault is above it.
 
 j36.lima=1
     Power the Mali-450 and load the DRM lima driver, in that order and only in
