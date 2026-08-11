@@ -296,8 +296,14 @@ ensure_rootfs_mounts() {
     mkdir -p Arkbuild
     if ! mountpoint -q Arkbuild; then
         log "Remounting the preserved $ROOT_FILESYSTEM_FORMAT build root"
+        # Fatal, and it was not before.  An unchecked failure here leaves Arkbuild as an
+        # ordinary directory on the VM's own disk, and everything below -- the bind
+        # mounts, debootstrap, every chroot stage -- then builds Debian into the build
+        # machine while `mark partition' records the stage as done.  The image that comes
+        # out has an empty OS partition, which is the shape of the bug that shipped.
         sudo mount -t "$ROOT_FILESYSTEM_FORMAT" -o "$ROOT_FILESYSTEM_MOUNT_OPTIONS",loop \
-            "$FILESYSTEM" Arkbuild
+            "$FILESYSTEM" Arkbuild || \
+            fail "Could not mount $FILESYSTEM as $ROOT_FILESYSTEM_FORMAT -- if this build root predates the ext2 layout, delete it and $ROOTFS_SNAPSHOT and run again"
     fi
     sudo mkdir -p Arkbuild/{dev/pts,proc,sys}
     mountpoint -q Arkbuild/dev || sudo mount --bind /dev Arkbuild/dev
@@ -425,6 +431,89 @@ verify_gui_architecture() {
     fi
     log "Verified ${USERSPACE_ARCH} EmulationStation GUI binary"
 }
+
+# ── A build root left over from the previous filesystem layout ────────────────
+#
+# ROOT_FILESYSTEM_FORMAT went from btrfs to ext2, because the MVII LK on the J36 Ultra
+# reads FAT32 only and the OS partition has to be the simplest filesystem both kernels
+# on the card can mount.  A build root made under the old value cannot be resumed from,
+# and every way that goes wrong is silent:
+#
+#   * ensure_rootfs_mounts mounts it with -t $ROOT_FILESYSTEM_FORMAT, so the mount
+#     fails outright while `mark partition' just above records the stage as done.  The
+#     build then walks into an unmounted Arkbuild and packages an image with no
+#     userspace in it.
+#   * write_rootfs.sh dds this very file into the image, so the image's p2 keeps the
+#     old format no matter what these variables say.
+#   * finishing_touches.sh writes /etc/fstab from $ROOT_FILESYSTEM_FORMAT, so a
+#     half-migrated card ends up claiming ext2 for a btrfs partition.
+#
+# There is no shortcut: Debian is unpacked again, 30-60 minutes for the GUI profile.
+# The snapshot goes too -- it is a copy of the same wrong filesystem, and leaving it
+# would have restore_rootfs_snapshot put it straight back a few lines below.
+#
+# The finished image and archive of the old layout are LEFT ALONE, and the build date
+# is reset so the rebuild takes a new name beside them.  They are the only flashable
+# card the operator has until this finishes, and deleting that to save a few gigabytes
+# would be the wrong trade.
+discard_foreign_format_rootfs() {
+    local target have keep part stale_loop
+    for target in "$FILESYSTEM" "$ROOTFS_SNAPSHOT"; do
+        [[ -s "$target" ]] || continue
+        have="$(sudo blkid -o value -s TYPE "$target" 2>/dev/null || true)"
+        # No answer at all is not a mismatch: an image mid-write has no superblock yet,
+        # and the stages below already handle a build root they cannot mount.
+        [[ -n "$have" ]] || continue
+        [[ "$have" != "$ROOT_FILESYSTEM_FORMAT" ]] || continue
+
+        log "$(basename "$target") is $have and this build makes $ROOT_FILESYSTEM_FORMAT"
+        log "Discarding the old build root; Debian will be unpacked again, which is the"
+        log "only way the image's OS partition changes format"
+        mountpoint -q Arkbuild && remove_arkbuild
+        # remove_arkbuild unmounts lazily, so a loop device can still be holding the
+        # image after the umount returns.  Detach it before the file goes: otherwise
+        # losetup keeps the unlinked inode alive and clear_foreign_rootfs_mount below
+        # compares the new build root against a loop that points at a deleted one.
+        while read -r stale_loop; do
+            [[ -n "$stale_loop" ]] && sudo losetup -d "$stale_loop" 2>/dev/null || true
+        done < <(sudo losetup -j "$ROOT/$FILESYSTEM" 2>/dev/null | cut -d: -f1)
+        sudo rm -f "$FILESYSTEM" "$FILESYSTEM.part" \
+                   "$ROOTFS_SNAPSHOT" "$ROOTFS_SNAPSHOT.part"
+        rm -f "$STATE_DIR"/partition.done "$STATE_DIR"/bootstrap.done \
+              "$STATE_DIR"/userspace.done "$STATE_DIR"/finalization.done \
+              "$STATE_DIR"/complete.done "$STATE_DIR"/image.done \
+              "$STATE_DIR"/component-*.done
+
+        # A fresh date, so the rebuilt image sits beside the old one instead of
+        # inheriting its name -- and so the "existing completed archive" check further
+        # down does not find the old layout's archive under the new layout's name and
+        # exit satisfied without building anything.
+        rm -f "$STATE_DIR/build-date"
+        BUILD_DATE="$(date +%m%d%Y)"
+        printf '%s\n' "$BUILD_DATE" > "$STATE_DIR/build-date"
+        DISK="${IMAGE_PREFIX}_${DEBIAN_CODE_NAME}_${BUILD_DATE}.img"
+        export BUILD_DATE DISK
+
+        # If the old layout was built today the new name collides with it, and the
+        # "existing completed archive" check further down would find ${DISK}.7z.001,
+        # verify it and exit 0 -- the exact failure this function exists to stop.  Move
+        # the old output aside rather than delete it: it is still the only card the
+        # operator can flash until this build finishes, and now it says what it is.
+        if [[ -f "$DISK" || -f "${DISK}.7z.001" ]]; then
+            keep="${DISK%.img}-btrfs-layout"
+            log "An image from today already exists under that name; keeping it as ${keep}.img"
+            [[ -f "$DISK" ]] && mv -f "$DISK" "${keep}.img"
+            for part in "${DISK}".7z.*; do
+                [[ -e "$part" ]] || continue
+                mv -f "$part" "${keep}.img.${part##*.img.}"
+            done
+        fi
+        log "The rebuilt image will be $DISK; the old one is still there to flash meanwhile"
+        return 0
+    done
+    return 0
+}
+discard_foreign_format_rootfs
 
 # A GUI-only and a full-app build use different filesystem/image names.  Make
 # sure a mount left by the other profile cannot contaminate this build.
