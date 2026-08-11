@@ -951,23 +951,24 @@ while : ; do
     sleep 1
 done
 
-# ── Optional payloads on the FAT BOOT partition ──────────────────────────────
+# ── Optional payloads: modules, mfgpower, Mesa, the probe ────────────────────
 #
-# Two of them now -- Doom and the Mali/lima bring-up -- and both are run here,
-# after the wait loop and before the hand-over, for the same two reasons: the card
-# is known to be up by now, and nothing of the rootfs is mounted yet, so systemd,
-# journald and the RK3326 units are not competing for the panel.  Neither payload
-# lives in this initramfs; see the fbdoom section of build-in-vm.sh for why.
+# All of them are run here, after the wait loop and before the hand-over, for the
+# same two reasons: the card is known to be up by now, and nothing of the rootfs
+# has started yet, so systemd, journald and the RK3326 units are not competing for
+# the panel.  None of them lives in this initramfs; see build-in-vm.sh for why.
 #
-# The partition is found the way try_root() finds the rootfs: by mounting
-# candidates and looking inside, because partition numbering follows whichever
-# MMC host attached first and this initramfs has no blkid.  Read-only, since
-# nothing here writes to the card.  vfat gives every file mode 0755, so anything
-# on it is executable straight off the mount.
+# WHERE THEY COME FROM.  The OS partition, at /opt/mixos/j36 -- and it is already
+# mounted, because find_root above mounted it as /newroot to switch into.  So the
+# usual answer needs no mount, no scan and no filesystem guess at all, and it comes
+# off a filesystem that holds symlinks and execute bits.
 #
-# The probe looks for the j36 DIRECTORY and not for one file in it, so that a card
-# carrying only the lima payload and a card carrying only Doom are found by the
-# same code.  It runs at most once even when both are asked for.
+# The FAT BOOT partition is the fallback and only the fallback: a card written by a
+# build from before this layout has its payload there, and the two-line search below
+# is the whole cost of not breaking it.  BOOT itself is still found the way
+# try_root() finds the rootfs -- by mounting candidates and looking inside, because
+# partition numbering follows whichever MMC host attached first and this initramfs
+# has no blkid.  Read-only, since nothing here writes to the card.
 bootfs_mounted=0
 # Remembered so that the data-partition automount below can leave the BOOT partition
 # alone: it is already reachable, it is the one partition the operator edits from a
@@ -979,7 +980,11 @@ mount_bootfs() {
     for dev in /dev/mmcblk*p*; do
         if [ ! -b "$dev" ]; then continue; fi
         if ! mount -t vfat -o ro "$dev" /bootfs 2>/dev/null; then continue; fi
-        if [ -d /bootfs/j36 ]; then
+        # mvii/ identifies it now, not j36/: boot.conf is the file the LK itself
+        # reads and the one thing BOOT always carries, whereas j36/ is exactly what
+        # moved off this partition.  j36/ is still accepted, because on a card from
+        # an older build that is what is there.
+        if [ -d /bootfs/mvii ] || [ -d /bootfs/j36 ]; then
             bootfs_mounted=1
             bootdev="$dev"
             say "boot partition: $dev"
@@ -987,7 +992,29 @@ mount_bootfs() {
         fi
         umount /bootfs
     done
-    say "no FAT partition on this card carries a j36/ directory"
+    say "no FAT partition on this card carries mvii/ or j36/"
+    return 1
+}
+
+# Set once, read by run_lima, run_mtkdrm, run_audio and setup_es_gl.  Empty means
+# "not looked for yet"; find_payload is called by each of them and is idempotent.
+payload=""
+find_payload() {
+    if [ -n "$payload" ]; then return 0; fi
+    if [ -d /newroot/opt/mixos/j36 ]; then
+        payload=/newroot/opt/mixos/j36
+        say "payload: /opt/mixos/j36 in the rootfs"
+        return 0
+    fi
+    # Second, and said out loud, because a payload found on BOOT means the card was
+    # written by an older build: it still works, and the person holding it should know
+    # which half of the card their next sd-root.tar.gz has to go onto.
+    if mount_bootfs && [ -d /bootfs/j36 ]; then
+        payload=/bootfs/j36
+        say "payload: j36/ on the BOOT partition (an older layout; it still works)"
+        return 0
+    fi
+    say "payload: no j36/ in the rootfs /opt/mixos and none on the BOOT partition"
     return 1
 }
 
@@ -1018,15 +1045,16 @@ mount_bootfs() {
 # fatal: a module that is already built in returns EEXIST-ish noise, and the boot
 # should continue either way.
 run_lima() {
-    if [ ! -x /bootfs/j36/mfgpower ]; then
+    if ! find_payload; then return 1; fi
+    if [ ! -x "$payload/mfgpower" ]; then
         say "lima: j36.lima was asked for but j36/mfgpower is not on the card"
         return 1
     fi
-    if [ ! -f /bootfs/j36/modules/load.order ]; then
+    if [ ! -f "$payload/modules/load.order" ]; then
         say "lima: j36/modules/load.order is missing; nothing to load"
         return 1
     fi
-    /bootfs/j36/mfgpower >/tmp/mfgpower.log 2>&1
+    "$payload/mfgpower" >/tmp/mfgpower.log 2>&1
     rc=$?
     show /tmp/mfgpower.log
     if [ "$rc" != 0 ]; then
@@ -1035,13 +1063,13 @@ run_lima() {
     fi
     while IFS= read -r ko; do
         case "$ko" in ''|'#'*) continue ;; esac
-        if insmod "/bootfs/j36/modules/$ko" >/tmp/insmod.log 2>&1; then
+        if insmod "$payload/modules/$ko" >/tmp/insmod.log 2>&1; then
             say "lima: loaded $ko"
         else
             say "lima: FAILED to load $ko"
             show /tmp/insmod.log
         fi
-    done < /bootfs/j36/modules/load.order
+    done < "$payload/modules/load.order"
     say "DRM devices:"
     ls -l /dev/dri 2>/dev/null || say "  none"
     return 0
@@ -1072,19 +1100,20 @@ run_lima() {
 # four loaded.  If /dev/dri stays empty after this, that is the first thing dmesg
 # will say.
 run_mtkdrm() {
-    if [ ! -f /bootfs/j36/mtkdrm/load.order ]; then
+    if ! find_payload; then return 1; fi
+    if [ ! -f "$payload/mtkdrm/load.order" ]; then
         say "mtkdrm: j36.mtkdrm was asked for but j36/mtkdrm/load.order is not on the card"
         return 1
     fi
     while IFS= read -r ko; do
         case "$ko" in ''|'#'*) continue ;; esac
-        if insmod "/bootfs/j36/mtkdrm/$ko" >/tmp/insmod.log 2>&1; then
+        if insmod "$payload/mtkdrm/$ko" >/tmp/insmod.log 2>&1; then
             say "mtkdrm: loaded $ko"
         else
             say "mtkdrm: FAILED to load $ko"
             show /tmp/insmod.log
         fi
-    done < /bootfs/j36/mtkdrm/load.order
+    done < "$payload/mtkdrm/load.order"
     say "DRM devices:"
     ls -l /dev/dri 2>/dev/null || say "  none"
     return 0
@@ -1107,7 +1136,8 @@ run_mtkdrm() {
 # The speaker parameter is passed as a module parameter and not compiled in, so
 # the same .ko serves both words.
 run_audio() {
-    if [ ! -f /bootfs/j36/audio/load.order ]; then
+    if ! find_payload; then return 1; fi
+    if [ ! -f "$payload/audio/load.order" ]; then
         say "audio: j36.audio was asked for but j36/audio/load.order is not on the card"
         return 1
     fi
@@ -1117,13 +1147,13 @@ run_audio() {
         if [ "$audio_speaker" = 1 ]; then
             case "$ko" in j36_mt6592_audio.ko) params="speaker=1" ;; esac
         fi
-        if insmod "/bootfs/j36/audio/$ko" $params >/tmp/insmod.log 2>&1; then
+        if insmod "$payload/audio/$ko" $params >/tmp/insmod.log 2>&1; then
             say "audio: loaded $ko $params"
         else
             say "audio: FAILED to load $ko"
             show /tmp/insmod.log
         fi
-    done < /bootfs/j36/audio/load.order
+    done < "$payload/audio/load.order"
     if [ -d /dev/snd ]; then
         say "sound devices:"
         ls -l /dev/snd 2>/dev/null
@@ -1199,7 +1229,8 @@ gl_ready=0
 probe_ready=0
 
 setup_es_gl() {
-    if [ ! -f /bootfs/j36/gl/links ]; then
+    if ! find_payload; then return 1; fi
+    if [ ! -f "$payload/gl/links" ]; then
         say "gl: j36.gl was asked for but j36/gl/ is not on the card"
         return 1
     fi
@@ -1215,7 +1246,11 @@ setup_es_gl() {
 
     mkdir -p /newroot/run/j36/gl
     staged=0
-    for so in /bootfs/j36/gl/*.so*; do
+    # cp and not a bind mount, even now that the payload is on a filesystem that could
+    # be bind-mounted: /run/j36/gl is a tmpfs the rootfs adopts, and the point of it is
+    # that nothing here depends on the payload partition still being reachable -- or
+    # writable, or unmounted cleanly -- once systemd is running.
+    for so in "$payload"/gl/*.so*; do
         [ -f "$so" ] || continue
         if cp "$so" /newroot/run/j36/gl/; then
             staged=$((staged + 1))
@@ -1223,13 +1258,14 @@ setup_es_gl() {
             say "es: could not copy $so"
         fi
     done
-    # The links file stands in for symlinks vfat cannot store: "name target", one
+    # The links file stands in for the symlinks vfat cannot store: "name target", one
     # pair per line, targets relative to this directory except libEGL.so's, which
-    # is a plain filename too.
+    # is a plain filename too.  Read whichever partition the payload came off, because
+    # a card written before the payload moved has it on the vfat one.
     while read -r name target; do
         case "$name" in ''|'#'*) continue ;; esac
         ln -sf "$target" "/newroot/run/j36/gl/$name"
-    done < /bootfs/j36/gl/links
+    done < "$payload/gl/links"
 
     # ── The GLES 2.0 EmulationStation ────────────────────────────────────────────
     #
@@ -1266,9 +1302,9 @@ setup_es_gl() {
         # a mount over a file on the shared rootfs that nothing will open is still a
         # mount somebody would have to explain.
         say "es: j36.dash=1, so the GLES 2.0 EmulationStation is not staged at all"
-    elif [ -f /bootfs/j36/es/emulationstation ]; then
+    elif [ -f "$payload/es/emulationstation" ]; then
         mkdir -p /newroot/run/j36/es
-        if cp /bootfs/j36/es/emulationstation /newroot/run/j36/es/emulationstation; then
+        if cp "$payload/es/emulationstation" /newroot/run/j36/es/emulationstation; then
             chmod 0755 /newroot/run/j36/es/emulationstation
             if [ ! -f /newroot/usr/bin/emulationstation/emulationstation ]; then
                 say "es: the rootfs has no emulationstation to mount over"
@@ -1290,8 +1326,8 @@ setup_es_gl() {
     # The EGL probe rides in beside the libraries, not among them: /run/j36/gl is
     # a loader search path and a binary in it would be a name ld.so has to skip.
     # It is only ever run by the j36.es=debug drop-in below.
-    if [ -f /bootfs/j36/eglprobe ]; then
-        if cp /bootfs/j36/eglprobe /newroot/run/j36/eglprobe; then
+    if [ -f "$payload/eglprobe" ]; then
+        if cp "$payload/eglprobe" /newroot/run/j36/eglprobe; then
             chmod 0755 /newroot/run/j36/eglprobe
             probe_ready=1
             # The drop-in tees the probe's output to a file so ExecStopPost can
@@ -1955,20 +1991,33 @@ UNITNOTICE
 
 if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || \
    [ "$want_gl" = 1 ] || [ "$want_audio" = 1 ]; then
-    if mount_bootfs; then
-        # lima first: it is the one payload with a hardware gate in front of it, and
-        # nothing else should be loaded if the MFG domain does not come up.  mtkdrm
-        # after it, so that if it does disturb the panel the thing that was already
-        # proved has already run.  Audio next: it touches nothing the others touch,
-        # and it has to be in place before systemd looks for a controlC0 to restore
-        # into.  The GL front end last, because it is the only one of the four that
-        # is not finished when this script ends -- it is a message to systemd, and
-        # systemd has not started yet.
-        if [ "$want_lima" = 1 ]; then run_lima; fi
-        if [ "$want_mtkdrm" = 1 ]; then run_mtkdrm; fi
-        if [ "$want_audio" = 1 ]; then run_audio; fi
-        if [ "$want_gl" = 1 ]; then setup_es_gl; fi
-        umount /bootfs
+    # find_payload is called by each of the four rather than once here, so that a card
+    # with no payload at all gets one message per word that was asked for, naming the
+    # word -- and so that this block does not have to know which of them needs what.
+    #
+    # lima first: it is the one payload with a hardware gate in front of it, and
+    # nothing else should be loaded if the MFG domain does not come up.  mtkdrm
+    # after it, so that if it does disturb the panel the thing that was already
+    # proved has already run.  Audio next: it touches nothing the others touch,
+    # and it has to be in place before systemd looks for a controlC0 to restore
+    # into.  The GL front end last, because it is the only one of the four that
+    # is not finished when this script ends -- it is a message to systemd, and
+    # systemd has not started yet.
+    if [ "$want_lima" = 1 ]; then run_lima; fi
+    if [ "$want_mtkdrm" = 1 ]; then run_mtkdrm; fi
+    if [ "$want_audio" = 1 ]; then run_audio; fi
+    if [ "$want_gl" = 1 ]; then setup_es_gl; fi
+    # Only if the fallback was taken.  Everything above has been copied into the
+    # rootfs's /run or insmod'ed, so nothing still reads this mount -- and leaving a
+    # vfat mount for switch_root to carry across is a mount systemd would inherit and
+    # nobody would own.  The payload in the rootfs needs no counterpart: that is the
+    # partition being switched into.
+    if [ "$bootfs_mounted" = 1 ]; then
+        umount /bootfs 2>/dev/null
+        bootfs_mounted=0
+        # Cleared with the mount, so that nothing added after this line can find a
+        # path under /bootfs that is no longer there.
+        case "$payload" in /bootfs/*) payload="" ;; esac
     fi
 fi
 
@@ -3256,7 +3305,7 @@ else
     log "es: J36_ES_BUILD=0, EmulationStation is not built (the dashboard replaces it)"
 fi
 
-# ── The SD BOOT payload ───────────────────────────────────────────────────────
+# ── The SD BOOT payload: the launcher, and nothing else ───────────────────────
 #
 # Copy this tree onto the FAT partition labelled BOOT and the MVII LK boots the
 # card instead of the eMMC.  /mvii/boot.conf is written because an R36S card
@@ -3268,40 +3317,72 @@ fi
 # Load addresses are deliberately absent.  They are the LK's business -- it knows
 # this SoC's DRAM map and the address of the framebuffer the DTB hands to
 # simple-framebuffer -- and boot.conf can only get them wrong.
+#
+# WHAT BELONGS HERE, AND WHY THAT IS NOW A SHORT LIST.  The MVII LK reads FAT32 and
+# nothing else, so BOOT exists because the loader has to be able to read it -- which
+# makes it the launcher and only the launcher: zImage, the device tree, initrd.img and
+# boot.conf, the four files something other than Linux has to open.  Everything the
+# LK never touches went to the OS partition, which is ext2 and therefore holds symlinks
+# and execute bits and is not a 100 MB partition an R36S card shares with its own boot
+# files.  vfat's own limits stop being anything to work around at that point: the GL
+# payload's `links' file existed because vfat cannot hold a symlink, and it stays only
+# because a card written by an older build still has its payload on BOOT.
 log "Staging the SD card BOOT payload"
 SDBOOT="$ARTIFACTS/sd-boot"
 rm -rf "$SDBOOT"
 mkdir -p "$SDBOOT/mvii"
+
+# The OS-partition tree, declared here because the j36/ payload below now goes into it
+# and the staging has to be able to write to it before the /opt/mixos section further
+# down fills in the dashboard.  One rm -rf, at the top, for the same reason.
+SDROOT="$ARTIFACTS/sd-root"
+rm -rf "$SDROOT" "$ARTIFACTS/sd-root.tar.gz"
+
+# WHERE THE j36/ PAYLOAD GOES.  Modules, mfgpower, the Mesa front end and the probe are
+# read by /init, never by the LK, so BOOT is the wrong partition for them: it is the
+# small vfat one, and vfat costs the payload its symlinks and its modes.  They live in
+# the OS partition's /opt/mixos/j36 now, which /init reaches through the rootfs it has
+# already mounted -- one mount fewer, and the same tarball that carries the dashboard.
+#
+# J36_PAYLOAD_ON=boot puts them back on BOOT.  That is not symmetry for its own sake:
+# /init still looks there second, so a card written by an earlier build keeps working,
+# and this switch is how that path stays buildable and testable instead of becoming
+# code nothing exercises.
+PAYLOAD_ON="${J36_PAYLOAD_ON:-root}"
+case "$PAYLOAD_ON" in
+    root) PAYDIR="$SDROOT/opt/mixos/j36"; PAYREL="sd-root/opt/mixos/j36" ;;
+    boot) PAYDIR="$SDBOOT/j36";           PAYREL="sd-boot/j36" ;;
+    *)    die "J36_PAYLOAD_ON must be root or boot, not $PAYLOAD_ON" ;;
+esac
+log "payload: j36/ goes to $PAYREL (J36_PAYLOAD_ON=$PAYLOAD_ON)"
 cp "$ZIMAGE" "$SDBOOT/zImage"
 cp "$DTB_OUT/mt6592-j36-ultra.dtb" "$SDBOOT/"
 cp "$ARTIFACTS/initramfs-j36-ultra.cpio.gz" "$SDBOOT/initrd.img"
 
-# j36/ is read by /init, not by the LK, so nothing here goes through a load
-# window and nothing here has a size limit worth worrying about.  Delete a directory
-# under it on the card and the boot is exactly what it was before -- /init says so and
-# carries on.
+# $PAYDIR from here down, which is opt/mixos/j36 in the OS partition unless
+# J36_PAYLOAD_ON=boot.  Everything in it is read by /init, never by the LK, so nothing
+# here goes through a load window and nothing here has a size limit worth worrying
+# about.  Delete a directory under it on the card and the boot is exactly what it was
+# before -- /init says so and carries on.
 #
-# What is deliberately NOT here any more is Doom and its IWAD.  This is a small vfat
-# partition that an R36S card shares with its own kernel, initrd and device trees, and
-# 26 MiB of game on it was 26 MiB the boot payload might need.  Doom moved to the
-# second partition with the dashboard; see the sd-root payload below.
+# Doom and its IWAD are in the same partition, under opt/mixos/bin and
+# opt/mixos/share; see the /opt/mixos section below.  They were on BOOT once, and 26 MiB
+# of game on the launcher partition is what started the move that this whole layout
+# finished.
 
 # Remove j36/mfgpower or j36/modules and j36.lima=1 finds nothing, says so, and the
 # boot continues.  load.order is written from the walk above, one module per line in
 # the order insmod needs them.
-# j36/mfgpower or j36/modules and j36.lima=1 finds nothing, says so, and the boot
-# continues.  load.order is written from the walk above, one module per line in
-# the order insmod needs them.
 if [[ -n "$MFGPOWER_BIN" && ${#LIMA_MODULE_ORDER[@]} -gt 0 ]]; then
-    mkdir -p "$SDBOOT/j36/modules"
-    cp "$MFGPOWER_BIN" "$SDBOOT/j36/mfgpower"
-    chmod 0755 "$SDBOOT/j36/mfgpower"
-    : > "$SDBOOT/j36/modules/load.order"
+    mkdir -p "$PAYDIR/modules"
+    cp "$MFGPOWER_BIN" "$PAYDIR/mfgpower"
+    chmod 0755 "$PAYDIR/mfgpower"
+    : > "$PAYDIR/modules/load.order"
     for i in "${!LIMA_MODULE_ORDER[@]}"; do
-        cp "${LIMA_MODULE_PATHS[$i]}" "$SDBOOT/j36/modules/${LIMA_MODULE_ORDER[$i]}"
-        printf '%s\n' "${LIMA_MODULE_ORDER[$i]}" >> "$SDBOOT/j36/modules/load.order"
+        cp "${LIMA_MODULE_PATHS[$i]}" "$PAYDIR/modules/${LIMA_MODULE_ORDER[$i]}"
+        printf '%s\n' "${LIMA_MODULE_ORDER[$i]}" >> "$PAYDIR/modules/load.order"
     done
-    log "lima: staged ${#LIMA_MODULE_ORDER[@]} modules and mfgpower into j36/"
+    log "lima: staged ${#LIMA_MODULE_ORDER[@]} modules and mfgpower into $PAYREL/"
 fi
 
 # j36/mtkdrm/ is the display set, in its own directory and with its own load.order
@@ -3310,11 +3391,11 @@ fi
 # whole mtk_drm experiment off the card and leaves the lima payload exactly as it
 # was; j36.mtkdrm=1 then finds nothing, says so, and the boot carries on.
 if (( ${#MTKDRM_MODULE_ORDER[@]} > 0 )); then
-    mkdir -p "$SDBOOT/j36/mtkdrm"
-    : > "$SDBOOT/j36/mtkdrm/load.order"
+    mkdir -p "$PAYDIR/mtkdrm"
+    : > "$PAYDIR/mtkdrm/load.order"
     for i in "${!MTKDRM_MODULE_ORDER[@]}"; do
-        cp "${MTKDRM_MODULE_PATHS[$i]}" "$SDBOOT/j36/mtkdrm/${MTKDRM_MODULE_ORDER[$i]}"
-        printf '%s\n' "${MTKDRM_MODULE_ORDER[$i]}" >> "$SDBOOT/j36/mtkdrm/load.order"
+        cp "${MTKDRM_MODULE_PATHS[$i]}" "$PAYDIR/mtkdrm/${MTKDRM_MODULE_ORDER[$i]}"
+        printf '%s\n' "${MTKDRM_MODULE_ORDER[$i]}" >> "$PAYDIR/mtkdrm/load.order"
     done
     log "mtkdrm: staged ${#MTKDRM_MODULE_ORDER[@]} modules into j36/mtkdrm/"
 fi
@@ -3327,25 +3408,27 @@ fi
 # which is the system node, and a board with no cell fitted cannot hold it up.
 # Removing this directory is the recovery, from any machine that reads SD cards.
 if (( ${#AUDIO_MODULE_ORDER[@]} > 0 )); then
-    mkdir -p "$SDBOOT/j36/audio"
-    : > "$SDBOOT/j36/audio/load.order"
+    mkdir -p "$PAYDIR/audio"
+    : > "$PAYDIR/audio/load.order"
     for i in "${!AUDIO_MODULE_ORDER[@]}"; do
-        cp "${AUDIO_MODULE_PATHS[$i]}" "$SDBOOT/j36/audio/${AUDIO_MODULE_ORDER[$i]}"
-        printf '%s\n' "${AUDIO_MODULE_ORDER[$i]}" >> "$SDBOOT/j36/audio/load.order"
+        cp "${AUDIO_MODULE_PATHS[$i]}" "$PAYDIR/audio/${AUDIO_MODULE_ORDER[$i]}"
+        printf '%s\n' "${AUDIO_MODULE_ORDER[$i]}" >> "$PAYDIR/audio/load.order"
     done
     log "audio: staged ${#AUDIO_MODULE_ORDER[@]} modules into j36/audio/"
 fi
 
-# j36/gl/ is the GL front end plus the links file that stands in for the symlinks
-# vfat cannot hold. Same removal contract as the other three: delete the directory
-# and j36.es=1 finds nothing, says so, and EmulationStation starts against the
-# rootfs's own libraries exactly as it does today -- which is to say against the
-# RK3326 blob, and fails, which is the behaviour this replaces.
+# j36/gl/ is the GL front end plus the links file that stands in for symlinks.  On the
+# OS partition it no longer has to -- ext2 holds symlinks -- and it is kept anyway
+# because /init reads the same file whichever partition the payload came off, and one
+# code path that works in both places beats two that each work in one.  Same removal
+# contract as the other three: delete the directory and j36.gl=1 finds nothing, says
+# so, and the boot carries on against the rootfs's own libraries, which is to say
+# against the RK3326 Mali blob -- the behaviour this payload replaces.
 if [[ -n "$GL_PAYLOAD" ]]; then
-    mkdir -p "$SDBOOT/j36/gl"
-    cp "$GL_PAYLOAD"/*.so* "$SDBOOT/j36/gl/"
-    cp "$GL_PAYLOAD/links" "$SDBOOT/j36/gl/links"
-    log "gl: staged $(ls -1 "$SDBOOT/j36/gl" | wc -l) files into j36/gl/"
+    mkdir -p "$PAYDIR/gl"
+    cp "$GL_PAYLOAD"/*.so* "$PAYDIR/gl/"
+    cp "$GL_PAYLOAD/links" "$PAYDIR/gl/links"
+    log "gl: staged $(ls -1 "$PAYDIR/gl" | wc -l) files into $PAYREL/gl/"
 fi
 
 # The probe sits beside the payload rather than inside j36/gl/, because that
@@ -3353,9 +3436,10 @@ fi
 # a library. j36.es=debug runs it; j36.es=1 never touches it. Deleting it is the
 # same contract as the rest: the debug boot simply loses this report.
 if [[ -n "$ESPROBE_BIN" ]]; then
-    cp "$ESPROBE_BIN" "$SDBOOT/j36/eglprobe"
-    chmod 0755 "$SDBOOT/j36/eglprobe"
-    log "gl: staged j36/eglprobe ($(stat -c %s "$SDBOOT/j36/eglprobe") bytes)"
+    mkdir -p "$PAYDIR"
+    cp "$ESPROBE_BIN" "$PAYDIR/eglprobe"
+    chmod 0755 "$PAYDIR/eglprobe"
+    log "gl: staged $PAYREL/eglprobe ($(stat -c %s "$PAYDIR/eglprobe") bytes)"
 fi
 
 # j36/es/ is the GLES 2.0 EmulationStation, and it is the one payload here that
@@ -3369,10 +3453,10 @@ fi
 # deleted to go back to the old behaviour is a directory a reader can see the
 # purpose of.
 if [[ -n "$ES_BIN" ]]; then
-    mkdir -p "$SDBOOT/j36/es"
-    cp "$ES_BIN" "$SDBOOT/j36/es/emulationstation"
-    chmod 0755 "$SDBOOT/j36/es/emulationstation"
-    log "es: staged j36/es/emulationstation ($(stat -c %s "$SDBOOT/j36/es/emulationstation") bytes)"
+    mkdir -p "$PAYDIR/es"
+    cp "$ES_BIN" "$PAYDIR/es/emulationstation"
+    chmod 0755 "$PAYDIR/es/emulationstation"
+    log "es: staged $PAYREL/es/emulationstation ($(stat -c %s "$PAYDIR/es/emulationstation") bytes)"
 fi
 
 # rdinit=/init stays even though root= is now present, and the two do not
