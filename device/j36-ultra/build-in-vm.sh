@@ -5048,15 +5048,23 @@ print(p[0]["start"], p[0]["size"], p[1]["start"], p[1]["size"])
     fi
     sudo losetup -d "$loop"
 
-    # ── p2, the OS partition.  Only if there is a tarball, and only if the
-    # filesystem is one this can write: an image left over from the btrfs era has
-    # to be rebuilt, and saying that is better than a mount error nobody reads.
+    # ── p2, the OS partition.  Only if there is a tarball, and only onto a filesystem
+    # this can actually write.
+    #
+    # btrfs is accepted as well as ext2, and that is not a retreat from the ext2
+    # refactor: an image built before it is entirely btrfs and self-consistent -- its
+    # own /etc/fstab says btrfs for / -- so injecting the payload into it produces a
+    # card that boots and runs the dashboard today.  Refusing would leave the operator
+    # with no working card at all until a full base rebuild finished, and the base
+    # rebuild is the thing that cannot be hurried: the build ROOT filesystem is btrfs
+    # too, and write_rootfs.sh dds it into the image, so nothing short of recreating it
+    # changes what is on p2.  The message says which layout was written either way.
     if [[ -f "$ARTIFACTS/sd-root.tar.gz" ]]; then
         loop="$(sudo losetup --find --show \
             --offset $((p2_start * 512)) --sizelimit $((p2_size * 512)) "$img")"
         fstype="$(sudo blkid -o value -s TYPE "$loop" 2>/dev/null || true)"
         case "$fstype" in
-            ext2|ext3|ext4)
+            ext2|ext3|ext4|btrfs)
                 if sudo mount -t "$fstype" "$loop" "$mnt"; then
                     # -p and --numeric-owner: the tarball was written --owner=root
                     # --group=root, and /opt/mixos has to come out root-owned with
@@ -5064,16 +5072,19 @@ print(p[0]["start"], p[0]["size"], p[1]["start"], p[1]["size"])
                     sudo tar -C "$mnt" -xzpf "$ARTIFACTS/sd-root.tar.gz" --numeric-owner
                     sync
                     log "image: p2 ($fstype) now carries /opt/mixos -- the card boots as flashed"
+                    if [[ "$fstype" == btrfs ]]; then
+                        log "image: NOTE p2 is btrfs, so this image predates the ext2 layout."
+                        log "image: It boots and the dashboard runs, but p3 is still vfat/exfat"
+                        log "image: and there is no /home/virtua home partition in it.  To get"
+                        log "image: that layout the base image has to be rebuilt from its"
+                        log "image: filesystem stage -- see the README; resuming will not do it,"
+                        log "image: because the build root itself is btrfs."
+                    fi
                     sudo umount "$mnt"
                 else
                     log "image: p2 would not mount as $fstype; /opt/mixos was NOT written"
                     rc=1
                 fi
-                ;;
-            btrfs)
-                log "image: p2 is btrfs -- this image predates the ext2 layout."
-                log "image: rebuild the base image; the payload was NOT written."
-                rc=1
                 ;;
             *)
                 log "image: p2 reports filesystem '${fstype:-unknown}', which this does"
