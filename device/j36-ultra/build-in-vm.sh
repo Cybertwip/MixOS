@@ -4462,14 +4462,19 @@ MixOS supports the MediaTek line of processors.  This card is that support: a
 keypad adapter and Mesa's lima/kmsro pair, on a Cortex-A7 from 2013.
 
 This file sits on the FAT32 BOOT partition, which is where a card is opened, but
-it covers everything MixOS put on the card.  Two partitions carry it, because the
-MVII LK reads FAT32 and nothing else:
+it covers everything MixOS put on the card.  Three partitions carry it, and BOOT
+is FAT because the MVII LK reads FAT32 and nothing else:
 
     BOOT, FAT32   the launcher, and only that: zImage, mt6592-j36-ultra.dtb,
                   initrd.img, mvii/boot.conf, README.txt and this file.
     ROOTFS, ext2  Debian, and MixOS's own tree at /opt/mixos -- unpacked there
                   from sd-root.tar.gz.  Every "bin/", "qt/" and "j36/" path below
                   means /opt/mixos/... on this partition.
+    DATA, ext2    your home directory, mounted at /home/virtua.  A shell starts
+                  here, the dashboard's Files page opens here, and nothing MixOS
+                  ships is licensed by this file on it -- what is on it is yours.
+                  roms/ inside it is the old EmulationStation tree, which /roms
+                  still points at.
 
 This payload is not licensed uniformly.  Saying otherwise would be a false
 statement about other people's code.
@@ -4682,6 +4687,16 @@ Unpack it into the root of the card's second partition -- the shared armhf Debia
 rootfs -- and nothing already on it is touched: everything here is under /opt/mixos,
 a directory neither Debian nor ArkOS nor dArkOS uses.  An R36S booting the same card
 is unaffected and never looks in it.
+
+The build normally does that for you: the flashable image ships with this tree
+already inside its ext2 OS partition, so a card that was written from that image
+needs nothing poured onto it.  The tarball is here for updating a card in place, and
+for a workstation that cannot write ext2 there is no way round reflashing.
+
+The third partition, DATA, is not this one.  It is your home directory, mounted at
+/home/virtua: a shell starts there, the dashboard's Files page opens there, and it is
+the only partition on the card meant to be written from the device.  Nothing in this
+payload is installed to it.
 
 The dashboard and the games:
 
@@ -4972,10 +4987,14 @@ inject_into_image() {
         log "image: sfdisk could not read the partition table; skipping"
         return 0
     }
-    p1_start="$(printf '%s' "$part_json" | python3 -c 'import json,sys; p=json.load(sys.stdin)["partitiontable"]["partitions"]; print(p[0]["start"])' 2>/dev/null || true)"
-    p1_size="$(printf '%s' "$part_json" | python3 -c 'import json,sys; p=json.load(sys.stdin)["partitiontable"]["partitions"]; print(p[0]["size"])' 2>/dev/null || true)"
-    p2_start="$(printf '%s' "$part_json" | python3 -c 'import json,sys; p=json.load(sys.stdin)["partitiontable"]["partitions"]; print(p[1]["start"])' 2>/dev/null || true)"
-    p2_size="$(printf '%s' "$part_json" | python3 -c 'import json,sys; p=json.load(sys.stdin)["partitiontable"]["partitions"]; print(p[1]["size"])' 2>/dev/null || true)"
+    # One python3 for all four numbers, read into the shell with `read'.  Four separate
+    # invocations would each re-parse the same JSON, and any one of them failing would
+    # leave a subset of the geometry set -- which is a losetup at the wrong offset.
+    read -r p1_start p1_size p2_start p2_size <<<"$(printf '%s' "$part_json" | python3 -c '
+import json, sys
+p = json.load(sys.stdin)["partitiontable"]["partitions"]
+print(p[0]["start"], p[0]["size"], p[1]["start"], p[1]["size"])
+' 2>/dev/null || true)"
     if [[ -z "$p1_start" || -z "$p2_start" ]]; then
         log "image: could not read p1/p2 geometry from the partition table; skipping"
         return 0
@@ -4986,16 +5005,21 @@ inject_into_image() {
 
     # ── p1, the FAT32 launcher.  Added to, never replaced: the R36S's own Image,
     # uInitrd, rk3326 trees and boot.ini are on this partition and stay there.
+    #
+    # The whole of $SDBOOT rather than a list of four filenames, because that list has
+    # already changed twice in this refactor and a copy that names files is a copy that
+    # silently stops shipping the next one added.  cp -a keeps mvii/ nested and the
+    # modes; vfat flattens the modes anyway and the LK does not care.
     loop="$(sudo losetup --find --show \
         --offset $((p1_start * 512)) --sizelimit $((p1_size * 512)) "$img")"
     if sudo mount -t vfat "$loop" "$mnt"; then
-        sudo mkdir -p "$mnt/mvii"
-        sudo cp "$SDBOOT/zImage" "$SDBOOT/mt6592-j36-ultra.dtb" \
-                "$SDBOOT/initrd.img" "$mnt/"
-        sudo cp "$SDBOOT/mvii/boot.conf" "$mnt/mvii/boot.conf"
-        sudo cp "$SDBOOT/LICENSE.txt" "$SDBOOT/README.txt" "$mnt/"
-        sync
-        log "image: p1 (vfat) now carries the launcher and mvii/boot.conf"
+        if sudo cp -a "$SDBOOT/." "$mnt/"; then
+            sync
+            log "image: p1 (vfat) now carries $(find "$SDBOOT" -type f | wc -l) launcher files, mvii/boot.conf included"
+        else
+            log "image: p1 mounted but the launcher copy failed -- is p1 full?  ${SYSTEM_SIZE:-100} MB is the budget"
+            rc=1
+        fi
         sudo umount "$mnt"
     else
         log "image: p1 would not mount as vfat; the launcher was NOT written"
