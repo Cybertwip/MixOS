@@ -1693,10 +1693,16 @@ find_mixos() {
         if [ ! -b "$dev" ]; then continue; fi
         if [ "$dev" = "$rootdev" ]; then continue; fi
         dash_mounted=0
-        # exfat is in the list because that is what firstboot converts EASYROMS to,
+        # exfat is in the list because that is what firstboot used to convert p3 to,
         # and a payload unpacked there has to be reported as "found but crippled"
         # rather than as "no such partition" -- the libQt5Core check below is what
         # says which.
+        #
+        # A payload found on the home partition is left mounted read-only here, and
+        # that does cost systemd's rw mount of it at /home/virtua: one device cannot
+        # be both.  It is the price of a card whose rootfs has no /opt/mixos at all,
+        # it is announced on the console by the line below, and the fix is the
+        # documented one -- put the tarball in the rootfs.
         for fs in ext2 ext4 btrfs exfat vfat; do
             if ! mount -t "$fs" -o ro "$dev" /newroot/run/j36/mixos 2>/dev/null; then continue; fi
             dash_mounted=1
@@ -3637,8 +3643,10 @@ systemd.mask=firstboot.service
     GUI-mode build does not ship.  With the tars missing, its two progress loops
     spin 15000 subshells apiece before giving up, which is minutes of dead panel,
     and then it reboots.  Delete this word to let it run on a card that does
-    carry the tars; it converts EASYROMS to exfat and grows ROOTFS to fill the
-    card, and this kernel now has exfat and vfat built in for the result.
+    carry the tars; it grows ROOTFS to fill the card and rebuilds p3 -- the home
+    partition, ext2 and labelled DATA -- from /roms.tar.  It no longer converts
+    that partition to exfat, though this kernel still has exfat and vfat built in
+    for cards written before the change.
 
 systemd.mask=batt_led.service
     The RK3326 battery LED daemon, and the first unit the forwarded log caught:
@@ -3778,17 +3786,25 @@ j36.dash=1
     whatever the rootfs starts by itself is what you get, which on a rootfs whose
     EmulationStation is not enabled is nothing at all.
 
-    One more thing it mounts: the first partition that is neither the rootfs nor this
-    one, read-only, at /run/j36/card, which is where the dashboard's Files page opens.
-    That is not a convenience -- with no keyboard there is no way to mount it by hand,
-    and a file browser rooted in an empty home directory is a file browser showing
-    nothing.  exfat and vfat are tried first because that is what the data partition
-    actually is: EASYROMS is made vfat and firstboot converts it to exfat, so on a
-    stock card the only ext2 partition is the rootfs.  This partition is
-    recognised and skipped by carrying j36/ or mvii/ rather than by its device name,
-    which is only known on a boot that had reason to mount it.  Read-only on purpose:
-    the operator writes the data partition from a PC, and one mounted rw by an
-    initramfs is one that replays dirty the first time the cell gives out mid-write.
+    One more thing it arranges: /run/j36/card, which is where the dashboard's Files
+    page opens.  That is not a convenience -- with no keyboard there is no way to
+    mount anything by hand, and a file browser rooted in an empty directory is a file
+    browser showing nothing.
+
+    On a current card that path is a SYMLINK to /home/virtua, the login user's home
+    and the mount point of p3: ext2, labelled DATA, and the one partition on the card
+    meant to be written.  /init recognises it by a .mixos-home stamp at its root --
+    it has no blkid to read the label with -- unmounts its own probe and leaves the
+    mounting to systemd's fstab entry.  Deliberately: a device cannot be mounted ro
+    and rw at once, so a read-only mount here would make that entry fail with EBUSY,
+    and because the entry carries nofail it would fail silently, leaving a home
+    directory that is really the rootfs copy underneath the mount point.
+
+    On a card written before this layout it is a read-only mount instead, of the
+    first partition that is neither the rootfs nor BOOT -- exfat and vfat tried
+    first, p3 having been made vfat and converted to exfat by firstboot back then.
+    BOOT is recognised and skipped by carrying j36/ or mvii/ rather than by its
+    device name, which is only known on a boot that had reason to mount it.
 
     Why ES was dropped rather than fixed: the rootfs's binary was compiled with the
     fixed-function renderer, and GLES1 is the one API this stack cannot supply.
@@ -4804,7 +4820,7 @@ fi
         echo "dtb_sha256=$(sha256sum mt6592-j36-ultra.dtb | awk '{print $1}')"
         echo "bootimg_size=$(stat -c %s boot.img) (slot 0x900000)"
         echo "storage=msdc1 mtk-sd mediatek,mt6592-mmc (ext2, ext4, btrfs, exfat, vfat)"
-        echo "card_layout=p1 BOOT vfat = launcher only (zImage, dtb, initrd.img, mvii/boot.conf, LICENSE.txt, README.txt); p2 ROOTFS ext2 = the OS and everything else"
+        echo "card_layout=p1 BOOT vfat = launcher only (zImage, dtb, initrd.img, mvii/boot.conf, LICENSE.txt, README.txt); p2 ROOTFS ext2 = the OS, /opt/mixos included; p3 DATA ext2 = the login user's home, mounted at ${DATA_MOUNT_POINT:-/home/virtua}, with the legacy roms/ tree inside it and /roms a symlink to that"
         echo "rootfs_format=ext2, set in setup_partition.sh and device/r36-ultra/build-in-vm.sh; the MVII LK reads FAT32 only, so BOOT is FAT and the OS partition is free to be the simplest filesystem both kernels on this card handle"
         echo "payload=$PAYREL (J36_PAYLOAD_ON=$PAYLOAD_ON; /init looks in the rootfs /opt/mixos/j36 first, then j36/ on BOOT for a card written by an older build)"
         echo "msdc1_irq=GIC_SPI 72 (INTID 104 - 32)"
@@ -4831,7 +4847,7 @@ fi
             echo "shell_es=emulationstation.service is masked in /run/systemd/system.control (the one runtime dir that outranks the /etc its unit is in), plus a drop-in that resets ExecStart to an echo in case the mask is ignored"
             echo "shell_find=/init looks in the rootfs first, then mounts every other partition read-only looking for opt/mixos/bin/mixdash (or mixos/bin/mixdash, for a tarball unpacked one level down); every partition it tries is named on the console, mounted or unreadable"
             echo "shell_missing=when nothing is found, /init also writes /run/systemd/system/mixdash-missing.service, which repeats the reason and the fix on the console six times at 20 s -- because the initramfs lines have scrolled off by then and a boot that ends at hostnamed looks the same as ten other faults"
-            echo "shell_card=the first partition that is neither the rootfs nor BOOT (skipped by carrying j36/ or mvii/, not by name) is mounted read-only at /run/j36/card -- exfat and vfat first, since EASYROMS is made vfat and firstboot converts it to exfat -- and that is what the dashboard's Files page opens on, there being no keyboard here to mount it by hand"
+            echo "shell_card=/run/j36/card is what the dashboard's Files page opens on, there being no keyboard here to mount anything by hand; on a current card it is a symlink to ${DATA_MOUNT_POINT:-/home/virtua}, the home partition's mount point, which /init recognises by a .mixos-home stamp at the partition root and leaves for systemd to mount rw -- a read-only mount from the initramfs would make that fstab entry fail with EBUSY, silently, it carrying nofail; on a card written before this layout it is a read-only mount of the first partition that is neither the rootfs nor BOOT (skipped by carrying j36/ or mvii/, not by name), exfat and vfat first"
             echo "shell_nodash=without j36.dash=1 nothing is staged at all and /init says so, naming the word to add -- a rootfs whose EmulationStation is not even enabled otherwise boots to nothing and explains nothing"
             echo "shell_render=Qt5 raster into /dev/fb0, which is simplefb's window onto the framebuffer the LK lit -- no EGL, no GBM, no DRM master, no modeset"
             echo "shell_input=evdev directly, QT_QPA_FB_DISABLE_INPUT=1 (gpio-keys plus the keypad, per the device tree)"
