@@ -12,7 +12,12 @@ parted -s "${DISK}" -a min unit s mkpart primary fat32 ${SYSTEM_PART_START} ${SY
 parted -s "${DISK}" set 1 boot on
 parted -s "${DISK}" -a min unit s mkpart primary ${ROOT_FILESYSTEM_FORMAT} ${STORAGE_PART_START} ${STORAGE_PART_END}
 #parted -s "${DISK}" set 2 lba off
-parted -s "${DISK}" -a min unit s mkpart primary fat32 ${ROM_PART_START} ${ROM_PART_END}
+# p3 is ${DATA_FILESYSTEM_FORMAT} -- ext2 -- and not fat32.  parted's fs-type argument
+# writes nothing but the MBR type byte, and Linux ignores it and probes the superblock,
+# so this was invisible on the device.  It is not invisible on a PC: a partition flagged
+# 0x0B with an ext2 superblock in it is what makes Windows and macOS offer to reformat
+# the card.  0x83 says Linux, which is what this partition is.
+parted -s "${DISK}" -a min unit s mkpart primary ${DATA_FILESYSTEM_FORMAT} ${ROM_PART_START} ${ROM_PART_END}
 sync
 
 
