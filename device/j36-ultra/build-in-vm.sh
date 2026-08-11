@@ -686,9 +686,16 @@ bb_disable() {
 # is what makes it callable.  chmod was the one that was missing, and it failed
 # the only way a missing applet can: "/init: line NNN: chmod: not found", twice,
 # which is why the probe log stayed unwritable.
+# rmdir is in this list because /init runs it, and it was missing: mount_card removes
+# its own mount point when there is nothing to mount there and again when it replaces
+# it with a symlink to the home partition.  A missing applet is not a no-op in the
+# second case -- `ln -s target dir' with dir still present creates the link INSIDE it,
+# so the dashboard's Files page would open on a directory containing one dangling
+# symlink instead of on the card.  The assertion loop below is what would have caught
+# this, and it can only catch what is named here.
 INIT_APPLETS=(sh mount umount mkdir mknod cat cp ln ls tr grep echo sleep dmesg
               insmod hexdump setsid cttyhack switch_root sync poweroff reboot
-              uname chmod)
+              uname chmod rmdir)
 
 # Most applets are CONFIG_<applet in caps>; three are not, and guessing would
 # assert a symbol that does not exist, which greps false and dies on a correct
@@ -1809,6 +1816,15 @@ mount_card() {
             if [ -f /newroot/run/j36/card/.mixos-home ]; then
                 umount /newroot/run/j36/card
                 rmdir /newroot/run/j36/card 2>/dev/null
+                # Checked, because `ln -s target dir' with the directory still there
+                # puts the link inside it instead of failing, and the Files page would
+                # then open on a directory holding one dangling symlink.
+                if [ -d /newroot/run/j36/card ]; then
+                    say "dash: could not remove /run/j36/card, so it stays a directory"
+                    say "      and the Files page will show nothing.  The home"
+                    say "      partition is still mounted by systemd at $home_mp."
+                    return 1
+                fi
                 ln -sfn "$home_mp" /newroot/run/j36/card
                 say "dash: $dev ($fs) is the home partition; /run/j36/card -> $home_mp"
                 say "      left to systemd to mount rw -- a read-only mount here would"
