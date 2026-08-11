@@ -1711,8 +1711,8 @@ find_mixos() {
 # out mid-write.
 #
 # exfat and vfat are in the list and are in fact the likely answer: EASYROMS is made
-# vfat and firstboot converts it to exfat, so on a stock card the only ext4/btrfs
-# partition is the rootfs -- which is skipped, being already mounted as /newroot.  BOOT
+# vfat and firstboot converts it to exfat, so on a stock card the only ext2 partition
+# is the rootfs -- which is skipped, being already mounted as /newroot.  BOOT
 # is skipped by what is in it rather than by its device name, because the name is only
 # known when mount_bootfs happened to run this boot.
 mount_card() {
@@ -1723,7 +1723,7 @@ mount_card() {
     for dev in /dev/mmcblk*p* /dev/sd*; do
         if [ ! -b "$dev" ]; then continue; fi
         if [ "$dev" = "$rootdev" ] || [ "$dev" = "$bootdev" ]; then continue; fi
-        for fs in exfat vfat ext4 btrfs; do
+        for fs in exfat vfat ext2 ext4 btrfs; do
             if ! mount -t "$fs" -o ro "$dev" /newroot/run/j36/card 2>/dev/null; then
                 continue
             fi
@@ -2102,8 +2102,9 @@ python3 "$ROOT/device/j36-ultra/create_boot_image.py" \
 # Every comment in this file that says "the fixed 9 MiB BOOTIMG slot" is quoting
 # the stock scatter: BOOTIMG is partition SYS9 at 0x1f40000 with
 # partition_size 0x900000, and RECOVERY begins at 0x2840000, exactly 9 MiB later.
-# Assert it, because the kernel config above just grew MMC, btrfs and ext4 and
-# nothing else in this build would notice the payload crossing into RECOVERY.
+# Assert it, because the kernel config above just grew MMC and three filesystem
+# drivers and nothing else in this build would notice the payload crossing into
+# RECOVERY.
 fits_in "$ARTIFACTS/boot.img" $((0x00900000)) "the BOOTIMG payload"
 
 # ── fbdoom: the first moving picture on this panel ────────────────────────────
@@ -3134,8 +3135,8 @@ collect_qt_payload() {
         [[ -f "$real" ]] || continue
         sudo cp "$real" "$out/lib/${real##*/}" || return 1
         # The SONAME the loader asks for, when the file it lands on is named after a
-        # version.  ext4 and btrfs hold symlinks, which is half of why this payload
-        # is on the second partition and not on the vfat one.
+        # version.  ext2 holds symlinks, which is half of why this payload is on the
+        # OS partition and not on the vfat one.
         [[ "${real##*/}" == "$base" ]] || ln -sf "${real##*/}" "$out/lib/$base"
         n=$((n + 1))
     done <<<"$list"
