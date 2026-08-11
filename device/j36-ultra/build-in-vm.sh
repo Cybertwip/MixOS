@@ -903,13 +903,15 @@ done
 
 mkdir -p /newroot
 
-# btrfs first because that is what MixOS formats ROOTFS as, ext4 second because
-# a hand-made card usually is not.  Mounted read-only to test, so a candidate
-# that is not the root filesystem is never written to.
+# ext2 first because that is what MixOS formats ROOTFS as now, and it has to be
+# named explicitly: ext2 and ext4 are separate drivers in this kernel, and
+# `mount -t ext4' will not touch an ext2 filesystem.  ext4 and btrfs follow for
+# the cards written by earlier builds and for hand-made ones.  Mounted read-only
+# to test, so a candidate that is not the root filesystem is never written to.
 try_root() {
     dev="$1"
     if [ ! -b "$dev" ]; then return 1; fi
-    for fs in btrfs ext4; do
+    for fs in ext2 ext4 btrfs; do
         if ! mount -t "$fs" -o ro "$dev" /newroot 2>/dev/null; then continue; fi
         if [ -x /newroot/sbin/init ] || [ -L /newroot/sbin/init ]; then
             umount /newroot
@@ -1656,7 +1658,7 @@ find_mixos() {
         # and a payload unpacked there has to be reported as "found but crippled"
         # rather than as "no such partition" -- the libQt5Core check below is what
         # says which.
-        for fs in btrfs ext4 exfat vfat; do
+        for fs in ext2 ext4 btrfs exfat vfat; do
             if ! mount -t "$fs" -o ro "$dev" /newroot/run/j36/mixos 2>/dev/null; then continue; fi
             dash_mounted=1
             # opt/mixos is what the tarball unpacks to at a partition root; mixos/ is
