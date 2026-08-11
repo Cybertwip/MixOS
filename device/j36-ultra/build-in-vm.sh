@@ -172,9 +172,14 @@ done
 # vmmc-supply the host advertises no voltage at all, and card init then fails
 # with nothing in the log pointing at the reason.
 #
-# BTRFS because the rootfs this card already carries is btrfs: MixOS's own
-# scripts/setup_partition.sh sets ROOT_FILESYSTEM_FORMAT="btrfs". EXT4 because a
-# hand-made card usually is not, and /init tries both.
+# EXT2 because the rootfs this card carries is ext2: setup_partition.sh and
+# device/r36-ultra/build-in-vm.sh both set ROOT_FILESYSTEM_FORMAT=ext2, precisely
+# so this kernel and the MVII LK can be asked for the same card.  It is its own
+# driver, not a mode of ext4 -- `mount -t ext4' does NOT mount an ext2 filesystem
+# when EXT2_FS is built separately, which is why /init names ext2 first and why
+# leaving this symbol out would produce a card that mounts on a PC and not here.
+# EXT4 and BTRFS stay for the cards already in the field, written by the builds
+# that came before this one; /init tries all three.
 #
 # EXFAT and VFAT are not for /init -- they are the other two partitions on the
 # same card, and the rootfs mounts them itself.  finishing_touches.sh writes the
@@ -189,7 +194,7 @@ done
 # fails, and systemd takes a machine with no keyboard driver into emergency mode.
 for symbol in \
     BLOCK BLK_DEV MMC MMC_BLOCK MMC_MTK REGULATOR REGULATOR_FIXED_VOLTAGE \
-    EXT4_FS BTRFS_FS EXFAT_FS VFAT_FS; do
+    EXT2_FS EXT4_FS BTRFS_FS EXFAT_FS VFAT_FS; do
     config_y "$symbol"
 done
 

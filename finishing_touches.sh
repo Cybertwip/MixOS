@@ -431,8 +431,14 @@ sudo umount -l ${mountpoint}
 sudo losetup -d ${LOOP_BOOT}
 
 # Format rootfs partition in final image
+#
+# --sizelimit, like the ROMS branch below: without it the loop device runs to the end of
+# the image, and mkfs then lays inode tables and group descriptors across the ROMS
+# partition as well.  Today that is survivable only because the ROMS mkfs.vfat a few
+# lines down happens afterwards and wipes them; it is not a property worth depending on.
 ROOTFS_PART_OFFSET=$((STORAGE_PART_START * 512))
-LOOP_ROOTFS=$(sudo losetup --find --show --offset ${ROOTFS_PART_OFFSET} ${DISK})
+ROOTFS_PART_SIZE_BYTES=$(( (STORAGE_PART_END - STORAGE_PART_START + 1) * 512 ))
+LOOP_ROOTFS=$(sudo losetup --find --show --offset ${ROOTFS_PART_OFFSET} --sizelimit ${ROOTFS_PART_SIZE_BYTES} ${DISK})
 sudo mkfs.${ROOT_FILESYSTEM_FORMAT} ${ROOT_FILESYSTEM_FORMAT_PARAMETERS} ${LOOP_ROOTFS}
 sudo losetup -d ${LOOP_ROOTFS}
 
