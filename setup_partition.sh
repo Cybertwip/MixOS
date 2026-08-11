@@ -2,7 +2,13 @@
 
 echo -e "Creating partitions...\n\n"
 # Partition setup
-ROOT_FILESYSTEM_FORMAT="btrfs"
+#
+# ext2, not btrfs: the J36 Ultra's MVII LK reads FAT32 only, so the card carries a FAT32
+# BOOT partition purely as the launcher, and the OS partition is then free to be the
+# simplest filesystem the two kernels sharing this card both handle.  See the longer
+# note in device/r36-ultra/build-in-vm.sh, which sets the same three values for the
+# checkpointed build and is what an R36/J36 build actually runs.
+ROOT_FILESYSTEM_FORMAT="ext2"
 if [ "$ROOT_FILESYSTEM_FORMAT" == "xfs" ] || [ "$ROOT_FILESYSTEM_FORMAT" == "btrfs" ]; then
   if [ "$ROOT_FILESYSTEM_FORMAT" != "btrfs" ]; then
     ROOT_FILESYSTEM_FORMAT_PARAMETERS="-f -L ROOTFS"

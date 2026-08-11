@@ -104,9 +104,30 @@ fi
 export BUILD_DATE
 
 # setup_partition.sh values, reproduced without recreating its 52 GB filesystem.
-ROOT_FILESYSTEM_FORMAT=btrfs
-ROOT_FILESYSTEM_FORMAT_PARAMETERS="-O ^free-space-tree -f -L ROOTFS"
-ROOT_FILESYSTEM_MOUNT_OPTIONS="defaults,noatime,compress=zlib:1"
+#
+# WHY ext2 AND NOT btrfs.  The J36's MVII LK reads FAT32 and nothing else, so the card
+# needs a FAT32 BOOT partition no matter what -- and that is all BOOT is for: the
+# kernel, the device tree and boot.conf, which the loader hands to Linux.  Nothing
+# after that moment is the loader's business, so the OS partition is free to be the
+# simplest filesystem both sides can read, and ext2 is it.  btrfs bought compression
+# and cost a filesystem whose on-disk format only Linux implements.
+#
+# What this is NOT: a fast filesystem, or a crash-safe one.  ext2 has no journal, so a
+# board that loses power with the rootfs mounted rw comes back needing an fsck -- which
+# is the trade this layout accepts, because the alternative is a rootfs the MVII side
+# cannot open at all.  It is also the reason /init mounts everything it does not own
+# read-only.
+#
+# The build root and the shipped filesystem are the same object: write_rootfs.sh dds
+# $FILESYSTEM straight into the image at STORAGE_PART_START.  So this choice is made
+# once, here, and the 52 GB build image is ext2 too.
+ROOT_FILESYSTEM_FORMAT=ext2
+# -F because mkfs is being pointed at a file rather than a block device, and -b 4096 so
+# the block size does not depend on how big the build image happens to be: resize2fs -M
+# in write_rootfs.sh and resize2fs on the device both work in these blocks, and a
+# 1 KiB-block filesystem would cap the rootfs at 16 GB after expansion.
+ROOT_FILESYSTEM_FORMAT_PARAMETERS="-F -b 4096 -L ROOTFS"
+ROOT_FILESYSTEM_MOUNT_OPTIONS="defaults,noatime"
 SYSTEM_SIZE=100
 STORAGE_SIZE=7500
 ROM_PART_SIZE=300
@@ -187,9 +208,11 @@ stash_boot_payload() {
 # write_rootfs.sh shrinks it to fit the image.  A later run whose $FILESYSTEM is
 # gone restores that copy and keeps its bootstrap/userspace checkpoints.
 #
-# The copy is crash-consistent rather than quiesced -- Arkbuild is still mounted,
-# so it is synced and then copied.  That is what btrfs' log replay is for, and a
-# build root is not a database.  --sparse=always keeps the 52 GiB image's holes.
+# The copy is crash-consistent rather than quiesced -- Arkbuild is still mounted, so it
+# is synced and then copied.  On btrfs that was what log replay was for; on ext2 there
+# is no log, and what a torn copy needs is the e2fsck that write_rootfs.sh runs before
+# it ships the image.  A build root is not a database either way.  --sparse=always
+# keeps the 52 GiB image's holes.
 ROOTFS_SNAPSHOT="$STATE_DIR/rootfs-prefinal.img"
 SNAPSHOT_ROOTFS="${DARKOS_R36_SNAPSHOT_ROOTFS:-1}"
 
@@ -211,7 +234,11 @@ snapshot_rootfs() {
 
     log "Snapshotting the build root so a later run need not bootstrap Debian again"
     sync
-    mountpoint -q Arkbuild && sudo btrfs filesystem sync Arkbuild 2>/dev/null || true
+    # btrfs has a sync of its own that flushes its log trees; ext2 has no log to flush
+    # and no such command, so the plain sync above is the whole of it.
+    if [[ "$ROOT_FILESYSTEM_FORMAT" == btrfs ]]; then
+        mountpoint -q Arkbuild && sudo btrfs filesystem sync Arkbuild 2>/dev/null || true
+    fi
     if ! sudo cp --reflink=auto --sparse=always "$FILESYSTEM" "$ROOTFS_SNAPSHOT.part"; then
         log "Snapshot failed; continuing without one"
         sudo rm -f "$ROOTFS_SNAPSHOT.part"
@@ -252,8 +279,8 @@ ensure_rootfs_mounts() {
     [[ -f "$FILESYSTEM" ]] || return 0
     mkdir -p Arkbuild
     if ! mountpoint -q Arkbuild; then
-        log "Remounting the preserved Btrfs build root"
-        sudo mount -t btrfs -o "$ROOT_FILESYSTEM_MOUNT_OPTIONS",loop \
+        log "Remounting the preserved $ROOT_FILESYSTEM_FORMAT build root"
+        sudo mount -t "$ROOT_FILESYSTEM_FORMAT" -o "$ROOT_FILESYSTEM_MOUNT_OPTIONS",loop \
             "$FILESYSTEM" Arkbuild
     fi
     sudo mkdir -p Arkbuild/{dev/pts,proc,sys}
