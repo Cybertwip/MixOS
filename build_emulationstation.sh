@@ -38,6 +38,7 @@ else
 	call_chroot "cd /home/ark &&
 	  source ES_VARIABLES.txt &&
 	  rm ES_VARIABLES.txt &&
+	  rm -rf EmulationStation-fcamod &&
 	  git clone --recursive --depth=1 https://github.com/christianhaitian/EmulationStation-fcamod -b ${ES_BRANCH} &&
 	  cd EmulationStation-fcamod &&
 	  git submodule update --init &&
@@ -53,6 +54,7 @@ else
 	   call_chroot "cd /home/ark &&
 	     source ES_VARIABLES.txt &&
 	     rm ES_VARIABLES.txt &&
+	     rm -rf EmulationStation-fcamod-${ES_BRANCH_ALT} &&
 	     git clone --recursive --depth=1 https://github.com/christianhaitian/EmulationStation-fcamod -b ${ES_BRANCH_ALT} EmulationStation-fcamod-${ES_BRANCH_ALT} &&
 	     cd EmulationStation-fcamod-${ES_BRANCH_ALT} &&
 	     git submodule update --init &&

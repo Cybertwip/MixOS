@@ -56,8 +56,10 @@ sudo chroot ${CHROOT_DIR}/ bash -c "[ -z \$(echo \$CCACHE_DIR | grep ccache) ]" 
 sudo chroot ${CHROOT_DIR}/ bash -c "[ -z \$(echo \$PATH | grep ccache) ]" && echo -e "export PATH=/usr/lib/ccache:\$PATH" | sudo tee -a ${CHROOT_DIR}/root/.bashrc > /dev/null
 sudo chroot ${CHROOT_DIR}/ bash -c "/usr/sbin/update-ccache-symlinks"
 
-# Symlink fix for DRM headers
-sudo chroot ${CHROOT_DIR}/ bash -c "ln -s /usr/include/libdrm/ /usr/include/drm"
+# Symlink fix for DRM headers.  -f because this script is re-run when a later
+# userspace component fails, and -n so that a second run replaces the symlink
+# instead of creating /usr/include/drm/libdrm inside what it already points at.
+sudo chroot ${CHROOT_DIR}/ bash -c "ln -sfn /usr/include/libdrm/ /usr/include/drm"
 
 # Place libmali manually (assumes you have libmali.so or mali drivers ready)
 if [[ "${USERSPACE_ARCH:-}" == "armhf" ]]; then
@@ -89,11 +91,32 @@ do
 done
 sudo chroot Arkbuild/ ldconfig
 
+# THE THREE BLOCKS BELOW HAVE TO SURVIVE A SECOND RUN.
+#
+# build-in-vm.sh marks each userspace component as it completes and re-runs the ones
+# that did not, so a component that fails anywhere after this point brings the whole
+# of this script round again -- and `git clone' into a directory that already exists
+# is fatal, not a no-op.  It is also the LAST command here whose status is seen, so
+# the libgo2 clone failing is what fails the build, several steps after the real
+# problem.  Each block therefore asks whether the thing it installs is already in
+# this chroot, skips itself if it is, and otherwise throws the old source tree away
+# and starts from a clone -- half-configured meson and premake trees resume worse
+# than they rebuild.  build_sdl2.sh guards its own clone the same way.
+
 # Install meson
-sudo chroot ${CHROOT_DIR}/ bash -c "git clone https://github.com/mesonbuild/meson.git && ln -s /meson/meson.py /usr/bin/meson"
+sudo chroot ${CHROOT_DIR}/ bash -c "
+if [ ! -f /meson/meson.py ]; then
+  rm -rf /meson && git clone https://github.com/mesonbuild/meson.git
+fi &&
+  ln -sfn /meson/meson.py /usr/bin/meson"
 
 # Build and install librga
-sudo chroot ${CHROOT_DIR}/ bash -c "cd /home/ark &&
+sudo chroot ${CHROOT_DIR}/ bash -c "
+if ls /usr/lib/${ARCH}/librga.so* > /dev/null 2>&1 && [ -f /usr/local/include/rga/RgaApi.h ]; then
+  echo 'librga is already installed in this chroot, skipping'
+else
+  cd /home/ark &&
+  rm -rf linux-rga &&
   git clone https://github.com/christianhaitian/linux-rga.git &&
   cd linux-rga &&
 	  git checkout 1fc02d56d97041c86f01bc1284b7971c6098c5fb &&
@@ -103,10 +126,16 @@ sudo chroot ${CHROOT_DIR}/ bash -c "cd /home/ark &&
   cd .. &&
   mkdir -p /usr/local/include/rga &&
   cp -f drmrga.h rga.h RgaApi.h RockchipRgaMacro.h /usr/local/include/rga/
+fi
   "
 
 # Build and install libgo2
-sudo chroot ${CHROOT_DIR}/ bash -c "cd /home/ark &&
+sudo chroot ${CHROOT_DIR}/ bash -c "
+if ls /usr/lib/${ARCH}/libgo2.so* > /dev/null 2>&1 && ls /usr/include/go2/*.h > /dev/null 2>&1; then
+  echo 'libgo2 is already installed in this chroot, skipping'
+else
+  cd /home/ark &&
+	  rm -rf libgo2 &&
 	  git clone https://github.com/OtherCrashOverride/libgo2.git &&
 	  cd libgo2 &&
 	  premake4 gmake &&
@@ -114,4 +143,5 @@ sudo chroot ${CHROOT_DIR}/ bash -c "cd /home/ark &&
   cp libgo2.so* /usr/lib/${ARCH}/ &&
   mkdir -p /usr/include/go2 &&
   cp -L src/*.h /usr/include/go2/
+fi
   "

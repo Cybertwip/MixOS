@@ -73,6 +73,14 @@ public:
 
     explicit Dashboard(QWidget *parent = nullptr);
 
+signals:
+    /*
+     * Emitted once, from the first paintEvent.  main() waits for it before it takes
+     * the console away from fbcon: until there is a frame worth showing, kernel
+     * messages and this program's own trace are the more useful thing on the glass.
+     */
+    void firstPainted();
+
 public slots:
     void onNav(int action);
 
@@ -108,6 +116,7 @@ private:
     Joypad *m_pad = nullptr;
 
     int m_page = 0;
+    bool m_firstPaint = false;
     int m_armed = InternalNone;
     /* The exe of a confirm-first card that has been pressed once.  Keyed on the path
      * rather than on a bool so two such cards cannot arm each other. */

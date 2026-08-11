@@ -84,6 +84,40 @@ elif [[ "${ROOT_FILESYSTEM_FORMAT}" == *"ext"* ]]; then
   sudo truncate -s "${fs_mib}M" "${FILESYSTEM}"
   sync
   sudo dd if="${FILESYSTEM}" of="${DISK}" bs=512 seek="${STORAGE_PART_START}" conv=fsync,notrunc
+
+  # AND THEN GROW IT BACK, INSIDE THE IMAGE.  The shrink above is only about how much of
+  # this file the dd has to copy -- 52 GB of build root down to what the rootfs weighs.
+  # What it leaves in the partition, though, is a filesystem with ZERO free blocks in a
+  # ${STORAGE_SIZE} MB partition, and that is what the card boots on: a read-write root
+  # with nothing writable in it.  It surfaced as the J36 payload's first mkdir answering
+  # "No space left on device", but nothing about it is J36-specific -- ldconfig, apt, a
+  # journal and every dpkg on the R36S would meet the same wall.
+  #
+  # Nothing on the device fixes it: firstboot resizes the DATA partition, not this one.
+  # So it is grown here, to the end of its own partition.  The image does not get bigger
+  # in any way that matters -- the blocks this adds are zeros, and 7z is what ships.
+  #
+  # The loop device is sizelimited to the partition, so resize2fs cannot run past its end.
+  rootfs_loop="$(sudo losetup --find --show \
+      --offset $(( STORAGE_PART_START * 512 )) \
+      --sizelimit $(( (STORAGE_PART_END - STORAGE_PART_START + 1) * 512 )) "${DISK}")"
+  if [[ -n "${rootfs_loop}" ]]; then
+    # resize2fs will not touch a filesystem it has not seen checked, and the last thing
+    # to touch this one was the dd.  1 and 2 mean "found and fixed", not "broken".
+    grow_fsck_rc=0
+    sudo e2fsck -p -f "${rootfs_loop}" >/dev/null 2>&1 || grow_fsck_rc=$?
+    if [[ ${grow_fsck_rc} -gt 2 ]]; then
+      echo -e "e2fsck could not clean the OS partition (exit ${grow_fsck_rc}); leaving it at ${fs_mib} MB"
+    elif sudo resize2fs "${rootfs_loop}" >/dev/null 2>&1; then
+      echo -e "OS partition filesystem grown from ${fs_mib} MB to fill its ${STORAGE_SIZE} MB partition"
+    else
+      echo -e "resize2fs could not grow the OS partition; it stays ${fs_mib} MB with no free space"
+    fi
+    sudo losetup -d "${rootfs_loop}"
+  else
+    echo -e "Could not attach a loop device to the OS partition; it stays ${fs_mib} MB with no free space"
+  fi
+  sync
 elif [ "${ROOT_FILESYSTEM_FORMAT}" == "btrfs" ]; then
   sudo btrfs balance start --full-balance Arkbuild
   sudo sync Arkbuild

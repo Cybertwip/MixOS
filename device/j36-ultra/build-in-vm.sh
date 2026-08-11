@@ -808,6 +808,31 @@ for applet in "${INIT_APPLETS[@]}"; do
 done
 cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 
+# ── the build identity, and why there is one ──────────────────────────────────
+#
+# The two halves of this build are updated by different means and can be a version
+# apart.  The boot image -- kernel, this initramfs, /init -- goes onto the vfat BOOT
+# partition, which is the one partition a Mac can write; /opt/mixos goes onto the ext2
+# OS partition, which a Mac cannot even mount, and reaches it either by being injected
+# into the image at build time or by /init unpacking sd-root.tar.gz from BOOT.
+#
+# So "did the tarball actually replace the binaries" is a real question with no way to
+# ask it, and a boot that answers with the OLD dashboard looks exactly like a boot that
+# answers with the new one and fails.  Both halves therefore carry the same twelve
+# characters -- the hash of the dashboard's sources -- /init states what it expects,
+# mixdash states what it is, and one line of the trace says whether they agree.
+#
+# Computed here rather than in build_mixdash because the initramfs is packed long
+# before the dashboard is compiled, and a hash of source files needs no compiler.
+MIXDASH_SRC="$ROOT/device/j36-ultra/tools/mixdash"
+mixdash_source_id() {
+    cat "$MIXDASH_SRC"/*.cpp "$MIXDASH_SRC"/*.h "$MIXDASH_SRC"/mixdash.pro 2>/dev/null \
+        | sha256sum | awk '{print $1}'
+}
+MIXDASH_SOURCE_ID="$(mixdash_source_id)"
+MIXDASH_BUILD_ID="${MIXDASH_SOURCE_ID:0:12}"
+log "mixdash: build id $MIXDASH_BUILD_ID (sha256 of its sources)"
+
 cat > "$INITROOT/init" <<'INIT'
 #!/bin/busybox sh
 export PATH=/bin:/sbin
@@ -1751,11 +1776,12 @@ DROPINPROBE
 # a data partition works, read-only mounted, without a keyboard and without a shell.
 #
 # WHY User=root.  The unit ES ran under is User=ark, and three things the dashboard
-# does are not ark's: Qt's linuxfb plugin puts /dev/tty0 into KD_GRAPHICS so the
-# kernel's console stops drawing over the dashboard, which is an ioctl on a device
-# ark cannot open; the Restart and Power off cards call reboot and poweroff; and the
-# 3D cube card needs DRM master for its modeset.  None of them is worth a polkit rule
-# on a card that cannot be edited.
+# does are not ark's: it puts /dev/tty0 into KD_GRAPHICS at its first paint so the
+# kernel's console stops drawing over the dashboard -- and back into KD_TEXT if it
+# fails or is stopped, which is the only reason a failure on this board is readable at
+# all -- and that is an ioctl on a device ark cannot open; the Restart and Power off
+# cards call reboot and poweroff; and the 3D cube card needs DRM master for its
+# modeset.  None of them is worth a polkit rule on a card that cannot be edited.
 #
 # WHY LD_LIBRARY_PATH NAMES BOTH DIRECTORIES.  mixdash finds its own Qt through
 # RPATH -- built with --disable-new-dtags, so it is DT_RPATH and it covers the
@@ -1997,10 +2023,31 @@ WorkingDirectory=$mixos_root/bin
 ExecStart=$mixos_root/bin/mixdash
 Restart=on-failure
 RestartSec=2
+# 3 is the dashboard's own startup watchdog, and a watchdog that has fired has left
+# its verdict on the console and put it back into text mode.  Restarting into the same
+# stall would spend another 90 s and scroll that verdict away.
+RestartPreventExitStatus=3
+# /run/mixdash, 0700, for XDG_RUNTIME_DIR -- Qt keeps sockets and lock files there and
+# warns about it in its first line of output when it is not set.
+RuntimeDirectory=mixdash
+RuntimeDirectoryMode=0700
+Environment="XDG_RUNTIME_DIR=/run/mixdash"
 Environment="LD_LIBRARY_PATH=/run/j36/gl:$mixos_root/qt/lib"
-Environment="QT_QPA_PLATFORM=linuxfb"
+# nographicsmodeswitch, AND IT IS NOT OPTIONAL ON THIS BOARD.  The bootargs put
+# /dev/console on tty0, so the panel IS the console; Qt's linuxfb plugin otherwise
+# sets KD_GRAPHICS from inside the QApplication constructor, fbcon stops drawing, and
+# every message after that -- kernel printk, this unit's own stdout, the dashboard's
+# reason for not starting -- goes only to a journal on an ext2 partition that the
+# machine which flashed this card cannot mount.  What that looks like is a panel
+# frozen mid-boot with no dashboard on it and nothing to say why.  mixdash takes
+# KD_GRAPHICS itself from its first paint instead.  The binary appends this option if
+# it is missing, because it is on the OS partition and this unit is on BOOT.
+Environment="QT_QPA_PLATFORM=linuxfb:nographicsmodeswitch"
 Environment="QT_QPA_PLATFORM_PLUGIN_PATH=$mixos_root/qt/plugins/platforms"
 Environment="QT_QPA_FB_DISABLE_INPUT=1"
+# Read only by QBasicFontDatabase, which is not the one this Qt uses -- Debian's
+# QtGui links fontconfig -- so it is a fallback, not the font path.  main.cpp loads
+# the payload's faces by name through QFontDatabase::addApplicationFont.
 Environment="QT_QPA_FONTDIR=$mixos_root/qt/fonts"
 StandardOutput=journal+console
 StandardError=journal+console
@@ -2008,6 +2055,54 @@ StandardError=journal+console
 [Install]
 WantedBy=multi-user.target
 UNITDASH
+
+    # FONTCONFIG_FILE, and only if the file is actually on this card.
+    #
+    # It is what decides what the font phase costs: without it fontconfig reads the
+    # rootfs's /etc/fonts/fonts.conf, walks every font directory on the card and builds
+    # a cache, and the payload's own fonts.conf names one directory with two faces in
+    # it instead.  But it is NOT safe to name unconditionally -- fontconfig fails
+    # closed.  Point FONTCONFIG_FILE at a file that is not there and FcInitLoadConfig
+    # gives back a configuration with no font directories at all, which is a dashboard
+    # with no glyphs rather than a slow one.  This unit is generated onto a tmpfs from
+    # an initramfs on the BOOT partition and the payload it names lives on the OS
+    # partition; the two are updated by different means and can be a version apart, so
+    # the test is done here rather than assumed.
+    if [ -f "/newroot$mixos_root/qt/fonts/fonts.conf" ]; then
+        cat >> /newroot/run/systemd/system/mixdash.service <<UNITFC
+
+[Service]
+Environment="FONTCONFIG_FILE=$mixos_root/qt/fonts/fonts.conf"
+UNITFC
+        say "dash: fontconfig confined to $mixos_root/qt/fonts, two faces, no rootfs scan"
+    else
+        say "dash: no $mixos_root/qt/fonts/fonts.conf, so fontconfig reads the rootfs's"
+        say "      own config and may build a cache -- watch for a long \"fonts\" phase"
+    fi
+
+    # ── which build is this, on both sides of the card ───────────────────────────
+    #
+    # /etc/j36-build was written into this initramfs when the boot image was built, and
+    # says what the dashboard binary of that same build hashes to.  The binary on the OS
+    # partition says what IT was compiled from.  They are updated by different means --
+    # a boot image is dragged onto the vfat BOOT partition, /opt/mixos arrives either
+    # baked into the image or unpacked from sd-root.tar.gz -- so they can be a version
+    # apart, and a stale dashboard failing looks exactly like a new one failing.
+    # Passing the expectation in lets mixdash print both and say whether they agree,
+    # which is the difference between "my change did not work" and "my change did not
+    # ship".
+    if [ -f /etc/j36-build ]; then
+        say "dash: this boot image is $(sed -n 's/^init=//p' /etc/j36-build)"
+        dash_expect="$(sed -n 's/^mixdash=//p' /etc/j36-build)"
+        if [ -n "$dash_expect" ]; then
+            cat >> /newroot/run/systemd/system/mixdash.service <<UNITID
+
+[Service]
+Environment="MIXDASH_EXPECT=$dash_expect"
+UNITID
+            say "dash: expects mixdash $dash_expect"
+        fi
+    fi
 
     # The [Install] section above is inert -- nothing runs systemctl enable on a
     # read-only rootfs -- so the want is written by hand.  .wants directories are
@@ -2316,6 +2411,16 @@ fi
 exec setsid cttyhack sh
 INIT
 chmod 0755 "$INITROOT/init"
+
+# What this boot image is, in a file, because the heredoc above is single-quoted:
+# nothing from out here can be interpolated into /init, so anything /init needs to know
+# has to arrive as a file inside the initramfs.  init= identifies the boot image itself;
+# mixdash= is what this build of the dashboard should be, which /init passes on to
+# mixdash so it can compare it with what it was actually compiled from.
+cat > "$INITROOT/etc/j36-build" <<BUILDID
+init=$(sha256sum "$INITROOT/init" | cut -c1-12)
+mixdash=$MIXDASH_BUILD_ID
+BUILDID
 
 log "Packing the bring-up initramfs"
 (
@@ -3242,7 +3347,9 @@ $(sha256sum "$ES_PATCH" | awk '{print $1}')"
 # is made current, and mixdash never makes one.  The binary's RPATH puts /run/j36/gl
 # first all the same, so anything launched FROM the dashboard that does want GL gets
 # Mesa from the boot payload rather than this stub.
-MIXDASH_SRC="$ROOT/device/j36-ultra/tools/mixdash"
+# MIXDASH_SRC and MIXDASH_SOURCE_ID are set far above, next to the initramfs, because
+# the boot image is packed long before anything here is compiled and /init has to carry
+# the id with it.
 MIXDASH_BIN=""
 QT_PAYLOAD=""
 
@@ -3265,7 +3372,7 @@ build_mixdash() {
 
     [[ -d "$MIXDASH_SRC" ]] || { log "mixdash: $MIXDASH_SRC is missing"; return 1; }
 
-    want="$(cat "$MIXDASH_SRC"/*.cpp "$MIXDASH_SRC"/*.h "$MIXDASH_SRC"/mixdash.pro | sha256sum | awk '{print $1}')"
+    want="$MIXDASH_SOURCE_ID"
     if [[ -x "$out" && "$(cat "$stamp" 2>/dev/null)" == "$want" ]]; then
         MIXDASH_BIN="$out"
         log "mixdash: reusing $out ($(stat -c %s "$out") bytes)"
@@ -3280,6 +3387,17 @@ build_mixdash() {
     for f in "$MIXDASH_SRC"/*.cpp "$MIXDASH_SRC"/*.h "$MIXDASH_SRC"/mixdash.pro; do
         sudo cp "$f" "$src/" || { armhf_chroot_teardown; return 1; }
     done
+
+    # Generated, not committed, and generated AFTER the copy loop so it cannot feed back
+    # into the hash it is derived from.  main.cpp includes it through __has_include, so
+    # the tree still builds by hand with a plain qmake && make and simply reports an
+    # unknown build then.
+    sudo tee "$src/buildid.h" >/dev/null <<BUILDIDH
+/* Generated by build-in-vm.sh.  The first twelve characters of the sha256 of this
+ * dashboard's own sources -- the same value /init writes into MIXDASH_EXPECT, so a
+ * boot image and an /opt/mixos payload from different builds say so out loud. */
+#define MIXDASH_BUILD_ID "${want:0:12}"
+BUILDIDH
 
     # RPATH and not RUNPATH: --disable-new-dtags makes ld emit DT_RPATH, which glibc
     # searches for the whole dependency chain rather than only for this object's
@@ -3344,6 +3462,51 @@ build_mixdash() {
 # walk and the dashboard starts, finds no platform plugin, and aborts with the
 # "This application failed to start because no Qt platform plugin could be
 # initialized" message that says nothing about which library was missing.
+# A fontconfig of two files, written here rather than inline in collect_qt_payload so
+# that a REUSED payload gets it too.  That cache is keyed on the libraries in it, which
+# a new configuration file does not change, so a resumed build would otherwise ship a
+# payload whose fonts.conf the unit file expects and cannot find -- and /init's test for
+# it would silently fall back to scanning the rootfs.
+#
+# QT_QPA_FONTDIR does not do this job: only QBasicFontDatabase reads that variable, and
+# Debian's QtGui links libfontconfig, so what Qt actually uses is QFontconfigDatabase --
+# which reads /etc/fonts/fonts.conf, scans every font directory in the rootfs and builds
+# a cache if there is not one already.  On this board that scan is the first substantial
+# read the dashboard does, off a card that had just spent 102 seconds handing over a
+# kernel, and there is no way to watch it happen: the console is not being drawn on by
+# then.  Two faces in one directory instead of a system scan, and a cache under /run so
+# a rootfs with none is not a first-run penalty every boot.
+#
+# This is also what makes the dashboard look the same on a rootfs with no fonts
+# installed at all, which is the case the payload's own copies exist for.
+write_fontconfig() {
+    local out="$1"
+    mkdir -p "$out/fonts" || return 1
+    cat > "$out/fonts/fonts.conf" <<'FCCONF'
+<?xml version="1.0"?>
+<!-- Written by device/j36-ultra/build-in-vm.sh.  See write_fontconfig for why. -->
+<fontconfig>
+  <dir>/opt/mixos/qt/fonts</dir>
+  <cachedir>/run/mixdash/fontconfig</cachedir>
+  <!-- The three generic families Qt asks for by name, all answered by the one
+       family that is here.  Without these a request for "sans-serif" has no match
+       and Qt falls back to its own last resort. -->
+  <match target="pattern">
+    <test qual="any" name="family"><string>sans-serif</string></test>
+    <edit name="family" mode="prepend" binding="strong"><string>DejaVu Sans</string></edit>
+  </match>
+  <match target="pattern">
+    <test qual="any" name="family"><string>serif</string></test>
+    <edit name="family" mode="prepend" binding="strong"><string>DejaVu Sans</string></edit>
+  </match>
+  <match target="pattern">
+    <test qual="any" name="family"><string>monospace</string></test>
+    <edit name="family" mode="prepend" binding="strong"><string>DejaVu Sans</string></edit>
+  </match>
+</fontconfig>
+FCCONF
+}
+
 collect_qt_payload() {
     local out="$CACHE/qt-payload" plugin list p base real n=0 ttf
     QT_PAYLOAD=""
@@ -3354,6 +3517,7 @@ collect_qt_payload() {
     # the chroot's Qt rather than anything in this tree.  Delete $CACHE/qt-payload to
     # pick up a Qt that apt has upgraded since.
     if [[ -e "$out/lib/libQt5Core.so.5" && -e "$out/plugins/platforms/libqlinuxfb.so" ]]; then
+        write_fontconfig "$out" || return 1
         QT_PAYLOAD="$out"
         log "qt: reusing $out ($(du -sh "$out" | awk '{print $1}'))"
         return 0
@@ -3406,6 +3570,8 @@ collect_qt_payload() {
             cp "$ARMHF_CHROOT/usr/share/fonts/truetype/dejavu/$ttf" "$out/fonts/" || return 1
         fi
     done
+
+    write_fontconfig "$out" || return 1
 
     # qt.conf next to the binary, because Qt reads it from the executable's own
     # directory before it looks at any environment.  It is what makes the dashboard
@@ -4595,6 +4761,58 @@ EmulationStation is not started in these builds at all: /init masks the unit in
 /run/systemd/system.control and resets its ExecStart as well.  To get it back for
 one boot, drop j36.dash=1 from the bootargs in mvii/boot.conf.
 
+Reading the dashboard's startup trace
+-------------------------------------
+
+The panel IS the console: the bootargs are `console=ttyS0,115200n8 console=tty0'
+and the last console= is the one /dev/console becomes.  That is why the boot is
+readable on the glass at all, and it is also the trap this dashboard fell into.
+Qt's linuxfb plugin, from inside the QApplication constructor, opens /dev/tty0 and
+sets KD_GRAPHICS -- and fbcon draws nothing whatever in KD_GRAPHICS.  A dashboard
+that then failed to reach a frame left a panel frozen mid-boot with no dashboard on
+it and no way to ask why: every message after that point, kernel printk included,
+went only to a journal on an ext2 partition that the machine which flashed the card
+cannot mount.
+
+So the mode switch is mixdash's now, taken at its FIRST PAINT and not before, and
+until then the console stays live and mixdash announces every phase into it.  Two
+lines come before the phases and they are worth reading first:
+
+  mixdash: build 4f2a1c9b03de
+  mixdash: the boot image expected 4f2a1c9b03de, so both halves are this build
+
+This card is updated across two partitions by two different means -- the boot image
+is dragged onto vfat BOOT, which is the only partition a Mac can write, while
+/opt/mixos sits on an ext2 partition a Mac cannot even mount and arrives either baked
+into the image or unpacked from sd-root.tar.gz by /init.  Either half can be a version
+behind with nothing to show it, and an old dashboard failing in an old way reads
+exactly like a new one failing.  Both ids are the first twelve characters of a sha256
+over the dashboard's sources, so MISMATCH means one half was not updated: if the boot
+image is the newer one the tarball never unpacked (look for /init's `stage:' lines
+further up), and if the binary is the newer one the boot image on BOOT is stale.
+Either way the trace below it is not evidence about whatever was last edited.
+
+  [   0.01s] framebuffer      /dev/fb0's id, geometry, bpp, stride and channels
+  [   0.05s] QApplication     loads libqlinuxfb.so and opens /dev/fb0; the line
+                              after it is Qt's version, the platform NAME Qt
+                              actually chose and the screen size it chose
+  [   0.9?s] fonts            QFontDatabase, and fontconfig behind it.  The one
+                              phase that can legitimately take minutes on a cold
+                              card, which is why FONTCONFIG_FILE confines it
+  [   ?    ] Dashboard        four pages, the dock, and a QFileSystemModel on
+                              /run/j36/card -- a read-only mount of this card
+  [   ?    ] show             fullscreen, and then the first frame
+  [   ?    ] first paint      the console is now KD_GRAPHICS, and this is the last
+                              line that will ever be seen on the panel
+
+The last line on the glass names the phase that did not finish.  There is a 90 s
+deadline on each one (MIXDASH_DEADLINE=<seconds> in the unit, 0 to disable): when it
+fires, mixdash puts the console back into KD_TEXT, prints WATCHDOG and the phase
+name, and exits 3 -- and RestartPreventExitStatus=3 stops systemd from restarting it
+into the same stall and scrolling the verdict away.  Every fatal signal does the same
+restore before re-raising, so a Qt abort cannot take the board's console with it
+either.
+
 Rebooting
 ---------
 
@@ -4879,7 +5097,10 @@ The dashboard and the games:
                        These are SONAME symlinks: unpack on ext2, not on the FAT
                        BOOT partition, or the loader finds nothing to open.
   qt/plugins/platforms libqlinuxfb.so, the one plugin this needs.
-  qt/fonts             DejaVu Sans, two faces.
+  qt/fonts             DejaVu Sans, two faces, and a fonts.conf that names this one
+                       directory.  /init points FONTCONFIG_FILE at it when it is
+                       there, which is what keeps the dashboard's font phase off a
+                       whole-rootfs fontconfig scan.
   bin/doom             framebuffer Doom (doomgeneric), if the build staged it.
   share/doom           its IWAD.
 
@@ -5221,8 +5442,51 @@ image_export_signature() {
 
 IMAGE_STAMP="$WORK/.image-export"
 
+# ── Making the OS partition's filesystem as big as the partition it is in ─────
+#
+# WHY THIS IS NEEDED BEFORE ANYTHING CAN BE WRITTEN TO p2.  write_rootfs.sh runs
+# `resize2fs -M' on the build root before it dds it into the image: the filesystem is
+# shrunk to the smallest size that holds its own contents, which is what keeps the
+# released .img compressible.  What that leaves in p2, though, is an ext2 with ZERO free
+# blocks sitting in a 7500 MB partition.  So the payload's first mkdir answered "No space
+# left on device", and every file after it "No such file or directory" -- because its
+# parent directory was the mkdir that had just failed.
+#
+# Nothing on the device fixes it either.  firstboot.service is masked in bootargs, and
+# even unmasked, what it resizes is the DATA partition.  So the filesystem is grown here,
+# to the end of its own partition, which is what both machines want anyway: an OS
+# partition whose filesystem stops 7 GB short of its own end is not a smaller image, it
+# is 7 GB that the running system cannot use.  The loop device is sizelimited to the
+# partition, so `resize2fs' with no size cannot run past the partition's end.
+grow_to_partition() {
+    local loop="$1" fstype="$2" fsck_rc=0
+
+    case "$fstype" in
+        ext2|ext3|ext4)
+            # resize2fs refuses a filesystem it has not seen checked, and the last thing
+            # to touch this one was a dd.  1 and 2 mean "found and fixed", not "broken".
+            sudo e2fsck -p -f "$loop" >/dev/null 2>&1 || fsck_rc=$?
+            if (( fsck_rc > 2 )); then
+                log "image: e2fsck could not clean p2 (exit $fsck_rc); not growing it"
+                return 1
+            fi
+            if ! sudo resize2fs "$loop" >/dev/null 2>&1; then
+                log "image: resize2fs could not grow p2 to fill its partition, so the"
+                log "image: payload has only the free space resize2fs -M left it: none"
+                return 1
+            fi
+            ;;
+        btrfs)
+            # btrfs only resizes mounted, so this one is done after the mount below.
+            return 0
+            ;;
+    esac
+    return 0
+}
+
 inject_into_image() {
     local img="$1" part_json p1_start p1_size p2_start p2_size loop mnt fstype rc=0
+    local tar_rc=0
 
     log "image: folding both payloads into $(basename "$img")"
 
@@ -5295,13 +5559,42 @@ print(p[0]["start"], p[0]["size"], p[1]["start"], p[1]["size"])
         fstype="$(sudo blkid -o value -s TYPE "$loop" 2>/dev/null || true)"
         case "$fstype" in
             ext2|ext3|ext4|btrfs)
+                # Not fatal on its own: the verdict on this partition is whether the
+                # payload came out of the tarball, not whether one resize2fs worked.  A
+                # filesystem that already had room needs neither.
+                grow_to_partition "$loop" "$fstype" || true
                 if sudo mount -t "$fstype" "$loop" "$mnt"; then
+                    if [[ "$fstype" == btrfs ]]; then
+                        sudo btrfs filesystem resize max "$mnt" >/dev/null 2>&1 || \
+                            log "image: btrfs would not resize to max; free space is as dd left it"
+                    fi
+                    log "image: p2 has $(sudo df -m --output=avail "$mnt" | tail -1 | tr -d ' ') MB free and /opt/mixos unpacks to $(du -sm "$SDROOT" | cut -f1) MB"
                     # -p and --numeric-owner: the tarball was written --owner=root
                     # --group=root, and /opt/mixos has to come out root-owned with
                     # the execute bits and the ~30 Qt SONAME symlinks intact.
-                    sudo tar -C "$mnt" -xzpf "$ARTIFACTS/sd-root.tar.gz" --numeric-owner
+                    #
+                    # AND ITS EXIT STATUS IS READ.  It was not, and this whole function
+                    # runs inside an `if !' so errexit is suppressed for it -- so a tar
+                    # that failed on every single member with "No space left on device"
+                    # was followed by "the card boots as flashed".  The verdict now comes
+                    # from the artifact as well as the status: an unpack can report
+                    # success and still be missing the one file that matters.
+                    sudo tar -C "$mnt" -xzpf "$ARTIFACTS/sd-root.tar.gz" --numeric-owner \
+                        || tar_rc=$?
                     sync
-                    log "image: p2 ($fstype) now carries /opt/mixos -- the card boots as flashed"
+                    if (( tar_rc != 0 )); then
+                        log "image: tar exited $tar_rc -- /opt/mixos was NOT written properly."
+                        log "image: The lines above tar's are the reason; 'No space left on"
+                        log "image: device' means p2's filesystem could not be grown."
+                        rc=1
+                    elif [[ ! -x "$mnt/opt/mixos/bin/mixdash" ]]; then
+                        log "image: tar succeeded but $mnt/opt/mixos/bin/mixdash is not"
+                        log "image: there and executable, so the dashboard would not start."
+                        rc=1
+                    else
+                        log "image: p2 ($fstype) now carries /opt/mixos -- the card boots as flashed"
+                        log "image: $(sudo du -sm "$mnt/opt/mixos" | cut -f1) MB of it, $(sudo find "$mnt/opt/mixos" -type f | wc -l) files, $(sudo df -m --output=avail "$mnt" | tail -1 | tr -d ' ') MB still free"
+                    fi
                     if [[ "$fstype" == btrfs ]]; then
                         log "image: NOTE p2 is btrfs, so this image predates the ext2 layout."
                         log "image: It boots and the dashboard runs, but p3 is still vfat/exfat"

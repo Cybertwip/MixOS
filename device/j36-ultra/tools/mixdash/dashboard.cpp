@@ -446,6 +446,16 @@ void Dashboard::paintEvent(QPaintEvent *)
     p.setPen(Qt::NoPen);
     p.setBrush(bloom);
     p.drawRect(rect());
+
+    /*
+     * Last, and after the painter has done its work, because what main() does with
+     * this is switch the console out of the mode fbcon draws in: say it only once
+     * there is genuinely a frame here to replace the console with.
+     */
+    if (!m_firstPaint) {
+        m_firstPaint = true;
+        emit firstPainted();
+    }
 }
 
 void Dashboard::toast(const QString &text, int ms)
