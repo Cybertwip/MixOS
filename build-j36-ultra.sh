@@ -173,14 +173,24 @@ printf '  %s\n' \
     "$ARTIFACT_DIR/mt6592-j36-ultra.dtb" \
     "$ARTIFACT_DIR/j36_mt6592_input.ko" \
     "$ARTIFACT_DIR/manifest.txt"
-# Two halves, two filesystems, and the split is not cosmetic: the MVII LK reads FAT32
-# and nothing else, so BOOT carries the launcher and the OS partition carries the rest.
-# Unpacking sd-root.tar.gz onto BOOT instead would drop the ~30 Qt SONAME symlinks and
-# every execute bit, and mixdash would then fail before main().
-darkos_log "Copy $ARTIFACT_DIR/sd-boot/ onto the card's FAT32 BOOT partition (the launcher: zImage, the DTB, initrd.img, mvii/boot.conf)"
+# FLASH AND GO.  The build folds both halves into the image inside the VM -- the
+# launcher into the vfat BOOT partition and /opt/mixos into the ext2 OS partition --
+# so the normal path is one dd and nothing else.  It has to be that way: the
+# workstation here is macOS, which mounts FAT and exFAT and neither ext2 nor btrfs, so
+# "untar this onto the OS partition" is a step that cannot be performed at all from the
+# machine doing the flashing.
+#
+# The two artifacts below are still emitted, for updating a card in place from a Linux
+# box.  Unpacking sd-root.tar.gz onto BOOT instead of the OS partition is the one wrong
+# way to do it: FAT holds neither the ~30 Qt SONAME symlinks nor the execute bits, and
+# mixdash would fail before main().
+darkos_log "Flash the newest dArkOS_*.img in $PWD -- it already carries the launcher on BOOT and /opt/mixos on the OS partition"
+darkos_log "The card's three partitions: p1 BOOT vfat (launcher only), p2 ROOTFS ext2 (Debian + /opt/mixos), p3 DATA ext2 (your home, mounted at /home/virtua)"
+darkos_log "To update a card in place from a Linux machine instead: copy $ARTIFACT_DIR/sd-boot/ onto BOOT"
 if [[ -f "$ARTIFACT_DIR/sd-root.tar.gz" ]]; then
-    darkos_log "Then, as root: sudo tar -C /path/to/the/mounted/ROOTFS -xzf $ARTIFACT_DIR/sd-root.tar.gz  (the ext2 OS partition -- gives /opt/mixos)"
+    darkos_log "  and, as root: sudo tar -C /path/to/the/mounted/ROOTFS -xzf $ARTIFACT_DIR/sd-root.tar.gz  (the ext2 OS partition -- gives /opt/mixos)"
 else
     darkos_warn "No sd-root.tar.gz was produced, so nothing will be on the OS partition: no dashboard, no lima, no Mesa. Check the sd-root lines in the build log."
 fi
+darkos_log "Check the build log for the 'image:' lines -- they say whether the fold into the image succeeded, and on which partitions"
 darkos_warn "The R36 base image kernel is arm64 and this SoC is ARMv7; only the armhf rootfs is shared. sd-boot/mvii/boot.conf is what points the MVII LK at the 32-bit kernel."
