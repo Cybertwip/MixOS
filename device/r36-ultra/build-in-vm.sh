@@ -432,8 +432,41 @@ verify_gui_architecture() {
     log "Verified ${USERSPACE_ARCH} EmulationStation GUI binary"
 }
 
-# ── A build root left over from the previous filesystem layout ────────────────
+# ── Anything left over from the previous filesystem layout ────────────────────
 #
+# What the artifacts of this build are made of, in one string, so a later run can tell
+# whether the checkpoints beside it describe the layout it is being asked for.  A
+# finished build writes it; a build from before this existed has no file, which reads
+# as "unknown" and is treated as foreign.
+layout_signature() { printf 'rootfs=%s data=%s\n' "$ROOT_FILESYSTEM_FORMAT" "$DATA_FILESYSTEM_FORMAT"; }
+
+# What is actually IN the finished image, which is the only evidence that survives the
+# build root being deleted -- and the evidence the last run had in front of it and did
+# not look at: parted printed "2 ... btrfs" and "3 ... fat32" while the resume decided
+# from a checkpoint file that everything was done.
+#
+# parted -m emits one line per partition: number:begin:end:size:filesystem:name:flags;
+# Field 5 is a probe of the partition's contents, not the MBR type byte, so it says
+# ext2 for an ext2 partition even when the table calls it fat32.  An empty field is a
+# partition with no filesystem yet -- an image mid-build -- and is not a mismatch.
+image_layout_is_foreign() {
+    local img="$1" num begin end size fs rest
+    [[ -s "$img" ]] || return 1
+    while IFS=: read -r num begin end size fs rest; do
+        case "$num" in
+            2)  [[ -n "$fs" && "$fs" != "$ROOT_FILESYSTEM_FORMAT" ]] && {
+                    log "$img: the OS partition holds $fs, not $ROOT_FILESYSTEM_FORMAT"
+                    return 0
+                } ;;
+            3)  [[ -n "$fs" && "$fs" != "$DATA_FILESYSTEM_FORMAT" ]] && {
+                    log "$img: the DATA partition holds $fs, not $DATA_FILESYSTEM_FORMAT"
+                    return 0
+                } ;;
+        esac
+    done < <(parted -m -s "$img" print 2>/dev/null || true)
+    return 1
+}
+
 # ROOT_FILESYSTEM_FORMAT went from btrfs to ext2, because the MVII LK on the J36 Ultra
 # reads FAT32 only and the OS partition has to be the simplest filesystem both kernels
 # on the card can mount.  A build root made under the old value cannot be resumed from,
@@ -456,17 +489,58 @@ verify_gui_architecture() {
 # is reset so the rebuild takes a new name beside them.  They are the only flashable
 # card the operator has until this finishes, and deleting that to save a few gigabytes
 # would be the wrong trade.
-discard_foreign_format_rootfs() {
-    local target have keep part stale_loop
+discard_foreign_layout() {
+    local target have keep part stale_loop recorded
+    local rootfs_foreign=0 image_foreign=0 snapshot_ok=0
+
     for target in "$FILESYSTEM" "$ROOTFS_SNAPSHOT"; do
         [[ -s "$target" ]] || continue
         have="$(sudo blkid -o value -s TYPE "$target" 2>/dev/null || true)"
         # No answer at all is not a mismatch: an image mid-write has no superblock yet,
         # and the stages below already handle a build root they cannot mount.
         [[ -n "$have" ]] || continue
-        [[ "$have" != "$ROOT_FILESYSTEM_FORMAT" ]] || continue
-
+        if [[ "$have" == "$ROOT_FILESYSTEM_FORMAT" ]]; then
+            [[ "$target" == "$ROOTFS_SNAPSHOT" ]] && snapshot_ok=1
+            continue
+        fi
+        rootfs_foreign=1
         log "$(basename "$target") is $have and this build makes $ROOT_FILESYSTEM_FORMAT"
+    done
+
+    if image_layout_is_foreign "$DISK"; then
+        image_foreign=1
+    elif [[ -f "${DISK}.7z.001" && ! -f "$DISK" ]]; then
+        # Archived, and the image it was made from is gone, so there is nothing left to
+        # probe.  The marker is the only remaining witness -- and its absence is itself
+        # the answer on a state directory written before this check existed.
+        recorded="$(cat "$STATE_DIR/layout" 2>/dev/null || true)"
+        if [[ "$recorded" != "$(layout_signature)" ]]; then
+            image_foreign=1
+            log "The finished archive records layout '${recorded:-unknown}', not '$(layout_signature)'"
+        fi
+    fi
+
+    (( rootfs_foreign || image_foreign )) || return 0
+
+    # An old image with a current build root: the rootfs itself is fine, but
+    # finalization has already shrunk it to fit and re-running the stage on a
+    # minimum-sized filesystem is how a build runs out of space at the very end.  The
+    # pre-finalization snapshot is exactly the state that stage expects, so hand back
+    # to it; with no snapshot there is no honest option but to bootstrap again.
+    if (( image_foreign && ! rootfs_foreign )); then
+        if (( snapshot_ok )); then
+            log "The image predates this layout but the build root does not"
+            log "Reverting to the pre-finalization snapshot rather than unpacking Debian again"
+            mountpoint -q Arkbuild && remove_arkbuild
+            sudo rm -f "$FILESYSTEM" "$FILESYSTEM.part"
+        else
+            log "The image predates this layout and there is no pre-finalization snapshot"
+            log "to fall back on, so the build root goes with it"
+            rootfs_foreign=1
+        fi
+    fi
+
+    if (( rootfs_foreign )); then
         log "Discarding the old build root; Debian will be unpacked again, which is the"
         log "only way the image's OS partition changes format"
         mountpoint -q Arkbuild && remove_arkbuild
@@ -480,40 +554,42 @@ discard_foreign_format_rootfs() {
         sudo rm -f "$FILESYSTEM" "$FILESYSTEM.part" \
                    "$ROOTFS_SNAPSHOT" "$ROOTFS_SNAPSHOT.part"
         rm -f "$STATE_DIR"/partition.done "$STATE_DIR"/bootstrap.done \
-              "$STATE_DIR"/userspace.done "$STATE_DIR"/finalization.done \
-              "$STATE_DIR"/complete.done "$STATE_DIR"/image.done \
-              "$STATE_DIR"/component-*.done
+              "$STATE_DIR"/userspace.done "$STATE_DIR"/component-*.done
+    fi
 
-        # A fresh date, so the rebuilt image sits beside the old one instead of
-        # inheriting its name -- and so the "existing completed archive" check further
-        # down does not find the old layout's archive under the new layout's name and
-        # exit satisfied without building anything.
-        rm -f "$STATE_DIR/build-date"
-        BUILD_DATE="$(date +%m%d%Y)"
-        printf '%s\n' "$BUILD_DATE" > "$STATE_DIR/build-date"
-        DISK="${IMAGE_PREFIX}_${DEBIAN_CODE_NAME}_${BUILD_DATE}.img"
-        export BUILD_DATE DISK
+    # Both cases end here: whatever else was kept, the image and everything that
+    # packaged it describe the old layout and have to be made again.
+    rm -f "$STATE_DIR"/finalization.done "$STATE_DIR"/complete.done \
+          "$STATE_DIR"/image.done "$STATE_DIR"/layout
 
-        # If the old layout was built today the new name collides with it, and the
-        # "existing completed archive" check further down would find ${DISK}.7z.001,
-        # verify it and exit 0 -- the exact failure this function exists to stop.  Move
-        # the old output aside rather than delete it: it is still the only card the
-        # operator can flash until this build finishes, and now it says what it is.
-        if [[ -f "$DISK" || -f "${DISK}.7z.001" ]]; then
-            keep="${DISK%.img}-btrfs-layout"
-            log "An image from today already exists under that name; keeping it as ${keep}.img"
-            [[ -f "$DISK" ]] && mv -f "$DISK" "${keep}.img"
-            for part in "${DISK}".7z.*; do
-                [[ -e "$part" ]] || continue
-                mv -f "$part" "${keep}.img.${part##*.img.}"
-            done
-        fi
-        log "The rebuilt image will be $DISK; the old one is still there to flash meanwhile"
-        return 0
-    done
+    # A fresh date, so the rebuilt image sits beside the old one instead of inheriting
+    # its name -- and so the "existing completed archive" check further down does not
+    # find the old layout's archive under the new layout's name and exit satisfied
+    # without building anything, which is exactly what it did.
+    rm -f "$STATE_DIR/build-date"
+    BUILD_DATE="$(date +%m%d%Y)"
+    printf '%s\n' "$BUILD_DATE" > "$STATE_DIR/build-date"
+    DISK="${IMAGE_PREFIX}_${DEBIAN_CODE_NAME}_${BUILD_DATE}.img"
+    export BUILD_DATE DISK
+
+    # If the old layout was built today the new name collides with it, and the
+    # "existing completed archive" check further down would find ${DISK}.7z.001, verify
+    # it and exit 0 -- the failure this function exists to stop.  Move the old output
+    # aside rather than delete it: it is still the only card the operator can flash
+    # until this build finishes, and now it says what it is.
+    if [[ -f "$DISK" || -f "${DISK}.7z.001" ]]; then
+        keep="${DISK%.img}-old-layout"
+        log "An image from today already exists under that name; keeping it as ${keep}.img"
+        [[ -f "$DISK" ]] && mv -f "$DISK" "${keep}.img"
+        for part in "${DISK}".7z.*; do
+            [[ -e "$part" ]] || continue
+            mv -f "$part" "${keep}.img.${part##*.img.}"
+        done
+    fi
+    log "The rebuilt image will be $DISK; the old one is still there to flash meanwhile"
     return 0
 }
-discard_foreign_format_rootfs
+discard_foreign_layout
 
 # A GUI-only and a full-app build use different filesystem/image names.  Make
 # sure a mount left by the other profile cannot contaminate this build.
@@ -580,6 +656,10 @@ if [[ -f "${DISK}.7z.001" ]]; then
         log "Existing completed archive found; verifying it"
         bash device/r36-ultra/verify_archive.sh "$DISK" "$STATE_DIR"
         mark complete
+        # Reached only because discard_foreign_layout let this archive stand, so it is
+        # this layout's archive by elimination.  Recording that is what lets the next
+        # run tell the two apart once the image itself has been deleted.
+        layout_signature > "$STATE_DIR/layout"
         printf '%s\n' "$DISK" > "$STATE_DIR/latest-image"
         exit 0
     fi
@@ -723,6 +803,10 @@ fi
 [[ -f "${DISK}.7z.001" ]] || fail "split archive was not produced: ${DISK}.7z.001"
 7z t "${DISK}.7z.001"
 mark complete
+# What this build's artifacts are, so a run made after the layout changes again can
+# tell that they are not what it was asked for -- even after the image is deleted and
+# only the archive is left.
+layout_signature > "$STATE_DIR/layout"
 printf '%s\n' "$DISK" > "$STATE_DIR/latest-image"
 rm -f "$CURRENT_STAGE"
 log "R36/RG351MP build completed successfully: $DISK"

@@ -693,9 +693,14 @@ bb_disable() {
 # so the dashboard's Files page would open on a directory containing one dangling
 # symlink instead of on the card.  The assertion loop below is what would have caught
 # this, and it can only catch what is named here.
+# tar and gunzip are here for stage_from_boot(): the only channel that can update an
+# already-flashed card from a macOS workstation is the FAT BOOT partition, and a tree
+# copied there by hand loses every SONAME symlink and every execute bit.  A tarball
+# does not, so the tarball is what crosses, and this initramfs unpacks it onto the OS
+# partition -- on Linux, as root, where symlinks and modes still mean something.
 INIT_APPLETS=(sh mount umount mkdir mknod cat cp ln ls tr grep echo sleep dmesg
               insmod hexdump setsid cttyhack switch_root sync poweroff reboot
-              uname chmod rmdir)
+              uname chmod rmdir tar gunzip)
 
 # Most applets are CONFIG_<applet in caps>; three are not, and guessing would
 # assert a symbol that does not exist, which greps false and dies on a correct
@@ -740,6 +745,12 @@ if [[ ! -x "$BUSYBOX_SRC/busybox" || "${J36_REBUILD_BUSYBOX:-0}" == 1 ]]; then
     bb_enable CONFIG_SWITCH_ROOT
     bb_enable CONFIG_UMOUNT
     bb_enable CONFIG_SYNC
+
+    # And the pair that unpacks sd-root.tar.gz from the BOOT partition onto the OS
+    # partition.  gunzip rather than tar -z: seamless decompression is a separate
+    # busybox feature symbol, and a pipe needs no feature at all.
+    bb_enable CONFIG_TAR
+    bb_enable CONFIG_GUNZIP
 
     yes '' | make -C "$BUSYBOX_SRC" oldconfig >/dev/null || true
 
@@ -1026,6 +1037,66 @@ find_payload() {
     fi
     say "payload: no j36/ in the rootfs /opt/mixos and none on the BOOT partition"
     return 1
+}
+
+# ── Updating a flashed card from a machine that can only write FAT ────────────
+#
+# The OS partition is ext2 and the home partition is ext2, and macOS mounts neither.
+# So the documented update -- untar sd-root.tar.gz onto ROOTFS -- needs a Linux
+# machine, and the only other way to change an already-flashed card is to write the
+# whole image again.  This is the third way: copy ONE FILE, sd-root.tar.gz, onto the
+# FAT BOOT partition, which macOS does mount, and let this initramfs unpack it.
+#
+# WHY A TARBALL AND NOT THE TREE.  Copying opt/ onto a FAT partition by hand is the
+# thing that looks like it should work and does not.  vfat and exfat have no symlinks
+# and no execute bit, and the Qt payload is some thirty SONAME symlinks -- libQt5Core.so.5
+# and friends.  Depending on which tool does the copying they arrive flattened into
+# full copies, dereferenced into nothing, or written as short text files holding the
+# target's path, and the loader's verdict on that last one is "invalid ELF header"
+# when it opens libQt5Widgets.so.  A tar archive stores the link, the mode and the
+# name; unpacking it here happens on Linux, as root, on ext2, where all three survive.
+#
+# Once per tarball, not once per boot: the size and timestamp are recorded in the tree
+# and compared on the next boot.  Nothing is deleted first -- tar overwrites in place,
+# and `rm -rf' inside an initramfs aimed at somebody's OS partition is not a trade
+# worth making for a few stale files.
+stage_from_boot() {
+    if [ -z "$rootdev" ]; then return 1; fi
+    if ! mount_bootfs; then return 1; fi
+    if [ ! -f /bootfs/sd-root.tar.gz ]; then return 1; fi
+
+    # Size, month, day and time out of `ls -l': this initramfs has no stat, no wc and
+    # no md5sum, and those four fields change whenever the build writes a new tarball.
+    set -- $(ls -l /bootfs/sd-root.tar.gz)
+    boot_stamp="$5 $6 $7 $8"
+    if [ -r /newroot/opt/mixos/.staged-from-boot ]; then
+        read -r staged_stamp < /newroot/opt/mixos/.staged-from-boot
+        if [ "$staged_stamp" = "$boot_stamp" ]; then
+            say "stage: /opt/mixos already matches sd-root.tar.gz on BOOT"
+            return 0
+        fi
+        say "stage: sd-root.tar.gz on BOOT is not the one that made /opt/mixos"
+    fi
+
+    say "stage: unpacking sd-root.tar.gz from BOOT onto the OS partition"
+    say "       $boot_stamp -- once per tarball, not once per boot"
+    mkdir -p /newroot/opt
+    gunzip -c /bootfs/sd-root.tar.gz | tar -x -C /newroot
+    # tar's exit status is not the test.  This is a pipeline in ash, so what is
+    # reported is tar's, and a gunzip that dies half way through a truncated file
+    # leaves tar perfectly happy with the part it did get.  What matters is whether
+    # the thing this exists to install is there and executable.
+    if [ ! -x /newroot/opt/mixos/bin/mixdash ]; then
+        say "stage: FAILED -- no executable opt/mixos/bin/mixdash came out of it."
+        say "       Either the copy of the tarball on BOOT is truncated (check that"
+        say "       it is the same size as the one in the artifacts) or the OS"
+        say "       partition is full."
+        return 1
+    fi
+    printf '%s\n' "$boot_stamp" > /newroot/opt/mixos/.staged-from-boot
+    sync
+    say "stage: /opt/mixos is now what the tarball holds"
+    return 0
 }
 
 # Doom used to run from here, off the BOOT partition, before the dashboard existed.
@@ -2053,6 +2124,11 @@ UNITNOTICE
     return 0
 }
 
+# Before any of them, because it is what puts /opt/mixos/j36 on the OS partition in
+# the first place on a card updated from a Mac: find_payload below looks there first,
+# and by the time it does the tarball has already been unpacked.
+stage_from_boot
+
 if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || \
    [ "$want_gl" = 1 ] || [ "$want_audio" = 1 ]; then
     # find_payload is called by each of the four rather than once here, so that a card
@@ -2071,18 +2147,21 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || \
     if [ "$want_mtkdrm" = 1 ]; then run_mtkdrm; fi
     if [ "$want_audio" = 1 ]; then run_audio; fi
     if [ "$want_gl" = 1 ]; then setup_es_gl; fi
-    # Only if the fallback was taken.  Everything above has been copied into the
-    # rootfs's /run or insmod'ed, so nothing still reads this mount -- and leaving a
-    # vfat mount for switch_root to carry across is a mount systemd would inherit and
-    # nobody would own.  The payload in the rootfs needs no counterpart: that is the
-    # partition being switched into.
-    if [ "$bootfs_mounted" = 1 ]; then
-        umount /bootfs 2>/dev/null
-        bootfs_mounted=0
-        # Cleared with the mount, so that nothing added after this line can find a
-        # path under /bootfs that is no longer there.
-        case "$payload" in /bootfs/*) payload="" ;; esac
-    fi
+fi
+
+# Outside that block, where it used to be inside it.  Everything above has been copied
+# into the rootfs's /run or insmod'ed, so nothing still reads this mount -- and leaving
+# a vfat mount for switch_root to carry across is a mount systemd would inherit and
+# nobody would own.  stage_from_boot mounts /bootfs whether or not a single payload
+# word was asked for, so a cleanup that only ran when one was is a cleanup that leaks.
+# The payload in the rootfs needs no counterpart: that is the partition being switched
+# into.
+if [ "$bootfs_mounted" = 1 ]; then
+    umount /bootfs 2>/dev/null
+    bootfs_mounted=0
+    # Cleared with the mount, so that nothing added after this line can find a path
+    # under /bootfs that is no longer there.
+    case "$payload" in /bootfs/*) payload="" ;; esac
 fi
 
 # Outside that block on purpose: the dashboard is in the second partition and the
@@ -4775,6 +4854,35 @@ MIXOSREADME
         --owner=root --group=root --numeric-owner opt )
     log "sd-root: sd-root.tar.gz is $(stat -c %s "$ARTIFACTS/sd-root.tar.gz") bytes"
     log "sd-root: $(find "$SDROOT/opt" -type f | wc -l) files, $(du -sh "$SDROOT/opt" | cut -f1) as a tree"
+
+    # ── The same tarball, on BOOT, for a workstation that cannot write ext2 ───
+    #
+    # This is the only way an already-flashed card can be updated from macOS: BOOT is
+    # the one partition it mounts.  The tarball goes on it whole and /init unpacks it
+    # onto the OS partition on the next boot -- see stage_from_boot().  Copying the
+    # tree there by hand instead is what produces "invalid ELF header", because vfat
+    # keeps neither the SONAME symlinks nor the execute bits.
+    #
+    # Only if it fits.  BOOT is ${SYSTEM_SIZE:-100} MB and its real job is the
+    # launcher; a tarball that crowds out the kernel would trade a working card for a
+    # convenient update.  FAT32 also rounds every file up to a cluster, so the budget
+    # here is deliberately short of the partition.
+    boot_used=$(du -s --block-size=1 "$SDBOOT" | cut -f1)
+    tar_bytes=$(stat -c %s "$ARTIFACTS/sd-root.tar.gz")
+    boot_budget=$(( (${SYSTEM_SIZE:-100} - 8) * 1024 * 1024 ))
+    if [[ "${J36_BOOT_TARBALL:-1}" != 1 ]]; then
+        log "sd-boot: J36_BOOT_TARBALL=0, so the tarball is not staged on BOOT"
+    elif (( boot_used + tar_bytes <= boot_budget )); then
+        cp "$ARTIFACTS/sd-root.tar.gz" "$SDBOOT/sd-root.tar.gz"
+        log "sd-boot: sd-root.tar.gz staged on BOOT too ($(( (boot_used + tar_bytes) / 1048576 )) MB of the ${SYSTEM_SIZE:-100} MB budget)"
+        log "sd-boot: copy it onto BOOT from any machine and the next boot unpacks it"
+        log "sd-boot: onto the OS partition -- no reflash, no Linux machine needed"
+    else
+        log "sd-boot: NOT staging sd-root.tar.gz on BOOT: the launcher is $(( boot_used / 1048576 )) MB,"
+        log "sd-boot: the tarball is $(( tar_bytes / 1048576 )) MB and the budget is $(( boot_budget / 1048576 )) MB."
+        log "sd-boot: Update the card by reflashing the image, or untar it onto the OS"
+        log "sd-boot: partition from a Linux machine."
+    fi
 else
     # Only reachable with J36_PAYLOAD_ON=boot and no dashboard: everything went to
     # $SDBOOT, and the OS partition needs nothing.  Worth saying out loud, because
