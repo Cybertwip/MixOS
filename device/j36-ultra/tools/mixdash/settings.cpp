@@ -146,6 +146,17 @@ void Settings::load()
      * rather than carry it. */
     if (!m_mediaRoot.isEmpty() && !QFileInfo(m_mediaRoot).isDir())
         m_mediaRoot.clear();
+
+    /*
+     * Brightness gets the same treatment as the pointer speeds, and for a harder
+     * reason: this is the only value in the file that can make the machine look
+     * dead.  A hand-edited display/brightness=0 would come back after a reboot as
+     * a black panel on a board whose only output is that panel, so the floor is
+     * clamped here as well as on the slider.  A negative value is left alone --
+     * it is not a brightness, it is the absence of one.
+     */
+    const int saved = m_store->value(QStringLiteral("display/brightness"), -1).toInt();
+    m_brightness = saved < 0 ? -1 : clampInt(saved, 5, 100);
 }
 
 void Settings::setMouse(const MouseConfig &config)
@@ -199,6 +210,18 @@ void Settings::setMediaRoot(const QString &path)
     m_mediaRoot = path;
     if (m_store) {
         m_store->setValue(QStringLiteral("media/root"), path);
+        m_store->sync();
+    }
+}
+
+void Settings::setBrightness(int percent)
+{
+    const int value = percent < 0 ? -1 : clampInt(percent, 5, 100);
+    if (m_brightness == value)
+        return;
+    m_brightness = value;
+    if (m_store) {
+        m_store->setValue(QStringLiteral("display/brightness"), m_brightness);
         m_store->sync();
     }
 }

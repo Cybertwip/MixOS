@@ -297,8 +297,24 @@ Dashboard::Dashboard(QWidget *parent)
     m_packages = new PackagesPage(this);
     Trace::step("MousePage");
     m_mouse = new MousePage(this);
+    Trace::step("DisplayPage");
+    m_display = new DisplayPage(this);
     Trace::step("InfoPage");
     m_info = new InfoPage(this);
+
+    /*
+     * The one thing built here that reaches the hardware before anybody asks for
+     * it.  j36_mt6592_backlight adopts the duty the MVII loader left in the BLS
+     * block rather than choosing a level, and the loader always hands over at
+     * full -- so a brightness the user set is applied by nothing at all unless
+     * the shell applies it, and the setting would appear to reset on every boot.
+     *
+     * Safe to do before the first frame: only a level this dashboard itself wrote
+     * is ever stored, the slider that wrote it cannot go below 5 per cent, and
+     * Settings clamps the same floor again on the way in.
+     */
+    Trace::step("backlight/restore");
+    DisplayPage::restoreSaved();
 
     Trace::step("Dock");
     m_dock = new Dock(this);
@@ -346,7 +362,7 @@ Dashboard::Dashboard(QWidget *parent)
     m_roots << m_apps << m_media << m_settings << m_power;
     m_all << m_apps << m_media << m_settings << m_power
           << m_files << m_terminal << m_wifi << m_packages
-          << m_diagnostics << m_mouse << m_info;
+          << m_diagnostics << m_mouse << m_display << m_info;
     for (PageWidget *page : m_all) {
         adopt(page);
         page->hide();
@@ -921,6 +937,9 @@ void Dashboard::openDestination(int destination)
     switch (destination) {
     case SettingsPage::OpenMouse:
         push(m_mouse);
+        break;
+    case SettingsPage::OpenDisplay:
+        push(m_display);
         break;
     case SettingsPage::OpenWifi:
         push(m_wifi);

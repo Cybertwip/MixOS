@@ -5,12 +5,16 @@
  */
 #include "settingspage.h"
 
+#include <QDir>
+#include <QFile>
 #include <QFileInfo>
+#include <QGuiApplication>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QProcess>
 #include <QRegularExpression>
 #include <QResizeEvent>
+#include <QScreen>
 #include <QStringList>
 #include <QSysInfo>
 
@@ -22,6 +26,104 @@ namespace {
 /* Rows that are not a destination.  Above every Destination value so one `id'
  * field can carry both without a second tag. */
 enum { RowVolume = 900, RowMute, RowInert };
+
+/*
+ * The floor the brightness slider will not go below, in per cent.
+ *
+ * See the note on DisplayPage in the header: the panel is this board's only
+ * output, so the setting is not allowed to turn it off.  Five per cent of a
+ * 1023-count duty is 51, which the TPS61161 in front of the LED string still
+ * drives -- and it is far above the sub-millisecond low it treats as a shutdown
+ * request, so dimming this far cannot latch the driver off.
+ */
+const int MinBrightness = 5;
+
+/*
+ * The backlight, looked up every time rather than cached.
+ *
+ * Caching it would be one fewer readdir per rebuild and would be wrong: the
+ * module is in the j36.power payload and can be inserted or removed while the
+ * dashboard is running, which is exactly what happens while somebody is bringing
+ * the driver up.  A page that decided at startup that there was no backlight, and
+ * kept saying so after one appeared, would send that person looking for a bug in
+ * the kernel.
+ */
+struct BacklightDevice {
+    QString dir;
+    QString name;
+    int max = 0;
+
+    bool valid() const { return !dir.isEmpty() && max > 0; }
+};
+
+BacklightDevice findBacklight()
+{
+    BacklightDevice bl;
+
+    const QStringList names = QDir(QStringLiteral("/sys/class/backlight"))
+                                  .entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &name : names) {
+        const QString dir = "/sys/class/backlight/" + name;
+        const int max = SysInfo::readTrimmed(dir + "/max_brightness").toInt();
+        /* A zero max_brightness is a device that registered without a usable
+         * scale; dividing by it later would be the crash. */
+        if (max <= 0)
+            continue;
+
+        /* The board's own is taken by name, anything else only because it is the
+         * only one there -- a USB display or a debug LED class device turning up
+         * first in readdir order must not become "the screen". */
+        const bool ours = name.startsWith(QLatin1String("j36"));
+        if (ours || !bl.valid()) {
+            bl.dir = dir;
+            bl.name = name;
+            bl.max = max;
+        }
+        if (ours)
+            break;
+    }
+
+    return bl;
+}
+
+/* Per cent to the driver's own scale, never landing on zero: 1 is the dimmest
+ * thing that is still a backlight. */
+int percentToRaw(int percent, int max)
+{
+    return qMax(1, qRound(qBound(0, percent, 100) * max / 100.0));
+}
+
+/* -1 for "there is nothing to read", which is not the same as 0 per cent. */
+int readBacklightPercent(const BacklightDevice &bl)
+{
+    if (!bl.valid())
+        return -1;
+    const QString raw = SysInfo::readTrimmed(bl.dir + "/brightness");
+    if (raw.isEmpty())
+        return -1;
+    return qBound(0, qRound(raw.toInt() * 100.0 / bl.max), 100);
+}
+
+/*
+ * One integer into one sysfs file.
+ *
+ * flush() before close() on purpose.  The backlight driver verifies each write by
+ * reading the BLS block back and returns -EIO when the block is not taking them,
+ * and that error surfaces at write(2) -- which is inside flush(), not inside
+ * QFile::write(), because QFile buffers.  Closing without flushing would throw
+ * the one signal worth having away.
+ */
+bool writeSysfs(const QString &path, int value)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+
+    const QByteArray bytes = QByteArray::number(value) + '\n';
+    const bool ok = (f.write(bytes) == bytes.size()) && f.flush();
+    f.close();
+    return ok;
+}
 
 QString firstExecutable(const QStringList &paths)
 {
@@ -203,6 +305,24 @@ void SettingsPage::rebuild()
     r.text = QStringLiteral("Mouse and pointer");
     r.detail = QStringLiteral("Speed, tracking, double click, idle");
     r.id = OpenMouse;
+    rows << r;
+
+    h.text = QStringLiteral("Display");
+    rows << h;
+
+    /* The current level goes on the hub row rather than only inside the page:
+     * "how bright is it" is the question this row is opened to answer, and half
+     * the time reading it is the whole errand. */
+    const int lit = readBacklightPercent(findBacklight());
+    r = ListRow();
+    r.kind = ListRow::Item;
+    r.glyph = GlyphDisplay;
+    r.accent = Theme::yellow();
+    r.text = QStringLiteral("Screen and backlight");
+    r.detail = lit < 0
+                   ? QStringLiteral("No backlight device -- the loader owns the brightness")
+                   : QString("Brightness %1 %").arg(lit);
+    r.id = OpenDisplay;
     rows << r;
 
     h.text = QStringLiteral("Network");
@@ -773,4 +893,270 @@ void MousePage::paintEvent(QPaintEvent *)
                    wasDouble ? QStringLiteral("counted as a double click")
                              : QStringLiteral("counted as two clicks"));
     }
+}
+
+/* ── the display page ────────────────────────────────────────────────────── */
+
+DisplayPage::DisplayPage(QWidget *parent)
+    : PageWidget(parent)
+{
+    m_list = new ListPane(this);
+    m_list->setRowHeight(30);
+    connect(m_list, &ListPane::activated, this, &DisplayPage::onActivated);
+    connect(m_list, &ListPane::valueChanged, this, &DisplayPage::onValueChanged);
+}
+
+void DisplayPage::resizeEvent(QResizeEvent *event)
+{
+    const QRect card(Theme::Margin, Theme::Margin,
+                     width() - 2 * Theme::Margin, height() - 2 * Theme::Margin);
+    m_list->setGeometry(card.x() + 6, card.y() + 36 + 20, card.width() - 12,
+                        card.height() - 36 - 26);
+    QWidget::resizeEvent(event);
+}
+
+void DisplayPage::onEnter()
+{
+    /*
+     * Read the hardware rather than trusting what was left in m_percent.  The
+     * driver is the owner of that number and this program is not the only thing
+     * that can write it: echo into the sysfs file from the Terminal page, and the
+     * slider should agree with the panel the next time it is looked at.
+     */
+    m_percent = readBacklightPercent(findBacklight());
+    m_note.clear();
+    rebuild();
+}
+
+void DisplayPage::rebuild()
+{
+    const int keep = m_list->current();
+    QVector<ListRow> rows;
+
+    ListRow h;
+    h.kind = ListRow::Header;
+
+    ListRow r;
+
+    const BacklightDevice bl = findBacklight();
+
+    h.text = QStringLiteral("Backlight");
+    rows << h;
+
+    if (!bl.valid()) {
+        r = ListRow();
+        r.kind = ListRow::Item;
+        r.text = QStringLiteral("Brightness");
+        r.detail = QStringLiteral("Nothing in /sys/class/backlight -- is j36_mt6592_backlight loaded?");
+        r.enabled = false;
+        r.id = IdInert;
+        rows << r;
+
+        r = ListRow();
+        r.kind = ListRow::Item;
+        r.text = QStringLiteral("Why the panel is still lit");
+        r.detail = QStringLiteral("The loader set the duty and nothing has changed it since");
+        r.enabled = false;
+        r.id = IdInert;
+        rows << r;
+    } else {
+        /* m_percent is -1 only if the read failed on a device that does exist,
+         * which leaves the slider somewhere sane rather than at its floor. */
+        const int now = qBound(MinBrightness, m_percent < 0 ? 100 : m_percent, 100);
+
+        r = ListRow();
+        r.kind = ListRow::Slider;
+        r.text = QStringLiteral("Brightness");
+        /* The raw duty is on the row because this is a bring-up: when the slider
+         * moves and the panel does not, the next question is always whether the
+         * number reached the driver, and this is where that is answered. */
+        r.detail = QString("%1, duty %2 of %3")
+                       .arg(bl.name)
+                       .arg(percentToRaw(now, bl.max))
+                       .arg(bl.max);
+        r.minimum = MinBrightness;
+        r.maximum = 100;
+        r.stepSize = 5;
+        r.value = now;
+        r.valueText = QString("%1 %").arg(now);
+        r.accent = Theme::yellow();
+        r.id = IdBrightness;
+        rows << r;
+
+        r = ListRow();
+        r.kind = ListRow::Action;
+        r.text = QStringLiteral("Full brightness");
+        r.detail = QStringLiteral("One press back to 100, for a room brighter than the last one");
+        r.accent = Theme::teal();
+        r.id = IdFull;
+        rows << r;
+    }
+
+    h.text = QStringLiteral("Panel");
+    rows << h;
+
+    /*
+     * From QScreen and not from /dev/fb0.  What matters on a settings page is the
+     * surface this program is drawing into, which under the linuxfb plugin is the
+     * framebuffer as Qt understood it -- and if Qt read it differently from the
+     * driver, this row is where that shows.  System information opens the device
+     * itself and prints the stride and the channel layout; that is the page for
+     * the ioctl, this one only has to name the screen.
+     */
+    const QScreen *screen = QGuiApplication::primaryScreen();
+    r = ListRow();
+    r.kind = ListRow::Item;
+    r.text = QStringLiteral("Resolution");
+    r.detail = screen ? QString("%1 x %2, %3-bit colour")
+                            .arg(screen->geometry().width())
+                            .arg(screen->geometry().height())
+                            .arg(screen->depth())
+                      : QStringLiteral("Qt reports no screen at all");
+    r.enabled = false;
+    r.id = IdInert;
+    rows << r;
+
+    if (bl.valid()) {
+        r = ListRow();
+        r.kind = ListRow::Item;
+        r.text = QStringLiteral("Backlight device");
+        r.detail = bl.dir;
+        r.enabled = false;
+        r.id = IdInert;
+        rows << r;
+    }
+
+    m_list->setRows(rows);
+    if (keep >= 0 && keep < rows.size())
+        m_list->setCurrent(keep);
+}
+
+void DisplayPage::applyPercent(int percent)
+{
+    const BacklightDevice bl = findBacklight();
+    if (!bl.valid()) {
+        m_note = QStringLiteral("There is no backlight device to write to");
+        update();
+        return;
+    }
+
+    const int want = qBound(MinBrightness, percent, 100);
+    if (!writeSysfs(bl.dir + "/brightness", percentToRaw(want, bl.max))) {
+        /*
+         * Said out loud, with the path in it.  The two ways this fails are a
+         * dashboard that is not root and a driver whose readback check refused
+         * the write, and the difference between them is one ls away -- but only
+         * for somebody who knows the write was attempted at all.
+         */
+        m_note = QString("Cannot write %1/brightness").arg(bl.dir);
+        update();
+        return;
+    }
+
+    m_percent = want;
+    /*
+     * Remembered on every notch, like the mouse page and for the same reason:
+     * this device stops by having its power button held, and a level the user
+     * watched themselves choose should not be the one thing that did not survive
+     * it.  A QSettings write is a rename on an ext2 partition; the panel takes
+     * longer to respond than the file does.
+     */
+    Settings::instance().setBrightness(want);
+    m_note = QString("Brightness %1 %").arg(want);
+    update();
+}
+
+void DisplayPage::onValueChanged(int index, int value)
+{
+    const QVector<ListRow> &rows = m_list->rows();
+    if (index < 0 || index >= rows.size() || rows[index].id != IdBrightness)
+        return;
+
+    ListRow r = rows[index];
+    applyPercent(value);
+
+    const BacklightDevice bl = findBacklight();
+    r.valueText = QString("%1 %").arg(value);
+    if (bl.valid())
+        r.detail = QString("%1, duty %2 of %3")
+                       .arg(bl.name)
+                       .arg(percentToRaw(value, bl.max))
+                       .arg(bl.max);
+    m_list->updateRow(index, r);
+}
+
+void DisplayPage::onActivated(int index)
+{
+    const QVector<ListRow> &rows = m_list->rows();
+    if (index < 0 || index >= rows.size())
+        return;
+    if (rows[index].id != IdFull)
+        return;
+
+    applyPercent(100);
+    rebuild();
+    emit toastRequested(QStringLiteral("Brightness at full"), 1400);
+}
+
+void DisplayPage::restoreSaved()
+{
+    const int want = Settings::instance().brightness();
+    if (want < 0)
+        return;
+
+    const BacklightDevice bl = findBacklight();
+    if (!bl.valid())
+        return;
+
+    const int raw = percentToRaw(qBound(MinBrightness, want, 100), bl.max);
+    /* Nothing to do is the common case -- a board that boots at full and was left
+     * at full -- and writing anyway would poke the BLS block on every start for
+     * no reason. */
+    if (SysInfo::readTrimmed(bl.dir + "/brightness").toInt() == raw)
+        return;
+
+    writeSysfs(bl.dir + "/brightness", raw);
+}
+
+bool DisplayPage::handleNav(int action)
+{
+    switch (action) {
+    case Joypad::NavUp:
+        m_list->step(-1);
+        return true;
+    case Joypad::NavDown:
+        m_list->step(1);
+        return true;
+    case Joypad::NavLeft:
+        return m_list->adjust(-1);
+    case Joypad::NavRight:
+        return m_list->adjust(1);
+    case Joypad::NavOk:
+        return m_list->press();
+    default:
+        break;
+    }
+    return false;
+}
+
+void DisplayPage::paintEvent(QPaintEvent *)
+{
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    const QRectF card(Theme::Margin, Theme::Margin,
+                      width() - 2.0 * Theme::Margin, height() - 2.0 * Theme::Margin);
+    const QRectF body = paintSheet(p, card, title(),
+                                   Settings::instance().writable()
+                                       ? QString()
+                                       : QStringLiteral("not saved"));
+
+    const QString line =
+        m_note.isEmpty()
+            ? QStringLiteral("Left and Right dim and brighten.  The panel follows as you go.")
+            : m_note;
+    p.setFont(Theme::font(12));
+    p.setPen(Theme::ink2());
+    p.drawText(QRectF(body.x() + 12, body.y() + 2, body.width() - 24, 18),
+               Qt::AlignLeft | Qt::AlignVCenter, line);
 }

@@ -36,6 +36,7 @@
 #include "widgets.h"
 
 class DiagnosticsPage;
+class DisplayPage;
 class Joypad;
 class Keyboard;
 class MediaPage;
@@ -191,6 +192,7 @@ private:
     PackagesPage *m_packages = nullptr;
     DiagnosticsPage *m_diagnostics = nullptr;
     MousePage *m_mouse = nullptr;
+    DisplayPage *m_display = nullptr;
     InfoPage *m_info = nullptr;
 
     QVector<PageWidget *> m_roots;

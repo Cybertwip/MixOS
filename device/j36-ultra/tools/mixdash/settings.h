@@ -92,6 +92,19 @@ public:
     QString mediaRoot() const { return m_mediaRoot; }
     void setMediaRoot(const QString &path);
 
+    /*
+     * Screen brightness as a percentage, or -1 for "nobody has moved it here".
+     *
+     * It is remembered because nothing else remembers it.  The backlight driver
+     * adopts the duty the MVII loader left in the BLS block rather than picking a
+     * level of its own, and the loader always hands over at full -- so without
+     * this, a brightness the user chose would silently go back to maximum on the
+     * next boot.  -1 is meaningfully different from any percentage: it means
+     * leave the panel exactly as the loader set it.
+     */
+    int brightness() const { return m_brightness; }
+    void setBrightness(int percent);
+
     /* The file the settings actually landed in, for the Settings page to print. */
     QString path() const;
     /* False when even the tmpfs fallback would not open, which is worth saying
@@ -110,6 +123,7 @@ private:
     MouseConfig m_mouse;
     QString m_wifiInterface;
     QString m_mediaRoot;
+    int m_brightness = -1;
     bool m_writable = false;
 };
 
