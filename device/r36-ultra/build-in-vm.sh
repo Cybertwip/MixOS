@@ -344,9 +344,19 @@ ensure_boot_mount() {
     mkdir -p "$mountpoint"
     if ! mountpoint -q "$mountpoint"; then
         local offset size loop
+        # There is no image to find a partition in, so say that instead of what
+        # this function used to say.  losetup writes its own "No such file or
+        # directory" to stderr, leaves $loop empty, and `mount ""' then fails --
+        # which the tolerant branch below reported as an unformatted boot
+        # partition.  That is a different fault with a different fix, and dressing
+        # one as the other is what let a run walk two more stages before stopping
+        # in install_boot.sh with "the disk image is missing".
+        [[ -s "$DISK" ]] || fail "the disk image $DISK is missing, so its boot partition cannot be mounted"
         offset=$((SYSTEM_PART_START * 512))
         size=$(( (SYSTEM_PART_END - SYSTEM_PART_START + 1) * 512 ))
-        loop="$(sudo losetup --find --show --offset "$offset" --sizelimit "$size" "$DISK")"
+        loop="$(sudo losetup --find --show --offset "$offset" --sizelimit "$size" "$DISK")" || \
+            fail "could not attach a loop device to $DISK at offset $offset"
+        [[ -n "$loop" ]] || fail "losetup attached no device to $DISK"
         # A disk the image stage has just recreated has no filesystem here yet.
         # Mounting it is not possible and not needed: install_boot.sh formats and
         # fills this partition during the finalization stage.  Failing quietly
