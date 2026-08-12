@@ -3,42 +3,73 @@
  * Copyright (c) 2025-2026 the MixOS project and contributors
  * See device/j36-ultra/LICENSE for the licence text and what it covers.
  *
- * dashboard.h -- the shell itself: four pages, one dock, one input path.
+ * dashboard.h -- the shell: four root pages, a stack above them, one input path.
+ *
+ * WHAT CHANGED AND WHY.  The first version of this file was four pages and a
+ * chain of `if (m_page == 1)' in onNav().  That was honest at four pages and
+ * unreadable at twelve, and twelve is what this build has: Apps, Media, Settings
+ * and Power at the root, and Files, Terminal, Wi-Fi, Packages, Diagnostics,
+ * Mouse and System pushed on top of them.  Every page now answers handleNav()
+ * for itself and the shell only decides WHICH page is on screen.  The shell's
+ * remaining jobs are the ones no page can do alone:
+ *
+ *   - the stack.  Back falls through a page that does not consume it, and the
+ *     shell pops.  That is the whole navigation model.
+ *   - launching.  A child process needs the pad suspended, the panel warned
+ *     about and a toast afterwards; a page cannot do that to itself.
+ *   - the keyboard overlay.  It is one widget shared by every page that asks for
+ *     text, and the answer goes back to whichever page asked.
+ *   - the pointer.  One cursor over every page, above everything, asleep while a
+ *     page owns the whole panel.
+ *   - the chrome.  The status bar and the dock go away for a page that says
+ *     wantsFullscreen(), and come back when it stops saying it.
  */
 #ifndef MIXDASH_DASHBOARD_H
 #define MIXDASH_DASHBOARD_H
 
+#include <QPointer>
 #include <QString>
 #include <QStringList>
+#include <QVector>
 #include <QWidget>
 
 #include "widgets.h"
 
+class DiagnosticsPage;
 class Joypad;
+class Keyboard;
+class MediaPage;
+class MousePage;
+class PackagesPage;
+class Pointer;
 class QFileSystemModel;
 class QLabel;
 class QListView;
 class QTimer;
+class SettingsPage;
+class TerminalPage;
+class WifiPage;
 
 /*
  * The file browser.  QFileSystemModel and QListView do the work; what is written
- * here is the D-pad contract -- up and down move, A descends or opens, B climbs and
- * then leaves the page at the top.  A real file manager is a later iteration; this
- * one exists because a dashboard that cannot show you the card is not much of a
- * shell.
+ * here is the D-pad contract -- up and down move, A descends or opens, B climbs
+ * and then falls through, which is how the shell knows to pop the page.
+ *
+ * IT IS THE ONE PAGE THAT USES A MODEL AND A VIEW.  Everything else in this
+ * dashboard paints its own rows through ListPane, because eight settings do not
+ * need a model.  A directory on an SD card can have four thousand entries in it,
+ * and that is exactly what QFileSystemModel and QListView are for.
  */
-class FilesPage : public QWidget
+class FilesPage : public PageWidget
 {
     Q_OBJECT
 
 public:
     explicit FilesPage(QWidget *parent = nullptr);
 
-    void step(int delta);
-    void enter();
-    /* False when there is nowhere further up, which the Dashboard reads as
-     * "go back to Apps". */
-    bool leave();
+    QString title() const override;
+    bool handleNav(int action) override;
+
     QString rootPath() const { return m_root; }
 
 signals:
@@ -49,6 +80,10 @@ protected:
 
 private:
     void setRoot(const QString &path);
+    void step(int delta);
+    void enter();
+    /* False when there is nowhere further up, which the shell reads as "pop me". */
+    bool leave();
 
     QFileSystemModel *m_model = nullptr;
     QListView *m_view = nullptr;
@@ -61,9 +96,16 @@ class Dashboard : public QWidget
     Q_OBJECT
 
 public:
+    /* A card with no exe does one of these instead of starting a process. */
     enum Internal {
         InternalNone = 0,
         InternalFiles,
+        InternalMedia,
+        InternalTerminal,
+        InternalWifi,
+        InternalPackages,
+        InternalDiagnostics,
+        InternalSettings,
         InternalInfo,
         InternalPower,
         InternalReboot,
@@ -96,9 +138,37 @@ private slots:
     void onPowerActivated(int index);
     void onOpenRequested(const QString &path);
 
+    /* From any page, through PageWidget's signals. */
+    void onToastRequested(const QString &text, int ms);
+    void onCloseRequested();
+    void onTitleChanged();
+    void onTextRequested(const QString &prompt, const QString &initial, bool password);
+    void onKeyboardFinished(const QString &text, bool accepted);
+
+    /* From the pages that ask the shell for something only it can do. */
+    void onSettingsOpen(int destination);
+    void onTerminalRequested(const QString &command);
+    void onLaunchRequested(const QString &title, const QString &exe,
+                           const QStringList &args, bool confirm);
+
+    void onKey(int code, bool pressed, int modifiers);
+
 private:
     void buildPages();
-    void setPage(int page);
+    /* Wire the signals every PageWidget has.  Called once per page, so a page
+     * added later cannot forget to be connected to the toast. */
+    void adopt(PageWidget *page);
+
+    PageWidget *current() const;
+    void showPage(PageWidget *page);
+    void setRoot(int page);
+    void push(PageWidget *page);
+    void pop();
+    /* Status bar, dock, page geometry and the pointer, from whatever is current. */
+    void applyChrome();
+    void syncInputMode();
+    void openDestination(int destination);
+
     void activate(const AppEntry &entry);
     void launch(const QString &title, const QString &exe, const QStringList &args);
     void toast(const QString &text, int ms = 2400);
@@ -106,11 +176,36 @@ private:
     static QString firstWad();
 
     StatusBar *m_bar = nullptr;
-    CardGrid *m_apps = nullptr;
-    FilesPage *m_files = nullptr;
-    InfoPage *m_info = nullptr;
-    CardGrid *m_power = nullptr;
     Dock *m_dock = nullptr;
+
+    /* The four root pages, in dock order. */
+    CardGrid *m_apps = nullptr;
+    MediaPage *m_media = nullptr;
+    SettingsPage *m_settings = nullptr;
+    CardGrid *m_power = nullptr;
+
+    /* Pushed on top of a root page. */
+    FilesPage *m_files = nullptr;
+    TerminalPage *m_terminal = nullptr;
+    WifiPage *m_wifi = nullptr;
+    PackagesPage *m_packages = nullptr;
+    DiagnosticsPage *m_diagnostics = nullptr;
+    MousePage *m_mouse = nullptr;
+    InfoPage *m_info = nullptr;
+
+    QVector<PageWidget *> m_roots;
+    QVector<PageWidget *> m_all;
+    /* Empty means a root page is on screen; otherwise the last one is. */
+    QVector<PageWidget *> m_stack;
+    PageWidget *m_current = nullptr;
+
+    Keyboard *m_keyboard = nullptr;
+    /* The page that asked for text, so the answer goes back to it and not to
+     * whatever happens to be on screen when the keyboard closes. */
+    QPointer<PageWidget> m_textTarget;
+
+    Pointer *m_pointer = nullptr;
+
     QLabel *m_toast = nullptr;
     QTimer *m_toastTimer = nullptr;
     Joypad *m_pad = nullptr;

@@ -22,6 +22,18 @@
  * handful of descriptors every 15 ms costs nothing measurable on a Cortex-A7 while
  * being the same code on every Qt 5.  It also puts key repeat and the suspend that
  * hands input to a launched child in one obvious place.
+ *
+ * THREE KINDS OF OUTPUT, because this device has three kinds of input and the
+ * dashboard should not have to know which one is plugged in:
+ *
+ *   nav()     -- an action.  The D-pad, the left stick, the face buttons, and a
+ *                USB keyboard's arrows all land here.
+ *   pointer*  -- pixels and buttons.  The right stick and a USB mouse both land
+ *                here, already scaled by the user's settings, because the axis
+ *                ranges live in this file and the poll tick that integrates them
+ *                is already running.
+ *   key()     -- an evdev code and the modifier state.  Only devices that look
+ *                like real keyboards produce it, and only the Terminal listens.
  */
 #ifndef MIXDASH_JOYPAD_H
 #define MIXDASH_JOYPAD_H
@@ -57,11 +69,25 @@ public:
         NavQuit
     };
 
+    /* Bit flags on key().  Tracked here because only this file sees the press
+     * and the release of a shift that a consumer only ever sees the effect of. */
+    enum Modifier {
+        ModNone = 0,
+        ModShift = 1,
+        ModCtrl = 2,
+        ModAlt = 4
+    };
+
     explicit Joypad(QObject *parent = nullptr);
     ~Joypad() override;
 
     int deviceCount() const { return m_devs.size(); }
     QStringList deviceNames() const;
+    /* For the Diagnostics page: how many of the open devices look like a mouse
+     * and how many like a keyboard.  Answers "is my USB dongle working" without
+     * the user having to find a text field to type into. */
+    int mouseCount() const;
+    int keyboardCount() const;
 
     /*
      * Off while a child process owns the screen, then on again with whatever
@@ -70,8 +96,33 @@ public:
      */
     void setSuspended(bool suspended);
 
+    /*
+     * Text mode: a page that wants characters rather than actions.  Keyboard-class
+     * devices stop producing nav() and produce only key(); the pad keeps producing
+     * nav(), so B still leaves the Terminal even while something is being typed
+     * into it.  That split is the whole point -- a handheld with a USB keyboard in
+     * it is two devices, not one.
+     */
+    void setTextMode(bool textMode) { m_textMode = textMode; }
+    bool textMode() const { return m_textMode; }
+
+    /* Re-scan /dev/input.  Called when a hotplug is suspected -- there is no udev
+     * in this image, so "suspected" means the user opened Diagnostics and asked. */
+    void rescan();
+
 signals:
     void nav(int action);
+
+    /* Pixels, already scaled and accelerated.  Fractional because at low speeds a
+     * 15 ms tick moves less than a pixel and truncating each tick would stop the
+     * pointer dead rather than move it slowly. */
+    void pointerMove(qreal dx, qreal dy);
+    /* button is a Qt::MouseButton value. */
+    void pointerButton(int button, bool pressed);
+    /* Eighths of a degree, like QWheelEvent: 120 is one notch. */
+    void pointerWheel(int delta);
+
+    void key(int code, bool pressed, int modifiers);
 
 private slots:
     void poll();
@@ -85,6 +136,14 @@ private:
         int absLo[4] = { 0, 0, 0, 0 };
         int absHi[4] = { 0, 0, 0, 0 };
         int absState[4] = { 0, 0, 0, 0 };
+        /* Raw value of the two right-stick axes, kept because the pointer
+         * integrates a position from them on every tick rather than reacting to
+         * the edges the way nav does. */
+        int absRaw[4] = { 0, 0, 0, 0 };
+        bool absSeen[4] = { false, false, false, false };
+
+        bool keyboard = false;
+        bool mouse = false;
     };
 
     void openDevices();
@@ -92,16 +151,36 @@ private:
     void drain();
     void feed(int action, bool pressed);
     void axis(Dev &d, int slot, int value);
+    /* EV_KEY from a device that reports relative motion, or a stick click. */
+    bool pointerKey(int code, bool pressed);
+    void driveStick(int ms);
+    void relative(int code, int value);
 
     QVector<Dev> m_devs;
     QTimer *m_timer = nullptr;
     bool m_suspended = false;
+    bool m_textMode = false;
+    int m_mods = ModNone;
 
     /* Our own key repeat: the input core only autorepeats if a driver asks it to,
      * and neither the keypad nor gpio-keys does here. */
     int m_held = NavNone;
     QElapsedTimer m_heldSince;
     qint64 m_nextRepeat = 0;
+
+    /* Wall clock between poll ticks, so pointer speed is in pixels per second and
+     * not pixels per however-often-the-event-loop-got-round-to-us. */
+    QElapsedTimer m_tick;
+
+    /*
+     * A mouse reports REL_X, REL_Y and then SYN_REPORT: one movement, three
+     * events.  Emitting on each of the first two would send the pointer down a
+     * staircase and would make every diagonal produce two hover events.  These
+     * hold the packet until the SYN.
+     */
+    qreal m_relPendX = 0.0;
+    qreal m_relPendY = 0.0;
+    int m_wheelPend = 0;
 };
 
 #endif /* MIXDASH_JOYPAD_H */

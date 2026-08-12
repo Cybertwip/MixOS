@@ -362,6 +362,7 @@ QString loadFont()
             files << payload.filePath(f);
     files << "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
           << "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+          << "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
           << "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf";
 
     QString family;
@@ -372,7 +373,17 @@ QString loadFont()
         if (id < 0)
             continue;
         const QStringList families = QFontDatabase::applicationFontFamilies(id);
-        if (!families.isEmpty() && family.isEmpty())
+        if (families.isEmpty())
+            continue;
+        /*
+         * EVERY face is registered -- the Terminal asks QFontDatabase for "DejaVu
+         * Sans Mono" by name and cannot draw a character grid without it -- but the
+         * MONO one is never chosen as the application-wide font.  The payload
+         * directory is read in name order, and one day a file that sorts before
+         * DejaVuSans.ttf will be added to it; when that happens this dashboard
+         * should not silently turn monospace.
+         */
+        if (family.isEmpty() && !families.first().contains(QLatin1String("Mono")))
             family = families.first();
     }
     return family;

@@ -3771,7 +3771,10 @@ MIXDASH_BUILD_DEPS=(build-essential pkg-config qtbase5-dev fonts-dejavu-core)
 # chroot: the ELF interpreter, the C library's set, and the two GCC runtimes.  Every
 # other library the closure names is staged, because "the rootfs surely has this one"
 # is an assumption that costs a boot to disprove, and 40 MB of SD card to avoid.
-QT_PAYLOAD_SKIP='ld-linux|libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|libgcc_s\.so\.1|libstdc\+\+\.so\.6'
+# libutil.so.1 is in the list for the same reason libpthread.so.0 is: since glibc
+# 2.34 it is an empty compatibility shim that belongs to the rootfs's own glibc,
+# and mixdash names it only because the Terminal page links -lutil for forkpty(3).
+QT_PAYLOAD_SKIP='ld-linux|libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|libutil\.so\.1|libgcc_s\.so\.1|libstdc\+\+\.so\.6'
 
 build_mixdash() {
     local src="$ARMHF_CHROOT/home/build/mixdash" out="$CACHE/mixdash"
@@ -3956,16 +3959,29 @@ write_fontconfig() {
     <test qual="any" name="family"><string>serif</string></test>
     <edit name="family" mode="prepend" binding="strong"><string>DejaVu Sans</string></edit>
   </match>
+  <!-- monospace answers with the mono face and NOT with DejaVu Sans.  The
+       Terminal page measures the font it gets and refuses to draw a character
+       grid with a proportional one, so a monospace request that lands on DejaVu
+       Sans is the difference between a terminal and a column of overlapping
+       glyphs. -->
   <match target="pattern">
     <test qual="any" name="family"><string>monospace</string></test>
-    <edit name="family" mode="prepend" binding="strong"><string>DejaVu Sans</string></edit>
+    <edit name="family" mode="prepend" binding="strong"><string>DejaVu Sans Mono</string></edit>
   </match>
 </fontconfig>
 FCCONF
 }
 
+# Bumped whenever this function stages something it did not stage before.  The
+# payload cache is keyed on the chroot's Qt rather than on anything in this tree,
+# so without a recipe number a resumed build happily reuses a payload that predates
+# the imageformats plugins and the mono font -- and the failure that produces is
+# "pictures do not open" on a card whose build log says the payload was fine.
+QT_PAYLOAD_RECIPE=2
+
 collect_qt_payload() {
     local out="$CACHE/qt-payload" plugin list p base real n=0 ttf
+    local imgdir imgplugins img walk
     QT_PAYLOAD=""
 
     [[ -x "$MIXDASH_BIN" ]] || { log "qt: no dashboard binary to walk"; return 1; }
@@ -3973,7 +3989,8 @@ collect_qt_payload() {
     # Keyed on nothing but its own completeness, because what shapes this payload is
     # the chroot's Qt rather than anything in this tree.  Delete $CACHE/qt-payload to
     # pick up a Qt that apt has upgraded since.
-    if [[ -e "$out/lib/libQt5Core.so.5" && -e "$out/plugins/platforms/libqlinuxfb.so" ]]; then
+    if [[ -e "$out/lib/libQt5Core.so.5" && -e "$out/plugins/platforms/libqlinuxfb.so"
+          && "$(cat "$out/.recipe" 2>/dev/null)" == "$QT_PAYLOAD_RECIPE" ]]; then
         write_fontconfig "$out" || return 1
         QT_PAYLOAD="$out"
         log "qt: reusing $out ($(du -sh "$out" | awk '{print $1}'))"
@@ -3993,12 +4010,34 @@ collect_qt_payload() {
         return 1
     }
 
-    list="$(armhf_chroot_run "ldd /home/build/mixdash/mixdash $plugin 2>/dev/null | \
+    # The image format plugins.  QImageReader has PNG, BMP, PPM, XBM and XPM built
+    # into QtGui and NOTHING else: JPEG and GIF are dlopened plugins, and without
+    # them the Media page opens a photograph, gets a null QImage back and can only
+    # say that it does not know the format.  Every camera and every phone on earth
+    # writes JPEG, so this is the difference between a picture viewer and a PNG
+    # viewer.  They go through the ldd walk below too, because libqjpeg.so pulls in
+    # libjpeg, which nothing else here names.
+    imgdir="$(armhf_chroot_run 'ls -d /usr/lib/*/qt5/plugins/imageformats 2>/dev/null | head -1')"
+    imgplugins=""
+    if [[ -n "$imgdir" ]]; then
+        for img in libqjpeg.so libqgif.so; do
+            if [[ -f "$ARMHF_CHROOT$imgdir/$img" ]]; then
+                imgplugins="$imgplugins $imgdir/$img"
+            else
+                log "qt: this chroot has no $img -- that format will not open on the board"
+            fi
+        done
+    else
+        log "qt: this chroot's Qt has no imageformats directory; JPEG will not open"
+    fi
+
+    walk="$plugin$imgplugins"
+    list="$(armhf_chroot_run "ldd /home/build/mixdash/mixdash $walk 2>/dev/null | \
         sed -n 's|.*=> \\(/[^ ]*\\).*|\\1|p' | sort -u")" || return 1
     [[ -n "$list" ]] || { log "qt: ldd resolved nothing in the chroot"; return 1; }
 
     rm -rf "$out"
-    mkdir -p "$out/lib" "$out/plugins/platforms" "$out/fonts"
+    mkdir -p "$out/lib" "$out/plugins/platforms" "$out/plugins/imageformats" "$out/fonts"
 
     while read -r p; do
         [[ -n "$p" ]] || continue
@@ -4015,14 +4054,19 @@ collect_qt_payload() {
     done <<<"$list"
 
     sudo cp "$ARMHF_CHROOT$plugin" "$out/plugins/platforms/libqlinuxfb.so" || return 1
+    for img in $imgplugins; do
+        sudo cp "$ARMHF_CHROOT$img" "$out/plugins/imageformats/${img##*/}" || return 1
+    done
     sudo chown -R "$(id -u):$(id -g)" "$out"
     chmod -R u+rw "$out"
 
-    # Two faces of one family, and no more: 640x480 shows about 24 rows of text and
+    # Three faces of one family, and no more: 640x480 shows about 24 rows of text and
     # a font family is a megabyte.  DejaVu because Debian's fontconfig defaults to it
     # and because main.cpp prefers the payload's copy, so the dashboard looks the
-    # same on a rootfs with no fonts installed at all.
-    for ttf in DejaVuSans.ttf DejaVuSans-Bold.ttf; do
+    # same on a rootfs with no fonts installed at all.  The Mono face is the
+    # Terminal's: it checks that the font it was given is really fixed-pitch before
+    # it draws a character grid in it.
+    for ttf in DejaVuSans.ttf DejaVuSans-Bold.ttf DejaVuSansMono.ttf DejaVuSansMono-Bold.ttf; do
         if [[ -f "$ARMHF_CHROOT/usr/share/fonts/truetype/dejavu/$ttf" ]]; then
             cp "$ARMHF_CHROOT/usr/share/fonts/truetype/dejavu/$ttf" "$out/fonts/" || return 1
         fi
@@ -4055,8 +4099,10 @@ QTCONF
         return 1
     }
 
+    printf '%s\n' "$QT_PAYLOAD_RECIPE" >"$out/.recipe"
+
     QT_PAYLOAD="$out"
-    log "qt: staged $n libraries, libqlinuxfb.so and $(ls -1 "$out/fonts" | wc -l) fonts ($(du -sh "$out" | awk '{print $1}'))"
+    log "qt: staged $n libraries, libqlinuxfb.so, $(ls -1 "$out/plugins/imageformats" 2>/dev/null | wc -l) image plugins and $(ls -1 "$out/fonts" | wc -l) fonts ($(du -sh "$out" | awk '{print $1}'))"
     return 0
 }
 

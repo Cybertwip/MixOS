@@ -8,14 +8,18 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QTimer>
+#include <Qt>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/input.h>
+#include <math.h>
 #include <poll.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+
+#include "settings.h"
 
 namespace {
 
@@ -27,6 +31,9 @@ namespace {
  *
  * BTN_SOUTH is the physical A on this shell and BTN_EAST is B, which is why OK and
  * Back are those two and not the other way round.
+ *
+ * BTN_THUMBL and BTN_THUMBR are deliberately absent: the two stick clicks are the
+ * pointer's buttons, handled in pointerKey() before this table is consulted.
  */
 struct Map {
     int code;
@@ -67,7 +74,9 @@ const Map kMap[] = {
     { KEY_Q,         Joypad::NavQuit }
 };
 
-/* Slot order matches the adc-joystick node: ABS_X, ABS_Y, ABS_Z, ABS_RY. */
+/* Slot order matches the adc-joystick node: ABS_X, ABS_Y, ABS_Z, ABS_RY.
+ * Slots 0 and 1 are the left stick and navigate; 2 and 3 are the right stick and
+ * drive the pointer unless the user has turned the pointer off. */
 const int kAxis[4] = { ABS_X, ABS_Y, ABS_Z, ABS_RY };
 
 const int kRepeatFirstMs = 380;
@@ -87,6 +96,39 @@ bool isDirection(int action)
         || action == Joypad::NavLeft || action == Joypad::NavRight;
 }
 
+/* EVIOCGBIT hands back a bitmap in longs.  Two lines of arithmetic rather than a
+ * dependency on libevdev, which is not in the armhf chroot. */
+bool testBit(const unsigned long *bits, int bit)
+{
+    return (bits[bit / (8 * sizeof(unsigned long))] >> (bit % (8 * sizeof(unsigned long)))) & 1UL;
+}
+
+int modifierFor(int code)
+{
+    switch (code) {
+    case KEY_LEFTSHIFT:
+    case KEY_RIGHTSHIFT:
+        return Joypad::ModShift;
+    case KEY_LEFTCTRL:
+    case KEY_RIGHTCTRL:
+        return Joypad::ModCtrl;
+    case KEY_LEFTALT:
+    case KEY_RIGHTALT:
+        return Joypad::ModAlt;
+    default:
+        return Joypad::ModNone;
+    }
+}
+
+qreal clampReal(qreal v, qreal lo, qreal hi)
+{
+    if (v < lo)
+        return lo;
+    if (v > hi)
+        return hi;
+    return v;
+}
+
 } /* namespace */
 
 Joypad::Joypad(QObject *parent)
@@ -94,6 +136,7 @@ Joypad::Joypad(QObject *parent)
 {
     openDevices();
     m_heldSince.start();
+    m_tick.start();
 
     m_timer = new QTimer(this);
     m_timer->setInterval(15);
@@ -118,13 +161,14 @@ void Joypad::openDevices()
             continue;
 
         /*
-         * A device with no keys and no axes is not an input we can navigate with --
-         * on this board that is the power button's own node and anything a USB hub
-         * brings along.  Closed rather than polled.
+         * A device with no keys, no axes and no relative motion is not an input we
+         * can navigate with -- on this board that is the power button's own node
+         * and anything a USB hub brings along.  Closed rather than polled.
          */
         unsigned long evbits = 0;
         if (::ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), &evbits) < 0
-            || !((evbits & (1UL << EV_KEY)) || (evbits & (1UL << EV_ABS)))) {
+            || !((evbits & (1UL << EV_KEY)) || (evbits & (1UL << EV_ABS))
+                 || (evbits & (1UL << EV_REL)))) {
             ::close(fd);
             continue;
         }
@@ -138,6 +182,32 @@ void Joypad::openDevices()
         else
             d.name = n;
 
+        /*
+         * Classification, and it decides two things: whether this device's keys
+         * become text in the Terminal, and whether its motion becomes pointer
+         * motion.  Both are asked of the device rather than of its name, because
+         * "SEM HID Device" is what half the USB dongles on this planet call
+         * themselves.
+         */
+        if (evbits & (1UL << EV_KEY)) {
+            unsigned long keys[(KEY_MAX / (8 * sizeof(unsigned long))) + 1];
+            ::memset(keys, 0, sizeof(keys));
+            if (::ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keys)), keys) >= 0) {
+                /* A real keyboard has letters.  A pad that reports BTN_* does not,
+                 * and a mouse reports BTN_LEFT and nothing alphabetic. */
+                d.keyboard = testBit(keys, KEY_A) && testBit(keys, KEY_Z)
+                    && testBit(keys, KEY_SPACE);
+                if (testBit(keys, BTN_LEFT) && (evbits & (1UL << EV_REL)))
+                    d.mouse = true;
+            }
+        }
+        if (evbits & (1UL << EV_REL)) {
+            unsigned long rels = 0;
+            if (::ioctl(fd, EVIOCGBIT(EV_REL, sizeof(rels)), &rels) >= 0
+                && (rels & (1UL << REL_X)) && (rels & (1UL << REL_Y)))
+                d.mouse = true;
+        }
+
         if (evbits & (1UL << EV_ABS)) {
             for (int slot = 0; slot < 4; ++slot) {
                 struct input_absinfo info;
@@ -149,6 +219,10 @@ void Joypad::openDevices()
                 d.absCode[slot] = kAxis[slot];
                 d.absLo[slot] = info.minimum;
                 d.absHi[slot] = info.maximum;
+                /* Seed with the value the driver already has, so a stick that is
+                 * resting off-centre does not lurch on the first report. */
+                d.absRaw[slot] = info.value;
+                d.absSeen[slot] = true;
             }
         }
 
@@ -164,12 +238,38 @@ void Joypad::closeDevices()
     m_devs.clear();
 }
 
+void Joypad::rescan()
+{
+    closeDevices();
+    openDevices();
+    m_held = NavNone;
+    m_mods = ModNone;
+}
+
 QStringList Joypad::deviceNames() const
 {
     QStringList out;
     for (const Dev &d : m_devs)
         out << d.name;
     return out;
+}
+
+int Joypad::mouseCount() const
+{
+    int n = 0;
+    for (const Dev &d : m_devs)
+        if (d.mouse)
+            ++n;
+    return n;
+}
+
+int Joypad::keyboardCount() const
+{
+    int n = 0;
+    for (const Dev &d : m_devs)
+        if (d.keyboard)
+            ++n;
+    return n;
 }
 
 void Joypad::setSuspended(bool suspended)
@@ -181,8 +281,10 @@ void Joypad::setSuspended(bool suspended)
     if (suspended) {
         m_timer->stop();
         m_held = NavNone;
+        m_mods = ModNone;
     } else {
         drain();
+        m_tick.restart();
         m_timer->start();
     }
 }
@@ -199,6 +301,19 @@ void Joypad::poll()
 {
     if (m_devs.isEmpty())
         return;
+
+    /*
+     * How long since the last tick, clamped.  The lower bound stops a division
+     * from a zero interval; the upper stops a pointer from teleporting across the
+     * panel after the event loop was blocked -- by a child process, by a page that
+     * read /proc synchronously, by anything.  Distance is a function of time here,
+     * so time is the thing that has to be sane.
+     */
+    qint64 ms = m_tick.restart();
+    if (ms < 1)
+        ms = 1;
+    if (ms > 100)
+        ms = 100;
 
     struct pollfd pfd[16];
     int n = 0;
@@ -217,20 +332,60 @@ void Joypad::poll()
             struct input_event ev;
             while (::read(d.fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
                 if (ev.type == EV_KEY) {
-                    /* value 2 is the input core's own autorepeat; ours is below. */
+                    /* value 2 is the input core's own autorepeat; ours is below.
+                     * A USB keyboard DOES autorepeat, and in text mode that is the
+                     * repeat the user wants, so it is passed through to key(). */
+                    const bool pressed = ev.value != 0;
+
+                    if (d.keyboard) {
+                        const int mod = modifierFor(ev.code);
+                        if (mod != ModNone) {
+                            if (pressed)
+                                m_mods |= mod;
+                            else
+                                m_mods &= ~mod;
+                        }
+                        if (ev.value != 2 || m_textMode)
+                            emit key(ev.code, pressed, m_mods);
+                        if (m_textMode)
+                            continue;
+                    }
+
                     if (ev.value == 2)
+                        continue;
+                    if (pointerKey(ev.code, pressed))
                         continue;
                     const int action = lookup(ev.code);
                     if (action != NavNone)
-                        feed(action, ev.value != 0);
+                        feed(action, pressed);
                 } else if (ev.type == EV_ABS) {
-                    for (int slot = 0; slot < 4; ++slot)
-                        if (d.absCode[slot] == (int)ev.code)
-                            axis(d, slot, ev.value);
+                    for (int slot = 0; slot < 4; ++slot) {
+                        if (d.absCode[slot] != (int)ev.code)
+                            continue;
+                        d.absRaw[slot] = ev.value;
+                        /* The right stick only navigates when it is not pointing. */
+                        if (slot >= 2 && Settings::instance().mouse().enabled)
+                            continue;
+                        axis(d, slot, ev.value);
+                    }
+                } else if (ev.type == EV_REL) {
+                    relative(ev.code, ev.value);
+                } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+                    if (m_relPendX != 0.0 || m_relPendY != 0.0) {
+                        emit pointerMove(m_relPendX, m_relPendY);
+                        m_relPendX = 0.0;
+                        m_relPendY = 0.0;
+                    }
+                    if (m_wheelPend != 0) {
+                        emit pointerWheel(m_wheelPend);
+                        m_wheelPend = 0;
+                    }
                 }
             }
         }
     }
+
+    driveStick((int)ms);
 
     /* Key repeat, for the four directions only. */
     if (m_held != NavNone) {
@@ -240,6 +395,128 @@ void Joypad::poll()
             m_nextRepeat = now + kRepeatNextMs;
         }
     }
+}
+
+void Joypad::relative(int code, int value)
+{
+    const MouseConfig &cfg = Settings::instance().mouse();
+    const qreal scale = cfg.trackingSpeed / 100.0;
+
+    switch (code) {
+    case REL_X:
+        m_relPendX += value * scale;
+        break;
+    case REL_Y:
+        m_relPendY += value * scale;
+        break;
+    case REL_WHEEL:
+        /* evdev counts notches, QWheelEvent counts eighths of a degree. */
+        m_wheelPend += value * 120;
+        break;
+    default:
+        break;
+    }
+}
+
+bool Joypad::pointerKey(int code, bool pressed)
+{
+    const MouseConfig &cfg = Settings::instance().mouse();
+
+    int button = 0;
+    switch (code) {
+    case BTN_LEFT:
+        button = Qt::LeftButton;
+        break;
+    case BTN_RIGHT:
+        button = Qt::RightButton;
+        break;
+    case BTN_MIDDLE:
+        button = Qt::MiddleButton;
+        break;
+    case BTN_THUMBR:
+        /* Right stick click.  The stick that moves the pointer carries the button
+         * that clicks with it, which is the only arrangement that can be used
+         * one-handed. */
+        if (!cfg.enabled)
+            return false;
+        button = cfg.leftHanded ? Qt::RightButton : Qt::LeftButton;
+        break;
+    case BTN_THUMBL:
+        if (!cfg.enabled)
+            return false;
+        button = cfg.leftHanded ? Qt::LeftButton : Qt::RightButton;
+        break;
+    default:
+        return false;
+    }
+
+    emit pointerButton(button, pressed);
+    return true;
+}
+
+void Joypad::driveStick(int ms)
+{
+    const MouseConfig &cfg = Settings::instance().mouse();
+    if (!cfg.enabled)
+        return;
+
+    /* The first device that reports both right-stick axes wins.  There is exactly
+     * one adc-joystick on this board; the loop is here so that a USB pad plugged
+     * in later is not silently ignored. */
+    qreal nx = 0.0;
+    qreal ny = 0.0;
+    bool found = false;
+    for (const Dev &d : m_devs) {
+        if (!d.absSeen[2] || !d.absSeen[3])
+            continue;
+        const qreal dz = cfg.deadzone / 100.0;
+        for (int slot = 2; slot <= 3; ++slot) {
+            const qreal mid = (d.absLo[slot] + d.absHi[slot]) / 2.0;
+            const qreal half = (d.absHi[slot] - d.absLo[slot]) / 2.0;
+            if (half <= 0.0)
+                continue;
+            qreal v = clampReal((d.absRaw[slot] - mid) / half, -1.0, 1.0);
+            /* Rescale outside the deadzone so the first pixel of movement past it
+             * is slow rather than a jump to deadzone-speed. */
+            const qreal mag = fabs(v);
+            if (mag <= dz)
+                v = 0.0;
+            else
+                v = (v < 0.0 ? -1.0 : 1.0) * (mag - dz) / (1.0 - dz);
+            if (slot == 2)
+                nx = v;
+            else
+                ny = v;
+        }
+        found = true;
+        break;
+    }
+    if (!found)
+        return;
+
+    qreal mag = sqrt(nx * nx + ny * ny);
+    if (mag <= 0.0)
+        return;
+    if (mag > 1.0) {
+        /* A square stick gate reads 1.41 on the diagonal.  Normalising the
+         * direction and clamping the magnitude keeps diagonals from being half as
+         * fast again as the axes. */
+        nx /= mag;
+        ny /= mag;
+        mag = 1.0;
+    }
+
+    /*
+     * The response curve.  acceleration 0 is linear -- deflection is speed.  Above
+     * that the exponent rises to 2.5, which makes a small push crawl and a full
+     * push cross the 640 px panel, and that spread is what lets a 12 mm stick both
+     * travel and land on a scrollbar.
+     */
+    const qreal exponent = 1.0 + cfg.acceleration * 0.015;
+    const qreal curved = pow(mag, exponent);
+    const qreal step = cfg.pointerSpeed * curved * ms / 1000.0;
+
+    emit pointerMove(nx / mag * step, ny / mag * step);
 }
 
 void Joypad::feed(int action, bool pressed)

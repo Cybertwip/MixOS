@@ -4,9 +4,18 @@
  * See device/j36-ultra/LICENSE for the licence text and what it covers.
  */
 #include "dashboard.h"
+
+#include "diagnostics.h"
 #include "joypad.h"
+#include "keyboard.h"
+#include "media.h"
+#include "packages.h"
+#include "pointer.h"
+#include "settingspage.h"
+#include "terminal.h"
 #include "theme.h"
 #include "trace.h"
+#include "wifi.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -24,6 +33,23 @@
 #include <QTimer>
 #include <QVBoxLayout>
 
+namespace {
+
+/*
+ * Quote a path for /bin/sh.  Inside single quotes everything is literal except a
+ * single quote, which has to leave the quoting to be written: ' -> '\''.  Paths
+ * on an SD card come from whoever wrote the card, and a filename with a quote or
+ * a space in it is not an attack, it is Tuesday.
+ */
+QString shellQuote(const QString &s)
+{
+    QString out = s;
+    out.replace('\'', "'\\''");
+    return "'" + out + "'";
+}
+
+} /* namespace */
+
 /* ── FilesPage ───────────────────────────────────────────────────────────── */
 
 /*
@@ -35,7 +61,7 @@
  * other page is arithmetic and QPainter calls.
  */
 FilesPage::FilesPage(QWidget *parent)
-    : QWidget(parent)
+    : PageWidget(parent)
 {
     /*
      * /run/j36/card first: that is the card's data partition, mounted read-only by
@@ -116,6 +142,11 @@ FilesPage::FilesPage(QWidget *parent)
     setRoot(m_base);
 }
 
+QString FilesPage::title() const
+{
+    return m_root.isEmpty() ? QStringLiteral("Files") : m_root;
+}
+
 void FilesPage::setRoot(const QString &path)
 {
     m_root = QDir::cleanPath(path);
@@ -123,6 +154,7 @@ void FilesPage::setRoot(const QString &path)
     const QModelIndex root = m_model->index(m_root);
     m_view->setRootIndex(root);
     m_view->setCurrentIndex(m_model->index(0, 0, root));
+    emit titleChanged();
     update();
 }
 
@@ -171,6 +203,28 @@ bool FilesPage::leave()
     return true;
 }
 
+bool FilesPage::handleNav(int action)
+{
+    switch (action) {
+    case Joypad::NavUp:
+        step(-1);
+        return true;
+    case Joypad::NavDown:
+        step(1);
+        return true;
+    case Joypad::NavRight:
+    case Joypad::NavOk:
+        enter();
+        return true;
+    case Joypad::NavLeft:
+    case Joypad::NavBack:
+        /* False at the top of the tree: the shell takes that as "pop me". */
+        return leave();
+    default:
+        return false;
+    }
+}
+
 void FilesPage::paintEvent(QPaintEvent *)
 {
     QPainter p(this);
@@ -215,8 +269,8 @@ Dashboard::Dashboard(QWidget *parent)
 
     /*
      * WHY EVERY LINE OF THIS CONSTRUCTOR IS ANNOUNCED.  It is one statement at the
-     * call site -- `Dashboard dash;' -- and eleven objects here, and when it aborted
-     * the console named the statement, which named all eleven at once and therefore
+     * call site -- `Dashboard dash;' -- and twenty objects here, and when it aborted
+     * the console named the statement, which named all twenty at once and therefore
      * none of them.  A step costs one store and one line of console; it buys the name
      * of the object that was being built when the process died.
      */
@@ -224,12 +278,28 @@ Dashboard::Dashboard(QWidget *parent)
     m_bar = new StatusBar(this);
     Trace::step("CardGrid (apps)");
     m_apps = new CardGrid(this);
-    Trace::step("FilesPage");
-    m_files = new FilesPage(this);
-    Trace::step("InfoPage");
-    m_info = new InfoPage(this);
+    m_apps->setPageTitle(QStringLiteral("Apps"));
+    Trace::step("MediaPage");
+    m_media = new MediaPage(this);
+    Trace::step("SettingsPage");
+    m_settings = new SettingsPage(this);
     Trace::step("CardGrid (power)");
     m_power = new CardGrid(this);
+    m_power->setPageTitle(QStringLiteral("Power"));
+
+    Trace::step("FilesPage");
+    m_files = new FilesPage(this);
+    Trace::step("TerminalPage");
+    m_terminal = new TerminalPage(this);
+    Trace::step("WifiPage");
+    m_wifi = new WifiPage(this);
+    Trace::step("PackagesPage");
+    m_packages = new PackagesPage(this);
+    Trace::step("MousePage");
+    m_mouse = new MousePage(this);
+    Trace::step("InfoPage");
+    m_info = new InfoPage(this);
+
     Trace::step("Dock");
     m_dock = new Dock(this);
 
@@ -253,34 +323,89 @@ Dashboard::Dashboard(QWidget *parent)
         m_armedExe.clear();
     });
 
+    Trace::step("Keyboard overlay");
+    m_keyboard = new Keyboard(this);
+    connect(m_keyboard, &Keyboard::finished, this, &Dashboard::onKeyboardFinished);
+
+    /*
+     * The pad comes before the Diagnostics page because that page reports on it --
+     * how many devices are open, how many of them look like a mouse -- and holding
+     * the pointer to a Joypad that does not exist yet would be a null on the first
+     * probe.
+     */
+    Trace::step("Joypad -- opens /dev/input/event*");
+    m_pad = new Joypad(this);
+
+    Trace::step("DiagnosticsPage");
+    m_diagnostics = new DiagnosticsPage(m_pad, this);
+
+    Trace::step("Pointer");
+    m_pointer = new Pointer(this);
+
+    Trace::step("page tables");
+    m_roots << m_apps << m_media << m_settings << m_power;
+    m_all << m_apps << m_media << m_settings << m_power
+          << m_files << m_terminal << m_wifi << m_packages
+          << m_diagnostics << m_mouse << m_info;
+    for (PageWidget *page : m_all) {
+        adopt(page);
+        page->hide();
+    }
+
     Trace::step("connections");
     connect(m_apps, &CardGrid::activated, this, &Dashboard::onAppActivated);
     connect(m_power, &CardGrid::activated, this, &Dashboard::onPowerActivated);
     connect(m_apps, &CardGrid::indexChanged, this, [this](int) {
-        if (m_page == 0)
-            m_bar->setTitle(m_apps->currentTitle());
+        if (m_current == m_apps)
+            m_bar->setTitle(m_apps->title());
+    });
+    connect(m_power, &CardGrid::indexChanged, this, [this](int) {
+        if (m_current == m_power)
+            m_bar->setTitle(m_power->title());
     });
     connect(m_files, &FilesPage::openRequested, this, &Dashboard::onOpenRequested);
+    connect(m_settings, &SettingsPage::openRequested, this, &Dashboard::onSettingsOpen);
+    connect(m_packages, &PackagesPage::terminalRequested,
+            this, &Dashboard::onTerminalRequested);
+    connect(m_diagnostics, &DiagnosticsPage::launchRequested,
+            this, &Dashboard::onLaunchRequested);
+    connect(m_dock, &Dock::pageClicked, this, &Dashboard::setRoot);
+
+    connect(m_pad, &Joypad::nav, this, &Dashboard::onNav);
+    connect(m_pad, &Joypad::key, this, &Dashboard::onKey);
+    connect(m_pad, &Joypad::pointerMove, m_pointer, &Pointer::onMove);
+    connect(m_pad, &Joypad::pointerButton, m_pointer, &Pointer::onButton);
+    connect(m_pad, &Joypad::pointerWheel, m_pointer, &Pointer::onWheel);
 
     Trace::step("dock pages");
-    m_dock->setPages(QStringList() << "Apps" << "Files" << "System" << "Power");
+    m_dock->setPages(QStringList() << "Apps" << "Media" << "Settings" << "Power");
 
     /* Stats every candidate executable and IWAD on the card. */
     Trace::step("buildPages -- looks for the apps on disk");
     buildPages();
 
-    Trace::step("Joypad -- opens /dev/input/event*");
-    m_pad = new Joypad(this);
-    connect(m_pad, &Joypad::nav, this, &Dashboard::onNav);
     m_info->setInputSummary(
         m_pad->deviceCount() == 0
             ? QString("no /dev/input/event* -- nothing to navigate with")
             : QString("%1: %2").arg(m_pad->deviceCount()).arg(m_pad->deviceNames().join(", ")));
 
-    Trace::step("setPage(0)");
-    setPage(0);
+    Trace::step("setRoot(0)");
+    setRoot(0);
     qApp->installEventFilter(this);
     Trace::step("constructed");
+}
+
+/*
+ * Every page gets the same four wires.  Written once here rather than four times
+ * per page at the call site, so a page added next month is connected to the toast
+ * and the keyboard by the act of being put in m_all.
+ */
+void Dashboard::adopt(PageWidget *page)
+{
+    connect(page, &PageWidget::toastRequested, this, &Dashboard::onToastRequested);
+    connect(page, &PageWidget::closeRequested, this, &Dashboard::onCloseRequested);
+    connect(page, &PageWidget::titleChanged, this, &Dashboard::onTitleChanged);
+    connect(page, &PageWidget::textRequested, this, &Dashboard::onTextRequested);
 }
 
 QString Dashboard::firstExisting(const QStringList &candidates)
@@ -364,6 +489,28 @@ void Dashboard::buildPages()
         doom.subtitle = QFileInfo(wad).fileName() + ".\n640x400 straight into /dev/fb0.";
     apps.append(doom);
 
+    /*
+     * Media, and it is a PAGE now rather than a launcher.  The old card ran mpv,
+     * then cvlc, then vlc, then ffplay, and all four exited 1 -- none of them has
+     * an output this board can use.  media.cpp decodes with ffmpeg and paints the
+     * frames here, in the one process that holds the framebuffer.
+     */
+    AppEntry media;
+    media.title = "Media";
+    media.subtitle = "Music, video and pictures,\ndecoded into this framebuffer.";
+    media.accent = Theme::pink();
+    media.glyph = GlyphVideo;
+    media.internal = InternalMedia;
+    apps.append(media);
+
+    AppEntry terminal;
+    terminal.title = "Terminal";
+    terminal.subtitle = "A real login shell,\nwith a real pty behind it.";
+    terminal.accent = Theme::green();
+    terminal.glyph = GlyphTerminal;
+    terminal.internal = InternalTerminal;
+    apps.append(terminal);
+
     AppEntry files;
     files.title = "Files";
     files.subtitle = "Browse the card.";
@@ -372,49 +519,43 @@ void Dashboard::buildPages()
     files.internal = InternalFiles;
     apps.append(files);
 
-    AppEntry video;
-    video.title = "Video";
-    video.accent = Theme::pink();
-    video.glyph = GlyphVideo;
-    video.exe = firstExisting(QStringList() << "/usr/bin/mpv" << "/usr/bin/cvlc"
-                                            << "/usr/bin/vlc" << "/usr/bin/ffplay");
-    video.subtitle = video.exe.isEmpty() ? QString("No player installed.")
-                                         : QFileInfo(video.exe).fileName();
-    video.available = !video.exe.isEmpty();
-    apps.append(video);
+    AppEntry packages;
+    packages.title = "Packages";
+    packages.subtitle = "Everything Debian has,\nincluding a desktop.";
+    packages.accent = Theme::yellow();
+    packages.glyph = GlyphPackage;
+    packages.internal = InternalPackages;
+    apps.append(packages);
+
+    AppEntry wifi;
+    wifi.title = "Wi-Fi";
+    wifi.subtitle = "Scan, join, remember.";
+    wifi.accent = Theme::blue();
+    wifi.glyph = GlyphWifi;
+    wifi.internal = InternalWifi;
+    apps.append(wifi);
 
     /*
-     * The GPU, and the only thing on this card that asks it to rasterise anything.
-     * eglprobe's five paint phases are all clears -- a driver that could do nothing
-     * but clear a buffer would pass every one -- so -c is the card that compiles two
-     * shaders and turns a cube, and its result is the one that says whether lima
-     * works.  It finds the modesetting node itself now rather than assuming card0,
-     * which is what the "Operation not supported" run was really reporting.
-     *
-     * It asks twice because it cannot give the panel back: setting a mode of its own
-     * moves the scanout off the LK's framebuffer, this dashboard keeps drawing into
-     * that framebuffer, and nothing puts it back on screen short of a reboot.
+     * What the "3D cube" card became.  The cube is still in there and still turns;
+     * it is rasterised by QPainter now, because eglprobe's GLES2 cube cannot be
+     * SHOWN on this board -- lima has no CRTC and mtk_drm is not loaded, so there is
+     * nothing to flip a rendered buffer onto.  The page says so, with the evidence.
      */
-    AppEntry cube;
-    cube.title = "3D cube";
-    cube.accent = Theme::purple();
-    cube.glyph = GlyphDisplay;
-    cube.exe = firstExisting(QStringList() << "/run/j36/eglprobe"
-                                           << "/opt/mixos/bin/eglprobe");
-    cube.args = QStringList() << "-c" << "20";
-    cube.subtitle = cube.exe.isEmpty() ? QString("eglprobe is not on this card.")
-                                       : QString("GLES2 through lima, flipped.\nKeeps the panel: reboot after.");
-    cube.available = !cube.exe.isEmpty();
-    cube.confirm = true;
-    apps.append(cube);
+    AppEntry diag;
+    diag.title = "Diagnostics";
+    diag.subtitle = "Display, GPU, input, sound,\nUSB and power -- with reasons.";
+    diag.accent = Theme::purple();
+    diag.glyph = GlyphChip;
+    diag.internal = InternalDiagnostics;
+    apps.append(diag);
 
-    AppEntry system;
-    system.title = "System";
-    system.subtitle = "What this boot brought up.";
-    system.accent = Theme::orange();
-    system.glyph = GlyphSettings;
-    system.internal = InternalInfo;
-    apps.append(system);
+    AppEntry settings;
+    settings.title = "Settings";
+    settings.subtitle = "Pointer, sound, network.";
+    settings.accent = Theme::orange();
+    settings.glyph = GlyphSettings;
+    settings.internal = InternalSettings;
+    apps.append(settings);
 
     AppEntry power;
     power.title = "Power";
@@ -452,47 +593,242 @@ void Dashboard::buildPages()
     console.internal = InternalConsole;
     powers.append(console);
 
+    AppEntry info;
+    info.title = "System";
+    info.subtitle = "What this boot brought up.";
+    info.accent = Theme::ink3();
+    info.glyph = GlyphInfo;
+    info.internal = InternalInfo;
+    powers.append(info);
+
     m_power->setEntries(powers);
+}
+
+/* ── the page stack ──────────────────────────────────────────────────────── */
+
+PageWidget *Dashboard::current() const
+{
+    if (!m_stack.isEmpty())
+        return m_stack.last();
+    if (m_page >= 0 && m_page < m_roots.size())
+        return m_roots[m_page];
+    return nullptr;
+}
+
+/*
+ * The one place a page becomes visible or stops being.  onLeave() and onEnter()
+ * are what stop a Wi-Fi scan, a video decode and a 60 Hz cube from running behind
+ * a page nobody is looking at, so they have to be paired here rather than at the
+ * six call sites that change pages.
+ */
+void Dashboard::showPage(PageWidget *page)
+{
+    if (m_current == page) {
+        applyChrome();
+        return;
+    }
+
+    if (m_current) {
+        m_current->onLeave();
+        m_current->hide();
+    }
+    m_current = page;
+    if (m_current) {
+        /* Geometry before onEnter: a page that measures itself while populating
+         * -- ListPane's scroll clamp, the Terminal's column count -- has to be
+         * asked at the size it is about to be shown at. */
+        applyChrome();
+        m_current->onEnter();
+        m_current->show();
+    }
+    applyChrome();
+}
+
+void Dashboard::setRoot(int page)
+{
+    m_page = qBound(0, page, m_roots.size() - 1);
+    /*
+     * Switching root pages empties the stack.  The alternative -- a stack per root
+     * -- means the shoulder buttons take you somewhere different depending on
+     * where you have been, which is not something a dock can show.
+     */
+    m_stack.clear();
+    showPage(m_roots[m_page]);
+}
+
+void Dashboard::push(PageWidget *page)
+{
+    if (!page || current() == page)
+        return;
+    /* A page can only be on the stack once; pushing one that is already there
+     * unwinds back to it instead of stacking a second copy that Back would have
+     * to be pressed twice for. */
+    const int at = m_stack.indexOf(page);
+    if (at >= 0)
+        m_stack.resize(at + 1);
+    else
+        m_stack.append(page);
+    showPage(m_stack.last());
+}
+
+void Dashboard::pop()
+{
+    if (m_stack.isEmpty())
+        return;
+    m_stack.removeLast();
+    showPage(current());
+}
+
+void Dashboard::applyChrome()
+{
+    PageWidget *page = current();
+    const bool full = page && page->wantsFullscreen();
+
+    m_bar->setVisible(!full);
+    m_dock->setVisible(!full);
+
+    const QRect normal(0, Theme::StatusH, width(),
+                       qMax(0, height() - Theme::StatusH - Theme::DockH));
+    if (page)
+        page->setGeometry(full ? rect() : normal);
+
+    m_dock->setCurrent(m_page);
+    if (page)
+        m_bar->setTitle(page->title());
+
+    /*
+     * A page that owns every pixel is showing something -- a picture, a video, a
+     * shell -- that an arrow sitting in the middle of would be on top of.  It comes
+     * straight back the moment the stick moves.
+     */
+    if (full)
+        m_pointer->sleep();
+
+    if (m_keyboard->isVisible())
+        m_keyboard->raise();
+    if (m_toast->isVisible())
+        m_toast->raise();
+    m_pointer->raise();
+
+    syncInputMode();
+    update();
+}
+
+/*
+ * Text mode splits the input devices in two: anything that looks like a keyboard
+ * stops producing nav actions and produces raw key codes instead, while the pad
+ * keeps producing nav actions.  That is what lets B leave the Terminal while a
+ * USB keyboard is typing into it.
+ */
+void Dashboard::syncInputMode()
+{
+    const bool wantKeys = m_keyboard->isVisible()
+                          || (current() && current()->wantsKeys());
+    m_pad->setTextMode(wantKeys);
 }
 
 void Dashboard::resizeEvent(QResizeEvent *event)
 {
-    const int top = Theme::StatusH;
-    const int bottom = height() - Theme::DockH;
-
     m_bar->setGeometry(0, 0, width(), Theme::StatusH);
     m_dock->setGeometry(0, height() - Theme::DockH, width(), Theme::DockH);
 
-    const QRect page(0, top, width(), qMax(0, bottom - top));
-    m_apps->setGeometry(page);
-    m_files->setGeometry(page);
-    m_info->setGeometry(page);
-    m_power->setGeometry(page);
+    const QRect normal(0, Theme::StatusH, width(),
+                       qMax(0, height() - Theme::StatusH - Theme::DockH));
+    for (PageWidget *page : m_all)
+        page->setGeometry(normal);
 
+    /* The keyboard is an overlay over the bottom of the screen rather than a page:
+     * what is being typed into stays visible above it. */
+    const int kb = qMin(300, height());
+    m_keyboard->setGeometry(0, height() - kb, width(), kb);
+
+    applyChrome();
     QWidget::resizeEvent(event);
 }
 
-void Dashboard::setPage(int page)
+/* ── the pages talking back ──────────────────────────────────────────────── */
+
+void Dashboard::onToastRequested(const QString &text, int ms)
 {
-    m_page = qBound(0, page, 3);
+    toast(text, ms > 0 ? ms : 2400);
+}
 
-    m_apps->setVisible(m_page == 0);
-    m_files->setVisible(m_page == 1);
-    m_info->setVisible(m_page == 2);
-    m_power->setVisible(m_page == 3);
-    m_dock->setCurrent(m_page);
+void Dashboard::onCloseRequested()
+{
+    if (!m_stack.isEmpty())
+        pop();
+    else if (m_page != 0)
+        setRoot(0);
+}
 
-    switch (m_page) {
-    case 0: m_bar->setTitle(m_apps->currentTitle()); break;
-    case 1: m_bar->setTitle("Files"); break;
-    case 2: m_bar->setTitle("System"); break;
-    default: m_bar->setTitle("Power"); break;
-    }
+void Dashboard::onTitleChanged()
+{
+    /* Only the page on screen may retitle the bar -- a Wi-Fi scan finishing behind
+     * a Terminal must not rename the Terminal. */
+    if (sender() != current())
+        return;
+    applyChrome();
+}
 
-    if (m_toast->isVisible())
-        m_toast->raise();
+void Dashboard::onTextRequested(const QString &prompt, const QString &initial, bool password)
+{
+    m_textTarget = qobject_cast<PageWidget *>(sender());
+    m_keyboard->open(prompt, initial, password);
+    m_keyboard->raise();
+    m_pointer->raise();
+    syncInputMode();
+}
+
+void Dashboard::onKeyboardFinished(const QString &text, bool accepted)
+{
+    PageWidget *target = m_textTarget.data();
+    m_textTarget.clear();
+    syncInputMode();
+    if (target)
+        target->textEntered(text, accepted);
     update();
 }
+
+void Dashboard::onSettingsOpen(int destination)
+{
+    openDestination(destination);
+}
+
+/*
+ * The Packages page hands installs to the Terminal rather than running them
+ * itself: apt takes minutes, asks questions, and prints the only progress report
+ * anyone has ever needed.  See packages.h.
+ */
+void Dashboard::onTerminalRequested(const QString &command)
+{
+    push(m_terminal);
+    m_terminal->runCommand(command);
+}
+
+void Dashboard::onLaunchRequested(const QString &title, const QString &exe,
+                                  const QStringList &args, bool confirm)
+{
+    if (confirm && m_armedExe != exe) {
+        m_armedExe = exe;
+        toast(title + " takes the panel for good.\nPress A again to run it.", 6000);
+        return;
+    }
+    m_armedExe.clear();
+    launch(title, exe, args);
+}
+
+void Dashboard::onKey(int code, bool pressed, int modifiers)
+{
+    if (m_keyboard->isVisible()) {
+        m_keyboard->keyPressed(code, pressed, modifiers);
+        return;
+    }
+    PageWidget *page = current();
+    if (page && page->wantsKeys())
+        page->keyPressed(code, pressed, modifiers);
+}
+
+/* ── painting, toast, launching ──────────────────────────────────────────── */
 
 void Dashboard::paintEvent(QPaintEvent *)
 {
@@ -532,6 +868,7 @@ void Dashboard::toast(const QString &text, int ms)
                   qMax(0, height() - Theme::DockH - m_toast->height() - 6));
     m_toast->show();
     m_toast->raise();
+    m_pointer->raise();
     m_toastTimer->start(ms);
 }
 
@@ -553,6 +890,7 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
     /* The child gets the input devices to itself, and whatever it was pressed with
      * is discarded before the dashboard listens again. */
     m_pad->setSuspended(true);
+    m_pointer->sleep();
     const int rc = QProcess::execute(exe, args);
     m_pad->setSuspended(false);
 
@@ -563,6 +901,8 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
      * back -- which is worth knowing when a launch comes back to a black panel.
      */
     update();
+    if (m_current)
+        m_current->update();
 
     if (rc == -2)
         toast(title + " would not start");
@@ -572,6 +912,41 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
         toast(QString("%1 exited %2").arg(title).arg(rc));
     else
         toast(title + " exited");
+}
+
+/* ── activating a card ───────────────────────────────────────────────────── */
+
+void Dashboard::openDestination(int destination)
+{
+    switch (destination) {
+    case SettingsPage::OpenMouse:
+        push(m_mouse);
+        break;
+    case SettingsPage::OpenWifi:
+        push(m_wifi);
+        break;
+    case SettingsPage::OpenDiagnostics:
+        push(m_diagnostics);
+        break;
+    case SettingsPage::OpenPackages:
+        push(m_packages);
+        break;
+    case SettingsPage::OpenTerminal:
+        push(m_terminal);
+        break;
+    case SettingsPage::OpenSystem:
+        m_info->refresh();
+        push(m_info);
+        break;
+    case SettingsPage::OpenFiles:
+        push(m_files);
+        break;
+    case SettingsPage::OpenMedia:
+        setRoot(1);
+        break;
+    default:
+        break;
+    }
 }
 
 void Dashboard::activate(const AppEntry &entry)
@@ -592,13 +967,32 @@ void Dashboard::activate(const AppEntry &entry)
 
     switch (entry.internal) {
     case InternalFiles:
-        setPage(1);
+        push(m_files);
+        break;
+    case InternalMedia:
+        setRoot(1);
+        break;
+    case InternalTerminal:
+        push(m_terminal);
+        break;
+    case InternalWifi:
+        push(m_wifi);
+        break;
+    case InternalPackages:
+        push(m_packages);
+        break;
+    case InternalDiagnostics:
+        push(m_diagnostics);
+        break;
+    case InternalSettings:
+        setRoot(2);
         break;
     case InternalInfo:
-        setPage(2);
+        m_info->refresh();
+        push(m_info);
         break;
     case InternalPower:
-        setPage(3);
+        setRoot(3);
         break;
     case InternalReboot:
         if (m_armed != InternalReboot) {
@@ -642,77 +1036,84 @@ void Dashboard::onPowerActivated(int index)
         activate(entries[index]);
 }
 
+/*
+ * A file chosen in the browser.  Media is asked first because it is the only
+ * thing here that can actually SHOW a file; everything else is handed to the
+ * Terminal, which at least lets the user decide what to do with it.
+ */
 void Dashboard::onOpenRequested(const QString &path)
 {
-    static const char *kPlayable[] = { ".mp4", ".mkv", ".avi", ".webm", ".mov",
-                                       ".mp3", ".ogg", ".wav", ".flac", ".m4a" };
-    const QString lower = path.toLower();
-    for (size_t i = 0; i < sizeof(kPlayable) / sizeof(kPlayable[0]); ++i) {
-        if (!lower.endsWith(QLatin1String(kPlayable[i])))
-            continue;
-        const QString player = firstExisting(QStringList() << "/usr/bin/mpv" << "/usr/bin/cvlc"
-                                                           << "/usr/bin/vlc" << "/usr/bin/ffplay");
-        if (player.isEmpty()) {
-            toast("No player is installed");
-            return;
-        }
-        launch(QFileInfo(path).fileName(), player, QStringList() << path);
+    const QFileInfo info(path);
+
+    if (m_media->openPath(path)) {
+        setRoot(1);
         return;
     }
-    toast("Nothing here opens " + QFileInfo(path).fileName());
+
+    static const char *kText[] = { ".txt", ".log", ".conf", ".cfg", ".ini", ".md",
+                                   ".sh", ".py", ".json", ".xml", ".dts", ".c",
+                                   ".h", ".cpp", ".service", ".list" };
+    const QString lower = path.toLower();
+    for (size_t i = 0; i < sizeof(kText) / sizeof(kText[0]); ++i) {
+        if (!lower.endsWith(QLatin1String(kText[i])))
+            continue;
+        push(m_terminal);
+        /* less, not cat: a 40 MB log poured into a terminal emulator that keeps
+         * 600 lines of scrollback is 40 MB of work to show 600 lines. */
+        m_terminal->runCommand("less -- " + shellQuote(path));
+        return;
+    }
+
+    if (info.isFile() && info.isExecutable()) {
+        push(m_terminal);
+        m_terminal->runCommand(shellQuote(path));
+        return;
+    }
+
+    toast("Nothing here opens " + info.fileName());
 }
+
+/* ── input ───────────────────────────────────────────────────────────────── */
 
 void Dashboard::onNav(int action)
 {
+    /* The keyboard is an overlay, so it gets first refusal: Back closes it rather
+     * than popping the page being typed into. */
+    if (m_keyboard->isVisible()) {
+        if (m_keyboard->handleNav(action))
+            return;
+    }
+
+    if (action == Joypad::NavQuit) {
+        toast("Power, then Console, leaves the dashboard");
+        return;
+    }
+
+    PageWidget *page = current();
+    if (page && page->handleNav(action))
+        return;
+
+    /* Whatever the page did not want. */
     switch (action) {
     case Joypad::NavPrevPage:
-        setPage(m_page == 0 ? 3 : m_page - 1);
+        setRoot(m_page == 0 ? m_roots.size() - 1 : m_page - 1);
         return;
     case Joypad::NavNextPage:
-        setPage(m_page == 3 ? 0 : m_page + 1);
+        setRoot(m_page == m_roots.size() - 1 ? 0 : m_page + 1);
         return;
     case Joypad::NavMenu:
-        /* The most useful thing Menu can do during bring-up is show what came up. */
-        setPage(m_page == 2 ? 0 : 2);
+        /* Menu is the settings button when the page in front has no use for it. */
+        setRoot(m_current == m_settings ? 0 : 2);
         return;
-    case Joypad::NavQuit:
-        toast("Power, then Console, leaves the dashboard");
+    case Joypad::NavBack:
+        if (!m_stack.isEmpty())
+            pop();
+        else if (m_page != 0)
+            setRoot(0);
         return;
     default:
         break;
     }
-
-    CardGrid *grid = m_page == 0 ? m_apps : m_page == 3 ? m_power : nullptr;
-
-    if (grid) {
-        switch (action) {
-        case Joypad::NavUp:    grid->moveBy(0, -1); break;
-        case Joypad::NavDown:  grid->moveBy(0, 1); break;
-        case Joypad::NavLeft:  grid->moveBy(-1, 0); break;
-        case Joypad::NavRight: grid->moveBy(1, 0); break;
-        case Joypad::NavOk:    grid->activate(); break;
-        case Joypad::NavBack:  if (m_page != 0) setPage(0); break;
-        default: break;
-        }
-        return;
-    }
-
-    if (m_page == 1) {
-        switch (action) {
-        case Joypad::NavUp:    m_files->step(-1); break;
-        case Joypad::NavDown:  m_files->step(1); break;
-        case Joypad::NavRight:
-        case Joypad::NavOk:    m_files->enter(); break;
-        case Joypad::NavLeft:
-        case Joypad::NavBack:  if (!m_files->leave()) setPage(0); break;
-        default: break;
-        }
-        return;
-    }
-
-    /* The System sheet: nothing to move, and Back is the way out. */
-    if (action == Joypad::NavBack || action == Joypad::NavOk)
-        setPage(0);
 }
 
 bool Dashboard::eventFilter(QObject *watched, QEvent *event)
@@ -724,6 +1125,38 @@ bool Dashboard::eventFilter(QObject *watched, QEvent *event)
      */
     if (event->type() == QEvent::KeyPress) {
         QKeyEvent *key = static_cast<QKeyEvent *>(event);
+
+        /*
+         * A page that wants raw keys gets them here too, so a workstation build can
+         * type into the Terminal.  Qt has already mapped the scan code to a Qt key,
+         * and the pages want evdev codes, so nativeScanCode is what is forwarded:
+         * on Linux that is the evdev code plus 8, which is the same offset X11 has
+         * used since it had a keyboard driver at all.
+         */
+        PageWidget *page = current();
+        const bool toKeyboard = m_keyboard->isVisible();
+        /* Escape is never forwarded: on a workstation it is the only way out of a
+         * page that has asked for every other key, and a terminal with no way out
+         * of it is a terminal you reboot the machine to leave. */
+        const bool escapes = key->key() == Qt::Key_Escape;
+        if (!escapes && (toKeyboard || (page && page->wantsKeys()))) {
+            const int code = (int)key->nativeScanCode() - 8;
+            int mods = Joypad::ModNone;
+            if (key->modifiers() & Qt::ShiftModifier)
+                mods |= Joypad::ModShift;
+            if (key->modifiers() & Qt::ControlModifier)
+                mods |= Joypad::ModCtrl;
+            if (key->modifiers() & Qt::AltModifier)
+                mods |= Joypad::ModAlt;
+            if (code > 0) {
+                if (toKeyboard)
+                    m_keyboard->keyPressed(code, true, mods);
+                else
+                    page->keyPressed(code, true, mods);
+                return true;
+            }
+        }
+
         int action = Joypad::NavNone;
         switch (key->key()) {
         case Qt::Key_Up:        action = Joypad::NavUp; break;

@@ -4,6 +4,7 @@
  * See device/j36-ultra/LICENSE for the licence text and what it covers.
  */
 #include "widgets.h"
+#include "joypad.h"
 #include "theme.h"
 
 #include <QDateTime>
@@ -12,17 +13,20 @@
 #include <QFileInfo>
 #include <QFontMetrics>
 #include <QGuiApplication>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QResizeEvent>
 #include <QShowEvent>
 #include <QTimer>
+#include <QWheelEvent>
 
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-namespace {
+namespace SysInfo {
 
 QString readTrimmed(const QString &path)
 {
@@ -33,10 +37,9 @@ QString readTrimmed(const QString &path)
 }
 
 /*
- * The cell, if the kernel has anything to say about it.  It does not yet: this
- * kernel has no MT6592 PMIC driver, so there is no power_supply class and this
- * returns -1, which the status bar draws as a dash rather than as 0%.  When the
- * driver lands nothing here has to change.
+ * The cell, if the kernel has anything to say about it.  Until the MT6592 PMIC
+ * driver lands there is no power_supply class and this returns -1, which the
+ * status bar draws as a dash rather than as 0%.
  */
 int batteryCapacity(bool *charging)
 {
@@ -76,10 +79,63 @@ bool networkUp()
     return false;
 }
 
+/*
+ * The wireless interface, asked of the kernel rather than guessed from a name.
+ * "wlan0" is only a convention, and a USB dongle on this board can just as easily
+ * come up as wlx0013effe1234; what all of them have is a phy80211 link.
+ */
+QString wirelessInterface()
+{
+    const QString base = "/sys/class/net";
+    const QStringList ifaces = QDir(base).entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &i : ifaces) {
+        if (i == "lo")
+            continue;
+        if (QFileInfo::exists(base + "/" + i + "/phy80211")
+            || QFileInfo::exists(base + "/" + i + "/wireless"))
+            return i;
+    }
+    return QString();
+}
+
+} /* namespace SysInfo */
+
+namespace {
+
+using SysInfo::readTrimmed;
+
 QString firstWords(const QString &s, int n)
 {
     const QStringList parts = s.split(' ', Qt::SkipEmptyParts);
     return QStringList(parts.mid(0, n)).join(' ');
+}
+
+/*
+ * Link quality out of 100, from the same file iwconfig reads.  Column 3 of a
+ * /proc/net/wireless line is "link", which the kernel reports 0..70 for most
+ * drivers.  -1 for "no wireless" and for "wireless but not associated", because
+ * three empty bars is the honest drawing of both.
+ */
+int wirelessQuality()
+{
+    QFile f("/proc/net/wireless");
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return -1;
+    while (!f.atEnd()) {
+        const QString line = QString::fromLatin1(f.readLine());
+        const int colon = line.indexOf(':');
+        if (colon < 0)
+            continue;
+        const QStringList cols = line.mid(colon + 1).split(' ', Qt::SkipEmptyParts);
+        if (cols.size() < 2)
+            continue;
+        bool ok = false;
+        const double link = cols.at(1).remove('.').toDouble(&ok);
+        if (!ok || link <= 0.0)
+            continue;
+        return qBound(1, (int)(link * 100.0 / 70.0), 100);
+    }
+    return -1;
 }
 
 } /* namespace */
@@ -178,12 +234,148 @@ void paintGlyph(QPainter &p, const QRectF &box, int glyph, const QColor &ink)
         p.drawLine(QPointF(x + w * 0.36, y + h * 0.50), QPointF(x + w * 0.62, y + h * 0.74));
         break;
     }
+    case GlyphWifi: {
+        /* Three arcs and a dot, struck about a centre below the box so the
+         * curvature reads as a broadcast rather than as a rainbow. */
+        const QPointF c(x + w * 0.50, y + h * 0.78);
+        for (int i = 0; i < 3; ++i) {
+            const qreal r = w * (0.16 + 0.14 * i);
+            p.drawArc(QRectF(c.x() - r, c.y() - r, r * 2, r * 2), 35 * 16, 110 * 16);
+        }
+        p.setBrush(ink);
+        p.drawEllipse(c, w * 0.05, w * 0.05);
+        break;
+    }
+    case GlyphMouse: {
+        p.drawRoundedRect(QRectF(x + w * 0.28, y + h * 0.16, w * 0.44, h * 0.68),
+                          w * 0.22, w * 0.22);
+        p.drawLine(QPointF(x + w * 0.50, y + h * 0.16), QPointF(x + w * 0.50, y + h * 0.44));
+        p.drawLine(QPointF(x + w * 0.28, y + h * 0.44), QPointF(x + w * 0.72, y + h * 0.44));
+        break;
+    }
+    case GlyphPackage: {
+        /* A carton: a box with a lid seam and a strap. */
+        p.drawRect(QRectF(x + w * 0.12, y + h * 0.32, w * 0.76, h * 0.50));
+        p.drawLine(QPointF(x + w * 0.12, y + h * 0.48), QPointF(x + w * 0.88, y + h * 0.48));
+        p.drawLine(QPointF(x + w * 0.50, y + h * 0.32), QPointF(x + w * 0.50, y + h * 0.82));
+        p.drawLine(QPointF(x + w * 0.12, y + h * 0.32), QPointF(x + w * 0.30, y + h * 0.18));
+        p.drawLine(QPointF(x + w * 0.88, y + h * 0.32), QPointF(x + w * 0.70, y + h * 0.18));
+        break;
+    }
+    case GlyphMusic: {
+        p.setBrush(ink);
+        p.drawEllipse(QPointF(x + w * 0.30, y + h * 0.70), w * 0.12, w * 0.10);
+        p.drawEllipse(QPointF(x + w * 0.70, y + h * 0.60), w * 0.12, w * 0.10);
+        p.setBrush(Qt::NoBrush);
+        p.drawLine(QPointF(x + w * 0.42, y + h * 0.70), QPointF(x + w * 0.42, y + h * 0.24));
+        p.drawLine(QPointF(x + w * 0.82, y + h * 0.60), QPointF(x + w * 0.82, y + h * 0.16));
+        p.drawLine(QPointF(x + w * 0.42, y + h * 0.24), QPointF(x + w * 0.82, y + h * 0.16));
+        break;
+    }
+    case GlyphImage: {
+        p.drawRoundedRect(QRectF(x + w * 0.08, y + h * 0.22, w * 0.84, h * 0.56),
+                          h * 0.10, h * 0.10);
+        p.setBrush(ink);
+        p.drawEllipse(QPointF(x + w * 0.32, y + h * 0.40), w * 0.06, w * 0.06);
+        p.setBrush(Qt::NoBrush);
+        QPainterPath hill;
+        hill.moveTo(x + w * 0.14, y + h * 0.72);
+        hill.lineTo(x + w * 0.40, y + h * 0.48);
+        hill.lineTo(x + w * 0.58, y + h * 0.66);
+        hill.lineTo(x + w * 0.70, y + h * 0.56);
+        hill.lineTo(x + w * 0.88, y + h * 0.72);
+        p.drawPath(hill);
+        break;
+    }
+    case GlyphChip: {
+        p.drawRoundedRect(QRectF(x + w * 0.26, y + h * 0.26, w * 0.48, h * 0.48), 3, 3);
+        for (int i = 0; i < 3; ++i) {
+            const qreal t = x + w * (0.36 + 0.14 * i);
+            p.drawLine(QPointF(t, y + h * 0.26), QPointF(t, y + h * 0.12));
+            p.drawLine(QPointF(t, y + h * 0.74), QPointF(t, y + h * 0.88));
+            const qreal s = y + h * (0.36 + 0.14 * i);
+            p.drawLine(QPointF(x + w * 0.26, s), QPointF(x + w * 0.12, s));
+            p.drawLine(QPointF(x + w * 0.74, s), QPointF(x + w * 0.88, s));
+        }
+        break;
+    }
+    case GlyphInfo: {
+        p.drawEllipse(QRectF(x + w * 0.16, y + h * 0.16, w * 0.68, h * 0.68));
+        p.drawLine(QPointF(x + w * 0.50, y + h * 0.46), QPointF(x + w * 0.50, y + h * 0.70));
+        p.setBrush(ink);
+        p.drawEllipse(QPointF(x + w * 0.50, y + h * 0.34), w * 0.045, w * 0.045);
+        break;
+    }
     default:
         break;
     }
 
     p.restore();
 }
+
+/* ── Sheet chrome ────────────────────────────────────────────────────────── */
+
+QRectF paintSheet(QPainter &p, const QRectF &card, const QString &title,
+                  const QString &rightText)
+{
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    Theme::softShadow(p, card, Theme::Radius, 6, 24);
+    Theme::vgrad(p, card, Theme::window(), Theme::window().darker(112), Theme::Radius);
+    p.setBrush(Qt::NoBrush);
+    p.setPen(QPen(Theme::border(), 1.0));
+    p.drawRoundedRect(card.adjusted(0.5, 0.5, -0.5, -0.5), Theme::Radius, Theme::Radius);
+
+    QPainterPath clip;
+    clip.addRoundedRect(card, Theme::Radius, Theme::Radius);
+    p.save();
+    p.setClipPath(clip);
+    const QRectF head(card.x(), card.y(), card.width(), 34);
+    Theme::vgrad(p, head, Theme::titlebar(), Theme::titlebarLow());
+    p.setPen(QPen(Theme::separator(), 1.0));
+    p.drawLine(QPointF(head.x(), head.bottom() - 0.5), QPointF(head.right(), head.bottom() - 0.5));
+    p.restore();
+
+    qreal rightW = 0;
+    if (!rightText.isEmpty()) {
+        const QFont rf = Theme::font(12);
+        const QFontMetrics rfm(rf);
+        rightW = rfm.horizontalAdvance(rightText) + 8;
+        p.setFont(rf);
+        p.setPen(Theme::ink3());
+        p.drawText(QRectF(head.right() - 14 - rightW, head.y(), rightW, head.height()),
+                   Qt::AlignRight | Qt::AlignVCenter, rightText);
+    }
+
+    const QFont f = Theme::font(13, true);
+    const QFontMetrics fm(f);
+    p.setFont(f);
+    p.setPen(Theme::ink());
+    const QRectF text = head.adjusted(14, 0, -14 - rightW, 0);
+    p.drawText(text, Qt::AlignLeft | Qt::AlignVCenter,
+               fm.elidedText(title, Qt::ElideMiddle, (int)qMax(10.0, text.width())));
+
+    return QRectF(card.x() + 1, head.bottom() + 1, card.width() - 2,
+                  card.bottom() - head.bottom() - 2);
+}
+
+/* ── PageWidget ──────────────────────────────────────────────────────────── */
+
+PageWidget::PageWidget(QWidget *parent)
+    : QWidget(parent)
+{
+    /* Every page is pointer-driven as well as pad-driven, and hover highlights
+     * need moves with no button down. */
+    setMouseTracking(true);
+}
+
+bool PageWidget::handleNav(int) { return false; }
+void PageWidget::onEnter() {}
+void PageWidget::onLeave() {}
+bool PageWidget::wantsFullscreen() const { return false; }
+bool PageWidget::wantsKeys() const { return false; }
+void PageWidget::keyPressed(int, bool, int) {}
+void PageWidget::textEntered(const QString &, bool) {}
 
 /* ── StatusBar ───────────────────────────────────────────────────────────── */
 
@@ -209,12 +401,9 @@ void StatusBar::setTitle(const QString &title)
 
 void StatusBar::refresh()
 {
-    const int cap = batteryCapacity(&m_charging);
-    const bool net = networkUp();
-    if (cap != m_capacity || net != m_net) {
-        m_capacity = cap;
-        m_net = net;
-    }
+    m_capacity = SysInfo::batteryCapacity(&m_charging);
+    m_net = SysInfo::networkUp();
+    m_wifi = wirelessQuality();
     /* The clock is in here too, so one timer covers everything that moves. */
     update();
 }
@@ -282,7 +471,7 @@ void StatusBar::paintEvent(QPaintEvent *)
     }
 
     /* The cell. An empty outline with a dash in it is the honest drawing when the
-     * kernel exposes no power_supply class, which on this board it does not yet. */
+     * kernel exposes no power_supply class. */
     const qreal bw = 24.0;
     const qreal bh = 12.0;
     const QRectF cell(rx - bw, by - bh / 2.0, bw, bh);
@@ -317,12 +506,18 @@ void StatusBar::paintEvent(QPaintEvent *)
     }
     rx -= bw + 14.0;
 
-    /* Three bars for the network, lit only if something is actually up. */
+    /*
+     * Three bars.  Lit progressively from the wireless link quality when there is
+     * one, and all three lit for a wired link that is up -- a cable has no
+     * strength to report and drawing one bar for it would read as a bad signal.
+     */
+    const int lit = m_wifi >= 0 ? (m_wifi >= 66 ? 3 : m_wifi >= 33 ? 2 : 1)
+                                : (m_net ? 3 : 0);
     for (int i = 0; i < 3; ++i) {
         const qreal barH = 4.0 + i * 3.0;
         const QRectF b(rx - 12.0 + i * 5.0, by + 5.0 - barH, 3.0, barH);
         p.setPen(Qt::NoPen);
-        p.setBrush(m_net ? Theme::ink() : Theme::ink3());
+        p.setBrush(i < lit ? Theme::ink() : Theme::ink3());
         p.drawRoundedRect(b, 1.0, 1.0);
     }
     rx -= 20.0;
@@ -346,7 +541,7 @@ void StatusBar::paintEvent(QPaintEvent *)
 /* ── CardGrid ────────────────────────────────────────────────────────────── */
 
 CardGrid::CardGrid(QWidget *parent)
-    : QWidget(parent)
+    : PageWidget(parent)
 {
 }
 
@@ -364,6 +559,28 @@ QString CardGrid::currentTitle() const
     if (m_index < 0 || m_index >= m_entries.size())
         return QString();
     return m_entries[m_index].title;
+}
+
+QString CardGrid::title() const
+{
+    const QString t = currentTitle();
+    if (m_pageTitle.isEmpty())
+        return t;
+    if (t.isEmpty())
+        return m_pageTitle;
+    return m_pageTitle + " -- " + t;
+}
+
+bool CardGrid::handleNav(int action)
+{
+    switch (action) {
+    case Joypad::NavUp:    moveBy(0, -1); return true;
+    case Joypad::NavDown:  moveBy(0, 1); return true;
+    case Joypad::NavLeft:  moveBy(-1, 0); return true;
+    case Joypad::NavRight: moveBy(1, 0); return true;
+    case Joypad::NavOk:    activate(); return true;
+    default: return false;
+    }
 }
 
 QRectF CardGrid::cardRect(int i) const
@@ -386,6 +603,59 @@ QRectF CardGrid::cardRect(int i) const
     const int c = i % cols;
     const int r = i / cols;
     return QRectF(Theme::Margin + c * (cw + Theme::Gap), top + r * (ch + Theme::Gap), cw, ch);
+}
+
+int CardGrid::cardAt(const QPoint &p) const
+{
+    for (int i = 0; i < m_entries.size(); ++i)
+        if (cardRect(i).contains(QPointF(p)))
+            return i;
+    return -1;
+}
+
+void CardGrid::mouseMoveEvent(QMouseEvent *event)
+{
+    /* Hover selects.  The selection and the cursor are two different things on
+     * this device -- the pad owns one and the stick owns the other -- and having
+     * the cursor move the selection is what keeps them from disagreeing about
+     * what "the current card" is when the user switches hands mid-page. */
+    const int i = cardAt(event->pos());
+    if (i >= 0 && i != m_index) {
+        m_index = i;
+        update();
+        emit indexChanged(m_index);
+    }
+    event->accept();
+}
+
+void CardGrid::mousePressEvent(QMouseEvent *event)
+{
+    if (event->button() != Qt::LeftButton) {
+        event->ignore();
+        return;
+    }
+    m_pressed = cardAt(event->pos());
+    if (m_pressed >= 0 && m_pressed != m_index) {
+        m_index = m_pressed;
+        update();
+        emit indexChanged(m_index);
+    }
+    event->accept();
+}
+
+void CardGrid::mouseReleaseEvent(QMouseEvent *event)
+{
+    if (event->button() != Qt::LeftButton) {
+        event->ignore();
+        return;
+    }
+    /* Only if the release is on the card the press landed on, which is what lets
+     * a mis-aimed press be slid off and abandoned. */
+    const int i = cardAt(event->pos());
+    if (i >= 0 && i == m_pressed)
+        emit activated(i);
+    m_pressed = -1;
+    event->accept();
 }
 
 void CardGrid::moveBy(int dx, int dy)
@@ -518,20 +788,15 @@ void Dock::setCurrent(int page)
     update();
 }
 
-void Dock::paintEvent(QPaintEvent *)
+QVector<QRectF> Dock::slotRects() const
 {
+    QVector<QRectF> out;
     if (m_pages.isEmpty())
-        return;
-
-    QPainter p(this);
-    p.setRenderHint(QPainter::Antialiasing, true);
+        return out;
 
     const QFont f = Theme::font(12, true);
     const QFontMetrics fm(f);
-    p.setFont(f);
 
-    /* Slots sized to their labels, so the bar is as wide as it needs to be and
-     * centred -- which is what makes it read as a dock and not as a tab strip. */
     QVector<qreal> slotW;
     qreal total = 0;
     for (const QString &name : m_pages) {
@@ -544,6 +809,48 @@ void Dock::paintEvent(QPaintEvent *)
     const qreal barH = 40.0;
     const QRectF bar((width() - barW) / 2.0, (height() - barH) / 2.0, barW, barH);
 
+    qreal x = bar.x() + pad;
+    for (int i = 0; i < m_pages.size(); ++i) {
+        out.append(QRectF(x, bar.y() + 5, slotW[i], barH - 10));
+        x += slotW[i];
+    }
+    return out;
+}
+
+void Dock::mousePressEvent(QMouseEvent *event)
+{
+    const QVector<QRectF> slots = slotRects();
+    for (int i = 0; i < slots.size(); ++i) {
+        if (!slots[i].contains(QPointF(event->pos())))
+            continue;
+        emit pageClicked(i);
+        event->accept();
+        return;
+    }
+    event->ignore();
+}
+
+void Dock::paintEvent(QPaintEvent *)
+{
+    if (m_pages.isEmpty())
+        return;
+
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    const QFont f = Theme::font(12, true);
+    p.setFont(f);
+
+    const QVector<QRectF> slots = slotRects();
+    if (slots.isEmpty())
+        return;
+
+    /* Slots sized to their labels, so the bar is as wide as it needs to be and
+     * centred -- which is what makes it read as a dock and not as a tab strip. */
+    const qreal pad = 8.0;
+    const QRectF bar(slots.first().x() - pad, slots.first().y() - 5,
+                     slots.last().right() - slots.first().x() + pad * 2, 40.0);
+
     Theme::softShadow(p, bar, 16, 6, 30);
     QColor glass = Theme::dock();
     glass.setAlpha(Theme::DockAlpha);
@@ -554,9 +861,8 @@ void Dock::paintEvent(QPaintEvent *)
     p.setPen(QPen(QColor(255, 255, 255, 40), 1.0));
     p.drawRoundedRect(bar.adjusted(0.5, 0.5, -0.5, -0.5), 16, 16);
 
-    qreal x = bar.x() + pad;
-    for (int i = 0; i < m_pages.size(); ++i) {
-        const QRectF slot(x, bar.y() + 5, slotW[i], barH - 10);
+    for (int i = 0; i < m_pages.size() && i < slots.size(); ++i) {
+        const QRectF slot = slots[i];
         if (i == m_current) {
             Theme::vgrad(p, slot, Theme::blue(), Theme::blueLow(), 11);
             p.setPen(Theme::ink());
@@ -569,14 +875,450 @@ void Dock::paintEvent(QPaintEvent *)
             p.setPen(Theme::ink2());
         }
         p.drawText(slot, Qt::AlignCenter, m_pages[i]);
-        x += slotW[i];
+    }
+}
+
+/* ── ListPane ────────────────────────────────────────────────────────────── */
+
+ListPane::ListPane(QWidget *parent)
+    : QWidget(parent)
+{
+    setMouseTracking(true);
+}
+
+void ListPane::setRows(const QVector<ListRow> &rows)
+{
+    m_rows = rows;
+    m_pressed = -1;
+    m_dragging = false;
+    if (m_current >= m_rows.size() || m_current < 0 || !selectable(m_current))
+        m_current = nextSelectable(-1, 1);
+    m_scroll = 0;
+    if (m_current >= 0)
+        ensureVisible(m_current);
+    clampScroll();
+    update();
+    emit currentChanged(m_current);
+}
+
+void ListPane::updateRow(int index, const ListRow &row)
+{
+    if (index < 0 || index >= m_rows.size())
+        return;
+    m_rows[index] = row;
+    update();
+}
+
+const ListRow *ListPane::currentRow() const
+{
+    if (m_current < 0 || m_current >= m_rows.size())
+        return nullptr;
+    return &m_rows[m_current];
+}
+
+void ListPane::setRowHeight(int px)
+{
+    m_rowHeight = qMax(16, px);
+    update();
+}
+
+void ListPane::setPlaceholder(const QString &text)
+{
+    m_placeholder = text;
+    update();
+}
+
+bool ListPane::selectable(int index) const
+{
+    if (index < 0 || index >= m_rows.size())
+        return false;
+    const ListRow &r = m_rows[index];
+    return r.kind != ListRow::Header && r.enabled;
+}
+
+int ListPane::nextSelectable(int from, int delta) const
+{
+    for (int i = from + delta; i >= 0 && i < m_rows.size(); i += delta)
+        if (selectable(i))
+            return i;
+    return -1;
+}
+
+int ListPane::rowHeightFor(const ListRow &r) const
+{
+    switch (r.kind) {
+    case ListRow::Header:
+        return m_rowHeight - 4;
+    case ListRow::Slider:
+        return m_rowHeight + 10;
+    default:
+        return r.detail.isEmpty() ? m_rowHeight : m_rowHeight + 12;
+    }
+}
+
+int ListPane::rowTop(int index) const
+{
+    int y = 0;
+    for (int i = 0; i < index && i < m_rows.size(); ++i)
+        y += rowHeightFor(m_rows[i]);
+    return y;
+}
+
+int ListPane::contentHeight() const
+{
+    int y = 0;
+    for (int i = 0; i < m_rows.size(); ++i)
+        y += rowHeightFor(m_rows[i]);
+    return y;
+}
+
+int ListPane::rowAt(const QPoint &p) const
+{
+    int y = -m_scroll;
+    for (int i = 0; i < m_rows.size(); ++i) {
+        const int h = rowHeightFor(m_rows[i]);
+        if (p.y() >= y && p.y() < y + h)
+            return i;
+        y += h;
+    }
+    return -1;
+}
+
+void ListPane::clampScroll()
+{
+    const int maxScroll = qMax(0, contentHeight() - height());
+    m_scroll = qBound(0, m_scroll, maxScroll);
+}
+
+void ListPane::ensureVisible(int index)
+{
+    if (index < 0 || index >= m_rows.size())
+        return;
+    const int top = rowTop(index);
+    const int h = rowHeightFor(m_rows[index]);
+    if (top < m_scroll)
+        m_scroll = top;
+    else if (top + h > m_scroll + height())
+        m_scroll = top + h - height();
+    clampScroll();
+}
+
+void ListPane::setCurrent(int index)
+{
+    if (!selectable(index))
+        return;
+    if (m_current == index)
+        return;
+    m_current = index;
+    ensureVisible(index);
+    update();
+    emit currentChanged(m_current);
+}
+
+void ListPane::step(int delta)
+{
+    if (m_rows.isEmpty())
+        return;
+    const int next = nextSelectable(m_current, delta > 0 ? 1 : -1);
+    if (next < 0)
+        return;
+    m_current = next;
+    ensureVisible(m_current);
+    update();
+    emit currentChanged(m_current);
+}
+
+void ListPane::pageStep(int delta)
+{
+    const int rows = qMax(1, height() / qMax(1, m_rowHeight));
+    for (int i = 0; i < rows; ++i)
+        step(delta);
+}
+
+bool ListPane::adjust(int delta)
+{
+    if (m_current < 0 || m_current >= m_rows.size())
+        return false;
+    ListRow &r = m_rows[m_current];
+    if (r.kind == ListRow::Slider) {
+        const int was = r.value;
+        r.value = qBound(r.minimum, r.value + delta * qMax(1, r.stepSize), r.maximum);
+        if (r.value == was)
+            return true;
+        update();
+        emit valueChanged(m_current, r.value);
+        return true;
+    }
+    if (r.kind == ListRow::Toggle) {
+        r.on = !r.on;
+        update();
+        emit valueChanged(m_current, r.on ? 1 : 0);
+        return true;
+    }
+    return false;
+}
+
+bool ListPane::press()
+{
+    if (m_current < 0 || m_current >= m_rows.size())
+        return false;
+    ListRow &r = m_rows[m_current];
+    if (r.kind == ListRow::Toggle) {
+        r.on = !r.on;
+        update();
+        emit valueChanged(m_current, r.on ? 1 : 0);
+        return true;
+    }
+    emit activated(m_current);
+    return true;
+}
+
+void ListPane::resizeEvent(QResizeEvent *event)
+{
+    clampScroll();
+    QWidget::resizeEvent(event);
+}
+
+void ListPane::wheelEvent(QWheelEvent *event)
+{
+    const int notches = event->angleDelta().y() / 120;
+    if (notches == 0) {
+        event->ignore();
+        return;
+    }
+    m_scroll -= notches * m_rowHeight * 2;
+    clampScroll();
+    update();
+    event->accept();
+}
+
+void ListPane::mouseMoveEvent(QMouseEvent *event)
+{
+    if (m_dragging && m_pressed >= 0 && m_pressed < m_rows.size()) {
+        ListRow &r = m_rows[m_pressed];
+        const int y = rowTop(m_pressed) - m_scroll;
+        const QRectF track(width() * 0.44, y + rowHeightFor(r) * 0.62,
+                           width() * 0.44, 6.0);
+        const qreal t = qBound(0.0, (event->pos().x() - track.x()) / qMax(1.0, track.width()), 1.0);
+        const int was = r.value;
+        r.value = r.minimum + qRound(t * (r.maximum - r.minimum));
+        if (r.value != was) {
+            update();
+            emit valueChanged(m_pressed, r.value);
+        }
+        event->accept();
+        return;
+    }
+
+    const int i = rowAt(event->pos());
+    if (i >= 0 && selectable(i) && i != m_current) {
+        m_current = i;
+        update();
+        emit currentChanged(m_current);
+    }
+    event->accept();
+}
+
+void ListPane::mousePressEvent(QMouseEvent *event)
+{
+    if (event->button() != Qt::LeftButton) {
+        event->ignore();
+        return;
+    }
+
+    const int i = rowAt(event->pos());
+    m_pressed = i;
+    if (i >= 0 && selectable(i)) {
+        if (i != m_current) {
+            m_current = i;
+            emit currentChanged(m_current);
+        }
+        /* A press on a slider's half of the row starts a drag; a press on its
+         * label does not, so a label can still be read without moving the value. */
+        if (m_rows[i].kind == ListRow::Slider && event->pos().x() > width() * 0.42) {
+            m_dragging = true;
+            mouseMoveEvent(event);
+            return;
+        }
+        update();
+    }
+    event->accept();
+}
+
+void ListPane::mouseReleaseEvent(QMouseEvent *event)
+{
+    if (event->button() != Qt::LeftButton) {
+        event->ignore();
+        return;
+    }
+    if (m_dragging) {
+        m_dragging = false;
+        m_pressed = -1;
+        event->accept();
+        return;
+    }
+
+    const int i = rowAt(event->pos());
+    if (i >= 0 && i == m_pressed && selectable(i)) {
+        m_current = i;
+        press();
+    }
+    m_pressed = -1;
+    event->accept();
+}
+
+void ListPane::paintEvent(QPaintEvent *)
+{
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    if (m_rows.isEmpty()) {
+        if (!m_placeholder.isEmpty()) {
+            p.setFont(Theme::font(13));
+            p.setPen(Theme::ink3());
+            p.drawText(rect(), Qt::AlignCenter | Qt::TextWordWrap, m_placeholder);
+        }
+        return;
+    }
+
+    const QFont textFont = Theme::font(13);
+    const QFont boldFont = Theme::font(13, true);
+    const QFont smallFont = Theme::font(11);
+    const QFontMetrics textMetrics(textFont);
+    const QFontMetrics smallMetrics(smallFont);
+
+    int y = -m_scroll;
+    for (int i = 0; i < m_rows.size(); ++i) {
+        const ListRow &r = m_rows[i];
+        const int h = rowHeightFor(r);
+        if (y + h < 0) {
+            y += h;
+            continue;
+        }
+        if (y > height())
+            break;
+
+        const QRectF row(4, y, width() - 8, h);
+
+        if (r.kind == ListRow::Header) {
+            p.setFont(smallFont);
+            p.setPen(Theme::ink3());
+            p.drawText(row.adjusted(8, 0, 0, 0), Qt::AlignLeft | Qt::AlignBottom,
+                       r.text.toUpper());
+            p.setPen(QPen(Theme::separator(), 1.0));
+            p.drawLine(QPointF(row.x() + 8, row.bottom() - 1.5),
+                       QPointF(row.right() - 8, row.bottom() - 1.5));
+            y += h;
+            continue;
+        }
+
+        const bool selected = (i == m_current);
+        if (selected) {
+            QColor sel = Theme::blue();
+            sel.setAlpha(r.enabled ? 210 : 90);
+            p.setPen(Qt::NoPen);
+            p.setBrush(sel);
+            p.drawRoundedRect(row.adjusted(2, 1, -2, -1), 8, 8);
+        }
+
+        qreal x = row.x() + 10;
+
+        if (r.glyph >= 0) {
+            const QRectF icon(x, row.center().y() - 11, 22, 22);
+            paintGlyph(p, icon, r.glyph,
+                       selected ? Theme::ink() : (r.accent.isValid() ? r.accent : Theme::ink2()));
+            x += 30;
+        }
+
+        /* The right-hand furniture first, so the label knows how much room it has. */
+        qreal right = row.right() - 12;
+
+        if (r.kind == ListRow::Toggle) {
+            const QRectF sw(right - 40, row.center().y() - 10, 40, 20);
+            p.setPen(Qt::NoPen);
+            p.setBrush(r.on ? Theme::green() : Theme::separator());
+            p.drawRoundedRect(sw, 10, 10);
+            p.setBrush(QColor(250, 251, 255));
+            p.drawEllipse(QPointF(r.on ? sw.right() - 10 : sw.x() + 10, sw.center().y()), 8, 8);
+            right = sw.x() - 10;
+        } else if (r.kind == ListRow::Slider) {
+            const QString vt = r.valueText.isEmpty() ? QString::number(r.value) : r.valueText;
+            const qreal vw = qMax(38.0, (qreal)smallMetrics.horizontalAdvance(vt) + 6.0);
+            p.setFont(smallFont);
+            p.setPen(selected ? Theme::ink() : Theme::ink2());
+            p.drawText(QRectF(right - vw, row.y(), vw, h * 0.6),
+                       Qt::AlignRight | Qt::AlignVCenter, vt);
+
+            const QRectF track(width() * 0.44, row.y() + h * 0.62, width() * 0.44, 6.0);
+            p.setPen(Qt::NoPen);
+            p.setBrush(selected ? QColor(255, 255, 255, 70) : Theme::separator());
+            p.drawRoundedRect(track, 3, 3);
+            const qreal span = qMax(1, r.maximum - r.minimum);
+            const qreal t = qBound(0.0, (r.value - r.minimum) / span, 1.0);
+            QRectF fill = track;
+            fill.setWidth(track.width() * t);
+            p.setBrush(selected ? Theme::ink() : Theme::blue());
+            p.drawRoundedRect(fill, 3, 3);
+            p.setBrush(QColor(250, 251, 255));
+            p.drawEllipse(QPointF(track.x() + track.width() * t, track.center().y()), 6.5, 6.5);
+            right = track.x() - 10;
+        } else if (!r.badge.isEmpty()) {
+            p.setFont(smallFont);
+            const qreal bw = smallMetrics.horizontalAdvance(r.badge) + 14;
+            const QRectF pill(right - bw, row.center().y() - 9, bw, 18);
+            QColor bc = r.badgeColour.isValid() ? r.badgeColour : Theme::separator();
+            if (selected)
+                bc = bc.lighter(120);
+            p.setPen(Qt::NoPen);
+            p.setBrush(bc);
+            p.drawRoundedRect(pill, 9, 9);
+            p.setPen(Theme::ink());
+            p.drawText(pill, Qt::AlignCenter, r.badge);
+            right = pill.x() - 10;
+        }
+
+        const qreal tw = qMax(20.0, right - x);
+        const bool twoLine = (r.kind != ListRow::Slider) && !r.detail.isEmpty();
+
+        p.setFont(selected ? boldFont : textFont);
+        p.setPen(r.enabled ? (selected ? Theme::ink() : Theme::ink())
+                           : Theme::ink3());
+        const QFontMetrics fm(selected ? boldFont : textFont);
+        p.drawText(QRectF(x, twoLine ? row.y() + 5 : row.y(), tw, twoLine ? 18 : h),
+                   Qt::AlignLeft | (twoLine ? Qt::AlignTop : Qt::AlignVCenter),
+                   fm.elidedText(r.text, Qt::ElideRight, (int)tw));
+
+        if (twoLine) {
+            p.setFont(smallFont);
+            p.setPen(selected ? QColor(230, 238, 255) : Theme::ink2());
+            p.drawText(QRectF(x, row.y() + 22, tw, 16), Qt::AlignLeft | Qt::AlignTop,
+                       smallMetrics.elidedText(r.detail, Qt::ElideRight, (int)tw));
+        } else if (r.kind == ListRow::Slider && !r.detail.isEmpty()) {
+            p.setFont(smallFont);
+            p.setPen(selected ? QColor(230, 238, 255) : Theme::ink3());
+            p.drawText(QRectF(x, row.y() + h * 0.52, tw, 14), Qt::AlignLeft | Qt::AlignTop,
+                       smallMetrics.elidedText(r.detail, Qt::ElideRight, (int)tw));
+        }
+
+        y += h;
+    }
+
+    /* A scrollbar, only when there is something to scroll. */
+    const int total = contentHeight();
+    if (total > height()) {
+        const qreal t = (qreal)height() / total;
+        const qreal barH = qMax(24.0, height() * t);
+        const qreal barY = (height() - barH) * m_scroll / qMax(1, total - height());
+        p.setPen(Qt::NoPen);
+        p.setBrush(Theme::dockHi());
+        p.drawRoundedRect(QRectF(width() - 5, barY, 3, barH), 1.5, 1.5);
     }
 }
 
 /* ── InfoPage ────────────────────────────────────────────────────────────── */
 
 InfoPage::InfoPage(QWidget *parent)
-    : QWidget(parent)
+    : PageWidget(parent)
 {
     QTimer *t = new QTimer(this);
     t->setInterval(2000);
@@ -594,6 +1336,34 @@ void InfoPage::showEvent(QShowEvent *event)
 {
     refresh();
     QWidget::showEvent(event);
+}
+
+bool InfoPage::handleNav(int action)
+{
+    switch (action) {
+    case Joypad::NavUp:
+        m_scroll = qMax(0, m_scroll - 1);
+        update();
+        return true;
+    case Joypad::NavDown:
+        m_scroll = qMin(qMax(0, m_rows.size() - 4), m_scroll + 1);
+        update();
+        return true;
+    default:
+        return false;
+    }
+}
+
+void InfoPage::wheelEvent(QWheelEvent *event)
+{
+    const int notches = event->angleDelta().y() / 120;
+    if (notches == 0) {
+        event->ignore();
+        return;
+    }
+    m_scroll = qBound(0, m_scroll - notches, qMax(0, m_rows.size() - 4));
+    update();
+    event->accept();
 }
 
 void InfoPage::refresh()
@@ -656,9 +1426,9 @@ void InfoPage::refresh()
     }
 
     bool charging = false;
-    const int cap = batteryCapacity(&charging);
+    const int cap = SysInfo::batteryCapacity(&charging);
     m_rows.append(qMakePair(QString("Cell"),
-                            cap < 0 ? QString("no power_supply class -- this kernel has no PMIC driver yet")
+                            cap < 0 ? QString("no power_supply class -- see Diagnostics")
                                     : QString::number(cap) + "%"
                                           + QString(charging ? ", charging" : "")));
 
@@ -718,6 +1488,9 @@ void InfoPage::refresh()
     m_rows.append(qMakePair(QString("Boot words"),
                             words.isEmpty() ? QString("none") : words.join(' ')));
 
+    if (m_scroll > qMax(0, m_rows.size() - 4))
+        m_scroll = qMax(0, m_rows.size() - 4);
+
     update();
 }
 
@@ -728,36 +1501,17 @@ void InfoPage::paintEvent(QPaintEvent *)
 
     const QRectF card(Theme::Margin, Theme::Margin,
                       width() - 2.0 * Theme::Margin, height() - 2.0 * Theme::Margin);
-    Theme::softShadow(p, card, Theme::Radius, 6, 24);
-    Theme::vgrad(p, card, Theme::window(), Theme::window().darker(112), Theme::Radius);
-    p.setBrush(Qt::NoBrush);
-    p.setPen(QPen(Theme::border(), 1.0));
-    p.drawRoundedRect(card.adjusted(0.5, 0.5, -0.5, -0.5), Theme::Radius, Theme::Radius);
-
-    /* A title bar inside the card, clipped to its top corners. */
-    QPainterPath clip;
-    clip.addRoundedRect(card, Theme::Radius, Theme::Radius);
-    p.save();
-    p.setClipPath(clip);
-    const QRectF head(card.x(), card.y(), card.width(), 34);
-    Theme::vgrad(p, head, Theme::titlebar(), Theme::titlebarLow());
-    p.setPen(QPen(Theme::separator(), 1.0));
-    p.drawLine(QPointF(head.x(), head.bottom() - 0.5), QPointF(head.right(), head.bottom() - 0.5));
-    p.restore();
-
-    p.setFont(Theme::font(14, true));
-    p.setPen(Theme::ink());
-    p.drawText(head.adjusted(14, 0, -14, 0), Qt::AlignLeft | Qt::AlignVCenter, "System");
+    const QRectF body = paintSheet(p, card, QStringLiteral("System"));
 
     const QFont labelFont = Theme::font(12, true);
     const QFont valueFont = Theme::font(12);
     const QFontMetrics valueMetrics(valueFont);
     const qreal labelW = 96.0;
     const qreal rowH = 21.0;
-    qreal y = head.bottom() + 8;
+    qreal y = body.y() + 8;
 
-    for (int i = 0; i < m_rows.size(); ++i) {
-        if (y + rowH > card.bottom() - 6)
+    for (int i = m_scroll; i < m_rows.size(); ++i) {
+        if (y + rowH > body.bottom() - 6)
             break;
         p.setFont(labelFont);
         p.setPen(Theme::ink3());

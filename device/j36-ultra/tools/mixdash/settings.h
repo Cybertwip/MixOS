@@ -1,0 +1,116 @@
+/* SPDX-License-Identifier: MS-PL */
+/*
+ * Copyright (c) 2025-2026 the MixOS project and contributors
+ * See device/j36-ultra/LICENSE for the licence text and what it covers.
+ *
+ * settings.h -- everything the dashboard remembers between boots.
+ *
+ * ONE FILE, WRITTEN WHERE THERE IS SOMEWHERE TO WRITE.  /var/lib/mixos is on the
+ * ext2 OS partition and survives a power cut; /run/mixdash is a tmpfs and does
+ * not.  The fallback is not a nicety -- /init mounts the OS partition read-only
+ * on some of the recovery paths in this bring-up, and a dashboard that aborts
+ * because it cannot save a pointer speed would be a worse dashboard than one
+ * whose pointer speed resets.  path() says which of the two won, and the Settings
+ * page prints it, so "my settings do not stick" is answerable from the glass.
+ *
+ * QSettings and not a hand-rolled parser: it is already linked, it writes
+ * atomically through a temporary and a rename, and it is the only code here that
+ * would have to care that the card can be pulled out mid-write.
+ */
+#ifndef MIXDASH_SETTINGS_H
+#define MIXDASH_SETTINGS_H
+
+#include <QObject>
+#include <QString>
+
+class QSettings;
+
+/*
+ * The mouse block, as a struct rather than as eight separate getters, because
+ * Pointer reads all of it on every 15 ms tick and a QSettings lookup is a hash
+ * of a string.  Settings::mouse() hands back a const reference to a cached copy
+ * and save() is what writes.
+ */
+struct MouseConfig {
+    /*
+     * Pixels per second at full stick deflection.  A speed rather than a
+     * per-sample step: the poll interval is a property of Joypad and a user who
+     * changes this should not have to know it.
+     */
+    int pointerSpeed = 560;
+
+    /*
+     * Per cent applied to the deltas a real USB mouse reports.  Separate from
+     * pointerSpeed because the two have nothing in common -- one integrates a
+     * position, the other scales a distance the hardware already measured.
+     */
+    int trackingSpeed = 100;
+
+    /*
+     * 0 is linear -- the stick's deflection maps straight to a speed.  Higher
+     * values bend the response so small deflections are slower than linear and
+     * large ones are faster, which is what makes a 12 mm stick able to both
+     * cross the panel and land on a 20 px target.
+     */
+    int acceleration = 45;
+
+    /* Per cent of half travel ignored around centre.  An ADC joystick with no
+     * calibration does not read its own centre as centre. */
+    int deadzone = 16;
+
+    /* The window two presses have to fall inside to be a double click. */
+    int doubleClickMs = 400;
+
+    /* Idle seconds before the pointer fades out.  Four, as asked for. */
+    int hideSeconds = 4;
+
+    /* Off means the right stick goes back to being a second D-pad. */
+    bool enabled = true;
+
+    /* Swap the two pointer buttons, which is what a left-handed user wants and
+     * costs one branch to offer. */
+    bool leftHanded = false;
+};
+
+class Settings : public QObject
+{
+    Q_OBJECT
+
+public:
+    static Settings &instance();
+
+    const MouseConfig &mouse() const { return m_mouse; }
+    void setMouse(const MouseConfig &config);
+
+    /* The Wi-Fi interface the user picked, when the board has more than one.
+     * Empty means "whichever /sys/class/net says is wireless". */
+    QString wifiInterface() const { return m_wifiInterface; }
+    void setWifiInterface(const QString &iface);
+
+    /* Where the last Media page browse ended up, so it opens where it was left
+     * rather than at the top of the card every time. */
+    QString mediaRoot() const { return m_mediaRoot; }
+    void setMediaRoot(const QString &path);
+
+    /* The file the settings actually landed in, for the Settings page to print. */
+    QString path() const;
+    /* False when even the tmpfs fallback would not open, which is worth saying
+     * out loud rather than silently discarding every change. */
+    bool writable() const { return m_writable; }
+
+signals:
+    void mouseChanged();
+
+private:
+    Settings();
+
+    void load();
+
+    QSettings *m_store = nullptr;
+    MouseConfig m_mouse;
+    QString m_wifiInterface;
+    QString m_mediaRoot;
+    bool m_writable = false;
+};
+
+#endif /* MIXDASH_SETTINGS_H */

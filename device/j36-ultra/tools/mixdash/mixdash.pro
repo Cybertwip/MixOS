@@ -27,17 +27,43 @@ QMAKE_CXXFLAGS += -Wall -Wextra
 # frames resolve either way -- a shared library exports its symbols already.
 QMAKE_LFLAGS += -rdynamic
 
+# forkpty(3), for the Terminal page.  On a glibc from 2.34 onwards every symbol
+# that used to live in libutil is in libc proper and libutil.a is an empty
+# archive, so this adds no DT_NEEDED there and simply keeps the link working on
+# anything older.  It is NOT libutil the Qt payload should ever stage: see
+# QT_PAYLOAD_SKIP in build-in-vm.sh -- a glibc library has to come from the same
+# glibc as the rootfs's own libc.so.6.
+LIBS += -lutil
+
 SOURCES += \
     main.cpp \
     trace.cpp \
     alloc.cpp \
     dashboard.cpp \
     widgets.cpp \
-    joypad.cpp
+    joypad.cpp \
+    settings.cpp \
+    pointer.cpp \
+    keyboard.cpp \
+    settingspage.cpp \
+    wifi.cpp \
+    terminal.cpp \
+    media.cpp \
+    diagnostics.cpp \
+    packages.cpp
 
 HEADERS += \
     dashboard.h \
     trace.h \
     widgets.h \
     joypad.h \
-    theme.h
+    theme.h \
+    settings.h \
+    pointer.h \
+    keyboard.h \
+    settingspage.h \
+    wifi.h \
+    terminal.h \
+    media.h \
+    diagnostics.h \
+    packages.h
