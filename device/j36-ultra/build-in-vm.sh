@@ -683,6 +683,17 @@ done
 # unresolved symbols on the board.
 config_y POWER_SUPPLY
 
+# ── The backlight class, for the BLS driver ───────────────────────────────────
+#
+# Same argument as POWER_SUPPLY above, one word at a time: a class, not a driver,
+# =y so that j36_mt6592_backlight.ko has one fewer line in load.order, and named
+# explicitly because nothing in this configuration selects it on purpose.  It
+# does usually arrive anyway -- half the DRM panel drivers in multi_v7_defconfig
+# select it for boards that are not this one -- and that is precisely the kind of
+# accidental dependency that disappears under a prune, taking
+# /sys/class/backlight and the dashboard's brightness slider with it.
+config_y BACKLIGHT_CLASS_DEVICE
+
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
     CROSS_COMPILE=arm-linux-gnueabihf- olddefconfig
 
@@ -720,7 +731,7 @@ for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 DEVTMPFS DEVTMPFS_MOUNT TMPFS TMPFS_XATTR TMPFS_POSIX_ACL \
                 PROC_FS PROC_SYSCTL SYSFS \
                 EXT2_FS_XATTR EXT2_FS_POSIX_ACL BTRFS_FS_POSIX_ACL \
-                DRM DEVMEM SOUND POWER_SUPPLY \
+                DRM DEVMEM SOUND POWER_SUPPLY BACKLIGHT_CLASS_DEVICE \
                 USB_SUPPORT USB_PHY GENERIC_PHY HID_SUPPORT \
                 USB_MUSB_HOST MUSB_PIO_ONLY USB_ANNOUNCE_NEW_DEVICES; do
     grep -q "^CONFIG_${required}=y$" "$CONFIG" || \
@@ -2042,6 +2053,22 @@ run_power() {
 
     if [ "$power_charge" != 1 ]; then
         say "power: charger left as the LK set it by j36.power=nocharge"
+    fi
+
+    # The backlight, by the same test and for the same reason: the dashboard's
+    # Display page walks /sys/class/backlight/* and drives the first entry it
+    # finds, so the directory existing at all is the whole difference between a
+    # brightness slider and a row that says there is nothing to move.  The
+    # adopted level is printed because it is the LK's, not ours -- the driver
+    # reads the duty out of the PWM block rather than writing one -- so this line
+    # is also the answer to "what did the loader hand over".
+    if [ -d /sys/class/backlight ] && [ -n "$(ls /sys/class/backlight 2>/dev/null)" ]; then
+        for bl in /sys/class/backlight/*; do
+            [ -r "$bl/brightness" ] || continue
+            say "power: backlight ${bl##*/} at $(cat "$bl/brightness" 2>/dev/null) of $(cat "$bl/max_brightness" 2>/dev/null)"
+        done
+    else
+        say "power: no /sys/class/backlight -- brightness cannot be changed from Linux"
     fi
     return 0
 }
@@ -5338,10 +5365,13 @@ if (( ${#USB_MODULE_ORDER[@]} > 0 )); then
     log "usb: staged ${#USB_MODULE_ORDER[@]} modules into $PAYREL/usb/"
 fi
 
-# j36/power/ is the PMIC, and it is the payload with the largest consequence per
-# kilobyte on the card: 40 KB of module is the difference between a dashboard that
-# draws a battery and one that draws nothing, and between a `poweroff' that halts
-# the CPU with the rail still up and one that actually switches the board off.
+# j36/power/ is the PMIC and the backlight, and it is the payload with the largest
+# consequence per kilobyte on the card: 40 KB of module is the difference between
+# a dashboard that draws a battery and one that draws nothing, and between a
+# `poweroff' that halts the CPU with the rail still up and one that actually
+# switches the board off.  The second module adds /sys/class/backlight, which is
+# the difference between a brightness slider and a row of text explaining why
+# there is not one.
 #
 # Same removal contract as the rest, and here it is a real recovery rather than a
 # formality.  This is the one payload that programs a charger, and a charger is
