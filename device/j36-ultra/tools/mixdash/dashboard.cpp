@@ -6,6 +6,7 @@
 #include "dashboard.h"
 #include "joypad.h"
 #include "theme.h"
+#include "trace.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -25,6 +26,14 @@
 
 /* ── FilesPage ───────────────────────────────────────────────────────────── */
 
+/*
+ * ANNOUNCED STEP BY STEP, and here more than anywhere else in this file.  This page
+ * is the only one that hands a Qt class a path off the SD card and lets it go and
+ * look: QFileSystemModel does its work on a thread of its own (QFileInfoGatherer),
+ * so a throw inside it aborts the process while the main thread is still building
+ * widgets, and the last thing printed is the only evidence of where that was.  Every
+ * other page is arithmetic and QPainter calls.
+ */
 FilesPage::FilesPage(QWidget *parent)
     : QWidget(parent)
 {
@@ -35,15 +44,21 @@ FilesPage::FilesPage(QWidget *parent)
      * there, which makes it the useful place to open on.  The home directories are
      * the fallback for a boot without that mount, and / for a rootfs with neither.
      */
+    Trace::step("FilesPage: choosing a base directory");
     m_base = QFileInfo::exists("/run/j36/card") ? QString("/run/j36/card")
            : QFileInfo::exists("/home/ark")     ? QString("/home/ark")
            : QFileInfo::exists("/root")         ? QString("/root")
                                                 : QString("/");
 
+    Trace::step("FilesPage: QFileSystemModel");
     m_model = new QFileSystemModel(this);
     m_model->setFilter(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden);
+
+    /* Starts the gatherer thread walking the card. */
+    Trace::step("FilesPage: setRootPath -- starts the gatherer thread on the card");
     m_model->setRootPath(m_base);
 
+    Trace::step("FilesPage: QListView");
     m_view = new QListView(this);
     m_view->setModel(m_model);
     m_view->setFrameShape(QFrame::NoFrame);
@@ -60,6 +75,7 @@ FilesPage::FilesPage(QWidget *parent)
      * and without that selector the selection is drawn in the inactive palette --
      * grey on grey, which reads as nothing being selected at all.
      */
+    Trace::step("FilesPage: stylesheet");
     m_view->setStyleSheet(
         "QListView { background: transparent; border: none; color: #E8EAF2;"
         "            font-size: 13px; outline: none; }"
@@ -73,6 +89,7 @@ FilesPage::FilesPage(QWidget *parent)
         "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {"
         "            background: transparent; }");
 
+    Trace::step("FilesPage: layout");
     QVBoxLayout *layout = new QVBoxLayout(this);
     layout->setContentsMargins(Theme::Margin + 12, Theme::Margin + 42,
                                Theme::Margin + 12, Theme::Margin + 10);
@@ -95,6 +112,7 @@ FilesPage::FilesPage(QWidget *parent)
         update();
     });
 
+    Trace::step("FilesPage: setRoot -- reads the directory");
     setRoot(m_base);
 }
 
@@ -195,13 +213,27 @@ Dashboard::Dashboard(QWidget *parent)
      * skip clearing the backing store before every paint. */
     setAttribute(Qt::WA_OpaquePaintEvent, true);
 
+    /*
+     * WHY EVERY LINE OF THIS CONSTRUCTOR IS ANNOUNCED.  It is one statement at the
+     * call site -- `Dashboard dash;' -- and eleven objects here, and when it aborted
+     * the console named the statement, which named all eleven at once and therefore
+     * none of them.  A step costs one store and one line of console; it buys the name
+     * of the object that was being built when the process died.
+     */
+    Trace::step("StatusBar");
     m_bar = new StatusBar(this);
+    Trace::step("CardGrid (apps)");
     m_apps = new CardGrid(this);
+    Trace::step("FilesPage");
     m_files = new FilesPage(this);
+    Trace::step("InfoPage");
     m_info = new InfoPage(this);
+    Trace::step("CardGrid (power)");
     m_power = new CardGrid(this);
+    Trace::step("Dock");
     m_dock = new Dock(this);
 
+    Trace::step("toast label and its timer");
     m_toast = new QLabel(this);
     m_toast->setAlignment(Qt::AlignCenter);
     m_toast->setStyleSheet(
@@ -221,6 +253,7 @@ Dashboard::Dashboard(QWidget *parent)
         m_armedExe.clear();
     });
 
+    Trace::step("connections");
     connect(m_apps, &CardGrid::activated, this, &Dashboard::onAppActivated);
     connect(m_power, &CardGrid::activated, this, &Dashboard::onPowerActivated);
     connect(m_apps, &CardGrid::indexChanged, this, [this](int) {
@@ -229,10 +262,14 @@ Dashboard::Dashboard(QWidget *parent)
     });
     connect(m_files, &FilesPage::openRequested, this, &Dashboard::onOpenRequested);
 
+    Trace::step("dock pages");
     m_dock->setPages(QStringList() << "Apps" << "Files" << "System" << "Power");
 
+    /* Stats every candidate executable and IWAD on the card. */
+    Trace::step("buildPages -- looks for the apps on disk");
     buildPages();
 
+    Trace::step("Joypad -- opens /dev/input/event*");
     m_pad = new Joypad(this);
     connect(m_pad, &Joypad::nav, this, &Dashboard::onNav);
     m_info->setInputSummary(
@@ -240,8 +277,10 @@ Dashboard::Dashboard(QWidget *parent)
             ? QString("no /dev/input/event* -- nothing to navigate with")
             : QString("%1: %2").arg(m_pad->deviceCount()).arg(m_pad->deviceNames().join(", ")));
 
+    Trace::step("setPage(0)");
     setPage(0);
     qApp->installEventFilter(this);
+    Trace::step("constructed");
 }
 
 QString Dashboard::firstExisting(const QStringList &candidates)

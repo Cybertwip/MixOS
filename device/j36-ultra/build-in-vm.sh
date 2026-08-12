@@ -2061,10 +2061,13 @@ WorkingDirectory=$mixos_root/bin
 ExecStart=$mixos_root/bin/mixdash
 Restart=on-failure
 RestartSec=2
-# 3 is the dashboard's own startup watchdog, and a watchdog that has fired has left
-# its verdict on the console and put it back into text mode.  Restarting into the same
-# stall would spend another 90 s and scroll that verdict away.
-RestartPreventExitStatus=3
+# 3 is the dashboard's own startup watchdog and 4 is an exception caught at the top of
+# main -- an out-of-memory report with the requested size, the step and a backtrace in
+# it.  Both mean the dashboard has already put the console back into text mode and
+# written its own verdict there.  Restarting produces the identical verdict twice more
+# and scrolls the first one off a 480-pixel panel, which is exactly how the last
+# bad_alloc was read as three unrelated failures.
+RestartPreventExitStatus=3 4
 # /run/mixdash, 0700, for XDG_RUNTIME_DIR -- Qt keeps sockets and lock files there and
 # warns about it in its first line of output when it is not set.
 RuntimeDirectory=mixdash
@@ -3406,7 +3409,7 @@ QT_PAYLOAD_SKIP='ld-linux|libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0
 
 build_mixdash() {
     local src="$ARMHF_CHROOT/home/build/mixdash" out="$CACHE/mixdash"
-    local stamp="$CACHE/mixdash.stamp" want f header needed lib
+    local stamp="$CACHE/mixdash.stamp" want f header needed lib dynsyms
 
     [[ -d "$MIXDASH_SRC" ]] || { log "mixdash: $MIXDASH_SRC is missing"; return 1; }
 
@@ -3484,6 +3487,27 @@ BUILDIDH
                 ;;
         esac
     done
+
+    # -rdynamic, checked rather than assumed.  It is one line in a .pro file that a
+    # later edit can drop with nothing failing to build, and what it buys is only ever
+    # visible on the board: without it alloc.cpp's out-of-memory backtrace prints bare
+    # addresses for mixdash's own frames, and the strip above has already removed the
+    # .symtab that could have resolved them afterwards.  A dynamic symbol table with
+    # nothing but imports in it is exactly what that looks like.
+    #
+    # Into a variable and then a herestring, like the header checks above, and NOT
+    # `readelf ... | grep -q'.  This script runs under `set -o pipefail'; grep -q exits
+    # the instant it matches, readelf is still writing, and it dies of SIGPIPE -- so the
+    # pipeline reports 141 precisely BECAUSE the symbol was found.  That inversion cost
+    # a build: it failed here on a binary carrying ten Trace symbols, blanked
+    # MIXDASH_BIN, and left the tarball -- and so the card -- on the previous dashboard.
+    dynsyms="$(readelf --dyn-syms -W "$out" 2>/dev/null || true)"
+    if ! grep -q 'Trace' <<<"$dynsyms"; then
+        log "mixdash: the binary exports none of its own symbols, so -rdynamic was lost"
+        log "    from mixdash.pro.  An out-of-memory backtrace would then be a column of"
+        log "    hex with no names, on a stripped binary nothing can symbolize later."
+        return 1
+    fi
 
     printf '%s\n' "$want" >"$stamp"
     MIXDASH_BIN="$out"
@@ -4830,6 +4854,11 @@ image is the newer one the tarball never unpacked (look for /init's `stage:' lin
 further up), and if the binary is the newer one the boot image on BOOT is stale.
 Either way the trace below it is not evidence about whatever was last edited.
 
+Those two lines are also reprinted at the bottom of every failure report, and that is
+not redundancy.  This panel is thirty lines tall and a crash is thirty lines down, so
+the first bad_alloc off this board was read for a day as evidence about sources that
+were never on the card.  A photograph of a failure has to say which build it is of.
+
   [   0.01s] framebuffer      /dev/fb0's id, geometry, bpp, stride and channels
   [   0.05s] QApplication     loads libqlinuxfb.so and opens /dev/fb0; the line
                               after it is Qt's version, the platform NAME Qt
@@ -4839,17 +4868,59 @@ Either way the trace below it is not evidence about whatever was last edited.
                               card, which is why FONTCONFIG_FILE confines it
   [   ?    ] Dashboard        four pages, the dock, and a QFileSystemModel on
                               /run/j36/card -- a read-only mount of this card
+                              . StatusBar / CardGrid / FilesPage / InfoPage /
+                                Dock / toast / connections / dock pages /
+                                buildPages / Joypad / setPage(0)
   [   ?    ] show             fullscreen, and then the first frame
   [   ?    ] first paint      the console is now KD_GRAPHICS, and this is the last
                               line that will ever be seen on the panel
 
-The last line on the glass names the phase that did not finish.  There is a 90 s
-deadline on each one (MIXDASH_DEADLINE=<seconds> in the unit, 0 to disable): when it
-fires, mixdash puts the console back into KD_TEXT, prints WATCHDOG and the phase
-name, and exits 3 -- and RestartPreventExitStatus=3 stops systemd from restarting it
-into the same stall and scrolling the verdict away.  Every fatal signal does the same
-restore before re-raising, so a Qt abort cannot take the board's console with it
-either.
+The last line on the glass names the phase that did not finish, and the indented
+`. ' lines under Dashboard name the object.  They exist because that phase aborted
+once and naming eleven constructors at once named none of them.
+
+There is a 90 s deadline on each phase and each step (MIXDASH_DEADLINE=<seconds> in
+the unit, 0 to disable): when it fires, mixdash puts the console back into KD_TEXT,
+prints WATCHDOG and the phase name, and exits 3.  An exception that reaches the top
+of main -- std::bad_alloc, most likely -- prints what() with the phase and step and
+exits 4.  RestartPreventExitStatus=3 4 stops systemd restarting into either one and
+scrolling the verdict away.  Every fatal signal does the same restore before
+re-raising, so a Qt abort cannot take the board's console with it either.
+
+EVERY THROW is reported where it happens, before any unwinding, on whatever thread it
+happened on -- which is the only place the frames that threw still exist:
+
+  mixdash: THROW St9bad_alloc in phase "Dashboard -- ...", step "FilesPage: QListView"
+  mixdash: backtrace:
+           /opt/mixos/qt/lib/libQt5Core.so.5(_Z9qBadAllocv+0x1c) [0xb6a...]
+           ...
+
+The type is printed mangled because demangling allocates: St9bad_alloc is
+std::bad_alloc.  This exists because Qt's containers never touch operator new --
+QArrayData::allocate calls ::malloc through qMallocAligned and the caller's
+Q_CHECK_PTR throws from inside libQt5Core -- so a QString or QVector that cannot be
+allocated produces a bad_alloc the replaced operator new below never sees.
+
+An allocation that fails THROUGH operator new prints more still, because std::bad_alloc
+carries nothing -- no size, no address, no stack:
+
+  mixdash: OUT OF MEMORY asking for 4294967232 bytes (4194303 KiB) in phase
+           "Dashboard -- four pages, the dock and the evdev map", step "FilesPage:
+           setRootPath -- starts the gatherer thread on the card"
+  mixdash:   VmSize:   123456 kB
+  mixdash: backtrace:
+           /opt/mixos/bin/mixdash(_Znwj+0x5c) [0xb6f0]
+           ...
+
+The size is the whole question.  This board has 1 GB and the process is 32-bit with
+~3 GB of address space, so malloc does not return null a quarter of a second into a
+boot unless it was asked for something absurd: a seven-digit size means memory
+really ran out and the leak is upstream, a ten-digit one means a length was computed
+negative and widened into a size_t, and the backtrace names the frame that did it.
+Any single allocation of 8 MiB or more is printed the same way even when it succeeds
+(the first eight of them), because a 640x480 dashboard has no honest reason to ask
+for one and the request before the fatal one is usually the same code path getting
+away with it.
 
 Rebooting
 ---------
