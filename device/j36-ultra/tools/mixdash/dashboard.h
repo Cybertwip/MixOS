@@ -39,6 +39,7 @@ class DiagnosticsPage;
 class DisplayPage;
 class Joypad;
 class Keyboard;
+class LanguagePage;
 class MediaPage;
 class MousePage;
 class PackagesPage;
@@ -97,18 +98,21 @@ class Dashboard : public QWidget
     Q_OBJECT
 
 public:
-    /* A card with no exe does one of these instead of starting a process. */
+    /*
+     * A card with no exe does one of these instead of starting a process.
+     *
+     * There is no InternalMedia, InternalSettings or InternalPower any more: those
+     * three cards did nothing but setRoot() to a tab the dock already shows, so
+     * the cards are gone and so are the arms that served them.
+     */
     enum Internal {
         InternalNone = 0,
         InternalFiles,
-        InternalMedia,
         InternalTerminal,
         InternalWifi,
         InternalPackages,
         InternalDiagnostics,
-        InternalSettings,
         InternalInfo,
-        InternalPower,
         InternalReboot,
         InternalPoweroff,
         InternalConsole
@@ -154,6 +158,16 @@ private slots:
 
     void onKey(int code, bool pressed, int modifiers);
 
+    /*
+     * The language changed under the shell's feet.
+     *
+     * The cards and the dock are the only strings in this program built once and
+     * kept: every other page fills its rows in onEnter(), so walking back to a
+     * page is already enough to retranslate it.  These two are not walked back to
+     * -- the dock is always on the glass -- so they are rebuilt here.
+     */
+    void retranslate();
+
 private:
     void buildPages();
     /* Wire the signals every PageWidget has.  Called once per page, so a page
@@ -193,6 +207,7 @@ private:
     DiagnosticsPage *m_diagnostics = nullptr;
     MousePage *m_mouse = nullptr;
     DisplayPage *m_display = nullptr;
+    LanguagePage *m_language = nullptr;
     InfoPage *m_info = nullptr;
 
     QVector<PageWidget *> m_roots;

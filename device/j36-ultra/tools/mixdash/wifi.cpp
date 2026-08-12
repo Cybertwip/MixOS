@@ -80,7 +80,7 @@ WifiPage::WifiPage(QWidget *parent)
 
     m_list = new ListPane(this);
     m_list->setRowHeight(30);
-    m_list->setPlaceholder(QStringLiteral("Nothing found yet.\nPress A on Scan again."));
+    m_list->setPlaceholder(tr("Nothing found yet.\nPress A on Scan again."));
     connect(m_list, &ListPane::activated, this, &WifiPage::onActivated);
 
     m_timer = new QTimer(this);
@@ -92,6 +92,8 @@ WifiPage::WifiPage(QWidget *parent)
 
 QString WifiPage::title() const
 {
+    /* Not translated, and deliberately: it is a trademark of the Wi-Fi Alliance
+     * and it is spelled "Wi-Fi" on the box in all six of these languages. */
     return QStringLiteral("Wi-Fi");
 }
 
@@ -278,7 +280,7 @@ QString WifiPage::security(const QString &flags)
         return QStringLiteral("WPA");
     if (flags.contains("WEP"))
         return QStringLiteral("WEP");
-    return QStringLiteral("open");
+    return tr("open");
 }
 
 /* -30 dBm is as good as it gets in the room with the router; -90 is the floor
@@ -438,9 +440,9 @@ void WifiPage::startDhcp()
     }
 
     if (exe.isEmpty()) {
-        m_note = "associated, but no DHCP client is installed";
-        emit toastRequested("Joined, but nothing here can ask for an address.\n"
-                            "Install isc-dhcp-client from Packages.", 5000);
+        m_note = tr("associated, but no DHCP client is installed");
+        emit toastRequested(tr("Joined, but nothing here can ask for an address.\n"
+                               "Install isc-dhcp-client from Packages."), 5000);
         update();
         return;
     }
@@ -453,13 +455,13 @@ void WifiPage::startDhcp()
         connect(m_dhcp, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
                 this, [this](int, QProcess::ExitStatus) {
                     m_address = ipv4();
-                    m_note = m_address.isEmpty() ? QString("DHCP finished with no address")
+                    m_note = m_address.isEmpty() ? tr("DHCP finished with no address")
                                                  : QString();
                     rebuild();
                 });
     }
 
-    m_note = "asking for an address";
+    m_note = tr("asking for an address");
     update();
     m_dhcp->start(exe, args);
 }
@@ -515,7 +517,7 @@ QString WifiPage::psk(const QString &ssid, const QString &passphrase) const
 void WifiPage::connectTo(const Ap &ap)
 {
     if (!supplicantUp()) {
-        emit toastRequested("wpa_supplicant is not running on " + m_iface, 3500);
+        emit toastRequested(tr("wpa_supplicant is not running on %1").arg(m_iface), 3500);
         return;
     }
 
@@ -523,7 +525,7 @@ void WifiPage::connectTo(const Ap &ap)
         /* Already configured -- and the passphrase is in the supplicant's own
          * config, which is where it belongs.  Just switch to it. */
         cli(QStringList() << "select_network" << QString::number(ap.networkId));
-        m_note = "joining " + ap.ssid;
+        m_note = tr("joining %1").arg(ap.ssid);
         m_dhcpTried = false;
         m_addressWait = 0;
         update();
@@ -537,7 +539,7 @@ void WifiPage::connectTo(const Ap &ap)
 
     m_pending = ap;
     m_awaitingKey = true;
-    emit textRequested("Passphrase for " + ap.ssid, QString(), true);
+    emit textRequested(tr("Passphrase for %1").arg(ap.ssid), QString(), true);
 }
 
 void WifiPage::textEntered(const QString &text, bool accepted)
@@ -549,7 +551,7 @@ void WifiPage::textEntered(const QString &text, bool accepted)
         return;
 
     if (text.size() < 8 && text.size() != 0) {
-        emit toastRequested("A WPA passphrase is at least 8 characters", 3000);
+        emit toastRequested(tr("A WPA passphrase is at least 8 characters"), 3000);
         return;
     }
     connectWithKey(m_pending, text);
@@ -570,7 +572,7 @@ void WifiPage::connectWithKey(const Ap &ap, const QString &passphrase)
         }
     }
     if (id < 0) {
-        emit toastRequested("wpa_supplicant would not add a network", 3000);
+        emit toastRequested(tr("wpa_supplicant would not add a network"), 3000);
         return;
     }
 
@@ -603,7 +605,7 @@ void WifiPage::connectWithKey(const Ap &ap, const QString &passphrase)
      * reboot.  Fails harmlessly if update_config=1 is not set in the file. */
     cli(QStringList() << "save_config");
 
-    m_note = "joining " + ap.ssid;
+    m_note = tr("joining %1").arg(ap.ssid);
     m_dhcpTried = false;
     m_addressWait = 0;
     m_scanAge.restart();
@@ -619,12 +621,12 @@ void WifiPage::rebuild()
     if (m_iface.isEmpty()) {
         ListRow r;
         r.kind = ListRow::Header;
-        r.text = "No wireless interface";
+        r.text = tr("No wireless interface");
         rows.append(r);
 
         ListRow explain;
-        explain.text = "Nothing in /sys/class/net has a phy80211";
-        explain.detail = "No Wi-Fi hardware, or its driver did not load. See Diagnostics.";
+        explain.text = tr("Nothing in /sys/class/net has a phy80211");
+        explain.detail = tr("No Wi-Fi hardware, or its driver did not load. See Diagnostics.");
         explain.enabled = false;
         explain.glyph = GlyphWifi;
         rows.append(explain);
@@ -642,8 +644,8 @@ void WifiPage::rebuild()
 
         ListRow start;
         start.kind = ListRow::Action;
-        start.text = "Start wpa_supplicant on " + m_iface;
-        start.detail = "No control socket in /run/wpa_supplicant";
+        start.text = tr("Start wpa_supplicant on %1").arg(m_iface);
+        start.detail = tr("No control socket in /run/wpa_supplicant");
         start.glyph = GlyphWifi;
         start.accent = Theme::orange();
         start.id = RowStartSupplicant;
@@ -656,7 +658,7 @@ void WifiPage::rebuild()
 
     ListRow head;
     head.kind = ListRow::Header;
-    head.text = "Networks";
+    head.text = tr("Networks");
     rows.append(head);
 
     for (int i = 0; i < m_aps.size(); ++i) {
@@ -670,16 +672,16 @@ void WifiPage::rebuild()
         r.accent = ap.current ? Theme::green() : Theme::ink2();
 
         const int q = quality(ap.signalDbm);
-        QString detail = QString("%1%  %2 dBm  %3")
+        QString detail = tr("%1%  %2 dBm  %3")
                              .arg(q).arg(ap.signalDbm).arg(security(ap.flags));
         if (ap.frequency >= 5000)
             detail += "  5 GHz";
         if (ap.saved)
-            detail += "  saved";
+            detail += "  " + tr("saved");
         r.detail = detail;
 
         if (ap.current && m_state == "COMPLETED") {
-            r.badge = m_address.isEmpty() ? "no address" : m_address;
+            r.badge = m_address.isEmpty() ? tr("no address") : m_address;
             r.badgeColour = m_address.isEmpty() ? Theme::orange() : Theme::green();
         } else if (ap.current) {
             r.badge = m_state.toLower();
@@ -690,12 +692,12 @@ void WifiPage::rebuild()
 
     ListRow actions;
     actions.kind = ListRow::Header;
-    actions.text = "Actions";
+    actions.text = tr("Actions");
     rows.append(actions);
 
     ListRow rescan;
     rescan.kind = ListRow::Action;
-    rescan.text = m_scanPending ? "Scanning..." : "Scan again";
+    rescan.text = m_scanPending ? tr("Scanning...") : tr("Scan again");
     rescan.glyph = GlyphWifi;
     rescan.accent = Theme::blue();
     rescan.id = RowRescan;
@@ -704,8 +706,8 @@ void WifiPage::rebuild()
     if (!m_ssid.isEmpty()) {
         ListRow disconnect;
         disconnect.kind = ListRow::Action;
-        disconnect.text = "Disconnect";
-        disconnect.detail = "Stay on " + m_iface + " but drop " + m_ssid;
+        disconnect.text = tr("Disconnect");
+        disconnect.detail = tr("Stay on %1 but drop %2").arg(m_iface, m_ssid);
         disconnect.glyph = GlyphPower;
         disconnect.accent = Theme::orange();
         disconnect.id = RowDisconnect;
@@ -713,8 +715,8 @@ void WifiPage::rebuild()
 
         ListRow forget;
         forget.kind = ListRow::Action;
-        forget.text = "Forget " + m_ssid;
-        forget.detail = "Remove it from wpa_supplicant.conf";
+        forget.text = tr("Forget %1").arg(m_ssid);
+        forget.detail = tr("Remove it from wpa_supplicant.conf");
         forget.glyph = GlyphBack;
         forget.accent = Theme::red();
         forget.id = RowForget;
@@ -722,7 +724,7 @@ void WifiPage::rebuild()
     } else {
         ListRow reconnect;
         reconnect.kind = ListRow::Action;
-        reconnect.text = "Reconnect to a saved network";
+        reconnect.text = tr("Reconnect to a saved network");
         reconnect.glyph = GlyphWifi;
         reconnect.accent = Theme::teal();
         reconnect.id = RowReconnect;
@@ -776,7 +778,7 @@ void WifiPage::onActivated(int index)
         return;
     case RowDisconnect:
         cli(QStringList() << "disconnect");
-        m_note = "disconnected";
+        m_note = tr("disconnected");
         rebuild();
         return;
     case RowForget: {
@@ -787,7 +789,7 @@ void WifiPage::onActivated(int index)
                 continue;
             cli(QStringList() << "remove_network" << cols.at(0).trimmed());
             cli(QStringList() << "save_config");
-            m_note = "forgot " + m_ssid;
+            m_note = tr("forgot %1").arg(m_ssid);
             break;
         }
         rebuild();
@@ -795,7 +797,7 @@ void WifiPage::onActivated(int index)
     }
     case RowReconnect:
         cli(QStringList() << "reconnect");
-        m_note = "reconnecting";
+        m_note = tr("reconnecting");
         rebuild();
         return;
     case RowStartSupplicant: {
@@ -808,12 +810,12 @@ void WifiPage::onActivated(int index)
         const QString systemctl = firstExecutable(QStringList()
                                                   << "/bin/systemctl" << "/usr/bin/systemctl");
         if (systemctl.isEmpty()) {
-            emit toastRequested("No systemctl on this card", 3000);
+            emit toastRequested(tr("No systemctl on this card"), 3000);
             return;
         }
         QProcess::startDetached(systemctl,
                                 QStringList() << "start" << ("wpa_supplicant@" + m_iface + ".service"));
-        m_note = "starting wpa_supplicant@" + m_iface;
+        m_note = tr("starting wpa_supplicant@%1").arg(m_iface);
         update();
         QTimer::singleShot(2500, this, [this]() {
             if (supplicantUp()) {
@@ -855,7 +857,7 @@ void WifiPage::paintEvent(QPaintEvent *)
     const QRectF card(Theme::Margin, Theme::Margin,
                       width() - 2.0 * Theme::Margin, height() - 2.0 * Theme::Margin);
 
-    QString right = m_iface.isEmpty() ? QString("no interface") : m_iface;
+    QString right = m_iface.isEmpty() ? tr("no interface") : m_iface;
     if (!m_state.isEmpty())
         right += "  " + m_state.toLower();
     const QRectF body = paintSheet(p, card, QStringLiteral("Wi-Fi"), right);
@@ -870,7 +872,7 @@ void WifiPage::paintEvent(QPaintEvent *)
         else if (!m_ssid.isEmpty())
             line = m_ssid;
         else
-            line = "Not connected";
+            line = tr("Not connected");
     }
     p.setFont(Theme::font(12));
     p.setPen(m_address.isEmpty() ? Theme::ink2() : Theme::green());

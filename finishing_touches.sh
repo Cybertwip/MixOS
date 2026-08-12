@@ -54,7 +54,7 @@ fi
 echo "$NAME" | sudo tee Arkbuild/etc/hostname
 echo -e "# This host address\n127.0.1.1\t${NAME}" | sudo tee -a Arkbuild/etc/hosts
 
-# Copy the necessary .asoundrc file for proper audio in emulationstation and emulators
+# Copy the necessary .asoundrc file for proper audio
 sudo cp audio/.asoundrc Arkbuild/home/ark/.asoundrc
 sudo cp audio/.asoundrcbak Arkbuild/home/ark/.asoundrcbak
 sudo chroot Arkbuild/ bash -c "chown ark:ark /home/ark/.asoundrc*"
@@ -171,7 +171,6 @@ if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
     sudo cp dArkOS_Tools/${CHIPSET}/*.sh Arkbuild/opt/system/Advanced/
   fi
   sudo cp dArkOS_Tools/Advanced/*.sh Arkbuild/opt/system/Advanced/
-  sudo cp scripts/"Enable Quick Mode".sh Arkbuild/opt/system/Advanced/
   if [[ "$UNIT" == *"rgb10"* ]] || [[ "$UNIT" == "rk2020" ]] || [[ "$UNIT" == *"oga"* ]]; then
     sudo cp dArkOS_Tools/OGA/*.sh Arkbuild/opt/system/Advanced/
   else
@@ -230,16 +229,16 @@ sudo cp scripts/checkbrightonboot Arkbuild/usr/local/bin/
 sudo cp scripts/current_* Arkbuild/usr/local/bin/
 sudo cp scripts/finish.sh Arkbuild/usr/local/bin/
 sudo cp scripts/pause.sh Arkbuild/usr/local/bin/
-sudo cp scripts/finish.sh.qm Arkbuild/usr/local/bin/
-sudo cp scripts/pause.sh.qm Arkbuild/usr/local/bin/
-sudo cp scripts/finish.sh Arkbuild/usr/local/bin/finish.sh.orig
-sudo cp scripts/pause.sh Arkbuild/usr/local/bin/pause.sh.orig
 sudo cp scripts/speak_bat_life.sh Arkbuild/usr/local/bin/
 sudo cp scripts/spktoggle.sh Arkbuild/usr/local/bin/
 sudo cp scripts/timezones Arkbuild/usr/local/bin/
-sudo cp scripts/BaRT_QuickMode.sh Arkbuild/usr/local/bin/
-sudo cp scripts/"Enable Quick Mode".sh Arkbuild/usr/local/bin/
-sudo cp scripts/"Disable Quick Mode".sh Arkbuild/usr/local/bin/
+# Quick Mode used to be installed here: BaRT_QuickMode.sh, its Enable/Disable pair,
+# .qm and .orig copies of finish.sh and pause.sh, get_last_played.sh, and the
+# isitpng.sh/wasitpng.sh hooks that ES ran at game-start and game-end.  All of it
+# existed to boot straight into the last game instead of into EmulationStation, and
+# it read that game out of ~/.emulationstation.  With no front end on this image
+# there is no last game to read and nothing to skip past, so the whole cluster is
+# gone rather than left installed and inert.
 sudo cp scripts/arkos_ap_mode.sh Arkbuild/usr/local/bin/
 sudo cp scripts/auto_suspend* Arkbuild/usr/local/bin/
 sudo cp scripts/processcheck.sh Arkbuild/usr/local/bin/
@@ -252,16 +251,13 @@ sudo cp scripts/keystroke.py Arkbuild/usr/local/bin/
 sudo cp scripts/b2.sh Arkbuild/usr/local/bin/
 sudo cp scripts/freej2me.sh Arkbuild/usr/local/bin/
 sudo cp scripts/easyrpg.sh Arkbuild/usr/local/bin/
-sudo cp scripts/get_last_played.sh Arkbuild/usr/local/bin/
 sudo cp scripts/gx4000.sh Arkbuild/usr/local/bin/
-sudo cp scripts/isitpng.sh Arkbuild/usr/local/bin/
 sudo cp scripts/neogeocd.sh Arkbuild/usr/local/bin/
 sudo cp scripts/netplay.sh Arkbuild/usr/local/bin/
 sudo mkdir -p Arkbuild/etc/hostapd
 sudo cp hostapd/hostapd.conf Arkbuild/etc/hostapd/
 sudo cp dnsmasq/dnsmasq.conf Arkbuild/etc/
 sudo cp scripts/sleep_governors.sh Arkbuild/usr/local/bin/
-sudo cp scripts/wasitpng.sh Arkbuild/usr/local/bin/
 sudo cp global/* Arkbuild/usr/local/bin/
 # Disable winbind as connectivity to Active Directory is not needed
 sudo chroot Arkbuild/ bash -c "systemctl disable winbind"
@@ -310,19 +306,10 @@ fi
 # Make all scripts in /usr/local/bin executable, world style
 sudo chmod 777 Arkbuild/usr/local/bin/*
 
-# Link themes folder to /roms/themes and clone some themes to the folder
-sudo rm -rf Arkbuild/etc/emulationstation/themes/
-sudo chroot Arkbuild/ bash -c "ln -sfv /roms/themes/ /etc/emulationstation/themes"
-
-# Also expose /roms2/themes via the user themes path so ES picks up themes
-# from the second SD card in SD2-for-Roms mode (dangles harmlessly otherwise).
-if [[ "$UNIT" != *"rgb10"* ]] && [[ "$UNIT" != "rk2020" ]] && [[ "$UNIT" != *"oga"* ]]; then
-  sudo chroot Arkbuild/ bash -c "ln -sfv /roms2/themes/ /home/ark/.emulationstation/themes"
-fi
-
-# Link music folder to /roms/bgmusic
-sudo rm -rf Arkbuild/home/ark/.emulationstation/music
-sudo chroot Arkbuild/ bash -c "ln -sfv /roms/bgmusic/ /home/ark/.emulationstation/music"
+# Three symlink sets used to be written here -- /etc/emulationstation/themes,
+# ~/.emulationstation/themes and ~/.emulationstation/music, all pointing into the
+# rom partition.  There is no front end on this image to read any of them, so they
+# were three dangling links and a directory tree created for their sake.
 
 # The GUI-only image does not build image-viewer, so use the built-in ASCII
 # loading screen instead of leaving a launcher dependency on a skipped app.
@@ -423,21 +410,12 @@ fi
 # Set the ownver of the ark folder and all sub content to ark
 sudo chroot Arkbuild/ bash -c "chown -R ark:ark /home/ark"
 
-# Clone some themes to the tempthemes folder
+# /tempthemes was six git clones of front-end themes, staged on the rootfs for
+# firstboot to untar onto the rom partition.  Nothing reads a theme on this image, so
+# the clones are gone and with them six network fetches in the middle of a build.
+# The directory itself stays: firstboot.sh moves it if it is there and says nothing
+# if it is not, and an empty one keeps that path the same on every image.
 sudo mkdir -p Arkbuild/tempthemes
-if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
-  if [[ "$UNIT" == *"rgb10"* ]] || [[ "$UNIT" == "rk2020" ]] || [[ "$UNIT" == *"oga"* ]]; then
-    sudo git clone --depth=1 https://github.com/pix33l/es-theme-pixui.git Arkbuild/tempthemes/es-theme-pixui
-  fi
-  sudo git clone --depth=1 https://github.com/Jetup13/es-theme-freeplay.git Arkbuild/tempthemes/es-theme-freeplay
-  sudo git clone --depth=1 https://github.com/Jetup13/es-theme-minimal-arkos.git Arkbuild/tempthemes/es-theme-minimal-arkos
-  sudo git clone --depth=1 https://github.com/Jetup13/es-theme-nes-box.git Arkbuild/tempthemes/es-theme-nes-box
-  sudo git clone --depth=1 https://github.com/Jetup13/es-theme-switch.git Arkbuild/tempthemes/es-theme-switch
-  sudo git clone --depth=1 https://github.com/dani7959/es-theme-replica.git Arkbuild/tempthemes/es-theme-replica
-else
-  # One theme is enough for the system-tools-only EmulationStation GUI.
-  sudo git clone --depth=1 https://github.com/Jetup13/es-theme-nes-box.git Arkbuild/tempthemes/es-theme-nes-box
-fi
 
 sync
 sudo umount -l ${mountpoint}
@@ -488,7 +466,7 @@ fat32_mountpoint=${data_mountpoint}/roms
 sudo mkdir -p ${fat32_mountpoint}
 
 # /roms on the rootfs becomes a symlink into the home partition.  Some 200 lines across
-# the RK3326 scripts, the EmulationStation config and the PortMaster tooling say /roms,
+# the RK3326 scripts and the PortMaster tooling say /roms,
 # and they keep resolving through this; nothing has to be renamed to move the partition.
 # If an earlier stage already put real files in Arkbuild/roms they are moved onto the
 # partition rather than lost, because replacing a populated directory with a symlink
@@ -581,8 +559,8 @@ fi
 sync
 
 # The home directory itself.  useradd -m in setup_ark_user built this tree on the ROOTFS,
-# under what is about to become a mount point: the skeleton, .config, .emulationstation
-# and the two locale lines in .bashrc.  Once p3 mounts over it none of that is reachable,
+# under what is about to become a mount point: the skeleton, .config and the two
+# locale lines in .bashrc.  Once p3 mounts over it none of that is reachable,
 # so the same tree is copied onto the partition and the mounted and unmounted cases look
 # alike.  Anything an emulator build dropped in /home/ark came here too -- that path is a
 # symlink to this directory now, so those builds wrote into this very tree.
@@ -600,7 +578,7 @@ fi
 cat <<EOF | sudo tee ${data_mountpoint}/.mixos-home > /dev/null
 This partition is the MixOS home directory: it mounts at ${DATA_MOUNT_POINT}.
 Label ${DATA_LABEL}, ${DATA_FILESYSTEM_FORMAT}, owned by uid 1000.  roms/ inside it is
-the legacy EmulationStation tree, which /roms still points at.
+the legacy media tree, which /roms still points at.
 Do not delete this file: the J36 Ultra initramfs reads it to tell this partition apart
 from a plain data partition, and without it the boot mounts this one read-only.
 EOF

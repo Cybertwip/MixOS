@@ -8,7 +8,7 @@
 exists and it is what makes it different from what it came from. The MediaTek
 MT6592 (Cortex-A7, ARMv7, Mali-450 MP4) is brought up natively here — a 32-bit ARM
 kernel, a mainline `mtk_drm` display path, `mtk-sd` storage, the MT6592 AFE for
-audio, a keypad adapter, and Mesa's lima/kmsro pair driving EmulationStation — on
+audio, a keypad adapter, and Mesa's lima/kmsro pair on the GPU — on
 the J36 Ultra. The MediaTek work lives in [`device/j36-ultra/`](device/j36-ultra/)
 and is licensed under the
 [Microsoft Public License](device/j36-ultra/LICENSE). Rockchip RK3326 and RK3566
@@ -74,9 +74,9 @@ any part of it from a card without a reflash.
 
 The R36 Ultra helper currently builds the RG351MP/RK3326 base image used for
 bring-up (the R36-specific DTB layer is still separate).  Its default profile
-is intentionally small: one native armhf (32-bit) Debian userspace and the
-EmulationStation GUI are built, while the arm64 userspace, bundled emulators,
-and standalone applications are skipped.  The existing RK3326 kernel/U-Boot
+is intentionally small: one native armhf (32-bit) Debian userspace is built,
+with no front end on it, while the arm64 userspace, bundled emulators and
+standalone applications are skipped.  The existing RK3326 kernel/U-Boot
 chain is still arm64; a 32-bit kernel would be a separate board port.
 
 ```bash
@@ -125,11 +125,10 @@ MixOS is made up of many open-source components, each under its own licence; see
 
 # Credits and Thanks
 **[Debian](https://www.debian.org/)** — the operating system all of this is built on.  The rootfs a MixOS device boots *is* Debian, assembled with Debian's own tools, and all but a handful of the packages on the card are the Debian project's work.  MixOS is a set of device ports and a build system on top of Debian; the operating system itself is theirs.  MixOS is not affiliated with or endorsed by the Debian project. \
-**[ArkOS](https://github.com/christianhaitian/arkos/wiki)** and christianhaitian — the original handheld distribution, and the layout, tools menu and EmulationStation integration this still uses \
+**[ArkOS](https://github.com/christianhaitian/arkos/wiki)** and christianhaitian — the original handheld distribution, and the layout and tools menu this still uses \
 **dArkOS** — the Debian rebuild of ArkOS that this fork diverged from, and the origin of everything outside the `device/` ports \
 **MediaTek** — the MT6592 documentation and vendor driver sources the J36 Ultra port reads \
 **[Mesa](https://www.mesa3d.org/)** — lima and kmsro, which are the entire reason a Mali-450 from 2013 can run a GLES 2.0 UI \
-**EmulationStation** (fcamod) — the front end, and a renderer architecture clean enough to add a third backend to \
 **The Linux kernel, SDL, busybox, doomgeneric and Freedoom** projects \
 [ChatGPT](https://chatgpt.com/) for guidance on how to build a Debian image \
 Jetup13 for many themes \

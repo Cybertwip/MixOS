@@ -40,7 +40,7 @@ BUSYBOX_URL="${J36_BUSYBOX_URL:-https://git.busybox.net/busybox}"
 BUSYBOX_BRANCH="${J36_BUSYBOX_BRANCH:-1_36_stable}"
 BUSYBOX_SRC="$WORK/busybox"
 # fbdoom: the first thing that drew a moving picture on this panel, and off by
-# default now that EmulationStation draws on it -- J36_DOOM=1 stages it again.
+# default now that the dashboard draws on it -- J36_DOOM=1 stages it again.
 # Pinned to a commit rather than a branch because the build recipe below derives
 # its source list from the layout of that tree -- see the fbdoom section for why.
 DOOM_URL="${J36_DOOM_URL:-https://github.com/ozkl/doomgeneric}"
@@ -1072,12 +1072,12 @@ bb_disable() {
 #
 # and the consequence was not a missing symlink. /init's GL staging runs `cp' and
 # `ln'; neither was in either list, so the payload directory was created, the
-# systemd drop-in pointing LD_LIBRARY_PATH at it was written, and the directory
-# stayed empty. EmulationStation's one GL DT_NEEDED is the bare name `libEGL.so',
-# so the loader missed the empty path and resolved it in /usr/lib, where the
-# shared rootfs has pointed that name at the RK3326's libMali.so. That blob is Tag_CPU_arch v8
-# -- ARMv8-A -- and this SoC is a Cortex-A7. ES died on SIGILL, status 132,
-# before main(), six times, until systemd gave up on the restart counter.
+# LD_LIBRARY_PATH pointing at it was written, and the directory stayed empty. A GL
+# client's DT_NEEDED is the bare name `libEGL.so', so the loader missed the empty
+# path and resolved it in /usr/lib, where the shared rootfs has pointed that name at
+# the RK3326's libMali.so. That blob is Tag_CPU_arch v8 -- ARMv8-A -- and this SoC is
+# a Cortex-A7. The client died on SIGILL, status 132, before main(), six times, until
+# systemd gave up on the restart counter.
 #
 # `grep' was missing too, and had been all along: /init asks /proc/consoles which
 # console the kernel chose, under a 2>/dev/null that hid the failure, so
@@ -1206,12 +1206,13 @@ done
 # /bin/sh, and /init is #!/bin/sh.
 grep -q '^CONFIG_SH_IS_ASH=y$' "$BUSYBOX_SRC/.config" || \
     die "busybox CONFIG_SH_IS_ASH is off; /init is #!/bin/sh"
-# Nor is this one, and without it `mount -o bind' silently becomes a mount attempt
-# with a filesystem type of "bind": busybox parses -o flag words only when
-# FEATURE_MOUNT_FLAGS is on.  /init bind-mounts the GLES 2.0 EmulationStation over
-# the rootfs's, which is the one place in the boot that needs it.
+# Nor is this one, and without it `mount -o ro' silently becomes a mount attempt with
+# a filesystem type of "ro": busybox parses -o flag words only when
+# FEATURE_MOUNT_FLAGS is on.  Every probe /init makes -- the rootfs scan, BOOT, the
+# home partition -- mounts read-only first and remounts rw after, so this is not one
+# corner of the boot but the whole of how it looks at a card.
 grep -q '^CONFIG_FEATURE_MOUNT_FLAGS=y$' "$BUSYBOX_SRC/.config" || \
-    die "busybox CONFIG_FEATURE_MOUNT_FLAGS is off; /init needs \`mount -o bind'"
+    die "busybox CONFIG_FEATURE_MOUNT_FLAGS is off; /init needs \`mount -o ro'"
 
 rm -rf "$INITROOT"
 mkdir -p "$INITROOT"/{bin,dev,etc,lib/modules/$KERNEL_RELEASE/extra,proc,root,sbin,sys,tmp}
@@ -1514,10 +1515,13 @@ for arg in $(cat /proc/cmdline); do
             power_charge=0
             ;;
         # Mesa, staged where the loader will find it ahead of the RK3326 blob.
-        # j36.es is the name this word had while EmulationStation was the thing
-        # that used it; cards written before the dashboard existed still say it,
-        # and they still boot.
-        j36.gl|j36.gl=1|j36.es|j36.es=1)
+        #
+        # j36.es and j36.es=debug were accepted here too, because this word was
+        # named after the thing that first used the payload.  They are gone with
+        # the rest of it, and nothing in the field is stranded by that: /init and
+        # boot.conf are written to the boot partition by the same build, so a card
+        # old enough to say j36.es carries an /init old enough to understand it.
+        j36.gl|j36.gl=1)
             want_gl=1
             ;;
         # Same payload, plus the things that make a failed GL bring-up say why:
@@ -1525,14 +1529,13 @@ for arg in $(cat /proc/cmdline); do
         # is a separate word rather than a build option because boot.conf is on
         # the vfat partition, so it can be turned off from any machine that can
         # read the card.
-        j36.gl=debug|j36.es=debug)
+        j36.gl=debug)
             want_gl=1
             gl_debug=1
             ;;
-        # The dashboard, in place of EmulationStation.  A word of its own because
-        # the two are alternatives: this one writes a drop-in that resets the
-        # unit's ExecStart, so with it the shell is mixdash and without it the
-        # rootfs's own EmulationStation still starts.
+        # The dashboard as the shell.  Still a word rather than the unconditional
+        # default because /init has to be able to hand a board to systemd without
+        # staging anything at all -- that is the boot that says what is missing.
         j36.dash|j36.dash=1)
             want_dash=1
             ;;
@@ -1821,7 +1824,7 @@ mount_bootfs() {
     return 1
 }
 
-# Set once, read by run_lima, run_mtkdrm, run_audio and setup_es_gl.  Empty means
+# Set once, read by run_lima, run_mtkdrm, run_audio and setup_gl.  Empty means
 # "not looked for yet"; find_payload is called by each of them and is idempotent.
 payload=""
 find_payload() {
@@ -1864,6 +1867,24 @@ find_payload() {
 # and compared on the next boot.  Nothing is deleted first -- tar overwrites in place,
 # and `rm -rf' inside an initramfs aimed at somebody's OS partition is not a trade
 # worth making for a few stale files.
+#
+# Same two files and the same protocol as the card scan above, for the same reason and
+# with a second one on top.  The reason: unpacking tens of megabytes of Qt through
+# gunzip on a Cortex-A7 takes minutes, and for every one of them this shell was inside
+# a single pipeline saying nothing -- past mixsplash's ninety-second last-message fuse,
+# which then decided /init had died and gave the text console back.  That is exactly
+# what "the splash stops after Installing the update and the kernel log comes back"
+# was, and it was not a crash: the boot underneath carried on and finished, invisibly,
+# behind a console nobody had asked for.
+#
+# The second reason is that this step has something worth showing.  `tar -v' names
+# every entry as it writes it, so the child pipes that into a read loop that keeps the
+# LAST name in $unpack_status -- one builtin write per file, no fork -- and the parent
+# puts it on the panel once a second.  So the minute is a minute of libQt5Widgets.so.5
+# and bin/mixdash going past rather than a still picture, and a hang has an obvious
+# shape: the name stops changing while the seconds keep counting.
+unpack_status=/dev/.unpack-status
+unpack_result=/dev/.unpack-result
 stage_from_boot() {
     if [ -z "$rootdev" ]; then return 1; fi
     if ! mount_bootfs; then return 1; fi
@@ -1887,17 +1908,60 @@ stage_from_boot() {
     # The longest single step in this script by a wide margin -- tens of megabytes
     # of Qt through gunzip on a Cortex-A7 -- and it happens on exactly the boot
     # where the user has just changed something and is watching.  It gets its own
-    # headline for that reason, and no progress number: the bar would sit still
-    # for a minute and look wedged either way, so it eases toward the next step
-    # instead.
+    # headline for that reason.
     stage "Installing the update"
-    detail "unpacking sd-root.tar.gz -- this takes a minute"
+    detail "unpacking sd-root.tar.gz"
     mkdir -p /newroot/opt
-    gunzip -c /bootfs/sd-root.tar.gz | tar -x -C /newroot
-    # tar's exit status is not the test.  This is a pipeline in ash, so what is
-    # reported is tar's, and a gunzip that dies half way through a truncated file
-    # leaves tar perfectly happy with the part it did get.  What matters is whether
-    # the thing this exists to install is there and executable.
+    : > "$unpack_status"
+    : > "$unpack_result"
+    (
+        gunzip -c /bootfs/sd-root.tar.gz | tar -xv -C /newroot 2>/dev/null | \
+        while IFS= read -r unpacked; do
+            printf '%s\n' "$unpacked" > "$unpack_status" 2>/dev/null
+        done
+        # In here, and not after the loop below, because this is the second place the
+        # fuse used to fire.  tar returns when the last write is in the page cache;
+        # pushing tens of megabytes of that out to a class-4 microSD is its own long
+        # silence, and it landed immediately after the one this whole fork exists to
+        # cover.  Inside the child it is ticked like everything else, and the parent's
+        # own sync a few lines down then has only the stamp file left to flush.
+        sync
+        # The answer, and it is only ever this one word: what the unpack produced is
+        # checked by the parent below, on the tree, not on an exit status.  All this
+        # has to carry is "the child is no longer running".
+        printf 'done\n' > "$unpack_result"
+    ) &
+
+    # 900 seconds.  A tarball this size has never taken five, and the number is not a
+    # patience setting -- it is the bound that stops a wedged gunzip from counting
+    # upwards until the battery goes, on a board with no key to press.  Past it the
+    # boot carries on and the check below reports what did or did not arrive, which is
+    # a great deal more use than a panel stuck on a number.
+    unpack_waited=0
+    while [ ! -s "$unpack_result" ]; do
+        if [ "$unpack_waited" -ge 900 ]; then
+            say "stage: the unpack has not finished in ${unpack_waited}s; carrying on"
+            break
+        fi
+        # Empty means the status file was caught between its truncate and its write,
+        # which is a tick of the headline word rather than a blank line on the panel.
+        unpack_what=""
+        if [ -s "$unpack_status" ]; then read -r unpack_what < "$unpack_status"; fi
+        if [ -z "$unpack_what" ]; then unpack_what="unpacking"; fi
+        detail "$unpack_what -- ${unpack_waited}s"
+        unpack_waited=$((unpack_waited + 1))
+        sleep 1
+    done
+    : > "$unpack_status"
+    : > "$unpack_result"
+    say "stage: unpacked in ${unpack_waited}s"
+
+    # tar's exit status is not the test, and now it is not even reachable -- the
+    # unpack ran in a child that is answered for by a file.  It was never the right
+    # test anyway: that was a pipeline in ash, so what came back was tar's, and a
+    # gunzip that dies half way through a truncated file leaves tar perfectly happy
+    # with the part it did get.  What matters is whether the thing this exists to
+    # install is there and executable.
     if [ ! -x /newroot/opt/mixos/bin/mixdash ]; then
         say "stage: FAILED -- no executable opt/mixos/bin/mixdash came out of it."
         say "       Either the copy of the tarball on BOOT is truncated (check that"
@@ -2244,51 +2308,39 @@ run_power() {
     return 0
 }
 
-# ── EmulationStation's GL front end, installed without touching the rootfs ───
+# ── Mesa, staged where the loader will find it, without touching the rootfs ───
 #
 # This is the last link in the chain: card0 from mtkdrm, a render node from lima,
-# and now a libEGL/libgbm/libGLES that are Mesa's rather than the RK3326 blob's.
+# and now a libEGL/libgbm/libGLESv2 that are Mesa's rather than the RK3326 blob's.
 #
 # NOTHING ON THE SHARED ROOTFS IS WRITTEN, and that is the whole design of this
-# function. The card carries one Debian rootfs for two machines, and the R36S needs
+# function.  The card carries one Debian rootfs for two machines, and the R36S needs
 # its libEGL.so -> libMali.so symlinks to stay exactly where they are: that blob is
-# the only thing that drives its Mali-G31. So the five libraries go into a tmpfs
-# and the environment that points at them goes into a systemd drop-in in the same
-# tmpfs. Pull this card into an R36S and there is no trace of any of it.
+# the only thing that drives its Mali-G31.  So the libraries go into a tmpfs and the
+# environment that points at them goes into mixdash.service, in the same tmpfs.  Pull
+# this card into an R36S and there is no trace of any of it.
 #
-# The mechanism is the initrd's half of a contract systemd documents: /run must be
-# a tmpfs, and if the initrd has already mounted one, PID 1 adopts it with its
-# contents rather than mounting its own over the top. Drop-ins under
-# /run/systemd/system/<unit>.d/ are read exactly like ones in /etc, and they are
-# read AFTER the unit file, so an Environment= here replaces the unit's own
-# SDL_VIDEO_EGL_DRIVER=libEGL.so instead of adding to it.
+# The mechanism is the initrd's half of a contract systemd documents: /run must be a
+# tmpfs, and if the initrd has already mounted one, PID 1 adopts it with its contents
+# rather than mounting its own over the top.
 #
-# Why each variable is set:
-#   LD_LIBRARY_PATH   puts the five staged libraries ahead of
-#                     /usr/lib/arm-linux-gnueabihf, where the blob's symlinks live.
-#                     Ahead of, not instead of: everything else EmulationStation
-#                     needs -- SDL2, freetype, VLC, and Mesa's own back end,
-#                     libgallium and dri/lima_dri.so and dri/mediatek_dri.so --
-#                     still comes from the rootfs, untouched.
-#   LD_PRELOAD        Only for the rootfs's own binary, and only as a fallback:
-#                     its 29 undefined GL symbols are GLES1 fixed-function calls
-#                     and it names only libEGL.so as a dependency, because the blob
-#                     it was linked against exported both from one object. glvnd's
-#                     libEGL does not export a single gl* entry point, so the GLES1
-#                     library has to be forced into the global scope or the binary
-#                     will not start. The GLES 2.0 binary staged below needs none
-#                     of this -- it has no GL library in its DT_NEEDED.
-#   SDL_VIDEODRIVER   kmsdrm. SDL2 here has KMSDRM, wayland, offscreen and dummy
-#                     and no fbdev at all, so this is the only backend that can
-#                     drive this panel, and naming it stops SDL trying wayland
-#                     first on a machine with no compositor.
-#   SDL_VIDEO_*_DRIVER  the versioned SONAMEs, because SDL dlopens by name and the
-#                     unversioned ones in /usr/lib are the blob's symlinks.
-# One tmpfs, two callers.  The GL payload and the dashboard both put their files
-# and their drop-in under /newroot/run, and both are optional, so whichever runs
-# first mounts it -- and mounting a second one over the top would hide the first
-# one's work.  It has to be a tmpfs and not the rootfs's own /run because of the
-# invariant this whole card is built on: nothing on the shared rootfs is written.
+# WHAT THIS FUNCTION USED TO ALSO BE.  It was setup_es_gl, and better than half of it
+# was EmulationStation: a second GLES 2.0 build of it copied out of the payload and
+# bind-mounted over the rootfs's binary, and four drop-ins under
+# emulationstation.service.d that set SDL_VIDEODRIVER, an LD_PRELOAD, a debug ExecStart
+# and a pair of probe ExecStartPres.  All of it existed to get one program that this
+# board cannot run -- Renderer_GLES10.cpp aborts with status 134 here -- as far as its
+# first frame.  The dashboard replaced that program, so the reason went with it; what
+# is left is the part that was never about ES at all, which is Mesa on a search path.
+# The three names checked at the bottom are the ones mixdash's 3D cube card needs
+# through eglprobe, and they are the same three the GLES 2.0 renderer needed, because
+# they are simply what EGL on this GPU is made of.
+#
+# One tmpfs, two callers.  The GL payload and the dashboard both put their files and
+# their units under /newroot/run, and both are optional, so whichever runs first
+# mounts it -- and mounting a second one over the top would hide the first one's work.
+# It has to be a tmpfs and not the rootfs's own /run because of the invariant this
+# whole card is built on: nothing on the shared rootfs is written.
 run_tmpfs=0
 ensure_run_tmpfs() {
     if [ "$run_tmpfs" = 1 ]; then return 0; fi
@@ -2299,14 +2351,14 @@ ensure_run_tmpfs() {
     return 1
 }
 
-# Set by setup_es_gl for setup_dash to read: whether the Mesa payload is complete
-# enough to point a child at, and whether the probe was staged.  They are separate
-# because the payload can be there without the probe and the dashboard's 3D cube
-# card needs the first while the boot-time diagnostics need the second.
+# Set by setup_gl for setup_dash to read: whether the Mesa payload is complete enough
+# to point a child at, and whether the probe was staged.  They are separate because
+# the payload can be there without the probe and the dashboard's 3D cube card needs
+# the first while the boot-time diagnostics need the second.
 gl_ready=0
 probe_ready=0
 
-setup_es_gl() {
+setup_gl() {
     if ! find_payload; then return 1; fi
     if [ ! -f "$payload/gl/links" ]; then
         say "gl: j36.gl was asked for but j36/gl/ is not on the card"
@@ -2333,413 +2385,98 @@ setup_es_gl() {
         if cp "$so" /newroot/run/j36/gl/; then
             staged=$((staged + 1))
         else
-            say "es: could not copy $so"
+            say "gl: could not copy $so"
         fi
     done
     # The links file stands in for the symlinks vfat cannot store: "name target", one
-    # pair per line, targets relative to this directory except libEGL.so's, which
-    # is a plain filename too.  Read whichever partition the payload came off, because
-    # a card written before the payload moved has it on the vfat one.
+    # pair per line, targets relative to this directory.  Read whichever partition the
+    # payload came off, because a card written before the payload moved has it on the
+    # vfat one.
     while read -r name target; do
         case "$name" in ''|'#'*) continue ;; esac
         ln -sf "$target" "/newroot/run/j36/gl/$name"
     done < "$payload/gl/links"
 
-    # ── The GLES 2.0 EmulationStation ────────────────────────────────────────────
-    #
-    # j36/es/emulationstation is built from the same upstream commit as the one in
-    # the rootfs, with one difference: -DUSE_OPENGLES_20 and Renderer_GLES20.cpp
-    # instead of -DUSE_OPENGLES_10 and Renderer_GLES10.cpp.
-    #
-    # Why a different renderer at all, measured rather than assumed: GLES1 is the
-    # one API this stack cannot give. eglCreateContext for an ES1 context returns
-    # EGL_BAD_ALLOC on lima, on llvmpipe and on softpipe alike, because Debian's
-    # Mesa 25.0.7 is a -Dgles1=disabled build -- the package, not this SoC. ES2 is
-    # what does come up on lima, as "OpenGL ES 2.0 Mesa 25.0.7-2+deb13u1". The
-    # rootfs's binary cannot ask for it: its renderer is fixed-function, and
-    # Renderer_GLES10.cpp does
-    #     std::string glExts = (const char *)glGetString(GL_EXTENSIONS);
-    # at line 129 without ever checking SDL_GL_CreateContext, so a context that was
-    # never created arrives as std::string(NULL) -- abort, status 134, reason
-    # discarded. That 134 is the whole reason this file exists.
-    #
-    # It goes in over the rootfs's copy as a BIND MOUNT, which is the only way to
-    # replace it without writing to a card the R36S also boots: the mount table is
-    # in memory, the file underneath is untouched, and switch_root moves the mount
-    # across with everything else under /newroot. Pull this card into an R36S and
-    # its own binary is the one that runs.
-    #
-    # /run/j36/es and not /run/j36/gl, for the same reason the probe is kept out of
-    # there: /run/j36/gl is an ld.so search path and an executable in it is a name
-    # the loader has to stat and skip.
-    es_gles20=0
-    if [ "$want_dash" = 1 ]; then
-        # j36.dash=1 means EmulationStation is not the shell on this boot and its
-        # binary is never executed, so replacing that binary is work with no
-        # observable effect.  The bind mount is skipped rather than made harmless:
-        # a mount over a file on the shared rootfs that nothing will open is still a
-        # mount somebody would have to explain.
-        say "es: j36.dash=1, so the GLES 2.0 EmulationStation is not staged at all"
-    elif [ -f "$payload/es/emulationstation" ]; then
-        mkdir -p /newroot/run/j36/es
-        if cp "$payload/es/emulationstation" /newroot/run/j36/es/emulationstation; then
-            chmod 0755 /newroot/run/j36/es/emulationstation
-            if [ ! -f /newroot/usr/bin/emulationstation/emulationstation ]; then
-                say "es: the rootfs has no emulationstation to mount over"
-            # -o bind rather than --bind: this is BusyBox's mount.
-            elif mount -o bind /newroot/run/j36/es/emulationstation \
-                               /newroot/usr/bin/emulationstation/emulationstation; then
-                es_gles20=1
-                say "es: the GLES 2.0 binary is mounted over the rootfs's"
-            else
-                say "es: could not bind-mount the GLES 2.0 binary; the rootfs's GLES1 one will run"
-            fi
-        else
-            say "es: could not copy the GLES 2.0 binary"
-        fi
-    else
-        say "es: no j36/es/emulationstation on the card, so the rootfs's GLES1 binary will run"
-    fi
-
     # The EGL probe rides in beside the libraries, not among them: /run/j36/gl is
     # a loader search path and a binary in it would be a name ld.so has to skip.
-    # It is only ever run by the j36.es=debug drop-in below.
+    # mixdash-probe.service is what runs it, once, under j36.gl=debug.
     if [ -f "$payload/eglprobe" ]; then
         if cp "$payload/eglprobe" /newroot/run/j36/eglprobe; then
             chmod 0755 /newroot/run/j36/eglprobe
             probe_ready=1
-            # The drop-in tees the probe's output to a file so ExecStopPost can
-            # print it again after ES's own spew has scrolled past.  emulation-
-            # station.service is User=ark and this directory is root-owned 0755,
-            # so tee could not create that file -- it said "permission denied"
-            # and the repeat had nothing to print.  Create it here, where we are
-            # root, and let anyone write it.  A log in a tmpfs that is thrown
-            # away on reboot does not need to be guarded.
+            # The unit tees the probe's output to a file so it can be printed again
+            # after the shell has exited and its own spew has scrolled past.  That
+            # unit does not run as root and this directory is root-owned 0755, so
+            # tee could not create the file -- it said "permission denied" and the
+            # repeat had nothing to print.  Create it here, where we are root, and
+            # let anyone write it.  A log in a tmpfs that is thrown away on reboot
+            # does not need to be guarded.
             : > /newroot/run/j36/eglprobe.log
             chmod 0666 /newroot/run/j36/eglprobe.log
         else
-            say "es: could not copy the EGL probe"
+            say "gl: could not copy the EGL probe"
         fi
     fi
 
     # Nothing above is allowed to fail quietly, because of what the fallback is.
-    # The drop-in tells the loader to look in this directory; if the directory is
-    # empty the loader simply misses and finds the same names in /usr/lib, where
-    # the shared rootfs has pointed them at the RK3326's libMali.so -- an ARMv8-A object on a
-    # Cortex-A7. For the rootfs's binary that is SIGILL before main(), which names
-    # neither this directory nor the blob; for the GLES 2.0 one it is SDL dlopening
-    # the blob and reporting no EGL. Neither message points here, so it has to be
-    # caught here.
+    # LD_LIBRARY_PATH tells the loader to look in this directory; if the directory is
+    # incomplete the loader simply misses and finds the same names in /usr/lib, where
+    # the shared rootfs has pointed them at the RK3326's libMali.so -- an ARMv8-A
+    # object on a Cortex-A7.  What that produces is SIGILL before main() in whatever
+    # dlopened it, and the message names neither this directory nor the blob.  So it
+    # has to be caught here.
     #
-    # Which three are load-bearing depends on which binary is going to run, and
-    # they are not the same three:
+    # These three and no others.  libEGL.so.1 creates the context and libGLESv2.so.2
+    # supplies the entry points eglGetProcAddress hands back.  libgbm.so.1 is
+    # load-bearing twice over: the KMSDRM path dlopens it and libEGL_mesa.so.0 carries
+    # it in its own DT_NEEDED, so without it Mesa's EGL pulls the RK3326 blob in as
+    # its gbm and cannot initialise.
     #
-    #   GLES 2.0 binary.  It has no GL library in its DT_NEEDED at all, so the bare
-    #     libEGL.so alias stops mattering.  What matters is the pair SDL dlopens:
-    #     libEGL.so.1 for the context and libGLESv2.so.2 for the entry points
-    #     SDL_GL_GetProcAddress hands back.
-    #   Rootfs's GLES1 binary.  libEGL.so is the literal string in its DT_NEEDED,
-    #     and libGL.so.1 is the LD_PRELOAD that supplies the fixed-function calls.
-    #
-    # libgbm.so.1 is load-bearing either way, and twice over: SDL2's KMSDRM backend
-    # dlopens it and libEGL_mesa.so.0 carries it in its own DT_NEEDED, so without it
-    # Mesa's EGL pulls the RK3326 blob in as its gbm and cannot initialise.
-    #   The dashboard.  mixdash itself needs none of them -- it is Qt on linuxfb and
-    #     it draws with the CPU -- but the 3D cube card runs eglprobe, which dlopens
-    #     the same pair the GLES 2.0 binary does.
-    #
-    # libgbm.so.1 is load-bearing either way, and twice over: SDL2's KMSDRM backend
-    # dlopens it and libEGL_mesa.so.0 carries it in its own DT_NEEDED, so without it
-    # Mesa's EGL pulls the RK3326 blob in as its gbm and cannot initialise.
+    # mixdash itself needs none of them: it is Qt on linuxfb and it draws with the
+    # CPU.  Its 3D cube card is what needs them, through eglprobe -- so an incomplete
+    # payload costs one card in the dashboard, not the boot.
     missing=""
-    if [ "$es_gles20" = 1 ] || [ "$want_dash" = 1 ]; then
-        needs="libEGL.so.1 libgbm.so.1 libGLESv2.so.2"
-    else
-        needs="libEGL.so libgbm.so.1 libGL.so.1"
-    fi
-    for need in $needs; do
+    for need in libEGL.so.1 libgbm.so.1 libGLESv2.so.2; do
         [ -e "/newroot/run/j36/gl/$need" ] || missing="$missing $need"
     done
     if [ -n "$missing" ]; then
-        say "es: the GL payload is incomplete, missing:$missing"
-        say "    ($staged of the libraries copied.)  The drop-in is deliberately"
-        say "    NOT written: pointing LD_LIBRARY_PATH at a directory that cannot"
-        say "    satisfy those names sends ES to /usr/lib and the RK3326 Mali blob,"
-        say "    which is ARMv8-A on this Cortex-A7.  Leaving the environment alone"
-        say "    fails in the same place but without this initramfs having claimed"
-        say "    to fix it."
+        say "gl: the GL payload is incomplete, missing:$missing"
+        say "    ($staged of the libraries copied.)  LD_LIBRARY_PATH is deliberately"
+        say "    NOT set: pointing it at a directory that cannot satisfy those names"
+        say "    sends the loader to /usr/lib and the RK3326 Mali blob, which is"
+        say "    ARMv8-A on this Cortex-A7.  Leaving the environment alone fails in"
+        say "    the same place but without this initramfs having claimed to fix it."
         return 1
     fi
     gl_ready=1
 
-    # And with the dashboard as the shell there is no EmulationStation drop-in to
-    # write: every line below configures SDL, a videodriver and a GL front end for a
-    # binary that will not be executed on this boot.  setup_dash puts the one thing
-    # from here that a Qt dashboard still needs -- the search path its children use
-    # to find Mesa rather than the RK3326 blob -- into mixdash.service, where it can
-    # be read next to the process it applies to instead of inherited from a unit
-    # named after a program that is gone.
-    if [ "$want_dash" = 1 ]; then
-        say "gl: payload in /run/j36/gl; no ES drop-in, the dashboard is the shell"
-        say "    $(ls /newroot/run/j36/gl | tr '\n' ' ')"
-        return 0
-    fi
-
-    mkdir -p /newroot/run/systemd/system/emulationstation.service.d
-    cat > /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPIN'
-# Written by the J36 Ultra initramfs, into a tmpfs. Not on the card, not in the
-# rootfs: it exists only for as long as this boot does.
-[Service]
-Environment="LD_LIBRARY_PATH=/run/j36/gl"
-Environment="SDL_VIDEODRIVER=kmsdrm"
-Environment="SDL_VIDEO_EGL_DRIVER=libEGL.so.1"
-DROPIN
-
-    # The GL front end SDL is told to dlopen, and it follows the binary rather than
-    # the board -- these two paragraphs are the whole difference between them.
-    if [ "$es_gles20" = 1 ]; then
-        cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINES2'
-
-# The GLES 2.0 binary is the one mounted, and ES2 is the one API measured to build
-# a context on lima here: "OpenGL ES 2.0 Mesa 25.0.7-2+deb13u1".  ES1 cannot,
-# anywhere -- Debian's Mesa 25.0.7 is a -Dgles1=disabled build, so eglCreateContext
-# returns EGL_BAD_ALLOC for it on lima, on llvmpipe and on softpipe alike.
-#
-# No LD_PRELOAD.  Renderer_GLES20.cpp resolves all 43 entry points through
-# SDL_GL_GetProcAddress, which under this videodriver is eglGetProcAddress, so the
-# binary carries no GL library in its DT_NEEDED and there is nothing that has to be
-# forced into the global scope.  That is also what makes one binary correct on both
-# machines: nothing in it names libMali.so or libGLESv2.so.
-Environment="SDL_VIDEO_GL_DRIVER=libGLESv2.so.2"
-DROPINES2
-    else
-        cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINGL'
-
-# Fallback: the rootfs's own binary, which is fixed-function.  The GL_DRIVER name
-# is libGL and not libGLESv1_CM because a GLES1 CONTEXT cannot be created at all
-# here -- Debian's Mesa 25.0.7 is built without GLES1, so eglCreateContext for ES1
-# returns EGL_BAD_ALLOC on lima, on llvmpipe and on softpipe alike.  What does come
-# up is desktop GL as a COMPATIBILITY profile, and compat GL is a superset of the
-# fixed-function subset that binary uses: all 29 gl* symbols in its undefined list
-# are exported by glvnd's libGL.so.1 with the signatures GLES1 gives them.  It is
-# also the context SDL asks for anyway -- Renderer_GLES10.cpp's setupWindow() never
-# sets SDL_GL_CONTEXT_PROFILE_MASK and sets MAJOR_VERSION twice, so SDL sends no
-# context attribs and EGL falls back to its own default of OpenGL.
-#
-# What the preload does NOT do is fix a broken dispatch, because there was not one.
-# Measured against the image's own libraries: with a compat context current, the
-# GLES1 stub and libGL both return "4.5 (Compatibility Profile) Mesa 25.0.7" from
-# glGetString and both accept glMatrixMode/glLoadMatrixf/glEnableClientState with
-# glGetError 0 -- glvnd gives libEGL and both GL front ends one shared
-# current-context table.  It is there because that binary names only libEGL.so as a
-# dependency and glvnd's libEGL exports no gl* entry point at all.
-#
-# This path has never drawn a frame on this board: it is the 134.  It is kept
-# because it is what happens when j36/es is not on the card, and it should say so
-# rather than look like the intended configuration.
-Environment="LD_PRELOAD=libGL.so.1"
-Environment="SDL_VIDEO_GL_DRIVER=libGL.so.1"
-DROPINGL
-    fi
-
-    # j36.es=debug appends the diagnostics.  Kept out of the default drop-in
-    # because it is noise on a board that works, and kept in the same file
-    # because systemd merges drop-ins in name order and one file cannot be
-    # overridden by half of itself.
-    #
-    # What each line buys, and why this particular set:
-    #
-    #   --debug          EmulationStation's log is normally a file that is never
-    #                    written.  Log::init() sees LogLevel=disabled in
-    #                    es_settings.cfg, deletes the file and returns, so
-    #                    es_log.txt does not exist -- but Log::~Log() also writes
-    #                    to stderr whenever the reporting level is LogDebug or
-    #                    above, and --debug sets exactly that.  So this puts ES's
-    #                    whole trace on the panel without touching the rootfs, and
-    #                    the launcher passes "$@" through to the binary.
-    #   EGL_LOG_LEVEL    Mesa's EGL prints which vendor it loaded, which DRI
-    #                    driver it paired the card with, and the reason
-    #                    eglInitialize or eglCreateContext failed.  This is the
-    #                    one that matters most, because of what ES does NOT do:
-    #                    Renderer_GLES10.cpp calls SDL_GL_CreateContext and
-    #                    SDL_GL_MakeCurrent and checks neither return value, then
-    #                    at line 129 does
-    #                        std::string glExts = (const char *)glGetString(GL_EXTENSIONS);
-    #                    With no current context glvnd's libGL stub returns NULL,
-    #                    and std::string(NULL) throws std::logic_error
-    #                    "basic_string: construction from null is not valid" --
-    #                    abort, status 134.  So a 134 means the context failed and
-    #                    the reason was thrown away.  Mesa is the only party left
-    #                    that still knows it.
-    #   MESA_DEBUG       Mesa's own GL error stream, in case a context is created
-    #                    and then something inside it is rejected.
-    #   LIBGL_DEBUG      names the dri module it tried to dlopen when it cannot.
-    #                    dri/mediatek_dri.so and dri/lima_dri.so are both symlinks
-    #                    to one megadriver here, and a failure to find either
-    #                    looks identical to a failure to find a GPU.
-    #   J36_ES_GL_PROBE  read by the GLES 2.0 renderer only.  It turns the clear
-    #                    colour magenta and, either way, that renderer logs a
-    #                    startup self test -- one magenta quad drawn straight in
-    #                    NDC and read back with glReadPixels -- plus a draw count
-    #                    per frame.  Between them they split the one symptom that
-    #                    has three causes:
-    #                      magenta panel      the swap chain reaches the CRTC, so a
-    #                                         black UI on top of it is ES's drawing
-    #                      black panel, self
-    #                      test pixel ff00ff  GL is correct and the frames never
-    #                                         reach the panel -- a display problem,
-    #                                         not a GL one
-    #                      self test black    the pipeline swallows the draw; the
-    #                                         compile and link lines say why
-    #                      frame N, 0 draws   ES asked for nothing; a theme or a
-    #                                         gamelist, not a shader
-    #                    The fixed-function binary ignores it entirely.
-    #   Restart=no       the unit restarts on failure, and six identical stack
-    #                    traces scroll the first one off a 640x480 panel before it
-    #                    can be read.  One attempt, one trace.
-    #   StandardError    the trace is on stderr, and this boot's whole purpose is
-    #                    to read it off the panel, so it is stated rather than
-    #                    inherited.  StandardOutput joins it because the probe
-    #                    below writes to stdout.
-    if [ "$gl_debug" = 1 ]; then
-        cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINDBG'
-
-# j36.es=debug
-Environment="EGL_LOG_LEVEL=debug"
-Environment="MESA_DEBUG=1"
-Environment="LIBGL_DEBUG=verbose"
-Environment="J36_ES_GL_PROBE=1"
-Restart=no
-StandardOutput=journal+console
-StandardError=journal+console
-DROPINDBG
-
-        # The `--debug' ExecStart override that used to be in that block is written
-        # only when EmulationStation is the shell, and that is not a tidiness point.
-        # neuter_es replaces emulationstation.service in the SAME directory with a
-        # unit that only echoes a line, and a drop-in beside it outranks nothing --
-        # it MERGES.  So `ExecStart=' followed by the real binary resurrected the
-        # very thing j36.dash=1 exists to keep out of the boot: under j36.gl=debug
-        # the stub's echo was cleared and ES ran, aborted at
-        # Renderer_GLES10.cpp:129, and did it while holding the panel.
-        if [ "$want_dash" != 1 ]; then
-            cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINDBGES'
-ExecStart=
-ExecStart=/usr/bin/emulationstation/emulationstation.sh --debug
-DROPINDBGES
-        else
-            say "gl: j36.dash=1, so the debug drop-in does not re-add an ExecStart --"
-            say "    a drop-in merges with the stub unit and would start ES anyway"
-        fi
-
-        # And the probe, if it was staged.  Written separately so that a card
-        # without it produces a drop-in that does not mention it, rather than a
-        # tolerated failure the reader has to recognise as harmless.
-        #
-        # ExecStartPre inherits this unit's Environment, which is the point: the
-        # probe resolves libEGL.so.1 and libgbm.so.1 through LD_LIBRARY_PATH the
-        # same way ES will, so it reports on the payload rather than on Debian's
-        # copies.  It is prefixed with - because a probe is not a precondition:
-        # whatever it says, ES still gets its attempt.
-        #
-        # It runs before ES and is repeated after ES exits because of the panel:
-        # ES with --debug prints more than 30 lines and the probe's verdict would
-        # scroll away before it could be photographed.  The second copy comes
-        # from the log rather than a second run, so it cannot disagree with the
-        # first.
-        # The second line is the same probe with no DRM device at all and the
-        # software driver forced.  swrast does desktop GL, GLES1 and GLES2
-        # everywhere, so it says whether this Mesa can build those contexts at
-        # all -- and a row that works there but returns BAD_ALLOC on the nodes
-        # above is lima's, not the payload's.  It appends to the same log so the
-        # repeat after the shell exits carries both.
-        #
-        # WHAT IS NOT HERE ANY MORE IS -p, and the reason is worth writing down.
-        # -p sets a mode of its own, and on a board with no fbdev emulation
-        # nothing puts the scanout back afterwards: the panel keeps showing -p's
-        # last frame and the shell that starts next -- which draws into the LK's
-        # framebuffer through /dev/fb0 -- is never seen again.  Run before
-        # EmulationStation that cost five colours and nothing else, because ES
-        # would have taken the panel with a modeset of its own.  Run before
-        # mixdash it would hide the dashboard for the whole boot.  So it is a
-        # thing the dashboard's own 3D cube card starts, on purpose, after asking
-        # twice -- and the first line below already prints what -p's opening
-        # lines were the useful part of: which node is lima and which one, if
-        # any, can modeset at all.
-        #
-        # Same reasoning as the ExecStart above: this drop-in merges into whatever
-        # emulationstation.service is, stub included, so with the dashboard as the
-        # shell these lines were a SECOND full EGL probe in the boot -- one from the
-        # stub unit and one from mixdash's own ExecStartPre.  Every one of them
-        # creates contexts on lima, and this board does not survive many of those.
-        # The dashboard boot gets exactly one, from mixdash-probe.service.
-        if [ -x /newroot/run/j36/eglprobe ] && [ "$want_dash" != 1 ]; then
-            cat >> /newroot/run/systemd/system/emulationstation.service.d/j36-gl.conf <<'DROPINPROBE'
-ExecStartPre=-/bin/sh -c '/run/j36/eglprobe 2>&1 | tee /run/j36/eglprobe.log'
-ExecStartPre=-/bin/sh -c 'LIBGL_ALWAYS_SOFTWARE=1 /run/j36/eglprobe -s 2>&1 | tee -a /run/j36/eglprobe.log'
-ExecStopPost=-/bin/sh -c 'echo "--- eglprobe, repeated now that the shell has exited ---"; cat /run/j36/eglprobe.log'
-DROPINPROBE
-        fi
-    fi
-
-    say "gl: front end in /run/j36/gl, drop-in in /run/systemd/system"
+    say "gl: payload in /run/j36/gl, $staged libraries"
     say "    $(ls /newroot/run/j36/gl | tr '\n' ' ')"
     return 0
 }
 
-# ── The dashboard, in place of EmulationStation ───────────────────────────────
+# ── The dashboard, and the unit that starts it ────────────────────────────────
 #
-# A UNIT OF OUR OWN, AND WHERE A MASK HAS TO GO ON THIS CARD.  EmulationStation
-# should not be an autostart service in these builds at all, and the way to say that
-# is to mask it -- a symlink to /dev/null over the unit name.  The catch is which
-# directory: build_emulationstation.sh installs the unit as
-# /etc/systemd/system/emulationstation.service, and /etc/systemd/system OUTRANKS
-# /run/systemd/system, so the obvious mask would be silently ignored and this build
-# would think it had removed ES while ES was still starting.
-#
-# systemd.unit(5)'s precedence list has one runtime directory above /etc, and it is
-# the one `systemctl mask --runtime' writes into:
-#
-#     /etc/systemd/system.control/     highest
-#     /run/systemd/system.control/     <-- this is where the mask goes
-#     /run/systemd/transient/
-#     /run/systemd/generator.early/
-#     /etc/systemd/system/             <-- where the ES unit is
-#     /run/systemd/system/             <-- where mixdash.service goes
-#     /usr/lib/systemd/system/         lowest
-#
-# So the removal is three writes, all of them into the tmpfs mounted a few lines up,
-# and all of them gone on the next boot:
-#
-#   1  /run/systemd/system.control/emulationstation.service -> /dev/null.  The real
-#      mask.  The unit becomes unloadable, so multi-user.target cannot pull it in and
-#      nothing can start it by hand either.
-#   2  mixdash.service in /run/systemd/system, wanted by multi-user.target through a
-#      symlink in /run/systemd/system/multi-user.target.wants/.  Unit FILES do not
-#      merge across the trees but dependency DIRECTORIES do -- .wants is additive --
-#      so a want written in /run is honoured for a target whose unit is in /usr/lib.
-#      This is the only thing that starts the dashboard.
-#   3  a drop-in on emulationstation.service that resets ExecStart to an echo.
-#      Redundant if (1) took, and it is there for the case where it did not: a
-#      systemd without system.control in its search path, or a derived image that
-#      moved the unit somewhere with even higher precedence.  Drop-ins from /run are
-#      merged into a unit in /etc, so this still stops the binary from being
-#      executed even when the mask is ignored.  Type=oneshot and Restart=no as well,
-#      because the unit's own Restart=on-failure is what turned a single 134 into six
-#      identical stack traces scrolling a 640x480 panel.
-#
-# It matters that (3) does not launch mixdash even though it could.  If it did, then
-# on a boot where the mask was ignored the dashboard would start twice -- once from
-# each unit -- and two processes drawing into /dev/fb0 while both read the same evdev
-# nodes is a fault that looks exactly like a broken dashboard.  One owner.
-#
-# The units that name ES in ordering -- ogage.service After=, welcome-message and
-# wifi_importer Before= -- are ordering only, with no Requires anywhere, so a masked
-# ES drops out of their dependency graph without failing them.  That was read out of
-# the unit files, not assumed.
+# A UNIT OF OUR OWN, WRITTEN INTO A tmpfs.  mixdash.service goes in
+# /run/systemd/system, wanted by multi-user.target through a symlink in
+# /run/systemd/system/multi-user.target.wants/.  Unit FILES do not merge across the
+# search trees but dependency DIRECTORIES do -- .wants is additive -- so a want
+# written in /run is honoured for a target whose unit is in /usr/lib.  This is the
+# only thing that starts the dashboard.
 #
 # Nothing here writes to the card, and the whole arrangement is gone on the next
-# boot: /run/systemd/system is the tmpfs mounted a few lines up.
+# boot: /run/systemd/system is the tmpfs mounted a few lines up.  That is the
+# invariant the whole card is built on -- one Debian rootfs, two machines, and the
+# R36S has to find it exactly as it left it.
+#
+# THIS USED TO BE TWICE THE SIZE, and half of it was a mask.  EmulationStation was
+# installed as /etc/systemd/system/emulationstation.service and enabled, so taking it
+# out of the boot meant a symlink to /dev/null in /run/systemd/system.control -- the
+# one runtime directory in systemd.unit(5)'s precedence list that outranks /etc --
+# plus a drop-in resetting its ExecStart to an echo for the case where the mask was
+# ignored.  There is no such unit on this rootfs any more, so there is nothing to
+# mask; the precedence detail is written down once more above where neuter_es was,
+# because it is the part somebody would get wrong if it ever comes back.
 #
 #
 # WHERE THE PAYLOAD IS, asked rather than assumed.  find_mixos() looks for it in the
@@ -2956,12 +2693,9 @@ setup_dash() {
         say "dash: no opt/mixos/bin/mixdash on any partition of this card."
         say "      Unpack sd-root.tar.gz at the root of the ext2 ROOTFS partition,"
         say "      not on BOOT -- BOOT is FAT and would lose Qt's symlinks."
-        say "      EmulationStation is NOT started as a fallback --"
-        say "      it aborts at Renderer_GLES10.cpp:129 on this board and its unit"
-        say "      restarts it, so the panel would end up black with six identical"
-        say "      stack traces on it instead of this message.  A readable console"
-        say "      is the better failure."
-        neuter_es
+        say "      Nothing is started as a fallback: the dashboard is the only shell"
+        say "      in this build, so a readable console is the whole of what is left"
+        say "      and it is the better failure."
         dash_notice
         return 1
     fi
@@ -2972,27 +2706,46 @@ setup_dash() {
 
     # ── the dashboard's own unit ─────────────────────────────────────────────────
     #
-    # The directory is made here and not assumed: setup_es_gl used to be the only
-    # thing that created it, and with the dashboard as the shell that function returns
-    # before it gets there -- and on a card with no j36/ directory at all it never
-    # runs.  A `cat >' into a directory that does not exist would take the dashboard
-    # out of the boot for the sake of one mkdir.
+    # The directory is made here and not assumed: setup_gl is the only other thing
+    # that creates it, and on a card with no j36/ directory at all, or a boot with no
+    # j36.gl word, it never runs.  A `cat >' into a directory that does not exist
+    # would take the dashboard out of the boot for the sake of one mkdir.
     mkdir -p /newroot/run/systemd/system
+    # ── UNQUOTED, AND THAT MAKES THE COMMENTS BELOW CODE ──────────────────────
+    #
+    # The word is bare and has to stay bare: $mixos_root is resolved at boot and is
+    # the whole point of writing this unit from the initramfs rather than shipping
+    # it.  The cost is that everything between here and UNITDASH is still read by
+    # the shell for $, ` and \ -- a `#' at the start of a line means nothing to it,
+    # so these are systemd comments and not shell comments.
+    #
+    # This is not hypothetical.  Two of them said `handover' and `-', the way every
+    # other comment in this file does, and the backticks paired up into a command
+    # substitution spanning six lines with unbalanced apostrophes inside it.
+    # BusyBox ash gave up parsing setup_dash, /init exited on the spot, and because
+    # nothing else ever writes to /dev/.mixsplash the splash held its last line --
+    # "trying /dev/mmcblk0p2" -- for as long as the board was on.  A quoting mistake
+    # in prose that reads as a frozen boot.
+    #
+    # So: no backticks, no bare $, no trailing backslash in this body or in UNITFC,
+    # UNITID and UNITNOTICE below, which are unquoted for the same reason.  Use "..."
+    # when a word needs setting off.  The check after the heredoc parses the finished
+    # /init with a real POSIX shell so the next one fails the build instead.
     cat > /newroot/run/systemd/system/mixdash.service <<UNITDASH
 # Written by the J36 Ultra initramfs, into a tmpfs.  Not on the card, not in the
 # rootfs: it exists only for as long as this boot does.
 [Unit]
 Description=MixOS dashboard (J36 Ultra)
 Documentation=file:///opt/mixos/README.txt
-# Ordering only, and the same place EmulationStation sat: firstboot resizes the data
-# partition and a dashboard that lists it should not race that.  A unit that is not
-# installed is simply not ordered against, so naming it costs nothing.
+# Ordering only: firstboot resizes the data partition and a dashboard that lists it
+# should not race that.  A unit that is not installed is simply not ordered against,
+# so naming it costs nothing.
 After=firstboot.service systemd-user-sessions.service
-# Three tries a minute and then it stops.  EmulationStation's own unit had
-# Restart=on-failure against a binary that aborts in 200 ms, and what that produced on
-# a 640x480 panel was the same stack trace six times with the first line -- the only
-# one that said anything -- already scrolled away.  A dashboard that cannot start
-# should leave its last error on the glass.
+# Three tries a minute and then it stops, and the number is not caution -- it is the
+# lesson from the shell this one replaced, whose Restart=on-failure ran a binary that
+# aborted in 200 ms and put the same stack trace on a 640x480 panel six times, with
+# the first line -- the only one that said anything -- already scrolled away.  A
+# dashboard that cannot start should leave its last error on the glass.
 StartLimitIntervalSec=60
 StartLimitBurst=3
 
@@ -3011,15 +2764,20 @@ WorkingDirectory=$mixos_root/bin
 #
 # It stops BEFORE mixdash rather than after its first paint, and the second is
 # not a gap: mixsplash exits with the console still in KD_GRAPHICS (that is what
-# the `handover' message bought), so what stays on the glass is its own last
+# the "handover" message bought), so what stays on the glass is its own last
 # frame, held there until Qt has finished its dynamic linking and painted over
 # it.  A frozen splash is the correct thing to look at during that; a text
 # console suddenly reappearing is not.
 #
 # Appending to a file, never a pipe, so this cannot block even if nothing is
-# reading; and `-' in front so that a boot with no splash at all does not fail
+# reading; and "-" in front so that a boot with no splash at all does not fail
 # its ExecStartPre.  Re-running on every restart attempt is harmless by design.
-ExecStartPre=-/bin/sh -c '{ echo "stage:Starting the dashboard"; echo "progress:100"; } >> /dev/.mixsplash; sleep 1; echo quit >> /dev/.mixsplash'
+#
+# The touch comes first and is the whole stop protocol for the ticker that has
+# been feeding the splash since sysinit -- see mixos-splash-tick.  If it came
+# last, the ticker's next line would land on top of "Starting the dashboard" and
+# the last thing on the panel before Qt paints would be a stale seconds count.
+ExecStartPre=-/bin/sh -c ': > /dev/.mixsplash-done; { echo "stage:Starting the dashboard"; echo "progress:100"; } >> /dev/.mixsplash; sleep 1; echo quit >> /dev/.mixsplash'
 ExecStart=$mixos_root/bin/mixdash
 Restart=on-failure
 RestartSec=2
@@ -3083,37 +2841,90 @@ UNITFC
         say "      own config and may build a cache -- watch for a long \"fonts\" phase"
     fi
 
-    # ── one milestone in the middle of systemd ───────────────────────────────────
+    # ── the middle of systemd, narrated once a second ────────────────────────────
     #
     # Between switch_root and mixdash there is a stretch of systemd -- fsck, udev,
     # the journal, whatever the rootfs enables -- that on this SoC is the longest
     # quiet part of the boot.  /init cannot narrate it (it is gone) and mixdash
-    # cannot (it has not started), so the splash would sit on the last line /init
-    # wrote for half a minute.  The spinner keeps turning, so it does not look
-    # crashed, but it does not say anything either.  This is one oneshot unit
-    # whose whole body is two echoes.
+    # cannot (it has not started).
     #
-    # After=sysinit.target and nothing else: that is the point in the graph where
-    # the low-level work is done and the ordinary services are about to start, and
-    # ordering against only a target that always exists cannot make a cycle.
+    # This was one oneshot unit that echoed twice at sysinit.target, and that was
+    # not enough for the same reason a single message is never enough here: the
+    # splash gives the console back when nothing has spoken to it for long enough,
+    # and after the hand-over that fuse is three minutes.  A first boot -- fsck of
+    # a freshly written OS partition, a cold udev, ldconfig, a journal with no
+    # /var/log yet -- can spend longer than that between two echoes, and what the
+    # panel then does is exactly what it does when /init dies: picture off, kernel
+    # log back.  Nothing has gone wrong at that point; the boot below carries on
+    # and finishes, unwatched, behind a console nobody asked for.
+    #
+    # So it ticks.  Every five seconds it says how long systemd has been at it,
+    # which resets the fuse and, more usefully, turns "did it stop?" into a
+    # question the panel answers by itself: a number that keeps climbing is a slow
+    # boot and a number that stops is a wedged one.
+    #
+    # WHY IT IS A FILE AND NOT A LINE IN THE UNIT.  systemd expands ${...} in Exec
+    # lines before /bin/sh ever sees them, so a shell loop with a counter written
+    # inline is at the mercy of a substitution rule that has nothing to do with the
+    # shell.  A script in /run has no such reader in the middle; the unit names it
+    # and that is all.
+    #
+    # It starts before sysinit.target rather than after it, because the stretch
+    # this exists to cover starts at switch_root -- waiting for sysinit is waiting
+    # through the very part of the boot that is slowest on a first run.
+    # DefaultDependencies=no is what makes that legal, and Type=simple means
+    # systemd considers it started the moment it forks, so nothing waits on it.
+    mkdir -p /newroot/run/j36/bin
+    cat > /newroot/run/j36/bin/mixos-splash-tick <<'SPLASHTICK'
+#!/bin/sh
+# Written by the J36 Ultra initramfs into a tmpfs.  Feeds the boot splash while
+# systemd starts, and stops the moment mixdash.service touches the done file.
+chan=/dev/.mixsplash
+done_flag=/dev/.mixsplash-done
+
+# A boot with j36.splash=0, or one where mixsplash could not open /dev/fb0, has no
+# channel and nothing to say anything to.  Appending would create the file and tick
+# into it forever.
+[ -e "$chan" ] || exit 0
+
+{ echo "stage:Starting system services"
+  echo "detail:systemd"
+  echo "progress:94"
+} >> "$chan"
+
+# 2400 ticks of five seconds is two hours, and it is a backstop rather than a
+# patience setting: every boot that reaches a dashboard stops this in well under a
+# minute by way of the done file.  What it bounds is the boot that does not, where
+# a shell counting into a file nobody reads should eventually stop counting.
+n=0
+while [ "$n" -lt 2400 ]; do
+    if [ -e "$done_flag" ]; then exit 0; fi
+    sleep 5
+    n=$((n + 1))
+    echo "detail:systemd -- $((n * 5))s" >> "$chan"
+done
+exit 0
+SPLASHTICK
+    chmod 0755 /newroot/run/j36/bin/mixos-splash-tick
+
     cat > /newroot/run/systemd/system/j36-splash.service <<'UNITSPLASH'
 # Written by the J36 Ultra initramfs, into a tmpfs.
 [Unit]
-Description=Tell the boot splash that systemd has got this far
-After=sysinit.target
+Description=Keep the boot splash fed until the dashboard takes the panel
 DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=sysinit.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=-/bin/sh -c '{ echo "stage:Starting system services"; echo "detail:systemd"; echo "progress:94"; } >> /dev/.mixsplash'
+Type=simple
+ExecStart=-/bin/sh /run/j36/bin/mixos-splash-tick
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=sysinit.target
 UNITSPLASH
-    mkdir -p /newroot/run/systemd/system/multi-user.target.wants
+    mkdir -p /newroot/run/systemd/system/sysinit.target.wants
     ln -sf ../j36-splash.service \
-           /newroot/run/systemd/system/multi-user.target.wants/j36-splash.service
+           /newroot/run/systemd/system/sysinit.target.wants/j36-splash.service
 
     # ── which build is this, on both sides of the card ───────────────────────────
     #
@@ -3213,9 +3024,7 @@ UNITDBGREPLAY
         say "      start attempt -- three restarts used to mean three EGL inits"
     fi
 
-    neuter_es
-
-    say "dash: mixdash.service is the shell; EmulationStation is not started"
+    say "dash: mixdash.service is the shell"
     say "      $mixos_root/bin/mixdash, Qt on linuxfb over /dev/fb0"
     if [ "$gl_ready" != 1 ]; then
         say "dash: /run/j36/gl has no usable Mesa payload, so the 3D cube card will"
@@ -3625,41 +3434,24 @@ AUTOMOUNT
     return 0
 }
 
-# ── EmulationStation, taken out of the boot ───────────────────────────────────
+# ── WHAT USED TO BE HERE, AND WHY NOTHING REPLACED IT ─────────────────────────
 #
-# The mask and the drop-in described above setup_dash.  Called on the failure path
-# too, and that is deliberate: a card with no dashboard on it should show the reason
-# on the console, not six copies of ES's abort over the top of it.
-neuter_es() {
-    # /run/systemd/system.control, because that is the one runtime directory that
-    # outranks the /etc the unit lives in.  ln -sf and not a file: a mask IS a
-    # symlink to /dev/null, and systemd tests for exactly that.
-    mkdir -p /newroot/run/systemd/system.control
-    if ln -sf /dev/null \
-              /newroot/run/systemd/system.control/emulationstation.service; then
-        say "es: emulationstation.service is masked in /run/systemd/system.control"
-    else
-        say "es: could not mask emulationstation.service; the drop-in below is what"
-        say "    stops it, and it is why that drop-in exists"
-    fi
-
-    mkdir -p /newroot/run/systemd/system/emulationstation.service.d
-    cat > /newroot/run/systemd/system/emulationstation.service.d/zz-j36-dash.conf <<'DROPINDASH'
-# Written by the J36 Ultra initramfs, into a tmpfs.  EmulationStation is not part of
-# these builds: mixdash.service is the shell, the unit is masked in
-# /run/systemd/system.control, and this drop-in is the belt to that braces -- if the
-# mask is ever ignored, what starts here is an echo and not EmulationStation.
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=
-ExecStart=/bin/echo "j36: EmulationStation is not started in this build -- mixdash.service is the shell."
-# The unit's own Restart=on-failure is what turned one abort into six stack traces
-# scrolling a 640x480 panel.  Nothing here can fail, but it is stated anyway.
-Restart=no
-DROPINDASH
-    return 0
-}
+# neuter_es(), which masked emulationstation.service with a symlink to /dev/null in
+# /run/systemd/system.control -- the one runtime directory that outranks the /etc its
+# unit was installed into -- and dropped a zz-j36-dash.conf beside it that reset
+# ExecStart to an echo, in case the mask was ever ignored.  Two mechanisms for one
+# job, because the cost of getting it wrong was six copies of an abort scrolling a
+# 640x480 panel with no keyboard attached.
+#
+# It is gone because the thing it defended against is gone: no build_emulationstation.sh,
+# no /usr/bin/emulationstation on the rootfs, and therefore no unit to mask.  Masking
+# a unit that does not exist is not harmless housekeeping -- it is a line that makes a
+# reader believe ES is still somewhere on this card.
+#
+# If EmulationStation ever comes back as a Debian package on this rootfs, this is
+# where its mask goes, and the /run/systemd/system.control path is the part worth
+# keeping from the old function: /etc/systemd/system outranks /run/systemd/system,
+# so the obvious mask is silently ignored and the build believes it worked.
 
 # ── the failure, said where it can be read ────────────────────────────────────
 #
@@ -3703,8 +3495,8 @@ ExecStart=/bin/sh -c 'for i in 1 2 3 4 5 6; do \\
   echo "j36: which gives /opt/mixos, the first place /init looks.  Not BOOT:"; \\
   echo "j36: that one is FAT and holds none of the ~30 Qt SONAME symlinks --"; \\
   echo "j36: mixdash would then die before main()."; \\
-  echo "j36: EmulationStation is masked in this build on purpose and is not a"; \\
-  echo "j36: fallback: it aborts in Renderer_GLES10.cpp on this board."; \\
+  echo "j36: there is no other shell in this build and nothing is started as a"; \\
+  echo "j36: fallback, so this console is what the board has until it is fixed."; \\
   sleep 20; \\
 done'
 UNITNOTICE
@@ -3775,7 +3567,7 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_gl" = 1 ] || \
     fi
     if [ "$want_gl" = 1 ]; then
         stage "Staging OpenGL"; detail "Mesa, EGL, GLESv2"
-        progress 74; setup_es_gl
+        progress 74; setup_gl
     fi
 fi
 
@@ -3794,15 +3586,15 @@ if [ "$bootfs_mounted" = 1 ]; then
     case "$payload" in /bootfs/*) payload="" ;; esac
 fi
 
-# Outside that block on purpose: the dashboard is in the second partition and the
-# BOOT partition has nothing to do with it, so a card whose j36/ directory was
-# deleted still comes up in the dashboard rather than in EmulationStation.  Last of
-# all, so that the drop-in it writes has the final word on ExecStart.
+# Outside that block on purpose: the dashboard is on the OS partition and the BOOT
+# partition has nothing to do with it, so a card whose j36/ directory was deleted --
+# no Mesa, no modules, no probe -- still comes up in the dashboard.  Last of all, so
+# that its unit is written after everything it reads has run.
 #
-# The else branch is not noise.  A card still carrying a boot.conf written before
-# j36.dash existed boots to a rootfs whose EmulationStation may not even be enabled,
-# and then nothing at all starts and nothing says why -- which is precisely the
-# failure this line names in one word instead of an evening.
+# The else branch is not noise.  Without j36.dash=1 nothing stages a shell at all,
+# and this rootfs enables none of its own: the panel would go to a login prompt on a
+# board with no keyboard and nothing would say why.  That is the failure this line
+# names in one word instead of an evening.
 if [ "$want_dash" = 1 ]; then
     stage "Preparing the dashboard"
     progress 82
@@ -3919,6 +3711,44 @@ exec setsid cttyhack sh
 INIT
 chmod 0755 "$INITROOT/init"
 
+# ── PARSE /init WITH A POSIX SHELL BEFORE IT GOES ON A CARD ───────────────────
+#
+# /init is 2600 lines of shell that nothing on this workstation ever runs: the
+# first thing to read it is BusyBox ash on a board with no keyboard, and a syntax
+# error there is a boot that stops with whatever the splash last said still on the
+# panel.  There is no console to see the message on and no shell to fix it from --
+# the card comes out and goes back in a reader.  So it gets parsed here.
+#
+# NOT WITH bash.  `bash -n' accepts a backtick inside an unquoted here-document
+# body and ash does not, which is exactly the mistake this is here to catch: two
+# comment lines in the mixdash.service heredoc said `handover' and `-', the
+# backticks paired into a command substitution, and every bash on every machine
+# involved said the file was fine.  dash is ash's near relative and is /bin/sh on
+# the Ubuntu build VM, so it is what gets asked.  busybox first when it is there,
+# because that is the parser that actually runs.
+#
+# -n is parse-only: it reads and checks and executes nothing, so this cannot mount,
+# unmount or reboot anything by being wrong about the machine it is on.
+init_parser=""
+for candidate in busybox dash; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        init_parser="$candidate"
+        break
+    fi
+done
+case "$init_parser" in
+    busybox) busybox sh -n "$INITROOT/init" || die "/init does not parse under busybox ash; the board would stop at whatever the splash last said" ;;
+    dash)    dash -n "$INITROOT/init"       || die "/init does not parse under dash, which is ash's relative; the board would stop at whatever the splash last said" ;;
+    *)
+        # Neither is installed, which on the build VM means something is wrong with
+        # it -- dash is /bin/sh there.  Say so rather than silently checking nothing.
+        log "WARNING: neither busybox nor dash is installed, so /init went out unparsed"
+        ;;
+esac
+if [[ -n "$init_parser" ]]; then
+    log "init: parses under $init_parser ($(wc -l < "$INITROOT/init") lines)"
+fi
+
 # What this boot image is, in a file, because the heredoc above is single-quoted:
 # nothing from out here can be interpolated into /init, so anything /init needs to know
 # has to arrive as a file inside the initramfs.  init= identifies the boot image itself;
@@ -3979,11 +3809,11 @@ fits_in "$ARTIFACTS/boot.img" $((0x00900000)) "the BOOTIMG payload"
 # from /dev/input/event0.
 #
 # NOTHING ON THE ROOTFS COULD DO THIS.  The shared armhf rootfs already carries
-# gzdoom, lzdoom and EmulationStation.  SDL2 has no fbdev backend -- KMSDRM,
-# X11, Wayland, offscreen and dummy are the whole list -- so all three need
-# either DRM/KMS, which this kernel has no driver for yet, or a GL stack, and the
-# GL stack on that card is the RK3326's Mali-G31 Bifrost blob for a SoC whose GPU
-# is a Mali-450.  doomgeneric needs none of it: no SDL, no X11, no GL, no DRM.
+# gzdoom and lzdoom.  SDL2 has no fbdev backend -- KMSDRM, X11, Wayland, offscreen
+# and dummy are the whole list -- so both need either DRM/KMS, which this kernel
+# has no driver for yet, or a GL stack, and the GL stack on that card is the
+# RK3326's Mali-G31 Bifrost blob for a SoC whose GPU is a Mali-450.  doomgeneric
+# needs none of it: no SDL, no X11, no GL, no DRM.
 #
 # WHERE IT LIVES, AND WHY NOT IN THE INITRAMFS OR ON BOOT.  The initramfs goes
 # into both payloads, and boot.img is capped at the 9 MiB BOOTIMG slot asserted
@@ -4510,7 +4340,7 @@ fi
 # utils.sh, because the two do not agree -- utils.sh names four libraries and what
 # it leaves behind is this:
 #
-#   libEGL.so             -> libMali.so     clobbered   ES's only GL DT_NEEDED
+#   libEGL.so             -> libMali.so     clobbered   the bare -dev name
 #   libgbm.so             -> libMali.so     clobbered
 #   libgbm.so.1           -> libMali.so     clobbered   an SONAME, see below
 #   libgbm.so.1.0.0       -> libMali.so     clobbered
@@ -4523,30 +4353,33 @@ fi
 # names do not, and all three libgbm names do not. That split is what decides which
 # payload entries are load-bearing, and the answer is not the obvious one:
 #
-#   - libEGL.so is load-bearing because it is the literal string in
-#     emulationstation's DT_NEEDED. Not libEGL.so.1 -- the bare name, which is
-#     normally a -dev symlink no runtime binary should reference, and which here
-#     resolves to a Mali blob for a GPU that is not on this board.
+#   - libEGL.so.1 is the entry point everything on this board goes through:
+#     eglprobe dlopens exactly that soname, and so does SDL2's KMSDRM backend
+#     (SDL_VIDEO_EGL_DRIVER defaults to it). The bare libEGL.so beside it is
+#     normally a -dev symlink no runtime binary should reference, and here it
+#     resolves to a Mali blob for a GPU that is not on this board, so anything that
+#     does reference it takes SIGILL before main(). Both names are shipped.
 #   - libgbm.so.1 is load-bearing TWICE, and the second time is the one that would
 #     have been missed: SDL2's KMSDRM backend dlopens it, and libEGL_mesa.so.0
 #     carries it in its own DT_NEEDED. So with the rootfs as it stands, glvnd reads
 #     50_mesa.json, dlopens Mesa's EGL vendor, and that pulls the RK3326 blob into
 #     the process as its gbm. Mesa's EGL cannot initialise on this board without
-#     this payload -- the point is not merely that ES fails to link.
-#   - libGL.so.1 is what supplies the entry points EmulationStation calls. Its 29
-#     undefined GL symbols are glMatrixMode, glLoadMatrixf, glEnableClientState --
-#     fixed function, which reads as GLES1 and is equally desktop GL compat, and
-#     all 29 are exported by glvnd's libGL.so.1. libGLESv1_CM.so.1 is the obvious
-#     choice and it is the wrong one: Debian's Mesa is built without GLES1, so an
-#     ES1 context is EGL_BAD_ALLOC on every driver including llvmpipe, and a stub
-#     with no context under it returns NULL. libGL.so.1 brings libGLX.so.0 with it
-#     (its DT_NEEDED), which wants libX11.so.6 -- present on this rootfs; nothing
-#     here opens a display, it is glvnd's one-library-for-both-APIs shape.
-#   - libGLESv2.so.2 is for when SDL's context request comes out as ES2, and
-#     libGLdispatch.so.0 is glvnd's own dependency and the only DT_NEEDED any of
-#     these have on each other. It is also what makes the libGL preload work at
-#     all: glvnd's libEGL and libGL share one current-dispatch table, so a context
-#     created through eglMakeCurrent is the one libGL's stubs dispatch into.
+#     this payload -- the point is not merely that one program fails to link.
+#   - libGL.so.1 and libGLESv1_CM.so.1 are here for the probe rather than for
+#     anything in the boot. eglprobe asks each node for a desktop-GL context and an
+#     ES1 one as well as ES2, because the three answers together say whether a
+#     failure is the driver or the Mesa build: ES1 is EGL_BAD_ALLOC on lima, on
+#     llvmpipe AND on softpipe, which is Debian's armhf Mesa being a
+#     -Dgles1=disabled build and not anything about this GPU. libGL.so.1 brings
+#     libGLX.so.0 with it (its DT_NEEDED), which wants libX11.so.6 -- present on
+#     this rootfs; nothing here opens a display, it is glvnd's
+#     one-library-for-both-APIs shape.
+#   - libGLESv2.so.2 is the one a program on this board actually draws through --
+#     eglprobe's cube dlopens it by that soname -- and libGLdispatch.so.0 is
+#     glvnd's own dependency and the only DT_NEEDED any of these have on each
+#     other. Only one copy of it is ever loaded, and LD_LIBRARY_PATH puts the
+#     payload's ahead of the rootfs's, so whichever front end a symbol came from
+#     dispatches into whatever eglMakeCurrent installed.
 #
 # The intact ones are shipped anyway. Which names survive is an accident of which
 # utils.sh path ran on the day the image was built, and a payload that depends on
@@ -4648,11 +4481,13 @@ collect_gl_payload() {
         fi
     done
 
-    # And one link that is not a SONAME. EmulationStation's DT_NEEDED entry is the
-    # bare development name `libEGL.so', because it was linked against the rootfs's
-    # libEGL.so -> libMali.so symlink, where the blob exported EGL and GLES1 and
-    # GLES2 all from one object. glvnd's libEGL is only ever installed as
-    # libEGL.so.1, so without this alias the binary does not load at all.
+    # And one link that is not a SONAME. Anything built against this rootfs on the
+    # device records the bare development name `libEGL.so' in its DT_NEEDED, because
+    # that is what the rootfs's libEGL.so -> libMali.so symlink is called and the
+    # blob exported EGL and GLES1 and GLES2 all from one object. glvnd's libEGL is
+    # only ever installed as libEGL.so.1, so without this alias such a binary does
+    # not load at all -- and with the rootfs's own symlink first it loads the ARMv8
+    # blob and takes SIGILL, which is the failure this whole payload exists to stop.
     local egl
     egl="$(sed -n 's/^libEGL\.so\.1 \(.*\)$/\1/p' "$GL_PAYLOAD/links")"
     if [[ -z "$egl" ]]; then
@@ -4684,15 +4519,15 @@ collect_gl_payload() {
 # Non-fatal, like fbdoom and mfgpower: a diagnostic must never cost the user the
 # kernel artifacts.  Hence the local readelf tests instead of verify_arm_elf,
 # which dies.
-ESPROBE_SRC="$ROOT/device/j36-ultra/tools/j36-eglprobe.c"
-ESPROBE_BIN=""
+EGLPROBE_SRC="$ROOT/device/j36-ultra/tools/j36-eglprobe.c"
+EGLPROBE_BIN=""
 
 build_eglprobe() {
     local out="$WORK/j36-eglprobe" header needed
 
-    [[ -f "$ESPROBE_SRC" ]] || { log "gl: $ESPROBE_SRC is missing"; return 1; }
+    [[ -f "$EGLPROBE_SRC" ]] || { log "gl: $EGLPROBE_SRC is missing"; return 1; }
     arm-linux-gnueabihf-gcc -O2 -std=gnu11 -Wall -Wextra \
-        -o "$out" "$ESPROBE_SRC" || return 1
+        -o "$out" "$EGLPROBE_SRC" || return 1
 
     header="$(readelf -hd "$out" 2>/dev/null)" || return 1
     grep -q 'Class:.*ELF32' <<<"$header" || { log "gl: eglprobe is not a 32-bit ELF"; return 1; }
@@ -4710,66 +4545,37 @@ build_eglprobe() {
         return 1
     fi
 
-    ESPROBE_BIN="$out"
+    EGLPROBE_BIN="$out"
     log "gl: eglprobe is $(stat -c %s "$out") bytes, dynamic ARM, needs $needed"
 
     return 0
 }
 
-# ── EmulationStation, rebuilt with a GLES 2.0 renderer ────────────────────────
+# ── The armhf chroot ──────────────────────────────────────────────────────────
 #
-# The one thing the GL payload above cannot fix.  The binary in the shared rootfs
-# was compiled -DUSE_OPENGLES_10, and GLES1 is the single API this stack cannot
-# provide: eglCreateContext for an ES1 context returns 0x3003 EGL_BAD_ALLOC on
-# lima, on llvmpipe AND on softpipe, because Debian's armhf Mesa 25.0.7 is a
-# -Dgles1=disabled build.  That is the package and not this SoC, so there is no
-# driver work that would make the stock binary run and no MESA_GL_VERSION_OVERRIDE
-# that would help -- BAD_ALLOC is __DRI_CTX_ERROR_NO_MEMORY, the driver's own
-# create returning NULL, not the BAD_MATCH an unadvertised API gives.
+# One emulated Debian armhf trixie tree, built once and kept, in which the dashboard
+# is compiled against Debian's own qtbase5-dev.  Nothing is cross-compiled: the
+# target runs the same package versions, so what links here links there.
 #
-# ES2 is what does come up on lima here, measured with j36-eglprobe:
-# "OpenGL ES 2.0 Mesa 25.0.7-2+deb13u1", context created and made current.  So the
-# renderer is a third one, es/Renderer_GLES20.cpp, and this is where it is compiled.
-# Everything else about the binary is upstream at the same commit the rootfs's own
-# copy was built from, so the only difference between the two is the renderer.
+# IT USED TO BUILD TWO THINGS.  The other was EmulationStation, rebuilt from
+# christianhaitian/EmulationStation-fcamod at a pinned commit with a third renderer
+# -- es/Renderer_GLES20.cpp -- and a patch that took `EGL' off the link line, because
+# GLES1 is the one API this stack cannot provide: eglCreateContext for an ES1 context
+# returns 0x3003 EGL_BAD_ALLOC on lima, on llvmpipe and on softpipe alike, since
+# Debian's armhf Mesa is a -Dgles1=disabled build.  That binary went onto the BOOT
+# partition and /init bind-mounted it over the rootfs's copy.  All of it is gone with
+# EmulationStation itself, along with device/j36-ultra/es/ and the libvlc-dev,
+# libfreeimage-dev, rapidjson-dev half of what this chroot used to install.
 #
-# THREE THINGS ABOUT THIS BUILD ARE DELIBERATE AND NOT CONVENIENCES:
+# What survives from that work is the part that was never ES-specific and is directly
+# above: Mesa staged into /run/j36/gl, and eglprobe, which is now run by
+# mixdash-probe.service and by the dashboard's 3D cube card.
 #
-#   - It links no GL library at all, and es/patch-gles20.py exists to take `EGL'
-#     off the link line.  Every unversioned GL name in this rootfs -- libEGL.so,
-#     libGLESv2.so, libGLESv2.so.2, libGLESv1_CM.so* -- is a symlink to an
-#     SONAME-less ARMv8-A libMali.so, so linking any of them records a DT_NEEDED
-#     that is SIGILL on a Cortex-A7.  The renderer resolves all 43 entry points
-#     through SDL_GL_GetProcAddress instead, and the assertion at the end of this
-#     function is what keeps it that way.  One binary is then correct on both
-#     machines -- the R36S blob and this board's Mesa -- with no LD_PRELOAD.
-#   - It builds in an armhf chroot rather than cross-compiling, because ES needs
-#     SDL2, SDL2_mixer, FreeImage, FreeType, cURL, VLC, ALSA and RapidJSON headers
-#     and Debian trixie armhf has all of them at the versions the target runs.
-#     Its SDL2 is 2.32.4, the same as the rootfs's.
-#   - It never touches the rootfs image.  The binary is staged onto the vfat BOOT
-#     partition and /init bind-mounts it over /usr/bin/emulationstation/
-#     emulationstation, so the card stays byte-identical for the R36S.
-#
-# Non-fatal, like everything else in this file: if it does not build the kernel
-# artifacts still ship, /init finds no j36/es, says so, and the rootfs's own binary
-# runs and fails in the way it already fails.
-ES_URL="https://github.com/christianhaitian/EmulationStation-fcamod"
-# The rootfs's own ES commit, read out of the MixOS package cache's
-# emulationstation_351v_armhf.commit.  Pinned rather than tracking the branch so
-# that the renderer patch's anchors stay valid and the only difference from the
-# installed binary stays the renderer.
-ES_COMMIT="74498be31cd016af6a42d00310f876d7256eff52"
-ES_RENDERER="$ROOT/device/j36-ultra/es/Renderer_GLES20.cpp"
-ES_PATCH="$ROOT/device/j36-ultra/es/patch-gles20.py"
-ARMHF_CHROOT="$WORK/es-chroot"
-ES_BIN=""
-
-# Debian trixie armhf has all of ES's dependencies.  --no-install-recommends
-# because the recommends of libvlc-dev alone pull a desktop in.
-ES_BUILD_DEPS=(build-essential cmake git pkg-config ca-certificates
-               libsdl2-dev libsdl2-mixer-dev libfreeimage-dev libfreetype-dev
-               libcurl4-openssl-dev libvlc-dev libasound2-dev rapidjson-dev)
+# The directory was $WORK/es-chroot, and it is renamed here rather than left alone
+# because the name is the last thing on the host side still saying EmulationStation.
+# An existing one is moved rather than rebuilt -- re-extracting the base is cheap but
+# re-running apt for qtbase5-dev under qemu-arm is not.
+ARMHF_CHROOT="$WORK/armhf-chroot"
 
 armhf_chroot_run() {
     sudo chroot "$ARMHF_CHROOT" bash -c "$1"
@@ -4780,22 +4586,31 @@ armhf_chroot_run() {
 # the same debootstrap the target was made from; debootstrap is the fallback for a
 # machine where only this build has ever run.
 #
-# Two things build in here now -- the dashboard and, when it is asked for,
-# EmulationStation -- so the base and the dependencies are separate steps.  A card
-# that only wants mixdash should not spend twenty emulated minutes installing
-# libvlc-dev, and chroot_install_deps below is what keeps the two apart.
+# The base and the dependency install are separate steps, and chroot_install_deps
+# keeps a stamp per set.  That mattered when two different programs built in here;
+# with one left it is what stops a re-run from doing the qtbase5-dev apt again.
 ensure_armhf_chroot() {
     local suite="${DEBIAN_RELEASE:-trixie}" base m
     base="$ROOT/Arkbuild_package_cache/debian_${suite}_userspace-armhf_rootfs.tar.gz"
 
+    # The rename described above ARMHF_CHROOT, done once and quietly.  Guarded on the
+    # stamp file so a half-made or already-migrated tree is left alone, and on the
+    # destination not existing so this can never write over a good chroot.  If the
+    # move fails -- a bind mount still up inside it, most likely -- nothing is said
+    # and the block below rebuilds, which is slow but correct.
+    if [[ -f "$WORK/es-chroot/.j36-base" && ! -e "$ARMHF_CHROOT" ]]; then
+        log "chroot: moving the armhf chroot from es-chroot to armhf-chroot"
+        sudo mv "$WORK/es-chroot" "$ARMHF_CHROOT" || true
+    fi
+
     if [[ ! -f "$ARMHF_CHROOT/.j36-base" ]]; then
-        sudo rm -rf "$ARMHF_CHROOT" "$WORK/es-chroot-x"
-        mkdir -p "$WORK/es-chroot-x"
+        sudo rm -rf "$ARMHF_CHROOT" "$WORK/armhf-chroot-x"
+        mkdir -p "$WORK/armhf-chroot-x"
         if [[ -f "$base" ]]; then
             log "chroot: unpacking the armhf $suite rootfs from the MixOS package cache"
-            sudo tar -xpzf "$base" -C "$WORK/es-chroot-x" || return 1
+            sudo tar -xpzf "$base" -C "$WORK/armhf-chroot-x" || return 1
             # The cache tarball carries MixOS's own chroot name at the top.
-            sudo mv "$WORK/es-chroot-x/Arkbuild" "$ARMHF_CHROOT" || return 1
+            sudo mv "$WORK/armhf-chroot-x/Arkbuild" "$ARMHF_CHROOT" || return 1
         else
             log "chroot: no armhf rootfs in the package cache, debootstrapping one"
             command -v qemu-arm-static >/dev/null || {
@@ -4806,7 +4621,7 @@ ensure_armhf_chroot() {
             sudo cp /usr/bin/qemu-arm-static "$ARMHF_CHROOT/usr/bin/" || return 1
             sudo chroot "$ARMHF_CHROOT" /debootstrap/debootstrap --second-stage || return 1
         fi
-        sudo rm -rf "$WORK/es-chroot-x"
+        sudo rm -rf "$WORK/armhf-chroot-x"
         sudo touch "$ARMHF_CHROOT/.j36-base"
     fi
 
@@ -4827,10 +4642,11 @@ ensure_armhf_chroot() {
 
 # chroot_install_deps <stamp-name> <package>...
 #
-# One stamp per set, so the two builds do not install each other's dependencies and
-# neither reinstalls on a re-run.  The stamp names are part of the chroot's state and
-# not of this file's: .j36-deps is the name the ES set has always had, and keeping it
-# is what stops an existing chroot from doing twenty emulated minutes of apt again.
+# One stamp per set, so a re-run does not repeat the apt.  The stamp names are part of
+# the chroot's state and not of this file's, which is why `qt' is spelled the way it
+# already is on disk: change it and an existing chroot does twenty emulated minutes of
+# apt again for packages it already has.  The unnamed stamp, .j36-deps, was the ES
+# set's and nothing writes it any more.
 chroot_install_deps() {
     local stamp="$ARMHF_CHROOT/.j36-deps${1:+-$1}" ; shift
     [[ -f "$stamp" ]] && return 0
@@ -4850,98 +4666,12 @@ armhf_chroot_teardown() {
     return 0
 }
 
-build_es_gles20() {
-    local src="$ARMHF_CHROOT/home/build/es" out="$CACHE/emulationstation-gles20"
-    local stamp="$CACHE/emulationstation-gles20.stamp" want header needed lib
-
-    [[ -f "$ES_RENDERER" ]] || { log "es: $ES_RENDERER is missing"; return 1; }
-    [[ -f "$ES_PATCH" ]]    || { log "es: $ES_PATCH is missing"; return 1; }
-
-    # Keyed on the commit and on both files that shape the build, so editing the
-    # renderer rebuilds and re-running the script does not.
-    want="$ES_COMMIT $(sha256sum "$ES_RENDERER" | awk '{print $1}') \
-$(sha256sum "$ES_PATCH" | awk '{print $1}')"
-    if [[ -x "$out" && "$(cat "$stamp" 2>/dev/null)" == "$want" ]]; then
-        ES_BIN="$out"
-        log "es: reusing $out ($(stat -c %s "$out") bytes)"
-        return 0
-    fi
-
-    ensure_armhf_chroot || { armhf_chroot_teardown; return 1; }
-    # The empty stamp name is .j36-deps, which is what this set has always used.
-    chroot_install_deps "" "${ES_BUILD_DEPS[@]}" || { armhf_chroot_teardown; return 1; }
-
-    # Cloned from outside the chroot: git over TLS under qemu-arm is minutes of
-    # emulated crypto for no reason.  --depth 1 of one SHA rather than of a branch,
-    # because the pin has to be in the clone and GitHub serves a reachable SHA.
-    if [[ ! -d "$src/.git" ]]; then
-        log "es: cloning EmulationStation-fcamod at $ES_COMMIT"
-        sudo rm -rf "$src"
-        sudo mkdir -p "$src"
-        sudo chown "$(id -u):$(id -g)" "$ARMHF_CHROOT/home/build" "$src" || true
-        git -C "$src" init -q || return 1
-        git -C "$src" remote add origin "$ES_URL" || return 1
-        git -C "$src" fetch -q --depth 1 origin "$ES_COMMIT" || return 1
-        git -C "$src" checkout -q FETCH_HEAD || return 1
-        # external/pugixml is the tree's one submodule; nanosvg is vendored.
-        git -C "$src" submodule update --init --depth 1 || return 1
-    fi
-
-    cp "$ES_RENDERER" "$src/es-core/src/renderers/" || return 1
-    # Patched from a clean copy every time, so a re-run cannot stack the patch on
-    # top of itself and so a moved upstream fails in patch-gles20.py's anchor
-    # check rather than halfway through cmake.
-    git -C "$src" checkout -- CMakeLists.txt es-core/CMakeLists.txt || return 1
-    python3 "$ES_PATCH" "$src" || return 1
-
-    # CMAKE_POLICY_VERSION_MINIMUM because upstream's cmake_minimum_required is
-    # 2.8 and trixie's cmake is 3.31, which makes anything under 3.5 an error.
-    log "es: configuring and building EmulationStation for armhf (emulated; this is slow)"
-    armhf_chroot_run "cd /home/build/es && rm -rf CMakeCache.txt CMakeFiles && \
-        cmake -DGLES20=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release ." \
-        || { armhf_chroot_teardown; return 1; }
-    armhf_chroot_run "cd /home/build/es && make -j\$(nproc)" \
-        || { armhf_chroot_teardown; return 1; }
-    armhf_chroot_teardown
-
-    [[ -f "$src/emulationstation" ]] || { log "es: make left no binary"; return 1; }
-
-    mkdir -p "$CACHE"
-    # Stripped, because this goes on a 100 MB vfat partition beside the kernel, the
-    # initrd and the module payloads, and ES's debug info is most of its size.
-    arm-linux-gnueabihf-strip -o "$out" "$src/emulationstation" || return 1
-    chmod 0755 "$out"
-
-    # The assertion the whole design rests on: no GL library in DT_NEEDED.  A
-    # regression here does not fail to build, it builds a binary that dlopens the
-    # RK3326 Mali blob on a Cortex-A7 and dies with SIGILL before main().
-    header="$(readelf -hd "$out" 2>/dev/null)" || return 1
-    grep -q 'Class:.*ELF32' <<<"$header" || { log "es: not a 32-bit ELF"; return 1; }
-    grep -q 'Machine:.*ARM' <<<"$header" || { log "es: not an ARM ELF"; return 1; }
-    needed="$(sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p' <<<"$header" | tr '\n' ' ')"
-    for lib in $needed; do
-        case "$lib" in
-            libEGL*|libGL*|libGLES*|libMali*|libmali*|libgbm*)
-                log "es: the binary links $lib -- patch-gles20.py did not take the GL"
-                log "    library off the link line, and every one of those names on this"
-                log "    rootfs is a symlink to an ARMv8-A libMali.so.  Refusing to stage it."
-                return 1
-                ;;
-        esac
-    done
-
-    printf '%s\n' "$want" >"$stamp"
-    ES_BIN="$out"
-    log "es: $(stat -c %s "$out") bytes, stripped ARM, no GL in DT_NEEDED"
-    log "es: needs $needed"
-    return 0
-}
-
 # ── mixdash: the dashboard, and what it does not need ─────────────────────────
 #
-# WHY THIS EXISTS.  EmulationStation reaches the panel through SDL's KMSDRM
-# backend, so EGL, so GBM, so Mesa's lima on a Mali-450 -- and it stayed black with
-# no error past eglCreateContext.  mixdash reaches the panel through none of them:
+# WHY THIS EXISTS.  Everything tried on this panel before it reached it through
+# SDL's KMSDRM backend, so EGL, so GBM, so Mesa's lima on a Mali-450 -- five layers
+# that each fail silently, and a black panel is what all five look like from the
+# outside.  mixdash reaches the panel through none of them:
 # Qt5 Widgets on the `linuxfb' platform plugin writes into /dev/fb0, and on this
 # board /dev/fb0 is the framebuffer the LK already lit.  That is not a hope, it is
 # the consequence of two decisions further up this file: FB_SIMPLE binds the device
@@ -4950,8 +4680,8 @@ $(sha256sum "$ES_PATCH" | awk '{print $1}')"
 # this panel already proved the path end to end.
 #
 # WHAT IS BUILT.  Five files in device/j36-ultra/tools/mixdash, against Debian's own
-# qtbase5-dev in the same armhf chroot EmulationStation used.  Nothing is
-# cross-compiled, no Qt is built from source, and QT does not include opengl.
+# qtbase5-dev in the armhf chroot above.  Nothing is cross-compiled, no Qt is built
+# from source, and QT does not include opengl.
 #
 # WHERE IT GOES, AND WHY NOT ONTO BOOT.  Qt's runtime closure for the linuxfb path
 # is 14 MB of Qt plus 35 MB of ICU -- libQt5Core.so.5 carries libicui18n.so.76 and
@@ -5323,11 +5053,12 @@ QTCONF
     return 0
 }
 
-# J36_GL is the GL front end and the probe, and it is worth keeping even now that
-# the dashboard needs no GL: eglprobe is still the only thing here that says whether
-# a frame reaches the glass, and anything launched from the dashboard that does want
-# GL resolves it out of this payload.  J36_ES is the name that word used to have.
-if [[ "${J36_GL:-${J36_ES:-1}}" == 1 ]]; then
+# J36_GL is Mesa and the probe, and it is worth keeping even now that the dashboard
+# needs no GL: eglprobe is still the only thing here that says whether a frame reaches
+# the glass, and anything launched from the dashboard that does want GL resolves it
+# out of this payload.  J36_ES was the name this word had; it is gone with the rest of
+# that spelling, and the default is on either way.
+if [[ "${J36_GL:-1}" == 1 ]]; then
     set +e
     collect_gl_payload
     gl_rc=$?
@@ -5342,7 +5073,7 @@ if [[ "${J36_GL:-${J36_ES:-1}}" == 1 ]]; then
     probe_rc=$?
     set -e
     if (( probe_rc != 0 )); then
-        ESPROBE_BIN=""
+        EGLPROBE_BIN=""
         log "gl: eglprobe was not built, see the error above -- j36.gl=debug will just be quieter"
     fi
 else
@@ -5376,27 +5107,20 @@ else
     log "mixdash: J36_DASH=0, skipping the dashboard"
 fi
 
-# EmulationStation, and it is off by default now.  Not because the GLES 2.0 renderer
-# was wrong -- it is still here, and the reasoning above it still holds -- but because
-# it never drew: the last measurement was a context that was created, a frame that was
-# submitted and a panel that stayed black, with nothing in EGL, in SDL or in Mesa
-# saying why.  Five layers deep is a bad place to be stuck, and the dashboard reaches
-# the same panel through none of them.  J36_ES_BUILD=1 brings it back verbatim, and it
-# is worth keeping buildable: it is the only real GL application on this board, so the
-# day mtk_drm and lima do land a frame, this is what proves it.
-if [[ "${J36_ES_BUILD:-0}" == 1 ]]; then
-    set +e
-    build_es_gles20
-    es_rc=$?
-    set -e
-    if (( es_rc != 0 )); then
-        ES_BIN=""
-        armhf_chroot_teardown
-        log "es: the GLES 2.0 binary was not built, see the error above -- the card"
-        log "    will carry no j36/es"
-    fi
-else
-    log "es: J36_ES_BUILD=0, EmulationStation is not built (the dashboard replaces it)"
+# J36_ES_BUILD=1 built the GLES 2.0 EmulationStation here, and it is gone rather than
+# defaulted off.  It had already been off by default for a while, and not because the
+# renderer was wrong: the last measurement was a context that was created, a frame
+# that was submitted and a panel that stayed black, with nothing in EGL, in SDL or in
+# Mesa saying why.  Five layers deep is a bad place to be stuck, and the dashboard
+# reaches the same panel through none of them.  Something still has to prove a frame
+# on lima the day mtk_drm lands one, and eglprobe is that something now -- it is 400
+# lines instead of a fork of a fork of a front end, and mixdash-probe.service already
+# runs it once per boot.
+#
+# Set by habit, by a stale environment, or by a script that has not been updated: say
+# so rather than silently doing nothing.
+if [[ -n "${J36_ES_BUILD:-}" ]]; then
+    log "es: J36_ES_BUILD=${J36_ES_BUILD} is ignored; EmulationStation is not part of this build"
 fi
 
 # ── The SD BOOT payload: the launcher, and nothing else ───────────────────────
@@ -5578,30 +5302,15 @@ fi
 
 # The probe sits beside the payload rather than inside j36/gl/, because that
 # directory is copied wholesale into the loader's search path and a binary is not
-# a library. j36.es=debug runs it; j36.es=1 never touches it. Deleting it is the
-# same contract as the rest: the debug boot simply loses this report.
-if [[ -n "$ESPROBE_BIN" ]]; then
+# a library. mixdash-probe.service runs -f once per boot and j36.gl=debug adds the
+# node probes; j36.gl=1 on its own never touches it. Deleting it is the same
+# contract as the rest: the boot loses the colour bars and this report, and nothing
+# else changes.
+if [[ -n "$EGLPROBE_BIN" ]]; then
     mkdir -p "$PAYDIR"
-    cp "$ESPROBE_BIN" "$PAYDIR/eglprobe"
+    cp "$EGLPROBE_BIN" "$PAYDIR/eglprobe"
     chmod 0755 "$PAYDIR/eglprobe"
     log "gl: staged $PAYREL/eglprobe ($(stat -c %s "$PAYDIR/eglprobe") bytes)"
-fi
-
-# j36/es/ is the GLES 2.0 EmulationStation, and it is the one payload here that
-# REPLACES something rather than adding to it -- /init bind-mounts it over
-# /usr/bin/emulationstation/emulationstation.  The removal contract is therefore
-# the interesting one: delete this directory and the rootfs's own binary runs
-# instead, which is the status-134 abort this exists to fix, so /init says which of
-# the two it mounted and the drop-in it writes differs accordingly.
-#
-# Its own directory and not j36/ directly, so that the one file that has to be
-# deleted to go back to the old behaviour is a directory a reader can see the
-# purpose of.
-if [[ -n "$ES_BIN" ]]; then
-    mkdir -p "$PAYDIR/es"
-    cp "$ES_BIN" "$PAYDIR/es/emulationstation"
-    chmod 0755 "$PAYDIR/es/emulationstation"
-    log "es: staged $PAYREL/es/emulationstation ($(stat -c %s "$PAYDIR/es/emulationstation") bytes)"
 fi
 
 # rdinit=/init stays even though root= is now present, and the two do not
@@ -5643,8 +5352,8 @@ initrd=initrd.img
 # j36.audio=speaker powers the class-D amp off VBAT, the system node, so a
 # battery-less board pulls itself under its own lockout.  j36.usb=1 sources 5 V
 # off that same rail: say j36.usb=novbus with no cell, or a self-powered hub.
-# j36.gl=debug adds Mesa's EGL trace; a diagnostic, not a default.  j36.es is
-# the old j36.gl.  j36.splash=0 with loglevel=7 boots to text, which is the pair
+# j36.gl=debug adds Mesa's EGL trace; a diagnostic, not a default.
+# j36.splash=0 with loglevel=7 boots to text, which is the pair
 # ./build-j36-ultra.sh --no-splash writes here.
 bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1 j36.usb=1 j36.power=1 j36.splash=1
 CONF
@@ -5738,9 +5447,6 @@ written by a build from before this layout has the same directory on BOOT instea
 and /init looks there second and says which one it found, so such a card still
 boots -- but the tarball above is where new payloads go.
 
-EmulationStation is not part of these builds and is not started.  There is no
-j36/es/ directory any more.
-
 The R36S kernel on the same card is arm64 and stays there for the R36S.  The
 armhf Debian rootfs is shared, and this kernel can now mount it: MSDC1, the
 microSD host, is driven by mtk-sd through a mediatek,mt6592-mmc node, and ext2 --
@@ -5813,9 +5519,8 @@ batt_led.service, no longer masked
 
     Other RK3326-only units are left alone on purpose: 351mp.service (power LED,
     backlight, amixer), audiopath, audiostate and wifi_importer are all
-    Type=oneshot, so they fail once and stay failed, and emulationstation is
-    Restart=on-failure under the default 5-starts-in-10-s limit.  Bounded noise
-    is evidence; only the unbounded one had to go.
+    Type=oneshot, so they fail once and stay failed.  Bounded noise is evidence;
+    only the unbounded one had to go.
 
     The three audio units are worth watching now that j36.audio=1 registers a card:
     they were failing on a machine with no /dev/snd at all, and with one present
@@ -6078,7 +5783,7 @@ j36.power=nocharge
     so a boot without the word starts from whatever the last boot with it left
     behind, not from a clean slate.
 
-j36.gl=1  (j36.es=1 is the old spelling of the same word)
+j36.gl=1
     Stage j36/gl/ -- Debian's armhf Mesa -- into a tmpfs, so that a program looking
     for libEGL.so.1 finds it there instead of at the RK3326's Mali blob, which is
     what /usr/lib on the shared rootfs points those names at and which is an
@@ -6101,21 +5806,18 @@ j36.gl=1  (j36.es=1 is the old spelling of the same word)
     whether anything userspace draws can be seen at all.
 
 j36.dash=1
-    Run the MixOS dashboard as the shell, and take EmulationStation out of the boot:
-    the unit is masked in /run/systemd/system.control -- the one runtime directory
-    that outranks the /etc its unit file lives in -- and its ExecStart is reset to an
-    echo as well, in case a systemd ever ignores the mask.  mixdash.service is
-    written into /run/systemd/system and wanted from multi-user.target through a
-    symlink there.  All of it is in tmpfs and none of it survives a reboot.
+    Run the MixOS dashboard as the shell.  mixdash.service is written into
+    /run/systemd/system and wanted from multi-user.target through a symlink there.
+    All of it is in tmpfs and none of it survives a reboot.
 
     The dashboard is not on this partition: /init looks for opt/mixos/bin/mixdash in
     the rootfs first and then on every other partition of the card, read-only.  Every
     partition it tries is named on the console -- as carrying no opt/mixos, or as
     unmountable, which is what a btrfs data partition looks like here because the
-    initramfs carries no modules.  With nothing found it says so and still does not
-    start EmulationStation, because that binary aborts with status 134 on this board
-    and its unit restarts it -- six identical stack traces over the message explaining
-    the fault is worse than the message.
+    initramfs carries no modules.  With nothing found it says so and starts nothing
+    in its place.  There is no fallback front end to fall back to: the dashboard is
+    the only shell this build has, and a board with no keyboard is better served by
+    a console that says what is missing than by something else taking the panel.
 
     And because those lines are printed from the initramfs, where a hundred lines of
     kernel and systemd output push them off a 640x480 panel long before anybody reads
@@ -6125,8 +5827,8 @@ j36.dash=1
     no other diagnostic interface.  If what you see instead is a console that simply
     stops -- typically at hostnamed deactivating -- then j36.dash=1 never reached
     /proc/cmdline, and /init says that too: without the word nothing is staged and
-    whatever the rootfs starts by itself is what you get, which on a rootfs whose
-    EmulationStation is not enabled is nothing at all.
+    whatever the rootfs starts by itself is what you get, which on this rootfs is a
+    login prompt on a console nothing is plugged into.
 
     One more thing it arranges: /run/j36/card, which is where the dashboard's Files
     page opens.  That is not a convenience -- with no keyboard there is no way to
@@ -6148,15 +5850,14 @@ j36.dash=1
     BOOT is recognised and skipped by carrying j36/ or mvii/ rather than by its
     device name, which is only known on a boot that had reason to mount it.
 
-    Why ES was dropped rather than fixed: the rootfs's binary was compiled with the
-    fixed-function renderer, and GLES1 is the one API this stack cannot supply.
-    Debian's armhf Mesa 25.0.7 is a -Dgles1=disabled build, so an ES1 context is
-    0x3003 EGL_BAD_ALLOC on lima, on llvmpipe and on softpipe alike.
-    Renderer_GLES10.cpp then reads glGetString(GL_EXTENSIONS) without having checked
-    SDL_GL_CreateContext, so a context that was never created arrives as
-    std::string(NULL) -- abort, 134.  A GLES 2.0 rebuild did get a context ("OpenGL
-    ES 2.0 Mesa 25.0.7-2+deb13u1") and still drew a black panel, through five
-    silent layers -- ES, SDL, KMSDRM, EGL, GBM.  The dashboard removes all five.
+    Why a framebuffer dashboard rather than something on GL: everything that had
+    been tried on the panel before it went through five layers that each fail
+    silently -- SDL, KMSDRM, EGL, gbm, the driver -- and a black panel is what all
+    five look like from the outside.  Qt on linuxfb has none of them.  It needs no
+    context, no modeset and no DRM node, so the only thing between it and the glass
+    is the memory LK already lit, and when it does not draw there is one place to
+    look.  GL is still on the card and still measured, but it is now a card in the
+    dashboard rather than the thing the boot depends on.
 
 j36.splash=1
     The boot picture, and the boot stage written on it.  Both halves of it are in
@@ -6206,19 +5907,19 @@ Doom, what it was for, and why it is no longer on the card
 ----------------------------------------------------------
 
 It answered a question the boot itself does not: whether a program can drive this
-panel and read this pad.  It did, the answer was yes, and EmulationStation now
-answers the same question further up the stack -- so J36_DOOM defaults to 0 and
-neither j36/doom nor an IWAD is written to this partition.  Everything below is
-what a J36_DOOM=1 build stages, kept because /init still runs it and because it
-is the fastest way to split "the panel is broken" from "GL is broken".
+panel and read this pad.  It did, the answer was yes, and the dashboard now
+answers the same question every boot -- so J36_DOOM defaults to 0 and neither
+j36/doom nor an IWAD is written to this partition.  Everything below is what a
+J36_DOOM=1 build stages, kept because /init still runs it and because it is the
+fastest way to split "the panel is broken" from "GL is broken".
 
-Nothing already on the card can ask that question -- SDL2 has no
-fbdev backend, so gzdoom, lzdoom and EmulationStation all need DRM/KMS or GL,
-this kernel has no DRM driver bound yet, and the GL stack in the shared rootfs is
-the RK3326's Mali-G31 blob for a GPU this SoC has not got.  doomgeneric needs
-none of that: it writes 32-bit pixels into /dev/fb0, which is the framebuffer the
-MVII LK was already scanning out when it jumped to the kernel, and reads
-/dev/input/event0 from j36_mt6592_input.ko.
+Nothing else on the card could ask it at the time -- SDL2 here has no fbdev
+backend, so anything SDL-based needs DRM/KMS or GL, this kernel had no DRM driver
+bound yet, and the GL stack in the shared rootfs is the RK3326's Mali-G31 blob for
+a GPU this SoC has not got.  doomgeneric needs none of that: it writes 32-bit
+pixels into /dev/fb0, which is the framebuffer the MVII LK was already scanning out
+when it jumped to the kernel, and reads /dev/input/event0 from
+j36_mt6592_input.ko.
 
 It runs from the initramfs, before switch_root, so it touches nothing on the
 shared rootfs and competes with no systemd unit for the panel.  It takes the VT
@@ -6381,19 +6082,24 @@ comes out of the shared Debian rootfs and has nothing to do with any of this.  I
 first two lines are early-exit GOTOs whose LABEL is in a file udev is not reading
 here; it was there when there was no ALSA core at all, and it is still there now.
 
-EmulationStation
-----------------
+Mesa, and what GL on this board can do
+--------------------------------------
 
-It is the default now.  Four links had to close for that, each one measured rather
-than assumed, and it is worth keeping the list because it is also the fault tree:
+The dashboard needs no GL at all: it is Qt drawing with the CPU into /dev/fb0.  GL
+is here for j36/eglprobe -- the display tests below, and the "3D cube" card, which
+is the dashboard running eglprobe -c -- and for anything added later that wants a
+context.  Four links had to close before any of that worked, each one measured
+rather than assumed, and the list is worth keeping because it is also the fault
+tree:
 
   1. A KMS device.  j36.mtkdrm=1 gives /dev/dri/card0 for the display, j36.lima=1
      gives /dev/dri/renderD128 for rendering.  Before this the panel was simplefb
-     only -- a framebuffer, not a DRM device -- and SDL cannot use one.
-  2. An SDL2 that can drive it.  This one needed nothing: the SDL2 in the shared
-     rootfs has KMSDRM, wayland, offscreen and dummy compiled in.  There is no
-     fbdev backend, which is why /dev/fb0 was never a route to ES, and KMSDRM
-     needs the card node step 1 produces.
+     only -- a framebuffer, not a DRM device -- and nothing that wants a modeset
+     can use one.
+  2. A client that can drive it.  The SDL2 in the shared rootfs has KMSDRM,
+     wayland, offscreen and dummy compiled in.  There is no fbdev backend, which
+     is why /dev/fb0 is not a route to anything SDL-based, and why KMSDRM needs
+     the card node step 1 produces.
   3. A Mesa that can pair the two.  This is why the display driver is
      mediatek-drm specifically: Debian's armhf Mesa 25.0.7 ships BOTH halves of
      the pair, dri/lima_dri.so for the renderer and dri/mediatek_dri.so for the
@@ -6402,12 +6108,11 @@ than assumed, and it is worth keeping the list because it is also the fault tree
      one reason it was never the answer -- the other being that it binds the same
      `simple-framebuffer' the working display is on and evicts simplefb.
   4. A GL front end that is Mesa's.  Debian's Mesa was in the rootfs all along;
-     what was not was its front door.  The shared rootfs points libEGL.so, libgbm.so{,.1,.1.0.0}
-     and libGLESv1_CM.so at the RK3326's Mali-G31 blob, and
-     emulationstation.service pins SDL to it with SDL_VIDEO_EGL_DRIVER=libEGL.so.
+     what was not was its front door.  The shared rootfs points libEGL.so,
+     libgbm.so{,.1,.1.0.0} and libGLESv1_CM.so at the RK3326's Mali-G31 blob.
      Bifrost is a different architecture from this SoC's Utgard part, so that
-     library cannot drive this GPU whatever else is true.  j36.es=1 closes it:
-     see the next section.
+     library cannot drive this GPU whatever else is true.  j36.gl=1 closes it:
+     see below.
 
 So there was no Mesa to cross-compile.  The whole of step 4 is five small
 libraries -- about 1.4 MB, most of it glvnd's dispatch table -- and an environment.
@@ -6418,11 +6123,10 @@ libEGL_mesa.so.0 -- Mesa's own EGL vendor, the library /usr/share/glvnd/
 egl_vendor.d/50_mesa.json names -- carries libgbm.so.1 in its DT_NEEDED.  So on
 the rootfs as it stands, asking for EGL loads glvnd, glvnd loads Mesa's vendor,
 and Mesa's vendor pulls the Mali-G31 blob in as its GBM.  Mesa's EGL cannot come
-up on this board without the payload.  That is a stronger statement than "ES will
-not link", and it is why the fix is a library path rather than a rebuild.
+up on this board without the payload, whatever is asking for it.
 
-The GL front end, and why it is a tmpfs
----------------------------------------
+Why the payload is a tmpfs
+--------------------------
 
 THE SHARED ROOTFS IS NOT WRITTEN.  That is the constraint everything here follows
 from.  One Debian armhf rootfs serves two machines, and the R36S needs its
@@ -6430,296 +6134,164 @@ libEGL.so -> libMali.so symlinks to stay exactly where they are, because that bl
 is the only thing that drives its Mali-G31.  Replacing them would trade this
 board's GL for the other board's.
 
-So with j36.es=1 the initramfs, after it has mounted the rootfs and before it hands
-over, mounts a tmpfs on the rootfs's /run and puts three things in it: the
-libraries from j36/gl/, the binary from j36/es/, and a systemd drop-in at
-/run/systemd/system/emulationstation.service.d/j36-gl.conf that sets
-LD_LIBRARY_PATH=/run/j36/gl and the SDL variables.  systemd reads drop-ins from
-/run exactly as it reads them from /etc, and it reads them after the unit file, so
-the drop-in's SDL_VIDEO_EGL_DRIVER replaces the unit's own rather than fighting it.
-Mounting /run from the initrd is the documented half of the handover: PID 1 adopts
-a /run that is already a tmpfs instead of mounting another over the top.
-
-The binary goes in over /usr/bin/emulationstation/emulationstation as a BIND MOUNT,
-which is the same constraint solved the same way: the mount table is in memory, the
-file underneath is not touched, and switch_root moves the mount across with
-everything else under /newroot.
+So with j36.gl=1 the initramfs, after it has mounted the rootfs and before it hands
+over, mounts a tmpfs on the rootfs's /run and copies j36/gl/ into /run/j36/gl.
+Anything that wants Mesa is run with LD_LIBRARY_PATH=/run/j36/gl, which puts the
+payload's libEGL.so.1, libgbm.so.1 and libGLESv2.so.2 ahead of the rootfs's
+symlinks to the blob.  Mounting /run from the initrd is the documented half of the
+handover: PID 1 adopts a /run that is already a tmpfs instead of mounting another
+over the top, which is also what keeps /run/j36 visible after systemd starts.
 
 Pull the card into an R36S and none of it exists.  Nothing was written to the
 filesystem, so there is nothing to undo.
 
-The renderer, and why the binary had to be rebuilt
--------------------------------------------------
+Which APIs come up, and which one does not
+------------------------------------------
 
-GLES1 is the one API this stack cannot supply, and that is a property of the
-package rather than of this SoC: Debian's armhf Mesa 25.0.7 is a -Dgles1=disabled
-build, so eglCreateContext for an ES1 context returns 0x3003 EGL_BAD_ALLOC on lima,
-on llvmpipe AND on softpipe.  The rootfs's EmulationStation is compiled
--DUSE_OPENGLES_10, so on this board it asks for the one thing that cannot be given,
-does not check the answer, and aborts -- the 134 below.
+Measured with j36/eglprobe, per DRM node, and against a software control row:
 
-The error code says there is nothing to configure around it.  Mesa's
-validate_context_version rejects an API the screen does not advertise with
-__DRI_CTX_ERROR_BAD_API, which surfaces as EGL_BAD_MATCH; BAD_ALLOC is
-__DRI_CTX_ERROR_NO_MEMORY, a driver whose own context creation returned NULL.  ES1
-is BAD_ALLOC everywhere here, so the version gate passed and
-MESA_GL_VERSION_OVERRIDE has nothing to override.
+  ES2 = ctx/cur "OpenGL ES 2.0 Mesa 25.0.7-2+deb13u1" on lima, current on an
+        ARGB8888 window surface
+  GL  = ctx/cur "4.5 (Compatibility Profile) Mesa 25.0.7-2+deb13u1" on swrast
+  ES1 = 0x3003 EGL_BAD_ALLOC on lima, on llvmpipe and on softpipe alike
 
-What lima does give is ES2: "OpenGL ES 2.0 Mesa 25.0.7-2+deb13u1", context created
-and made current on an ARGB8888 window surface.  So es/Renderer_GLES20.cpp is a
-third renderer -- the 351v tree has only Renderer_GLES10.cpp and Renderer_GL21.cpp,
-both fixed-function -- and the build compiles the same upstream commit the rootfs's
-copy came from with -DUSE_OPENGLES_20 instead.  The renderer's own header comment
-carries the details; three of its decisions matter from outside:
+The ES2 row clears the whole lower half of the stack in one measurement: gbm, the
+kmsro mediatek-to-lima pairing, the config, the ARGB8888 visual, lima's own context
+creation and the kernel uAPI all work.  ES2 is what to write against here.
 
-  - It links no GL library and resolves all 43 entry points through
-    SDL_GL_GetProcAddress.  Every unversioned GL name on this rootfs -- libEGL.so,
-    libGLESv2.so, libGLESv2.so.2, libGLESv1_CM.so* -- is a symlink to an
-    SONAME-less ARMv8-A libMali.so, so any -l against them records a DT_NEEDED that
-    is SIGILL on a Cortex-A7.  With none of them named, one binary is correct on
-    both machines and no LD_PRELOAD is needed at all.
-  - It asks for ES2 explicitly.  Both upstream renderers set
-    SDL_GL_CONTEXT_MAJOR_VERSION twice instead of MAJOR then MINOR (GLES10: 1 then
-    0; GL21: 2 then 1), and with major_version 0 SDL sends no context attributes,
-    so EGL falls back to its own default of desktop OpenGL.  That typo is why the
-    fixed-function binary was getting a compat context by accident.
-  - Three one-line fragment programs instead of one with a mode uniform, because
-    Utgard fragment hardware has no branching; and the ALPHA-texture program
-    follows the spec's MODULATE row (Cv = Cf, Av = Af * At) rather than multiplying
-    the texel in, which a naive shader does and which renders every glyph black.
+The ES1 row is a property of the package and not of this SoC: Debian's armhf Mesa
+is a -Dgles1=disabled build, so there is no fixed-function GL on this image at all
+and no environment variable brings one back.  The error code says that before the
+source does.  Mesa's validate_context_version rejects an API the screen does not
+advertise with __DRI_CTX_ERROR_BAD_API, which surfaces as EGL_BAD_MATCH; BAD_ALLOC
+is __DRI_CTX_ERROR_NO_MEMORY, a driver whose own context creation returned NULL.
+Both ES1 rows are BAD_ALLOC, so the version gate passed and the versions are
+advertised -- MESA_GL_VERSION_OVERRIDE has nothing to override and is not worth
+trying.  Anything ported here that draws with glMatrixMode and glEnableClientState
+has to be rewritten to shaders; it cannot be configured into working.
 
-The fallback, and why LD_PRELOAD is still in the file
-----------------------------------------------------
+Three things about writing ES2 for this hardware, learned the expensive way:
 
-Delete j36/es/ from the card and the rootfs's own binary runs.  /init notices,
-says which one it mounted, and writes a different drop-in: LD_PRELOAD=libGL.so.1
-and SDL_VIDEO_GL_DRIVER=libGL.so.1.  That path has never drawn a frame on this
-board -- it is the 134 -- but it is what the card does without the directory, so it
-is configured deliberately rather than left to chance.
+  - Link no GL library.  Resolve entry points through eglGetProcAddress or
+    SDL_GL_GetProcAddress instead.  Every unversioned GL name on this rootfs --
+    libEGL.so, libGLESv2.so, libGLESv1_CM.so* -- is a symlink to an SONAME-less
+    ARMv8-A libMali.so, so any -l against them records a DT_NEEDED that is SIGILL
+    on a Cortex-A7.  With none of them named, one binary is correct on both
+    machines.
+  - Ask for ES2 explicitly, and set MAJOR then MINOR.  Setting
+    SDL_GL_CONTEXT_MAJOR_VERSION twice is a common typo, and with major_version 0
+    SDL sends no context attributes at all, so EGL falls back to its default of
+    desktop OpenGL: a program that thought it asked for ES2 gets a compat context
+    by accident, which works on swrast and nowhere else on this board.
+  - Utgard fragment hardware has no branching, so one small program per case beats
+    one program with a mode uniform; and an ALPHA texture has to follow the spec's
+    MODULATE row (Cv = Cf, Av = Af * At) rather than multiplying the texel in,
+    which a naive shader does and which renders every glyph black.
 
-Its reasoning, since the file still carries it.  That binary's undefined GL symbols
-are glMatrixMode, glLoadMatrixf, glEnableClientState and 26 more like them, while
-the only GL library it declares a dependency on is libEGL.so.  That works against a
-vendor blob, where one object exports EGL and GLES1 and GLES2 together; glvnd's
-libEGL exports no gl* entry point at all, so a library that has them must be in the
-global scope before the binary starts or it does not start.  libGLESv1_CM.so.1 is
-the obvious choice and the wrong one, for the reason above.  libGL.so.1 works
-because all 29 of those symbols are exported by it with the signatures GLES1 gives
-them -- client arrays, the matrix stack, glTexImage2D with GL_ALPHA,
-GL_CLAMP_TO_EDGE and the stencil calls are common to GLES1 and to GL compat -- and
-a compat context does come up, reporting "4.5 (Compatibility Profile) Mesa 25.0.7"
-on llvmpipe.
+Two failure signatures are worth knowing on sight, because each one looks like a
+bug in whatever printed it and is not.
 
-Be precise about what the preload changes, because it is easy to overclaim: the
-dispatch was never broken.  Run against the image's own libraries, in a binary
-linked the way ES is -- gl* undefined, no libGL in DT_NEEDED -- with a compat
-context current:
-
-  LD_PRELOAD=libGL.so.1          glGetString -> "4.5 (Compatibility Profile)"
-  LD_PRELOAD=libGLESv1_CM.so.1   glGetString -> "4.5 (Compatibility Profile)"
-  no LD_PRELOAD                  glGetString -> NULL, from the stub it was linked
-                                 against, which is the 134
-
-Both preloads work, and glMatrixMode, glLoadMatrixf and glEnableClientState are
-accepted with glGetError 0 through either.  glvnd is why: libEGL.so.1 and both GL
-front ends share one libGLdispatch.so.0 current-context table, so whatever
-eglMakeCurrent installed is what the stubs dispatch into, no matter which stub
-library the symbol came from.  Only one copy of libGLdispatch is ever loaded, and
-LD_LIBRARY_PATH puts the payload's ahead of the rootfs's.
-
-So the preload was necessary and its name was not the fault.  ES aborting means the
-CONTEXT was never created, and on the DRM nodes it never is -- which is what the
-rebuild above is for, and why the probe's GL row was the measurement that decided
-between the two:
-
-  GL=ctx    desktop compat works on lima; the library payload alone would do.
-  GL=0x3003 lima cannot create a compat context either.  Then no fixed-function
-            context of any kind exists on this stack and no environment can make
-            one: the ES1 half is a Mesa built without it, the compat half is the
-            driver, and the renderer has to change.  It did.
-
-Note that the error code discriminates before the source does.  Mesa's
-validate_context_version rejects an API the screen does not advertise with
-__DRI_CTX_ERROR_BAD_API, which surfaces as EGL_BAD_MATCH; BAD_ALLOC is
-__DRI_CTX_ERROR_NO_MEMORY, which is what a driver whose own context creation
-returned NULL produces.  Both ES1 rows here are BAD_ALLOC, so the version gate
-passed and the versions are advertised -- MESA_GL_VERSION_OVERRIDE has nothing to
-override and is not worth trying.
-
-One failure has a signature worth knowing on sight:
-
-  emulationstation.sh: line 27: NNN Illegal instruction "$esdir/emulationstation"
-  emulationstation.service: Main process exited, code=exited, status=132/n/a
+  <program>: Illegal instruction
+  <unit>.service: Main process exited, code=exited, status=132/n/a
 
 Status 132 is 128+4, SIGILL, and it happens before main().  It means the process
 loaded the RK3326 Mali blob: libMali.so is an ARMv8-A object (readelf -A says
 Tag_CPU_arch: v8) and the MT6592 is a Cortex-A7, so the first instruction the blob
-executes is one this SoC does not have.  EmulationStation itself is v7 and fine.
-So SIGILL is never an ES bug and never a Mesa bug -- it means the GL payload did
-not take, and the loader fell back to /usr/lib.  Check for "es: GL front end in
-/run/j36/gl" in the boot log, and `ls /run/j36/gl` on the device: if libEGL.so is
-not in there, nothing else in this section matters yet.  With j36/es/ on the card
-this one should be gone for good: that binary names no GL library at all, so there
-is nothing for the loader to resolve to the blob.
+executes is one this SoC does not have.  SIGILL here is never a Mesa bug and never
+the program's -- it means the GL payload did not take and the loader fell back to
+/usr/lib.  Check for "gl: payload in /run/j36/gl" in the boot log and `ls
+/run/j36/gl` on the device: if libEGL.so.1 is not in there, nothing else in this
+section matters yet.
 
-The other signature is the one after that one is fixed, and it is the fixed-function
-binary's -- if it appears while "es: the GLES 2.0 binary is mounted over the
-rootfs's" is in the boot log, then the bind mount and the abort disagree and the
-mount is what to doubt first:
-
-  emulationstation.sh[878]: terminate called after throwing an instance of
-                            'std::logic_error'
-  emulationstation.sh[878]:   what():  basic_string: construction from null is not valid
-  emulationstation.service: Main process exited, code=exited, status=134/n/a
+  terminate called after throwing an instance of 'std::logic_error'
+    what():  basic_string: construction from null is not valid
+  <unit>.service: Main process exited, code=exited, status=134/n/a
 
 134 is 128+6, SIGABRT from an uncaught C++ exception, and it is NOT a missing
-EmulationStation -- a missing binary is status 127 and a different message.  It is
-one line of upstream ES, es-core/src/renderers/Renderer_GLES10.cpp:129:
+binary -- a missing binary is status 127 and a different message.  It is the shape
+of every program that calls SDL_GL_CreateContext, does not check what came back,
+and then reads glGetString(GL_EXTENSIONS): with no context current, glvnd's no-op
+dispatch returns NULL and std::string(NULL) throws.  So the abort is a report that
+eglCreateContext failed, and that the reason was discarded one line earlier.  Ask
+eglprobe for the reason rather than reading the abort.
 
-  sdlContext = SDL_GL_CreateContext(getSDLWindow());
-  SDL_GL_MakeCurrent(getSDLWindow(), sdlContext);
-  ...
-  std::string glExts = (const char *)glGetString(GL_EXTENSIONS);
+j36.gl=debug asks for it at boot instead: EGL_LOG_LEVEL=debug, MESA_DEBUG=1 and
+LIBGL_DEBUG=verbose, plus the node probes before the dashboard starts.  Two things
+in that trace are noise and not failures:
 
-Neither return value is checked, so when the context cannot be created the next GL
-call goes to glvnd's no-op dispatch, returns NULL, and std::string(NULL) throws.
-The abort is therefore a report that eglCreateContext failed and that the reason
-was discarded one line earlier.
-
-j36.es=debug asks for the reason.  It adds ES's --debug -- which reaches stderr
-even with LogLevel=disabled in es_settings.cfg, because Log::~Log() writes to
-stderr at LogDebug while Log::init() never opens the file -- plus
-EGL_LOG_LEVEL=debug, MESA_DEBUG=1, LIBGL_DEBUG=verbose and Restart=no, so there is
-one trace to read instead of six.  What that boot showed, in order:
-
-  libGL: Can't open configuration file /home/ark/.drirc: No such file
+  libGL: Can't open configuration file /home/virtua/.drirc: No such file
   libEGL debug: No DRI config supports native format <name>          (repeatedly)
+
+The .drirc line is Mesa looking for a tuning file that was never written, and the
+"No DRI config supports native format" lines come from Mesa's own per-visual walk
+at eglInitialize: libEGL_mesa.so.0 carries that literal next to dri2_create_context
+and DRI2: failed to validate config, it prints a pipe-format name, and it says one
+line for every format in Mesa's visual table that this driver pair does not expose.
+A kmsro display device exposes few, so most of the table misses and the noise is
+expected.
+
   libEGL debug: EGL user error <code> in dri2_create_context
-  what():  basic_string: construction from null is not valid
 
-Only the third line is a failure.  The .drirc lines are Mesa looking for tuning
-files that were never written, and the "No DRI config supports native format"
-lines come from Mesa's own per-visual walk at eglInitialize: libEGL_mesa.so.0
-carries that literal next to dri2_create_context and DRI2: failed to validate
-config, it prints a pipe-format name, and it says one line for every format in
-Mesa's visual table that this driver pair does not expose.  A kmsro display device
-exposes few, so most of the table misses and the noise is expected.
+That one is a failure, and the code is the whole message: BAD_MATCH is the DRI
+layer rejecting the API or the version, BAD_ALLOC is the driver's own context
+creation returning NULL.  Those have different fixes and look identical from
+anywhere above EGL.
 
-The third line is eglCreateContext being rejected inside Mesa, and the order of
-SDL's calls narrows it a long way before anything is measured.  SDL's KMSDRM
-backend chooses a config, creates a gbm surface, calls eglCreateWindowSurface and
-only then creates a context (SDL_kmsdrmvideo.c: KMSDRM_CreateSurfaces at 1190,
-SDL_EGL_SetRequiredVisualId with GBM_FORMAT_ARGB8888 at 1236).  So by the time
-dri2_create_context runs, eglChooseConfig has already matched and the window
-surface has already been created:
+What the probe measures, and why it probes each node separately
+---------------------------------------------------------------
 
-  - a config was found for EGL_RENDERABLE_TYPE=EGL_OPENGL_BIT, and Mesa sets a
-    config's RenderableType from the display's supported client APIs, so this
-    driver pair does advertise desktop OpenGL;
-  - the surface came up on an ARGB8888 gbm surface, and surface creation performs
-    the same surface-type/colorspace pairing check that the context path does and
-    fails with its own message -- so the config, the visual and the missing alpha
-    channel are all cleared.
+j36/eglprobe prints, per DRM node: the EGL version and client APIs, the config
+table summarised (how many configs carry each renderable bit, and how many window
+configs are AR24 and XR24), then one row of GL / ES1 / ES2 each showing either a
+created context taken all the way to glGetString on a current ARGB8888 window
+surface, or the exact EGL error.
 
-That leaves the driver refusing the context itself, and the EGL error code says
-which way: BAD_MATCH is the DRI layer rejecting the API or version, BAD_ALLOC is
-the driver's own context creation returning NULL.  Those have different fixes and
-the same 134.
-
-Which is what j36/eglprobe is for.  It runs before ES under j36.es=debug and is
-repeated after ES exits, so it survives the scroll, and it prints per DRM node:
-the EGL version and client APIs, the config table summarised (how many configs
-carry each renderable bit, and how many window configs are AR24 and XR24), then
-one row of GL / ES1 / ES2 each showing either a created context taken all the way
-to glGetString on a current ARGB8888 window surface, or the exact EGL error.  It
-probes /dev/dri/card0 and /dev/dri/renderD128 separately because those are two
+It probes /dev/dri/card0 and /dev/dri/renderD128 separately because those are two
 different chips here -- mtk_drm displays, lima renders, Mesa bridges them with
 kmsro -- so contexts on the render node but not the display node means the kmsro
 pairing, and failures on both mean lima.  A second run adds a row with no DRM
 device at all and LIBGL_ALWAYS_SOFTWARE=1, which is the control: swrast does
 desktop GL, GLES1 and GLES2 on any machine, so a row that fails there is the
-payload's fault and not the board's.
+payload's fault and not the board's.  That control row is what found the ES1
+result above -- the same failure on lima, on llvmpipe and on softpipe is not a
+driver, it is a build option.
 
-What it found, and it was the control row that found it:
+Black panel from something that draws through DRM
+--------------------------------------------------
 
-  ES1 = 0x3003(BAD_ALLOC) on lima, on llvmpipe and on softpipe alike
-  GL  = ctx/cur "4.5 (Compatibility Profile) Mesa 25.0.7-2+deb13u1" on swrast
-  ES2 = ctx/cur "OpenGL ES 2.0 Mesa 25.0.7-2+deb13u1" on lima, current on an
-        ARGB8888 window surface
+Nothing in the boot depends on this any more -- the dashboard is on /dev/fb0 -- but
+it is the trap anything GL-based here falls into, so it is worth writing down.
+Black is the one symptom that three unrelated faults share, and guessing between
+them costs a boot each:
 
-The third line clears the whole lower half of the stack in one measurement: gbm,
-the kmsro mediatek-to-lima pairing, the config, the ARGB8888 visual, lima's own
-context creation and the kernel uAPI all work.  The first line is a Mesa built
-without GLES1.  Between them they are the whole argument for the rebuild: the one
-API measured to work here is the one no renderer in the tree was written against.
-
-The GL row on the DRM nodes is what the fixed-function binary's fate hung on,
-because it asks for desktop GL and nothing else -- setupWindow() sets
-SDL_GL_CONTEXT_MAJOR_VERSION twice (1, then 0), never sets
-SDL_GL_CONTEXT_PROFILE_MASK, and with no RPI video driver in this SDL2
-KMSDRM_GLES_DefaultProfileConfig is compiled out to an empty function.  With
-major_version 0 SDL sends no context attributes at all, so the probe's GL row and
-SDL's request were the same call.  The GLES 2.0 binary does not depend on it: it
-sets PROFILE_MASK_ES and MAJOR 2 / MINOR 0, so its row is the ES2 one, which is
-measured working.
-
-The black panel, and the three faults it can be
------------------------------------------------
-
-Where this stands: the GLES 2.0 binary starts, does not abort, and the panel goes
-black.  That is progress and not a new failure -- 134 is gone, so a context was
-created and made current, and the console text disappearing means something took
-the CRTC.  But "black" is the one symptom that three unrelated faults share, and
-guessing between them costs a boot each:
-
-  1. this renderer draws nothing -- a program that did not link, or a projection
-     that puts ES's 0..640 pixel coordinates outside the frustum;
-  2. ES asks for nothing to be drawn -- a theme that did not parse, a gamelist
-     that is empty, a resource that did not load;
+  1. nothing is drawn -- a program that did not link, or a projection that puts
+     pixel coordinates outside the frustum;
+  2. nothing is asked for -- an empty scene, a resource that did not load;
   3. everything is drawn correctly and the buffers never reach the panel -- the
-     format the KMSDRM backend chose for its gbm surface, the connector or the
-     CRTC it picked, or a page flip the display driver refused.
+     format chosen for the gbm surface, the connector or the CRTC picked, or a
+     page flip the display driver refused.
 
-j36.es=debug now separates all three in one boot, and none of it is on in
-j36.es=1:
+They separate cheaply and in that order.  Draw one quad straight in NDC with both
+matrices at identity and read it back with glReadPixels: a correct centre pixel
+retires fault 1 outright, and black there, or a shader link error just above it,
+IS fault 1 and the log says which line of GLSL.  Count draws per frame: a frame
+with zero draws is fault 2, and no shader will change that.  Clear to a colour
+nothing else uses: if the panel takes the clear colour then the buffers being
+swapped are the buffers being scanned out, fault 3 is retired, and anything still
+black on top of it is the program's own drawing.
 
-  GLES2: self test 640x480, centre pixel ff 00 ff ff ..., glGetError 0x0000
-      One magenta quad, drawn straight in NDC with both matrices at identity,
-      read back with glReadPixels before ES has drawn anything.  ff 00 ff means
-      the context, the three programs, the attribute arrays and the draw path all
-      work, which retires fault 1 outright.  Black here, or a shader/link error
-      logged just above it, is fault 1 and the log says which line of GLSL.
-
-  GLES2: first draw, program N, 4 verts, v0 (0.0, 0.0), proj sx 0.00312 sy -0.00417
-      ES's first real draw.  sx should be 2/screenWidth and sy -2/screenHeight;
-      sx 1.00000 sy 1.00000 is a projection left at identity, which clips the
-      whole UI away without raising one GL error.
-
-  GLES2: frame 1, 37 draws since the last line
-      Frames 1-3 and then one line every 600.  A frame with 0 draws is fault 2:
-      ES decided there was nothing to show, and no shader will change that.
-
-  A magenta panel
-      The clear colour under J36_ES_GL_PROBE.  If the panel is magenta, the
-      buffers this renderer swaps are the buffers being scanned out -- fault 3 is
-      retired and anything still black on top of the magenta is ES's drawing.  If
-      the panel stays black while the self test reads ff 00 ff, that is fault 3
-      exactly, and the SDL_LOG_PRIORITY_VERBOSE lines from the same boot carry the
-      KMSDRM backend's own account of the modeset: which connector, which CRTC,
-      which plane format, and what drmModeAddFB2 or drmModePageFlip said.
-
-One candidate for fault 3 has to be withdrawn before it costs a boot.  This
-renderer asks for SDL_GL_ALPHA_SIZE 8 where the fixed-function one asked for no
-alpha, and that reads like the cause of an ARGB8888 framebuffer a plane might
+One candidate for fault 3 has to be withdrawn before it costs a boot.  Asking for
+SDL_GL_ALPHA_SIZE 8 reads like the cause of an ARGB8888 framebuffer a plane might
 refuse -- but SDL is not choosing: KMSDRM_CreateSurfaces hardcodes
-GBM_FORMAT_ARGB8888 for its gbm surface (SDL_kmsdrmvideo.c:1197) and then pins
-that visual with SDL_EGL_SetRequiredVisualId whatever was asked for.  Dropping
+GBM_FORMAT_ARGB8888 for its gbm surface (SDL_kmsdrmvideo.c:1197) and then pins that
+visual with SDL_EGL_SetRequiredVisualId whatever was asked for.  Dropping
 ALPHA_SIZE to 0 changes which EGL config is chosen and not one byte of the buffer
 that is scanned out, so it is not the experiment it looks like.  What remains for
 fault 3 is fbcon -- a console released without the CRTC handed over leaves the
-panel scanning out nothing while ES renders perfectly into buffers nobody reads --
-and the two things ES's own log cannot see: whether a modeset reaches the glass at
-all, and whether the OVL blends per-pixel alpha.
+panel scanning out nothing while the program renders perfectly into buffers nobody
+reads -- and the two things a program's own log cannot see: whether a modeset
+reaches the glass at all, and whether the OVL blends per-pixel alpha.  eglprobe -f
+and -p below answer both without a DRM node in the way.
 
 j36/eglprobe -f, and the colour bars
 ------------------------------------
@@ -6764,9 +6336,9 @@ j36/eglprobe -p, and the five colours
 -------------------------------------
 
 Everything in the probe's other modes asks whether a context can be built; -p
-paints, and it takes ES, then SDL, then GL, then gbm out of the path one step at a
-time, holding each frame three seconds because the instrument for this one is an
-eye.  It speaks DRM with raw ioctls -- the uapi structs are ABI and libdrm would be
+paints, and it takes the client, then SDL, then GL, then gbm out of the path one
+step at a time, holding each frame three seconds because the instrument for this
+one is an eye.  It speaks DRM with raw ioctls -- the uapi structs are ABI and libdrm would be
 a fourth library that can be missing -- and prints the connector, the mode it was
 given, the CRTC and whatever framebuffer was already on it.
 
@@ -6783,8 +6355,8 @@ seen.  Run -f first, not after.
                                               alpha and no Mesa anywhere
   2  MAGENTA, AR24 alpha ff, memset()         the same, in the format SDL uses
   3  MAGENTA, AR24 alpha 00, memset()         the same buffer, transparent
-  4  MAGENTA, lima into a gbm surface         ES's path with ES, SDL and the
-                                              renderer removed
+  4  MAGENTA, lima into a gbm surface         a GL client's path with the client,
+                                              SDL and the renderer removed
   5  GREEN, lima's second frame               the swap chain rotating
 
 Read it as four verdicts:
@@ -6796,26 +6368,23 @@ Read it as four verdicts:
                            init table, so a DSI re-initialised to a different
                            timing has nothing that puts it back.
   1 and 2 but not 3        the OVL blends per-pixel alpha against a black
-                           background.  That alone explains a black ES, and the
-                           fix is in the renderer, not the kernel:
-                           Renderer_GLES20.cpp clears to (0, 0, 0, 0) and every
-                           pixel ES does not overdraw is transparent black.
+                           background.  That alone explains a black panel under a
+                           GL client, and the fix is in the client, not the
+                           kernel: a renderer that clears to (0, 0, 0, 0) makes
+                           every pixel it does not overdraw transparent black.
   1, 2 and 3 but not 4/5   the display path is sound and the gbm/kmsro pairing is
                            the fault: lima renders into a buffer the OVL never
                            fetches.  The ADDFB2 line names the handle and stride
                            it refused.
-  all five                 the display path is sound end to end and a black ES is
-                           ES's own drawing -- fault 1 or 2, and the self test and
-                           per-frame draw count above are the evidence.
+  all five                 the display path is sound end to end, so a black panel
+                           is the client's own drawing -- fault 1 or 2 from the
+                           section above, and a self test and a per-frame draw
+                           count are the evidence.
 
 `/run/j36/eglprobe -p' by hand does the same thing from a console at any time, and
 it keeps the panel afterwards for the reason above -- reboot when it is done.  The
 dashboard's own "3D cube" card runs -c the same way, which is why that card asks
 twice before it starts.
-
-EmulationStation is not started in these builds at all: /init masks the unit in
-/run/systemd/system.control and resets its ExecStart as well.  To get it back for
-one boot, drop j36.dash=1 from the bootargs in mvii/boot.conf.
 
 Reading the dashboard's startup trace
 -------------------------------------
@@ -6961,8 +6530,8 @@ is FAT because the MVII LK reads FAT32 and nothing else:
     DATA, ext2    your home directory, mounted at /home/virtua.  A shell starts
                   here, the dashboard's Files page opens here, and nothing MixOS
                   ships is licensed by this file on it -- what is on it is yours.
-                  roms/ inside it is the old EmulationStation tree, which /roms
-                  still points at.
+                  roms/ inside it is the legacy media tree, which /roms still
+                  points at.
 
 This payload is not licensed uniformly.  Saying otherwise would be a false
 statement about other people's code.
@@ -7002,16 +6571,14 @@ Their own terms:
     qt/fonts                DejaVu Sans, under the Bitstream Vera licence
     bin/doom, share/doom    doomgeneric and Doom's engine source, id Software's
                             under the GPL, as Debian and doomgeneric ship them
-    j36/es/emulationstation EmulationStation-fcamod, under its own licence, with a
-                            third renderer added by MixOS that follows it
     the rootfs on ROOTFS    Debian.  Per-package terms are in
                             /usr/share/doc/*/copyright on the running device.
 
 SOURCE.  Everything GPL-2.0-only here is built from public source: Linux 6.12 LTS
 from kernel.org with the two patches in the MixOS repository under
 device/j36-ultra/linux/, the three MixOS modules in the same directory, and
-busybox, Mesa, Qt, the fonts, doomgeneric and EmulationStation as Debian packages
-them.  The MixOS work is in the same repository: the dashboard in
+busybox, Mesa, Qt, the fonts and doomgeneric as Debian packages them.  The MixOS
+work is in the same repository: the dashboard in
 device/j36-ultra/tools/mixdash, eglprobe and mfgpower beside it.  The MixOS build
 script that assembled this card is device/j36-ultra/build-in-vm.sh, and it is the
 complete recipe -- nothing here was produced by hand.
@@ -7023,10 +6590,9 @@ neither, and neither dArkOS nor ArkOS endorses it, is affiliated with it, or sho
 receive its bug reports.  Thanks are owed to the Debian project above all -- the
 operating system this device runs is Debian, and MixOS is a device port on top of
 it -- and to ArkOS and dArkOS, to MediaTek's documentation and vendor sources, to
-Mesa for lima and kmsro, and to the Linux kernel, SDL, busybox and
-EmulationStation projects.  MixOS is not affiliated with or endorsed by the Debian
-project, MediaTek, or Microsoft; "Ms-PL" is simply the licence chosen for the
-MixOS work.
+Mesa for lima and kmsro, and to the Linux kernel, SDL and busybox projects.  MixOS
+is not affiliated with or endorsed by the Debian project, MediaTek, or Microsoft;
+"Ms-PL" is simply the licence chosen for the MixOS work.
 
 
 Microsoft Public License (Ms-PL)
@@ -7100,8 +6666,8 @@ LICENCE
 # machines -- this board and an R36S -- and the rule that has held all the way through
 # this bring-up is that nothing on it is modified.  /opt/mixos is a path neither ArkOS
 # nor dArkOS nor Debian has ever used, so unpacking this payload adds files and
-# changes none: an R36S booting the same card gets its own libEGL.so symlink, its own
-# EmulationStation and its own units, and never looks in /opt.
+# changes none: an R36S booting the same card gets its own libEGL.so symlink and its
+# own units, and never looks in /opt.
 #
 # WHY IT IS A TARBALL AS WELL AS A TREE.  The SONAME aliases in qt/lib are symlinks and
 # mfgpower, eglprobe, mixdash and doom have to stay executable.  A tarball is the copy
@@ -7113,9 +6679,9 @@ LICENCE
 # It is not fatal for any of this to be absent, but it is not silent either, and that
 # is the lesson of a boot that ended at hostnamed with nothing on the panel: with no
 # /opt/mixos on the card /init writes mixdash-missing.service instead, which says on
-# the console what it looked for and where.  EmulationStation is still not started --
-# it aborts 134 on this board -- so a card with no payload comes up to a readable
-# console and not to a shell.
+# the console what it looked for and where.  Nothing is started in the dashboard's
+# place, so a card with no payload comes up to a readable console rather than to
+# something else taking the panel.
 # SDROOT was declared and cleared up beside SDBOOT, because the j36/ payload above is
 # staged into it.  So this section adds to a tree that may already have files in it,
 # and the tarball below is written whenever ANY of them are there -- not only when the
@@ -7232,20 +6798,19 @@ SD cards.
                        VBAT and a cell should be fitted; j36.usb=novbus leaves the
                        pad alone.  Two modules here also live in j36/mtkdrm;
                        whichever loaded first wins.            j36.usb=1
-  j36/gl               Mesa's GL front end, bind-mounted at /run/j36/gl ahead of
-                       the rootfs's RK3326 Mali blob.  links/ records the SONAME
+  j36/gl               Mesa's GL front end, staged in /run/j36/gl ahead of the
+                       rootfs's RK3326 Mali blob.  links/ records the SONAME
                        aliases, kept from when this payload was on FAT.  j36.gl=1
   j36/eglprobe         asks the DRI nodes what they can do and prints the answer.
                        j36.gl=debug runs it; -f works from a shell at any time.
 
 The initramfs writes mixdash.service into /run/systemd/system -- in memory, never on
 the card -- and wants it from multi-user.target, so this payload does not depend on
-any unit the rootfs happens to have installed or enabled.  EmulationStation is masked
-at the same time, in /run/systemd/system.control.  Delete this directory and neither
-is written: instead the console gets mixdash-missing.service, saying which partitions
-were searched.  EmulationStation stays masked even then, because it aborts on this
-board; to hand the boot back to the rootfs's own shell, drop j36.dash=1 from the
-bootargs in mvii/boot.conf on the BOOT partition.
+any unit the rootfs happens to have installed or enabled.  Delete this directory and
+it is not written: instead the console gets mixdash-missing.service, saying which
+partitions were searched.  Nothing is started in the dashboard's place either way;
+to hand the boot back to the rootfs's own shell, drop j36.dash=1 from the bootargs
+in mvii/boot.conf on the BOOT partition.
 
 Licence: the MixOS work here -- bin/mixdash, j36/mfgpower, j36/eglprobe -- is under
 the Microsoft Public License; the full text is in LICENSE.txt on the BOOT partition.
@@ -7354,9 +6919,6 @@ fi
     if [[ -f $PAYREL/eglprobe ]]; then
         sums+=("$PAYREL/eglprobe")
     fi
-    if [[ -f $PAYREL/es/emulationstation ]]; then
-        sums+=("$PAYREL/es/emulationstation")
-    fi
     sha256sum "${sums[@]}" > SHA256SUMS
     {
         echo "licence=Ms-PL for the MixOS bring-up work, GPL-2.0-only for the kernel and the three MixOS modules, per-payload in sd-boot/LICENSE.txt and summarised in sd-root/opt/mixos/README.txt"
@@ -7391,11 +6953,10 @@ fi
             echo "shell=mixdash ($(stat -c %s sd-root/opt/mixos/bin/mixdash) bytes, Qt5 Widgets on linuxfb)"
             echo "shell_payload=sd-root.tar.gz ($(stat -c %s sd-root.tar.gz) bytes), untarred at the root of the ext2 ROOTFS partition as /opt/mixos"
             echo "shell_start=j36.dash=1; /init writes /run/systemd/system/mixdash.service and wants it from multi-user.target"
-            echo "shell_es=emulationstation.service is masked in /run/systemd/system.control (the one runtime dir that outranks the /etc its unit is in), plus a drop-in that resets ExecStart to an echo in case the mask is ignored"
             echo "shell_find=/init looks in the rootfs first, then mounts every other partition read-only looking for opt/mixos/bin/mixdash (or mixos/bin/mixdash, for a tarball unpacked one level down); every partition it tries is named on the console, mounted or unreadable"
             echo "shell_missing=when nothing is found, /init also writes /run/systemd/system/mixdash-missing.service, which repeats the reason and the fix on the console six times at 20 s -- because the initramfs lines have scrolled off by then and a boot that ends at hostnamed looks the same as ten other faults"
             echo "shell_card=/run/j36/card is what the dashboard's Files page opens on, there being no keyboard here to mount anything by hand; on a current card it is a symlink to ${DATA_MOUNT_POINT:-/home/virtua}, the home partition's mount point, which /init recognises by a .mixos-home stamp at the partition root and leaves for systemd to mount rw -- a read-only mount from the initramfs would make that fstab entry fail with EBUSY, silently, it carrying nofail; on a card written before this layout it is a read-only mount of the first partition that is neither the rootfs nor BOOT (skipped by carrying j36/ or mvii/, not by name), exfat and vfat first"
-            echo "shell_nodash=without j36.dash=1 nothing is staged at all and /init says so, naming the word to add -- a rootfs whose EmulationStation is not even enabled otherwise boots to nothing and explains nothing"
+            echo "shell_nodash=without j36.dash=1 nothing is staged at all and /init says so, naming the word to add -- this rootfs enables no shell of its own, so the alternative is a board that boots to nothing and explains nothing"
             echo "shell_render=Qt5 raster into /dev/fb0, which is simplefb's window onto the framebuffer the LK lit -- no EGL, no GBM, no DRM master, no modeset"
             echo "shell_input=evdev directly, QT_QPA_FB_DISABLE_INPUT=1 (gpio-keys plus the keypad, per the device tree)"
             if [[ -f sd-root/opt/mixos/bin/doom ]]; then
@@ -7411,7 +6972,7 @@ fi
                 echo "fbdoom=not staged (J36_DOOM=1 builds it into the second partition)"
             fi
         else
-            echo "shell=not staged; /init says so on the console and still does not start EmulationStation (it aborts 134 here and its unit restarts it)"
+            echo "shell=not staged; /init says so on the console, and there is no fallback shell in this build to start instead"
         fi
         if [[ -f $PAYREL/mfgpower ]]; then
             echo "gpu=mali-450 mp4 at 0x13040000 (gp irq 234..pp_bcast 244, GIC_SPI 202..212)"
@@ -7454,20 +7015,10 @@ fi
             echo "gl_front_end=$(ls $PAYREL/gl/*.so* | xargs -n1 basename | tr '\n' ' ')"
             echo "gl_reason=the shared rootfs points libEGL.so, libgbm.so{,.1,.1.0.0} and libGLESv1_CM.so at the RK3326 Mali blob"
             echo "gl_load_bearing=libgbm.so.1 -- libEGL_mesa.so.0 needs it, so mesa's own EGL cannot load without this payload"
-            echo "gl_install=tmpfs on the rootfs /run plus a systemd drop-in; nothing is written to the card"
+            echo "gl_install=tmpfs on the rootfs /run, named by LD_LIBRARY_PATH in mixdash.service; nothing is written to the card"
             echo "gl_boot_word=$(grep -o 'j36\.gl=[a-z0-9]*' sd-boot/mvii/boot.conf)"
-            echo "gl_users=mixdash's 3D cube card only; with j36.dash=1 no ES drop-in is written and the GLES 2.0 binary is not staged either"
-            if [[ -f $PAYREL/es/emulationstation ]]; then
-                echo "es_binary=j36/es/emulationstation ($(stat -c %s $PAYREL/es/emulationstation) bytes, stripped ARMv7)"
-                echo "es_commit=$ES_COMMIT (the rootfs's own EmulationStation commit)"
-                echo "es_renderer=USE_OPENGLES_20, es/Renderer_GLES20.cpp, no GL library in DT_NEEDED"
-                echo "es_renderer_reason=ES1 is 0x3003 EGL_BAD_ALLOC everywhere (mesa built -Dgles1=disabled); ES2 is ctx/cur on lima"
-                echo "es_install=bind mount over /usr/bin/emulationstation/emulationstation from a tmpfs; the rootfs file is untouched"
-                echo "es_gl_driver=SDL_VIDEO_GL_DRIVER=libGLESv2.so.2, no LD_PRELOAD"
-            else
-                echo "es_binary=not staged; the rootfs's fixed-function one runs and aborts with status 134"
-                echo "es_gl_driver=SDL_VIDEO_GL_DRIVER=libGL.so.1 with LD_PRELOAD=libGL.so.1 (the fallback)"
-            fi
+            echo "gl_users=eglprobe, and through it mixdash's 3D cube card; mixdash itself is Qt on linuxfb and needs no GL at all"
+            echo "gl_es1=not available and not a driver bug: Debian's armhf mesa is a -Dgles1=disabled build, so eglCreateContext for an ES1 context is 0x3003 EGL_BAD_ALLOC on lima, on llvmpipe and on softpipe alike. ES2 is what comes up."
             if [[ -f $PAYREL/eglprobe ]]; then
                 echo "gl_probe=j36/eglprobe ($(stat -c %s $PAYREL/eglprobe) bytes, dynamic ARMv7, dlopens libEGL.so.1 and libgbm.so.1)"
                 echo "gl_probe_run=-f 1 from mixdash-probe.service, Type=oneshot RemainAfterExit=yes, so once per boot and NOT once per mixdash start attempt; under j36.gl=debug that unit also runs the node probes and -s with LIBGL_ALWAYS_SOFTWARE=1 as the control, and mixdash replays the log from ExecStopPost. As mixdash's own ExecStartPre these re-ran on all three restarts, which meant three EGL inits on lima and the bars repainted over each attempt's error"

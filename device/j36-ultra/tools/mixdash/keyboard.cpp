@@ -157,13 +157,13 @@ void Keyboard::buildLayout()
             /* The short row gets the two edits, so backspace is never more than
              * two presses from wherever the cursor is. */
             Cap shift;
-            shift.label = m_layer == 1 ? "shift" : "SHIFT";
+            shift.label = m_layer == 1 ? tr("shift") : tr("SHIFT");
             shift.special = KeyShift;
             shift.span = 1.5;
             row.prepend(shift);
 
             Cap back;
-            back.label = "back";
+            back.label = tr("back");
             back.special = KeyBackspace;
             back.span = 1.5;
             row.append(back);
@@ -185,7 +185,7 @@ void Keyboard::buildLayout()
     bottom.append(left);
 
     Cap space;
-    space.label = "space";
+    space.label = tr("space");
     space.special = KeySpace;
     space.span = 4.0;
     bottom.append(space);
@@ -197,13 +197,13 @@ void Keyboard::buildLayout()
     bottom.append(right);
 
     Cap cancel;
-    cancel.label = "cancel";
+    cancel.label = tr("cancel");
     cancel.special = KeyCancel;
     cancel.span = 1.6;
     bottom.append(cancel);
 
     Cap ok;
-    ok.label = "done";
+    ok.label = tr("done");
     ok.special = KeyAccept;
     ok.span = 1.6;
     bottom.append(ok);

@@ -1292,6 +1292,21 @@ int main(int argc, char **argv)
 
         while (msgs_next(&msgs, line, sizeof(line))) {
             last_msg = now_seconds();
+            /*
+             * A message after hand-over pushes THAT deadline out too, and not
+             * only the idle one.  The hand-over fuse means "the rootfs took the
+             * machine and nothing ever replaced me" -- but it was measured from
+             * the hand-over itself, so anything that spoke afterwards was heard,
+             * drawn, and then timed out against a clock that had been running
+             * since before switch_root.  On a first boot that is a real gap:
+             * j36-splash.service reports multi-user.target, which is proof the
+             * boot is alive and getting on with it, and three minutes later this
+             * gave the console back anyway.  Now every line resets the fuse, so
+             * the boot buys its own time by saying where it is, and a hand-over
+             * that goes quiet still ends the same way it always did.
+             */
+            if (handover)
+                handover_at = last_msg;
             if (!strncmp(line, "stage:", 6)) {
                 set_text(stage, sizeof(stage), line + 6);
                 detail[0] = '\0';

@@ -2,9 +2,18 @@
 # SPDX-License-Identifier: MS-PL
 # Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
 # device/j36-ultra/LICENSE for the full text and for what it does not cover.
-# Checkpointed RG351MP/R36 base builder for Ubuntu.  The default profile builds
-# a native armhf Debian userspace and EmulationStation on the existing arm64
-# RK3326 kernel/boot chain, while preserving completed stages across retries.
+# Checkpointed RG351MP/R36 base builder for Ubuntu.  It builds a native armhf
+# Debian userspace on the existing arm64 RK3326 kernel/boot chain, preserving
+# completed stages across retries.
+#
+# WHAT IT NO LONGER BUILDS: EmulationStation, and the thirty-odd emulators and
+# helper applications that used to hang off BUILD_BUNDLED_APPS=y.  Every one of
+# those was a third-party source tree cloned at build time, and between them they
+# carried licences MixOS cannot ship under.  The Debian packages stay exactly as
+# they were -- needed_packages*.txt is untouched -- so this is still the same full
+# gaming/PC/development userspace; what left is the vendored source, not the
+# software.  The dashboard is mixdash, which the J36 layer stages into /opt/mixos
+# on this same rootfs.
 
 set -o pipefail
 
@@ -17,17 +26,17 @@ USERSPACE_ARCH="${USERSPACE_ARCH:-armhf}"
 # multiarch switch off; USERSPACE_ARCH selects the native rootfs instead.
 BUILD_ARMHF=n
 BUILD_JOBS="${BUILD_JOBS:-4}"
-BUILD_BUNDLED_APPS="${BUILD_BUNDLED_APPS:-n}"
 ENABLE_CACHE="${ENABLE_CACHE:-y}"
 CHIPSET=rk3326
 UNIT=rg351mp
-if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
-    BUILD_PROFILE=full
-else
-    BUILD_PROFILE=gui
-fi
+# One profile now, because BUILD_BUNDLED_APPS is gone with the source trees it
+# selected.  The string is still `gui' and not something truer only because it is
+# part of the intermediate image's filename: renaming it here would orphan the
+# build root of any run currently in flight.  It gets its real name when the
+# artifact rename lands and the whole ArkOS_R36_ prefix goes with it.
+BUILD_PROFILE=gui
 FILESYSTEM="ArkOS_R36_${DEBIAN_CODE_NAME}_${USERSPACE_ARCH}_${BUILD_PROFILE}_File_System.img"
-export DEBIAN_CODE_NAME USERSPACE_ARCH BUILD_ARMHF BUILD_JOBS BUILD_BUNDLED_APPS
+export DEBIAN_CODE_NAME USERSPACE_ARCH BUILD_ARMHF BUILD_JOBS
 export ENABLE_CACHE CHIPSET UNIT BUILD_PROFILE FILESYSTEM
 
 # Keep direct make, CMake, Meson/Ninja, and helper scripts on the same
@@ -60,13 +69,14 @@ maybe_stop() {
 
 [[ "$USERSPACE_ARCH" == armhf || "$USERSPACE_ARCH" == arm64 ]] || \
     fail "USERSPACE_ARCH must be armhf or arm64"
-[[ "$BUILD_BUNDLED_APPS" == y || "$BUILD_BUNDLED_APPS" == n ]] || \
-    fail "BUILD_BUNDLED_APPS must be y or n"
 [[ "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || \
     fail "BUILD_JOBS must be a positive integer"
 
-if [[ "$USERSPACE_ARCH" == armhf && "$BUILD_BUNDLED_APPS" == y ]]; then
-    fail "The armhf-only R36 profile supports Debian + EmulationStation only; set BUILD_BUNDLED_APPS=n"
+# Set by habit, by a stale Makefile, or by a shell that still has it exported from
+# before: say what happened rather than building something other than what was
+# asked for and never mentioning it.
+if [[ -n "${BUILD_BUNDLED_APPS:-}" ]]; then
+    log "BUILD_BUNDLED_APPS=${BUILD_BUNDLED_APPS} is ignored: the bundled emulator and application source builds are gone"
 fi
 
 log "Configuration: Debian=${DEBIAN_CODE_NAME}, userspace=${USERSPACE_ARCH}, profile=${BUILD_PROFILE}, jobs=${BUILD_JOBS}, cache=${ENABLE_CACHE}"
@@ -508,20 +518,14 @@ verify_native_userspace() {
     log "Verified native ${actual} Debian userspace with no foreign architecture"
 }
 
-verify_gui_architecture() {
-    local binary header
-    binary="Arkbuild/usr/bin/emulationstation/emulationstation"
-    [[ -x "$binary" ]] || fail "EmulationStation GUI binary is missing"
-    header="$(readelf -h "$binary")" || fail "Could not inspect the EmulationStation GUI binary"
-    if [[ "$USERSPACE_ARCH" == armhf ]]; then
-        grep -q 'Class:.*ELF32' <<<"$header" && grep -q 'Machine:.*ARM' <<<"$header" || \
-            fail "EmulationStation is not a 32-bit ARM binary"
-    else
-        grep -q 'Class:.*ELF64' <<<"$header" && grep -q 'Machine:.*AArch64' <<<"$header" || \
-            fail "EmulationStation is not a 64-bit AArch64 binary"
-    fi
-    log "Verified ${USERSPACE_ARCH} EmulationStation GUI binary"
-}
+# verify_gui_architecture IS GONE, and nothing replaced it.  It read the ELF header
+# of Arkbuild/usr/bin/emulationstation/emulationstation and asserted ELF32/ARM or
+# ELF64/AArch64 to catch a GUI built for the wrong architecture -- a real risk when
+# one build script cross-compiled and the next did not.  There is no GUI in this
+# image any more: mixdash is built by the J36 layer, from its own toolchain, and
+# checked there.  What that assertion was really protecting -- "the userspace is
+# the architecture it claims to be" -- verify_native_userspace above already states
+# from dpkg, for the whole rootfs rather than for one binary in it.
 
 # ── Anything left over from the previous filesystem layout ────────────────────
 #
@@ -841,10 +845,20 @@ fi
 verify_boot_kernel_arch
 maybe_stop kernel
 
-# A failed userspace phase can be safely retried.  The default GUI profile only
-# builds the native graphics/runtime prerequisites and EmulationStation.  The
-# original complete emulator/application list remains available only for the
-# arm64 userspace profile with BUILD_BUNDLED_APPS=y.
+# A failed userspace phase can be safely retried.  Two components are left of what
+# used to be a forty-entry list: the native build dependencies, and SDL2.
+#
+# WHY THE OTHER THIRTY-EIGHT WENT.  Every one was `git clone' plus `make' against a
+# third-party tree -- RetroArch and the libretro cores, PPSSPP, DuckStation,
+# Mupen64Plus, Drastic, BigPEmu, the two Dooms, and the small ArkOS utilities that
+# only ever existed to be launched from EmulationStation's menus.  Vendoring that
+# source put licences into this repository that MixOS cannot ship under, and the
+# whole layer had exactly one consumer, which was EmulationStation.
+#
+# The DEBIAN PACKAGES are not affected and were not touched: needed_packages*.txt
+# still installs the compilers, the libraries, the media stack and the desktop
+# tooling, so the image is the same full gaming/PC/development userspace it was.
+# What is gone is source this project was copying, not software the device runs.
 if ! marked userspace; then
     if marked component-build_deps; then
         ensure_ccache_mount
@@ -852,56 +866,10 @@ if ! marked userspace; then
     if ! marked component-build_deps && mountpoint -q Arkbuild/home/ark/Arkbuild_ccache; then
         sudo umount -l Arkbuild/home/ark/Arkbuild_ccache || true
     fi
-    if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
-        userspace_scripts=(
-            build_deps.sh
-            build_sdl2.sh
-            build_ppssppsa.sh
-            build_ppsspp-2021sa.sh
-            build_duckstationsa.sh
-            build_mupen64plussa.sh
-            build_gzdoom.sh
-            build_lzdoom.sh
-            build_retroarch.sh
-            build_retrorun.sh
-            build_yabasanshirosa.sh
-            build_mednafen.sh
-            build_ecwolfsa.sh
-            build_hypseus-singe.sh
-            build_openbor.sh
-            build_solarus.sh
-            build_scummvmsa.sh
-            build_fake08.sh
-            build_xroar.sh
-            build_mvem.sh
-            build_bigpemu.sh
-            build_ogage.sh
-            build_ogacontrols.sh
-            build_351files.sh
-            build_filemanager.sh
-            build_filebrowser.sh
-            build_gptokeyb.sh
-            build_image-viewer.sh
-            build_emulationstation.sh
-            build_linapple.sh
-            build_applewinsa.sh
-            build_piemu.sh
-            build_ti99sim.sh
-            build_gametank.sh
-            build_openmsxsa.sh
-            build_flycastsa.sh
-            build_sdljoytest.sh
-            build_controllertester.sh
-            build_batteryplus.sh
-            build_drastic.sh
-        )
-    else
-        userspace_scripts=(
-            build_deps.sh
-            build_sdl2.sh
-            build_emulationstation.sh
-        )
-    fi
+    userspace_scripts=(
+        build_deps.sh
+        build_sdl2.sh
+    )
     if [[ -s "$STATE_DIR/sdl2-extension" ]]; then
         extension="$(cat "$STATE_DIR/sdl2-extension")"
     fi
@@ -931,7 +899,10 @@ else
             Arkbuild/home/ark/${CHIPSET}_core_builds/scripts/sdl2.sh 2>/dev/null || true)"
     fi
 fi
-verify_gui_architecture
+# Again, and not by oversight: it ran once after the bootstrap, and build_deps.sh
+# has since run `apt install' inside the chroot.  A package that pulls in a foreign
+# architecture does it there, which is after the first check and before this one.
+verify_native_userspace
 
 # Final image assembly is kept as one checkpoint because these scripts shrink
 # and unmount the root filesystem. If it fails, the log identifies the exact

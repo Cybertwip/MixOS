@@ -3,19 +3,26 @@
  * Copyright (c) 2025-2026 the MixOS project and contributors
  * See device/j36-ultra/LICENSE for the licence text and what it covers.
  *
- * settingspage.h -- the settings hub, and the two pages under it.
+ * settingspage.h -- the settings hub, and the three pages under it.
  *
- * THREE CLASSES IN ONE FILE because they are one screen and its leaves: the hub
+ * FOUR CLASSES IN ONE FILE because they are one screen and its leaves: the hub
  * is a list of destinations with the two things that are genuinely global on it
- * (volume, mute), and the mouse and display pages are the settings proper.
- * Wi-Fi, Packages and Diagnostics are reached FROM here but are not settings --
- * they are applications, and they live in their own files.
+ * (volume, mute), and the mouse, display and language pages are the settings
+ * proper.
+ *
+ * WHAT THE HUB NO LONGER OPENS, AND WHY.  It used to end in a "System" section
+ * that led to Packages, Terminal, Files, Diagnostics and System information, and
+ * a "Network" section that led to Wi-Fi.  Every one of those is an Apps card or
+ * a dock tab, so every one of those rows was a second door into a room that
+ * already had one -- and a second door somebody has to keep in step with the
+ * first.  Those are applications, not settings; they live in their own files and
+ * they are reached from the grid.  What is left here is the three pages that are
+ * settings and are reachable nowhere else.
  *
  * THE HUB DOES NOT OWN THE PAGES IT OPENS.  It emits openRequested() with a
- * destination and the shell pushes whichever page that is.  A hub that held a
- * WifiPage and a PackagesPage would mean the Wi-Fi scanner runs whenever the
- * dashboard has ever shown Settings, and would make the same page reachable from
- * two owners once the Apps grid gained a Wi-Fi card -- which it has.
+ * destination and the shell pushes whichever page that is.  A hub that held its
+ * leaves would mean their timers run whenever the dashboard has ever shown
+ * Settings.
  *
  * SOUND IS DRIVEN THROUGH amixer rather than through libasound.  Linking ALSA
  * would put a hard NEEDED entry on a device where the codec is still in bring-up;
@@ -41,24 +48,18 @@ class SettingsPage : public PageWidget
 public:
     /*
      * Where a row goes.  Numbered, not pointered, so this header does not have to
-     * include every page in the build to say "open the Wi-Fi one".
+     * include every page in the build to say "open the mouse one".
      */
     enum Destination {
         OpenNone = 0,
         OpenMouse,
-        OpenWifi,
-        OpenDiagnostics,
-        OpenPackages,
-        OpenTerminal,
-        OpenSystem,
-        OpenFiles,
-        OpenMedia,
-        OpenDisplay
+        OpenDisplay,
+        OpenLanguage
     };
 
     explicit SettingsPage(QWidget *parent = nullptr);
 
-    QString title() const override { return QStringLiteral("Settings"); }
+    QString title() const override { return tr("Settings"); }
     bool handleNav(int action) override;
     void onEnter() override;
 
@@ -113,7 +114,7 @@ class MousePage : public PageWidget
 public:
     explicit MousePage(QWidget *parent = nullptr);
 
-    QString title() const override { return QStringLiteral("Mouse and pointer"); }
+    QString title() const override { return tr("Mouse and pointer"); }
     bool handleNav(int action) override;
     void onEnter() override;
     void onLeave() override;
@@ -188,7 +189,7 @@ class DisplayPage : public PageWidget
 public:
     explicit DisplayPage(QWidget *parent = nullptr);
 
-    QString title() const override { return QStringLiteral("Display"); }
+    QString title() const override { return tr("Display"); }
     bool handleNav(int action) override;
     void onEnter() override;
 
@@ -229,6 +230,43 @@ private:
     /* Per cent as last read or written; -1 when there is no backlight to read. */
     int m_percent = -1;
     QString m_note;
+};
+
+/*
+ * The language page: one row per language the strings database carries.
+ *
+ * EVERY ROW IS WRITTEN IN THE LANGUAGE IT SELECTS, and that is not decoration.
+ * This is a handheld with no keyboard and no second screen: somebody who picks
+ * the wrong row is looking at a settings hub they cannot read, and the only way
+ * back is to recognise the word for their own language in a list.  "Deutsch"
+ * next to "German" costs one column and is the difference between a wrong press
+ * being a mistake and a wrong press being a reflash.
+ *
+ * The second column is the English name, for the same reason from the other
+ * side: somebody helping over a phone can say "the row that says French".
+ */
+class LanguagePage : public PageWidget
+{
+    Q_OBJECT
+
+public:
+    explicit LanguagePage(QWidget *parent = nullptr);
+
+    QString title() const override { return tr("Language"); }
+    bool handleNav(int action) override;
+    void onEnter() override;
+
+protected:
+    void paintEvent(QPaintEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
+
+private slots:
+    void onActivated(int index);
+
+private:
+    void rebuild();
+
+    ListPane *m_list = nullptr;
 };
 
 #endif /* MIXDASH_SETTINGSPAGE_H */

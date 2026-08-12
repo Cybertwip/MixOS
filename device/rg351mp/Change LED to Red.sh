@@ -22,4 +22,3 @@ sudo cp -f -v /usr/local/bin/fix_power_led.red /usr/local/bin/fix_power_led
 sudo cp /usr/local/bin/Change\ LED\ to\ Green.sh /opt/system/.
 sudo rm /opt/system/Change\ LED\ to\ Red.sh
 printf "\033c" >> /dev/tty1
-sudo systemctl restart emulationstation

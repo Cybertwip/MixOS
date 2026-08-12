@@ -116,17 +116,30 @@ public:
     virtual void textEntered(const QString &text, bool accepted);
 };
 
-/* One entry in a card grid.  An empty exe means the card does something internal,
- * named by `internal'; the Dashboard owns that enum. */
+/*
+ * One entry in a card grid.  An empty exe means the card does something internal,
+ * named by `internal'; the Dashboard owns that enum.
+ *
+ * NO DESCRIPTION FIELD, DELIBERATELY.  Every card used to carry a line of prose
+ * under its name, and on a 640x480 panel that is the difference between a grid
+ * you read and a grid you scan: nine cards times two lines of 12 px text is more
+ * words than the rest of the shell put together, and none of them told you
+ * anything the name and the icon had not.  A card is a glyph and a noun.  What is
+ * wrong with one -- Doom with no IWAD -- is said by the card going grey and by
+ * the toast that comes when it is pressed, not by a caption that is there whether
+ * or not anything is wrong.
+ */
 struct AppEntry {
     QString title;
-    QString subtitle;
     QColor accent;
     int glyph = GlyphGames;
     QString exe;
     QStringList args;
     int internal = 0;
+    /* Greys the card out and turns activation into an explanation instead of a
+     * launch.  `reason' is what that explanation says; it is never painted. */
     bool available = true;
+    QString reason;
     /* Ask twice.  For a child that sets its own mode through /dev/dri/card0: it
      * takes the scanout away from the framebuffer this dashboard draws into and
      * nothing gives it back, so the warning has to come before the launch -- once
@@ -180,6 +193,9 @@ public:
     void setEntries(const QVector<AppEntry> &entries);
     const QVector<AppEntry> &entries() const { return m_entries; }
     int index() const { return m_index; }
+    /* Absolute, unlike moveBy(), which walks the grid and wraps.  For putting the
+     * selection back after setEntries() has reset it. */
+    void setIndex(int index);
     QString currentTitle() const;
 
     void moveBy(int dx, int dy);

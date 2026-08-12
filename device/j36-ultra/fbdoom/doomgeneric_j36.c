@@ -5,10 +5,10 @@
  * Derived from doomgeneric_linuxvt.c, Copyright (C) 2025 Techflash, itself
  * based on doomgeneric_sdl.c.  doomgeneric is GPLv2 and so is this file.
  *
- * WHY A FRAMEBUFFER PORT AT ALL.  The shared armhf rootfs already carries
- * gzdoom, lzdoom and EmulationStation, and none of them can draw here: SDL2 has
- * no fbdev backend (KMSDRM, X11, Wayland, offscreen and dummy are the whole
- * list), the GL stack in that rootfs is the RK3326's Mali-G31 Bifrost blob,
+ * WHY A FRAMEBUFFER PORT AT ALL.  The shared armhf rootfs already carries gzdoom
+ * and lzdoom, and neither of them can draw here: SDL2 has no fbdev backend
+ * (KMSDRM, X11, Wayland, offscreen and dummy are the whole list), the GL stack in
+ * that rootfs is the RK3326's Mali-G31 Bifrost blob,
  * which is the wrong architecture for this SoC's Mali-450, and this kernel has
  * no DRM driver bound yet.  What it does have is /dev/fb0: simple-framebuffer
  * over the buffer the MVII LK was already scanning out when it jumped to the

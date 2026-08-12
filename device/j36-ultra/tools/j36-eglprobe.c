@@ -2,15 +2,16 @@
 /* Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
  * device/j36-ultra/LICENSE for the full text and for what it does not cover. */
 /*
- * j36-eglprobe -- ask EGL the question EmulationStation's abort throws away.
+ * j36-eglprobe -- ask EGL the questions a failed context throws away.
  *
- * ES dies at es-core/src/renderers/Renderer_GLES10.cpp:129 with
+ * An SDL program that does not check SDL_GL_CreateContext() dies two lines later,
+ * in something like
  *
  *     std::string glExts = (const char*)glGetString(GL_EXTENSIONS);
  *
- * two lines after an unchecked SDL_GL_CreateContext().  So a failed context
- * reaches us as std::logic_error "basic_string: construction from null is not
- * valid" and SIGABRT -- status 134 -- with the reason discarded.  Mesa's own
+ * so a failed context reaches us as std::logic_error "basic_string: construction
+ * from null is not valid" and SIGABRT -- status 134 -- with the reason discarded.
+ * That is how this board's GL stack first announced itself.  Mesa's own
  * EGL_LOG_LEVEL=debug does print the reason, but it prints it once, in the
  * middle of a scrolling 30-line console, on a 640x480 panel photographed by
  * hand.
@@ -43,7 +44,7 @@
  * no scanout), and Mesa bridges them with kmsro.  If contexts come up on the render
  * node but not on the display node, the kmsro pairing is what is broken; if they
  * fail on both, lima's context creation is.  That distinction is the whole reason
- * this file exists and it is not observable from ES's abort.
+ * this file exists, and it is not observable from a client's abort.
  *
  * WHICH node is which is asked, not assumed.  This file used to hard-code card0 as
  * the display, and on the kernel we ship that is lima: -p answered "GETRESOURCES:
@@ -53,24 +54,24 @@
  * go by probe order, so display_node() names every node and picks the one that has
  * a CRTC and a connector.  -i prints that table and does nothing else.
  *
- * Which API is asked for matters as much as whether it works.  ES is a pure
- * GLES1 fixed-function renderer -- glMatrixMode, glVertexPointer -- but it asks
- * SDL for DESKTOP GL: setupWindow() sets SDL_GL_CONTEXT_MAJOR_VERSION twice (1,
- * then 0) and never sets SDL_GL_CONTEXT_PROFILE_MASK, and this SDL2 has no RPI
- * driver, so KMSDRM_GLES_DefaultProfileConfig is compiled out to a no-op and the
- * profile stays at SDL's desktop default.  SDL_egl.c then asks for
- * EGL_OPENGL_BIT, calls eglBindAPI(EGL_OPENGL_API), and passes no context
- * attribs at all.  So the GL row below is what ES actually requests and the ES1
- * row is what it actually needs; the two need not agree, and if they disagree
- * that is the finding.
+ * Which API is asked for matters as much as whether it works, and an SDL program
+ * does not necessarily ask for the one it draws with.  A fixed-function renderer
+ * -- glMatrixMode, glVertexPointer -- needs GLES1, but a program that leaves
+ * SDL_GL_CONTEXT_MAJOR_VERSION at 0 and never sets SDL_GL_CONTEXT_PROFILE_MASK
+ * gets DESKTOP GL instead: this SDL2 has no RPI driver, so
+ * KMSDRM_GLES_DefaultProfileConfig is compiled out to a no-op and the profile
+ * stays at SDL's desktop default.  SDL_egl.c then asks for EGL_OPENGL_BIT, calls
+ * eglBindAPI(EGL_OPENGL_API), and passes no context attribs at all.  So the GL
+ * row below is what such a program requests and the ES1 row is what it needs;
+ * the two need not agree, and if they disagree that is the finding.
  *
  * Everything is dlopen'd.  Linking against libEGL and libgbm would mean armhf
  * -dev packages in the image and a build that fails differently from the run;
  * dlopen means the only DT_NEEDED is libc, a missing library is a printed result
  * rather than a dead loader, and resolution goes through whatever
- * LD_LIBRARY_PATH the caller has -- for us /run/j36/gl, the same search path ES
- * gets.  So this measures the libraries ES will use, not the ones Debian
- * shipped.
+ * LD_LIBRARY_PATH the caller has -- for us /run/j36/gl, the same search path
+ * anything started from the payload gets.  So this measures the libraries a
+ * client on this card will use, not the ones Debian shipped.
  *
  * With -f it looks at the panel instead of at a driver, and this is the mode to
  * reach for first when the report is "the screen is black".  Black is what every
@@ -84,10 +85,10 @@
  *
  * With -p it stops asking and paints.  Everything above measures whether a
  * context can be built, and none of it can answer the question this board is
- * actually stuck on: ES2 comes up on lima, ES runs, and the panel is black.  A
- * config table says nothing about whether a frame reaches the glass.  So -p
- * drives the whole scanout chain itself, in five phases that remove ES, then
- * SDL, then GL, then gbm from the picture -- see paint() for what each one
+ * actually stuck on: ES2 comes up on lima, a client runs, and the panel is black.
+ * A config table says nothing about whether a frame reaches the glass.  So -p
+ * drives the whole scanout chain itself, in five phases that remove the client,
+ * then SDL, then GL, then gbm from the picture -- see paint() for what each one
  * proves and for the four verdicts the sequence can return.  It holds each
  * frame for three seconds, because the instrument for this one is an eye.
  *
@@ -365,7 +366,7 @@ static int load(void)
     /*
      * The names SDL's KMSDRM backend dlopens: SDL_VIDEO_EGL_DRIVER is
      * libEGL.so.1 and gbm comes in as libgbm.so.1.  Using the same sonames means
-     * a payload that is missing one fails here the way it fails for ES.
+     * a payload that is missing one fails here the way it fails for SDL.
      */
     void *egl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
     if (!egl) {
@@ -430,8 +431,8 @@ struct api {
 };
 
 static const struct api APIS[] = {
-    { "GL",  EGL_OPENGL_API,    EGL_OPENGL_BIT,     0 }, /* what ES asks for */
-    { "ES1", EGL_OPENGL_ES_API, EGL_OPENGL_ES_BIT,  1 }, /* what ES needs */
+    { "GL",  EGL_OPENGL_API,    EGL_OPENGL_BIT,     0 }, /* SDL's default request */
+    { "ES1", EGL_OPENGL_ES_API, EGL_OPENGL_ES_BIT,  1 }, /* fixed-function GL */
     { "ES2", EGL_OPENGL_ES_API, EGL_OPENGL_ES2_BIT, 2 },
 };
 
@@ -507,7 +508,7 @@ static int try_apis(EGLDisplay dpy, struct gbm_device *gbm, int scanout)
         appendf(" %s=ctx", api->name);
 
         /*
-         * A context alone is not what ES needs; it needs glGetString to answer
+         * A context alone is not enough; a client needs glGetString to answer
          * on a current one.  So take it the whole way: an ARGB8888 gbm surface
          * the size of the panel, a window surface on it, make current, ask.
          */
@@ -601,8 +602,8 @@ static int probe(const char *path, int scanout)
      * One line for the whole config table: how many there are, how many carry
      * each renderable bit, and how many window-capable ones are in each of the
      * two formats that matter -- ARGB8888 because SDL pins that visual for a
-     * scanout surface, XRGB8888 because that is where a config with no alpha
-     * lands and ES never asks for alpha.
+     * scanout surface, XRGB8888 because that is where a config lands when no
+     * alpha was asked for.
      */
     if (p_eglGetConfigs(dpy, cfgs, 256, &got) && got > 0) {
         int gl = 0, es1 = 0, es2 = 0, win = 0, ar24 = 0, xr24 = 0, oth = 0, d24 = 0;
@@ -1102,8 +1103,8 @@ static int fb_report(int repair, int paint_it, int secs)
 /* ── -p: the scanout test ──────────────────────────────────────────────────────
  *
  * Everything above measures whether a context can be built.  None of it can
- * answer the question the board is stuck on -- ES2 comes up on lima, ES runs,
- * and the panel is black -- because a config table says nothing about whether a
+ * answer the question the board is stuck on -- ES2 comes up on lima, a client
+ * runs, and the panel is black -- because a config table says nothing about whether a
  * frame reaches the glass.
  *
  * DRM is spoken to with raw ioctls rather than through libdrm, for the reason EGL
@@ -1233,7 +1234,7 @@ struct drm_version {
 #define GL_COLOR_BUFFER_BIT        0x00004000
 
 /* How long each frame is held up.  Long enough to see, short enough that five of
- * them do not look like a hang on a board whose next line is ES starting. */
+ * them do not look like a hang on a board whose next line is the shell starting. */
 #define HOLD_SECONDS 3
 
 static int      paint_fd = -1;
@@ -1478,10 +1479,11 @@ out_handle:
 
 /*
  * The same colour, this time drawn by lima into a gbm surface and scanned out of
- * the buffer EGL hands back -- which is the whole of ES's path with ES, SDL and
- * the renderer taken out of it.  ARGB8888 because that is the format SDL's KMSDRM
- * backend hardcodes for its gbm surface (SDL_kmsdrmvideo.c:1197) whatever
- * SDL_GL_ALPHA_SIZE was asked for, so it is the format ES will use.
+ * the buffer EGL hands back -- which is the whole of an SDL KMSDRM client's path
+ * with the client, SDL and its renderer taken out of it.  ARGB8888 because that is
+ * the format SDL's KMSDRM backend hardcodes for its gbm surface
+ * (SDL_kmsdrmvideo.c:1197) whatever SDL_GL_ALPHA_SIZE was asked for, so it is the
+ * format any such client will use.
  *
  * Two frames, in two colours.  The second one comes out of the other buffer of
  * the swap chain, so it says whether the chain rotates: a first frame that
@@ -1778,7 +1780,7 @@ static int find_crtc(void)
  *   1  RED, XR24, CPU-filled       modeset + DSI + panel + OVL, no alpha anywhere
  *   2  MAGENTA, AR24 alpha ff      the same with the format SDL will hand it
  *   3  MAGENTA, AR24 alpha 00      the same buffer, transparent
- *   4  MAGENTA, lima into gbm      the ES path with ES, SDL and the renderer out
+ *   4  MAGENTA, lima into gbm      the GL path with the client, SDL and the renderer out
  *   5  GREEN, lima's second frame  the swap chain rotating
  *
  * and four verdicts:
@@ -1789,16 +1791,16 @@ static int find_crtc(void)
  *                           reports, and the place to look is mtk_dsi against the
  *                           state the LK left.
  *   1 and 2 but not 3       the OVL blends per-pixel alpha against a black
- *                           background.  Then ES is invisible for one reason and
- *                           it is in the renderer, not the kernel:
- *                           Renderer_GLES20.cpp clears to (0,0,0,0) and every
- *                           pixel it does not overdraw is transparent black.
+ *                           background.  Then a GL client is invisible for one
+ *                           reason and it is in its renderer, not the kernel: a
+ *                           renderer that clears to (0,0,0,0) leaves every pixel
+ *                           it does not overdraw transparent black.
  *   1, 2, 3 but not 4 or 5  the display path is sound and the fault is the
  *                           gbm/kmsro pairing -- lima's buffer imports but never
  *                           becomes what the OVL fetches.
- *   all five               the display path is sound end to end, and a black ES
- *                           is ES's own drawing.  The GLES2 self-test line and
- *                           the per-frame draw count are then the evidence.
+ *   all five               the display path is sound end to end, and a panel that
+ *                           is still black under a GL client is that client's own
+ *                           drawing.  The GLES2 self-test line is then the evidence.
  */
 static int paint(const char *path)
 {
@@ -1816,7 +1818,7 @@ static int paint(const char *path)
 
     /*
      * Ask for master explicitly.  Opening the only open of the device makes us
-     * master implicitly, but ES may have been here first on a re-run and the
+     * master implicitly, but something may have been here first on a re-run and the
      * error is worth naming: EBUSY here means something else owns the display and
      * every SETCRTC below would have failed with EACCES instead.
      */
@@ -2526,8 +2528,8 @@ static int cube(const char *path, int seconds)
         /*
          * MVII's desktop grey rather than black, on purpose: a frame that arrives
          * with nothing drawn in it is then distinguishable from a frame that never
-         * arrived at all, which is exactly the ambiguity that made the ES black
-         * screen so expensive to read.
+         * arrived at all, which is exactly the ambiguity that made this board's
+         * black screen so expensive to read.
          */
         p_glClearColor(0.102f, 0.110f, 0.149f, 1.0f);
         p_glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);

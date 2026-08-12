@@ -49,7 +49,7 @@
  * hardware. If the cursor never moves the work item paces the stream from the
  * wall clock instead and says so once -- silence that keeps running is a
  * measurement, whereas an ALSA stream that never completes a period hangs every
- * program that opens the card, EmulationStation included.
+ * program that opens the card.
  */
 
 #include <linux/bitops.h>
@@ -794,7 +794,8 @@ static const struct snd_pcm_ops j36_afe_pcm_ops = {
  *
  * Two controls, and they exist as much for the userspace on the card as for a
  * person with amixer: alsa-restore wants a controlC0 to restore into, and the
- * MixOS units and EmulationStation both look for a "Master" element. Seven
+ * MixOS units and the dashboard's volume page both look for a "Master" element
+ * first. Seven
  * steps and not a hundred, because the class-D level field really is four bits
  * with seven usable values -- a 0..100 scale here would be a fiction.
  */

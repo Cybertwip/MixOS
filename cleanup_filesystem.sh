@@ -9,7 +9,6 @@ fi
 
 # Cleanup to reduce image size and remove build remnants
 echo -e "Cleaning up filesystem"
-call_chroot "rm -rf /home/ark/EmulationStation-fcamod"
 call_chroot "rm -rf /home/ark/libgo2"
 call_chroot "rm -rf /home/ark/linux-rga"
 call_chroot "rm -rf /home/ark/${CHIPSET}_core_builds"

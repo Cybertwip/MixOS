@@ -1,6 +1,5 @@
 [Unit]
 Description=Global Hotkey listener
-After=emulationstation.service
 
 [Service]
 ExecStartPre=/bin/sleep 3

@@ -9,9 +9,9 @@ BUILD_ARMHF ?= y
 BUILD_BLUEALSA ?= y
 BUILD_JOBS ?= 4
 
-# The R36 Ultra bring-up build defaults to a Debian + EmulationStation image.
-# Its native userspace defaults to armhf.  The complete emulator/application
-# bundle is available only with USERSPACE_ARCH=arm64 BUILD_BUNDLED_APPS=y.
+# The R36 Ultra bring-up build defaults to a plain Debian image with no front end
+# on it.  Its native userspace defaults to armhf.  The bundled application set is
+# available only with USERSPACE_ARCH=arm64 BUILD_BUNDLED_APPS=y.
 R36_BUILD_BUNDLED_APPS = $(if $(strip $(BUILD_BUNDLED_APPS)),$(BUILD_BUNDLED_APPS),n)
 R36_USERSPACE_ARCH = $(if $(strip $(USERSPACE_ARCH)),$(USERSPACE_ARCH),armhf)
 

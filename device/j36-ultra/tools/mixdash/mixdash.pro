@@ -2,9 +2,9 @@
 # Copyright (c) 2025-2026 the MixOS project and contributors
 # See device/j36-ultra/LICENSE for the licence text and what it covers.
 #
-# Built by qmake inside the armhf chroot build-in-vm.sh already keeps for
-# EmulationStation, against Debian's own qtbase5-dev.  Nothing here is
-# cross-compiled and nothing is built from source but the files listed below.
+# Built by qmake inside the armhf chroot build-in-vm.sh already keeps, against
+# Debian's own qtbase5-dev.  Nothing here is cross-compiled and nothing is built
+# from source but the files listed below.
 #
 # QT does NOT include opengl, and that is the point of the whole exercise: the
 # platform plugin this runs on is linuxfb, which writes into the framebuffer the
@@ -43,6 +43,7 @@ SOURCES += \
     widgets.cpp \
     joypad.cpp \
     settings.cpp \
+    strings.cpp \
     pointer.cpp \
     keyboard.cpp \
     settingspage.cpp \
@@ -59,6 +60,7 @@ HEADERS += \
     joypad.h \
     theme.h \
     settings.h \
+    strings.h \
     pointer.h \
     keyboard.h \
     settingspage.h \

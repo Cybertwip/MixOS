@@ -157,6 +157,11 @@ void Settings::load()
      */
     const int saved = m_store->value(QStringLiteral("display/brightness"), -1).toInt();
     m_brightness = saved < 0 ? -1 : clampInt(saved, 5, 100);
+
+    /* Not validated here.  Strings::fromCode() is the one place that knows which
+     * codes exist, and it answers English for anything else -- so a hand-edited
+     * language=xx costs a fallback, not a startup failure. */
+    m_language = m_store->value(QStringLiteral("ui/language")).toString().trimmed().toLower();
 }
 
 void Settings::setMouse(const MouseConfig &config)
@@ -210,6 +215,17 @@ void Settings::setMediaRoot(const QString &path)
     m_mediaRoot = path;
     if (m_store) {
         m_store->setValue(QStringLiteral("media/root"), path);
+        m_store->sync();
+    }
+}
+
+void Settings::setLanguage(const QString &code)
+{
+    if (m_language == code)
+        return;
+    m_language = code;
+    if (m_store) {
+        m_store->setValue(QStringLiteral("ui/language"), code);
         m_store->sync();
     }
 }

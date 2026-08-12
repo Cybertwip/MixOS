@@ -6,8 +6,11 @@ yres="$(cat /sys/class/graphics/fb0/modes | grep -o -P '(?<=:).*(?=p-)' | cut -d
 sudo chmod 666 /dev/tty1
 sudo chmod 666 /dev/uinput
 export SDL_GAMECONTROLLERCONFIG_FILE="/opt/inttools/gamecontrollerdb.txt"
-# This gaurd is specifically for the Chi to change the exit hotkey to be 1 and Start as other emulators and tools are for that unit
-if [[ ! -z $(cat /etc/emulationstation/es_input.cfg | grep "190000004b4800000010000001010000") ]] || [[ -e "/dev/input/by-path/platform-gameforce-gamepad-event-joystick" ]]; then
+# This gaurd is specifically for the Chi to change the exit hotkey to be 1 and Start as other emulators and tools are for that unit.
+# The Chi used to be identified by its controller GUID in /etc/emulationstation/es_input.cfg
+# as well; there is no front end on this image and no such file, so the device node is
+# the whole test now.
+if [[ -e "/dev/input/by-path/platform-gameforce-gamepad-event-joystick" ]]; then
   export HOTKEY="l3"
 elif [[ $(cat /home/ark/.config/.DEVICE) == "MINILOONG" ]]; then
   export HOTKEY="guide"

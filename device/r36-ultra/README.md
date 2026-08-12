@@ -4,7 +4,7 @@
 ./build-r36-ultra.sh
 ```
 
-One native **armhf** Debian userspace with EmulationStation, on the existing
+One native **armhf** Debian userspace, with no front end on it, on the existing
 **arm64** RK3326 kernel and boot chain. On macOS it builds inside a persistent
 Ubuntu 24.04 Multipass VM (`darkos-r36`); on Linux the same checkpointed build
 runs directly.
@@ -15,7 +15,6 @@ runs directly.
 | --- | --- | --- |
 | kernel | arm64 (`Image`) | `verify_boot_kernel_arch` — arm64 magic at 0x38 |
 | userspace | armhf, no foreign arch | `verify_native_userspace` — `dpkg --print-architecture` |
-| GUI binary | ELF32 / ARM | `verify_gui_architecture` — `readelf -h` |
 
 The mix is the point. The RK3326 is arm64 and its kernel has to be; the userspace
 is 32-bit so the **same rootfs also runs on the ARMv7 J36 Ultra**. What is never

@@ -27,11 +27,9 @@ Two carve-outs matter, and they are not optional:
   **GPL-2.0-only** and are not relicensed.  They derive from and link against
   GPL-2.0-only kernel internals, and Ms-PL is not GPL-compatible: its section
   3(D) adds a condition that GPLv2 section 6 forbids adding.
-* `device/j36-ultra/es/Renderer_GLES20.cpp` is written to drop into
-  EmulationStation's own source tree and follows **EmulationStation's** license.
 
 Ms-PL also does not reach anything a build downloads or stages.  The Linux kernel,
-Mesa, SDL, EmulationStation, busybox, doomgeneric, the Freedoom IWAD and the
+Mesa, SDL, busybox, doomgeneric, the Freedoom IWAD and the
 Debian rootfs are each obtained under their own terms.  A finished card is an
 aggregate of many licenses; Ms-PL applies to the MixOS scripts, probes and
 documentation that assembled it.
@@ -53,7 +51,7 @@ copyright and MIT license — including the files MixOS has modified: the
 modifications are MixOS's, the files remain dArkOS's work under dArkOS's terms.
 dArkOS is in turn a Debian-based continuation of
 [ArkOS](https://github.com/christianhaitian/arkos/wiki) by christianhaitian, whose
-layout, tools menu and EmulationStation integration this distribution still uses.
+layout and tools menu this distribution still uses.
 
 Neither dArkOS nor ArkOS endorses MixOS, is affiliated with it, or is responsible
 for it, and neither should receive MixOS bug reports.

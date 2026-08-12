@@ -3,7 +3,7 @@
 # Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
 # device/j36-ultra/LICENSE for the full text and for what it does not cover.
 # Build the MixOS RG351MP base used for R36 Ultra bring-up.  The default
-# profile is a native armhf Debian userspace + EmulationStation with bundled
+# profile is a native armhf Debian userspace with no front end and with bundled
 # applications disabled.  The RK3326 kernel/boot chain remains arm64.
 #
 # macOS: builds inside a persistent Ubuntu 24.04 Multipass VM.
@@ -34,7 +34,7 @@
 #   DEBIAN_CODE_NAME=trixie
 #   USERSPACE_ARCH=armhf          # armhf (default) or arm64; never multiarch.
 #   BUILD_JOBS=4
-#   BUILD_BUNDLED_APPS=n         # Debian + EmulationStation only (default).
+#   BUILD_BUNDLED_APPS=n         # plain Debian userspace only (default).
 #   ENABLE_CACHE=y
 
 set -Eeuo pipefail
@@ -81,9 +81,9 @@ usage() {
 Usage: ./build-r36-ultra.sh
 
 Builds the RG351MP/RK3326 base image used for R36 Ultra bring-up.  By default
-this produces one native armhf (32-bit) Debian userspace with the
-EmulationStation GUI.  It does not add an arm64 userspace or build the bundled
-emulators and standalone applications.  The existing arm64 RK3326 kernel/boot
+this produces one native armhf (32-bit) Debian userspace with no front end on
+it.  It does not add an arm64 userspace or build the bundled emulators and
+standalone applications.  The existing arm64 RK3326 kernel/boot
 chain is retained, and the R36 Ultra-specific DTB is not yet injected.
 
 On macOS the script automatically creates or reuses a Multipass VM. Failed

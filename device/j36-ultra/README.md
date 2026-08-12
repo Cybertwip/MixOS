@@ -126,9 +126,8 @@ now share an SD card, so neither architecture is left to memory:
 | userspace | armhf (32-bit) | armhf (32-bit), shared |
 
 The rootfs is shared; the kernel never is. `build-r36-ultra.sh` asserts both
-halves — `verify_native_userspace` for the armhf rootfs, `verify_gui_architecture`
-for an ELF32/ARM EmulationStation, and `verify_boot_kernel_arch` for the arm64
-boot magic in its own kernel. `device/j36-ultra/build-in-vm.sh` runs the MVII LK's
+halves — `verify_native_userspace` for the armhf rootfs and
+`verify_boot_kernel_arch` for the arm64 boot magic in its own kernel. `device/j36-ultra/build-in-vm.sh` runs the MVII LK's
 own test on its own artifact: `readelf` for ELF32/ARM, then the arm64 magic at
 offset 0x38 and the zImage magic at 0x24, on the exact bytes the LK will read.
 That check is the LK's `sd_kernel_is_armv7()`, moved to the build machine so "no"
@@ -215,7 +214,6 @@ j36/audio/             the ALSA core and the MT6592 AFE, plus load.order (j36.au
 j36/gl/                Mesa's GL front end, plus links (vfat has no symlinks)
 j36/eglprobe           what can create a GL context, and with -p whether a frame
                        reaches the glass: five held colours, CPU then lima
-j36/es/emulationstation  the same ES with a GLES 2.0 renderer (j36.es=1)
 LICENSE.txt            which licence covers which file above, and where the
                        GPL-2.0-only source is
 ```
@@ -456,10 +454,8 @@ fix, and it would make this daemon work unmodified.
 
 The other RK3326-only units are deliberately left running. `351mp.service` (power
 LED, backlight, `amixer`), `audiopath`, `audiostate` and `wifi_importer` are all
-`Type=oneshot`: they fail once and stay failed. `emulationstation.service` is
-`Restart=on-failure` under the default five-starts-in-ten-seconds limit, so
-systemd stops it by itself — and its failure is the thing we still need to read.
-Bounded noise is evidence; only the unbounded one had to go.
+`Type=oneshot`: they fail once and stay failed. Bounded noise is evidence; only
+the unbounded one had to go.
 
 ## What used to cost ten seconds of every boot
 
@@ -484,8 +480,8 @@ doomgeneric writing 32-bit pixels into `/dev/fb0` and reading `/dev/input/event0
 
 Nothing already on the card could ask the question. SDL2's video backends are
 KMSDRM, X11, Wayland, offscreen and dummy — there is **no fbdev backend** — so the
-`gzdoom`, `lzdoom` and EmulationStation already in the shared rootfs all need
-DRM/KMS or a GL stack. doomgeneric needs neither, nor SDL, nor X11.
+`gzdoom` and `lzdoom` already in the shared rootfs both need DRM/KMS or a GL
+stack. doomgeneric needs neither, nor SDL, nor X11.
 
 The panel is `640x480`, stride 2560, `x8r8g8b8`, and doomgeneric's `rgba8888`
 packing is bit-identical to it, so the blit is one `memcpy` per line.
@@ -575,37 +571,38 @@ matters: `multi_v7_defconfig` turns on a dozen DRM drivers and one of them,
 and wins, by calling `drm_aperture_acquire_from_firmware()` and evicting the
 working display. It is refused outright after `olddefconfig`, at either value.
 
-### EmulationStation is blocked, not misconfigured
+### Why lima alone is not a GL stack
 
 If lima loads you get `/dev/dri/renderD128` and **no** `card0`. That is not a
-fault; lima is render-only, because a Mali-450 has no display controller. The
-consequence is that ES cannot start yet, and no flag reaches it:
+fault; lima is render-only, because a Mali-450 has no display controller. Four
+links have to close before anything on this board can create a GL context, and
+lima is one of them:
 
-1. No KMS device from lima. The panel is on `simplefb`, which is a framebuffer,
-   not a DRM device.
-2. SDL2's only viable backend here is KMSDRM, which needs a card node.
+1. A KMS device. lima gives none — the panel is on `simplefb`, which is a
+   framebuffer, not a DRM device — so `mediatek-drm` supplies `card0`.
+2. SDL2's only viable backend here is KMSDRM, which needs that card node.
 3. `simpledrm` could supply one, and is disabled for the reason above — and even
    enabled it would not help, because Mesa's kmsro/renderonly driver table has no
    `simpledrm` entry, so there would be no GBM and no EGL on top of it.
-4. The shared rootfs's GL is the RK3326's Mali-G31 **Bifrost** blob, forced by
-   `SDL_VIDEO_EGL_DRIVER=libEGL.so` in `emulationstation.service`. Bifrost is a
-   different architecture from this Utgard part.
+   `mediatek_dri.so` **is** in that table, which is why the display driver is
+   `mediatek-drm` specifically.
+4. A GL front end that is Mesa's. The shared rootfs points `libEGL.so` and
+   `libgbm.so*` at the RK3326's Mali-G31 **Bifrost** blob, a different
+   architecture from this Utgard part, so `j36.gl=1` stages Debian's armhf Mesa
+   into `/run/j36/gl` ahead of it.
 
-What closes it is a real MT6592 DRM/KMS driver for the DISP/OVL/DSI path — the
-same work the full JD9365 program in the DTB is being kept for. Until then ES is
-left enabled and failing, because its unit is bounded (`Restart=on-failure`, five
-starts in ten seconds) and its failure is evidence;
-`systemd.mask=emulationstation.service` in `bootargs` silences it.
+With all four closed, `j36/eglprobe` measures ES2 contexts current on an ARGB8888
+window surface. The dashboard itself needs none of it: it is Qt on `linuxfb`.
 
 ## Licence and attribution
 
 The original MixOS work here — `build-in-vm.sh`, `generate_dts.py`,
 `create_boot_image.py`, `fetch_freedoom.py`, `sync-mvii-board.sh`,
-`es/patch-gles20.py`, `tools/j36-eglprobe.c`, `tools/mfgpower.c` and this
-documentation — is under the **Microsoft Public License (Ms-PL)**. The full text
+`tools/j36-eglprobe.c`, `tools/mfgpower.c`, `tools/mixsplash.c`, `tools/mixdash/`
+and this documentation — is under the **Microsoft Public License (Ms-PL)**. The full text
 and the exact per-file scope are in [LICENSE](LICENSE).
 
-Three things in this directory are **not** Ms-PL, and the distinction is not
+Two things in this directory are **not** Ms-PL, and the distinction is not
 cosmetic:
 
 - `linux/j36_mt6592_input.c`, `linux/j36_mt6592_audio.c`,
@@ -614,15 +611,12 @@ cosmetic:
   internals, and Ms-PL is not GPL-compatible — its section 3(D) adds a condition
   GPLv2 section 6 forbids adding — so relicensing them is not this project's to
   do, and it is not attempted.
-- `es/Renderer_GLES20.cpp` is written to drop into EmulationStation's own
-  `es-core/src/renderers/` beside its two existing renderers. It is a derivative
-  of that tree and follows **EmulationStation's** licence.
 - `mvii-board/` is five verbatim MediaTek/MVII board headers and driver sources,
   redistributed unmodified with a SHA-256 each in `mvii-board/PROVENANCE.txt`.
   They are inputs the DTS generator parses, not MixOS work.
 
-A finished card is an aggregate: the Linux kernel, Mesa, SDL, EmulationStation,
-busybox, the Freedoom IWAD and the Debian rootfs each arrive under their own terms.
+A finished card is an aggregate: the Linux kernel, Mesa, Qt, SDL, busybox, the
+Freedoom IWAD and the Debian rootfs each arrive under their own terms.
 `build-in-vm.sh` writes the same statement onto the card as `sd-boot/LICENSE.txt`,
 mapped payload file by payload file, because handing somebody a card is a
 distribution and Ms-PL section 3(C) says the notices travel with it.
@@ -641,6 +635,6 @@ Debian's work; to **ArkOS** and **dArkOS** for the distribution this grew out of
 to **MediaTek**, whose register documentation and vendor driver sources the device
 tree generator reads directly rather than guessing from; to **Mesa**, whose lima
 and kmsro drivers are the only reason a Utgard part from 2013 can run a GLES 2.0
-UI at all; and to the **Linux kernel**, **SDL**, **busybox**, **doomgeneric** and
-**EmulationStation** projects. MixOS is not affiliated with or endorsed by any of
+UI at all; and to the **Linux kernel**, **Qt**, **SDL**, **busybox** and
+**doomgeneric** projects. MixOS is not affiliated with or endorsed by any of
 them, nor by Microsoft — Ms-PL is simply the licence chosen for the MixOS work.

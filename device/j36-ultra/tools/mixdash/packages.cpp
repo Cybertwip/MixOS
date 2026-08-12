@@ -60,7 +60,7 @@ PackagesPage::PackagesPage(QWidget *parent)
 {
     m_list = new ListPane(this);
     m_list->setRowHeight(30);
-    m_list->setPlaceholder(QStringLiteral("Nothing matched.\nB goes back."));
+    m_list->setPlaceholder(tr("Nothing matched.\nB goes back."));
     connect(m_list, &ListPane::activated, this, &PackagesPage::onActivated);
 
     buildCollections();
@@ -72,7 +72,7 @@ QString PackagesPage::title() const
         return "Search: " + m_term;
     if (m_view == ViewCollection && m_collection >= 0 && m_collection < m_collections.size())
         return m_collections[m_collection].title;
-    return QStringLiteral("Packages");
+    return tr("Packages");
 }
 
 void PackagesPage::resizeEvent(QResizeEvent *event)
@@ -158,9 +158,9 @@ QString PackagesPage::summaryFor(const QString &name) const
 void PackagesPage::buildCollections()
 {
     Collection desktops;
-    desktops.title = QStringLiteral("Desktops");
-    desktops.subtitle = QStringLiteral("A full X or Wayland session.  Big, and worth knowing:\n"
-                                       "they need a display server this board has no KMS for.");
+    desktops.title = tr("Desktops");
+    desktops.subtitle = tr("A full X or Wayland session.  Big, and worth knowing:\n"
+                           "they need a display server this board has no KMS for.");
     desktops.accent = Theme::blue();
     desktops.glyph = GlyphDisplay;
     desktops.packages = QStringList()
@@ -170,8 +170,8 @@ void PackagesPage::buildCollections()
     m_collections.append(desktops);
 
     Collection browsers;
-    browsers.title = QStringLiteral("Browsers and network");
-    browsers.subtitle = QStringLiteral("Getting at the rest of the world.");
+    browsers.title = tr("Browsers and network");
+    browsers.subtitle = tr("Getting at the rest of the world.");
     browsers.accent = Theme::teal();
     browsers.glyph = GlyphWifi;
     browsers.packages = QStringList()
@@ -181,8 +181,8 @@ void PackagesPage::buildCollections()
     m_collections.append(browsers);
 
     Collection media;
-    media.title = QStringLiteral("Media");
-    media.subtitle = QStringLiteral("What the Media page needs, and more of it.");
+    media.title = tr("Media");
+    media.subtitle = tr("What the Media page needs, and more of it.");
     media.accent = Theme::pink();
     media.glyph = GlyphMusic;
     media.packages = QStringList()
@@ -192,8 +192,8 @@ void PackagesPage::buildCollections()
     m_collections.append(media);
 
     Collection tools;
-    tools.title = QStringLiteral("Command line");
-    tools.subtitle = QStringLiteral("The things a bring-up console is missing.");
+    tools.title = tr("Command line");
+    tools.subtitle = tr("The things a bring-up console is missing.");
     tools.accent = Theme::orange();
     tools.glyph = GlyphTerminal;
     tools.packages = QStringList()
@@ -203,8 +203,8 @@ void PackagesPage::buildCollections()
     m_collections.append(tools);
 
     Collection dev;
-    dev.title = QStringLiteral("Building things");
-    dev.subtitle = QStringLiteral("A toolchain, on the device itself.");
+    dev.title = tr("Building things");
+    dev.subtitle = tr("A toolchain, on the device itself.");
     dev.accent = Theme::purple();
     dev.glyph = GlyphChip;
     dev.packages = QStringList()
@@ -213,8 +213,8 @@ void PackagesPage::buildCollections()
     m_collections.append(dev);
 
     Collection games;
-    games.title = QStringLiteral("Games and emulators");
-    games.subtitle = QStringLiteral("Anything that draws without a GPU has a chance here.");
+    games.title = tr("Games and emulators");
+    games.subtitle = tr("Anything that draws without a GPU has a chance here.");
     games.accent = Theme::green();
     games.glyph = GlyphGames;
     games.packages = QStringList()
@@ -301,7 +301,7 @@ void PackagesPage::showCollection(int index)
     m_shown = ordered;
 
     if (m_shown.isEmpty())
-        m_note = QStringLiteral("apt has no package lists yet -- run Update first");
+        m_note = tr("apt has no package lists yet -- run Update first");
     else
         m_note.clear();
 
@@ -338,11 +338,11 @@ void PackagesPage::showSearch(const QString &term)
     }
 
     if (m_shown.isEmpty())
-        m_note = "nothing matched " + term;
+        m_note = tr("nothing matched %1").arg(term);
     else if (m_shown.size() >= kMaxResults)
-        m_note = QString("first %1 matches -- narrow the search for the rest").arg(kMaxResults);
+        m_note = tr("first %1 matches -- narrow the search for the rest").arg(kMaxResults);
     else
-        m_note = QString("%1 matches").arg(m_shown.size());
+        m_note = tr("%1 matches").arg(m_shown.size());
 
     rebuild();
     emit titleChanged();
@@ -355,13 +355,13 @@ void PackagesPage::rebuild()
     if (m_view == ViewHome) {
         ListRow head;
         head.kind = ListRow::Header;
-        head.text = QStringLiteral("Find");
+        head.text = tr("Find");
         rows.append(head);
 
         ListRow search;
         search.kind = ListRow::Action;
-        search.text = QStringLiteral("Search the archive");
-        search.detail = QStringLiteral("By name.  Menu opens the keyboard anywhere on this page.");
+        search.text = tr("Search the archive");
+        search.detail = tr("By name.  Menu opens the keyboard anywhere on this page.");
         search.glyph = GlyphPackage;
         search.accent = Theme::blue();
         search.id = RowSearch;
@@ -369,7 +369,7 @@ void PackagesPage::rebuild()
 
         ListRow collectionsHead;
         collectionsHead.kind = ListRow::Header;
-        collectionsHead.text = QStringLiteral("Collections");
+        collectionsHead.text = tr("Collections");
         rows.append(collectionsHead);
 
         for (int i = 0; i < m_collections.size(); ++i) {
@@ -387,13 +387,13 @@ void PackagesPage::rebuild()
 
         ListRow maintenance;
         maintenance.kind = ListRow::Header;
-        maintenance.text = QStringLiteral("Maintenance");
+        maintenance.text = tr("Maintenance");
         rows.append(maintenance);
 
         ListRow update;
         update.kind = ListRow::Action;
-        update.text = QStringLiteral("Update package lists");
-        update.detail = QStringLiteral("apt-get update, in the Terminal.");
+        update.text = tr("Update package lists");
+        update.detail = tr("apt-get update, in the Terminal.");
         update.glyph = GlyphPackage;
         update.accent = Theme::teal();
         update.id = RowUpdate;
@@ -401,8 +401,8 @@ void PackagesPage::rebuild()
 
         ListRow upgrade;
         upgrade.kind = ListRow::Action;
-        upgrade.text = QStringLiteral("Upgrade everything installed");
-        upgrade.detail = QStringLiteral("apt-get upgrade.  Answer its questions in the Terminal.");
+        upgrade.text = tr("Upgrade everything installed");
+        upgrade.detail = tr("apt-get upgrade.  Answer its questions in the Terminal.");
         upgrade.glyph = GlyphPackage;
         upgrade.accent = Theme::orange();
         upgrade.id = RowUpgrade;
@@ -410,8 +410,8 @@ void PackagesPage::rebuild()
 
         ListRow clean;
         clean.kind = ListRow::Action;
-        clean.text = QStringLiteral("Free up space");
-        clean.detail = QStringLiteral("apt-get clean and autoremove.  The card is small.");
+        clean.text = tr("Free up space");
+        clean.detail = tr("apt-get clean and autoremove.  The card is small.");
         clean.glyph = GlyphPackage;
         clean.accent = Theme::ink2();
         clean.id = RowClean;
@@ -419,8 +419,10 @@ void PackagesPage::rebuild()
 
         ListRow installed;
         installed.kind = ListRow::Item;
-        installed.text = QString("%1 packages installed").arg(m_installed.size());
-        installed.detail = QStringLiteral("What dpkg says is on this card right now.");
+        installed.text = m_installed.size() == 1
+                             ? tr("1 package installed")
+                             : tr("%1 packages installed").arg(m_installed.size());
+        installed.detail = tr("What dpkg says is on this card right now.");
         installed.glyph = GlyphInfo;
         installed.accent = Theme::ink3();
         installed.enabled = false;
@@ -429,7 +431,7 @@ void PackagesPage::rebuild()
     } else {
         ListRow back;
         back.kind = ListRow::Action;
-        back.text = QStringLiteral("Back");
+        back.text = tr("Back");
         back.glyph = GlyphBack;
         back.accent = Theme::ink3();
         back.id = RowBack;
@@ -437,7 +439,7 @@ void PackagesPage::rebuild()
 
         ListRow head;
         head.kind = ListRow::Header;
-        head.text = (m_view == ViewSearch) ? ("Matches for " + m_term)
+        head.text = (m_view == ViewSearch) ? tr("Matches for %1").arg(m_term)
                                            : m_collections[m_collection].title;
         rows.append(head);
 
@@ -451,7 +453,7 @@ void PackagesPage::rebuild()
             r.value = i;
             r.key = m_shown[i].name;
             if (m_shown[i].installed) {
-                r.badge = QStringLiteral("installed");
+                r.badge = tr("installed");
                 r.badgeColour = Theme::green();
                 r.accent = Theme::green();
             } else {
@@ -479,13 +481,13 @@ void PackagesPage::install(const QString &name)
      * manager takes over the console this dashboard is drawn on.
      */
     emit terminalRequested(privileged("apt-get install " + name));
-    emit toastRequested("Installing " + name + " in the Terminal", 3000);
+    emit toastRequested(tr("Installing %1 in the Terminal").arg(name), 3000);
 }
 
 void PackagesPage::remove(const QString &name)
 {
     emit terminalRequested(privileged("apt-get remove " + name));
-    emit toastRequested("Removing " + name + " in the Terminal", 3000);
+    emit toastRequested(tr("Removing %1 in the Terminal").arg(name), 3000);
 }
 
 void PackagesPage::onActivated(int index)
@@ -498,7 +500,7 @@ void PackagesPage::onActivated(int index)
     switch (row.id) {
     case RowSearch:
         m_awaitingSearch = true;
-        emit textRequested(QStringLiteral("Search packages"), m_term, false);
+        emit textRequested(tr("Search packages"), m_term, false);
         return;
     case RowCollection:
         m_list->setCurrent(0);
@@ -530,8 +532,8 @@ void PackagesPage::onActivated(int index)
         if (m_armed != pkg.name) {
             m_armed = pkg.name;
             emit toastRequested(pkg.installed
-                                    ? ("Press A again to remove " + pkg.name)
-                                    : ("Press A again to install " + pkg.name),
+                                    ? tr("Press A again to remove %1").arg(pkg.name)
+                                    : tr("Press A again to install %1").arg(pkg.name),
                                 5000);
             return;
         }
@@ -566,7 +568,7 @@ bool PackagesPage::handleNav(int action)
     case Joypad::NavOk:   m_list->press(); return true;
     case Joypad::NavMenu:
         m_awaitingSearch = true;
-        emit textRequested(QStringLiteral("Search packages"), m_term, false);
+        emit textRequested(tr("Search packages"), m_term, false);
         return true;
     case Joypad::NavBack:
         if (m_view != ViewHome) {
@@ -590,7 +592,7 @@ void PackagesPage::paintEvent(QPaintEvent *)
 
     QString right;
     if (aptCache().isEmpty())
-        right = QStringLiteral("apt-cache missing");
+        right = tr("apt-cache missing");
     else
         right = QString("%1 installed").arg(m_installed.size());
 
@@ -599,9 +601,9 @@ void PackagesPage::paintEvent(QPaintEvent *)
     QString line = m_note;
     if (line.isEmpty()) {
         if (m_view == ViewHome)
-            line = QStringLiteral("A opens, Menu searches.  Installs run in the Terminal.");
+            line = tr("A opens, Menu searches.  Installs run in the Terminal.");
         else
-            line = QStringLiteral("A installs or removes -- twice, to be sure.");
+            line = tr("A installs or removes -- twice, to be sure.");
     }
     p.setFont(Theme::font(12));
     p.setPen(Theme::ink2());

@@ -19,6 +19,7 @@
 #include <QSysInfo>
 
 #include "joypad.h"
+#include "strings.h"
 #include "theme.h"
 
 namespace {
@@ -301,19 +302,19 @@ void SettingsPage::rebuild()
     ListRow h;
     h.kind = ListRow::Header;
 
-    h.text = QStringLiteral("Input");
+    h.text = tr("Input");
     rows << h;
 
     ListRow r;
     r.kind = ListRow::Item;
     r.glyph = GlyphMouse;
     r.accent = Theme::purple();
-    r.text = QStringLiteral("Mouse and pointer");
-    r.detail = QStringLiteral("Speed, tracking, double click, idle");
+    r.text = tr("Mouse and pointer");
+    r.detail = tr("Speed, tracking, double click, idle");
     r.id = OpenMouse;
     rows << r;
 
-    h.text = QStringLiteral("Display");
+    h.text = tr("Display");
     rows << h;
 
     /* The current level goes on the hub row rather than only inside the page:
@@ -324,46 +325,31 @@ void SettingsPage::rebuild()
     r.kind = ListRow::Item;
     r.glyph = GlyphDisplay;
     r.accent = Theme::yellow();
-    r.text = QStringLiteral("Screen and backlight");
+    r.text = tr("Screen and backlight");
     r.detail = lit < 0
-                   ? QStringLiteral("No backlight device -- the loader owns the brightness")
-                   : QString("Brightness %1 %").arg(lit);
+                   ? tr("No backlight device -- the loader owns the brightness")
+                   : tr("Brightness %1 %").arg(lit);
     r.id = OpenDisplay;
     rows << r;
 
-    h.text = QStringLiteral("Network");
-    rows << h;
-
-    const QString iface = SysInfo::wirelessInterface();
-    r = ListRow();
-    r.kind = ListRow::Item;
-    r.glyph = GlyphWifi;
-    r.accent = Theme::blue();
-    r.text = QStringLiteral("Wi-Fi");
-    r.detail = iface.isEmpty()
-                   ? QStringLiteral("No wireless interface found")
-                   : QString("Scan and join, on %1").arg(iface);
-    r.id = OpenWifi;
-    rows << r;
-
-    h.text = QStringLiteral("Sound");
+    h.text = tr("Sound");
     rows << h;
 
     const QString ctl = mixer();
     if (ctl.isEmpty()) {
         r = ListRow();
         r.kind = ListRow::Item;
-        r.text = QStringLiteral("Volume");
+        r.text = tr("Volume");
         r.detail = m_haveAmixer
-                       ? QStringLiteral("No playback control -- is a card registered?")
-                       : QStringLiteral("amixer is missing.  Install alsa-utils.");
+                       ? tr("No playback control -- is a card registered?")
+                       : tr("amixer is missing.  Install alsa-utils.");
         r.enabled = false;
         r.id = RowInert;
         rows << r;
     } else {
         r = ListRow();
         r.kind = ListRow::Slider;
-        r.text = QStringLiteral("Volume");
+        r.text = tr("Volume");
         r.detail = ctl;
         r.minimum = 0;
         r.maximum = 100;
@@ -376,64 +362,46 @@ void SettingsPage::rebuild()
 
         r = ListRow();
         r.kind = ListRow::Toggle;
-        r.text = QStringLiteral("Mute");
+        r.text = tr("Mute");
         r.on = m_muted;
         r.id = RowMute;
         rows << r;
     }
 
-    h.text = QStringLiteral("System");
+    h.text = tr("Language");
     rows << h;
 
-    struct Dest {
-        const char *text;
-        const char *detail;
-        int glyph;
-        QColor accent;
-        int id;
-    };
-    const Dest dests[] = {
-        { "Packages", "Install anything Debian has", GlyphPackage, Theme::green(),
-          OpenPackages },
-        { "Terminal", "A shell on the glass", GlyphTerminal, Theme::orange(),
-          OpenTerminal },
-        { "Files", "Browse the card and the rootfs", GlyphFiles, Theme::yellow(),
-          OpenFiles },
-        { "Diagnostics", "Display, GPU, input, sound, USB, power", GlyphChip,
-          Theme::pink(), OpenDiagnostics },
-        { "System information", "CPU, memory, disks, USB, network", GlyphInfo,
-          Theme::ink3(), OpenSystem }
-    };
-    for (uint i = 0; i < sizeof(dests) / sizeof(dests[0]); ++i) {
-        r = ListRow();
-        r.kind = ListRow::Item;
-        r.text = QString::fromLatin1(dests[i].text);
-        r.detail = QString::fromLatin1(dests[i].detail);
-        r.glyph = dests[i].glyph;
-        r.accent = dests[i].accent;
-        r.id = dests[i].id;
-        rows << r;
-    }
+    r = ListRow();
+    r.kind = ListRow::Item;
+    r.glyph = GlyphInfo;
+    r.accent = Theme::green();
+    r.text = tr("Language");
+    /* In the language itself, and that is the point: somebody who has landed on
+     * a language they cannot read has to be able to find the way out of it by
+     * recognising the name of their own. */
+    r.detail = Strings::nativeName(Strings::instance().language());
+    r.id = OpenLanguage;
+    rows << r;
 
-    h.text = QStringLiteral("About");
+    h.text = tr("About");
     rows << h;
 
     Settings &s = Settings::instance();
     r = ListRow();
     r.kind = ListRow::Item;
-    r.text = QStringLiteral("Settings file");
-    r.detail = s.path().isEmpty() ? QStringLiteral("nowhere writable") : s.path();
+    r.text = tr("Settings file");
+    r.detail = s.path().isEmpty() ? tr("nowhere writable") : s.path();
     r.enabled = false;
     r.id = RowInert;
     if (!s.writable()) {
-        r.badge = QStringLiteral("read-only");
+        r.badge = tr("read-only");
         r.badgeColour = Theme::orange();
     }
     rows << r;
 
     r = ListRow();
     r.kind = ListRow::Item;
-    r.text = QStringLiteral("MixOS on J36 Ultra");
+    r.text = tr("MixOS on J36 Ultra");
     r.detail = QString("Linux %1, %2")
                    .arg(QSysInfo::kernelVersion(), QSysInfo::currentCpuArchitecture());
     r.enabled = false;
@@ -480,14 +448,14 @@ void SettingsPage::onValueChanged(int index, int value)
                 }
             }
         }
-        m_note = QString("Volume %1 %").arg(m_volume);
+        m_note = tr("Volume %1 %").arg(m_volume);
         update();
         return;
     }
 
     if (rows[index].id == RowMute) {
         writeMute(value != 0);
-        m_note = m_muted ? QStringLiteral("Muted") : QStringLiteral("Unmuted");
+        m_note = m_muted ? tr("Muted") : tr("Unmuted");
         update();
     }
 }
@@ -523,7 +491,7 @@ void SettingsPage::paintEvent(QPaintEvent *)
     const QRectF body = paintSheet(p, card, title());
 
     const QString line = m_note.isEmpty()
-                             ? QStringLiteral("A opens, Left and Right change a value.")
+                             ? tr("A opens, Left and Right change a value.")
                              : m_note;
     p.setFont(Theme::font(12));
     p.setPen(Theme::ink2());
@@ -586,21 +554,21 @@ void MousePage::rebuild()
 
     ListRow r;
 
-    h.text = QStringLiteral("Stick pointer");
+    h.text = tr("Stick pointer");
     rows << h;
 
     r = ListRow();
     r.kind = ListRow::Toggle;
-    r.text = QStringLiteral("Right stick moves a pointer");
-    r.detail = QStringLiteral("Off makes it a second D-pad");
+    r.text = tr("Right stick moves a pointer");
+    r.detail = tr("Off makes it a second D-pad");
     r.on = m_cfg.enabled;
     r.id = IdEnabled;
     rows << r;
 
     r = ListRow();
     r.kind = ListRow::Slider;
-    r.text = QStringLiteral("Pointer speed");
-    r.detail = QStringLiteral("At full deflection");
+    r.text = tr("Pointer speed");
+    r.detail = tr("At full deflection");
     r.minimum = 80;
     r.maximum = 2400;
     r.stepSize = 40;
@@ -612,13 +580,13 @@ void MousePage::rebuild()
 
     r = ListRow();
     r.kind = ListRow::Slider;
-    r.text = QStringLiteral("Acceleration");
-    r.detail = QStringLiteral("Bends small movements slower, big ones faster");
+    r.text = tr("Acceleration");
+    r.detail = tr("Bends small movements slower, big ones faster");
     r.minimum = 0;
     r.maximum = 100;
     r.stepSize = 5;
     r.value = m_cfg.acceleration;
-    r.valueText = m_cfg.acceleration == 0 ? QStringLiteral("Linear")
+    r.valueText = m_cfg.acceleration == 0 ? tr("Linear")
                                           : QString("%1 %").arg(m_cfg.acceleration);
     r.accent = Theme::purple();
     r.id = IdAccel;
@@ -626,8 +594,8 @@ void MousePage::rebuild()
 
     r = ListRow();
     r.kind = ListRow::Slider;
-    r.text = QStringLiteral("Dead zone");
-    r.detail = QStringLiteral("Ignore this much around centre");
+    r.text = tr("Dead zone");
+    r.detail = tr("Ignore this much around centre");
     r.minimum = 2;
     r.maximum = 60;
     r.stepSize = 2;
@@ -637,13 +605,13 @@ void MousePage::rebuild()
     r.id = IdDeadzone;
     rows << r;
 
-    h.text = QStringLiteral("USB mouse");
+    h.text = tr("USB mouse");
     rows << h;
 
     r = ListRow();
     r.kind = ListRow::Slider;
-    r.text = QStringLiteral("Tracking speed");
-    r.detail = QStringLiteral("Scales what the mouse reports");
+    r.text = tr("Tracking speed");
+    r.detail = tr("Scales what the mouse reports");
     r.minimum = 10;
     r.maximum = 400;
     r.stepSize = 5;
@@ -655,19 +623,19 @@ void MousePage::rebuild()
 
     r = ListRow();
     r.kind = ListRow::Toggle;
-    r.text = QStringLiteral("Left-handed");
-    r.detail = QStringLiteral("Swap the two buttons");
+    r.text = tr("Left-handed");
+    r.detail = tr("Swap the two buttons");
     r.on = m_cfg.leftHanded;
     r.id = IdLeftHanded;
     rows << r;
 
-    h.text = QStringLiteral("Clicking");
+    h.text = tr("Clicking");
     rows << h;
 
     r = ListRow();
     r.kind = ListRow::Slider;
-    r.text = QStringLiteral("Double click speed");
-    r.detail = QStringLiteral("Two presses inside this are one double click");
+    r.text = tr("Double click speed");
+    r.detail = tr("Two presses inside this are one double click");
     r.minimum = 120;
     r.maximum = 1200;
     r.stepSize = 20;
@@ -677,13 +645,13 @@ void MousePage::rebuild()
     r.id = IdDoubleClick;
     rows << r;
 
-    h.text = QStringLiteral("Idle");
+    h.text = tr("Idle");
     rows << h;
 
     r = ListRow();
     r.kind = ListRow::Slider;
-    r.text = QStringLiteral("Hide the pointer after");
-    r.detail = QStringLiteral("It comes back the moment the stick moves");
+    r.text = tr("Hide the pointer after");
+    r.detail = tr("It comes back the moment the stick moves");
     r.minimum = 1;
     r.maximum = 60;
     r.stepSize = 1;
@@ -695,7 +663,7 @@ void MousePage::rebuild()
 
     r = ListRow();
     r.kind = ListRow::Action;
-    r.text = QStringLiteral("Reset to defaults");
+    r.text = tr("Reset to defaults");
     r.accent = Theme::red();
     r.id = IdReset;
     rows << r;
@@ -722,7 +690,7 @@ void MousePage::onValueChanged(int index, int value)
         break;
     case IdAccel:
         m_cfg.acceleration = value;
-        r.valueText = value == 0 ? QStringLiteral("Linear")
+        r.valueText = value == 0 ? tr("Linear")
                                  : QString("%1 %").arg(value);
         break;
     case IdDeadzone:
@@ -770,7 +738,7 @@ void MousePage::onActivated(int index)
     m_cfg = MouseConfig();
     commit();
     rebuild();
-    emit toastRequested(QStringLiteral("Pointer settings reset"), 1600);
+    emit toastRequested(tr("Pointer settings reset"), 1600);
 }
 
 bool MousePage::handleNav(int action)
@@ -855,13 +823,13 @@ void MousePage::paintEvent(QPaintEvent *)
     const QRectF body = paintSheet(p, card, title(),
                                    Settings::instance().writable()
                                        ? QString()
-                                       : QStringLiteral("not saved"));
+                                       : tr("not saved"));
 
     p.setFont(Theme::font(12));
     p.setPen(Theme::ink2());
     p.drawText(QRectF(body.x() + 12, body.y() + 2, body.width() - 24, 18),
                Qt::AlignLeft | Qt::AlignVCenter,
-               QStringLiteral("Left and Right change a value.  Changes apply as you make them."));
+               tr("Left and Right change a value.  Changes apply as you make them."));
 
     /* The pad. */
     const QRectF pad = padRect();
@@ -875,15 +843,15 @@ void MousePage::paintEvent(QPaintEvent *)
     p.setPen(Theme::ink());
     p.drawText(QRectF(pad.x() + 12, pad.y() + 4, pad.width() - 24, 18),
                Qt::AlignLeft | Qt::AlignVCenter,
-               QStringLiteral("Click here twice to test the double click speed"));
+               tr("Click here twice to test the double click speed"));
 
     QString state;
     if (m_clicks == 0)
-        state = QStringLiteral("nothing yet");
+        state = tr("nothing yet");
     else if (m_gapMs < 0)
-        state = QString("%1 click").arg(m_clicks);
+        state = tr("%1 click").arg(m_clicks);
     else
-        state = QString("%1 clicks, %2 doubles, last gap %3 ms")
+        state = tr("%1 clicks, %2 doubles, last gap %3 ms")
                     .arg(m_clicks).arg(m_doubles).arg(m_gapMs);
 
     p.setFont(Theme::font(11));
@@ -896,8 +864,8 @@ void MousePage::paintEvent(QPaintEvent *)
         p.setPen(wasDouble ? Theme::green() : Theme::ink3());
         p.drawText(QRectF(pad.x() + 12, pad.y() + 22, pad.width() - 24, 18),
                    Qt::AlignRight | Qt::AlignVCenter,
-                   wasDouble ? QStringLiteral("counted as a double click")
-                             : QStringLiteral("counted as two clicks"));
+                   wasDouble ? tr("counted as a double click")
+                             : tr("counted as two clicks"));
     }
 }
 
@@ -946,22 +914,22 @@ void DisplayPage::rebuild()
 
     const BacklightDevice bl = findBacklight();
 
-    h.text = QStringLiteral("Backlight");
+    h.text = tr("Backlight");
     rows << h;
 
     if (!bl.valid()) {
         r = ListRow();
         r.kind = ListRow::Item;
-        r.text = QStringLiteral("Brightness");
-        r.detail = QStringLiteral("Nothing in /sys/class/backlight -- is j36_mt6592_backlight loaded?");
+        r.text = tr("Brightness");
+        r.detail = tr("Nothing in /sys/class/backlight -- is j36_mt6592_backlight loaded?");
         r.enabled = false;
         r.id = IdInert;
         rows << r;
 
         r = ListRow();
         r.kind = ListRow::Item;
-        r.text = QStringLiteral("Why the panel is still lit");
-        r.detail = QStringLiteral("The loader set the duty and nothing has changed it since");
+        r.text = tr("Why the panel is still lit");
+        r.detail = tr("The loader set the duty and nothing has changed it since");
         r.enabled = false;
         r.id = IdInert;
         rows << r;
@@ -972,11 +940,11 @@ void DisplayPage::rebuild()
 
         r = ListRow();
         r.kind = ListRow::Slider;
-        r.text = QStringLiteral("Brightness");
+        r.text = tr("Brightness");
         /* The raw duty is on the row because this is a bring-up: when the slider
          * moves and the panel does not, the next question is always whether the
          * number reached the driver, and this is where that is answered. */
-        r.detail = QString("%1, duty %2 of %3")
+        r.detail = tr("%1, duty %2 of %3")
                        .arg(bl.name)
                        .arg(percentToRaw(now, bl.max))
                        .arg(bl.max);
@@ -991,14 +959,14 @@ void DisplayPage::rebuild()
 
         r = ListRow();
         r.kind = ListRow::Action;
-        r.text = QStringLiteral("Full brightness");
-        r.detail = QStringLiteral("One press back to 100, for a room brighter than the last one");
+        r.text = tr("Full brightness");
+        r.detail = tr("One press back to 100, for a room brighter than the last one");
         r.accent = Theme::teal();
         r.id = IdFull;
         rows << r;
     }
 
-    h.text = QStringLiteral("Panel");
+    h.text = tr("Panel");
     rows << h;
 
     /*
@@ -1012,12 +980,12 @@ void DisplayPage::rebuild()
     const QScreen *screen = QGuiApplication::primaryScreen();
     r = ListRow();
     r.kind = ListRow::Item;
-    r.text = QStringLiteral("Resolution");
-    r.detail = screen ? QString("%1 x %2, %3-bit colour")
+    r.text = tr("Resolution");
+    r.detail = screen ? tr("%1 x %2, %3-bit colour")
                             .arg(screen->geometry().width())
                             .arg(screen->geometry().height())
                             .arg(screen->depth())
-                      : QStringLiteral("Qt reports no screen at all");
+                      : tr("Qt reports no screen at all");
     r.enabled = false;
     r.id = IdInert;
     rows << r;
@@ -1025,7 +993,7 @@ void DisplayPage::rebuild()
     if (bl.valid()) {
         r = ListRow();
         r.kind = ListRow::Item;
-        r.text = QStringLiteral("Backlight device");
+        r.text = tr("Backlight device");
         r.detail = bl.dir;
         r.enabled = false;
         r.id = IdInert;
@@ -1041,7 +1009,7 @@ void DisplayPage::applyPercent(int percent)
 {
     const BacklightDevice bl = findBacklight();
     if (!bl.valid()) {
-        m_note = QStringLiteral("There is no backlight device to write to");
+        m_note = tr("There is no backlight device to write to");
         update();
         return;
     }
@@ -1054,7 +1022,7 @@ void DisplayPage::applyPercent(int percent)
          * the write, and the difference between them is one ls away -- but only
          * for somebody who knows the write was attempted at all.
          */
-        m_note = QString("Cannot write %1/brightness").arg(bl.dir);
+        m_note = tr("Cannot write %1/brightness").arg(bl.dir);
         update();
         return;
     }
@@ -1068,7 +1036,7 @@ void DisplayPage::applyPercent(int percent)
      * longer to respond than the file does.
      */
     Settings::instance().setBrightness(want);
-    m_note = QString("Brightness %1 %").arg(want);
+    m_note = tr("Brightness %1 %").arg(want);
     update();
 }
 
@@ -1084,7 +1052,7 @@ void DisplayPage::onValueChanged(int index, int value)
     const BacklightDevice bl = findBacklight();
     r.valueText = QString("%1 %").arg(value);
     if (bl.valid())
-        r.detail = QString("%1, duty %2 of %3")
+        r.detail = tr("%1, duty %2 of %3")
                        .arg(bl.name)
                        .arg(percentToRaw(value, bl.max))
                        .arg(bl.max);
@@ -1101,7 +1069,7 @@ void DisplayPage::onActivated(int index)
 
     applyPercent(100);
     rebuild();
-    emit toastRequested(QStringLiteral("Brightness at full"), 1400);
+    emit toastRequested(tr("Brightness at full"), 1400);
 }
 
 void DisplayPage::restoreSaved()
@@ -1155,14 +1123,129 @@ void DisplayPage::paintEvent(QPaintEvent *)
     const QRectF body = paintSheet(p, card, title(),
                                    Settings::instance().writable()
                                        ? QString()
-                                       : QStringLiteral("not saved"));
+                                       : tr("not saved"));
 
     const QString line =
         m_note.isEmpty()
-            ? QStringLiteral("Left and Right dim and brighten.  The panel follows as you go.")
+            ? tr("Left and Right dim and brighten.  The panel follows as you go.")
             : m_note;
     p.setFont(Theme::font(12));
     p.setPen(Theme::ink2());
     p.drawText(QRectF(body.x() + 12, body.y() + 2, body.width() - 24, 18),
                Qt::AlignLeft | Qt::AlignVCenter, line);
+}
+
+/* ── the language page ───────────────────────────────────────────────────── */
+
+LanguagePage::LanguagePage(QWidget *parent)
+    : PageWidget(parent)
+{
+    m_list = new ListPane(this);
+    m_list->setRowHeight(32);
+    connect(m_list, &ListPane::activated, this, &LanguagePage::onActivated);
+}
+
+void LanguagePage::resizeEvent(QResizeEvent *event)
+{
+    const QRect card(Theme::Margin, Theme::Margin,
+                     width() - 2 * Theme::Margin, height() - 2 * Theme::Margin);
+    m_list->setGeometry(card.x() + 6, card.y() + 36 + 20, card.width() - 12,
+                        card.height() - 36 - 26);
+    QWidget::resizeEvent(event);
+}
+
+void LanguagePage::onEnter()
+{
+    rebuild();
+}
+
+void LanguagePage::rebuild()
+{
+    QVector<ListRow> rows;
+    const int now = Strings::instance().language();
+
+    for (int i = 0; i < Lang::Count; ++i) {
+        ListRow r;
+        r.kind = ListRow::Item;
+        r.glyph = GlyphInfo;
+        /*
+         * The native name is the row.  The English name is the detail, not the
+         * other way round: on a screen somebody has landed on by accident, the
+         * word they are scanning for is the one their own language calls itself.
+         */
+        r.text = Strings::nativeName(i);
+        r.detail = Strings::englishName(i);
+        r.id = i + 1;              /* +1 so English is not the falsy id 0 */
+        r.accent = (i == now) ? Theme::green() : Theme::blue();
+        if (i == now) {
+            r.badge = tr("current");
+            r.badgeColour = Theme::green();
+        }
+        rows << r;
+    }
+
+    m_list->setRows(rows);
+    m_list->setCurrent(now);
+    update();
+}
+
+void LanguagePage::onActivated(int index)
+{
+    const QVector<ListRow> &rows = m_list->rows();
+    if (index < 0 || index >= rows.size())
+        return;
+
+    const int id = rows[index].id - 1;
+    if (id < 0 || id >= Lang::Count)
+        return;
+    if (id == Strings::instance().language())
+        return;
+
+    /*
+     * setLanguage() emits languageChanged(), which the Dashboard answers by
+     * rebuilding the dock and the cards.  This page rebuilds itself afterwards
+     * so the "current" badge moves in the same frame as the rest of the shell --
+     * a settings screen that has to be left and re-entered before it agrees with
+     * itself reads as a setting that did not take.
+     */
+    Strings::instance().setLanguage(id);
+    rebuild();
+    emit titleChanged();
+    emit toastRequested(tr("Language changed"), 2000);
+}
+
+bool LanguagePage::handleNav(int action)
+{
+    switch (action) {
+    case Joypad::NavUp:
+        m_list->step(-1);
+        return true;
+    case Joypad::NavDown:
+        m_list->step(1);
+        return true;
+    case Joypad::NavOk:
+        return m_list->press();
+    default:
+        break;
+    }
+    return false;
+}
+
+void LanguagePage::paintEvent(QPaintEvent *)
+{
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    const QRectF card(Theme::Margin, Theme::Margin,
+                      width() - 2.0 * Theme::Margin, height() - 2.0 * Theme::Margin);
+    const QRectF body = paintSheet(p, card, title(),
+                                   Settings::instance().writable()
+                                       ? QString()
+                                       : tr("not saved"));
+
+    p.setFont(Theme::font(12));
+    p.setPen(Theme::ink2());
+    p.drawText(QRectF(body.x() + 12, body.y() + 2, body.width() - 24, 18),
+               Qt::AlignLeft | Qt::AlignVCenter,
+               tr("A changes the language everywhere at once."));
 }

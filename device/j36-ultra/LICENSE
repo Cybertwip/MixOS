@@ -20,16 +20,13 @@ Ms-PL, the licence below:
     create_boot_image.py        the MT6592 Android boot.img writer
     fetch_freedoom.py           the optional Freedoom fetcher
     sync-mvii-board.sh          the by-hand MVII driver refresh
-    es/patch-gles20.py          the EmulationStation CMake patch generator
     tools/j36-eglprobe.c        the EGL/GBM/DRM scanout probe
     tools/mfgpower.c            the MFG power-domain bring-up probe
+    tools/mixsplash.c           the framebuffer boot splash
+    tools/mixdash/              the Qt dashboard
     README.md, this file        the documentation
 
-    Each of those carries an `SPDX-License-Identifier: MS-PL' header, with one
-    deliberate exception: es/patch-gles20.py has none, because build-in-vm.sh
-    stamps the EmulationStation build with a SHA-256 of that file, so editing it at
-    all -- even to add a comment -- discards a finished ES build and rebuilds it
-    from scratch.  It is Ms-PL by this listing instead.
+    Each of those carries an `SPDX-License-Identifier: MS-PL' header.
 
 GPL-2.0-only, and deliberately NOT relicensed:
 
@@ -47,14 +44,6 @@ GPL-2.0-only, and deliberately NOT relicensed:
     relicensing them is not something this project is free to do, and it does not
     try.  Send changes to them upstream; they are GPL either way.
 
-EmulationStation's own terms:
-
-    es/Renderer_GLES20.cpp      a renderer for EmulationStation-fcamod, written to
-                                drop into that project's es-core/src/renderers/
-                                directory alongside its two existing renderers.
-                                It is a derivative of that tree and follows its
-                                licence, not this one.
-
 Vendor material, redistributed unmodified for provenance:
 
     mvii-board/                 five verbatim MediaTek/MVII board headers and
@@ -64,8 +53,8 @@ Vendor material, redistributed unmodified for provenance:
                                 carry whatever terms their authors set.
 
 Nothing in this file changes the licence of anything a build downloads or stages:
-the Linux kernel, Mesa, SDL, EmulationStation, busybox, the Debian rootfs and the
-Freedoom IWAD are each obtained under their own terms and are not covered here.
+the Linux kernel, Mesa, Qt, SDL, busybox, the Debian rootfs and the Freedoom IWAD
+are each obtained under their own terms and are not covered here.
 A card built by `build-in-vm.sh' is an aggregate of many licences; Ms-PL applies
 to the MixOS scripts and probes that assembled it.
 
@@ -142,10 +131,10 @@ is responsible for it.  Full attribution and thanks are in ../../LICENSES.md and
     boots is Debian, built with Debian's own tools, and every package outside
     this directory that is not the kernel came from Debian.  https://www.debian.org
   * ArkOS, by christianhaitian -- the original handheld distribution and the
-    source of the layout, the tools menu and the EmulationStation integration.
+    source of the layout and the tools menu.
   * dArkOS -- the Debian rebuild of ArkOS this repository was forked from, and
     the origin of everything outside device/j36-ultra/ and device/r36-ultra/.
   * MediaTek -- the MT6592 register-level documentation and the vendor driver
     sources this port reads, via the MVII tree in mvii-board/.
-  * The Linux kernel, Mesa (lima and kmsro), SDL, EmulationStation, busybox,
-    doomgeneric and Freedoom, without any of which there would be no port.
+  * The Linux kernel, Mesa (lima and kmsro), Qt, SDL, busybox, doomgeneric and
+    Freedoom, without any of which there would be no port.

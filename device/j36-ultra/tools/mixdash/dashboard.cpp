@@ -12,6 +12,7 @@
 #include "packages.h"
 #include "pointer.h"
 #include "settingspage.h"
+#include "strings.h"
 #include "terminal.h"
 #include "theme.h"
 #include "trace.h"
@@ -144,7 +145,7 @@ FilesPage::FilesPage(QWidget *parent)
 
 QString FilesPage::title() const
 {
-    return m_root.isEmpty() ? QStringLiteral("Files") : m_root;
+    return m_root.isEmpty() ? tr("Files") : m_root;
 }
 
 void FilesPage::setRoot(const QString &path)
@@ -278,14 +279,14 @@ Dashboard::Dashboard(QWidget *parent)
     m_bar = new StatusBar(this);
     Trace::step("CardGrid (apps)");
     m_apps = new CardGrid(this);
-    m_apps->setPageTitle(QStringLiteral("Apps"));
+    m_apps->setPageTitle(tr("Apps"));
     Trace::step("MediaPage");
     m_media = new MediaPage(this);
     Trace::step("SettingsPage");
     m_settings = new SettingsPage(this);
     Trace::step("CardGrid (power)");
     m_power = new CardGrid(this);
-    m_power->setPageTitle(QStringLiteral("Power"));
+    m_power->setPageTitle(tr("Power"));
 
     Trace::step("FilesPage");
     m_files = new FilesPage(this);
@@ -299,6 +300,8 @@ Dashboard::Dashboard(QWidget *parent)
     m_mouse = new MousePage(this);
     Trace::step("DisplayPage");
     m_display = new DisplayPage(this);
+    Trace::step("LanguagePage");
+    m_language = new LanguagePage(this);
     Trace::step("InfoPage");
     m_info = new InfoPage(this);
 
@@ -362,7 +365,7 @@ Dashboard::Dashboard(QWidget *parent)
     m_roots << m_apps << m_media << m_settings << m_power;
     m_all << m_apps << m_media << m_settings << m_power
           << m_files << m_terminal << m_wifi << m_packages
-          << m_diagnostics << m_mouse << m_display << m_info;
+          << m_diagnostics << m_mouse << m_display << m_language << m_info;
     for (PageWidget *page : m_all) {
         adopt(page);
         page->hide();
@@ -386,6 +389,8 @@ Dashboard::Dashboard(QWidget *parent)
     connect(m_diagnostics, &DiagnosticsPage::launchRequested,
             this, &Dashboard::onLaunchRequested);
     connect(m_dock, &Dock::pageClicked, this, &Dashboard::setRoot);
+    connect(&Strings::instance(), &Strings::languageChanged,
+            this, &Dashboard::retranslate);
 
     connect(m_pad, &Joypad::nav, this, &Dashboard::onNav);
     connect(m_pad, &Joypad::key, this, &Dashboard::onKey);
@@ -394,7 +399,8 @@ Dashboard::Dashboard(QWidget *parent)
     connect(m_pad, &Joypad::pointerWheel, m_pointer, &Pointer::onWheel);
 
     Trace::step("dock pages");
-    m_dock->setPages(QStringList() << "Apps" << "Media" << "Settings" << "Power");
+    m_dock->setPages(QStringList() << tr("Apps") << tr("Media")
+                                   << tr("Settings") << tr("Power"));
 
     /* Stats every candidate executable and IWAD on the card. */
     Trace::step("buildPages -- looks for the apps on disk");
@@ -402,7 +408,7 @@ Dashboard::Dashboard(QWidget *parent)
 
     m_info->setInputSummary(
         m_pad->deviceCount() == 0
-            ? QString("no /dev/input/event* -- nothing to navigate with")
+            ? tr("no /dev/input/event* -- nothing to navigate with")
             : QString("%1: %2").arg(m_pad->deviceCount()).arg(m_pad->deviceNames().join(", ")));
 
     Trace::step("setRoot(0)");
@@ -477,6 +483,16 @@ QString Dashboard::firstWad()
     return QString();
 }
 
+/*
+ * WHAT IS NOT ON THE APPS GRID, AND WHY.
+ *
+ * Media, Settings and Power each used to have a card here as well as a slot in
+ * the dock, and pressing the card did nothing but setRoot() to the tab that was
+ * already one shoulder press away.  Two ways to reach the same page is not two
+ * features; it is one feature and one piece of furniture the user has to learn is
+ * furniture.  The dock is the way to a root page.  The grid is the way to the
+ * pages that have no other way in -- which is exactly the six below.
+ */
 void Dashboard::buildPages()
 {
     QVector<AppEntry> apps;
@@ -486,10 +502,10 @@ void Dashboard::buildPages()
      * to put a moving picture on this panel: doomgeneric writes 32-bit pixels into
      * /dev/fb0 and reads the pad through evdev, which is exactly the layer this
      * dashboard draws in.  No EGL, no GBM, no mode set -- so it hands the panel back
-     * when it exits, which EmulationStation never did.
+     * when it exits, which nothing that sets a mode on this board does.
      */
     AppEntry doom;
-    doom.title = "Doom";
+    doom.title = tr("Doom");
     doom.accent = Theme::blue();
     doom.glyph = GlyphGames;
     doom.exe = firstExisting(QStringList() << "/opt/mixos/bin/doom");
@@ -497,55 +513,36 @@ void Dashboard::buildPages()
     if (!doom.exe.isEmpty() && !wad.isEmpty())
         doom.args = QStringList() << "-iwad" << wad;
     doom.available = !doom.exe.isEmpty() && !wad.isEmpty();
+    /* Said when the card is pressed, not printed under it: see AppEntry. */
     if (doom.exe.isEmpty())
-        doom.subtitle = "Not installed. J36_DOOM=1\nputs it in /opt/mixos.";
+        doom.reason = tr("Not installed. Build with J36_DOOM=1 to put it in /opt/mixos.");
     else if (wad.isEmpty())
-        doom.subtitle = "No IWAD in\n/opt/mixos/share/doom.";
-    else
-        doom.subtitle = QFileInfo(wad).fileName() + ".\n640x400 straight into /dev/fb0.";
+        doom.reason = tr("No IWAD in /opt/mixos/share/doom.");
     apps.append(doom);
 
-    /*
-     * Media, and it is a PAGE now rather than a launcher.  The old card ran mpv,
-     * then cvlc, then vlc, then ffplay, and all four exited 1 -- none of them has
-     * an output this board can use.  media.cpp decodes with ffmpeg and paints the
-     * frames here, in the one process that holds the framebuffer.
-     */
-    AppEntry media;
-    media.title = "Media";
-    media.subtitle = "Music, video and pictures,\ndecoded into this framebuffer.";
-    media.accent = Theme::pink();
-    media.glyph = GlyphVideo;
-    media.internal = InternalMedia;
-    apps.append(media);
-
     AppEntry terminal;
-    terminal.title = "Terminal";
-    terminal.subtitle = "A real login shell,\nwith a real pty behind it.";
+    terminal.title = tr("Terminal");
     terminal.accent = Theme::green();
     terminal.glyph = GlyphTerminal;
     terminal.internal = InternalTerminal;
     apps.append(terminal);
 
     AppEntry files;
-    files.title = "Files";
-    files.subtitle = "Browse the card.";
+    files.title = tr("Files");
     files.accent = Theme::teal();
     files.glyph = GlyphFiles;
     files.internal = InternalFiles;
     apps.append(files);
 
     AppEntry packages;
-    packages.title = "Packages";
-    packages.subtitle = "Everything Debian has,\nincluding a desktop.";
+    packages.title = tr("Packages");
     packages.accent = Theme::yellow();
     packages.glyph = GlyphPackage;
     packages.internal = InternalPackages;
     apps.append(packages);
 
     AppEntry wifi;
-    wifi.title = "Wi-Fi";
-    wifi.subtitle = "Scan, join, remember.";
+    wifi.title = tr("Wi-Fi");
     wifi.accent = Theme::blue();
     wifi.glyph = GlyphWifi;
     wifi.internal = InternalWifi;
@@ -558,66 +555,72 @@ void Dashboard::buildPages()
      * nothing to flip a rendered buffer onto.  The page says so, with the evidence.
      */
     AppEntry diag;
-    diag.title = "Diagnostics";
-    diag.subtitle = "Display, GPU, input, sound,\nUSB and power -- with reasons.";
+    diag.title = tr("Diagnostics");
     diag.accent = Theme::purple();
     diag.glyph = GlyphChip;
     diag.internal = InternalDiagnostics;
     apps.append(diag);
-
-    AppEntry settings;
-    settings.title = "Settings";
-    settings.subtitle = "Pointer, sound, network.";
-    settings.accent = Theme::orange();
-    settings.glyph = GlyphSettings;
-    settings.internal = InternalSettings;
-    apps.append(settings);
-
-    AppEntry power;
-    power.title = "Power";
-    power.subtitle = "Restart, shut down, console.";
-    power.accent = Theme::red();
-    power.glyph = GlyphPower;
-    power.internal = InternalPower;
-    apps.append(power);
 
     m_apps->setEntries(apps);
 
     QVector<AppEntry> powers;
 
     AppEntry restart;
-    restart.title = "Restart";
-    restart.subtitle = "Press A twice.";
+    restart.title = tr("Restart");
     restart.accent = Theme::orange();
     restart.glyph = GlyphPower;
     restart.internal = InternalReboot;
     powers.append(restart);
 
     AppEntry off;
-    off.title = "Power off";
-    off.subtitle = "Press A twice.";
+    off.title = tr("Power off");
     off.accent = Theme::red();
     off.glyph = GlyphPower;
     off.internal = InternalPoweroff;
     powers.append(off);
 
     AppEntry console;
-    console.title = "Console";
-    console.subtitle = "Leave the dashboard and\nhand the panel back to the tty.";
+    console.title = tr("Console");
     console.accent = Theme::teal();
     console.glyph = GlyphTerminal;
     console.internal = InternalConsole;
     powers.append(console);
 
     AppEntry info;
-    info.title = "System";
-    info.subtitle = "What this boot brought up.";
+    info.title = tr("System");
     info.accent = Theme::ink3();
     info.glyph = GlyphInfo;
     info.internal = InternalInfo;
     powers.append(info);
 
     m_power->setEntries(powers);
+}
+
+/*
+ * A language was picked.  Everything that is rebuilt on the way into a page
+ * retranslates itself the next time that page is entered -- which for a page you
+ * had to walk to the Language list from is immediately, on the way back.  What is
+ * left is the furniture: the two card grids, built once in the constructor, and
+ * the dock, which never leaves the glass.
+ */
+void Dashboard::retranslate()
+{
+    const int apps = m_apps->index();
+    const int power = m_power->index();
+
+    m_apps->setPageTitle(tr("Apps"));
+    m_power->setPageTitle(tr("Power"));
+    m_dock->setPages(QStringList() << tr("Apps") << tr("Media")
+                                   << tr("Settings") << tr("Power"));
+    buildPages();
+
+    /* setEntries resets the selection; putting it back is what keeps a language
+     * change from also being a jump to the first card. */
+    m_apps->setIndex(apps);
+    m_power->setIndex(power);
+
+    applyChrome();
+    update();
 }
 
 /* ── the page stack ──────────────────────────────────────────────────────── */
@@ -891,11 +894,11 @@ void Dashboard::toast(const QString &text, int ms)
 void Dashboard::launch(const QString &title, const QString &exe, const QStringList &args)
 {
     if (exe.isEmpty() || !QFileInfo(exe).isExecutable()) {
-        toast(title + " is not on this card");
+        toast(tr("%1 is not on this card").arg(title));
         return;
     }
 
-    toast("Starting " + title, 60000);
+    toast(tr("Starting %1").arg(title), 60000);
     /*
      * Painted before we block, or the toast never reaches the glass: everything
      * below this line runs with the event loop stopped.
@@ -921,17 +924,30 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
         m_current->update();
 
     if (rc == -2)
-        toast(title + " would not start");
+        toast(tr("%1 would not start").arg(title));
     else if (rc == -1)
-        toast(title + " crashed");
+        toast(tr("%1 crashed").arg(title));
     else if (rc != 0)
-        toast(QString("%1 exited %2").arg(title).arg(rc));
+        toast(tr("%1 exited %2").arg(title).arg(rc));
     else
-        toast(title + " exited");
+        toast(tr("%1 exited").arg(title));
 }
 
 /* ── activating a card ───────────────────────────────────────────────────── */
 
+/*
+ * THREE DESTINATIONS, AND THAT IS THE POINT.
+ *
+ * Settings used to end in a "System" section that opened Packages, Terminal,
+ * Files, Diagnostics and System information, and a "Network" section that opened
+ * Wi-Fi.  Every one of those is a card on the Apps grid or a tab on the dock, so
+ * every one of them was a second door into a room that already had one -- and a
+ * second door that had to be kept in step with the first, which is how the Wi-Fi
+ * row came to describe an interface the Wi-Fi page names differently.
+ *
+ * What is left here is what Settings is for: the three pages that exist ONLY as
+ * settings and are reachable nowhere else.
+ */
 void Dashboard::openDestination(int destination)
 {
     switch (destination) {
@@ -941,27 +957,8 @@ void Dashboard::openDestination(int destination)
     case SettingsPage::OpenDisplay:
         push(m_display);
         break;
-    case SettingsPage::OpenWifi:
-        push(m_wifi);
-        break;
-    case SettingsPage::OpenDiagnostics:
-        push(m_diagnostics);
-        break;
-    case SettingsPage::OpenPackages:
-        push(m_packages);
-        break;
-    case SettingsPage::OpenTerminal:
-        push(m_terminal);
-        break;
-    case SettingsPage::OpenSystem:
-        m_info->refresh();
-        push(m_info);
-        break;
-    case SettingsPage::OpenFiles:
-        push(m_files);
-        break;
-    case SettingsPage::OpenMedia:
-        setRoot(1);
+    case SettingsPage::OpenLanguage:
+        push(m_language);
         break;
     default:
         break;
@@ -970,13 +967,28 @@ void Dashboard::openDestination(int destination)
 
 void Dashboard::activate(const AppEntry &entry)
 {
+    /*
+     * Why a card is greyed out, said when it is pressed.  This is where the
+     * description under the card went: a caption is on the glass whether or not
+     * anything is wrong, and this is on the glass exactly when somebody has asked.
+     */
+    if (!entry.available) {
+        toast(entry.reason.isEmpty()
+                  ? tr("%1 is not on this card").arg(entry.title)
+                  : entry.reason,
+              5000);
+        return;
+    }
+
     if (!entry.exe.isEmpty() || entry.internal == InternalNone) {
         /* Same two-press gate as Power off, and for the same reason: what it does
          * cannot be undone from here.  The warning has to be shown before the child
          * starts, because after it starts the panel is no longer ours to draw on. */
         if (entry.confirm && m_armedExe != entry.exe) {
             m_armedExe = entry.exe;
-            toast(entry.title + " takes the panel for good.\nPress A again to run it.", 6000);
+            toast(tr("%1 takes the panel for good.\nPress A again to run it.")
+                      .arg(entry.title),
+                  6000);
             return;
         }
         m_armedExe.clear();
@@ -987,9 +999,6 @@ void Dashboard::activate(const AppEntry &entry)
     switch (entry.internal) {
     case InternalFiles:
         push(m_files);
-        break;
-    case InternalMedia:
-        setRoot(1);
         break;
     case InternalTerminal:
         push(m_terminal);
@@ -1003,34 +1012,28 @@ void Dashboard::activate(const AppEntry &entry)
     case InternalDiagnostics:
         push(m_diagnostics);
         break;
-    case InternalSettings:
-        setRoot(2);
-        break;
     case InternalInfo:
         m_info->refresh();
         push(m_info);
         break;
-    case InternalPower:
-        setRoot(3);
-        break;
     case InternalReboot:
         if (m_armed != InternalReboot) {
             m_armed = InternalReboot;
-            toast("Press A again to restart");
+            toast(tr("Press A again to restart"));
             return;
         }
         m_armed = InternalNone;
-        launch("Restart", firstExisting(QStringList() << "/sbin/reboot" << "/usr/sbin/reboot"),
+        launch(tr("Restart"), firstExisting(QStringList() << "/sbin/reboot" << "/usr/sbin/reboot"),
                QStringList());
         break;
     case InternalPoweroff:
         if (m_armed != InternalPoweroff) {
             m_armed = InternalPoweroff;
-            toast("Press A again to power off");
+            toast(tr("Press A again to power off"));
             return;
         }
         m_armed = InternalNone;
-        launch("Power off", firstExisting(QStringList() << "/sbin/poweroff" << "/usr/sbin/poweroff"),
+        launch(tr("Power off"), firstExisting(QStringList() << "/sbin/poweroff" << "/usr/sbin/poweroff"),
                QStringList());
         break;
     case InternalConsole:
@@ -1089,7 +1092,7 @@ void Dashboard::onOpenRequested(const QString &path)
         return;
     }
 
-    toast("Nothing here opens " + info.fileName());
+    toast(tr("Nothing here opens %1").arg(info.fileName()));
 }
 
 /* ── input ───────────────────────────────────────────────────────────────── */
@@ -1104,7 +1107,7 @@ void Dashboard::onNav(int action)
     }
 
     if (action == Joypad::NavQuit) {
-        toast("Power, then Console, leaves the dashboard");
+        toast(tr("Power, then Console, leaves the dashboard"));
         return;
     }
 

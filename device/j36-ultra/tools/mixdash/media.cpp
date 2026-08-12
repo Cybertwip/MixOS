@@ -49,7 +49,7 @@ MediaPage::MediaPage(QWidget *parent)
 {
     m_list = new ListPane(this);
     m_list->setRowHeight(30);
-    m_list->setPlaceholder(QStringLiteral("Nothing playable here.\nB goes up a directory."));
+    m_list->setPlaceholder(tr("Nothing playable here.\nB goes up a directory."));
     connect(m_list, &ListPane::activated, this, &MediaPage::onActivated);
 
     m_ui = new QTimer(this);
@@ -68,7 +68,7 @@ QString MediaPage::title() const
 {
     if (m_mode != ModeBrowse && !m_playing.name.isEmpty())
         return m_playing.name;
-    return QStringLiteral("Media");
+    return tr("Media");
 }
 
 bool MediaPage::wantsFullscreen() const
@@ -251,7 +251,7 @@ void MediaPage::rebuild()
         case KindUp:
             r.glyph = GlyphBack;
             r.accent = Theme::ink3();
-            r.detail = QStringLiteral("up one level");
+            r.detail = tr("up one level");
             break;
         case KindDir:
             r.glyph = GlyphFiles;
@@ -281,7 +281,7 @@ void MediaPage::rebuild()
         }
 
         if (m_mode == ModeAudio && e.path == m_playing.path) {
-            r.badge = m_paused ? QStringLiteral("paused") : QStringLiteral("playing");
+            r.badge = m_paused ? tr("paused") : tr("playing");
             r.badgeColour = m_paused ? Theme::orange() : Theme::green();
         }
         rows.append(r);
@@ -323,7 +323,7 @@ void MediaPage::open(Entry entry)
         openAudio(entry);
         return;
     default:
-        emit toastRequested("Nothing here plays " + entry.name.section('.', -1), 2500);
+        emit toastRequested(tr("Nothing here plays %1").arg(entry.name.section('.', -1)), 2500);
         return;
     }
 }
@@ -355,11 +355,13 @@ void MediaPage::openImage(const Entry &entry)
         if (!supported.contains(suffix.toLatin1())
             && !(suffix == "jpg" && supported.contains("jpeg"))) {
             /* The honest diagnosis: the plugin is missing, not the file. */
-            emit toastRequested("No " + suffix.toUpper() + " image plugin is staged.\n"
-                                "Qt here reads: " + QString::fromLatin1(supported.join(", ")),
+            emit toastRequested(tr("No %1 image plugin is staged.\nQt here reads: %2")
+                                    .arg(suffix.toUpper(),
+                                         QString::fromLatin1(supported.join(", "))),
                                 5000);
         } else {
-            emit toastRequested("Could not read " + entry.name + ": " + reader.errorString(), 4000);
+            emit toastRequested(tr("Could not read %1: %2").arg(entry.name, reader.errorString()),
+                                4000);
         }
         return;
     }
@@ -494,7 +496,7 @@ double MediaPage::probeDuration(const QString &path) const
 void MediaPage::openVideo(const Entry &entry, double startAt)
 {
     if (ffmpegPath().isEmpty()) {
-        emit toastRequested("ffmpeg is not installed.\nInstall it from Packages.", 4000);
+        emit toastRequested(tr("ffmpeg is not installed.\nInstall it from Packages."), 4000);
         return;
     }
 
@@ -576,7 +578,7 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
             m_audioSide->setStandardOutputProcess(m_aplay);
             m_audioSide->start(ffmpegPath(), sideArgs);
             m_aplay->start(aplay, QStringList() << "-q" << "-f" << "cd" << "-");
-            m_note = QStringLiteral("audio on a separate clock -- no alsa muxer in ffmpeg");
+            m_note = tr("audio on a separate clock -- no alsa muxer in ffmpeg");
         }
     }
 
@@ -631,9 +633,9 @@ void MediaPage::onDecoderFinished()
     if (code != 0 && !err.isEmpty())
         m_note = err.section('\n', 0, 1);
     else if (code != 0)
-        m_note = QString("ffmpeg exited %1").arg(code);
+        m_note = tr("ffmpeg exited %1").arg(code);
     else
-        m_note = QStringLiteral("end of file");
+        m_note = tr("end of file");
 
     /* The picture stays on the glass with the note under it, rather than dropping
      * back to the list -- which is what the old card did, and why the only thing
@@ -648,8 +650,8 @@ void MediaPage::openAudio(const Entry &entry, double startAt)
     const QString ff = ffmpegPath();
     const QString aplay = firstExisting(QStringList() << "/usr/bin/aplay" << "/bin/aplay");
     if (ff.isEmpty() || aplay.isEmpty()) {
-        emit toastRequested(ff.isEmpty() ? "ffmpeg is not installed"
-                                         : "aplay is not installed (alsa-utils)", 4000);
+        emit toastRequested(ff.isEmpty() ? tr("ffmpeg is not installed")
+                                         : tr("aplay is not installed (alsa-utils)"), 4000);
         return;
     }
 
@@ -675,10 +677,10 @@ void MediaPage::openAudio(const Entry &entry, double startAt)
                     const QString err = m_music
                         ? QString::fromLocal8Bit(m_music->readAllStandardError()).trimmed()
                         : QString();
-                    m_note = err.isEmpty() ? QString("ffmpeg exited %1").arg(code)
+                    m_note = err.isEmpty() ? tr("ffmpeg exited %1").arg(code)
                                            : err.section('\n', 0, 0);
                 } else {
-                    m_note = QStringLiteral("end of track");
+                    m_note = tr("end of track");
                 }
                 rebuild();
             });
@@ -787,7 +789,7 @@ void MediaPage::seek(int seconds)
     else
         openAudio(entry, target);
 
-    m_note = QString("seek to %1").arg(humanTime((int)target));
+    m_note = tr("seek to %1").arg(humanTime((int)target));
     update();
 }
 
@@ -891,7 +893,7 @@ void MediaPage::paintEvent(QPaintEvent *)
         } else if (m_mode == ModeVideo) {
             p.setPen(Theme::ink2());
             p.setFont(Theme::font(14));
-            p.drawText(rect(), Qt::AlignCenter, QStringLiteral("decoding..."));
+            p.drawText(rect(), Qt::AlignCenter, tr("decoding..."));
         }
 
         /* A strip along the foot with the name, the clock and any complaint. */
@@ -912,9 +914,9 @@ void MediaPage::paintEvent(QPaintEvent *)
             if (m_duration > 0.0)
                 right += " / " + humanTime((int)m_duration);
             if (m_paused)
-                right = "paused  " + right;
+                right = tr("paused") + "  " + right;
             if (m_framesDropped > 0)
-                right += QString("  %1 dropped").arg(m_framesDropped);
+                right += "  " + tr("%1 dropped").arg(m_framesDropped);
         } else {
             int at = 0;
             int of = 0;
@@ -953,7 +955,7 @@ void MediaPage::paintEvent(QPaintEvent *)
     if (right.size() > 34)
         right = "..." + right.right(31);
 
-    paintSheet(p, card, QStringLiteral("Media"), right);
+    paintSheet(p, card, tr("Media"), right);
 
     if (m_mode == ModeAudio) {
         /* The now-playing line, drawn over the foot of the sheet so a record that
@@ -968,7 +970,7 @@ void MediaPage::paintEvent(QPaintEvent *)
         p.setFont(Theme::font(11));
         p.setPen(m_paused ? Theme::orange() : Theme::green());
         p.drawText(bar.adjusted(10, 0, -10, 0), Qt::AlignLeft | Qt::AlignVCenter,
-                   (m_paused ? QString("paused  ") : QString("playing  ")) + m_playing.name);
+                   (m_paused ? tr("paused") : tr("playing")) + "  " + m_playing.name);
 
         QString clock = humanTime(pos);
         if (m_duration > 0.0)

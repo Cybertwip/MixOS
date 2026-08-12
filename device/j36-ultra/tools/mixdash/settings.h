@@ -105,6 +105,18 @@ public:
     int brightness() const { return m_brightness; }
     void setBrightness(int percent);
 
+    /*
+     * The interface language, as a two-letter ISO 639-1 code.
+     *
+     * A CODE AND NOT AN ENUM, because this file is a plain INI on a partition
+     * somebody will eventually mount on a PC: "language=fr" says what it is, and
+     * it keeps meaning that when a seventh language is inserted in the middle of
+     * Lang::Id.  Empty means nobody has chosen -- which is not the same as having
+     * chosen English, and is what lets the first boot follow the environment.
+     */
+    QString language() const { return m_language; }
+    void setLanguage(const QString &code);
+
     /* The file the settings actually landed in, for the Settings page to print. */
     QString path() const;
     /* False when even the tmpfs fallback would not open, which is worth saying
@@ -123,6 +135,7 @@ private:
     MouseConfig m_mouse;
     QString m_wifiInterface;
     QString m_mediaRoot;
+    QString m_language;
     int m_brightness = -1;
     bool m_writable = false;
 };

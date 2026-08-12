@@ -5,7 +5,7 @@
  *
  * mixdash -- MixOS's dashboard for the J36 Ultra.
  *
- * WHY THIS EXISTS.  EmulationStation reaches the panel through SDL's KMSDRM
+ * WHY THIS EXISTS.  A front end built on SDL reaches the panel through its KMSDRM
  * backend, which means EGL, which means GBM, which means Mesa's lima on a
  * Mali-450 -- five layers, and the screen stayed black with no error past
  * eglCreateContext.  This dashboard reaches the panel through none of them.
@@ -72,6 +72,7 @@
  * thirty lines tall.
  */
 #include "dashboard.h"
+#include "strings.h"
 #include "trace.h"
 
 /*
@@ -554,6 +555,20 @@ int main(int argc, char **argv)
     QFont f = family.isEmpty() ? app.font() : QFont(family);
     f.setPixelSize(13);
     app.setFont(f);
+
+    /*
+     * The strings database, before anything builds a string.
+     *
+     * After the font and before the try block on purpose.  It has to be after
+     * QApplication exists, because it installs a translator on qApp; it has to be
+     * before the Dashboard constructor, because every page title and every card
+     * name is built in there and a translator installed afterwards would leave the
+     * shell in English until each page was walked into.  And it is outside the try
+     * because it cannot throw anything interesting -- the table is in .rodata and
+     * there is nothing to open, which is the whole reason it is a table.
+     */
+    Trace::phase("strings -- the localisation table");
+    Strings::install();
 
     /*
      * WHY THE REST OF main() IS INSIDE A try.  An exception that reaches the top of

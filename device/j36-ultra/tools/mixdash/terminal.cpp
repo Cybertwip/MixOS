@@ -85,6 +85,61 @@ QColor paletteColour(int index)
     return QColor();
 }
 
+/*
+ * Whether a locale variable says nothing at all.
+ *
+ * Unset and empty are obvious; C and POSIX are here because they are the absence
+ * of a choice rather than a choice of ASCII, and treating them as a preference
+ * is how a shell ends up in a non-UTF-8 locale on a device where nobody ever set
+ * one deliberately.
+ */
+bool localeIsUnset(const char *v)
+{
+    if (!v || !*v)
+        return true;
+    return qstrcmp(v, "C") == 0 || qstrcmp(v, "POSIX") == 0;
+}
+
+/*
+ * DEC Special Graphics, 0x5F..0x7E, as Unicode.
+ *
+ * THIS IS THE TABLE THAT TURNS `lqqqk' BACK INTO A BOX.  A curses program that
+ * does not believe the terminal can do UTF-8 draws its frames by designating
+ * this set into G1 and shifting into it, and then sends the ASCII letters below
+ * -- so `x' means a vertical bar and `q' means a horizontal one, and a terminal
+ * that ignores the designation prints the letters.  That is the whole of the
+ * garbage this page used to show the moment anything with a frame was run.
+ *
+ * The scan-line entries (o p r s) are the parts of a five-line ruler and are the
+ * only ones with no good single-width equivalent; U+23BA..U+23BD are what
+ * everyone else uses and what DejaVu Sans Mono has.
+ */
+uint decSpecialGraphic(uchar c)
+{
+    if (c < 0x5F || c > 0x7E)
+        return c;
+
+    static const ushort kMap[32] = {
+        0x00A0, /* _ blank            */ 0x25C6, /* ` diamond          */
+        0x2592, /* a checkerboard     */ 0x2409, /* b HT symbol        */
+        0x240C, /* c FF symbol        */ 0x240D, /* d CR symbol        */
+        0x240A, /* e LF symbol        */ 0x00B0, /* f degree           */
+        0x00B1, /* g plus-minus       */ 0x2424, /* h NL symbol        */
+        0x240B, /* i VT symbol        */ 0x2518, /* j lower right      */
+        0x2510, /* k upper right      */ 0x250C, /* l upper left       */
+        0x2514, /* m lower left       */ 0x253C, /* n crossing         */
+        0x23BA, /* o scan line 1      */ 0x23BB, /* p scan line 3      */
+        0x2500, /* q horizontal       */ 0x23BC, /* r scan line 7      */
+        0x23BD, /* s scan line 9      */ 0x251C, /* t left tee         */
+        0x2524, /* u right tee        */ 0x2534, /* v bottom tee       */
+        0x252C, /* w top tee          */ 0x2502, /* x vertical         */
+        0x2264, /* y less or equal    */ 0x2265, /* z greater or equal */
+        0x03C0, /* { pi               */ 0x2260, /* | not equal        */
+        0x00A3, /* } sterling         */ 0x00B7  /* ~ middle dot       */
+    };
+    return kMap[c - 0x5F];
+}
+
 int paramOr(const QVector<int> &params, int index, int fallback)
 {
     if (index >= params.size())
@@ -117,7 +172,7 @@ QString TerminalPage::title() const
 {
     if (!m_childTitle.isEmpty())
         return m_childTitle;
-    return QStringLiteral("Terminal");
+    return tr("Terminal");
 }
 
 /* ── the child ───────────────────────────────────────────────────────────── */
@@ -143,12 +198,23 @@ bool TerminalPage::startChild(const QString &command)
      */
     const QByteArray shell = shellPath().toLocal8Bit();
     const QByteArray cmd = command.toLocal8Bit();
+    /*
+     * And so is this, for the same reason: getenv() walks environ, which setenv()
+     * in another thread could be reallocating at the moment of the fork.
+     *
+     * True when nothing in the environment expresses a locale preference, which
+     * on this image is the normal case -- systemd starts mixdash with whatever
+     * /etc/environment holds, and that is empty.
+     */
+    const bool noLocale = localeIsUnset(::getenv("LC_ALL"))
+                          && localeIsUnset(::getenv("LC_CTYPE"))
+                          && localeIsUnset(::getenv("LANG"));
 
     int master = -1;
     const pid_t pid = ::forkpty(&master, nullptr, nullptr, &ws);
     if (pid < 0) {
         m_dead = true;
-        m_exitNote = QString("forkpty failed: %1").arg(QString::fromLocal8Bit(strerror(errno)));
+        m_exitNote = tr("forkpty failed: %1").arg(QString::fromLocal8Bit(strerror(errno)));
         update();
         return false;
     }
@@ -176,6 +242,39 @@ bool TerminalPage::startChild(const QString &command)
 
         ::setenv("TERM", "xterm-256color", 1);
         ::setenv("COLORTERM", "truecolor", 1);
+
+        /*
+         * A UTF-8 locale, and this is the half of the garbage-characters fix that
+         * stops the garbage being generated in the first place.
+         *
+         * In a C or POSIX locale ncurses concludes the terminal cannot carry
+         * UTF-8 and draws every frame with the DEC alternate character set
+         * instead -- so top, nano, whiptail and apt's own progress bar all shift
+         * into a line-drawing set and send ASCII letters.  feed() understands
+         * that now, but understanding it is recovery; asking for UTF-8 means
+         * those programs send U+2500 directly and there is nothing to recover
+         * from.  It also fixes every accented character in every message the
+         * shell prints, which no amount of parser work would have.
+         *
+         * C.UTF-8 AND NOT fr_FR.UTF-8, even when the dashboard itself has been
+         * switched to French.  C.UTF-8 is built into glibc and needs no
+         * locale-gen; a locale that was never generated makes setlocale() fall
+         * back to plain C, which is precisely the state being escaped here.  The
+         * shell is not the part of this device that gets translated.
+         *
+         * Only when the environment asked for nothing.  Somebody who set LANG in
+         * /etc/environment meant it, and second-guessing them from a terminal
+         * emulator is not this program's business.
+         */
+        if (noLocale) {
+            ::setenv("LANG", "C.UTF-8", 1);
+            /* Safe to clear: noLocale is exactly the case where these two held
+             * nothing, or held C or POSIX.  Left set, either would win over the
+             * LANG just written -- that is what LC_ALL is for. */
+            ::unsetenv("LC_ALL");
+            ::unsetenv("LC_CTYPE");
+        }
+
         /* Qt's own environment would follow the shell into anything it launches,
          * and a child that then tried linuxfb would fight for the framebuffer. */
         ::unsetenv("QT_QPA_PLATFORM");
@@ -340,12 +439,12 @@ void TerminalPage::drain()
         int status = 0;
         if (m_pid > 0 && ::waitpid(m_pid, &status, WNOHANG) == m_pid) {
             if (WIFEXITED(status))
-                m_exitNote = QString("shell exited %1").arg(WEXITSTATUS(status));
+                m_exitNote = tr("shell exited %1").arg(WEXITSTATUS(status));
             else if (WIFSIGNALED(status))
-                m_exitNote = QString("shell killed by signal %1").arg(WTERMSIG(status));
+                m_exitNote = tr("shell killed by signal %1").arg(WTERMSIG(status));
             m_pid = -1;
         } else if (m_exitNote.isEmpty()) {
-            m_exitNote = QStringLiteral("shell exited");
+            m_exitNote = tr("shell exited");
         }
         m_dead = true;
         ::close(m_fd);
@@ -377,11 +476,34 @@ void TerminalPage::resizeGrid(int cols, int rows)
         return;
 
     QVector<Cell> fresh(cols * rows);
+
+    /*
+     * HOW MANY ROWS THE OLD GRID ACTUALLY HOLDS, WHICH IS NOT m_rows.
+     *
+     * The constructor sizes the grid by calling this with the dimensions the
+     * members already declare -- 80x24 -- while m_grid is still the empty vector
+     * it was default-constructed as.  Copying qMin(rows, m_rows) x qMin(cols,
+     * m_cols) cells therefore read 1920 Cells off the end of a zero-length
+     * QVector and wrote whatever followed it into the fresh grid.  Qt's empty
+     * container is a shared null with a real address, so this did not fault: it
+     * quietly filled a brand new terminal with 1920 cells of adjacent heap, and
+     * every one of them was painted.  That is where the screenful of garbage
+     * characters came from the moment the page was opened, before the shell had
+     * written a single byte.
+     *
+     * Derived rather than remembered because m_grid.size() is the only thing
+     * that knows, and a second member saying the same thing is a second member
+     * that can disagree.
+     */
+    const int oldRows = (m_cols > 0) ? m_grid.size() / m_cols : 0;
+
     /* Keep what fits, anchored top-left.  Anchoring to the bottom would be kinder
      * to a shell prompt, but it moves text the user is looking at, and this panel
      * only ever resizes once at startup anyway. */
-    for (int r = 0; r < qMin(rows, m_rows); ++r)
-        for (int c = 0; c < qMin(cols, m_cols); ++c)
+    const int keepRows = qMin(rows, qMin(m_rows, oldRows));
+    const int keepCols = qMin(cols, m_cols);
+    for (int r = 0; r < keepRows; ++r)
+        for (int c = 0; c < keepCols; ++c)
             fresh[r * cols + c] = m_grid[r * m_cols + c];
 
     m_grid = fresh;
@@ -649,6 +771,12 @@ void TerminalPage::execute(uchar c)
         m_cx = 0;
         m_wrapPending = false;
         break;
+    case 0x0E:   /* SO -- shift out, GL becomes G1 */
+        m_gl = 1;
+        break;
+    case 0x0F:   /* SI -- shift in, GL becomes G0 */
+        m_gl = 0;
+        break;
     default:
         break;
     }
@@ -814,6 +942,10 @@ void TerminalPage::feed(const QByteArray &bytes)
                 m_state = Escape;
                 m_params.clear();
                 m_intermediate.clear();
+                /* A multi-byte character that was cut short by an escape is not
+                 * going to be completed.  Dropping it here keeps its stray lead
+                 * byte from being mistaken for the start of the next one. */
+                m_utf8.clear();
                 m_privateParam = false;
                 break;
             }
@@ -824,7 +956,11 @@ void TerminalPage::feed(const QByteArray &bytes)
             }
             if (c < 0x80) {
                 m_utf8.clear();
-                putChar(c);
+                /* The only place the character set matters.  It applies to the
+                 * 7-bit range and to nothing else: bytes that arrive as UTF-8
+                 * carry their own meaning and are never remapped, which is why
+                 * this is here and not inside putChar(). */
+                putChar(m_charset[m_gl] == '0' ? decSpecialGraphic(c) : c);
                 break;
             }
             /*
@@ -870,8 +1006,28 @@ void TerminalPage::feed(const QByteArray &bytes)
             } else if (c == ']') {
                 m_state = Osc;
                 m_oscBuffer.clear();
-            } else if (c == '(' || c == ')' || c == '*' || c == '+') {
-                m_state = Charset;   /* the next byte names a character set; ignored */
+            } else if (c >= 0x20 && c <= 0x2F) {
+                /*
+                 * An intermediate byte.  ESC ( ) * + designate a character set,
+                 * ESC # picks a line size, ESC SP selects the C1 form and ESC %
+                 * the encoding -- all of them ESC <intermediate...> <final>, and
+                 * all of them two bytes longer than they look.  Handled as one
+                 * state because the failure is the same for every one of them:
+                 * the final byte is a printable character, so getting here late
+                 * puts a `0' or an `8' or a `G' on the screen.
+                 */
+                m_intermediate.clear();
+                m_intermediate.append((char)c);
+                m_state = EscInter;
+            } else if (c == 'P' || c == 'X' || c == '^' || c == '_') {
+                /*
+                 * DCS, SOS, PM and APC.  None of them is anything this terminal
+                 * answers, but each carries a payload that runs until ST and the
+                 * payload is ordinary text -- so treating the introducer as an
+                 * unknown one-byte escape is how the answer to a query nobody
+                 * sent gets typed across the middle of the screen.
+                 */
+                m_state = StringSeq;
             } else if (c == 'M') {
                 /* Reverse index. */
                 if (m_cy == m_top)
@@ -903,14 +1059,62 @@ void TerminalPage::feed(const QByteArray &bytes)
                 m_flags = 0;
                 m_top = 0;
                 m_bottom = m_rows - 1;
+                /* RIS puts the character sets back to ASCII as well.  A program
+                 * that died while shifted out is the reason `reset' exists. */
+                m_charset[0] = m_charset[1] = m_charset[2] = m_charset[3] = 'B';
+                m_gl = 0;
                 m_state = Ground;
             } else {
                 m_state = Ground;
             }
             break;
 
-        case Charset:
+        case EscInter:
+            if (c >= 0x20 && c <= 0x2F) {
+                /* More intermediates.  Bounded because the byte stream is not
+                 * trusted -- a run of them is a corrupt sequence, not a long
+                 * one, and it must not grow a buffer without limit. */
+                if (m_intermediate.size() < 4)
+                    m_intermediate.append((char)c);
+                break;
+            }
+            if (c >= 0x30 && c <= 0x7E) {
+                /*
+                 * The final byte, at last.  For a designator the intermediate
+                 * says which slot and the final says which set; for everything
+                 * else -- ESC # 8, ESC SP F, ESC % G -- there is nothing to do
+                 * but consume it, which is the whole point of being here.
+                 */
+                const char slot = m_intermediate.isEmpty() ? '\0' : m_intermediate.at(0);
+                if (slot == '(' || slot == ')' || slot == '*' || slot == '+') {
+                    const int g = (slot == '(') ? 0 : (slot == ')') ? 1
+                                                    : (slot == '*') ? 2 : 3;
+                    m_charset[g] = (c == '0') ? '0' : 'B';
+                }
+                m_state = Ground;
+                break;
+            }
+            if (c < 0x20) {
+                /* A control byte interleaved into an escape sequence acts where
+                 * it lands and does not abort it -- ECMA-48 is explicit, and a
+                 * CR inside a designator is something `script' replays produce. */
+                execute(c);
+                break;
+            }
             m_state = Ground;
+            break;
+
+        case StringSeq:
+            /*
+             * Swallow to ST.  BEL is taken as a terminator too: it is not what
+             * the standard says, but xterm accepts it for OSC and enough
+             * programs end everything that way that the alternative is eating
+             * the rest of the screen's output waiting for a proper ST.
+             */
+            if (c == 0x07 || c == 0x9C)
+                m_state = Ground;
+            else if (c == 0x1B)
+                m_state = Escape;   /* the `\' of ST falls out of Escape's default */
             break;
 
         case Csi:
@@ -1120,7 +1324,7 @@ bool TerminalPage::handleNav(int action)
     case Joypad::NavMenu:
         /* The on-screen keyboard, for the case this device is normally in: no USB
          * keyboard attached and a command to type anyway. */
-        emit textRequested(QStringLiteral("Command"), QString(), false);
+        emit textRequested(tr("Command"), QString(), false);
         return true;
     case Joypad::NavBack:
         return false;   /* Leaves the page.  The shell keeps running. */
@@ -1296,11 +1500,13 @@ void TerminalPage::paintEvent(QPaintEvent *)
 
     QString foot;
     if (m_dead)
-        foot = m_exitNote + "  --  A or any key restarts it";
+        foot = tr("%1  --  A or any key restarts it").arg(m_exitNote);
     else if (m_view > 0)
-        foot = QString("scrolled back %1 lines  --  Down returns").arg(m_view);
+        foot = m_view == 1
+                   ? tr("scrolled back 1 line  --  Down returns")
+                   : tr("scrolled back %1 lines  --  Down returns").arg(m_view);
     else
-        foot = QString("%1x%2  --  B leaves, Menu types, A is Enter")
+        foot = tr("%1x%2  --  B leaves, Menu types, A is Enter")
                    .arg(m_cols).arg(m_rows);
 
     p.setFont(Theme::font(11));

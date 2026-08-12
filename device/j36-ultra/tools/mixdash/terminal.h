@@ -22,11 +22,21 @@
  *
  * WHAT IS IMPLEMENTED is the subset that bash, ls --color, top, nano, dmesg and
  * apt actually emit: cursor motion, erase, insert and delete of lines and
- * characters, a scrolling region, SGR colour including the 256-colour form, and
- * the alternate screen.  Sixel, mouse reporting and double-width characters are
- * not here.  When something unrecognised arrives it is swallowed rather than
- * printed, because a stray `[?25l' on the screen is worse than a missing hidden
- * cursor.
+ * characters, a scrolling region, SGR colour including the 256-colour form, the
+ * alternate screen, and the DEC alternate character set.  Sixel, mouse reporting
+ * and double-width characters are not here.  When something unrecognised arrives
+ * it is swallowed rather than printed, because a stray `[?25l' on the screen is
+ * worse than a missing hidden cursor.
+ *
+ * SWALLOWING IS THE HARD PART, AND GETTING IT WRONG IS WHAT MAKES A TERMINAL
+ * PRINT RUBBISH.  Every escape sequence has to be consumed to its last byte, and
+ * the ones that are easy to forget are the ones with no parameters to make them
+ * look like sequences: `ESC ( 0' is three bytes of which the parser used to eat
+ * two, leaving a `0' on the screen and -- far worse -- leaving the shift into
+ * the line-drawing set unrecorded, so the frame ncurses drew around `top' came
+ * out as a wall of `lqqqk'.  Hence States below has one state for ESC with
+ * intermediates and one for the string sequences (DCS, SOS, PM, APC), whose
+ * payloads are plain text and would otherwise be typed straight onto the glass.
  *
  * TYPING.  A USB keyboard goes through Joypad::key() and KeyMap; with no keyboard
  * plugged in the on-screen Keyboard is put up with the Menu button and types into
@@ -84,8 +94,15 @@ private:
 
     enum CellFlag { FlagBold = 1, FlagUnderline = 2, FlagReverse = 4, FlagDim = 8 };
 
-    /* Where the parser is in an escape sequence. */
-    enum State { Ground = 0, Escape, Csi, Osc, Charset };
+    /*
+     * Where the parser is in an escape sequence.
+     *
+     * EscInter is ESC followed by an intermediate byte (0x20..0x2F) and running
+     * until the final one: the character set designators `ESC ( ) * +', the line
+     * size `ESC # 8', the C1 form `ESC SP F' and the encoding select `ESC % G'.
+     * StringSeq is DCS, SOS, PM and APC -- everything up to ST, discarded.
+     */
+    enum State { Ground = 0, Escape, EscInter, Csi, Osc, StringSeq };
 
     bool startChild(const QString &command);
     void stopChild();
@@ -172,6 +189,19 @@ private:
     bool m_privateParam = false;
     /* A UTF-8 sequence can straddle two reads. */
     QByteArray m_utf8;
+
+    /*
+     * G0..G3, each holding the byte that designated it.  Only '0' -- DEC Special
+     * Graphics, the box-drawing set -- is told apart from everything else, which
+     * is treated as ASCII: the National Replacement Character sets have not
+     * shipped on a Linux in twenty years, and pretending a Norwegian G0 is ASCII
+     * costs three glyphs where pretending the line-drawing set is ASCII costs
+     * every frame on the screen.
+     */
+    uchar m_charset[4] = { 'B', 'B', 'B', 'B' };
+    /* Which of them GL is: 0 after SI, 1 after SO.  ncurses drives this pair far
+     * more often than it re-designates, so it has to be tracked separately. */
+    int m_gl = 0;
 
     /* Font metrics, measured once per resize. */
     int m_cellW = 8;

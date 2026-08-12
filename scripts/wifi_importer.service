@@ -2,7 +2,6 @@
 Description=Wifi Importer
 #Requires=NetworkManager.service
 After=network-pre.target
-Before=emulationstation.service
 
 [Service]
 Type=oneshot

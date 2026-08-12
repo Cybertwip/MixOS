@@ -60,7 +60,7 @@ DiagnosticsPage::DiagnosticsPage(Joypad *pad, QWidget *parent)
 {
     m_list = new ListPane(this);
     m_list->setRowHeight(30);
-    m_list->setPlaceholder(QStringLiteral("Nothing probed yet."));
+    m_list->setPlaceholder(tr("Nothing probed yet."));
     connect(m_list, &ListPane::activated, this, &DiagnosticsPage::onActivated);
 
     m_timer = new QTimer(this);
@@ -70,7 +70,7 @@ DiagnosticsPage::DiagnosticsPage(Joypad *pad, QWidget *parent)
 
 QString DiagnosticsPage::title() const
 {
-    return m_cube ? QStringLiteral("Render test") : QStringLiteral("Diagnostics");
+    return m_cube ? tr("Render test") : tr("Diagnostics");
 }
 
 void DiagnosticsPage::resizeEvent(QResizeEvent *event)
@@ -100,27 +100,27 @@ void DiagnosticsPage::onLeave()
 void DiagnosticsPage::probeDisplay(QVector<Finding> &out)
 {
     Finding fb;
-    fb.name = QStringLiteral("Framebuffer");
+    fb.name = tr("Framebuffer");
     const QString size = SysInfo::readTrimmed("/sys/class/graphics/fb0/virtual_size");
     const QString bpp = SysInfo::readTrimmed("/sys/class/graphics/fb0/bits_per_pixel");
     const QString stride = SysInfo::readTrimmed("/sys/class/graphics/fb0/stride");
     const QString name = SysInfo::readTrimmed("/sys/class/graphics/fb0/name");
     if (size.isEmpty()) {
-        fb.detail = QStringLiteral("no /dev/fb0 -- and yet you are reading this");
-        fb.badge = QStringLiteral("odd");
+        fb.detail = tr("no /dev/fb0 -- and yet you are reading this");
+        fb.badge = tr("odd");
         fb.colour = Theme::orange();
     } else {
-        fb.detail = QString("%1  %2 bpp  stride %3  %4")
+        fb.detail = tr("%1  %2 bpp  stride %3  %4")
                         .arg(QString(size).replace(',', 'x')).arg(bpp).arg(stride).arg(name);
-        fb.badge = QStringLiteral("live");
+        fb.badge = tr("live");
         fb.colour = Theme::green();
     }
     out.append(fb);
 
     Finding painter;
-    painter.name = QStringLiteral("Painting path");
-    painter.detail = QStringLiteral("Qt raster -> linuxfb -> /dev/fb0.  No GL anywhere.");
-    painter.badge = QStringLiteral("ok");
+    painter.name = tr("Painting path");
+    painter.detail = tr("Qt raster -> linuxfb -> /dev/fb0.  No GL anywhere.");
+    painter.badge = tr("ok");
     painter.colour = Theme::green();
     out.append(painter);
 }
@@ -144,10 +144,10 @@ void DiagnosticsPage::probeGpu(QVector<Finding> &out)
     }
 
     Finding drm;
-    drm.name = QStringLiteral("DRM nodes");
+    drm.name = tr("DRM nodes");
     if (primary.isEmpty() && render.isEmpty()) {
-        drm.detail = QStringLiteral("nothing in /sys/class/drm -- no DRM driver bound");
-        drm.badge = QStringLiteral("none");
+        drm.detail = tr("nothing in /sys/class/drm -- no DRM driver bound");
+        drm.badge = tr("none");
         drm.colour = Theme::red();
     } else {
         QStringList bits;
@@ -173,15 +173,15 @@ void DiagnosticsPage::probeGpu(QVector<Finding> &out)
      * exactly here, and every one of them reports it as its own separate failure.
      */
     Finding kms;
-    kms.name = QStringLiteral("Mode setting (KMS)");
+    kms.name = tr("Mode setting (KMS)");
     if (connectors.isEmpty()) {
-        kms.detail = QStringLiteral("no card*-* connectors: the DRM driver is render-only.\n"
-                                    "Nothing but this framebuffer can reach the panel.");
-        kms.badge = QStringLiteral("absent");
+        kms.detail = tr("no card*-* connectors: the DRM driver is render-only.\n"
+                        "Nothing but this framebuffer can reach the panel.");
+        kms.badge = tr("absent");
         kms.colour = Theme::red();
     } else {
         kms.detail = connectors.join(", ");
-        kms.badge = QStringLiteral("present");
+        kms.badge = tr("present");
         kms.colour = Theme::green();
     }
     out.append(kms);
@@ -189,12 +189,12 @@ void DiagnosticsPage::probeGpu(QVector<Finding> &out)
     Finding lima;
     lima.name = QStringLiteral("lima");
     if (moduleLoaded("lima")) {
-        lima.detail = QStringLiteral("bound -- Mali-450 rendering works, scanout does not");
-        lima.badge = QStringLiteral("loaded");
+        lima.detail = tr("bound -- Mali-450 rendering works, scanout does not");
+        lima.badge = tr("loaded");
         lima.colour = Theme::green();
     } else {
-        lima.detail = QStringLiteral("not loaded");
-        lima.badge = QStringLiteral("no");
+        lima.detail = tr("not loaded");
+        lima.badge = tr("no");
         lima.colour = Theme::ink3();
     }
     out.append(lima);
@@ -202,13 +202,13 @@ void DiagnosticsPage::probeGpu(QVector<Finding> &out)
     Finding mtk;
     mtk.name = QStringLiteral("mtk_drm");
     if (moduleLoaded("mtk_drm") || moduleLoaded("mediatek_drm")) {
-        mtk.detail = QStringLiteral("loaded -- the display controller has a driver");
-        mtk.badge = QStringLiteral("loaded");
+        mtk.detail = tr("loaded -- the display controller has a driver");
+        mtk.badge = tr("loaded");
         mtk.colour = Theme::green();
     } else {
-        mtk.detail = QStringLiteral("not loaded.  This is the missing half: mtk_drm is the\n"
-                                    "CRTC and the connector lima has none of.");
-        mtk.badge = QStringLiteral("no");
+        mtk.detail = tr("not loaded.  This is the missing half: mtk_drm is the\n"
+                        "CRTC and the connector lima has none of.");
+        mtk.badge = tr("no");
         mtk.colour = Theme::orange();
     }
     out.append(mtk);
@@ -229,18 +229,18 @@ void DiagnosticsPage::probeGpu(QVector<Finding> &out)
     }
 
     Finding mesa;
-    mesa.name = QStringLiteral("EGL / GLES userspace");
+    mesa.name = tr("EGL / GLES userspace");
     QStringList have;
     if (!egl.isEmpty())     have << "libEGL";
     if (!gles.isEmpty())    have << "libGLESv2";
     if (!limaDri.isEmpty()) have << "lima_dri";
     if (have.isEmpty()) {
-        mesa.detail = QStringLiteral("none installed");
-        mesa.badge = QStringLiteral("none");
+        mesa.detail = tr("none installed");
+        mesa.badge = tr("none");
         mesa.colour = Theme::ink3();
     } else {
-        mesa.detail = have.join(", ") + "  --  present, but with no KMS to present to";
-        mesa.badge = QStringLiteral("present");
+        mesa.detail = have.join(", ") + "  --  " + tr("present, but with no KMS to present to");
+        mesa.badge = tr("present");
         mesa.colour = Theme::blue();
     }
     out.append(mesa);
@@ -250,12 +250,12 @@ void DiagnosticsPage::probeGpu(QVector<Finding> &out)
     const QString exe = firstExisting(QStringList() << "/run/j36/eglprobe"
                                                     << "/opt/mixos/bin/eglprobe");
     if (exe.isEmpty()) {
-        probe.detail = QStringLiteral("not on this card");
-        probe.badge = QStringLiteral("absent");
+        probe.detail = tr("not on this card");
+        probe.badge = tr("absent");
         probe.colour = Theme::ink3();
     } else {
-        probe.detail = exe + "\nIt will fail at display_node() while KMS is absent.";
-        probe.badge = QStringLiteral("present");
+        probe.detail = exe + "\n" + tr("It will fail at display_node() while KMS is absent.");
+        probe.badge = tr("present");
         probe.colour = Theme::orange();
     }
     out.append(probe);
@@ -264,10 +264,10 @@ void DiagnosticsPage::probeGpu(QVector<Finding> &out)
 void DiagnosticsPage::probeInput(QVector<Finding> &out)
 {
     Finding devices;
-    devices.name = QStringLiteral("evdev devices");
+    devices.name = tr("evdev devices");
     if (!m_pad || m_pad->deviceCount() == 0) {
-        devices.detail = QStringLiteral("no /dev/input/event* opened");
-        devices.badge = QStringLiteral("none");
+        devices.detail = tr("no /dev/input/event* opened");
+        devices.badge = tr("none");
         devices.colour = Theme::red();
     } else {
         devices.detail = m_pad->deviceNames().join(", ");
@@ -277,19 +277,19 @@ void DiagnosticsPage::probeInput(QVector<Finding> &out)
     out.append(devices);
 
     Finding pointer;
-    pointer.name = QStringLiteral("Pointing devices");
+    pointer.name = tr("Pointing devices");
     const int mice = m_pad ? m_pad->mouseCount() : 0;
-    pointer.detail = mice > 0 ? QString("%1 attached, plus the right stick").arg(mice)
-                              : QStringLiteral("none attached -- the right stick drives the pointer");
+    pointer.detail = mice > 0 ? tr("%1 attached, plus the right stick").arg(mice)
+                              : tr("none attached -- the right stick drives the pointer");
     pointer.badge = QString::number(mice);
     pointer.colour = mice > 0 ? Theme::green() : Theme::ink3();
     out.append(pointer);
 
     Finding keys;
-    keys.name = QStringLiteral("Keyboards");
+    keys.name = tr("Keyboards");
     const int kbd = m_pad ? m_pad->keyboardCount() : 0;
-    keys.detail = kbd > 0 ? QStringLiteral("typing goes straight through to the Terminal")
-                          : QStringLiteral("none -- Menu puts the on-screen keyboard up");
+    keys.detail = kbd > 0 ? tr("typing goes straight through to the Terminal")
+                          : tr("none -- Menu puts the on-screen keyboard up");
     keys.badge = QString::number(kbd);
     keys.colour = kbd > 0 ? Theme::green() : Theme::ink3();
     out.append(keys);
@@ -298,11 +298,11 @@ void DiagnosticsPage::probeInput(QVector<Finding> &out)
 void DiagnosticsPage::probeAudio(QVector<Finding> &out)
 {
     Finding cards;
-    cards.name = QStringLiteral("ALSA cards");
+    cards.name = tr("ALSA cards");
     const QString list = SysInfo::readTrimmed("/proc/asound/cards");
     if (list.isEmpty() || list.contains("no soundcards")) {
-        cards.detail = QStringLiteral("none registered");
-        cards.badge = QStringLiteral("none");
+        cards.detail = tr("none registered");
+        cards.badge = tr("none");
         cards.colour = Theme::red();
     } else {
         /* The first line of each pair holds the name in brackets. */
@@ -320,7 +320,7 @@ void DiagnosticsPage::probeAudio(QVector<Finding> &out)
     out.append(cards);
 
     Finding tools;
-    tools.name = QStringLiteral("Playback tools");
+    tools.name = tr("Playback tools");
     QStringList found;
     if (!firstExisting(QStringList() << "/usr/bin/aplay" << "/bin/aplay").isEmpty())
         found << "aplay";
@@ -328,9 +328,9 @@ void DiagnosticsPage::probeAudio(QVector<Finding> &out)
         found << "ffmpeg";
     if (!firstExisting(QStringList() << "/usr/bin/ffprobe").isEmpty())
         found << "ffprobe";
-    tools.detail = found.isEmpty() ? QStringLiteral("none -- Media cannot play anything")
+    tools.detail = found.isEmpty() ? tr("none -- Media cannot play anything")
                                    : found.join(", ");
-    tools.badge = found.isEmpty() ? QStringLiteral("none") : QStringLiteral("ok");
+    tools.badge = found.isEmpty() ? tr("none") : tr("ok");
     tools.colour = found.isEmpty() ? Theme::red() : Theme::green();
     out.append(tools);
 }
@@ -338,19 +338,19 @@ void DiagnosticsPage::probeAudio(QVector<Finding> &out)
 void DiagnosticsPage::probeUsb(QVector<Finding> &out)
 {
     Finding controller;
-    controller.name = QStringLiteral("USB controller");
+    controller.name = tr("USB controller");
     const QStringList hosts = QDir("/sys/bus/usb/devices").entryList(QStringList() << "usb*",
                                                                      QDir::Dirs);
     if (hosts.isEmpty()) {
-        controller.detail = QStringLiteral("no root hub -- musb did not bind");
-        controller.badge = QStringLiteral("down");
+        controller.detail = tr("no root hub -- musb did not bind");
+        controller.badge = tr("down");
         controller.colour = Theme::red();
     } else {
         QStringList names;
         for (const QString &h : hosts)
             names << SysInfo::readTrimmed("/sys/bus/usb/devices/" + h + "/product");
         controller.detail = names.join(", ");
-        controller.badge = QStringLiteral("up");
+        controller.badge = tr("up");
         controller.colour = Theme::green();
     }
     out.append(controller);
@@ -376,32 +376,32 @@ void DiagnosticsPage::probeUsb(QVector<Finding> &out)
         const QString speed = SysInfo::readTrimmed(base + "/speed");
         ++attached;
         requestedMa += maxPower.left(maxPower.indexOf("mA")).trimmed().toInt();
-        lines << QString("%1 (%2, %3 Mb/s)")
+        lines << tr("%1 (%2, %3 Mb/s)")
                      .arg(product.isEmpty() ? d : product)
                      .arg(maxPower.isEmpty() ? QString("?") : maxPower)
                      .arg(speed);
     }
 
     Finding attachedF;
-    attachedF.name = QStringLiteral("Attached devices");
-    attachedF.detail = lines.isEmpty() ? QStringLiteral("none") : lines.join("\n");
+    attachedF.name = tr("Attached devices");
+    attachedF.detail = lines.isEmpty() ? tr("none") : lines.join("\n");
     attachedF.badge = QString::number(attached);
     attachedF.colour = attached > 0 ? Theme::green() : Theme::ink3();
     out.append(attachedF);
 
     Finding budget;
-    budget.name = QStringLiteral("Bus current asked for");
-    budget.detail = QString("%1 mA requested by attached devices.\n"
-                            "VBUS here is a load switch off VBAT, not a 5 V boost:\n"
-                            "a battery at 3.6 V cannot make 5 V, and the switch cannot\n"
-                            "raise it.  Anything that needs a real 500 mA at 5 V needs a\n"
-                            "powered hub.").arg(requestedMa);
-    budget.badge = requestedMa > 500 ? QStringLiteral("over") : QStringLiteral("info");
+    budget.name = tr("Bus current asked for");
+    budget.detail = tr("%1 mA requested by attached devices.\n"
+                       "VBUS here is a load switch off VBAT, not a 5 V boost:\n"
+                       "a battery at 3.6 V cannot make 5 V, and the switch cannot\n"
+                       "raise it.  Anything that needs a real 500 mA at 5 V needs a\n"
+                       "powered hub.").arg(requestedMa);
+    budget.badge = requestedMa > 500 ? tr("over") : tr("info");
     budget.colour = requestedMa > 500 ? Theme::orange() : Theme::ink3();
     out.append(budget);
 
     Finding vbus;
-    vbus.name = QStringLiteral("VBUS switch");
+    vbus.name = tr("VBUS switch");
     /* The gpio the device tree names j36,drvvbus-pad, if the driver exported it. */
     const QString musb = QDir("/sys/bus/platform/drivers/musb-mtk").exists()
                              ? QStringLiteral("musb-mtk")
@@ -409,13 +409,13 @@ void DiagnosticsPage::probeUsb(QVector<Finding> &out)
                                    ? QStringLiteral("musb-hdrc")
                                    : QString();
     if (musb.isEmpty()) {
-        vbus.detail = QStringLiteral("no musb driver bound");
-        vbus.badge = QStringLiteral("none");
+        vbus.detail = tr("no musb driver bound");
+        vbus.badge = tr("none");
         vbus.colour = Theme::red();
     } else {
-        vbus.detail = musb + " bound.  VBUS is driven from the pad the device tree\n"
-                             "calls j36,drvvbus-pad through an external load switch.";
-        vbus.badge = QStringLiteral("ok");
+        vbus.detail = musb + " " + tr("bound.  VBUS is driven from the pad the device tree\n"
+                                      "calls j36,drvvbus-pad through an external load switch.");
+        vbus.badge = tr("ok");
         vbus.colour = Theme::green();
     }
     out.append(vbus);
@@ -426,13 +426,13 @@ void DiagnosticsPage::probePower(QVector<Finding> &out)
     const QStringList supplies = QDir("/sys/class/power_supply").entryList(QDir::Dirs
                                                                           | QDir::NoDotAndDotDot);
     Finding battery;
-    battery.name = QStringLiteral("Power supplies");
+    battery.name = tr("Power supplies");
     if (supplies.isEmpty()) {
-        battery.detail = QStringLiteral("nothing in /sys/class/power_supply.\n"
-                                        "The PMIC has no Linux driver yet -- charge state,\n"
-                                        "battery voltage and the USB current limit are all\n"
-                                        "invisible from userspace until it does.");
-        battery.badge = QStringLiteral("none");
+        battery.detail = tr("nothing in /sys/class/power_supply.\n"
+                            "The PMIC has no Linux driver yet -- charge state,\n"
+                            "battery voltage and the USB current limit are all\n"
+                            "invisible from userspace until it does.");
+        battery.badge = tr("none");
         battery.colour = Theme::orange();
     } else {
         QStringList bits;
@@ -451,12 +451,12 @@ void DiagnosticsPage::probePower(QVector<Finding> &out)
     out.append(battery);
 
     Finding thermal;
-    thermal.name = QStringLiteral("Temperature");
+    thermal.name = tr("Temperature");
     const QStringList zones = QDir("/sys/class/thermal").entryList(QStringList() << "thermal_zone*",
                                                                    QDir::Dirs);
     if (zones.isEmpty()) {
-        thermal.detail = QStringLiteral("no thermal zones");
-        thermal.badge = QStringLiteral("none");
+        thermal.detail = tr("no thermal zones");
+        thermal.badge = tr("none");
         thermal.colour = Theme::ink3();
     } else {
         QStringList bits;
@@ -479,15 +479,15 @@ void DiagnosticsPage::probePower(QVector<Finding> &out)
 void DiagnosticsPage::probeSystem(QVector<Finding> &out)
 {
     Finding kernel;
-    kernel.name = QStringLiteral("Kernel");
+    kernel.name = tr("Kernel");
     kernel.detail = SysInfo::readTrimmed("/proc/sys/kernel/osrelease") + "  "
                     + SysInfo::readTrimmed("/proc/sys/kernel/version");
-    kernel.badge = QStringLiteral("info");
+    kernel.badge = tr("info");
     kernel.colour = Theme::ink3();
     out.append(kernel);
 
     Finding cpu;
-    cpu.name = QStringLiteral("CPU");
+    cpu.name = tr("CPU");
     QString model;
     int cores = 0;
     QFile f("/proc/cpuinfo");
@@ -504,16 +504,16 @@ void DiagnosticsPage::probeSystem(QVector<Finding> &out)
     }
     const int khz = SysInfo::readTrimmed(
                         "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq").toInt();
-    cpu.detail = QString("%1  --  %2 cores%3")
-                     .arg(model.isEmpty() ? QString("unknown") : model)
+    cpu.detail = tr("%1  --  %2 cores%3")
+                     .arg(model.isEmpty() ? tr("unknown") : model)
                      .arg(cores)
-                     .arg(khz > 0 ? QString(", cpu0 at %1 MHz").arg(khz / 1000) : QString());
+                     .arg(khz > 0 ? tr(", cpu0 at %1 MHz").arg(khz / 1000) : QString());
     cpu.badge = QString::number(cores);
     cpu.colour = Theme::ink3();
     out.append(cpu);
 
     Finding mem;
-    mem.name = QStringLiteral("Memory");
+    mem.name = tr("Memory");
     long totalKb = 0;
     long availKb = 0;
     QFile mf("/proc/meminfo");
@@ -526,37 +526,37 @@ void DiagnosticsPage::probeSystem(QVector<Finding> &out)
                 availKb = line.section(':', 1).trimmed().split(' ').first().toLong();
         }
     }
-    mem.detail = QString("%1 MB total, %2 MB available")
+    mem.detail = tr("%1 MB total, %2 MB available")
                      .arg(totalKb / 1024).arg(availKb / 1024);
     mem.badge = totalKb > 0 ? QString("%1%").arg(100 - (availKb * 100 / qMax(1L, totalKb)))
-                            : QStringLiteral("?");
+                            : tr("?");
     mem.colour = Theme::ink3();
     out.append(mem);
 
     Finding root;
-    root.name = QStringLiteral("Root filesystem");
+    root.name = tr("Root filesystem");
     struct statvfs vfs;
     if (::statvfs("/", &vfs) == 0) {
         const qulonglong total = (qulonglong)vfs.f_blocks * vfs.f_frsize;
         const qulonglong free = (qulonglong)vfs.f_bavail * vfs.f_frsize;
-        root.detail = QString("%1 MB free of %2 MB")
+        root.detail = tr("%1 MB free of %2 MB")
                           .arg(free / (1024 * 1024)).arg(total / (1024 * 1024));
         const int usedPercent = total ? (int)(100 - free * 100 / total) : 0;
         root.badge = QString("%1%").arg(usedPercent);
         root.colour = usedPercent > 92 ? Theme::red() : Theme::ink3();
     } else {
-        root.detail = QStringLiteral("statvfs failed");
-        root.badge = QStringLiteral("?");
+        root.detail = tr("statvfs failed");
+        root.badge = tr("?");
         root.colour = Theme::ink3();
     }
     out.append(root);
 
     Finding uptime;
-    uptime.name = QStringLiteral("Uptime");
+    uptime.name = tr("Uptime");
     const double seconds = readFirstLine("/proc/uptime").section(' ', 0, 0).toDouble();
     const int mins = (int)(seconds / 60);
-    uptime.detail = QString("%1h %2m since boot").arg(mins / 60).arg(mins % 60);
-    uptime.badge = QStringLiteral("info");
+    uptime.detail = tr("%1h %2m since boot").arg(mins / 60).arg(mins % 60);
+    uptime.badge = tr("info");
     uptime.colour = Theme::ink3();
     out.append(uptime);
 }
@@ -567,19 +567,19 @@ void DiagnosticsPage::probe()
 
     QVector<Finding> display;
     probeDisplay(display);
-    m_sections.append(qMakePair(QString("Display"), display));
+    m_sections.append(qMakePair(tr("Display"), display));
 
     QVector<Finding> gpu;
     probeGpu(gpu);
-    m_sections.append(qMakePair(QString("Graphics"), gpu));
+    m_sections.append(qMakePair(tr("Graphics"), gpu));
 
     QVector<Finding> input;
     probeInput(input);
-    m_sections.append(qMakePair(QString("Input"), input));
+    m_sections.append(qMakePair(tr("Input"), input));
 
     QVector<Finding> audio;
     probeAudio(audio);
-    m_sections.append(qMakePair(QString("Audio"), audio));
+    m_sections.append(qMakePair(tr("Audio"), audio));
 
     QVector<Finding> usb;
     probeUsb(usb);
@@ -587,11 +587,11 @@ void DiagnosticsPage::probe()
 
     QVector<Finding> power;
     probePower(power);
-    m_sections.append(qMakePair(QString("Power"), power));
+    m_sections.append(qMakePair(tr("Power"), power));
 
     QVector<Finding> system;
     probeSystem(system);
-    m_sections.append(qMakePair(QString("System"), system));
+    m_sections.append(qMakePair(tr("System"), system));
 }
 
 void DiagnosticsPage::rebuild()
@@ -600,14 +600,14 @@ void DiagnosticsPage::rebuild()
 
     ListRow tools;
     tools.kind = ListRow::Header;
-    tools.text = QStringLiteral("Tests");
+    tools.text = tr("Tests");
     rows.append(tools);
 
     ListRow cube;
     cube.kind = ListRow::Action;
-    cube.text = QStringLiteral("Render test");
-    cube.detail = QStringLiteral("The cube, rasterised by the CPU into this framebuffer.\n"
-                                 "Reports what this board can actually draw.");
+    cube.text = tr("Render test");
+    cube.detail = tr("The cube, rasterised by the CPU into this framebuffer.\n"
+                     "Reports what this board can actually draw.");
     cube.glyph = GlyphDisplay;
     cube.accent = Theme::purple();
     cube.id = RowCube;
@@ -618,9 +618,9 @@ void DiagnosticsPage::rebuild()
     if (!egl.isEmpty()) {
         ListRow probeRow;
         probeRow.kind = ListRow::Action;
-        probeRow.text = QStringLiteral("Run eglprobe anyway");
-        probeRow.detail = QStringLiteral("Expected to fail while KMS is absent.\n"
-                                         "It can also keep the panel: reboot after.");
+        probeRow.text = tr("Run eglprobe anyway");
+        probeRow.detail = tr("Expected to fail while KMS is absent.\n"
+                             "It can also keep the panel: reboot after.");
         probeRow.glyph = GlyphChip;
         probeRow.accent = Theme::orange();
         probeRow.id = RowEglProbe;
@@ -629,8 +629,8 @@ void DiagnosticsPage::rebuild()
 
     ListRow rescan;
     rescan.kind = ListRow::Action;
-    rescan.text = QStringLiteral("Re-scan input devices");
-    rescan.detail = QStringLiteral("There is no udev here, so a hotplug needs asking for.");
+    rescan.text = tr("Re-scan input devices");
+    rescan.detail = tr("There is no udev here, so a hotplug needs asking for.");
     rescan.glyph = GlyphMouse;
     rescan.accent = Theme::teal();
     rescan.id = RowRescanInput;
@@ -638,7 +638,7 @@ void DiagnosticsPage::rebuild()
 
     ListRow refresh;
     refresh.kind = ListRow::Action;
-    refresh.text = QStringLiteral("Probe again");
+    refresh.text = tr("Probe again");
     refresh.glyph = GlyphInfo;
     refresh.accent = Theme::blue();
     refresh.id = RowRefresh;
@@ -706,8 +706,8 @@ void DiagnosticsPage::onActivated(int index)
             m_pad->rescan();
         probe();
         rebuild();
-        emit toastRequested(m_pad ? QString("%1 input devices").arg(m_pad->deviceCount())
-                                  : QString("no pad"), 2500);
+        emit toastRequested(m_pad ? tr("%1 input devices").arg(m_pad->deviceCount())
+                                  : tr("no pad"), 2500);
         return;
     case RowRefresh:
         probe();
@@ -858,12 +858,12 @@ void DiagnosticsPage::paintCube(QPainter &p)
     p.setFont(Theme::font(12, true));
     p.setPen(Theme::ink());
     p.drawText(foot.adjusted(12, 4, -12, -22), Qt::AlignLeft | Qt::AlignVCenter,
-               QString("%1 fps at %2x%3, CPU rasterised")
+               tr("%1 fps at %2x%3, CPU rasterised")
                    .arg(m_fps, 0, 'f', 1).arg(width()).arg(height()));
     p.setFont(Theme::font(11));
     p.setPen(Theme::ink3());
     p.drawText(foot.adjusted(12, 22, -12, -4), Qt::AlignLeft | Qt::AlignVCenter,
-               QStringLiteral("No GPU involved -- lima has no CRTC to scan out from.  B returns."));
+               tr("No GPU involved -- lima has no CRTC to scan out from.  B returns."));
 }
 
 void DiagnosticsPage::paintEvent(QPaintEvent *)
@@ -878,5 +878,5 @@ void DiagnosticsPage::paintEvent(QPaintEvent *)
     p.setRenderHint(QPainter::Antialiasing, true);
     const QRectF card(Theme::Margin, Theme::Margin,
                       width() - 2.0 * Theme::Margin, height() - 2.0 * Theme::Margin);
-    paintSheet(p, card, QStringLiteral("Diagnostics"), QStringLiteral("A opens, Menu re-probes"));
+    paintSheet(p, card, tr("Diagnostics"), tr("A opens, Menu re-probes"));
 }
