@@ -1554,10 +1554,46 @@ mkdir -p /newroot
 # `mount -t ext4' will not touch an ext2 filesystem.  ext4 and btrfs follow for
 # the cards written by earlier builds and for hand-made ones.  Mounted read-only
 # to test, so a candidate that is not the root filesystem is never written to.
+#
+# A CARD THAT IS NOT THERE YET IS NOT A CARD TO MOUNT.
+#
+# This is what made the panel look frozen on "Looking for the MixOS card".  A
+# mount() against a block device whose card has not finished identification does
+# not fail quickly -- it goes down into MSDC1 and waits out a command timeout,
+# seconds at a time, in the kernel, with nothing for the splash to be scheduled
+# against.  Three filesystem types across every mmcblk node turned that into tens
+# of seconds of a boot that was, from the outside, a still picture.
+#
+# The block layer already knows the answer and it costs nothing to ask: a device
+# whose card has not been read has a size of 0 sectors.  Checking that first turns
+# the whole not-ready case into a sysfs read, which is what leaves the wait loop
+# below free to tick once a second and the animation free to run.
+# Only an ANSWER of zero disqualifies a device.  No sysfs entry at all is not an
+# answer, and a scan that treated it as one would refuse to mount a card this
+# check simply could not see -- trading a slow boot for no boot, which is not the
+# trade being made here.
+dev_ready() {
+    sz=""
+    if [ -r "/sys/class/block/${1##*/}/size" ]; then
+        read -r sz < "/sys/class/block/${1##*/}/size"
+    else
+        return 0
+    fi
+    case "$sz" in
+        0) return 1 ;;
+    esac
+    return 0
+}
+
 try_root() {
     dev="$1"
     if [ ! -b "$dev" ]; then return 1; fi
+    if ! dev_ready "$dev"; then return 1; fi
     for fs in ext2 ext4 btrfs; do
+        # Said BEFORE the call and not after it, because the call is the part that
+        # can take a while: if a mount really does stall, the panel is already
+        # showing which device and which driver it stalled in.
+        detail "trying $dev as $fs"
         if ! mount -t "$fs" -o ro "$dev" /newroot 2>/dev/null; then continue; fi
         if [ -x /newroot/sbin/init ] || [ -L /newroot/sbin/init ]; then
             umount /newroot
@@ -1590,14 +1626,22 @@ find_root() {
 # the kernel's own root mount, and rdinit= runs instead of that -- so a single
 # scan here races the card: MSDC1 runs card identification on a workqueue, and
 # an mmc host that is still deferred when /init starts has no block device yet.
+#
+# The detail line is written BEFORE the first scan rather than after it, and that
+# is the smaller half of the same fix as dev_ready() above: the first pass through
+# find_root is the one that used to happen in silence, so a card that took a
+# moment to attach showed a headline, no detail, and -- for as long as a stalled
+# mount held the CPU -- a spinner that looked like it had died.  Ten seconds of
+# patience, unchanged; it just says so from the first one now.
 rootdev=""
 waited=0
 stage "Looking for the MixOS card"
+detail "waiting for the card"
 progress 8
+say "waiting for the microSD card"
 while : ; do
     if find_root; then break; fi
     if [ "$waited" -ge 10 ]; then break; fi
-    if [ "$waited" = 0 ]; then say "waiting for the microSD card"; fi
     waited=$((waited + 1))
     # The one place a boot legitimately stands still for ten seconds, so it says
     # so on the panel rather than looking like a machine that has stopped.

@@ -73,6 +73,7 @@
 #include <linux/kd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -1217,6 +1218,25 @@ int main(int argc, char **argv)
         default: usage(); return opt == 'h' ? 0 : 2;
         }
     }
+
+    /*
+     * ── THE ANIMATION IS THE LOWEST-VALUE WORK ON THE MACHINE AND IT NEEDS THE
+     *    CPU ANYWAY ──
+     *
+     * Nothing here is urgent in the sense that matters to a scheduler: a dropped
+     * frame costs nothing.  But a spinner that stops is the one thing on this
+     * panel that a person reads as "it has crashed", so the frames have to keep
+     * landing while /init does the heavy part of the boot -- and /init's heavy
+     * part is a fork of BusyBox per mount, per ls, per probe, all of them at the
+     * same priority as this.
+     *
+     * -10 is a nudge and not a real-time class on purpose.  It buys a share of a
+     * loaded run queue without ever being able to hold the CPU off the work the
+     * splash exists to describe, which a SCHED_FIFO process on a single-core
+     * early boot absolutely can.  Failing is fine and is not reported: without
+     * CAP_SYS_NICE this simply keeps the priority it was given.
+     */
+    setpriority(PRIO_PROCESS, 0, -10);
 
     if (fb_open(&fb, fbpath) < 0)
         return 1;
