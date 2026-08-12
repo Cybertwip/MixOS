@@ -197,11 +197,11 @@ MODULE_PARM_DESC(poweroff, "register the RTC BBPU power-off handler");
 #define J36_ADC_POLL_LIMIT		16
 
 /*
- * 1800 mV full range, x4 divider arm on channels 6 and 7: 7200 mV full scale,
+ * 1800 mV full range, x4 divider arm on channels 6 and 7: 3600 mV full scale,
  * which puts 19181 counts at 4214 mV -- a cell at its CV setpoint.  Channel 4
  * takes the x1 arm and a 330k/39k board divider instead.
  */
-#define J36_ADC_FULL_SCALE_MV		7200
+#define J36_ADC_FULL_SCALE_MV		3600
 #define J36_ADC_VCHR_FULL_SCALE_MV	1800
 #define J36_VCHR_DIVIDER_NUM		369
 #define J36_VCHR_DIVIDER_DEN		39
