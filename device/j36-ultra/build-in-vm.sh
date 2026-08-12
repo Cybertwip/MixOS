@@ -5611,11 +5611,13 @@ fi
 # and the card boots to the initramfs shell exactly as it did before.
 #
 # The prose that used to explain each bootargs word lives in README.txt now.  The
-# LK reads boot.conf into a fixed 2 KiB buffer, comments included, and this file
-# has already been over it once -- rewriting the /opt/mixos paragraph took it to
-# 2109 bytes, which the assertion below turns into a failed build rather than a
-# silently truncated bootargs line.  Keep the comments terse; README.txt is where
-# the explanations belong.
+# LK reads boot.conf into a fixed 2 KiB buffer, COMMENTS INCLUDED, and this file
+# has been over that twice: once rewriting the /opt/mixos paragraph, to 2109
+# bytes, and once adding a single line about --no-splash, to 2059.  Both were
+# comments.  The assertion below turns either into a failed build rather than a
+# silently truncated bootargs line, and it prints the size so the next one says
+# by how much.  A comment here costs the same as a boot argument -- keep them
+# terse, and put the explanation in README.txt, which nothing parses.
 cat > "$SDBOOT/mvii/boot.conf" <<'CONF'
 # MVII LK SD hand-off, J36 Ultra (MT6592, ARMv7).
 #
@@ -5638,16 +5640,12 @@ initrd=initrd.img
 # Only the four files the LK reads are on BOOT; the rest is in sd-root.tar.gz,
 # unpacked as /opt/mixos on the ext2 OS partition.
 #
-# j36.audio=speaker powers the class-D amp off VBAT -- the system node -- so
-# battery-less it pulls the board under its own lockout.  j36.usb=1 sources 5 V
-# off that same VBAT; with no cell, or with a self-powered hub, say
-# j36.usb=novbus.  j36.gl=debug adds Mesa's EGL trace and the node probes -- a
-# diagnostic, not a default: a frozen kernel behind hundreds of libEGL lines is
-# that trace.  j36.es is the old j36.gl.
-# Drop j36.dash=1 and EmulationStation is neither masked nor replaced, and
-# j36.splash=0 boots to text.  loglevel=4 keeps the panel clear until the
-# splash starts; errors and warnings still print, and dmesg keeps the rest.
-# ./build-j36-ultra.sh --no-splash writes j36.splash=0 loglevel=7 here.
+# j36.audio=speaker powers the class-D amp off VBAT, the system node, so a
+# battery-less board pulls itself under its own lockout.  j36.usb=1 sources 5 V
+# off that same rail: say j36.usb=novbus with no cell, or a self-powered hub.
+# j36.gl=debug adds Mesa's EGL trace; a diagnostic, not a default.  j36.es is
+# the old j36.gl.  j36.splash=0 with loglevel=7 boots to text, which is the pair
+# ./build-j36-ultra.sh --no-splash writes here.
 bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1 j36.usb=1 j36.power=1 j36.splash=1
 CONF
 
@@ -5675,9 +5673,13 @@ if [[ "${J36_SPLASH:-1}" == 0 ]]; then
 fi
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
-# truncated mid-line.
-(( $(stat -c %s "$SDBOOT/mvii/boot.conf") <= 2048 )) || \
-    die "boot.conf exceeds the LK's 2048-byte read buffer"
+# truncated mid-line.  The size goes in the message: "too big" sends a reader
+# hunting through a file where every line looks necessary, and "by 11 bytes"
+# points straight at whichever comment was last touched.
+boot_conf_bytes="$(stat -c %s "$SDBOOT/mvii/boot.conf")"
+(( boot_conf_bytes <= 2048 )) || \
+    die "boot.conf is ${boot_conf_bytes} bytes, $(( boot_conf_bytes - 2048 )) over the LK's 2048-byte read buffer; shorten a comment in the CONF heredoc"
+log "boot.conf: ${boot_conf_bytes} bytes, $(( 2048 - boot_conf_bytes )) to spare in the LK's buffer"
 verify_armv7_kernel "$SDBOOT/zImage" "the SD payload kernel"
 
 cat > "$SDBOOT/README.txt" <<'README'
@@ -6190,6 +6192,15 @@ j36.splash=1
     j36.splash=0 -- or `nosplash' -- boots to the text console instead.  So does a
     build where the binary or the picture failed to build: /init tests for both
     files, and for /dev/fb0, before it starts anything.
+
+    ./build-j36-ultra.sh --no-splash writes that word for you, and raises loglevel
+    to 7 in the same line, because the two go together: with the picture off the
+    panel is the console, and a console showing only the four highest printk levels
+    is a nearly blank screen where the splash used to be.  It is the switch to
+    reach for when a board stops somewhere and the headline does not say where --
+    the splash summarises, the text console does not summarise anything.  Editing
+    this file on the card by hand does exactly the same thing, so a card built with
+    the splash does not have to be rebuilt to lose it.
 
 Doom, what it was for, and why it is no longer on the card
 ----------------------------------------------------------
