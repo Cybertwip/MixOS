@@ -666,6 +666,29 @@ if [[ -s "$mountpoint/Image" && -s "$mountpoint/$KERNEL_DTB" && -s "$mountpoint/
     mark kernel
 fi
 
+# The same reasoning as the kernel checkpoint below, for the one stage that never
+# had it: an image checkpoint means image_setup.sh once ran, not that its output
+# is still on disk.  $DISK is a plain file in the build directory and it goes
+# whenever the operator clears space, whenever a run is interrupted between the
+# `dd` and the partition table, and whenever the image was built under a
+# different commit -- the name carries the short SHA, so a commit is enough to
+# make this build look for a file no run ever wrote.
+#
+# Leaving the stamp in place is worse than useless: every later stage takes $DISK
+# for granted, so the run walks past `Skipping completed stage: image', reports
+# the boot partition as merely unformatted, and only stops in install_boot.sh at
+# the very end with "the disk image is missing".  Clearing it here costs one `dd`
+# and puts the failure where it belongs.
+if marked image && [[ ! -s "$DISK" ]]; then
+    log "The image checkpoint describes $DISK, which is not here; it will be rebuilt"
+    # finalization and complete both describe the contents of that same file, so
+    # they cannot outlive it either.  layout is the signature of the image that
+    # is gone; leaving it would let discard_foreign_layout believe the rebuilt
+    # image already matches a layout it has never been written with.
+    rm -f "$STATE_DIR"/image.done "$STATE_DIR"/finalization.done \
+          "$STATE_DIR"/complete.done "$STATE_DIR"/layout
+fi
+
 # clean_mounts.sh deletes the build filesystem at the end of a successful run,
 # so a state directory outlives the rootfs its checkpoints describe.  Every
 # rootfs stage has to run again in that case; leaving the stamps in place would
