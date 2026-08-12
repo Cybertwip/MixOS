@@ -3431,6 +3431,9 @@ build_mixdash() {
     # returns BY VALUE, which the range-for does extend -- and must not trip this.
     dangling="$(grep -nE 'for[[:space:]]*\([^;]*:[[:space:]]*[A-Za-z_][A-Za-z0-9_:<>, ]*\(\)[[:space:]]*<<' \
                      "$MIXDASH_SRC"/*.cpp "$MIXDASH_SRC"/*.h 2>/dev/null || true)"
+    # Comments are allowed to quote the bad form -- dashboard.cpp does, right where it
+    # was fixed, because the next reader of that loop needs to see what not to write.
+    dangling="$(grep -vE '^[^:]+:[0-9]+:[[:space:]]*(\*|//|/\*)' <<<"$dangling" || true)"
     if [[ -n "$dangling" ]]; then
         log "mixdash: a range-for iterates a temporary container built with <<, which"
         log "    is a use-after-free -- the container dies at the semicolon.  Assign it"
