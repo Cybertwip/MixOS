@@ -170,43 +170,110 @@ function setup_arkbuild32() {
   fi
 }
 
+# ── Taking down the ccache bind mount, and why it is not a plain rm -rf ───────
+#
+# <root>/home/ark/Arkbuild_ccache is a bind of the HOST's $PWD/Arkbuild_ccache, so an
+# rm -rf that runs while it is still mounted does not fail safely: it recurses THROUGH
+# the mount, deletes the host's ccache, and reports only "Device or resource busy" for
+# the mount point itself -- which is why a build that printed that line came back to
+# all-miss compiles.  Both callers already guarded on /proc/mounts and the message
+# appeared anyway, for three reasons:
+#
+#   * The mount can be STACKED.  ensure_ccache_mount in device/*/build-in-vm.sh binds
+#     only when the path is not already a mount point; build_deps.sh binds
+#     unconditionally.  A resumed build therefore has two mounts on one directory, and
+#     one umount leaves one behind.
+#   * `umount -l' returns before the mount is gone, so a check made immediately after
+#     it can read "not mounted" while the directory is still busy.
+#   * The bind PROPAGATES.  Ubuntu mounts / shared, so a service living in its own
+#     mount namespace can hold a copy that never appears in this process's
+#     /proc/mounts.  rmdir() refuses on a flag carried by the directory itself, which
+#     is set while anything anywhere is mounted there, so no amount of care with our
+#     own mount table can predict it.
+#
+# So: unmount every layer, wait for it to actually leave, and decide whether to delete
+# from `mountpoint' -- which asks the kernel about THIS path -- rather than from a
+# substring search of /proc/mounts.  If the directory survives regardless, what is left
+# is the empty underlying directory: nothing was deleted through anything, and a
+# shipped rootfs carrying an empty /home/ark/Arkbuild_ccache is not worth an error line
+# from rm, so report the outcome and carry on.
+function drop_ccache_mount() {
+  local mnt="$1" i
+
+  for i in 1 2 3 4 5; do
+    mountpoint -q "${mnt}" || break
+    sudo umount "${mnt}" 2>/dev/null || sudo umount -l "${mnt}" 2>/dev/null || break
+    sync
+  done
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    mountpoint -q "${mnt}" || break
+    sync
+    sleep 1
+  done
+
+  if mountpoint -q "${mnt}"; then
+    echo "${mnt} is still mounted, so it is being left alone."
+    echo "Deleting it now would delete the host's ccache through the mount."
+    echo "The shipped rootfs will carry an empty directory there."
+    return 0
+  fi
+
+  # Not a mount point here, so nothing under it belongs to the host and the delete is
+  # safe.  It can still be busy -- see the propagation case above -- and that is not
+  # something the log's reader can act on.
+  if ! sudo rm -rf "${mnt}" 2>/dev/null; then
+    echo "${mnt} is still referenced elsewhere on the system and could not be removed."
+    echo "The shipped rootfs will carry an empty directory there."
+  fi
+  return 0
+}
+
 function remove_arkbuild() {
-  for m in home/ark/Arkbuild_ccache proc dev/pts dev dev sys
+  drop_ccache_mount Arkbuild/home/ark/Arkbuild_ccache
+  # `dev' was listed twice here, which is what a stacked bind mount needs and what the
+  # other three would need just as much: ensure_rootfs_mounts binds only what is not
+  # already mounted, the individual build_*.sh scripts bind unconditionally, so any of
+  # these can carry more than one layer.  Unmount until the path is not a mount point
+  # instead of counting the layers by hand.
+  for m in proc dev/pts dev sys
   do
-    if grep -qs "Arkbuild/${m} " /proc/mounts; then
+    for i in 1 2 3
+    do
+      mountpoint -q Arkbuild/${m} || break
       sudo umount -l Arkbuild/${m}
       verify_action
       sync
       sleep 1
-    fi
+    done
   done
-  # Only once it is really unmounted.  `umount -l' above detaches when the last
-  # reference goes, and an rm -rf that runs before that recurses INTO the bind mount and
-  # deletes the host's ccache through it -- reporting only "Device or resource busy" for
-  # the mount point, which is what that message in the build log means.  The same guard
-  # and the same reasoning are in cleanup_filesystem.sh.
-  if grep -qs "Arkbuild/home/ark/Arkbuild_ccache" /proc/mounts; then
-    echo "Arkbuild_ccache is still mounted; leaving it rather than deleting the host's ccache through it"
-  else
-    sudo rm -rf Arkbuild/home/ark/Arkbuild_ccache
-  fi
   (cat /proc/mounts | grep -qs "Arkbuild") && sudo umount -l Arkbuild
   (cat /proc/mounts | grep -qs "Arkbuild-final") && sudo umount -l Arkbuild-final
   return 0
 }
 
 function remove_arkbuild32() {
-  for m in home/ark/Arkbuild_ccache proc dev/pts dev sys
+  drop_ccache_mount Arkbuild32/home/ark/Arkbuild_ccache
+  for m in proc dev/pts dev sys
   do
-    if grep -qs "Arkbuild32/${m} " /proc/mounts; then
+    for i in 1 2 3
+    do
+      mountpoint -q Arkbuild32/${m} || break
       sudo umount -l Arkbuild32/${m}
       verify_action
       sync
       sleep 1
-    fi
+    done
   done
   (cat /proc/mounts | grep -qs "Arkbuild32") && sudo umount -l Arkbuild32
-  [ -d "Arkbuild32" ] && sudo rm -rf Arkbuild32
+  # The whole tree, so the ccache bind inside it is the thing this must not walk into:
+  # `rm -rf Arkbuild32' with that mount still up deletes the host's ccache through it
+  # and says nothing about having done so.  drop_ccache_mount above prints why when it
+  # cannot clear it; this only has to decline.
+  if mountpoint -q Arkbuild32/home/ark/Arkbuild_ccache; then
+    echo "Leaving Arkbuild32 in place: its ccache bind mount is still up"
+  elif [ -d "Arkbuild32" ]; then
+    sudo rm -rf Arkbuild32
+  fi
   return 0
 }
 

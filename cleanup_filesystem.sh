@@ -213,31 +213,12 @@ else
 fi
 call_chroot "ldconfig"
 
-# ── The ccache bind mount, and why the rm is conditional ──────────────────────
-#
-# `sudo rm -rf' on a still-mounted bind mount does not fail safely: it recurses INTO
-# the mount and deletes the host's ccache through it, then reports "Device or resource
-# busy" for the mount point alone -- which is the message in the build log and the
-# reason the next build's compiles were all cache misses.  `umount -l' is why it can
-# still be mounted here: a lazy unmount detaches when the last reference goes, which
-# is not necessarily before the next line runs.  So unmount properly, wait for it to
-# actually leave /proc/mounts, and only delete the directory once it has.
-ccache_mnt=Arkbuild/home/ark/Arkbuild_ccache
-if grep -qs "${ccache_mnt}" /proc/mounts; then
-  sudo umount "${ccache_mnt}" 2>/dev/null || sudo umount -l "${ccache_mnt}" || true
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    grep -qs "${ccache_mnt}" /proc/mounts || break
-    sync
-    sleep 1
-  done
-fi
-if grep -qs "${ccache_mnt}" /proc/mounts; then
-  echo "WARNING: ${ccache_mnt} is still mounted, so it is being left alone."
-  echo "WARNING: Deleting it now would delete the host's ccache through the mount."
-  echo "WARNING: The shipped rootfs will carry an empty directory there."
-else
-  sudo rm -rf "${ccache_mnt}"
-fi
+# The ccache bind mount.  This used to be twenty lines of unmount-wait-then-rm here and
+# another set of them in utils.sh's remove_arkbuild, and both got the guard wrong in the
+# same way -- see drop_ccache_mount in utils.sh, which is now the only copy, for what
+# `rm -rf' does to the host's ccache when the mount is still up and for the three
+# reasons a /proc/mounts check does not catch it.
+drop_ccache_mount Arkbuild/home/ark/Arkbuild_ccache
 sudo rm -rf Arkbuild/var/log/journal
 # -f: this is written by bootstrap_rootfs.sh and removed here, so a resumed build that
 # reaches this stage twice finds it already gone.
