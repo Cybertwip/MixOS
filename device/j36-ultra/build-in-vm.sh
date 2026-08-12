@@ -20,6 +20,18 @@ WORK="${J36_WORK_DIR:-$HOME/j36-ultra-work}"
 # host, which made a MixOS build depend on a sibling repository being present.
 DRIVERS="${J36_DRIVERS_DIR:-$ROOT/device/j36-ultra/mvii-board}"
 EXPORT_DIR="${J36_EXPORT_DIR:-$WORK/export}"
+# `build-j36-ultra.sh --mix-only': build the board specifics and hand back boot/ and
+# root/, without touching the base image.
+#
+# WHY IT IS A MODE AND NOT A SEPARATE SCRIPT.  Everything a debug iteration changes --
+# a module, a driver, the dashboard, the probe -- is built by this script and then
+# folded into an 8 GB image, and folding it in costs minutes of losetup, e2fsck,
+# resize2fs and tar for a payload that is tens of megabytes.  On the workstation the
+# operator then writes the same two directories onto the card by hand anyway, because
+# BOOT is the one partition macOS can mount.  So the injection is skipped, not
+# reimplemented: same build, same artifacts, one step fewer.  The full build (no flag)
+# is what produces the flashable image, and it is the only thing that should.
+MIX_ONLY="${J36_MIX_ONLY:-0}"
 KERNEL_URL="${J36_KERNEL_URL:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
 KERNEL_BRANCH="${J36_KERNEL_BRANCH:-linux-6.12.y}"
 KERNEL_SRC="$WORK/linux"
@@ -46,7 +58,13 @@ die() { printf '\n[build-j36-ultra] ERROR: %s\n' "$*" >&2; exit 1; }
 [[ "$(uname -s)" == Linux ]] || die "build-in-vm.sh must run on Linux"
 [[ -d "$DRIVERS" ]] || die "MVII J36 Drivers not found: $DRIVERS"
 
-mkdir -p "$WORK" "$CACHE" "$ARTIFACTS" "$EXPORT_DIR"
+mkdir -p "$WORK" "$CACHE" "$ARTIFACTS"
+# Only --mix-only exports anything, so only --mix-only gets a directory.  A full build
+# ships one image and an empty export/ next to it would read as "the artifacts are
+# missing" rather than "they went into the image".
+if [[ "$MIX_ONLY" == 1 ]]; then
+    mkdir -p "$EXPORT_DIR"
+fi
 
 if [[ ! -f "$WORK/.deps-installed" ]]; then
     log "Installing the one-time ARMv7 kernel build dependencies"
@@ -5406,11 +5424,10 @@ fi
 # this section says so and leaves the two artifacts for a manual copy.
 R36_STATE_ROOT="${DARKOS_R36_STATE_DIR:-$HOME/darkos-r36-state}"
 
-# Which state directory the base build last finished in.  Its `latest-image' names the
-# image and its `archive-verified' stamp is what has to be refreshed when this script
-# rewrites the archive -- see refresh_image_archive.  Found rather than recomputed: the
-# key is built from DEBIAN_RELEASE/USERSPACE_ARCH/BUILD_PROFILE in two other scripts and
-# a third copy of that expression here would be a third thing to keep in step.
+# Which state directory the base build last finished in; its `latest-image' names the
+# image.  Found rather than recomputed: the key is built from
+# DEBIAN_RELEASE/USERSPACE_ARCH/BUILD_PROFILE in two other scripts and a third copy of
+# that expression here would be a third thing to keep in step.
 r36_state_dir() {
     local d newest=""
     for d in "$R36_STATE_ROOT"/*/; do
@@ -5426,6 +5443,14 @@ r36_state_dir() {
 # change there can be two images in this checkout -- the current one and the one kept as
 # `-old-layout' to flash meanwhile -- and newest-mtime is not the same question as which
 # one the base build considers finished.
+#
+# ONLY MixOS_*.img.  The glob used to include dArkOS_R36_ULTRA_GUI_BASE_* and
+# dArkOS_RG351MP_FULL_*, and those two names are now exactly the images this build must
+# not touch: an image with a dArkOS_ name was produced before the rename, which means
+# before the ext2/DATA layout, so injecting into it hands back a card that boots the old
+# partitioning with today's payload in it -- the most confusing possible result.  A
+# rebuild is the answer, and saying so is more useful than quietly patching the wrong
+# image.  The old ones are named in the log so it is clear why they were passed over.
 find_base_image() {
     local state name
     state="$(r36_state_dir)"
@@ -5436,17 +5461,15 @@ find_base_image() {
             return 0
         fi
     fi
-    ls -1t "$ROOT"/dArkOS_R36_ULTRA_GUI_BASE_*_*.img \
-           "$ROOT"/dArkOS_RG351MP_FULL_*_*.img \
-           "$ROOT"/MixOS_*_*_*.img 2>/dev/null | head -n 1 || true
+    ls -1t "$ROOT"/MixOS_*_*_*.img 2>/dev/null | head -n 1 || true
 }
 
 # What the injected image is a function of: the image it was injected into, and the two
 # payloads.  Recorded after a successful injection so a re-run that changes neither can
-# skip both the injection and the re-archive -- which is the whole cost of this section.
-# The image's own size and mtime are enough for the first half because injection is the
-# only thing that writes to it here, and the recorded value is read back after that
-# write; a base rebuild moves both.
+# skip the injection -- which is the whole cost of this section.  The image's own size and
+# mtime are enough for the first half because injection is the only thing that writes to
+# it here, and the recorded value is read back after that write; a base rebuild moves
+# both, and so does a new commit, because the image is named after the commit.
 image_export_signature() {
     local img="$1"
     {
@@ -5644,128 +5667,120 @@ print(p[0]["start"], p[0]["size"], p[1]["start"], p[1]["size"])
     return $rc
 }
 
-# ── Rebuilding the archive the operator actually flashes ──────────────────────
+# ── Which of the two things this run produces ─────────────────────────────────
 #
-# WHY THIS EXISTS.  Injecting into $ROOT/<image>.img was only half the job, and the
-# missing half is why a freshly flashed card still had no /opt/mixos and no
-# sd-root.tar.gz on BOOT.  The image never reaches the workstation.  What reaches it
-# is <image>.img.7z.001/.002, and those volumes are written by create_image.sh during
-# the BASE build's finalization -- which finishes before this script starts.  So the
-# operator was unpacking and flashing a snapshot of the image taken before the payload
-# went into it, every time, no matter how loudly the injection above reported success.
+# THE 7z IS GONE, AND WITH IT THE REASON THIS SECTION WAS HARD.  There used to be a
+# refresh_image_archive() here, and it existed because the image never reached the
+# workstation: what reached it was <image>.img.7z.001/.002, written by create_image.sh
+# during the BASE build's finalization -- which finishes before this script starts.  So
+# the operator unpacked and flashed a snapshot taken before the payload went in, no
+# matter how loudly the injection reported success, and the fix was to spend minutes
+# re-compressing 8 GB here.  The pipeline now ships the raw .img, which is the same file
+# this injects into, so there is nothing to rebuild and nothing that can go stale between
+# the two.  J36_IMAGE_EXPORT went with it: there is no archive to opt out of.
 #
-# The archive is therefore rewritten here, from the injected image, under the same name.
-# Same name and not a J36-specific one on purpose: `latest-image', the archive-verified
-# stamp and the artifact-copy stamps all key off it, and a second name would mean two
-# images in the artifact directory of which only one boots -- which is the mistake this
-# is fixing, not a fix for it.
-#
-# create_image.sh is reused rather than open-coded so the volume size and the 7z flags
-# stay defined in one place.  It skips an archive that already exists, hence the rm.
-refresh_image_archive() {
-    local img="$1" state base identity
-    base="$(basename "$img")"
-
-    if ! command -v 7z >/dev/null 2>&1; then
-        log "image: 7z is not installed in this VM, so the archive could not be rebuilt."
-        log "image: The volumes next to $base predate the payload -- do not flash them."
-        return 1
-    fi
-
-    log "image: rebuilding ${base}.7z.* from the injected image"
-    log "image: (this is the minutes-long step; J36_IMAGE_EXPORT=0 skips it and leaves"
-    log "image: sd-boot/ + sd-root.tar.gz as the update channel instead)"
-    rm -f "$img".7z.*
-    ( cd "$ROOT" && DISK="$base" BUILD_JOBS="$(nproc)" bash create_image.sh ) \
-        || { log "image: 7z failed; ${base}.7z.* is now missing or partial"; return 1; }
-    [[ -f "$img.7z.001" ]] || { log "image: 7z produced no volumes"; return 1; }
-
-    # The base build tests the archive it makes and caches that result by name, size and
-    # mtime of every volume (device/r36-ultra/verify_archive.sh).  These volumes are new,
-    # so the next resume would spend twenty minutes decompressing 8 GiB to re-test bytes
-    # 7z has just written and CRC'd itself.  Restamping says "these are the ones that
-    # were checked"; DARKOS_FORCE_ARCHIVE_VERIFY=1 still re-tests on demand.
-    state="$(r36_state_dir)"
-    if [[ -n "$state" ]]; then
-        identity="$(stat -c '%n %s %Y' "$img".7z.* | sort)"
-        printf '%s' "$identity" > "$state/archive-verified"
-        log "image: archive-verified restamped in $(basename "$state")"
-    fi
-    return 0
-}
-
-# Not fatal: the artifacts are complete either way, and a failure here costs the
-# operator a manual copy rather than the whole build.  It is loud, though.
+# Not fatal on failure: the artifacts are complete either way, and a failure here costs
+# the operator a manual copy rather than the whole build.  It is loud, though.
 BASE_IMAGE="$(find_base_image)"
-IMAGE_EXPORT="${J36_IMAGE_EXPORT:-archive}"
 
-if [[ -z "$BASE_IMAGE" ]]; then
-    log "image: no base image in $ROOT, so nothing to fold the payload into."
-    log "image: run the R36 base build first (J36_RESUME_R36=1) or copy sd-boot/"
-    log "image: and sd-root.tar.gz onto the card by hand."
+if [[ "$MIX_ONLY" == 1 ]]; then
+    log "image: --mix-only, so the base image is left alone.  boot/ and root/ below are"
+    log "image: what this run produced; copy boot/ onto the card's BOOT partition and the"
+    log "image: next boot unpacks sd-root.tar.gz from it onto the OS partition."
+    rm -f "$IMAGE_STAMP"
+elif [[ -z "$BASE_IMAGE" ]]; then
+    log "image: no MixOS_*.img in $ROOT, so nothing to fold the payload into."
+    log "image: Run the full build (no --mix-only) to make one."
+    # Named, not injected into: see find_base_image.
+    for stale in "$ROOT"/dArkOS_*.img; do
+        [[ -e "$stale" ]] || continue
+        log "image: NOTE $(basename "$stale") is here but predates the ext2 layout and the"
+        log "image: rename, so it is not a base for today's payload."
+    done
 elif [[ -f "$IMAGE_STAMP" ]] && \
-     [[ "$(cat "$IMAGE_STAMP")" == "$(image_export_signature "$BASE_IMAGE")" ]] && \
-     [[ "$IMAGE_EXPORT" == 0 || -f "$BASE_IMAGE.7z.001" ]]; then
-    log "image: $(basename "$BASE_IMAGE") already carries this exact payload and its"
-    log "image: archive matches it -- nothing to inject and nothing to re-archive."
+     [[ "$(cat "$IMAGE_STAMP")" == "$(image_export_signature "$BASE_IMAGE")" ]]; then
+    log "image: $(basename "$BASE_IMAGE") already carries this exact payload -- nothing"
+    log "image: to inject."
+elif inject_into_image "$BASE_IMAGE"; then
+    image_export_signature "$BASE_IMAGE" > "$IMAGE_STAMP"
 else
-    if ! inject_into_image "$BASE_IMAGE"; then
-        log "image: SOME OR ALL of the payload did not reach the image -- read the lines"
-        log "image: above.  sd-boot/ and sd-root.tar.gz are still in the artifacts and can"
-        log "image: be copied onto the card from a Linux machine."
-        rm -f "$IMAGE_STAMP"
-    elif [[ "$IMAGE_EXPORT" == 0 ]]; then
-        log "image: J36_IMAGE_EXPORT=0, so ${BASE_IMAGE##*/}.7z.* was NOT rebuilt and"
-        log "image: still predates the payload.  Update an already-flashed card by"
-        log "image: copying sd-boot/ (sd-root.tar.gz included) onto its BOOT partition."
-        rm -f "$IMAGE_STAMP"
-    elif refresh_image_archive "$BASE_IMAGE"; then
-        # Written last, and only now: the signature has to describe an image whose
-        # archive exists, or a run interrupted between the two would take the fast path
-        # above and hand over volumes that were never rebuilt.
-        image_export_signature "$BASE_IMAGE" > "$IMAGE_STAMP"
-    else
-        rm -f "$IMAGE_STAMP"
-    fi
+    log "image: SOME OR ALL of the payload did not reach the image -- read the lines"
+    log "image: above.  sd-boot/ and sd-root.tar.gz are still in the artifacts and can"
+    log "image: be copied onto the card from a Linux machine."
+    rm -f "$IMAGE_STAMP"
 fi
 
-# What build-j36-ultra.sh copies to the workstation, and what it says while doing it.
-# Written even when there is no image, because "there is no flashable image" is the
-# thing the operator most needs told.
+# What build-j36-ultra.sh reads to decide what to hand over, and what to say while doing
+# it.  Written even when there is no image, because "there is no flashable image" is the
+# thing the operator most needs told.  `volumes=' is gone with the archive; the wrapper
+# copies one file now.
 {
-    if [[ -n "$BASE_IMAGE" && -f "$BASE_IMAGE.7z.001" ]]; then
+    if [[ "$MIX_ONLY" == 1 ]]; then
+        printf 'image=mix-only\n'
+        printf 'payload=exported\n'
+    elif [[ -n "$BASE_IMAGE" ]] && [[ -f "$IMAGE_STAMP" ]]; then
         printf 'image=%s\n' "$(basename "$BASE_IMAGE")"
-        printf 'volumes=%s\n' "$(ls -1 "$BASE_IMAGE".7z.* | wc -l)"
-        # in-image only when the stamp is there, and the stamp is written only after
-        # both the injection and the re-archive succeeded.  Anything else means the
-        # volumes on disk predate the payload and must not be handed over as if they
-        # did not: that is exactly the bug this section exists for.
-        if [[ -f "$IMAGE_STAMP" ]]; then
-            printf 'payload=in-image\n'
-        else
-            printf 'payload=stale\n'
-        fi
+        printf 'payload=in-image\n'
+    elif [[ -n "$BASE_IMAGE" ]]; then
+        printf 'image=%s\n' "$(basename "$BASE_IMAGE")"
+        printf 'payload=stale\n'
     else
         printf 'image=none\n'
         printf 'payload=stale\n'
     fi
 } > "$ARTIFACTS/flashable-image.txt"
 
-mkdir -p "$EXPORT_DIR"
+# ── boot/ and root/, and nothing else ─────────────────────────────────────────
 #
-# --omit-link-times, because $EXPORT_DIR is a share and not a filesystem.  The Qt
-# payload is the first artifact tree with symlinks in it -- lib/libQt5Core.so.5 and
-# its thirty-odd SONAME aliases -- and utimensat(AT_SYMLINK_NOFOLLOW) on the host
-# share answers EOVERFLOW, which rsync reports as "failed to set times ... Value
-# too large for defined data type" once per link and then exits 23.  The links
-# themselves copy correctly; it is only their mtime that cannot be set, and nothing
-# reads a symlink's mtime.  Timestamps on the regular files are still preserved.
-rsync -a --omit-link-times --delete "$ARTIFACTS/" "$EXPORT_DIR/"
+# WHY ONLY TWO DIRECTORIES, AND ONLY IN --mix-only.  This used to rsync the whole of
+# $ARTIFACTS to the host on every run: boot.img, the bare zImage, the dtb, the .ko, the
+# cpio, the tarball, the manifest, the sums -- twenty-odd files of which the operator
+# copies exactly two trees onto the card.  The rest are intermediates that the image
+# already contains, and having them on the workstation next to a flashable image invites
+# copying the stale one.  So a full build exports nothing at all (its output is the
+# image), and --mix-only exports the two trees the card is updated from:
+#
+#   boot/  = $SDBOOT, the FAT32 launcher, sd-root.tar.gz included.  Complete on its own:
+#            macOS can write it, and /init unpacks the tarball onto the OS partition once
+#            per tarball, so this alone updates an already-flashed card.
+#   root/  = $SDROOT, the same payload unpacked, for copying onto the OS partition
+#            directly from a Linux machine (or just for reading what was built).
+#
+# --delete over the two of them and a sweep of anything else at the top level, because
+# this directory is the operator's staging area: an old boot.img sitting next to boot/
+# is a file that looks current and is not.
+if [[ "$MIX_ONLY" == 1 ]]; then
+    # --omit-link-times, because $EXPORT_DIR is a share and not a filesystem.  The Qt
+    # payload has symlinks in it -- lib/libQt5Core.so.5 and its thirty-odd SONAME
+    # aliases -- and utimensat(AT_SYMLINK_NOFOLLOW) on the host share answers EOVERFLOW,
+    # which rsync reports as "failed to set times ... Value too large for defined data
+    # type" once per link and then exits 23.  The links themselves copy correctly; it is
+    # only their mtime that cannot be set, and nothing reads a symlink's mtime.
+    rsync -a --omit-link-times --delete "$SDBOOT/" "$EXPORT_DIR/boot/"
+    if [[ -d "$SDROOT" ]]; then
+        rsync -a --omit-link-times --delete "$SDROOT/" "$EXPORT_DIR/root/"
+    else
+        log "export: nothing staged for the OS partition, so no root/"
+        rm -rf "$EXPORT_DIR/root"
+    fi
 
-log "J36 Ultra incremental bring-up artifacts are ready"
-printf '  %s\n' \
-    "$EXPORT_DIR/boot.img" \
-    "$EXPORT_DIR/mt6592-j36-ultra.dtb" \
-    "$EXPORT_DIR/j36_mt6592_input.ko" \
-    "$EXPORT_DIR/sd-boot/ (copy onto the BOOT partition; already in the image too)" \
-    "$EXPORT_DIR/manifest.txt"
+    # Everything the old blanket rsync used to leave here.  Removed rather than left,
+    # for the reason above; done by name-exclusion rather than a wipe-and-recopy so that
+    # the two trees keep their incremental rsync.
+    for leftover in "$EXPORT_DIR"/*; do
+        [[ -e "$leftover" ]] || continue
+        case "$(basename "$leftover")" in
+            boot|root) continue ;;
+        esac
+        log "export: removing $(basename "$leftover"), which this build no longer ships"
+        rm -rf "$leftover"
+    done
+
+    log "J36 Ultra board artifacts are ready (--mix-only; the base image was not touched)"
+    printf '  %s\n' \
+        "$EXPORT_DIR/boot/ -> the card's BOOT partition (vfat; macOS can write it)" \
+        "$EXPORT_DIR/root/ -> the card's OS partition, opt/mixos and all (ext2; Linux only)"
+else
+    log "J36 Ultra board artifacts are in the image; nothing was exported separately"
+    log "(--mix-only exports boot/ and root/ for updating a card without reflashing)"
+fi

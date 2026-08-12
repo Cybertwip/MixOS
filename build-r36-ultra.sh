@@ -16,7 +16,13 @@
 #   DARKOS_VM_DISK=160G
 #   DARKOS_UBUNTU_IMAGE=24.04
 #   DARKOS_ARTIFACT_DIR=/path/to/output
-#   DARKOS_COPY_RAW_IMAGE=0       # Set to 1 to copy the raw .img to macOS.
+#
+# The build produces exactly one artifact worth flashing, uncompressed:
+#   MixOS_<arch>_<debian>_<commit>.img
+# It is always copied out.  DARKOS_COPY_RAW_IMAGE used to gate that, because the
+# thing normally handed over was a pair of .7z volumes and the raw image was an
+# 8.3 GB extra; there is no archive any more, so the raw image is the deliverable
+# and there is nothing to opt into.
 #   DARKOS_R36_BOOT_PAYLOAD=<artifacts>/Reference/BOOT
 #                                 # The BOOT partition of a working R36
 #                                 # image.  Supplies what this pipeline never
@@ -46,7 +52,6 @@ VM_MEMORY="${DARKOS_VM_MEMORY:-16G}"
 VM_DISK="${DARKOS_VM_DISK:-160G}"
 UBUNTU_IMAGE="${DARKOS_UBUNTU_IMAGE:-24.04}"
 ARTIFACT_DIR="${DARKOS_ARTIFACT_DIR:-${SCRIPT_DIR}-artifacts}"
-COPY_RAW_IMAGE="${DARKOS_COPY_RAW_IMAGE:-0}"
 BOOT_PAYLOAD_DIR="${DARKOS_R36_BOOT_PAYLOAD:-${ARTIFACT_DIR}/Reference/BOOT}"
 DEBIAN_RELEASE="${DEBIAN_CODE_NAME:-trixie}"
 USERSPACE_ARCH="${USERSPACE_ARCH:-armhf}"
@@ -59,6 +64,14 @@ else
     BUILD_PROFILE="gui"
 fi
 STATE_KEY="${DEBIAN_RELEASE}-userspace-${USERSPACE_ARCH}-profile-${BUILD_PROFILE}-v3"
+# Computed here and passed in, because .git/ does not ride into the build VM.  Named
+# after the commit rather than the date -- see darkos_image_name.
+IMAGE_NAME="$(darkos_image_name "$SCRIPT_DIR" "$USERSPACE_ARCH" "$DEBIAN_RELEASE")"
+# An internal handshake, not an operator knob: build-j36-ultra.sh sets it because it is
+# about to inject two payloads into this image and re-copy it, and an 8.3 GB transfer of
+# the pre-injection bytes is one nobody ever wanted.  If the J36 layer then fails, the
+# image is still in the VM and the next run copies it out.
+DEFER_IMAGE_COPY="${DARKOS_DEFER_IMAGE_COPY:-0}"
 VM_SOURCE_MOUNT="/mnt/darkos-host"
 VM_ARTIFACT_MOUNT="/mnt/darkos-artifacts"
 VM_BUILD_DIR="/home/ubuntu/dArkOS"
@@ -79,10 +92,12 @@ recreating the partition image, Debian rootfs, U-Boot, or kernel.
 Artifacts are copied to:
   ${ARTIFACT_DIR}
 
+It produces one uncompressed image, named after the commit it was built from:
+  ${IMAGE_NAME}
+
 Common overrides:
   DARKOS_VM_CPUS=4 DARKOS_VM_MEMORY=8G ./build-r36-ultra.sh
   BUILD_JOBS=8 ./build-r36-ultra.sh
-  DARKOS_COPY_RAW_IMAGE=1 ./build-r36-ultra.sh
   USERSPACE_ARCH=arm64 ./build-r36-ultra.sh
   USERSPACE_ARCH=arm64 BUILD_BUNDLED_APPS=y ./build-r36-ultra.sh
 
@@ -103,12 +118,13 @@ fi
 [[ "$BUNDLED_APPS" == "y" || "$BUNDLED_APPS" == "n" ]] || darkos_die "BUILD_BUNDLED_APPS must be y or n."
 [[ "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || darkos_die "BUILD_JOBS must be a positive integer."
 [[ "$CACHE" == "y" || "$CACHE" == "n" ]] || darkos_die "ENABLE_CACHE must be y or n."
-[[ "$COPY_RAW_IMAGE" == "0" || "$COPY_RAW_IMAGE" == "1" ]] || darkos_die "DARKOS_COPY_RAW_IMAGE must be 0 or 1."
+[[ "$DEFER_IMAGE_COPY" == "0" || "$DEFER_IMAGE_COPY" == "1" ]] || darkos_die "DARKOS_DEFER_IMAGE_COPY must be 0 or 1."
 
 run_make() {
     cd "$SCRIPT_DIR"
     darkos_log "Building or resuming RG351MP (Debian ${DEBIAN_RELEASE}, userspace=${USERSPACE_ARCH}, profile=${BUILD_PROFILE}, jobs=${BUILD_JOBS}, cache=${CACHE})"
     env DEBIAN_CODE_NAME="$DEBIAN_RELEASE" \
+        DARKOS_IMAGE_NAME="$IMAGE_NAME" \
         USERSPACE_ARCH="$USERSPACE_ARCH" \
         BUILD_JOBS="$BUILD_JOBS" \
         BUILD_BUNDLED_APPS="$BUNDLED_APPS" \
@@ -180,6 +196,7 @@ darkos_log "Completed partition, Debian bootstrap, U-Boot and kernel stages are 
 
 multipass exec "$VM_NAME" -- env \
     DEBIAN_CODE_NAME="$DEBIAN_RELEASE" \
+    DARKOS_IMAGE_NAME="$IMAGE_NAME" \
     USERSPACE_ARCH="$USERSPACE_ARCH" \
     BUILD_JOBS="$BUILD_JOBS" \
     BUILD_BUNDLED_APPS="$BUNDLED_APPS" \
@@ -193,33 +210,39 @@ set -Eeuo pipefail
 STATE_DIR=$1
 BUILD_DIR=$2
 ARTIFACT_DIR=$3
-COPY_RAW=$4
+DEFER=$4
 read -r IMAGE < "$STATE_DIR/latest-image"
 cd "$BUILD_DIR"
 [[ -s "$IMAGE" ]] || { echo "missing image: $IMAGE" >&2; exit 1; }
-[[ -f "${IMAGE}.7z.001" ]] || { echo "missing archive: ${IMAGE}.7z.001" >&2; exit 1; }
-# Shares its stamp with the in-VM build, which has usually just tested the same
-# bytes; see device/r36-ultra/verify_archive.sh for why this is cached at all.
-bash device/r36-ultra/verify_archive.sh "$IMAGE" "$STATE_DIR"
 sudo parted -s "$IMAGE" print
-# Stamped, because these are the big ones and they cross the VM mount: the two
-# archive volumes are 2.4 GiB and the raw image 8.3 GB, and a resumed build
-# arrives here with bytes it has already copied.  The logs below are kilobytes
-# and change every run, so they just get copied.
-bash device/r36-ultra/copy_artifacts.sh "$ARTIFACT_DIR" "${IMAGE}.7z."*
-if [[ "$COPY_RAW" == 1 ]]; then
+# Stamped, because this is the big one and it crosses the VM mount: 8.3 GB, and a
+# resumed build arrives here with bytes it has already copied.  The logs below are
+# kilobytes and change every run, so they just get copied.
+if [[ "$DEFER" == 1 ]]; then
+    echo "Leaving $IMAGE in the VM: the J36 layer is about to inject into it and copy it out"
+else
     bash device/r36-ultra/copy_artifacts.sh "$ARTIFACT_DIR" "$IMAGE"
 fi
 cp -f -- "$STATE_DIR/resume.log" "$ARTIFACT_DIR/build-r36-ultra-resume.log"
 [[ -f build.log ]] && cp -f -- build.log "$ARTIFACT_DIR/build.log" || true
-printf "%s\n" "$IMAGE" > "$ARTIFACT_DIR/latest-image.txt"
+# Not when deferring: latest-image.txt is read as "this is the image next to me", and
+# writing it before the image arrives names a file that is not there -- or, if the
+# injection then fails, one that never will be.  build-j36-ultra.sh writes it after its
+# own copy succeeds.
+if [[ "$DEFER" != 1 ]]; then
+    printf "%s\n" "$IMAGE" > "$ARTIFACT_DIR/latest-image.txt"
+fi
 sync "$ARTIFACT_DIR"
 ' artifact-copy \
     "/home/ubuntu/darkos-r36-state/${STATE_KEY}" \
     "$VM_BUILD_DIR" \
     "$VM_ARTIFACT_MOUNT" \
-    "$COPY_RAW_IMAGE"
+    "$DEFER_IMAGE_COPY"
 
 darkos_log "Build completed and verified."
 darkos_log "Artifacts: ${ARTIFACT_DIR}"
+if [[ "$DEFER_IMAGE_COPY" == 0 ]]; then
+    darkos_log "Flash this: ${ARTIFACT_DIR}/${IMAGE_NAME}"
+    darkos_report_stale_images "$ARTIFACT_DIR" "$IMAGE_NAME"
+fi
 darkos_warn "This is the RG351MP/RK3326 base image. It does not yet contain the R36 Ultra-specific DTB layer."

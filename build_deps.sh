@@ -22,27 +22,32 @@ else
   CHROOT_DIR="Arkbuild"
 fi
 
-# Install additional needed packages and protect them from autoremove
-while read NEEDED_PACKAGE; do
-  if [[ ! "$NEEDED_PACKAGE" =~ ^# ]]; then
-    install_package $BIT "${NEEDED_PACKAGE}"
-    protect_package $BIT "${NEEDED_PACKAGE}"
-  fi
-done <needed_packages.txt
+# Install additional needed packages and protect them from autoremove.
+#
+# THE WHOLE LIST IN ONE CALL.  This was a `while read' loop around install_package,
+# and install_package is one apt transaction -- so the two lists below cost a hundred
+# and fifty separate apt invocations, each re-reading the package lists, resolving
+# dependencies and running its own trigger pass for a single package.  That is the
+# "packages download individually" in the build log, and it is most of the wall clock
+# of this stage.  install_package and protect_package both take a list; give them one.
+mapfile -t NEEDED_PACKAGES < <(read_package_list needed_packages.txt)
+if (( ${#NEEDED_PACKAGES[@]} )); then
+  install_package $BIT "${NEEDED_PACKAGES[@]}"
+  protect_package $BIT "${NEEDED_PACKAGES[@]}"
+fi
 
 # Install build dependencies
-while read NEEDED_DEV_PACKAGE; do
-  if [[ ! "$NEEDED_DEV_PACKAGE" =~ ^# ]]; then
-    install_package $BIT "${NEEDED_DEV_PACKAGE}"
-    #protect_package $BIT "${NEEDED_DEV_PACKAGE}"
-  fi
-done <needed_dev_packages.txt
+mapfile -t NEEDED_DEV_PACKAGES < <(read_package_list needed_dev_packages.txt)
+if (( ${#NEEDED_DEV_PACKAGES[@]} )); then
+  install_package $BIT "${NEEDED_DEV_PACKAGES[@]}"
+  # Deliberately not protected: these are build-time only and cleanup_filesystem.sh
+  # removes them from the shipped rootfs.
+fi
 
 # Default gcc and g++ to version 12 if gcc is newer than 12
 GCC_VERSION=`sudo chroot ${CHROOT_DIR}/ bash -c "gcc --version | head -n 1 | awk '{print $3}' | cut -d' ' -f3 | cut -d'.' -f1"`
 if (( GCC_VERSION > 12 )); then
-  install_package $BIT gcc-12
-  install_package $BIT g++-12
+  install_package $BIT gcc-12 g++-12
   sudo chroot ${CHROOT_DIR}/ bash -c "update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10"
   sudo chroot ${CHROOT_DIR}/ bash -c "update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 20"
   sudo chroot ${CHROOT_DIR}/ bash -c "update-alternatives --set gcc /usr/bin/gcc-12"

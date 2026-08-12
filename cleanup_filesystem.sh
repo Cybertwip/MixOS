@@ -90,50 +90,53 @@ call_chroot "apt remove -y autotools-dev \
 call_chroot "apt -y autoremove"
 call_chroot "apt -y clean"
 
+# ── Putting back what the autoremove above took out, in one transaction each ──
+#
+# These four blocks were `while read' loops calling install_package once per line, and
+# install_package is a whole apt transaction: the runtime lists alone cost a hundred and
+# fifty of them here, on top of the hundred and fifty build_deps.sh had already paid.
+# Both functions take a list; the loops are now only about which list.
 if [[ -z "$SELECTED_USERSPACE_ARCH" && "${BUILD_ARMHF}" == "y" ]]; then
   # Ensure additional needed packages are still in place
-  while read NEEDED_PACKAGE; do
-    if [[ ! "$NEEDED_PACKAGE" =~ ^# ]]; then
-      install_package armhf ${NEEDED_PACKAGE}
-    fi
-  done <needed_packages32.txt
+  mapfile -t ARMHF_PACKAGES < <(read_package_list needed_packages32.txt)
+  if (( ${#ARMHF_PACKAGES[@]} )); then
+    install_package armhf "${ARMHF_PACKAGES[@]}"
+  fi
   sync Arkbuild
 fi
 
 # Ensure additional needed packages for Kodi are still in place if Kodi is built
 if [[ "$CHIPSET" == *"3566"* ]] && [[ "$BUILD_KODI" == "y" ]]; then
-  while read KODI_NEEDED_PACKAGE; do
-    if [[ ! "$KODI_NEEDED_PACKAGE" =~ ^# ]] && [[ "$KODI_NEEDED_PACKAGE" != *"-dev"* ]]; then
-      install_package 64 ${KODI_NEEDED_PACKAGE}
-      protect_package 64 ${KODI_NEEDED_PACKAGE}
-    fi
-  done <kodi_needed_dev_packages.txt
+  KODI_PACKAGES=()
+  while read -r KODI_NEEDED_PACKAGE; do
+    [[ "$KODI_NEEDED_PACKAGE" == *"-dev"* ]] || KODI_PACKAGES+=( "$KODI_NEEDED_PACKAGE" )
+  done < <(read_package_list kodi_needed_dev_packages.txt)
+  if (( ${#KODI_PACKAGES[@]} )); then
+    install_package 64 "${KODI_PACKAGES[@]}"
+    protect_package 64 "${KODI_PACKAGES[@]}"
+  fi
 fi
 
-while read NEEDED_PACKAGE; do
-  if [[ ! "$NEEDED_PACKAGE" =~ ^# ]]; then
-    if [[ "$CHIPSET" != *"3566"* ]]; then
-      install_package ${NATIVE_PACKAGE_MODE} ${NEEDED_PACKAGE}
-      protect_package ${NATIVE_PACKAGE_MODE} ${NEEDED_PACKAGE}
-    else
-      if [[ "$NEEDED_PACKAGE" != "ffmpeg" ]]; then
-        install_package ${NATIVE_PACKAGE_MODE} ${NEEDED_PACKAGE}
-        protect_package ${NATIVE_PACKAGE_MODE} ${NEEDED_PACKAGE}
-      else
-        continue
-      fi
-    fi 
+RUNTIME_PACKAGES=()
+while read -r NEEDED_PACKAGE; do
+  # ffmpeg is held back on rk3566 -- see the apt-mark hold above.
+  if [[ "$CHIPSET" == *"3566"* && "$NEEDED_PACKAGE" == "ffmpeg" ]]; then
+    continue
   fi
-done <needed_packages.txt
+  RUNTIME_PACKAGES+=( "$NEEDED_PACKAGE" )
+done < <(read_package_list needed_packages.txt)
+if (( ${#RUNTIME_PACKAGES[@]} )); then
+  install_package ${NATIVE_PACKAGE_MODE} "${RUNTIME_PACKAGES[@]}"
+  protect_package ${NATIVE_PACKAGE_MODE} "${RUNTIME_PACKAGES[@]}"
+fi
 sync
 
 if [[ "$BUILD_BLUEALSA" == "y" ]]; then
-  while read BLUETOOTH_NEEDED_PACKAGE; do
-    if [[ ! "$BLUETOOTH_NEEDED_PACKAGE" =~ ^# ]]; then
-      install_package ${NATIVE_PACKAGE_MODE} ${BLUETOOTH_NEEDED_PACKAGE}
-      protect_package ${NATIVE_PACKAGE_MODE} ${BLUETOOTH_NEEDED_PACKAGE}
-    fi
-  done <bluetooth_needed_packages.txt
+  mapfile -t BLUETOOTH_PACKAGES < <(read_package_list bluetooth_needed_packages.txt)
+  if (( ${#BLUETOOTH_PACKAGES[@]} )); then
+    install_package ${NATIVE_PACKAGE_MODE} "${BLUETOOTH_PACKAGES[@]}"
+    protect_package ${NATIVE_PACKAGE_MODE} "${BLUETOOTH_PACKAGES[@]}"
+  fi
   call_chroot "systemctl disable watchforbtaudio bluetooth bluealsa"
 fi
 
@@ -191,17 +194,54 @@ if [[ "${ENABLE_CACHE}" == "y" ]]; then
   sudo rm -f Arkbuild/etc/apt/apt.conf.d/99proxy
   sudo sed -i '/127.0.0.1:3142\//s///' Arkbuild/etc/apt/sources.list
 fi
-# Ensure sdl-image is symlinked properly
-call_chroot "rm /lib/libSDL_image-1.2.so.0"
-call_chroot "cd /lib && ln -sf \$(find /lib/ -name 'libSDL_image-1.2.so.0.*' | head -n 1) /lib/libSDL_image-1.2.so.0"
+# Ensure sdl-image is symlinked properly -- IF THERE IS ONE TO SYMLINK.
+#
+# libSDL_image-1.2 comes from build_linapple.sh, which only the full arm64 profile
+# runs, so on the armhf GUI base this was `rm' on a file that does not exist ("rm:
+# cannot remove '/lib/libSDL_image-1.2.so.0': No such file or directory") followed by
+# something worse: with no versioned library to find, the `ln -sf $(find ...)' below
+# collapsed to a single argument, and `ln -sf /lib/libSDL_image-1.2.so.0' creates a
+# link IN THE CURRENT DIRECTORY pointing at itself -- a self-referential dangling
+# symlink installed into /lib of the shipped rootfs.  Ask for the versioned file
+# first, and do nothing at all when it is absent.
+sdl_image_real="$(call_chroot "find /lib -name 'libSDL_image-1.2.so.0.*' 2>/dev/null | head -n 1" | tr -d '\r')"
+if [[ -n "$sdl_image_real" ]]; then
+  call_chroot "rm -f /lib/libSDL_image-1.2.so.0"
+  call_chroot "ln -sf ${sdl_image_real} /lib/libSDL_image-1.2.so.0"
+else
+  echo "No libSDL_image-1.2 in this rootfs (SDL 1.2 is a full-profile build); nothing to symlink"
+fi
 call_chroot "ldconfig"
 
-if grep -qs "Arkbuild/home/ark/Arkbuild_ccache" /proc/mounts; then
-  sudo umount -l Arkbuild/home/ark/Arkbuild_ccache
+# ── The ccache bind mount, and why the rm is conditional ──────────────────────
+#
+# `sudo rm -rf' on a still-mounted bind mount does not fail safely: it recurses INTO
+# the mount and deletes the host's ccache through it, then reports "Device or resource
+# busy" for the mount point alone -- which is the message in the build log and the
+# reason the next build's compiles were all cache misses.  `umount -l' is why it can
+# still be mounted here: a lazy unmount detaches when the last reference goes, which
+# is not necessarily before the next line runs.  So unmount properly, wait for it to
+# actually leave /proc/mounts, and only delete the directory once it has.
+ccache_mnt=Arkbuild/home/ark/Arkbuild_ccache
+if grep -qs "${ccache_mnt}" /proc/mounts; then
+  sudo umount "${ccache_mnt}" 2>/dev/null || sudo umount -l "${ccache_mnt}" || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    grep -qs "${ccache_mnt}" /proc/mounts || break
+    sync
+    sleep 1
+  done
 fi
-sudo rm -rf Arkbuild/home/ark/Arkbuild_ccache
+if grep -qs "${ccache_mnt}" /proc/mounts; then
+  echo "WARNING: ${ccache_mnt} is still mounted, so it is being left alone."
+  echo "WARNING: Deleting it now would delete the host's ccache through the mount."
+  echo "WARNING: The shipped rootfs will carry an empty directory there."
+else
+  sudo rm -rf "${ccache_mnt}"
+fi
 sudo rm -rf Arkbuild/var/log/journal
-sudo rm Arkbuild/usr/sbin/policy-rc.d
+# -f: this is written by bootstrap_rootfs.sh and removed here, so a resumed build that
+# reaches this stage twice finds it already gone.
+sudo rm -f Arkbuild/usr/sbin/policy-rc.d
 sudo rm -f Arkbuild/etc/resolv.conf
 sudo rm -f Arkbuild/etc/network/interfaces
 sudo rm -rf Arkbuild/usr/share/man/*

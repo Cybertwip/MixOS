@@ -151,34 +151,57 @@ boots and then cannot find `/init`. The SD payload is therefore the **plain**
 
 ## Incremental build
 
+There are two things to build, and they are two commands.
+
 ```sh
-./build-j36-ultra.sh
+./build-j36-ultra.sh --mix-only     # the board specifics.  This is the iteration loop.
+./build-j36-ultra.sh                # the finished card: one flashable image.
 ```
 
 This is an extension of `build-r36-ultra.sh` rather than a second build system.
-It regenerates the DTB on the host first — so a keymap or pad-mux regression
-fails in a second — then resumes the checkpointed R36 base build (already
-finished ones cost seconds; `J36_RESUME_R36=0` skips it), then builds the J36
-layer in the same `darkos-r36` VM. The first J36 run creates a persistent ARMv7
-Linux 6.12 LTS workspace; later runs rebuild only changed kernel, DTB,
-input-module, initramfs and `boot.img` files.
+It regenerates the DTB in the VM first — so a keymap or pad-mux regression fails
+before the kernel is even cloned — then, unless `--mix-only` was given, resumes
+the checkpointed R36 base build (already finished ones cost seconds;
+`J36_RESUME_R36=0` skips it), then builds the J36 layer in the same `darkos-r36`
+VM. The first J36 run creates a persistent ARMv7 Linux 6.12 LTS workspace; later
+runs rebuild only changed kernel, DTB, input-module, initramfs and `boot.img`
+files.
 
-Artifacts are copied to:
+**The full build ships one file**, and it is not in this directory:
 
 ```text
-../dArkOS-artifacts/j36-ultra/boot.img            eMMC BOOTIMG payload (9 MiB slot)
-../dArkOS-artifacts/j36-ultra/zImage              plain 32-bit ARM kernel
-../dArkOS-artifacts/j36-ultra/mt6592-j36-ultra.dtb
-../dArkOS-artifacts/j36-ultra/j36_mt6592_input.ko
-../dArkOS-artifacts/j36-ultra/sd-boot/            copy onto the BOOT partition
-../dArkOS-artifacts/j36-ultra/manifest.txt
+../dArkOS-artifacts/MixOS_armhf_trixie_<commit>.img
 ```
+
+Both payloads are already folded into it — the launcher into the vfat `BOOT`
+partition and `/opt/mixos` into the ext2 OS partition — so flashing is one `dd`
+and nothing else. That is not a convenience: the workstation here is macOS, which
+mounts FAT and exFAT and neither ext2 nor btrfs, so "untar this onto the OS
+partition" is a step that cannot be performed at all from the machine doing the
+flashing.
+
+**`--mix-only` ships two directories**, and nothing else — no `boot.img` copy, no
+bare `zImage`, no `.cpio.gz`, no checksums. Those are intermediates that the image
+already contains, and having them sit next to a flashable image is how a stale one
+gets picked up:
+
+```text
+../dArkOS-artifacts/j36-ultra/boot/   -> the card's BOOT partition (vfat)
+../dArkOS-artifacts/j36-ultra/root/   -> the card's OS partition (ext2)
+```
+
+`--mix-only` builds no base image and touches none, which is the whole point of it:
+folding a 30 MB payload into an 8 GB image costs minutes of `losetup`, `e2fsck`,
+`resize2fs` and `tar` for a change to one module. Copy `boot/` onto the card from
+macOS and the next boot has the new payload — `sd-root.tar.gz` rides along in it and
+`/init` unpacks it onto the OS partition, once per tarball.
 
 ## The SD BOOT payload
 
-Copy `sd-boot/` into the root of the FAT partition labelled `BOOT` and the MVII
-LK boots the card instead of the eMMC. Nothing already there is disturbed: an
-R36S card keeps its `Image`, `uInitrd`, rk3326 trees and `boot.ini`.
+`boot/` above, and `sd-boot/` inside the build. Copy it into the root of the FAT
+partition labelled `BOOT` and the MVII LK boots the card instead of the eMMC.
+Nothing already there is disturbed: an R36S card keeps its `Image`, `uInitrd`,
+rk3326 trees and `boot.ini`.
 
 ```text
 zImage                 plain ARMv7 kernel, no appended tree

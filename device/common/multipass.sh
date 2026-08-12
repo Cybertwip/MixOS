@@ -22,6 +22,63 @@ darkos_log() { printf '\n[%s] %s\n' "$DARKOS_LOG_TAG" "$*"; }
 darkos_warn() { printf '\n[%s] WARNING: %s\n' "$DARKOS_LOG_TAG" "$*" >&2; }
 darkos_die() { printf '\n[%s] ERROR: %s\n' "$DARKOS_LOG_TAG" "$*" >&2; exit 1; }
 
+# darkos_image_name ROOT ARCH CODENAME
+#
+# The one name every image this project ships has: MixOS_<arch>_<debian>_<commit>.img,
+# for instance MixOS_armhf_trixie_cd52cee.img.
+#
+# WHY A COMMIT AND NOT A DATE.  The name used to end in %m%d%Y, which answers the wrong
+# question: two cards flashed a fortnight apart from identical sources got different
+# names, and two cards flashed on the same afternoon from different commits got the same
+# one.  "Which build is this?" could then only be answered from the operator's memory.
+# A commit id answers it exactly, and it is the same identity the boot image and the
+# dashboard already stamp themselves with.
+#
+# COMPUTED ON THE HOST and passed into the VM as DARKOS_IMAGE_NAME, because the checkout
+# that is rsynced into the build VM excludes .git/ -- see DARKOS_SYNC_EXCLUDES below --
+# so `git rev-parse' in there has nothing to read.
+#
+# A dirty tree keeps the committed id rather than growing a "-dirty" suffix: the name has
+# one shape, and every glob and stamp that looks for it would have to learn a second.
+# It says so loudly instead, because the id then describes the build only approximately.
+darkos_image_name() {
+    local root=$1 arch=$2 codename=$3 commit
+    commit="$(git -C "$root" rev-parse --short=7 HEAD 2>/dev/null || true)"
+    if [[ -z "$commit" ]]; then
+        commit=nogit
+        darkos_warn "$root is not a git checkout, so this image is named ..._nogit.img"
+    elif [[ -n "$(git -C "$root" status --porcelain 2>/dev/null)" ]]; then
+        darkos_warn "the checkout has uncommitted changes, so $commit names this image only approximately"
+    fi
+    printf 'MixOS_%s_%s_%s.img\n' "$arch" "$codename" "$commit"
+}
+
+# darkos_report_stale_images DIR KEEP_NAME
+#
+# One image per commit means the artifact directory grows by another 8 GB every time a
+# new commit is built, and the images are no longer compressed -- so it is worth saying
+# out loud rather than discovering when the workstation runs out of disk.
+#
+# Nothing is deleted here.  Which older card the operator still needs to be able to
+# flash is not this script's call to make, and an artifact directory that silently
+# removes builds is worse than one that grows.
+darkos_report_stale_images() {
+    local dir=$1 keep=$2 img name n=0
+    for img in "$dir"/MixOS_*.img; do
+        [[ -f "$img" ]] || continue
+        name="$(basename "$img")"
+        if [[ "$name" == "$keep" ]]; then
+            continue
+        fi
+        n=$((n + 1))
+        darkos_log "  older image still here: $name ($(du -h "$img" | awk '{print $1}'))"
+    done
+    if (( n )); then
+        darkos_warn "$n older image(s) in $dir; delete the ones you no longer flash"
+    fi
+    return 0
+}
+
 # Bring the Multipass daemon up, repairing it if macOS has left it installed but
 # unloaded -- which is the state that makes the GUI loop forever at "Waiting for
 # daemon". Only the already-installed service is touched, and macOS shows one

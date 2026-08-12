@@ -54,12 +54,15 @@ UBUNTU_IMAGE="${DARKOS_UBUNTU_IMAGE:-24.04}"
 BOARD_SRC="$ROOT/device/j36-ultra/mvii-board"
 POWERENGINE_ROOT="${POWERENGINE_ROOT:-$(dirname "$ROOT")/PowerEngineV3/PowerEngine}"
 DRIVERS_HOST="${J36_DRIVERS_DIR:-$POWERENGINE_ROOT/OS/MVII/Kernel/ARM/MediaTek/J36Ultra/Drivers}"
+# Only --mix-only writes here, and it holds exactly two directories: boot/ and root/.
+# See the MIX_ONLY block below for why a full build leaves this untouched.
 ARTIFACT_DIR="${J36_ARTIFACT_DIR:-${ROOT}-artifacts/j36-ultra}"
-# Where build-r36-ultra.sh puts the image archive and latest-image.txt.  Spelt the same
-# way it spells it, and honouring the same override, because the payload-carrying archive
-# has to land on top of the pre-payload one it wrote -- see the hand-over at the bottom.
+# Where build-r36-ultra.sh puts the image and latest-image.txt.  Spelt the same way it
+# spells it, and honouring the same override, because the payload-carrying image has to
+# land there and nowhere else -- see the hand-over at the bottom.
 BASE_ARTIFACT_DIR="${DARKOS_ARTIFACT_DIR:-${ROOT}-artifacts}"
 RESUME_R36="${J36_RESUME_R36:-1}"
+MIX_ONLY=0
 VM_SOURCE_MOUNT="/mnt/darkos-host"
 VM_ARTIFACT_MOUNT="/mnt/j36-artifacts"
 VM_BASE_ARTIFACT_MOUNT="/mnt/darkos-artifacts"
@@ -68,41 +71,66 @@ VM_WORK_DIR="/home/ubuntu/j36-ultra-work"
 
 usage() {
     cat <<USAGE
-Usage: ./build-j36-ultra.sh
+Usage: ./build-j36-ultra.sh [--mix-only]
 
 Resumes the R36 Ultra build (build-r36-ultra.sh, checkpointed) and then adds the
 J36 Ultra layer on top of it in the same Multipass VM: $VM_NAME
 
-Writes J36 artifacts to: $ARTIFACT_DIR
+    ./build-j36-ultra.sh              the finished article: one flashable image,
+                                      both payloads folded into it, written to
+                                      $BASE_ARTIFACT_DIR
+
+    ./build-j36-ultra.sh --mix-only   the board specifics only -- kernel, DTB,
+                                      modules, drivers, the mixdash dashboard,
+                                      eglprobe.  No base image is built, resumed
+                                      or touched, and the result is two
+                                      directories in $ARTIFACT_DIR:
+
+                                          boot/   copy onto the card's BOOT
+                                                  partition; sd-root.tar.gz rides
+                                                  along and /init unpacks it on the
+                                                  next boot, so this alone updates
+                                                  an already-flashed card, from
+                                                  macOS, without reflashing
+                                          root/   the same payload unpacked, for
+                                                  writing onto the ext2 OS
+                                                  partition from a Linux box
+
+                                      This is the iteration loop.  Use it while
+                                      debugging; use the full build when done.
 
 The first J36 run creates the persistent ARMv7 Linux 6.12 LTS workspace.  Later
 runs reuse it and rebuild only changed kernel, DTB, input-module, initramfs and
 boot.img files.
 
 Overrides:
-  J36_RESUME_R36=0 ./build-j36-ultra.sh      # J36 layer only, leave the base as is
+  J36_RESUME_R36=0 ./build-j36-ultra.sh      # build the layer and fold it into
+                                             # whatever base image the VM already
+                                             # has, without resuming the base build
   J36_UPDATE_KERNEL=1 ./build-j36-ultra.sh
   J36_REBUILD_BUSYBOX=1 ./build-j36-ultra.sh
   J36_KERNEL_BRANCH=linux-6.12.y ./build-j36-ultra.sh
-  J36_ARTIFACT_DIR=/path/to/output ./build-j36-ultra.sh
-  J36_IMAGE_EXPORT=0 ./build-j36-ultra.sh    # still fold the payload into the image,
-                                             # but skip the minutes-long re-split of
-                                             # its .7z volumes.  Use when the card is
-                                             # already flashed and sd-boot/ -- which
-                                             # carries sd-root.tar.gz -- is how it is
-                                             # being updated.
+  J36_ARTIFACT_DIR=/path/to/output ./build-j36-ultra.sh --mix-only
 
 Anything build-r36-ultra.sh honours (BUILD_JOBS, USERSPACE_ARCH,
 DARKOS_R36_BOOT_PAYLOAD, ...) is inherited by the resumed base build.
 USAGE
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    usage
-    exit 0
-elif [[ $# -ne 0 ]]; then
-    usage >&2
-    exit 2
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --mix-only) MIX_ONLY=1; shift ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+
+# --mix-only means the base image is not this run's business at all, so resuming the
+# base build would be a contradiction: it is the long step, and skipping it is the
+# point.  Said out loud rather than silently overridden, because J36_RESUME_R36=1 is
+# the default and someone will have it in their shell history.
+if [[ "$MIX_ONLY" == 1 && "$RESUME_R36" == "1" ]]; then
+    RESUME_R36=0
 fi
 
 [[ "$(uname -s)" == "Darwin" ]] || darkos_die "run this wrapper on macOS"
@@ -147,7 +175,20 @@ fi
 
 if [[ "$RESUME_R36" == "1" ]]; then
     darkos_log "Resuming the R36 Ultra base build; completed stages are skipped"
-    "$ROOT/build-r36-ultra.sh"
+    # DARKOS_DEFER_IMAGE_COPY=1: the base wrapper's last act is to copy its finished
+    # image out to the workstation, and this layer is about to inject two payloads into
+    # that very image.  Copying it twice moves 8 GB across the host share for nothing,
+    # and worse, between the two copies there is a window in which the artifact
+    # directory holds an image that boots without /opt/mixos.  So the base build leaves
+    # it in the VM and the hand-over at the bottom of this script does the one copy.
+    DARKOS_DEFER_IMAGE_COPY=1 "$ROOT/build-r36-ultra.sh"
+elif [[ "$MIX_ONLY" == 1 ]]; then
+    darkos_log "Board specifics only (--mix-only); the base image is not built or touched"
+    darkos_multipass_ready
+    darkos_vm_ensure "$VM_NAME" "$VM_CPUS" "$VM_MEMORY" "$VM_DISK" "$UBUNTU_IMAGE"
+    darkos_vm_remount "$VM_NAME" "$ROOT:$VM_SOURCE_MOUNT"
+    darkos_vm_refuse_concurrent_build "$VM_NAME"
+    darkos_vm_sync_checkout "$VM_NAME" "$VM_SOURCE_MOUNT" "$VM_BUILD_DIR"
 else
     darkos_log "Skipping the R36 base build (J36_RESUME_R36=0)"
     darkos_multipass_ready
@@ -158,17 +199,37 @@ else
 fi
 
 # The checkout is already in the VM either way, and device/j36-ultra rode along
-# with it -- board sources, kernel patch, input module and all.  The only mount
-# still needed is somewhere to put the results.  There used to be a second one,
-# /mnt/j36-drivers-host, plus an rsync into the VM to stage the PowerEngine
-# drivers; vendoring them removed both.
-mkdir -p "$ARTIFACT_DIR"
-darkos_vm_remount "$VM_NAME" "$ARTIFACT_DIR:$VM_ARTIFACT_MOUNT"
+# with it -- board sources, kernel patch, input module and all.  There used to be a
+# second mount, /mnt/j36-drivers-host, plus an rsync into the VM to stage the
+# PowerEngine drivers; vendoring them removed both.
+#
+# WHY THE OUTPUT MOUNT IS --mix-only's ALONE.  A full build ships one file, the image,
+# and it goes to $BASE_ARTIFACT_DIR next to latest-image.txt.  It used to also rsync
+# twenty-odd intermediates into a j36-ultra/ directory -- boot.img, the bare zImage,
+# the cpio, the checksums -- all of which are already inside the image and none of
+# which anyone copies anywhere.  Having them sit next to a flashable image is how a
+# stale one gets picked up.  So the directory exists only when it is the deliverable,
+# and the mount only then too.
+if [[ "$MIX_ONLY" == 1 ]]; then
+    mkdir -p "$ARTIFACT_DIR"
+    darkos_vm_remount "$VM_NAME" "$ARTIFACT_DIR:$VM_ARTIFACT_MOUNT"
+    VM_EXPORT_DIR="$VM_ARTIFACT_MOUNT"
+else
+    # Left over from a previous --mix-only run; unmounted so that nothing in this run
+    # can write into a directory it is not exporting to.
+    multipass umount "$VM_NAME:$VM_ARTIFACT_MOUNT" >/dev/null 2>&1 || true
+    VM_EXPORT_DIR="$VM_WORK_DIR/export"
+    if [[ -d "$ARTIFACT_DIR" ]]; then
+        darkos_warn "$ARTIFACT_DIR is from an earlier --mix-only run and is NOT being refreshed."
+        darkos_warn "The image this build writes carries the payload; that directory does not."
+    fi
+fi
 
 darkos_log "Building the J36 Ultra layer"
 multipass exec "$VM_NAME" -- env \
     J36_WORK_DIR="$VM_WORK_DIR" \
-    J36_EXPORT_DIR="$VM_ARTIFACT_MOUNT" \
+    J36_EXPORT_DIR="$VM_EXPORT_DIR" \
+    J36_MIX_ONLY="$MIX_ONLY" \
     J36_KERNEL_BRANCH="${J36_KERNEL_BRANCH:-linux-6.12.y}" \
     J36_KERNEL_URL="${J36_KERNEL_URL:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}" \
     J36_UPDATE_KERNEL="${J36_UPDATE_KERNEL:-0}" \
@@ -184,97 +245,106 @@ multipass exec "$VM_NAME" -- env \
     J36_GL="${J36_GL:-${J36_ES:-1}}" \
     J36_MIXDASH="${J36_MIXDASH:-1}" \
     J36_PAYLOAD_ON="${J36_PAYLOAD_ON:-root}" \
-    J36_IMAGE_EXPORT="${J36_IMAGE_EXPORT:-archive}" \
     bash "$VM_BUILD_DIR/device/j36-ultra/build-in-vm.sh"
 
 # ── Handing over the image that actually carries the payload ──────────────────
 #
-# WHY THIS STEP EXISTS.  build-r36-ultra.sh, which ran above, copies ${IMAGE}.7z.* to
-# the workstation as its last act -- and that archive was written by create_image.sh
-# during the base build's finalization, BEFORE this layer injected anything.  So every
-# card flashed from it came up with no /opt/mixos and no sd-root.tar.gz on BOOT, no
-# matter what the injection reported: the operator was unpacking a snapshot of the image
-# taken before the payload went in.
+# WHY THIS STEP EXISTS.  build-r36-ultra.sh finishes the image, and this layer then
+# injects two payloads into that very image inside the VM.  Whatever reaches the
+# workstation therefore has to be copied out AFTER the injection, not before -- which is
+# why the base wrapper was run with DARKOS_DEFER_IMAGE_COPY=1 above.  Getting this the
+# wrong way round is not a cosmetic bug: it is a card that boots to a Debian with no
+# /opt/mixos on it, and nothing in the log to say why.
 #
-# The in-VM script now rewrites the archive from the injected image under the same name.
-# This copies that rewrite out, on top of the volumes the base wrapper already put there.
-# Into $BASE_ARTIFACT_DIR and not $ARTIFACT_DIR on purpose: latest-image.txt, the
-# volumes and the per-file copy stamps are all there, and one image in one place is the
-# whole point -- two images of which only one boots is the mistake being fixed.  Sharing
-# copy_artifacts.sh's stamp directory with the base wrapper is also what keeps this to
-# one transfer per run: next run the wrapper finds the stamp written here and skips.
+# Into $BASE_ARTIFACT_DIR and not $ARTIFACT_DIR on purpose: latest-image.txt and the
+# per-file copy stamps are there, and one image in one place is the whole point -- two
+# images of which only one boots is the mistake being fixed.  Sharing copy_artifacts.sh's
+# stamp directory with the base wrapper is also what keeps this to one transfer per run.
+#
+# The manifest is read out of the VM rather than the artifact directory because in this
+# mode there is no artifact directory: nothing is exported except the image itself.
 FLASH_IMAGE=""
 FLASH_PAYLOAD=""
-if [[ -f "$ARTIFACT_DIR/flashable-image.txt" ]]; then
+if [[ "$MIX_ONLY" == 1 ]]; then
+    FLASH_PAYLOAD=exported
+else
+    # Through a temporary file and not `done < <(multipass ...)': macOS /bin/sh is bash
+    # 3.2 in POSIX mode, which rejects process substitution at PARSE time, so one such
+    # construct anywhere in this file kills `sh ./build-j36-ultra.sh' before line 1 runs
+    # -- branch never taken or not.  This file has been bitten by that once already.
+    FLASH_MANIFEST="$(mktemp -t j36-flashable)"
+    multipass exec "$VM_NAME" -- \
+        cat "$VM_WORK_DIR/artifacts/flashable-image.txt" > "$FLASH_MANIFEST" 2>/dev/null || true
     while IFS='=' read -r key value; do
         case "$key" in
             image)   FLASH_IMAGE="$value" ;;
             payload) FLASH_PAYLOAD="$value" ;;
         esac
-    done < "$ARTIFACT_DIR/flashable-image.txt"
+    done < "$FLASH_MANIFEST"
+    rm -f "$FLASH_MANIFEST"
 fi
 
-if [[ "$FLASH_PAYLOAD" == "in-image" && -n "$FLASH_IMAGE" && "$FLASH_IMAGE" != none ]]; then
+if [[ "$MIX_ONLY" == 1 ]]; then
+    :
+elif [[ "$FLASH_PAYLOAD" == "in-image" && -n "$FLASH_IMAGE" && "$FLASH_IMAGE" != none ]]; then
     mkdir -p "$BASE_ARTIFACT_DIR"
     darkos_vm_remount "$VM_NAME" "$BASE_ARTIFACT_DIR:$VM_BASE_ARTIFACT_MOUNT"
-    darkos_log "Copying ${FLASH_IMAGE}.7z.* out: the archive with both payloads folded in"
+    darkos_log "Copying $FLASH_IMAGE out: the image with both payloads folded in"
     multipass exec "$VM_NAME" -- bash -lc '
 set -Eeuo pipefail
 BUILD_DIR=$1
 DEST=$2
 IMAGE=$3
 cd "$BUILD_DIR"
-[[ -f "${IMAGE}.7z.001" ]] || { echo "missing archive: ${IMAGE}.7z.001" >&2; exit 1; }
-bash device/r36-ultra/copy_artifacts.sh "$DEST" "${IMAGE}.7z."*
+[[ -s "$IMAGE" ]] || { echo "missing image: $IMAGE" >&2; exit 1; }
+bash device/r36-ultra/copy_artifacts.sh "$DEST" "$IMAGE"
 printf "%s\n" "$IMAGE" > "$DEST/latest-image.txt"
 sync "$DEST"
 ' j36-image-copy "$VM_BUILD_DIR" "$VM_BASE_ARTIFACT_MOUNT" "$FLASH_IMAGE"
 elif [[ -n "$FLASH_IMAGE" && "$FLASH_IMAGE" != none ]]; then
-    darkos_warn "${FLASH_IMAGE}.7z.* in $BASE_ARTIFACT_DIR predates the payload and was NOT refreshed."
+    darkos_warn "$FLASH_IMAGE was NOT handed over: the payload did not reach it."
     darkos_warn "Read the 'image:' lines in the build log; do not expect /opt/mixos on a card flashed from it."
 else
     darkos_warn "No base image was found in the VM, so there is nothing flashable to hand over."
     darkos_warn "Run without J36_RESUME_R36=0 so the base build produces one."
 fi
 
-darkos_log "J36 Ultra artifacts are ready: $ARTIFACT_DIR"
-printf '  %s\n' \
-    "$ARTIFACT_DIR/boot.img" \
-    "$ARTIFACT_DIR/mt6592-j36-ultra.dtb" \
-    "$ARTIFACT_DIR/j36_mt6592_input.ko" \
-    "$ARTIFACT_DIR/manifest.txt"
-# FLASH AND GO.  The build folds both halves into the image inside the VM -- the
-# launcher into the vfat BOOT partition and /opt/mixos into the ext2 OS partition --
-# so the normal path is one dd and nothing else.  It has to be that way: the
-# workstation here is macOS, which mounts FAT and exFAT and neither ext2 nor btrfs, so
-# "untar this onto the OS partition" is a step that cannot be performed at all from the
-# machine doing the flashing.
+# ── What was produced, and what to do with it ─────────────────────────────────
 #
-# The two artifacts below are still emitted, for updating a card in place from a Linux
-# box.  Unpacking sd-root.tar.gz onto BOOT instead of the OS partition is the one wrong
-# way to do it: FAT holds neither the ~30 Qt SONAME symlinks nor the execute bits, and
-# mixdash would fail before main().
-if [[ "$FLASH_PAYLOAD" == "in-image" ]]; then
-    darkos_log "Flash this, and nothing else has to be copied: $BASE_ARTIFACT_DIR/${FLASH_IMAGE}.7z.001"
-    darkos_log "  7z x ${FLASH_IMAGE}.7z.001   then dd the .img -- the launcher is already on BOOT and /opt/mixos on the OS partition"
+# FLASH AND GO.  A full build folds both halves into the image inside the VM -- the
+# launcher into the vfat BOOT partition and /opt/mixos into the ext2 OS partition -- so
+# the normal path is one dd and nothing else.  It has to be that way: the workstation
+# here is macOS, which mounts FAT and exFAT and neither ext2 nor btrfs, so "untar this
+# onto the OS partition" is a step that cannot be performed at all from the machine
+# doing the flashing.
+#
+# --mix-only produces the in-place update channel instead, and that one works from
+# macOS too: boot/ contains sd-root.tar.gz, and /init unpacks it onto the ext2 OS
+# partition on the next boot, once per tarball.  Dragging the whole of boot/ onto the
+# one partition macOS can mount is therefore a complete update, dashboard included.
+# What does not work is unpacking that tarball onto BOOT itself, because FAT holds
+# neither the ~30 Qt SONAME symlinks nor the execute bits, and mixdash then dies before
+# main() with "invalid ELF header".
+if [[ "$MIX_ONLY" == 1 ]]; then
+    darkos_log "J36 Ultra board artifacts are ready: $ARTIFACT_DIR"
+    printf '  %s\n' \
+        "$ARTIFACT_DIR/boot/   -> copy ALL of it onto the card's BOOT partition (vfat; macOS can do this)" \
+        "$ARTIFACT_DIR/root/   -> the OS partition's contents, for a Linux box (ext2)"
+    if [[ -f "$ARTIFACT_DIR/boot/sd-root.tar.gz" ]]; then
+        darkos_log "  boot/sd-root.tar.gz rides along and /init unpacks it onto the OS partition on the next boot, so copying boot/ is a complete update"
+        darkos_log "  Do NOT untar it onto BOOT itself: FAT loses the Qt symlinks and the execute bits, which is the 'invalid ELF header' from libQt5Widgets"
+    else
+        darkos_warn "boot/ has no sd-root.tar.gz, so copying it updates the kernel and launcher only -- /opt/mixos on the card stays as it is."
+        darkos_log "  From a Linux box: sudo rsync -a $ARTIFACT_DIR/root/ /path/to/the/mounted/ROOTFS/"
+    fi
+    darkos_log "No image was built or modified.  Run ./build-j36-ultra.sh with no flag for that."
+elif [[ "$FLASH_PAYLOAD" == "in-image" ]]; then
+    darkos_log "Flash this, and nothing else has to be copied: $BASE_ARTIFACT_DIR/$FLASH_IMAGE"
+    darkos_log "  sudo dd if=$BASE_ARTIFACT_DIR/$FLASH_IMAGE of=/dev/rdiskN bs=4m status=progress"
+    darkos_log "  The launcher is already on BOOT and /opt/mixos on the OS partition; no copying afterwards"
+    darkos_log "  Iterating on the board specifics after this?  ./build-j36-ultra.sh --mix-only, then copy boot/ onto BOOT"
+    darkos_report_stale_images "$BASE_ARTIFACT_DIR" "$FLASH_IMAGE"
 fi
 darkos_log "The card's three partitions: p1 BOOT vfat (launcher only), p2 ROOTFS ext2 (Debian + /opt/mixos), p3 DATA ext2 (your home, mounted at /home/virtua)"
-# The in-place update channel, and it works FROM MACOS -- which the previous wording
-# denied.  sd-boot/ now contains sd-root.tar.gz, and /init unpacks it onto the ext2 OS
-# partition on the next boot, once per tarball.  Dragging the whole of sd-boot/ onto the
-# one partition macOS can mount is therefore a complete update, dashboard included; what
-# does not work is unpacking that tarball onto BOOT, because FAT holds neither the ~30 Qt
-# SONAME symlinks nor the execute bits and mixdash then dies before main() with
-# "invalid ELF header".
-darkos_log "To update an already-flashed card without reflashing: copy all of $ARTIFACT_DIR/sd-boot/ onto its BOOT partition"
-if [[ -f "$ARTIFACT_DIR/sd-boot/sd-root.tar.gz" ]]; then
-    darkos_log "  sd-root.tar.gz rides along on BOOT and /init unpacks it onto the OS partition on the next boot -- so this works from macOS, and only BOOT is written"
-    darkos_log "  Do NOT untar it onto BOOT itself: FAT loses the Qt symlinks and the execute bits, which is the 'invalid ELF header' from libQt5Widgets"
-elif [[ -f "$ARTIFACT_DIR/sd-root.tar.gz" ]]; then
-    darkos_warn "sd-root.tar.gz did not fit on BOOT alongside the launcher, so a card can only be updated by reflashing or from a Linux box:"
-    darkos_log "  as root: sudo tar -C /path/to/the/mounted/ROOTFS -xzpf $ARTIFACT_DIR/sd-root.tar.gz --numeric-owner   (the ext2 OS partition -- gives /opt/mixos)"
-else
-    darkos_warn "No sd-root.tar.gz was produced, so nothing will be on the OS partition: no dashboard, no lima, no Mesa. Check the sd-root lines in the build log."
-fi
 darkos_log "Check the build log for the 'image:' lines -- they say whether the fold into the image succeeded, and on which partitions"
 darkos_warn "The R36 base image kernel is arm64 and this SoC is ARMv7; only the armhf rootfs is shared. sd-boot/mvii/boot.conf is what points the MVII LK at the 32-bit kernel."

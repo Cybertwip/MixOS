@@ -180,7 +180,16 @@ function remove_arkbuild() {
       sleep 1
     fi
   done
-  sudo rm -rf Arkbuild/home/ark/Arkbuild_ccache
+  # Only once it is really unmounted.  `umount -l' above detaches when the last
+  # reference goes, and an rm -rf that runs before that recurses INTO the bind mount and
+  # deletes the host's ccache through it -- reporting only "Device or resource busy" for
+  # the mount point, which is what that message in the build log means.  The same guard
+  # and the same reasoning are in cleanup_filesystem.sh.
+  if grep -qs "Arkbuild/home/ark/Arkbuild_ccache" /proc/mounts; then
+    echo "Arkbuild_ccache is still mounted; leaving it rather than deleting the host's ccache through it"
+  else
+    sudo rm -rf Arkbuild/home/ark/Arkbuild_ccache
+  fi
   (cat /proc/mounts | grep -qs "Arkbuild") && sudo umount -l Arkbuild
   (cat /proc/mounts | grep -qs "Arkbuild-final") && sudo umount -l Arkbuild-final
   return 0
@@ -201,7 +210,49 @@ function remove_arkbuild32() {
   return 0
 }
 
+# One package name per line from a needed_*.txt list, comments and blanks dropped.
+#
+# Four callers had this loop inline as `while read pkg; do [[ ! "$pkg" =~ ^# ]] ...',
+# and each of them then called install_package once per line -- which is what made a
+# 15 MB download take a quarter of an hour.  Reading the list into an array instead is
+# what lets the whole list be handed to apt in one go.  Carriage returns are stripped
+# too: a CRLF list turned every name into `libfoo\r', which apt cannot satisfy.
+function read_package_list() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  sed -e 's/\r$//' -e 's/#.*//' -e 's/[[:space:]]*$//' "$file" | grep -v '^[[:space:]]*$' || true
+}
+
 updateapt="N"
+
+# The sources.list fix and one `apt update' for the whole build, not one per package.
+function apt_update_once() {
+  local chroot_dir="$1"
+  [[ "$updateapt" == "Y" ]] && return 0
+  if ! grep -qs contrib "${chroot_dir}/etc/apt/sources.list"; then
+    sudo sed -i '/main/s//main contrib non-free non-free-firmware/' "${chroot_dir}/etc/apt/sources.list"
+  fi
+  sudo chroot ${chroot_dir}/ apt -y update
+  updateapt="Y"
+  return 0
+}
+
+# install_package MODE PACKAGE [PACKAGE...]
+#
+# ── ONE APT TRANSACTION, NOT ONE PER PACKAGE ──────────────────────────────────
+#
+# This used to loop: a `dpkg -s' and then an entire `apt -y install' for every single
+# package, which is what "it downloads them individually" was.  Each install re-read
+# the package lists, resolved dependencies again, ran its own dpkg and its own trigger
+# pass -- several seconds of fixed cost times a hundred and fifty packages, on a step
+# whose actual download is fifteen megabytes.  Batched, it is one list read, one
+# download set and one trigger pass.
+#
+# THE FALLBACK IS THE POINT.  apt is all-or-nothing: one name that this Debian release
+# no longer carries fails the whole transaction, where the old loop installed
+# everything else and named the one casualty.  So a failed batch is retried one
+# package at a time.  The slow path costs exactly what the old code always cost, and
+# only a genuinely unsatisfiable name pays it.
 function install_package() {
   if [ "$1" == "native" ]; then
     NEEDED_ARCH=""
@@ -216,44 +267,73 @@ function install_package() {
     NEEDED_ARCH=":arm64"
     CHROOT_DIR="Arkbuild"
   fi
-  neededlibs=( ${@:2} )
-  for libs in "${neededlibs[@]}"
-  do
-     sudo chroot ${CHROOT_DIR}/ dpkg -s "${libs}${NEEDED_ARCH}" &>/dev/null
-     if [[ $? != "0" ]]; then
-       if [[ "$updateapt" == "N" ]]; then
-         if test -z "$(cat ${CHROOT_DIR}/etc/apt/sources.list | grep contrib)"
-         then
-           sudo sed -i '/main/s//main contrib non-free non-free-firmware/' ${CHROOT_DIR}/etc/apt/sources.list
-		 fi
-         sudo chroot ${CHROOT_DIR}/ apt -y update
-         updateapt="Y"
-       fi
-       sudo chroot ${CHROOT_DIR}/ bash -c "DEBIAN_FRONTEND=noninteractive eatmydata apt -y install ${libs}${NEEDED_ARCH}"
-       if [[ $? != "0" ]]; then
-         echo " "
-         echo "Could not install needed library ${libs}${NEEDED_ARCH}."
-       else
-	     echo "${libs}${NEEDED_ARCH} was successfully installed."
-       fi
-     fi
+  local needed=( "${@:2}" )
+  (( ${#needed[@]} )) || return 0
+
+  local spec want=() missing=() installed one
+  for spec in "${needed[@]}"; do
+    want+=( "${spec}${NEEDED_ARCH}" )
   done
+
+  # One dpkg-query for the lot.  A name dpkg has never heard of makes it exit non-zero
+  # and complain on stderr while still reporting the others on stdout, hence the
+  # redirect.  Both the bare name and name:arch are recorded as present, so a request
+  # for `foo' is satisfied by foo:armhf and a request for `foo:armhf' by itself.
+  installed=" $(sudo chroot ${CHROOT_DIR}/ dpkg-query -W \
+      -f '${Package} ${Package}:${Architecture} ${db:Status-Status}\n' "${want[@]}" 2>/dev/null |
+      awk '$NF == "installed" { print $1; print $2 }' | tr '\n' ' ')"
+  for spec in "${want[@]}"; do
+    [[ "$installed" == *" ${spec} "* ]] || missing+=( "$spec" )
+  done
+
+  if (( ${#missing[@]} == 0 )); then
+    echo "All ${#want[@]} requested package(s) are already installed in ${CHROOT_DIR}."
+    return 0
+  fi
+
+  apt_update_once "${CHROOT_DIR}"
+
+  echo "Installing ${#missing[@]} of ${#want[@]} package(s) into ${CHROOT_DIR} in one transaction:"
+  echo "  ${missing[*]}"
+  if sudo chroot ${CHROOT_DIR}/ bash -c \
+      "DEBIAN_FRONTEND=noninteractive eatmydata apt -y install ${missing[*]}"; then
+    echo "${#missing[@]} package(s) installed."
+    return 0
+  fi
+
+  echo " "
+  echo "The batch install failed, so it is being retried one package at a time to find"
+  echo "which name apt could not satisfy.  Each casualty is named below."
+  for one in "${missing[@]}"; do
+    if sudo chroot ${CHROOT_DIR}/ bash -c \
+        "DEBIAN_FRONTEND=noninteractive eatmydata apt -y install ${one}"; then
+      echo "${one} was successfully installed."
+    else
+      echo " "
+      echo "Could not install needed library ${one}."
+    fi
+  done
+  return 0
 }
 
+# protect_package MODE PACKAGE [PACKAGE...]
+#
+# apt-mark takes a list, so this is one chroot rather than one per package.  The old
+# success message read "$${protectedlib}", which bash expands to the shell's own PID
+# followed by a literal brace -- the "39947{protectedlib} has been marked as manually
+# installed" that filled the build log.
 function protect_package() {
   if [ "$1" == "32" ]; then
     CHROOT_DIR="Arkbuild32"
   else
     CHROOT_DIR="Arkbuild"
   fi
-  protectlibs=( ${@:2} )
-  for protectedlib in "${protectlibs[@]}"
-  do
-     sudo chroot ${CHROOT_DIR}/ apt-mark manual "${protectedlib}"
-     if [[ $? != "0" ]]; then
-       echo "${protectedlib} could not mark as manually installed."
-     else
-	   echo "$${protectedlib} has been marked as manually installed."
-     fi
-  done
+  local protectlibs=( "${@:2}" )
+  (( ${#protectlibs[@]} )) || return 0
+  if sudo chroot ${CHROOT_DIR}/ apt-mark manual "${protectlibs[@]}" >/dev/null; then
+    echo "${#protectlibs[@]} package(s) marked as manually installed (held against autoremove)."
+  else
+    echo "Could not mark all of these as manually installed: ${protectlibs[*]}"
+  fi
+  return 0
 }

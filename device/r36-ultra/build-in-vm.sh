@@ -23,10 +23,8 @@ CHIPSET=rk3326
 UNIT=rg351mp
 if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
     BUILD_PROFILE=full
-    IMAGE_PREFIX="dArkOS_RG351MP_FULL_${USERSPACE_ARCH}"
 else
     BUILD_PROFILE=gui
-    IMAGE_PREFIX="dArkOS_R36_ULTRA_GUI_BASE_${USERSPACE_ARCH}"
 fi
 FILESYSTEM="ArkOS_R36_${DEBIAN_CODE_NAME}_${USERSPACE_ARCH}_${BUILD_PROFILE}_File_System.img"
 export DEBIAN_CODE_NAME USERSPACE_ARCH BUILD_ARMHF BUILD_JOBS BUILD_BUNDLED_APPS
@@ -87,18 +85,16 @@ TOOLCHAIN="$ROOT/prebuilts/gcc/linux-x86/aarch64/gcc-linaro-6.3.1-2017.05-x86_64
 export PATH="$TOOLCHAIN/bin:$PATH"
 "$TOOLCHAIN/bin/aarch64-linux-gnu-gcc" --version | head -n 1
 
-# Recover the date of an existing partial image, even if a retry happens after
-# midnight. A new build records today's date once.
+# The on-device version string, and nothing else any more: finishing_touches.sh writes
+# it into /etc/os-release's title and ~/.config/.VERSION.  It used to name the image as
+# well, which is why it went to the trouble of recovering the date out of an existing
+# partial image's filename -- so that a retry after midnight did not produce a second
+# image under a second name.  The image is named after the commit now (see DISK below),
+# so all that is left is to keep one date per build across retries.
 if [[ -s "$STATE_DIR/build-date" ]]; then
     BUILD_DATE="$(cat "$STATE_DIR/build-date")"
 else
-    existing_image="$(ls -1t "${IMAGE_PREFIX}_${DEBIAN_CODE_NAME}_"*.img 2>/dev/null | head -n 1 || true)"
-    if [[ -n "$existing_image" && -f "$FILESYSTEM" ]]; then
-        BUILD_DATE="${existing_image##*_}"
-        BUILD_DATE="${BUILD_DATE%.img}"
-    else
-        BUILD_DATE="$(date +%m%d%Y)"
-    fi
+    BUILD_DATE="$(date +%m%d%Y)"
     printf '%s\n' "$BUILD_DATE" > "$STATE_DIR/build-date"
 fi
 export BUILD_DATE
@@ -154,7 +150,13 @@ ROM_PART_START=$(( STORAGE_PART_END + 1 ))
 ROM_PART_END=$(( ROM_PART_START + (ROM_PART_SIZE * 1024 * 1024 / 512) - 1 ))
 DISK_START_PADDING=$(( (SYSTEM_PART_START + 2048 - 1) / 2048 ))
 DISK_SIZE=$(( DISK_START_PADDING + SYSTEM_SIZE + STORAGE_SIZE + ROM_PART_SIZE + 1 ))
-DISK="${IMAGE_PREFIX}_${DEBIAN_CODE_NAME}_${BUILD_DATE}.img"
+# THE ONE ARTIFACT THIS BUILD SHIPS, and the only one: MixOS_<arch>_<debian>_<commit>.img,
+# uncompressed.  There is no .7z beside it any more -- see the finalization stage for why
+# that went, and darkos_image_name() in device/common/multipass.sh for where this name
+# comes from and why the host computes it rather than this script.  The fallback is for
+# running this file by hand on a Linux box with no wrapper; .git is absent in the build VM,
+# so there the wrapper's value is the only one there is.
+DISK="${DARKOS_IMAGE_NAME:-MixOS_${USERSPACE_ARCH}_${DEBIAN_CODE_NAME}_$(git -C "$ROOT" rev-parse --short=7 HEAD 2>/dev/null || echo nogit).img}"
 export ROOT_FILESYSTEM_FORMAT ROOT_FILESYSTEM_FORMAT_PARAMETERS
 export DATA_LABEL DATA_FILESYSTEM_FORMAT DATA_FILESYSTEM_FORMAT_PARAMETERS
 export DATA_MOUNT_OPTIONS DATA_MOUNT_POINT
@@ -270,9 +272,10 @@ snapshot_rootfs() {
 restore_rootfs_snapshot() {
     [[ -s "$ROOTFS_SNAPSHOT" ]] || return 1
     [[ ! -f "$FILESYSTEM" ]] || return 1
-    # A finished archive is about to be verified and returned; copying ten
-    # gigabytes to then exit immediately would be pure waste.
-    [[ ! -f "${DISK}.7z.001" ]] || return 1
+    # A finished image is about to be verified and returned; copying ten gigabytes to
+    # then exit immediately would be pure waste.  `marked finalization' and not merely
+    # the image's existence: image_setup.sh creates $DISK long before it is finished.
+    if marked finalization && [[ -s "$DISK" ]]; then return 1; fi
     log "Restoring the pre-finalization build root; Debian will not be unpacked again"
     if ! cp --reflink=auto --sparse=always "$ROOTFS_SNAPSHOT" "$FILESYSTEM.part"; then
         rm -f "$FILESYSTEM.part"
@@ -509,14 +512,15 @@ discard_foreign_layout() {
 
     if image_layout_is_foreign "$DISK"; then
         image_foreign=1
-    elif [[ -f "${DISK}.7z.001" && ! -f "$DISK" ]]; then
-        # Archived, and the image it was made from is gone, so there is nothing left to
-        # probe.  The marker is the only remaining witness -- and its absence is itself
-        # the answer on a state directory written before this check existed.
+    elif marked finalization && [[ ! -f "$DISK" ]]; then
+        # Finished and then deleted -- the operator flashed it and reclaimed the eight
+        # gigabytes.  There is nothing left to probe, so the recorded signature is the
+        # only remaining witness, and its absence is itself the answer on a state
+        # directory written before this check existed.
         recorded="$(cat "$STATE_DIR/layout" 2>/dev/null || true)"
         if [[ "$recorded" != "$(layout_signature)" ]]; then
             image_foreign=1
-            log "The finished archive records layout '${recorded:-unknown}', not '$(layout_signature)'"
+            log "The finished build records layout '${recorded:-unknown}', not '$(layout_signature)'"
         fi
     fi
 
@@ -562,29 +566,16 @@ discard_foreign_layout() {
     rm -f "$STATE_DIR"/finalization.done "$STATE_DIR"/complete.done \
           "$STATE_DIR"/image.done "$STATE_DIR"/layout
 
-    # A fresh date, so the rebuilt image sits beside the old one instead of inheriting
-    # its name -- and so the "existing completed archive" check further down does not
-    # find the old layout's archive under the new layout's name and exit satisfied
-    # without building anything, which is exactly what it did.
-    rm -f "$STATE_DIR/build-date"
-    BUILD_DATE="$(date +%m%d%Y)"
-    printf '%s\n' "$BUILD_DATE" > "$STATE_DIR/build-date"
-    DISK="${IMAGE_PREFIX}_${DEBIAN_CODE_NAME}_${BUILD_DATE}.img"
-    export BUILD_DATE DISK
-
-    # If the old layout was built today the new name collides with it, and the
-    # "existing completed archive" check further down would find ${DISK}.7z.001, verify
-    # it and exit 0 -- the failure this function exists to stop.  Move the old output
-    # aside rather than delete it: it is still the only card the operator can flash
-    # until this build finishes, and now it says what it is.
-    if [[ -f "$DISK" || -f "${DISK}.7z.001" ]]; then
-        keep="${DISK%.img}-old-layout"
-        log "An image from today already exists under that name; keeping it as ${keep}.img"
-        [[ -f "$DISK" ]] && mv -f "$DISK" "${keep}.img"
-        for part in "${DISK}".7z.*; do
-            [[ -e "$part" ]] || continue
-            mv -f "$part" "${keep}.img.${part##*.img.}"
-        done
+    # The name is the commit's, so the image being replaced is under exactly the name
+    # this build is about to write -- and the "existing finished image" check further
+    # down would otherwise find it, verify it and exit 0 without building anything,
+    # which is the failure this function exists to stop.  Move it aside rather than
+    # delete it: it is still the only card the operator can flash until this build
+    # finishes, and now it says what it is.
+    if [[ -f "$DISK" ]]; then
+        keep="${DISK%.img}-old-layout.img"
+        log "Keeping the old-layout image as $keep; the rebuilt one takes its name"
+        mv -f "$DISK" "$keep"
     fi
     log "The rebuilt image will be $DISK; the old one is still there to flash meanwhile"
     return 0
@@ -640,25 +631,28 @@ if marked kernel && ! boot_stash_ready; then
     rm -f "$STATE_DIR/kernel.done"
 fi
 
-# If a complete split archive already exists, verify and stop immediately -- but
-# only if the image it was made from can actually boot.  The 08042026 GUI image
-# archived cleanly with an unformatted BOOT partition, and accepting that here is
-# what turned a build bug into a released artifact.
-if [[ -f "${DISK}.7z.001" ]]; then
-    if [[ -f "$DISK" ]] && \
-        ! python3 device/r36-ultra/verify_boot.py "$DISK" \
+# If a finished image already exists, verify and stop immediately -- but only if it can
+# actually boot.  The 08042026 GUI image finalized cleanly with an unformatted BOOT
+# partition, and accepting that here is what turned a build bug into a released artifact.
+#
+# `marked finalization' is what makes "finished" mean finished: image_setup.sh creates
+# $DISK at full size long before anything is written into it, so the file's existence on
+# its own would let a half-built image be handed over as a completed build.  That
+# distinction used to be free, because the archive only existed after create_image.sh ran
+# at the very end -- and the archive is what has gone.
+if marked finalization && [[ -s "$DISK" ]]; then
+    if ! python3 device/r36-ultra/verify_boot.py "$DISK" \
             --require Image --require uInitrd --require boot.ini; then
         log "The finished image has no bootable BOOT partition; discarding it and rebuilding"
-        rm -f "$DISK" "${DISK}".7z.*
+        rm -f "$DISK"
         rm -f "$STATE_DIR"/complete.done "$STATE_DIR"/finalization.done \
             "$STATE_DIR"/image.done
     else
-        log "Existing completed archive found; verifying it"
-        bash device/r36-ultra/verify_archive.sh "$DISK" "$STATE_DIR"
+        log "Existing finished image found and its BOOT partition is bootable: $DISK"
         mark complete
-        # Reached only because discard_foreign_layout let this archive stand, so it is
-        # this layout's archive by elimination.  Recording that is what lets the next
-        # run tell the two apart once the image itself has been deleted.
+        # Reached only because discard_foreign_layout let this image stand, so it is this
+        # layout's image by elimination.  Recording that is what lets the next run tell
+        # the two apart once the image itself has been deleted.
         layout_signature > "$STATE_DIR/layout"
         printf '%s\n' "$DISK" > "$STATE_DIR/latest-image"
         exit 0
@@ -790,8 +784,15 @@ if ! marked finalization; then
         write_rootfs.sh
         clean_mounts.sh
         device/r36-ultra/verify_boot.sh
-        create_image.sh
     )
+    # create_image.sh IS NOT IN THAT LIST ANY MORE.  It 7z'd the finished image into
+    # 1950 MB volumes, and every consumer of this build then had to know about them: the
+    # wrapper copied ${DISK}.7z.* to the workstation, verify_archive.sh spent twenty
+    # minutes decompressing 8 GiB to test bytes 7z had just CRC'd, the J36 layer had to
+    # re-split the whole archive after injecting its payload -- and the operator had to
+    # 7z x before dd'ing anything.  The deliverable is one uncompressed .img; the only
+    # thing the compression ever bought was a smaller upload, and nothing here uploads.
+    # create_image.sh itself stays: the dormant per-device build_*.sh scripts source it.
     for script in "${final_scripts[@]}"; do
         printf '%s\n' "final:$script" > "$CURRENT_STAGE"
         log "Running final image stage: $script"
@@ -800,12 +801,10 @@ if ! marked finalization; then
     mark finalization
 fi
 
-[[ -f "${DISK}.7z.001" ]] || fail "split archive was not produced: ${DISK}.7z.001"
-7z t "${DISK}.7z.001"
+[[ -s "$DISK" ]] || fail "the image was not produced: $DISK"
 mark complete
 # What this build's artifacts are, so a run made after the layout changes again can
-# tell that they are not what it was asked for -- even after the image is deleted and
-# only the archive is left.
+# tell that they are not what it was asked for -- even after the image is deleted.
 layout_signature > "$STATE_DIR/layout"
 printf '%s\n' "$DISK" > "$STATE_DIR/latest-image"
 rm -f "$CURRENT_STAGE"

@@ -106,9 +106,28 @@ root is not a database.
 ```sh
 BUILD_JOBS=8 ./build-r36-ultra.sh
 USERSPACE_ARCH=arm64 BUILD_BUNDLED_APPS=y ./build-r36-ultra.sh   # full app set
-DARKOS_COPY_RAW_IMAGE=1 ./build-r36-ultra.sh                     # copy the .img out
 DARKOS_VM_CPUS=4 DARKOS_VM_MEMORY=8G ./build-r36-ultra.sh
 ```
 
 `BUILD_BUNDLED_APPS=y` is rejected on an armhf userspace: the emulator and
 application list is maintained for the arm64 profile only.
+
+## The one artifact
+
+A build produces exactly one file, uncompressed and named after the commit it was
+built from:
+
+```
+MixOS_<arch>_<debian codename>_<commit>.img
+```
+
+`dd` it and go. There is no `.7z` any more — the volumes were split, CRC'd, copied,
+verified by decompressing all 8 GiB again, and then unpacked by hand before every
+flash, all so a file could cross a local mount slightly smaller. `DARKOS_COPY_RAW_IMAGE`
+went with them: the raw image is not an extra, it is the deliverable.
+
+The date in the name went too. It answered the wrong question — two cards flashed a
+fortnight apart from identical sources got different names, and two flashed the same
+afternoon from different commits got the same one. The commit id is also what the boot
+image and the dashboard stamp themselves with, so a running card can be matched to the
+build that made it (`/etc/j36-build`).
