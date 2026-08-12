@@ -1066,7 +1066,7 @@ static int msgs_next(struct msgs *m, char *line, size_t linesz)
     char chunk[512];
     char *nl;
     ssize_t got;
-    size_t i;
+    size_t space, i;
 
     for (;;) {
         nl = memchr(m->buf, '\n', m->len);
