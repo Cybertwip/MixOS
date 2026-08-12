@@ -306,15 +306,25 @@ config_m BLK_DEV_SD
 # partition MixOS writes is ext2, vfat or exfat and all three are =y above; this
 # is for the disk somebody plugs in, which on any desk with a Windows machine on
 # it is NTFS more often than not.  ntfs3 is the in-tree read-write driver (the old
-# read-only NTFS_FS was deleted in 6.9, so there is no second option), it selects
+# read-only fs/ntfs was deleted in 6.9, so there is no second option), it selects
 # NLS_UCS2_UTILS for the UTF-16 name conversion, and =m puts it in the same
 # j36/usb/ payload as the stack that will need it -- the card itself never does.
+#
+# CONFIG_NTFS_FS HAS TO GO FIRST, and it is not the driver its name suggests.
+# 6.10 brought the symbol back after the classic driver was deleted, as a
+# compatibility shim for configs carrying it: a tristate whose entire body is
+# `select NTFS3_FS'.  multi_v7_defconfig still carries CONFIG_NTFS_FS=y, a select
+# forces its target to at least the selecting symbol's value, and =y outranks =m,
+# so olddefconfig quietly promoted NTFS3_FS back to built-in and the assertion
+# below caught it.  Turning the shim off costs nothing -- it is a name, not code --
+# and it is the only way `config_m NTFS3_FS' survives to the end of the file.
+config_n NTFS_FS
+config_m NTFS3_FS
 #
 # A dirty volume -- one Windows fast-booted out of rather than shut down -- is
 # refused read-write by design.  mixos-automount handles that by falling back to
 # a read-only mount rather than forcing it, which is the difference between a
 # disk you can read and a filesystem with two owners.
-config_m NTFS3_FS
 
 # ── What the shared rootfs's PID 1 needs to exist at all ──────────────────────
 #
@@ -851,6 +861,17 @@ for refused in ATA USB_UAS BLK_DEV_SR CHR_DEV_ST CHR_DEV_SG; do
     fi
 done
 
+# And the NTFS compatibility shim on its own, because it fails in a way none of
+# the lists above would name.  It is not a driver and it is not absent hardware:
+# it is a bare `select NTFS3_FS' left behind for configs that still spell the old
+# symbol, and multi_v7_defconfig is one of those.  At =y it drags ntfs3 into
+# vmlinux -- past the 9 MiB BOOTIMG budget's back, and out of the j36/usb/ payload
+# where run_usb expects to find it.  The assertion is here so that a kernel bump
+# putting it back cannot silently undo the config_n in the storage section.
+if grep -qE '^CONFIG_NTFS_FS=(y|m)$' "$CONFIG"; then
+    die "CONFIG_NTFS_FS came back after olddefconfig; it is a compatibility alias that selects NTFS3_FS and its =y from multi_v7_defconfig is what forces ntfs3 built-in"
+fi
+
 # Print the whole DRM set rather than trusting the assertions above to have named
 # everything that matters. This is the line to read when a kernel bump changes
 # what `select' pulls in. MTK_ and PHY_MTK_ are in the same line because the
@@ -869,7 +890,7 @@ log "Sound configuration: $(grep -E '^CONFIG_(SOUND|SND)[A-Z0-9_]*=(y|m)$' "$CON
 # the one most likely to be wrong.  The expected shape is short: SCSI=m, its two
 # hidden helpers, SCSI_PROC_FS and BLK_DEV_SD=m.  Anything else on this line is a
 # driver for hardware that is not in this handheld.
-log "Storage configuration: $(grep -E '^CONFIG_(SCSI|BLK_DEV_SD|BLK_DEV_SR|CHR_DEV_|USB_STORAGE|NTFS3)[A-Z0-9_]*=(y|m)$' "$CONFIG" | tr '\n' ' ')"
+log "Storage configuration: $(grep -E '^CONFIG_(SCSI|BLK_DEV_SD|BLK_DEV_SR|CHR_DEV_|USB_STORAGE|NTFS)[A-Z0-9_]*=(y|m)$' "$CONFIG" | tr '\n' ' ')"
 
 log "Building the incremental ARMv7 kernel and its symbol table"
 export CCACHE_DIR="${CCACHE_DIR:-$ROOT/Arkbuild_ccache}"
