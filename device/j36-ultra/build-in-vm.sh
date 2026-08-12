@@ -3409,9 +3409,35 @@ QT_PAYLOAD_SKIP='ld-linux|libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0
 
 build_mixdash() {
     local src="$ARMHF_CHROOT/home/build/mixdash" out="$CACHE/mixdash"
-    local stamp="$CACHE/mixdash.stamp" want f header needed lib dynsyms
+    local stamp="$CACHE/mixdash.stamp" want f header needed lib dynsyms dangling
 
     [[ -d "$MIXDASH_SRC" ]] || { log "mixdash: $MIXDASH_SRC is missing"; return 1; }
+
+    # A range-for over `QStringList() << a << b' iterates FREED MEMORY, and this is
+    # the one grep that catches it before the board does.  operator<< returns a
+    # reference to the temporary, so the loop's hidden `auto &&__range' is
+    # initialised from a reference rather than from the temporary itself -- and
+    # lifetime extension only applies to the direct case.  The list is destroyed at
+    # the semicolon and begin() then dereferences a released QArrayData.
+    #
+    # It cost a boot: the dashboard died with `std::bad_alloc' in the phase that
+    # builds the pages, because a QString built from the freed header asked for a
+    # nonsense length.  g++ DOES warn -- "'d' is used uninitialized", pointed at
+    # qlist.h and inlined from the loop -- but it is a -Wuninitialized buried in a
+    # wall of Qt template context, in a build whose exit status was 0.
+    #
+    # The pattern is deliberately narrow: `: Identifier() <<'.  The two loops that
+    # iterate `dir.entryList(QStringList() << pat, ...)' are correct -- entryList
+    # returns BY VALUE, which the range-for does extend -- and must not trip this.
+    dangling="$(grep -nE 'for[[:space:]]*\([^;]*:[[:space:]]*[A-Za-z_][A-Za-z0-9_:<>, ]*\(\)[[:space:]]*<<' \
+                     "$MIXDASH_SRC"/*.cpp "$MIXDASH_SRC"/*.h 2>/dev/null || true)"
+    if [[ -n "$dangling" ]]; then
+        log "mixdash: a range-for iterates a temporary container built with <<, which"
+        log "    is a use-after-free -- the container dies at the semicolon.  Assign it"
+        log "    to a named local first.  Offending lines:"
+        while IFS= read -r f; do log "      $f"; done <<<"$dangling"
+        return 1
+    fi
 
     want="$MIXDASH_SOURCE_ID"
     if [[ -x "$out" && "$(cat "$stamp" 2>/dev/null)" == "$want" ]]; then
@@ -3705,9 +3731,14 @@ if [[ "${J36_DASH:-1}" == 1 ]]; then
     if (( dash_rc != 0 )); then
         MIXDASH_BIN=""
         QT_PAYLOAD=""
-        log "mixdash: the dashboard was not built, see the error above -- the card will"
-        log "    carry no /opt/mixos payload, /init will find none, and the rootfs's own"
-        log "    emulationstation.service will run unmodified"
+        log "mixdash: the dashboard was not built, see the error above."
+        log "    THIS RUN'S ARTIFACTS CARRY NO DASHBOARD.  sd-root.tar.gz is written"
+        log "    without opt/mixos/bin/mixdash, so a card updated from it keeps whatever"
+        log "    dashboard it already had -- the build looks like it succeeded and the"
+        log "    board comes up on the PREVIOUS binary.  /init will say so on the console"
+        log "    (mixdash-missing.service names the partitions it searched), and if an"
+        log "    older mixdash is still on the card it prints HALF THIS CARD IS STALE,"
+        log "    because /etc/j36-build already names this run's build id."
     fi
 else
     log "mixdash: J36_DASH=0, skipping the dashboard"

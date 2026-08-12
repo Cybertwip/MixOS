@@ -302,7 +302,34 @@ QString Dashboard::firstWad()
         << "freedoom1.wad" << "freedoom2.wad" << "freedm.wad"
         << "doom.wad" << "doom1.wad" << "doom2.wad"
         << "plutonia.wad" << "tnt.wad" << "chex.wad" << "hacx.wad";
-    for (const QString &dir : QStringList() << "/opt/mixos/share/doom" << "/roms/doom")
+    /*
+     * NAMED, and it has to be.  Written inline --
+     *
+     *     for (const QString &dir : QStringList() << "/opt/mixos/share/doom" << ...)
+     *
+     * -- this loop iterates freed memory, and it is the bad_alloc that killed the
+     * dashboard in phase "Dashboard -- four pages, the dock and the evdev map".
+     * QStringList::operator<< returns a REFERENCE to the temporary, so what the
+     * range-for binds is `auto &&__range = <QStringList&>' -- a reference
+     * initialised from another reference.  The lifetime-extension rule only fires
+     * when the temporary is bound to the reference DIRECTLY, so it does not fire
+     * here: the QStringList is destroyed at the semicolon, before the first
+     * iteration, and begin()/end() then walk a released QArrayData.  Constructing
+     * a QString from that garbage asks qMallocAligned for whatever the freed
+     * header now says the length is, and Q_CHECK_PTR turns the null into a
+     * std::bad_alloc thrown from inside libQt5Core -- no size, no frame, no
+     * operator new involved, which is exactly the console this board printed.
+     *
+     * g++ said so, in the only terms it has for a dead object: two
+     * `-Wuninitialized' hits on this line, in a build that otherwise had none.
+     *
+     * A named list is bound directly and lives to the end of the function.  C++23
+     * extends the inline form's lifetime too (P2718R0), but this is built as
+     * gnu++17.
+     */
+    const QStringList dirs = QStringList()
+        << "/opt/mixos/share/doom" << "/roms/doom";
+    for (const QString &dir : dirs)
         for (const QString &n : names)
             if (QFileInfo(dir + "/" + n).isFile())
                 return dir + "/" + n;

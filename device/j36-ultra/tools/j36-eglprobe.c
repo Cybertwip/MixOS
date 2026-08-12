@@ -811,7 +811,16 @@ static void backlight_report(int repair)
         return;
     }
     while ((e = readdir(d)) != NULL) {
-        char path[256];
+        /*
+         * Big enough that -Wformat-truncation has nothing to say.  d_name is
+         * NAME_MAX (255) and the longest prefix+suffix here is 36 characters, so
+         * 256 was five warnings per build about a path that in practice is
+         * "/sys/class/backlight/mtk-pwm/max_brightness".  Truncation was never
+         * going to happen and would only have meant a failed open if it did --
+         * but five paragraphs of gcc note per build is how the one warning that
+         * DID matter (a dangling QStringList in mixdash) went unread.
+         */
+        char path[512];
         long b = -1, mx = -1, pw = -1;
 
         if (e->d_name[0] == '.')
