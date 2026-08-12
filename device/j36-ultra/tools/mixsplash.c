@@ -1054,10 +1054,12 @@ static int msgs_next(struct msgs *m, char *line, size_t linesz)
      * reason: `>=' instead of `==' on the full check, and then a saturating
      * assignment to m->len, are both statements about the OFFSET, and the offset
      * was never what it could not prove.  So the argument is dropped instead.
-     * read() is given `chunk' -- a complete object with a constant size, which
-     * leaves fortify nothing to be unsure about -- and the bytes are appended
-     * with an index that is compared against the destination's size on every
-     * single store.  There is no expression left for anyone to mis-range.
+     * read() is handed `chunk' -- a complete object, so its size is exact rather
+     * than inferred -- with a count clamped against sizeof chunk one line above
+     * the call, so fortify has two constants and no subtraction to range.  The
+     * bytes are then appended with an index compared against the destination's
+     * size on every single store.  There is no expression left to mis-range, and
+     * the clamp is `space' first so nothing that was read is ever dropped.
      *
      * It costs a copy of at most half a kilobyte per message on a path that runs
      * a few dozen times in a boot.  A build with no warnings in it is worth more
