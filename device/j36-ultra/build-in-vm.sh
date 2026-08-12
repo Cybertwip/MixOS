@@ -202,8 +202,16 @@ done
 # so once NET is on they would come back by default. Both the =y for NET and the
 # "is not set" lines for these are in .config before the single olddefconfig
 # below, which is what makes the explicit n stick.
+#
+# SCSI USED TO BE IN THIS LIST and is not any more.  It left for one reason: a USB
+# disk is a SCSI device.  usb-storage is a SCSI host adapter that speaks Bulk-Only
+# Transport, sd_mod is what turns the LUN behind it into /dev/sda, and there is no
+# arrangement of the USB menu that reaches a mountable partition without both. So
+# the storage section below turns SCSI on as a MODULE and prunes the rest of that
+# menu by name; ATA stays refused, because libata is the other thing under SCSI
+# and there is no SATA or PATA anywhere on this SoC.
 for symbol in \
-    MEDIA_SUPPORT WIRELESS WLAN BT SCSI ATA \
+    MEDIA_SUPPORT WIRELESS WLAN BT ATA \
     DEBUG_INFO DEBUG_KERNEL KALLSYMS LOGO; do
     config_n "$symbol"
 done
@@ -1037,6 +1045,69 @@ for applet in "${INIT_APPLETS[@]}"; do
 done
 cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 
+# ── the boot splash ───────────────────────────────────────────────────────────
+#
+# Two artifacts go into the initramfs: a static ARM binary that draws, and the
+# wallpaper it draws, already decoded.
+#
+# DECODED HERE AND NOT THERE, because /splash.mixspl is read before switch_root,
+# where there is no ld.so, no /lib and therefore no libjpeg -- the splash is one
+# of the few things on this board that genuinely cannot link against anything.
+# The decoder is tools/jpeg2raw.py: pure Python, no imports beyond the standard
+# library, vendored rather than `pip install pillow' for a reason that is easy to
+# miss.  The one-time apt install in this script is guarded by $WORK/.deps-installed,
+# so a dependency added to that list is a dependency that never reaches a VM which
+# has already built once -- the build would then fail on exactly the machines that
+# have been working, which is the worst possible failure mode.  Forty kilobytes of
+# baseline JPEG decoder costs nothing and cannot do that.
+#
+# Non-fatal, like fbdoom and mfgpower: a splash is decoration, and the boot has
+# to survive its absence.  /init tests for both files before running anything.
+SPLASH_SRC="$ROOT/device/j36-ultra/tools/mixsplash.c"
+SPLASH_JPEG="$ROOT/device/j36-ultra/resources/MixOS.jpg"
+SPLASH_TOOL="$ROOT/device/j36-ultra/tools/jpeg2raw.py"
+SPLASH_OK=0
+
+build_mixsplash() {
+    local out="$WORK/mixsplash" header
+
+    [[ -f "$SPLASH_SRC"  ]] || { log "splash: $SPLASH_SRC is missing";  return 1; }
+    [[ -f "$SPLASH_JPEG" ]] || { log "splash: $SPLASH_JPEG is missing"; return 1; }
+    [[ -f "$SPLASH_TOOL" ]] || { log "splash: $SPLASH_TOOL is missing"; return 1; }
+
+    # -static for the same reason Doom and mfgpower are.  No -lm: the two
+    # transcendentals it needs are polynomials in the source, so that the boot
+    # path carries no link dependency for two calls a frame.
+    arm-linux-gnueabihf-gcc -O2 -std=gnu11 -Wall -Wextra -static \
+        -o "$out" "$SPLASH_SRC" || return 1
+
+    header="$(readelf -hd "$out" 2>/dev/null)" || return 1
+    grep -q 'Class:.*ELF32' <<<"$header" || { log "splash: mixsplash is not a 32-bit ELF"; return 1; }
+    grep -q 'Machine:.*ARM' <<<"$header" || { log "splash: mixsplash is not an ARM ELF"; return 1; }
+    if grep -q 'NEEDED' <<<"$header"; then
+        log "splash: mixsplash wants shared libraries and the initramfs has none"
+        return 1
+    fi
+
+    # 640x480 x8r8g8b8 is what the LK leaves lit and what the panel is, and the
+    # picture is already exactly that -- so this is a decode and not a resample.
+    # The size is passed anyway: a later panel revision changes one number here
+    # rather than shipping a wallpaper that is silently letterboxed.
+    python3 "$SPLASH_TOOL" "$SPLASH_JPEG" "$INITROOT/splash.mixspl" 640 480 || return 1
+
+    install -m 0755 "$out" "$INITROOT/bin/mixsplash"
+    log "splash: mixsplash is $(stat -c %s "$out") bytes static ARM," \
+        "wallpaper $(stat -c %s "$INITROOT/splash.mixspl") bytes"
+    return 0
+}
+
+if build_mixsplash; then
+    SPLASH_OK=1
+else
+    log "splash: not built; the boot will narrate itself in text as it used to"
+    rm -f "$INITROOT/bin/mixsplash" "$INITROOT/splash.mixspl"
+fi
+
 # ── the build identity, and why there is one ──────────────────────────────────
 #
 # The two halves of this build are updated by different means and can be a version
@@ -1086,9 +1157,23 @@ mount -t devpts devpts /dev/pts
 # flags the one /dev/console maps to with a C.
 panel_is_console=0
 if grep -q '^tty0 .*C' /proc/consoles 2>/dev/null; then panel_is_console=1; fi
+# Declared before say() reads it, and that ordering is the whole reason it is up
+# here rather than in the splash block below: ash evaluates a function body when
+# it is called, so an unset variable would be a silent empty string in the first
+# comparison rather than an error anyone would notice.
+splash_on=0
 say() {
     echo "$@"
     if [ "$panel_is_console" = 0 ] && [ -c /dev/tty1 ]; then echo "$@" >/dev/tty1; fi
+    # With console=tty0 last, the line above went to the panel and nowhere else --
+    # and while the splash owns the panel, KD_GRAPHICS means it went nowhere at
+    # all.  It is still in the VT's scrollback and reappears the moment the splash
+    # gives the console back, which covers every failure; what it does not cover is
+    # somebody watching a working boot on the cable.  So while the picture is up,
+    # the cable gets a copy.
+    if [ "$splash_on" = 1 ] && [ "$panel_is_console" = 1 ] && [ -c /dev/ttyS0 ]; then
+        echo "$@" >/dev/ttyS0
+    fi
     return 0
 }
 
@@ -1100,9 +1185,70 @@ show() {
     return 0
 }
 
+# ── the splash, and the four helpers that talk to it ──────────────────────────
+#
+# Started here, at the top, because "where is the boot" is only worth answering
+# while the boot is still going on.  Everything below still calls say(), so the
+# serial console gets the same story in the same order it always did; stage()
+# just also puts the headline on the panel.
+#
+# THE CHANNEL IS A FILE THAT IS APPENDED TO, and that is a safety property rather
+# than a style: `echo x > fifo' blocks until something reads it, so a splash that
+# died -- no /dev/fb0, killed, panel-less board -- would hang the boot at the
+# next stage message, on a device whose only recovery is taking the card out.
+# `>>' on a regular file cannot block, cannot fail for want of a reader, and
+# cannot wedge anything.  It lives in /dev because /dev is `mount --move'd across
+# switch_root, so the same path keeps working in the rootfs.
+#
+# The command line is read here rather than in the option loop below, because
+# that loop runs after a module load and two mounts, and the whole point of this
+# is to be on the screen before any of that.
+splash_chan=/dev/.mixsplash
+case " $(cat /proc/cmdline 2>/dev/null) " in
+    *" j36.splash=0 "*|*" nosplash "*) want_splash=0 ;;
+    *)                                 want_splash=1 ;;
+esac
+if [ "$want_splash" = 1 ] && [ -x /bin/mixsplash ] && \
+   [ -f /splash.mixspl ] && [ -e /dev/fb0 ]; then
+    : > "$splash_chan"
+    /bin/mixsplash -i /splash.mixspl -f "$splash_chan" -s "Starting MixOS" &
+    splash_on=1
+fi
+
+# stage() is say() plus the headline; the panel gets the short version and the
+# cable gets everything, which is the right split for a 640x480 screen.
+stage() {
+    say "$1"
+    if [ "$splash_on" = 1 ]; then echo "stage:$1" >> "$splash_chan"; fi
+    return 0
+}
+detail() {
+    if [ "$splash_on" = 1 ]; then echo "detail:$1" >> "$splash_chan"; fi
+    return 0
+}
+progress() {
+    if [ "$splash_on" = 1 ]; then echo "progress:$1" >> "$splash_chan"; fi
+    return 0
+}
+# Told rather than killed: `kill' is a job-control builtin in BusyBox ash and
+# this initramfs does not carry the applet, and the splash puts the text console
+# back by itself on the way out -- which is the entire reason to stop it here.
+# The VT redraws from its own scrollback when KD_TEXT is restored, so everything
+# said while the picture was up is still on the panel afterwards.
+# `abort' and not `quit', and the difference is the whole reason both exist: the
+# hand-over below is sent before switch_root, and switch_root can fail.  A `quit'
+# would honour that hand-over and leave the panel showing a picture with the
+# post-mortem invisible behind it; `abort' gives the text console back whatever
+# it was told earlier.
+splash_off() {
+    if [ "$splash_on" = 1 ]; then echo "abort" >> "$splash_chan"; splash_on=0; fi
+    return 0
+}
+
 say ""
 say "J36 Ultra ARMv7 bring-up initramfs"
 say "Display: the LK's framebuffer on /dev/fb0 until something opens /dev/dri/card0."
+progress 4
 insmod /lib/modules/*/extra/j36_mt6592_input.ko || say "input module load failed"
 
 # ── Hand over to the rootfs on the card, if there is one ─────────────────────
@@ -1216,6 +1362,9 @@ try_root() {
             umount /newroot
             if mount -t "$fs" "$dev" /newroot; then
                 say "root: $dev ($fs)"
+                stage "Mounting the MixOS partition"
+                detail "$dev  $fs  read-write"
+                progress 22
                 return 0
             fi
             return 1
@@ -1242,11 +1391,16 @@ find_root() {
 # an mmc host that is still deferred when /init starts has no block device yet.
 rootdev=""
 waited=0
+stage "Looking for the MixOS card"
+progress 8
 while : ; do
     if find_root; then break; fi
     if [ "$waited" -ge 10 ]; then break; fi
     if [ "$waited" = 0 ]; then say "waiting for the microSD card"; fi
     waited=$((waited + 1))
+    # The one place a boot legitimately stands still for ten seconds, so it says
+    # so on the panel rather than looking like a machine that has stopped.
+    detail "waiting for the card -- ${waited}s"
     sleep 1
 done
 
@@ -1358,6 +1512,14 @@ stage_from_boot() {
 
     say "stage: unpacking sd-root.tar.gz from BOOT onto the OS partition"
     say "       $boot_stamp -- once per tarball, not once per boot"
+    # The longest single step in this script by a wide margin -- tens of megabytes
+    # of Qt through gunzip on a Cortex-A7 -- and it happens on exactly the boot
+    # where the user has just changed something and is watching.  It gets its own
+    # headline for that reason, and no progress number: the bar would sit still
+    # for a minute and look wedged either way, so it eases toward the next step
+    # instead.
+    stage "Installing the update"
+    detail "unpacking sd-root.tar.gz -- this takes a minute"
     mkdir -p /newroot/opt
     gunzip -c /bootfs/sd-root.tar.gz | tar -x -C /newroot
     # tar's exit status is not the test.  This is a pipeline in ash, so what is
@@ -2356,6 +2518,25 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=$mixos_root/bin
+# ── the last word to the splash ──────────────────────────────────────────────
+#
+# The splash has been running since the initramfs and is still on the panel: it
+# survived switch_root, /dev came with it, so /dev/.mixsplash is the same file it
+# has had open all along.  This finishes the bar, gives it a second to ease up to
+# the end, and then tells it to stop -- because from the next line on there are
+# two processes writing to /dev/fb0 and only one of them should be.
+#
+# It stops BEFORE mixdash rather than after its first paint, and the second is
+# not a gap: mixsplash exits with the console still in KD_GRAPHICS (that is what
+# the `handover' message bought), so what stays on the glass is its own last
+# frame, held there until Qt has finished its dynamic linking and painted over
+# it.  A frozen splash is the correct thing to look at during that; a text
+# console suddenly reappearing is not.
+#
+# Appending to a file, never a pipe, so this cannot block even if nothing is
+# reading; and `-' in front so that a boot with no splash at all does not fail
+# its ExecStartPre.  Re-running on every restart attempt is harmless by design.
+ExecStartPre=-/bin/sh -c '{ echo "stage:Starting the dashboard"; echo "progress:100"; } >> /dev/.mixsplash; sleep 1; echo quit >> /dev/.mixsplash'
 ExecStart=$mixos_root/bin/mixdash
 Restart=on-failure
 RestartSec=2
@@ -2418,6 +2599,38 @@ UNITFC
         say "dash: no $mixos_root/qt/fonts/fonts.conf, so fontconfig reads the rootfs's"
         say "      own config and may build a cache -- watch for a long \"fonts\" phase"
     fi
+
+    # ── one milestone in the middle of systemd ───────────────────────────────────
+    #
+    # Between switch_root and mixdash there is a stretch of systemd -- fsck, udev,
+    # the journal, whatever the rootfs enables -- that on this SoC is the longest
+    # quiet part of the boot.  /init cannot narrate it (it is gone) and mixdash
+    # cannot (it has not started), so the splash would sit on the last line /init
+    # wrote for half a minute.  The spinner keeps turning, so it does not look
+    # crashed, but it does not say anything either.  This is one oneshot unit
+    # whose whole body is two echoes.
+    #
+    # After=sysinit.target and nothing else: that is the point in the graph where
+    # the low-level work is done and the ordinary services are about to start, and
+    # ordering against only a target that always exists cannot make a cycle.
+    cat > /newroot/run/systemd/system/j36-splash.service <<'UNITSPLASH'
+# Written by the J36 Ultra initramfs, into a tmpfs.
+[Unit]
+Description=Tell the boot splash that systemd has got this far
+After=sysinit.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/bin/sh -c '{ echo "stage:Starting system services"; echo "detail:systemd"; echo "progress:94"; } >> /dev/.mixsplash'
+
+[Install]
+WantedBy=multi-user.target
+UNITSPLASH
+    mkdir -p /newroot/run/systemd/system/multi-user.target.wants
+    ln -sf ../j36-splash.service \
+           /newroot/run/systemd/system/multi-user.target.wants/j36-splash.service
 
     # ── which build is this, on both sides of the card ───────────────────────────
     #
@@ -2621,6 +2834,8 @@ UNITNOTICE
 # Before any of them, because it is what puts /opt/mixos/j36 on the OS partition in
 # the first place on a card updated from a Mac: find_payload below looks there first,
 # and by the time it does the tarball has already been unpacked.
+stage "Checking for an update"
+progress 28
 stage_from_boot
 
 if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || \
@@ -2644,11 +2859,31 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || \
     # skips its own copies.  The other way round works too -- run_mtkdrm has no
     # such skip -- but it would print two module-load failures on a boot that is
     # working correctly.
-    if [ "$want_lima" = 1 ]; then run_lima; fi
-    if [ "$want_mtkdrm" = 1 ]; then run_mtkdrm; fi
-    if [ "$want_audio" = 1 ]; then run_audio; fi
-    if [ "$want_usb" = 1 ]; then run_usb; fi
-    if [ "$want_gl" = 1 ]; then setup_es_gl; fi
+    #
+    # The progress numbers are not evenly spaced and should not be: they are
+    # roughly where each of these lands in the wall-clock of a working boot, so
+    # the bar tracks time rather than tasks.  run_lima carries the MFG power
+    # sequence and takes the longest of the five.
+    if [ "$want_lima" = 1 ]; then
+        stage "Starting the graphics core"; detail "MFG power domain, lima"
+        progress 40; run_lima
+    fi
+    if [ "$want_mtkdrm" = 1 ]; then
+        stage "Starting the display controller"; detail "mediatek-drm, MIPI-DSI, panel"
+        progress 55; run_mtkdrm
+    fi
+    if [ "$want_audio" = 1 ]; then
+        stage "Starting audio"; detail "MT6592 AFE, MT6323 codec"
+        progress 62; run_audio
+    fi
+    if [ "$want_usb" = 1 ]; then
+        stage "Starting USB"; detail "MUSB host, hub, HID"
+        progress 68; run_usb
+    fi
+    if [ "$want_gl" = 1 ]; then
+        stage "Staging OpenGL"; detail "Mesa, EGL, GLESv2"
+        progress 74; setup_es_gl
+    fi
 fi
 
 # Outside that block, where it used to be inside it.  Everything above has been copied
@@ -2676,6 +2911,8 @@ fi
 # and then nothing at all starts and nothing says why -- which is precisely the
 # failure this line names in one word instead of an evening.
 if [ "$want_dash" = 1 ]; then
+    stage "Preparing the dashboard"
+    progress 82
     setup_dash
 else
     say "dash: j36.dash is not in the kernel command line, so no shell is staged"
@@ -2685,6 +2922,15 @@ fi
 
 if [ -n "$rootdev" ]; then
     say "switching root into $rootdev"
+    stage "Starting MixOS"
+    detail "$rootdev"
+    progress 88
+    # The splash keeps running across the hand-over -- its pages are mapped and
+    # /dev goes with us -- so this is not goodbye, it is "stop expecting me to
+    # keep talking, and leave the console in graphics mode when you do stop".
+    # Without it the idle timeout would eventually hand the panel back to fbcon
+    # in the middle of systemd's boot.
+    if [ "$splash_on" = 1 ]; then echo "handover" >> "$splash_chan"; fi
     # Carried across rather than left behind: the real init inherits them
     # already mounted, and if the move is refused it mounts its own.
     mount --move /dev /newroot/dev 2>/dev/null
@@ -2700,6 +2946,11 @@ if [ -n "$rootdev" ]; then
     mount -t sysfs sysfs /sys 2>/dev/null
     say "switch_root failed; staying in the initramfs"
 fi
+
+# Everything from here down is a post-mortem, and a post-mortem behind a picture
+# is a post-mortem nobody reads.  devtmpfs is a single instance, so the remount
+# above brought the channel back with it and this still reaches the splash.
+splash_off
 
 say ""
 # Reached two ways: no root was found, or one was and switch_root refused it.
@@ -4376,9 +4627,8 @@ cat > "$SDBOOT/mvii/boot.conf" <<'CONF'
 # MVII LK SD hand-off, J36 Ultra (MT6592, ARMv7).
 #
 # Read after the card's own boot.ini, so these override it: an R36S boot.ini
-# names the RK3326 arm64 kernel, which this SoC cannot execute.  Keep this file
-# short -- the LK reads it into a fixed 2 KiB buffer.  ../README.txt is the long
-# form and explains every word below.
+# names the RK3326 arm64 kernel, which this SoC cannot execute.  Keep it short
+# -- a fixed 2 KiB buffer.  ../README.txt explains every word below.
 kernel=zImage
 dtb=mt6592-j36-ultra.dtb
 initrd=initrd.img
@@ -4389,22 +4639,22 @@ initrd=initrd.img
 # Every j36 word is removable on its own: delete one, or the matching directory
 # under /opt/mixos/j36 on the OS partition, and the boot carries straight on.
 # lima gives a render node, mtkdrm a display node, gl puts Mesa ahead of the
-# RK3326 blob, dash runs the MixOS dashboard, audio gives a sound card, usb
-# brings the one MUSB port up host-only.
+# RK3326 blob, dash runs the MixOS dashboard, audio a sound card, usb the one
+# MUSB port host-only, splash the MixOS picture with the boot stage on it.
 #
-# Only the four files the LK itself reads are on BOOT.  Everything else is in
-# sd-root.tar.gz, unpacked as /opt/mixos on the ext2 OS partition.
+# Only the four files the LK reads are on BOOT; the rest is in sd-root.tar.gz,
+# unpacked as /opt/mixos on the ext2 OS partition.
 #
-# j36.audio=speaker also powers the class-D amp, which hangs off VBAT -- the
-# system node -- so battery-less it pulls the board under its own lockout.
-# j36.usb=1 sources 5 V off that same VBAT.  Battery-less, or with a hub that
-# has its own supply, say j36.usb=novbus instead.
-# j36.gl=1 stages Mesa quietly.  j36.gl=debug adds Mesa's EGL trace and the full
-# node probes -- it is a diagnostic, not a default: those probes create EGL
-# contexts on lima, and a boot that ends with a frozen kernel and hundreds of
-# libEGL lines is that trace, not the dashboard.  j36.es is the old name for
-# j36.gl.  Drop j36.dash=1 and EmulationStation is neither masked nor replaced.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1 j36.usb=1
+# j36.audio=speaker powers the class-D amp off VBAT -- the system node -- so
+# battery-less it pulls the board under its own lockout.  j36.usb=1 sources 5 V
+# off that same VBAT; with no cell, or with a self-powered hub, say
+# j36.usb=novbus.  j36.gl=debug adds Mesa's EGL trace and the node probes -- a
+# diagnostic, not a default: a frozen kernel behind hundreds of libEGL lines is
+# that trace.  j36.es is the old j36.gl.
+# Drop j36.dash=1 and EmulationStation is neither masked nor replaced, and
+# j36.splash=0 boots to text.  loglevel=4 keeps the panel clear until the
+# splash starts; errors and warnings still print, and dmesg keeps the rest.
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1 j36.usb=1 j36.splash=1
 CONF
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
@@ -4423,7 +4673,8 @@ at the ARMv7 payload instead.
 
   zImage                    plain 32-bit ARM kernel, no appended device tree
   mt6592-j36-ultra.dtb      the tree the LK loads separately and patches
-  initrd.img                bring-up initramfs (busybox + the input module)
+  initrd.img                bring-up initramfs (busybox, the input module, and
+                            the boot splash with its picture)
   mvii/boot.conf            filenames and command line for the MVII LK
   LICENSE.txt               which licence covers which file above, and where the
                             GPL-2.0-only source is; keep it with the payload
@@ -4765,6 +5016,41 @@ j36.dash=1
     std::string(NULL) -- abort, 134.  A GLES 2.0 rebuild did get a context ("OpenGL
     ES 2.0 Mesa 25.0.7-2+deb13u1") and still drew a black panel, through five
     silent layers -- ES, SDL, KMSDRM, EGL, GBM.  The dashboard removes all five.
+
+j36.splash=1
+    The boot picture, and the boot stage written on it.  Both halves of it are in
+    initrd.img and nothing on either partition of the card is needed for it:
+    /splash.mixspl is resources/MixOS.jpg decoded to raw pixels at build time, and
+    /bin/mixsplash is a static ARM binary that mmaps /dev/fb0 and draws.  Nothing
+    is linked, because before switch_root there is no ld.so.
+
+    It is not plymouth, and could not be: plymouth wants a DRM device or its fbdev
+    renderer plus a theme, udev and a D-Bus name, and this initramfs is BusyBox and
+    one shell script.  lima registers without DRIVER_MODESET, so there is no CRTC
+    for anyone to take -- /dev/fb0 really is the only way to a pixel here.
+
+    While it runs it holds the VT in KD_GRAPHICS, which is what stops fbcon
+    painting over it, exactly as Doom above does.  /init still says everything it
+    ever said; the panel shows the headline and the serial console gets the whole
+    text, which is the reverse of the split before this existed.  The console is
+    handed back in text mode if the boot fails, so a board that stops somewhere is
+    still readable -- and NOT handed back after switch_root, because mixdash draws
+    through Qt's linuxfb plugin with nographicsmodeswitch and wants the mode left
+    where it is.  Everything /init printed is still in the VT's scrollback and
+    reappears the moment the mode goes back to text.
+
+    /init talks to it by appending lines to /dev/.mixsplash -- `stage:', `detail:',
+    `progress:0-100', `handover', `quit', `abort'.  A file and not a pipe: `echo
+    x > fifo' blocks until something reads it, so a splash that was not running
+    would hang the boot at the next message, and this is a device whose only
+    recovery is taking the card out.  /dev is `mount --move'd across switch_root,
+    so the same path keeps working afterwards: j36-splash.service uses it to mark
+    sysinit.target, and mixdash.service's ExecStartPre uses it to finish the bar
+    and stop the splash a second before Qt paints.
+
+    j36.splash=0 -- or `nosplash' -- boots to the text console instead.  So does a
+    build where the binary or the picture failed to build: /init tests for both
+    files, and for /dev/fb0, before it starts anything.
 
 Doom, what it was for, and why it is no longer on the card
 ----------------------------------------------------------
