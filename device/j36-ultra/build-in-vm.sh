@@ -307,8 +307,9 @@ config_m BLK_DEV_SD
 # is for the disk somebody plugs in, which on any desk with a Windows machine on
 # it is NTFS more often than not.  ntfs3 is the in-tree read-write driver (the old
 # read-only fs/ntfs was deleted in 6.9, so there is no second option), it selects
-# NLS_UCS2_UTILS for the UTF-16 name conversion, and =m puts it in the same
-# j36/usb/ payload as the stack that will need it -- the card itself never does.
+# NLS for the UTF-16 name conversion -- nls_base, already =y here, so ntfs3.ko
+# carries no modular dependency of its own -- and =m puts it in the same j36/usb/
+# payload as the stack that will need it.  The card itself never does.
 #
 # CONFIG_NTFS_FS HAS TO GO FIRST, and it is not the driver its name suggests.
 # 6.10 brought the symbol back after the classic driver was deleted, as a
