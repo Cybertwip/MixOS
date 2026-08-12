@@ -35,6 +35,12 @@ enum { RowVolume = 900, RowMute, RowInert };
  * 1023-count duty is 51, which the TPS61161 in front of the LED string still
  * drives -- and it is far above the sub-millisecond low it treats as a shutdown
  * request, so dimming this far cannot latch the driver off.
+ *
+ * It also keeps this out of a fight it would lose.  j36-eglprobe runs before the
+ * dashboard on every boot and repairs a backlight it finds at exactly zero, on
+ * the grounds that a lit panel with the lamp off is indistinguishable from a
+ * dead one.  It is right, and a slider that could store 0 would look like a
+ * setting that silently refuses to stick.
  */
 const int MinBrightness = 5;
 
