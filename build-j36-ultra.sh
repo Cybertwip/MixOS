@@ -63,6 +63,9 @@ ARTIFACT_DIR="${J36_ARTIFACT_DIR:-${ROOT}-artifacts/j36-ultra}"
 BASE_ARTIFACT_DIR="${DARKOS_ARTIFACT_DIR:-${ROOT}-artifacts}"
 RESUME_R36="${J36_RESUME_R36:-1}"
 MIX_ONLY=0
+# --no-splash.  Passed to the VM as J36_SPLASH and applied to the bootargs line in
+# device/j36-ultra/build-in-vm.sh, which is the only place that line exists.
+SPLASH=1
 VM_SOURCE_MOUNT="/mnt/darkos-host"
 VM_ARTIFACT_MOUNT="/mnt/j36-artifacts"
 VM_BASE_ARTIFACT_MOUNT="/mnt/darkos-artifacts"
@@ -71,7 +74,7 @@ VM_WORK_DIR="/home/ubuntu/j36-ultra-work"
 
 usage() {
     cat <<USAGE
-Usage: ./build-j36-ultra.sh [--mix-only]
+Usage: ./build-j36-ultra.sh [--mix-only] [--no-splash]
 
 Resumes the R36 Ultra build (build-r36-ultra.sh, checkpointed) and then adds the
 J36 Ultra layer on top of it in the same Multipass VM: $VM_NAME
@@ -99,6 +102,21 @@ J36 Ultra layer on top of it in the same Multipass VM: $VM_NAME
                                       This is the iteration loop.  Use it while
                                       debugging; use the full build when done.
 
+    ./build-j36-ultra.sh --no-splash  the same build, with the boot picture off:
+                                      writes j36.splash=0 loglevel=7 into
+                                      mvii/boot.conf instead of j36.splash=1
+                                      loglevel=4.  The panel then shows the
+                                      kernel console for the whole boot, which is
+                                      what to use when something goes wrong
+                                      behind the splash -- a stall in the card
+                                      scan, a module that does not probe, a
+                                      driver that says why only at loglevel 7.
+                                      Combines with --mix-only, and turns off
+                                      with a text editor on the card: boot.conf
+                                      is on the FAT partition, so the same switch
+                                      is one edit away from any machine that can
+                                      read it.
+
 The first J36 run creates the persistent ARMv7 Linux 6.12 LTS workspace.  Later
 runs reuse it and rebuild only changed kernel, DTB, input-module, initramfs and
 boot.img files.
@@ -121,6 +139,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --mix-only) MIX_ONLY=1; shift ;;
+        --no-splash) SPLASH=0; shift ;;
         *) usage >&2; exit 2 ;;
     esac
 done
@@ -244,6 +263,7 @@ multipass exec "$VM_NAME" -- env \
     J36_AUDIO="${J36_AUDIO:-1}" \
     J36_GL="${J36_GL:-${J36_ES:-1}}" \
     J36_MIXDASH="${J36_MIXDASH:-1}" \
+    J36_SPLASH="$SPLASH" \
     J36_PAYLOAD_ON="${J36_PAYLOAD_ON:-root}" \
     bash "$VM_BUILD_DIR/device/j36-ultra/build-in-vm.sh"
 

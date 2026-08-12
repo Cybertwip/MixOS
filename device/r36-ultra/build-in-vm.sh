@@ -119,8 +119,8 @@ export BUILD_DATE
 # once, here, and the 52 GB build image is ext2 too.
 ROOT_FILESYSTEM_FORMAT=ext2
 # -F because mkfs is being pointed at a file rather than a block device, and -b 4096 so
-# the block size does not depend on how big the build image happens to be: resize2fs -M
-# in write_rootfs.sh and resize2fs on the device both work in these blocks, and a
+# the block size does not depend on how big the build image happens to be: the shrink in
+# write_rootfs.sh and resize2fs on the device both work in these blocks, and a
 # 1 KiB-block filesystem would cap the rootfs at 16 GB after expansion.
 ROOT_FILESYSTEM_FORMAT_PARAMETERS="-F -b 4096 -L ROOTFS"
 ROOT_FILESYSTEM_MOUNT_OPTIONS="defaults,noatime"
@@ -140,7 +140,7 @@ DATA_MOUNT_OPTIONS="defaults,auto,noatime,nofail"
 DATA_MOUNT_POINT="/home/virtua"
 SYSTEM_SIZE=100
 # 4000 MB for the OS partition, not 7500.  write_rootfs.sh reports what the rootfs
-# actually weighs -- "Root filesystem shrank to 3384 MB" -- and 4000 is that rounded up
+# actually weighs -- "Root filesystem holds 3384 MB" -- and 4000 is that rounded up
 # to the next whole 1000 MB: compact base system, one round step of headroom.  The old
 # 7500 put 4 GB of zeros in the image and 4 GB nothing would ever use on the card, which
 # was free only while btrfs compressed the image and a .7z shipped it.  Both are gone, so
@@ -988,7 +988,8 @@ if ! marked finalization; then
         # The one moment the rootfs holds exactly what ships and nothing has been
         # written into it that a second run would write again.  After this,
         # finishing_touches.sh configures it and write_rootfs.sh shrinks it to
-        # minimum size; neither state is one a later build can start from.
+        # the size of the OS partition; neither state is one a later build can
+        # start from.
         if [[ "$script" == cleanup_filesystem.sh ]]; then
             snapshot_rootfs "$ROOTFS_STRIPPED_SNAPSHOT" "stripped"
             # cleanup_filesystem.sh ends by deleting the chroot's resolv.conf,

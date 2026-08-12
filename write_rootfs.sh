@@ -51,8 +51,91 @@ elif [[ "${ROOT_FILESYSTEM_FORMAT}" == *"ext"* ]]; then
     printf "\n\ne2fsck could not clean %s (exit %s).  Exiting...\n\n" "${FILESYSTEM}" "${e2fsck_rc}"
     exit 1
   fi
-  resize2fs -M "${FILESYSTEM}" || {
-    printf "\n\nFailed to shrink %s.  Exiting...\n\n" "${FILESYSTEM}"
+  # ── SHRINK ONCE, TO THE SIZE IT IS GOING TO BE ────────────────────────────────
+  #
+  # This was `resize2fs -M' followed, sixty lines down, by a grow back to the size of
+  # the partition -- shrink the filesystem to the smallest it can possibly be, copy
+  # that into the image, then attach a loop device to the partition, fsck it again and
+  # grow it back out.  Three filesystem passes and two full checks to arrive at a
+  # filesystem exactly ${STORAGE_SIZE} MB across, which is a size that was known before
+  # any of it started.
+  #
+  # Shrinking straight to ${STORAGE_SIZE} MB gets to the same place in one pass, and it
+  # is a strictly cheaper pass than -M was: every block -M relocates is one this has to
+  # relocate too, plus all the ones between the partition size and the minimum that
+  # this one can leave exactly where they are.  -M also spends real time just deciding
+  # what the minimum IS -- an iterative estimate before it moves anything -- and that
+  # answer was then used for nothing except a diagnostic, which `-P' prints without
+  # touching the filesystem at all.
+  #
+  # The dd copies ${STORAGE_SIZE} MB instead of the shrunk size, so a few hundred MB of
+  # zeros go across that did not before.  At 8M blocks that is a couple of seconds, and
+  # it buys back the second e2fsck of the whole root, the second resize2fs, the loop
+  # device, and every "it stays that size with no free space" half-failure that block
+  # could end in.
+  #
+  # THE FILESYSTEM MUST FILL ITS PARTITION and not merely fit in it -- that is what the
+  # grow-back was for.  A rootfs left at its minimum has ZERO free blocks, and the card
+  # boots on it: a read-write root with nothing writable in it.  It surfaced as the J36
+  # payload's first mkdir answering "No space left on device", but nothing about it was
+  # J36-specific -- ldconfig, apt, a journal and every dpkg on the R36S meet the same
+  # wall.  Nothing on the device fixes it either; firstboot resizes the DATA partition,
+  # not this one.  Sizing the shrink to the partition satisfies that by construction,
+  # which is the other reason this is the better shape: the free space is no longer
+  # something a later step has to remember to add back.
+  fs_geometry="$(dumpe2fs -h "${FILESYSTEM}" 2>/dev/null)"
+  fs_bsize="$(printf '%s\n' "${fs_geometry}" | awk -F: '/^Block size:/{gsub(/ /,"",$2); print $2}')"
+  if [[ -z "${fs_bsize}" ]]; then
+    printf "\n\nCould not read the block geometry of %s.  Exiting...\n\n" "${FILESYSTEM}"
+    exit 1
+  fi
+  # -P is read-only: it prints the estimate -M would have shrunk to and moves nothing.
+  fs_min_blocks="$(resize2fs -P "${FILESYSTEM}" 2>/dev/null | awk -F: '/minimum size/{gsub(/ /,"",$2); print $2}')"
+  fs_min_blocks="${fs_min_blocks:-0}"
+  # Rounded up to a whole MiB: a size in MiB is the number a human compares against
+  # STORAGE_SIZE without arithmetic.
+  fs_mib=$(( ((fs_min_blocks * fs_bsize) + 1048575) / 1048576 ))
+  echo -e "Root filesystem holds ${fs_mib} MB of the ${STORAGE_SIZE} MB partition"
+  # The partition is sized by the rule "the rootfs, rounded up to the next whole
+  # 1000 MB" -- see STORAGE_SIZE in device/r36-ultra/build-in-vm.sh.  It cannot be
+  # applied automatically: the partition table is written in the `image' stage and this
+  # is the first moment the rootfs has a size at all.  So the number is computed here
+  # and the two cases below say it out loud -- one as a failure, one as a warning --
+  # instead of leaving a reader to do the arithmetic.
+  fs_next_step=$(( ((fs_mib + 999) / 1000) * 1000 ))
+  if [[ ${fs_min_blocks} -gt 0 ]]; then
+    if [[ ${fs_mib} -gt ${STORAGE_SIZE} ]]; then
+      printf "\n\nThe root filesystem needs %s MB and the partition is %s MB.\n" "${fs_mib}" "${STORAGE_SIZE}"
+      printf "btrfs hid this behind compress=zlib:1; ext2 does not compress, so the\n"
+      printf "rootfs now costs what it actually weighs.\n\n"
+      printf "  Set STORAGE_SIZE=%s in device/r36-ultra/build-in-vm.sh\n\n" "${fs_next_step}"
+      printf "That is %s MB rounded up to the next whole 1000 MB, which is the rule this\n" "${fs_mib}"
+      printf "layout is sized by.  setup_partition.sh reads that value, so it is the only\n"
+      printf "place to change.  Taking content out of the build root works too.\n"
+      printf "Refusing to dd over the DATA partition.  Exiting...\n\n"
+      exit 1
+    fi
+    if [[ $(( STORAGE_SIZE - fs_mib )) -lt 256 ]]; then
+      echo -e "The OS partition has only $(( STORAGE_SIZE - fs_mib )) MB spare, which the J36 payload alone can fill"
+      echo -e "Set STORAGE_SIZE=$(( fs_next_step + 1000 )) in device/r36-ultra/build-in-vm.sh if the next build fails on space"
+    fi
+  else
+    echo -e "resize2fs -P did not report a minimum size; the shrink below is the real check"
+  fi
+
+  # In blocks, not `${STORAGE_SIZE}M', because the partition table counts sectors and
+  # this has to land on the same byte it does: STORAGE_PART_END is derived from
+  # STORAGE_SIZE * 1024 * 1024, so the filesystem is asked for exactly that many bytes
+  # in its own block size and there is no suffix convention in the middle to disagree
+  # about.
+  fs_target_blocks=$(( STORAGE_SIZE * 1024 * 1024 / fs_bsize ))
+  echo -e "Shrinking the root filesystem to the ${STORAGE_SIZE} MB of its partition"
+  resize2fs "${FILESYSTEM}" "${fs_target_blocks}" || {
+    printf "\n\nFailed to shrink %s to %s MB.\n\n" "${FILESYSTEM}" "${STORAGE_SIZE}"
+    printf "If resize2fs said the new size is smaller than the minimum, the build root\n"
+    printf "outgrew its partition: raise STORAGE_SIZE in device/r36-ultra/build-in-vm.sh\n"
+    printf "to the next whole 1000 MB above the minimum it printed, or take content out\n"
+    printf "of the build root.  Exiting...\n\n"
     exit 1
   }
 
@@ -61,40 +144,7 @@ elif [[ "${ROOT_FILESYSTEM_FORMAT}" == *"ext"* ]]; then
   # STORAGE_PART_START: over the ROMS partition and off the end of the image.  The
   # btrfs branch truncates before its dd; this one never did, because nothing had put
   # an ext rootfs through it yet.
-  fs_geometry="$(dumpe2fs -h "${FILESYSTEM}" 2>/dev/null)"
-  fs_blocks="$(printf '%s\n' "${fs_geometry}" | awk -F: '/^Block count:/{gsub(/ /,"",$2); print $2}')"
-  fs_bsize="$(printf '%s\n' "${fs_geometry}" | awk -F: '/^Block size:/{gsub(/ /,"",$2); print $2}')"
-  if [[ -z "${fs_blocks}" || -z "${fs_bsize}" ]]; then
-    printf "\n\nCould not read the block geometry of %s.  Exiting...\n\n" "${FILESYSTEM}"
-    exit 1
-  fi
-  # Rounded up to a whole MiB: the dd writes 512-byte sectors either way, and a size in
-  # MiB is the number a human compares against STORAGE_SIZE without arithmetic.
-  fs_mib=$(( ((fs_blocks * fs_bsize) + 1048575) / 1048576 ))
-  echo -e "Root filesystem shrank to ${fs_mib} MB of the ${STORAGE_SIZE} MB partition"
-  # The partition is sized by the rule "the rootfs, rounded up to the next whole
-  # 1000 MB" -- see STORAGE_SIZE in device/r36-ultra/build-in-vm.sh.  It cannot be
-  # applied automatically: the partition table is written in the `image' stage and this
-  # is the first moment the rootfs has a size at all.  So the number is computed here
-  # and the two cases below say it out loud -- one as a failure, one as a warning --
-  # instead of leaving a reader to do the arithmetic.
-  fs_next_step=$(( ((fs_mib + 999) / 1000) * 1000 ))
-  if [[ ${fs_mib} -gt ${STORAGE_SIZE} ]]; then
-    printf "\n\nThe root filesystem needs %s MB and the partition is %s MB.\n" "${fs_mib}" "${STORAGE_SIZE}"
-    printf "btrfs hid this behind compress=zlib:1; ext2 does not compress, so the\n"
-    printf "rootfs now costs what it actually weighs.\n\n"
-    printf "  Set STORAGE_SIZE=%s in device/r36-ultra/build-in-vm.sh\n\n" "${fs_next_step}"
-    printf "That is %s MB rounded up to the next whole 1000 MB, which is the rule this\n" "${fs_mib}"
-    printf "layout is sized by.  setup_partition.sh reads that value, so it is the only\n"
-    printf "place to change.  Taking content out of the build root works too.\n"
-    printf "Refusing to dd over the DATA partition.  Exiting...\n\n"
-    exit 1
-  fi
-  if [[ $(( STORAGE_SIZE - fs_mib )) -lt 256 ]]; then
-    echo -e "The OS partition has only $(( STORAGE_SIZE - fs_mib )) MB spare, which the J36 payload alone can fill"
-    echo -e "Set STORAGE_SIZE=$(( fs_next_step + 1000 )) in device/r36-ultra/build-in-vm.sh if the next build fails on space"
-  fi
-  sudo truncate -s "${fs_mib}M" "${FILESYSTEM}"
+  sudo truncate -s "${STORAGE_SIZE}M" "${FILESYSTEM}"
   sync
   # ── bs=8M AND A SEEK IN BYTES ─────────────────────────────────────────────
   #
@@ -113,43 +163,7 @@ elif [[ "${ROOT_FILESYSTEM_FORMAT}" == *"ext"* ]]; then
   # seek this is the difference between a copy and a corrupted partition.
   sudo dd if="${FILESYSTEM}" of="${DISK}" bs=8M iflag=fullblock \
       oflag=seek_bytes seek=$(( STORAGE_PART_START * 512 )) conv=fsync,notrunc
-
-  # AND THEN GROW IT BACK, INSIDE THE IMAGE.  The shrink above is only about how much of
-  # this file the dd has to copy -- 52 GB of build root down to what the rootfs weighs.
-  # What it leaves in the partition, though, is a filesystem with ZERO free blocks in a
-  # ${STORAGE_SIZE} MB partition, and that is what the card boots on: a read-write root
-  # with nothing writable in it.  It surfaced as the J36 payload's first mkdir answering
-  # "No space left on device", but nothing about it is J36-specific -- ldconfig, apt, a
-  # journal and every dpkg on the R36S would meet the same wall.
-  #
-  # Nothing on the device fixes it: firstboot resizes the DATA partition, not this one.
-  # So it is grown here, to the end of its own partition.
-  #
-  # The blocks this adds are zeros, and they used to cost nothing because a .7z was what
-  # shipped.  The raw image ships now, so they cost their full size -- which is the whole
-  # reason STORAGE_SIZE is the rootfs rounded up to the next 1000 MB instead of a flat
-  # 7500: unused partition is unused bytes in every copy of the image.
-  #
-  # The loop device is sizelimited to the partition, so resize2fs cannot run past its end.
-  rootfs_loop="$(sudo losetup --find --show \
-      --offset $(( STORAGE_PART_START * 512 )) \
-      --sizelimit $(( (STORAGE_PART_END - STORAGE_PART_START + 1) * 512 )) "${DISK}")"
-  if [[ -n "${rootfs_loop}" ]]; then
-    # resize2fs will not touch a filesystem it has not seen checked, and the last thing
-    # to touch this one was the dd.  1 and 2 mean "found and fixed", not "broken".
-    grow_fsck_rc=0
-    sudo e2fsck -p -f "${rootfs_loop}" >/dev/null 2>&1 || grow_fsck_rc=$?
-    if [[ ${grow_fsck_rc} -gt 2 ]]; then
-      echo -e "e2fsck could not clean the OS partition (exit ${grow_fsck_rc}); leaving it at ${fs_mib} MB"
-    elif sudo resize2fs "${rootfs_loop}" >/dev/null 2>&1; then
-      echo -e "OS partition filesystem grown from ${fs_mib} MB to fill its ${STORAGE_SIZE} MB partition"
-    else
-      echo -e "resize2fs could not grow the OS partition; it stays ${fs_mib} MB with no free space"
-    fi
-    sudo losetup -d "${rootfs_loop}"
-  else
-    echo -e "Could not attach a loop device to the OS partition; it stays ${fs_mib} MB with no free space"
-  fi
+  echo -e "OS partition written: ${STORAGE_SIZE} MB of filesystem holding ${fs_mib} MB, so $(( STORAGE_SIZE - fs_mib )) MB free on the card"
   sync
 elif [ "${ROOT_FILESYSTEM_FORMAT}" == "btrfs" ]; then
   sudo btrfs balance start --full-balance Arkbuild

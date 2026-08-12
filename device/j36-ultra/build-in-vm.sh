@@ -1572,7 +1572,30 @@ mkdir -p /newroot
 # answer, and a scan that treated it as one would refuse to mount a card this
 # check simply could not see -- trading a slow boot for no boot, which is not the
 # trade being made here.
+#
+# AND A DEVICE THAT CANNOT HOLD A ROOTFS IS NOT WORTH A MOUNT EITHER.  The glob
+# below matches everything the mmc block driver publishes, and two kinds of that
+# are traps rather than candidates:
+#
+#   mmcblk0rpmb   the eMMC's Replay Protected Memory Block.  Every read of it has
+#                 to be an authenticated RPMB request, so a plain block read is
+#                 answered with a command error -- and the controller's answer to
+#                 a command error is a timeout and a reset, seconds at a time, in
+#                 exactly the place this whole block is about.  It has a non-zero
+#                 size in sysfs, so the check above waves it straight through.
+#   mmcblk0boot0  the eMMC boot areas.  Readable, small, and never a rootfs.
+#   mmcblk0boot1
+#
+# The size gate covers the rest of it.  The OS partition is four thousand
+# megabytes and the smallest thing that has ever been asked to hold this rootfs
+# is a good deal more than 256 MB, so anything under that is the BOOT partition,
+# a vendor partition off the internal eMMC, or one of the two dozen small MediaTek
+# partitions on it -- none of which is a candidate, and all of which used to cost
+# three mount() calls apiece to prove it.
 dev_ready() {
+    case "${1##*/}" in
+        *rpmb|*boot0|*boot1) return 1 ;;
+    esac
     sz=""
     if [ -r "/sys/class/block/${1##*/}/size" ]; then
         read -r sz < "/sys/class/block/${1##*/}/size"
@@ -1580,8 +1603,30 @@ dev_ready() {
         return 0
     fi
     case "$sz" in
-        0) return 1 ;;
+        ''|*[!0-9]*) return 0 ;;
     esac
+    # 524288 sectors of 512 bytes is 256 MB.  Zero is caught by the same compare.
+    if [ "$sz" -lt 524288 ]; then return 1; fi
+    return 0
+}
+
+# Where the child below says what it is doing, so the loop in the parent can put
+# it on the panel, and where it leaves its answer.
+#
+# TWO FILES AND NO SIGNALS, and the reason is the applet list.  This initramfs
+# carries no `rm', no `mv' and no `kill' -- INIT_APPLETS in build-in-vm.sh is the
+# whole of what /bin holds, and ash here is built without the standalone-shell
+# lookup, so an applet that is compiled in but not symlinked is still "not found".
+# So the child is not waited on and not signalled: it ANSWERS, by making
+# $scan_result non-empty, and `[ -s ]' is the whole protocol.  `:>' creates and
+# empties without needing rm, which is why the files are reset that way rather
+# than deleted.  They live in /dev beside /dev/.mixsplash, which is mount --move'd
+# across switch_root, so a zero-byte leftover there is the same kind of thing that
+# channel already is.
+scan_status=/dev/.scan-status
+scan_result=/dev/.scan-result
+scan_say() {
+    echo "$1" > "$scan_status" 2>/dev/null
     return 0
 }
 
@@ -1590,18 +1635,39 @@ try_root() {
     if [ ! -b "$dev" ]; then return 1; fi
     if ! dev_ready "$dev"; then return 1; fi
     for fs in ext2 ext4 btrfs; do
-        # Said BEFORE the call and not after it, because the call is the part that
-        # can take a while: if a mount really does stall, the panel is already
-        # showing which device and which driver it stalled in.
-        detail "trying $dev as $fs"
+        # Recorded BEFORE the call and not after it, because the call is the part
+        # that can take a while: if a mount really does stall, the panel is
+        # already showing which device and which driver it stalled in.
+        scan_say "trying $dev as $fs"
         if ! mount -t "$fs" -o ro "$dev" /newroot 2>/dev/null; then continue; fi
         if [ -x /newroot/sbin/init ] || [ -L /newroot/sbin/init ]; then
+            # ── REMOUNTED, NOT MOUNTED ALL OVER AGAIN ─────────────────────────
+            #
+            # This used to umount and mount a second time, and that second mount
+            # re-reads the superblock and the group descriptors the first one has
+            # just read.  On a card slow enough to be worth watching -- which is
+            # the whole subject of this block -- it is the expensive part paid
+            # twice, for a filesystem that is already up and already correct.
+            # `remount,rw' leaves it where it is and flips the one flag.
+            #
+            # The read-only probe stays exactly as it was: a candidate that turns
+            # out not to be a root filesystem must never have been mounted
+            # writable, and that is what the probe is for.  What goes is only the
+            # round trip AFTER it has proved that this one is.
+            scan_say "remounting $dev read-write"
+            if mount -o remount,rw "$dev" /newroot 2>/dev/null ||
+               mount -o remount,rw /newroot 2>/dev/null; then
+                # Written after the mount call has returned, so a parent reading
+                # this file is reading it about a filesystem that is already up.
+                printf '%s %s\n' "$dev" "$fs" > "$scan_result"
+                return 0
+            fi
+            # A filesystem that will not remount, rather than one that will not
+            # mount.  Fall back to what this always did instead of refusing a
+            # card over the way it was asked.
             umount /newroot
             if mount -t "$fs" "$dev" /newroot; then
-                say "root: $dev ($fs)"
-                stage "Mounting the MixOS partition"
-                detail "$dev  $fs  read-write"
-                progress 22
+                printf '%s %s\n' "$dev" "$fs" > "$scan_result"
                 return 0
             fi
             return 1
@@ -1612,12 +1678,9 @@ try_root() {
 }
 
 find_root() {
-    if [ -n "$root_hint" ] && try_root "$root_hint"; then
-        rootdev="$root_hint"
-        return 0
-    fi
+    if [ -n "$root_hint" ] && try_root "$root_hint"; then return 0; fi
     for dev in /dev/mmcblk*p* /dev/mmcblk*; do
-        if try_root "$dev"; then rootdev="$dev"; return 0; fi
+        if try_root "$dev"; then return 0; fi
     done
     return 1
 }
@@ -1627,27 +1690,91 @@ find_root() {
 # scan here races the card: MSDC1 runs card identification on a workqueue, and
 # an mmc host that is still deferred when /init starts has no block device yet.
 #
-# The detail line is written BEFORE the first scan rather than after it, and that
-# is the smaller half of the same fix as dev_ready() above: the first pass through
-# find_root is the one that used to happen in silence, so a card that took a
-# moment to attach showed a headline, no detail, and -- for as long as a stalled
-# mount held the CPU -- a spinner that looked like it had died.  Ten seconds of
-# patience, unchanged; it just says so from the first one now.
+# ── THE SCAN RUNS IN A CHILD, AND THIS SHELL KEEPS TALKING ────────────────────
+#
+# The scan used to run right here, and that is what made the panel look dead.
+# Not because anything crashed: a single mount() of a card the controller is
+# still bringing up can sit in the kernel for tens of seconds, and while this
+# shell is inside that call it writes nothing.  mixsplash, which is a separate
+# process animating from its own clock, keeps drawing -- but its LAST-MESSAGE
+# fuse is ninety seconds, and when nothing has spoken to it for that long it
+# concludes /init has stopped somewhere it did not expect to and gives the text
+# console back.  A slow card was therefore indistinguishable, to the splash, from
+# a dead /init, and the way that reads on the panel is a picture that stops.
+#
+# So the scan is forked and the ticker is what stays in the foreground.  The
+# child mounts -- fork does not unshare the mount namespace, so /newroot really
+# is mounted for the parent too -- and reports what it is trying through
+# $scan_status; this loop reads that once a second, adds the elapsed time and
+# pushes it at the splash.  The splash is now fed every second no matter how long
+# any one mount takes, so the fuse cannot fire during a slow card.
+#
+# IT IS ALSO THE DIAGNOSTIC.  If the panel now counts the seconds up while the
+# card is found, userspace was never the problem and the wait is the controller.
+# If the count itself stops, the CPU is being held below userspace -- in the MMC
+# path, with preemption off -- and no change on this side of the kernel can fix
+# that.  One is a boot that says what it is waiting for; the other is a kernel
+# question.  Before this, both looked exactly the same.
 rootdev=""
-waited=0
+rootfs_type=""
 stage "Looking for the MixOS card"
 detail "waiting for the card"
 progress 8
 say "waiting for the microSD card"
-while : ; do
-    if find_root; then break; fi
-    if [ "$waited" -ge 10 ]; then break; fi
+
+: > "$scan_result"
+scan_say "waiting for the card"
+(
+    tries=0
+    while : ; do
+        if find_root; then break; fi
+        if [ "$tries" -ge 10 ]; then
+            # The give-up answer, so the parent stops on an answer rather than on
+            # its own timeout.  Two fields, because that is what the parent reads.
+            printf 'none -\n' > "$scan_result"
+            break
+        fi
+        tries=$((tries + 1))
+        scan_say "waiting for the card"
+        sleep 1
+    done
+) &
+
+# 300 seconds, and the number is chosen to be one nobody reaches by being slow.
+# Ten seconds of retries was the old patience and it is still the child's; this is
+# the outer bound on a scan that has WEDGED, and it exists because the alternative
+# to a bound is a board that counts upwards forever.  Five minutes in, the
+# emergency shell is more use than another tick -- and it says how it got there.
+waited=0
+while [ ! -s "$scan_result" ]; do
+    if [ "$waited" -ge 300 ]; then
+        say "the card scan has not answered in ${waited}s; carrying on without it"
+        break
+    fi
+    # An empty read is a status file caught between its truncate and its write,
+    # which is a tick of a generic word and not a blank line on the panel.
+    scan_what=""
+    if [ -s "$scan_status" ]; then read -r scan_what < "$scan_status"; fi
+    if [ -z "$scan_what" ]; then scan_what="scanning the card"; fi
+    detail "$scan_what -- ${waited}s"
     waited=$((waited + 1))
-    # The one place a boot legitimately stands still for ten seconds, so it says
-    # so on the panel rather than looking like a machine that has stopped.
-    detail "waiting for the card -- ${waited}s"
     sleep 1
 done
+
+# Said by the parent and not inside try_root, so that the ticker above -- which
+# can run for up to a second after the child has answered -- cannot overwrite it.
+if [ -s "$scan_result" ]; then
+    read -r rootdev rootfs_type < "$scan_result"
+fi
+if [ "$rootdev" = none ]; then rootdev=""; rootfs_type=""; fi
+if [ -n "$rootdev" ]; then
+    say "root: $rootdev ($rootfs_type) after ${waited}s"
+    stage "Mounting the MixOS partition"
+    detail "$rootdev  $rootfs_type  read-write"
+    progress 22
+fi
+: > "$scan_status"
+: > "$scan_result"
 
 # ── Optional payloads: modules, mfgpower, Mesa, the probe ────────────────────
 #
@@ -5520,8 +5647,32 @@ initrd=initrd.img
 # Drop j36.dash=1 and EmulationStation is neither masked nor replaced, and
 # j36.splash=0 boots to text.  loglevel=4 keeps the panel clear until the
 # splash starts; errors and warnings still print, and dmesg keeps the rest.
+# ./build-j36-ultra.sh --no-splash writes j36.splash=0 loglevel=7 here.
 bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1 j36.usb=1 j36.power=1 j36.splash=1
 CONF
+
+# ── --no-splash, applied to the line rather than written into it ──────────────
+#
+# J36_SPLASH=0 is `./build-j36-ultra.sh --no-splash': boot this card to the text
+# console, with the kernel talking, so that whatever the picture was covering is
+# on the screen instead.  It is a diagnostic switch and it is a pair of changes,
+# not one -- turning the splash off and leaving loglevel=4 gives a blank panel
+# with the interesting messages still suppressed, which is a worse view than the
+# splash was.
+#
+# WHY A sed AND NOT AN INTERPOLATION.  The heredoc above is quoted, and quoted is
+# what keeps every $ and ` in a 2 KiB file that goes to a bootloader from being
+# read by bash on the way past.  Unquoting it to substitute two words would put
+# the whole of boot.conf at the mercy of shell expansion for the rest of its life.
+# Both substitutions are the same length as what they replace, so the assertion
+# below is measuring the same file either way.
+if [[ "${J36_SPLASH:-1}" == 0 ]]; then
+    sed -i -e 's/ j36\.splash=1/ j36.splash=0/' \
+           -e 's/ loglevel=4 / loglevel=7 /' "$SDBOOT/mvii/boot.conf"
+    grep -q ' j36\.splash=0' "$SDBOOT/mvii/boot.conf" || \
+        die "J36_SPLASH=0 but boot.conf still asks for the splash; the bootargs line has changed shape"
+    log "splash: boot.conf says j36.splash=0 loglevel=7 (--no-splash); this card boots to text"
+fi
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
 # truncated mid-line.
@@ -7402,13 +7553,13 @@ IMAGE_STAMP="$WORK/.image-export"
 
 # ── Making the OS partition's filesystem as big as the partition it is in ─────
 #
-# WHY THIS IS NEEDED BEFORE ANYTHING CAN BE WRITTEN TO p2.  write_rootfs.sh runs
-# `resize2fs -M' on the build root before it dds it into the image: the filesystem is
-# shrunk to the smallest size that holds its own contents, so that the dd copies what the
-# rootfs weighs rather than the 52 GB build root.  What that leaves in p2, though, is an
-# ext2 with ZERO free blocks in a partition several hundred megabytes bigger than it.  So
-# the payload's first mkdir answered "No space left on device", and every file after it
-# "No such file or directory" -- because its parent directory was the mkdir that had just
+# WHY THIS IS NEEDED BEFORE ANYTHING CAN BE WRITTEN TO p2.  write_rootfs.sh used to run
+# `resize2fs -M' on the build root before it dds it into the image -- the filesystem
+# shrunk to the smallest size that holds its own contents, so that the dd copied what the
+# rootfs weighs rather than the 52 GB build root.  What that left in p2 was an ext2 with
+# ZERO free blocks in a partition several hundred megabytes bigger than it.  So the
+# payload's first mkdir answered "No space left on device", and every file after it "No
+# such file or directory" -- because its parent directory was the mkdir that had just
 # failed.
 #
 # Nothing on the device fixes it either.  firstboot.service is masked in bootargs, and
@@ -7418,15 +7569,38 @@ IMAGE_STAMP="$WORK/.image-export"
 # space the running system cannot use.  The loop device is sizelimited to the partition,
 # so `resize2fs' with no size cannot run past the partition's end.
 #
-# The gap is now the rootfs rounded up to the next 1000 MB minus the rootfs -- around
-# 600 MB, where it used to be 4 GB, because STORAGE_SIZE went from 7500 to 4000.  Which
-# is also why this still matters rather than becoming academic: 600 MB is comfortable for
-# /opt/mixos and nothing like enough to be ignored.
+# THAT SHRINK IS GONE NOW: write_rootfs.sh shrinks straight to STORAGE_SIZE, so an image
+# this build produced arrives here already filling its partition and there is nothing to
+# grow.  This stays anyway, and not out of sentiment -- it is the only thing standing
+# between a rootfs that came from somewhere else and a payload that cannot write a single
+# file.  What it does not do any more is PAY for the answer: see below.
 grow_to_partition() {
     local loop="$1" fstype="$2" fsck_rc=0
+    local geom blocks bsize span
 
     case "$fstype" in
         ext2|ext3|ext4)
+            # ── ASK BEFORE PAYING ─────────────────────────────────────────────
+            #
+            # The e2fsck below reads all four gigabytes of the partition, and on
+            # every build that write_rootfs.sh produced it reads them in order to
+            # discover that resize2fs has nothing to do.  dumpe2fs states the same
+            # fact from the superblock in no time at all: if the filesystem's own
+            # block count already spans the loop device to within one block, it
+            # fills the partition and there is no growing to be done.
+            #
+            # This is a short-cut around work already done, not around the check.
+            # A filesystem that really is smaller than its partition falls through
+            # to exactly the fsck-then-grow it always did.
+            geom="$(sudo dumpe2fs -h "$loop" 2>/dev/null)"
+            blocks="$(printf '%s\n' "$geom" | awk -F: '/^Block count:/{gsub(/ /,"",$2); print $2}')"
+            bsize="$(printf '%s\n' "$geom" | awk -F: '/^Block size:/{gsub(/ /,"",$2); print $2}')"
+            span="$(sudo blockdev --getsize64 "$loop" 2>/dev/null || echo 0)"
+            if [[ -n "$blocks" && -n "$bsize" ]] && (( span > 0 )) &&
+               (( span - blocks * bsize < bsize )); then
+                log "image: p2's filesystem already fills its partition"
+                return 0
+            fi
             # resize2fs refuses a filesystem it has not seen checked, and the last thing
             # to touch this one was a dd.  1 and 2 mean "found and fixed", not "broken".
             sudo e2fsck -p -f "$loop" >/dev/null 2>&1 || fsck_rc=$?
@@ -7436,7 +7610,7 @@ grow_to_partition() {
             fi
             if ! sudo resize2fs "$loop" >/dev/null 2>&1; then
                 log "image: resize2fs could not grow p2 to fill its partition, so the"
-                log "image: payload has only the free space resize2fs -M left it: none"
+                log "image: payload has only the free space the shrink left it: none"
                 return 1
             fi
             ;;

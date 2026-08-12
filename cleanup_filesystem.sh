@@ -16,76 +16,117 @@ call_chroot "rm -rf /home/ark/${CHIPSET}_core_builds"
 if [[ "${CHIPSET}" == "rk3566" ]]; then
   call_chroot "apt-mark hold ffmpeg"
 fi
-call_chroot "apt remove -y autotools-dev \
-  build-essential \
-  ccache \
-  clang \
-  cmake \
-  g++ \
-  liba52-0.7.4-dev \
-  libasound2-dev \
-  libboost-date-time-dev \
-  libboost-dev \
-  libboost-filesystem-dev \
-  libboost-locale-dev \
-  libboost-regex-dev \
-  libboost-system-dev \
-  libcurl4-openssl-dev \
-  libdrm-dev \
-  libeigen3-dev \
-  libevdev-dev \
-  libxext-dev \
-  libfaad-dev \
-  libflac-dev \
-  libfontconfig1-dev \
-  libfreeimage-dev \
-  libfreetype-dev \
-  libfribidi-dev \
-  libglew-dev \
-  libglfw3-dev \
-  libjpeg62-turbo-dev \
-  libluajit-5.1-dev \
-  libmad0-dev \
-  libmpeg2-4-dev \
-  libncurses-dev \
-  libnl-3-dev \
-  libnl-genl-3-dev \
-  libnl-route-3-dev \
-  libogg-dev \
-  libopenal-dev \
-  libphysfs-dev \
-  libpng-dev \
-  libsdl2-dev \
-  libsdl2-gfx-dev \
-  libsdl2-image-dev \
-  libsdl2-mixer-dev \
-  libsdl2-ttf-dev \
-  libshaderc-dev \
-  libslirp-dev \
-  libsm-dev \
-  libsoxr-dev \
-  libspeechd-dev \
-  libssl-dev \
-  libssl-ocaml-dev \
-  libstdc++-12-dev \
-  libtheora-dev \
-  libudev-dev \
-  libvlc-dev \
-  libvlccore-dev \
-  libvorbis-dev \
-  libvorbisidec-dev \
-  libvpx-dev \
-  libvulkan-dev \
-  libx11-dev \
-  libx11-xcb1 \
-  libxcb-dri2-0 \
-  libyaml-dev \
-  libzip-dev \
-  ninja-build \
-  pkg-config \
-  premake4 \
-  rapidjson-dev \
-  zlib1g-dev"
+# ── ASK dpkg WHAT IS ACTUALLY HERE, THEN NAME ONLY THAT ──────────────────────
+#
+# This was one `apt remove -y' carrying the whole list below, and on any run that
+# started from the stripped snapshot it printed fifty lines beginning with the
+# word "Error:".  Not one of them was one.  Cleanup ends by deleting
+# /var/lib/apt/lists, so a second run cannot RESOLVE a name -- and it is being
+# asked about packages the first run already removed, so there is nothing to
+# resolve them to.  "Unable to locate package libboost-dev" meant "that is gone,
+# as intended".  Harmless, and on a terminal completely indistinguishable from a
+# build that has broken, which is how it came to be reported as one.
+#
+# dpkg needs no lists.  /var/lib/dpkg/status is the record of what is installed
+# and cleanup never touches it, so the list is filtered through dpkg-query first
+# and apt is handed only names that are really present.  On a restored run that is
+# none of them and the transaction is skipped in silence; on a first run it is all
+# of them and nothing has changed.  Same idea as install_package in utils.sh,
+# which has asked dpkg before calling apt for a while now.
+#
+# AND IT FIXES g++.  apt reads a trailing `+' on an argument as "...and install
+# this one", so `apt remove g++' asked about a package called `g+' -- which is the
+# "Unable to locate package g+" in the log, a name nobody ever wrote.  dpkg-query
+# answers with `g++:armhf', and an arch-qualified name does not end in `+', so
+# there is no modifier left for apt to read.
+BUILD_ONLY_PACKAGES=(
+  autotools-dev
+  build-essential
+  ccache
+  clang
+  cmake
+  g++
+  liba52-0.7.4-dev
+  libasound2-dev
+  libboost-date-time-dev
+  libboost-dev
+  libboost-filesystem-dev
+  libboost-locale-dev
+  libboost-regex-dev
+  libboost-system-dev
+  libcurl4-openssl-dev
+  libdrm-dev
+  libeigen3-dev
+  libevdev-dev
+  libxext-dev
+  libfaad-dev
+  libflac-dev
+  libfontconfig1-dev
+  libfreeimage-dev
+  libfreetype-dev
+  libfribidi-dev
+  libglew-dev
+  libglfw3-dev
+  libjpeg62-turbo-dev
+  libluajit-5.1-dev
+  libmad0-dev
+  libmpeg2-4-dev
+  libncurses-dev
+  libnl-3-dev
+  libnl-genl-3-dev
+  libnl-route-3-dev
+  libogg-dev
+  libopenal-dev
+  libphysfs-dev
+  libpng-dev
+  libsdl2-dev
+  libsdl2-gfx-dev
+  libsdl2-image-dev
+  libsdl2-mixer-dev
+  libsdl2-ttf-dev
+  libshaderc-dev
+  libslirp-dev
+  libsm-dev
+  libsoxr-dev
+  libspeechd-dev
+  libssl-dev
+  libssl-ocaml-dev
+  libstdc++-12-dev
+  libtheora-dev
+  libudev-dev
+  libvlc-dev
+  libvlccore-dev
+  libvorbis-dev
+  libvorbisidec-dev
+  libvpx-dev
+  libvulkan-dev
+  libx11-dev
+  libx11-xcb1
+  libxcb-dri2-0
+  libyaml-dev
+  libzip-dev
+  ninja-build
+  pkg-config
+  premake4
+  rapidjson-dev
+  zlib1g-dev
+)
+# A name dpkg has never heard of makes it exit non-zero and complain on stderr
+# while still reporting the others on stdout, hence the redirect -- the same
+# reason install_package has one.
+REMOVABLE_PACKAGES=()
+while read -r INSTALLED_PACKAGE; do
+  REMOVABLE_PACKAGES+=( "$INSTALLED_PACKAGE" )
+done < <(sudo chroot Arkbuild/ dpkg-query -W \
+    -f '${Package}:${Architecture} ${db:Status-Status}\n' "${BUILD_ONLY_PACKAGES[@]}" 2>/dev/null |
+    awk '$NF == "installed" { print $1 }')
+
+if (( ${#REMOVABLE_PACKAGES[@]} )); then
+  echo -e "Removing ${#REMOVABLE_PACKAGES[@]} of ${#BUILD_ONLY_PACKAGES[@]} build-time packages"
+  call_chroot "apt remove -y ${REMOVABLE_PACKAGES[*]}"
+else
+  echo -e "None of the ${#BUILD_ONLY_PACKAGES[@]} build-time packages is installed; nothing to remove"
+fi
 
 call_chroot "apt -y autoremove"
 call_chroot "apt -y clean"
