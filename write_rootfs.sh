@@ -96,7 +96,23 @@ elif [[ "${ROOT_FILESYSTEM_FORMAT}" == *"ext"* ]]; then
   fi
   sudo truncate -s "${fs_mib}M" "${FILESYSTEM}"
   sync
-  sudo dd if="${FILESYSTEM}" of="${DISK}" bs=512 seek="${STORAGE_PART_START}" conv=fsync,notrunc
+  # ── bs=8M AND A SEEK IN BYTES ─────────────────────────────────────────────
+  #
+  # This was `bs=512 seek=${STORAGE_PART_START}', and 512 bytes is not a block
+  # size, it is a sector: three gigabytes of rootfs went across as 6.2 million
+  # read/write pairs at 13.9 MB/s, which is most of four minutes of a build doing
+  # nothing but syscall overhead.  The number was not chosen for throughput -- it
+  # was chosen because `seek' counts in blocks, and the partition start is a
+  # sector count, so 512 was the only block size that made the seek arithmetic
+  # come out right.
+  #
+  # oflag=seek_bytes decouples the two: the seek is given in bytes, exactly where
+  # the partition begins, and the block size is then free to be a real one.  Same
+  # bytes, same place, one transfer per eight megabytes instead of per sector.
+  # iflag=fullblock because a short read must not become a short block -- with a
+  # seek this is the difference between a copy and a corrupted partition.
+  sudo dd if="${FILESYSTEM}" of="${DISK}" bs=8M iflag=fullblock \
+      oflag=seek_bytes seek=$(( STORAGE_PART_START * 512 )) conv=fsync,notrunc
 
   # AND THEN GROW IT BACK, INSIDE THE IMAGE.  The shrink above is only about how much of
   # this file the dd has to copy -- 52 GB of build root down to what the rootfs weighs.
@@ -167,6 +183,8 @@ elif [ "${ROOT_FILESYSTEM_FORMAT}" == "btrfs" ]; then
     exit 1
   fi
   sync Arkbuild
-  sudo dd if="${FILESYSTEM}" of="${DISK}" bs=512 seek="${STORAGE_PART_START}" conv=fsync,notrunc
+  # Same as the ext branch above: a byte seek so the block size can be a block size.
+  sudo dd if="${FILESYSTEM}" of="${DISK}" bs=8M iflag=fullblock \
+      oflag=seek_bytes seek=$(( STORAGE_PART_START * 512 )) conv=fsync,notrunc
 fi
 sync ${DISK}
