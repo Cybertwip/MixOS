@@ -1038,9 +1038,35 @@ static void set_text(char *dst, size_t dstsz, const char *src)
  * 1 and fills `line' when there was one, 0 when there was not. */
 static int msgs_next(struct msgs *m, char *line, size_t linesz)
 {
+    /*
+     * ── READ INTO A WHOLE OBJECT, THEN APPEND BY HAND ──
+     *
+     * The obvious shape for this is read(fd, m->buf + m->len, sizeof(m->buf) -
+     * m->len), and that is what it was, and glibc's fortified read() would not
+     * have it: "writing 528 or more bytes into a region of size 512".  The
+     * complaint is not about a real code path.  __builtin_object_size() of
+     * `m->buf + m->len' with a non-constant len is the whole 512-byte member, and
+     * the count is a subtraction GCC will not correlate with the offset it was
+     * derived from -- so it pairs the largest count it can imagine with the
+     * smallest region and reports the overlap.
+     *
+     * Two attempts at arguing with it failed, and both failed for the same
+     * reason: `>=' instead of `==' on the full check, and then a saturating
+     * assignment to m->len, are both statements about the OFFSET, and the offset
+     * was never what it could not prove.  So the argument is dropped instead.
+     * read() is given `chunk' -- a complete object with a constant size, which
+     * leaves fortify nothing to be unsure about -- and the bytes are appended
+     * with an index that is compared against the destination's size on every
+     * single store.  There is no expression left for anyone to mis-range.
+     *
+     * It costs a copy of at most half a kilobyte per message on a path that runs
+     * a few dozen times in a boot.  A build with no warnings in it is worth more
+     * than that, because the next warning here will be a real one.
+     */
+    char chunk[512];
     char *nl;
     ssize_t got;
-    size_t space;
+    size_t i;
 
     for (;;) {
         nl = memchr(m->buf, '\n', m->len);
@@ -1056,34 +1082,12 @@ static int msgs_next(struct msgs *m, char *line, size_t linesz)
         if (m->fd < 0)
             return 0;
         /*
-         * ── SATURATE FIRST, THEN DECIDE ──
-         *
-         * This line is dead code and it is here on purpose.  m->len is only ever
-         * assigned bytes that fit, so it cannot exceed the buffer -- but GCC does
-         * not know that, because it does not know read() returns no more than the
-         * count it was given, and it re-enters this loop with whatever range that
-         * leaves.  Under -O2 the fortified read() then reports writing "528 or
-         * more bytes into a region of size 512": that number is not a real code
-         * path, it is what `sizeof(m->buf) - m->len' looks like once len is
-         * allowed to be bigger than the buffer and the subtraction wraps.
-         *
-         * A comparison cannot fix that, and `>=' in place of `==' did not: a test
-         * that RETURNS on the bad range still leaves the compiler carrying it into
-         * the next iteration.  An assignment ends the range instead of branching
-         * on it, so everything below is provably 0..512 and the read gets a count
-         * it can check.  One redundant compare per line of splash text is a fair
-         * price for a clean build.
-         */
-        if (m->len > sizeof(m->buf))
-            m->len = sizeof(m->buf);
-
-        /*
          * A writer with no newline in half a kilobyte.  Take what is there rather
          * than wedging: the alternative is a splash that stops updating because
          * somebody echoed -n.  The clamp is against sizeof(m->buf) and not against
          * m->len because what limits the copy is the buffer, not the count.
          */
-        if (m->len == sizeof(m->buf)) {
+        if (m->len >= sizeof(m->buf)) {
             size_t copy = sizeof(m->buf) < linesz - 1 ? sizeof(m->buf) : linesz - 1;
 
             memcpy(line, m->buf, copy);
@@ -1102,17 +1106,18 @@ static int msgs_next(struct msgs *m, char *line, size_t linesz)
                 m->len = 0;
             }
         }
+        /* Never more than there is room for, so nothing read is ever dropped --
+         * and never more than `chunk' holds, which is the clamp against a
+         * constant that lets fortify check the call instead of guessing at it. */
         space = sizeof(m->buf) - m->len;
-        got = read(m->fd, m->buf + m->len, space);
+        if (space > sizeof chunk)
+            space = sizeof chunk;
+        got = read(m->fd, chunk, space);
         if (got <= 0)
             return 0;
-        /* read() cannot return more than it was asked for.  Said out loud so the
-         * count that comes back is bounded on the way in to the next iteration,
-         * which is where the saturate above got its bad range from. */
-        if ((size_t)got > space)
-            got = (ssize_t)space;
-        m->len += (size_t)got;
         m->pos += got;
+        for (i = 0; i < (size_t)got && m->len < sizeof(m->buf); ++i)
+            m->buf[m->len++] = chunk[i];
     }
 }
 
