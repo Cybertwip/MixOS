@@ -185,8 +185,17 @@ done
 # Keep this first-stage image below the fixed 9 MiB BOOTIMG partition.
 # Each thing that leaves this list leaves it because its bring-up is proven and
 # it earned the bytes: storage went first, then NET -- see below -- then DRM, for
-# the GPU section further down, and now SOUND and SND, for the audio section
-# after it. A native DSI/display driver is still on the outside.
+# the GPU section further down, then SOUND and SND, for the audio section after
+# it, and now USB_SUPPORT, for the USB section after that. A native DSI/display
+# driver is still on the outside.
+#
+# USB_SUPPORT left this list as a menuconfig gate only. It costs nothing on its
+# own -- it is the `menuconfig' symbol that makes the whole drivers/usb menu
+# visible -- and everything behind it that this board actually loads is =m, on
+# the BOOT partition, insmodded from /init only when the command line asks. The
+# USB section below turns off the four host controllers and the gadget stack by
+# name, because none of them is on this SoC and all four are `default y' under
+# some dependency multi_v7_defconfig satisfies.
 #
 # WIRELESS, WLAN and BT stay off, and they are disabled here rather than left
 # out: all three live inside `if NET' in net/Kconfig and WIRELESS defaults to y,
@@ -194,7 +203,7 @@ done
 # "is not set" lines for these are in .config before the single olddefconfig
 # below, which is what makes the explicit n stick.
 for symbol in \
-    MEDIA_SUPPORT WIRELESS WLAN BT USB_SUPPORT SCSI ATA \
+    MEDIA_SUPPORT WIRELESS WLAN BT SCSI ATA \
     DEBUG_INFO DEBUG_KERNEL KALLSYMS LOGO; do
     config_n "$symbol"
 done
@@ -337,6 +346,26 @@ done
 # SoC, and the HDMI one `select's SND_SOC_HDMI_CODEC.  The prune below takes them
 # because the allowlist names DRM_MEDIATEK exactly, not a prefix.
 #
+# ── DRM_UDL: the third card, and it is not a SoC block at all ──────────────────
+#
+# The two refusals above are the reason this one needs a paragraph.  MT6592 has
+# no HDMI encoder and no DisplayPort, so "HDMI on this board" cannot come from
+# the display subsystem -- but it does not have to.  A DisplayLink adapter is a
+# USB device that receives compressed framebuffer updates over bulk transfers and
+# drives the monitor itself, so the entire path is drivers/usb plus udl.ko, and
+# the DDP, the MIPI-TX PHY and mtk_drm are not involved in it at any point.  That
+# makes it the one external-display route this SoC can take, and it is =m and
+# staged with the USB set below rather than with the display set above.
+#
+# What it will and will not bind, because this decides whether a given adapter
+# works: mainline udl speaks the USB 2.0 DisplayLink protocol -- DL-1x0/DL-1x5,
+# the "DisplayLink Graphics Adapter" generation, matched by
+# USB_CLASS_VENDOR_SPEC interface class 0xff/0x00/0x00 with a vendor-specific
+# descriptor.  DL-3xxx and later are USB 3.0 parts speaking a different protocol
+# with no in-tree driver; those need out-of-tree evdi.  This board is USB 2.0
+# high-speed and nothing else, so a USB 3.0 adapter has nothing to gain here
+# anyway.  At 640x480 the bandwidth question does not arise.
+#
 # The prune matters more here than in the ARCH loop above: multi_v7_defconfig
 # turns on a dozen other DRM drivers, and one of them, DRM_SIMPLEDRM, matches the
 # very `simple-framebuffer' node FB_SIMPLE is driving.  Two drivers bidding for
@@ -352,7 +381,7 @@ config_y DRM
 while IFS='=' read -r option _value; do
     symbol="${option#CONFIG_}"
     case "$symbol" in
-        DRM|DRM_LIMA|DRM_MEDIATEK) ;;
+        DRM|DRM_LIMA|DRM_MEDIATEK|DRM_UDL) ;;
         DRM_*) config_n "$symbol" ;;
     esac
 done < <(grep -E '^CONFIG_DRM_[A-Z0-9_]+=(y|m)$' "$CONFIG")
@@ -360,6 +389,8 @@ config_m DRM_LIMA
 config_m MTK_MMSYS
 config_m PHY_MTK_MIPI_DSI
 config_m DRM_MEDIATEK
+# Asked for down in the USB section, where its dependency lives; named in the
+# allowlist here so this prune does not take it back out again.
 # Off, and it is doing real work switched off.
 #
 # lima registers no CRTC, so for lima there is nothing to emulate; the symbol is
@@ -439,6 +470,116 @@ for symbol in SND_SUPPORT_OLD_API SND_PCM_OSS SND_MIXER_OSS SND_SEQUENCER \
     config_n "$symbol"
 done
 
+# ── USB: one controller, host mode, and everything else refused ────────────────
+#
+# What is on this SoC, measured rather than assumed.  MT6592 has exactly ONE USB
+# controller: a Mentor MUSBMHDRC dual-role core at 0x11200000, with the MediaTek
+# U2 PHY at 0x11210800 inside the SIFSLV window at 0x11210000, gated by the PERI
+# clock block at 0x10003010 (PDN_CLR) / 0x10003018 (PDN_STA).  There is no EHCI,
+# no OHCI and no XHCI anywhere on the die -- which is why all three are refused
+# below rather than merely left alone, and why every "add USB" instinct that
+# starts with USB_EHCI_HCD would produce a kernel that binds nothing.
+#
+# The evidence that host mode works on this hardware is the stock Android kernel:
+# it carries drivers/misc/mediatek/usb20/ driving the same core, with usbhid and
+# hid-generic built alongside.  Mainline's equivalent is USB_MUSB_MEDIATEK, which
+# has been in-tree since 5.4 and is the MT2701/MT8173-generation glue -- the same
+# reuse argument as mtk_drm above.
+#
+# HOST ONLY, and that is a deliberate narrowing.  The core is dual-role and the
+# board's port is an OTG port, but dual-role means a role switch driven by an ID
+# pin this bring-up has never read, and the PHY has no sequence that releases the
+# role override -- both of MTK's are overrides that pin it.  So USB_MUSB_HOST is
+# the mode and dr_mode = "host" is in the device tree, and the role is decided at
+# power-on rather than by how the ID pin floats.
+#
+# VBUS is sourced, which is new.  It is a GPIO on this board and not the MT6322
+# boost the MVII note assumed: the stock Android kernel's mt_usb_set_vbus() sets
+# pad 15 to mode 0 and drives it high, and j36_mt6592_usb_phy.ko now does the
+# same off j36,drvvbus-pad.  So a bus-powered hub enumerates.  The cost is that
+# the 5 V is a boost off VBAT, which on this PMIC is the system node -- with no
+# cell fitted that is the rail the class-D amp already proved can be pulled under
+# the undervoltage lockout, so j36.usb=novbus exists and a self-powered hub is
+# still the safer arrangement.  DEVCTL bits 3|4 report whether VBUS is present,
+# which is how to tell which of the two is actually carrying the port.
+#
+# MUSB_PIO_ONLY is the first-bring-up choice.  MUSB's DMA on this generation goes
+# through MediaTek's own controller glue and none of it has been measured here;
+# PIO is slower and cannot be wrong.  A mouse, a keyboard and a 640x480
+# DisplayLink surface are not a bandwidth problem.
+#
+# =m for the whole set, for the third time in this file and for the same reason:
+# an APB access to a clock-gated MediaTek peripheral does not fault, it HANGS THE
+# BUS.  A built-in musb would probe at boot, before anything has ungated PERI,
+# and take the board into a watchdog reset with nothing in any log.  As modules
+# they are on the BOOT partition and /init insmods them only for j36.usb=1.  The
+# same containment as lima, mtk_drm and the AFE: a default boot loads none of it.
+#
+# GENERIC_PHY is the one =y here, because it has to be: it is bool, phy-core is
+# what j36_mt6592_usb_phy.ko registers into, and mediatek.c reaches the PHY with
+# devm_of_phy_get_by_index().  It is a few kilobytes of class registration.
+config_y USB_SUPPORT
+while IFS='=' read -r option _value; do
+    symbol="${option#CONFIG_}"
+    case "$symbol" in
+        USB|USB_SUPPORT|USB_COMMON|USB_PHY|USB_HID|USB_ROLE_SWITCH) ;;
+        USB_MUSB_HDRC|USB_MUSB_MEDIATEK|USB_MUSB_HOST) ;;
+        USB_ANNOUNCE_NEW_DEVICES|USB_DEFAULT_PERSIST) ;;
+        USB_*) config_n "$symbol" ;;
+    esac
+done < <(grep -E '^CONFIG_USB[A-Z0-9_]*=(y|m)$' "$CONFIG")
+# The HID menu gets the same treatment and for a plainer reason: multi_v7_defconfig
+# turns on around eighty vendor HID drivers, every one of them a module this build
+# would compile and this card would never stage.  hid-generic is what binds a mouse
+# and a keyboard -- it claims any HID device no specific driver wanted -- so the
+# allowlist is the core, the gate and the generic driver, and nothing else.
+while IFS='=' read -r option _value; do
+    symbol="${option#CONFIG_}"
+    case "$symbol" in
+        HID|HID_SUPPORT|HID_GENERIC) ;;
+        HID_*) config_n "$symbol" ;;
+    esac
+done < <(grep -E '^CONFIG_HID[A-Z0-9_]*=(y|m)$' "$CONFIG")
+config_y HID_SUPPORT
+config_m USB
+config_y USB_ANNOUNCE_NEW_DEVICES
+config_y USB_DEFAULT_PERSIST
+config_y USB_PHY
+config_m NOP_USB_XCEIV
+config_y GENERIC_PHY
+config_m USB_MUSB_HDRC
+config_y USB_MUSB_HOST
+config_y MUSB_PIO_ONLY
+config_m USB_MUSB_MEDIATEK
+config_m USB_ROLE_SWITCH
+config_m HID
+config_m USB_HID
+config_m HID_GENERIC
+# The USB->HDMI half.  DRM_UDL is asked for here rather than in the DRM section
+# because its dependency is USB, not the display block -- `depends on DRM && USB
+# && MMU'.  DRM is =y, USB is =m, so =m is the only value it can take, which is
+# also the value that keeps it off the 9 MiB image and out of a default boot.
+config_m DRM_UDL
+# Named refusals, one line of reasoning each:
+#
+#   USB_GADGET      the other half of dual-role; nothing here is a peripheral,
+#                   and it would pull in a UDC, a composite framework and a
+#                   function set for a port that is being driven as a host.
+#   USB_EHCI/OHCI/  no such block on MT6592.  Left to the prune they would be
+#   XHCI_HCD        off anyway; refused by name so that a kernel bump which makes
+#                   one of them `default y' fails the build instead of adding a
+#                   host controller driver for hardware that does not exist.
+#   USB_DWC2/DWC3/  the same, for the three other IP cores an ARM defconfig
+#   CHIPIDEA        commonly carries.  This SoC has MUSB and only MUSB.
+#   USB_STORAGE     it selects SCSI, which is in the disable list at the top of
+#                   this file, and a mass-storage stack is not what was asked
+#                   for.  Refused rather than pruned so the SCSI decision and
+#                   this one cannot silently disagree.
+for symbol in USB_GADGET USB_EHCI_HCD USB_OHCI_HCD USB_XHCI_HCD \
+    USB_DWC2 USB_DWC3 USB_CHIPIDEA USB_STORAGE; do
+    config_n "$symbol"
+done
+
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
     CROSS_COMPILE=arm-linux-gnueabihf- olddefconfig
 
@@ -476,7 +617,9 @@ for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 DEVTMPFS DEVTMPFS_MOUNT TMPFS TMPFS_XATTR TMPFS_POSIX_ACL \
                 PROC_FS PROC_SYSCTL SYSFS \
                 EXT2_FS_XATTR EXT2_FS_POSIX_ACL BTRFS_FS_POSIX_ACL \
-                DRM DEVMEM SOUND; do
+                DRM DEVMEM SOUND \
+                USB_SUPPORT USB_PHY GENERIC_PHY HID_SUPPORT \
+                USB_MUSB_HOST MUSB_PIO_ONLY USB_ANNOUNCE_NEW_DEVICES; do
     grep -q "^CONFIG_${required}=y$" "$CONFIG" || \
         die "required kernel option CONFIG_${required}=y was not selected"
 done
@@ -566,6 +709,46 @@ for refused in DRM_MEDIATEK_HDMI DRM_MEDIATEK_DP; do
     fi
 done
 
+# The USB set, and the two entries that are not obvious are the load-bearing ones.
+#
+# NOP_USB_XCEIV has no relationship to this board's PHY and is required anyway:
+# USB_MUSB_MEDIATEK's Kconfig line is `depends on NOP_USB_XCEIV', and mediatek.c
+# calls usb_phy_generic_register() unconditionally in probe. Without it the glue
+# does not build at all, and the failure reads as "USB_MUSB_MEDIATEK was not
+# selected" with nothing to say why -- so it is asserted next to the thing that
+# needs it.
+#
+# USB_ROLE_SWITCH is the same shape: `select USB_ROLE_SWITCH' in the same Kconfig
+# entry, roles.ko at module scope, and mtk_musb_probe registers a switch even in
+# host mode. It is in the load order for that reason and not because anything
+# here changes role.
+#
+# DRM_UDL is asserted here rather than with the display set because the reason it
+# can exist is USB=m. If USB ever goes back to =y this assertion still passes; if
+# USB goes away, this is the line that says the external display went with it.
+for wanted_module in USB USB_COMMON USB_MUSB_HDRC USB_MUSB_MEDIATEK \
+                     NOP_USB_XCEIV USB_ROLE_SWITCH HID USB_HID HID_GENERIC \
+                     DRM_UDL; do
+    grep -q "^CONFIG_${wanted_module}=m$" "$CONFIG" || \
+        die "CONFIG_${wanted_module}=m was not selected; the USB stack must be modular because an APB access to the clock-gated MUSB window hangs the bus, so nothing may probe before /init has ungated PERI"
+done
+
+# No host controller driver may come back, because there is no host controller on
+# this SoC to drive -- MT6592 has one MUSB core and nothing else. =y and =m are
+# both refusals: /init loads modules by filename from a text file, so a stray one
+# is loadable, and a built-in one binds at boot.
+#
+# USB_GADGET is refused for a different reason: it is not absent hardware, it is
+# the other half of the same core. Turning it on changes MUSB's driver mode out
+# of host-only, and the board would then wait for a role switch that nothing
+# performs while the powered hub sits there unenumerated.
+for refused in USB_EHCI_HCD USB_OHCI_HCD USB_XHCI_HCD USB_DWC2 USB_DWC3 \
+               USB_CHIPIDEA USB_GADGET USB_STORAGE; do
+    if grep -qE "^CONFIG_${refused}=(y|m)$" "$CONFIG"; then
+        die "CONFIG_${refused} came back after olddefconfig; MT6592 has exactly one USB core (MUSB at 0x11200000) and it is driven host-only"
+    fi
+done
+
 # Print the whole DRM set rather than trusting the assertions above to have named
 # everything that matters. This is the line to read when a kernel bump changes
 # what `select' pulls in. MTK_ and PHY_MTK_ are in the same line because the
@@ -648,7 +831,7 @@ verify_armv7_kernel "$ZIMAGE" "the zImage"
 fits_in "$ZIMAGE" $((0x01800000)) "the zImage"
 log "Verified a 32-bit ARMv7 zImage: $(stat -c %s "$ZIMAGE") bytes"
 
-log "Building the out-of-tree J36 modules: the input adapter, the panel and the AFE"
+log "Building the out-of-tree J36 modules: the input adapter, the panel, the AFE and the USB PHY"
 mkdir -p "$MODULE_SRC"
 rsync -a --delete "$ROOT/device/j36-ultra/linux/" "$MODULE_SRC/"
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
@@ -672,6 +855,14 @@ verify_arm_elf "$PANEL_MODULE" "the panel module"
 AUDIO_MODULE="$MODULE_SRC/j36_mt6592_audio.ko"
 [[ -s "$AUDIO_MODULE" ]] || die "audio module was not produced"
 verify_arm_elf "$AUDIO_MODULE" "the audio module"
+# And the USB PHY, staged with the usb payload.  It is the first module of the
+# USB chain to load, because it is the only hook that runs before musb_hdrc
+# touches 0x11200000 -- and an APB read of that window while PERI still gates it
+# hangs the bus rather than faulting.  A missing .ko here would put musb_hdrc
+# first in load.order, so check it at build time.
+USB_PHY_MODULE="$MODULE_SRC/j36_mt6592_usb_phy.ko"
+[[ -s "$USB_PHY_MODULE" ]] || die "USB PHY module was not produced"
+verify_arm_elf "$USB_PHY_MODULE" "the USB PHY module"
 fits_in "$DTB_OUT/mt6592-j36-ultra.dtb" $((0x00040000)) "the device tree"
 
 if [[ ! -d "$BUSYBOX_SRC/.git" ]]; then
@@ -929,6 +1120,8 @@ gl_debug=0
 want_dash=0
 want_audio=0
 audio_speaker=0
+want_usb=0
+usb_vbus=1
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         j36.audio|j36.audio=1)
@@ -950,6 +1143,28 @@ for arg in $(cat /proc/cmdline); do
             ;;
         j36.mtkdrm|j36.mtkdrm=1)
             want_mtkdrm=1
+            ;;
+        # USB host: keyboards, mice, hubs, and the DisplayLink adapter, which is
+        # one word and not two because they are one stack -- a USB->HDMI adapter
+        # is a USB device, so udl loads off the same port and the same core as
+        # the mouse.  Behind a word like the rest because the first APB access to
+        # the MUSB window is the thing that could hang this board, and a card
+        # that ends up wedged by it is fixed by editing boot.conf on any machine
+        # that reads SD cards.
+        j36.usb|j36.usb=1)
+            want_usb=1
+            ;;
+        # The same stack with the 5 V left alone.  VBUS on this board is a GPIO
+        # -- pad 15, active high, read out of the stock Android kernel's
+        # mt_usb_set_vbus() -- and it is a boost off VBAT, which on this PMIC is
+        # the system node, the same rail the class-D amp above can pull under
+        # the undervoltage lockout.  So: use this word with a self-powered hub,
+        # which brings its own 5 V and does not want the port's, and use it on a
+        # board with no cell fitted, where a bus-powered device is a load VBAT
+        # cannot carry.  With it the pad stays exactly as the LK left it.
+        j36.usb=novbus)
+            want_usb=1
+            usb_vbus=0
             ;;
         # Mesa, staged where the loader will find it ahead of the RK3326 blob.
         # j36.es is the name this word had while EmulationStation was the thing
@@ -1306,6 +1521,89 @@ run_audio() {
     fi
     if [ "$audio_speaker" != 1 ]; then
         say "audio: the speaker amp is off -- add j36.audio=speaker with a cell fitted"
+    fi
+    return 0
+}
+
+# ── USB host, if the command line asks ────────────────────────────────────────
+#
+# Same containment as the three above, and here the gate is the sharpest one in
+# this file: MUSB and its PHY are behind the PERI clock gate, and on MediaTek an
+# APB access to a gated peripheral does not fault, it stalls the bus until the
+# watchdog resets the board.  j36_mt6592_usb_phy clears the gate in phy_init,
+# which musb calls before it reads a single controller register, so the ordering
+# is correct -- but it is correct by construction rather than by measurement, and
+# that is exactly the kind of thing that belongs behind a word.
+#
+# The load order comes out of the build's dependency walk, and the first entry is
+# the PHY: nothing that touches the MUSB window may be loaded before the driver
+# that ungates it.
+#
+# SKIP WHAT IS ALREADY LOADED, which none of the other payloads has to do.  udl
+# is a DRM driver, so it depends on drm_kms_helper and drm_shmem_helper -- the
+# same two modules the mtkdrm payload stages in its own directory.  A boot that
+# asks for both words would otherwise reach the second copy and insmod would fail
+# with EEXIST, which reads in the log exactly like a broken module.  /sys/module
+# names have underscores where filenames have hyphens, hence the tr.
+run_usb() {
+    if ! find_payload; then return 1; fi
+    if [ ! -f "$payload/usb/load.order" ]; then
+        say "usb: j36.usb was asked for but j36/usb/load.order is not on the card"
+        return 1
+    fi
+    while IFS= read -r ko; do
+        case "$ko" in ''|'#'*) continue ;; esac
+        mod=$(printf '%s' "${ko%.ko}" | tr '-' '_')
+        if [ -d "/sys/module/$mod" ]; then
+            say "usb: $ko is already loaded"
+            continue
+        fi
+        # The one module here that takes an argument, and it has to be passed on
+        # the insmod line rather than in bootargs: a kernel-cmdline
+        # `modname.param=' only reaches modules built into the image, and every
+        # one of these is loadable.  So j36.usb=novbus is translated here.
+        args=""
+        case "$ko" in
+            j36_mt6592_usb_phy.ko)
+                [ "$usb_vbus" = 1 ] || args="vbus=0"
+                ;;
+        esac
+        if insmod "$payload/usb/$ko" $args >/tmp/insmod.log 2>&1; then
+            say "usb: loaded $ko${args:+ $args}"
+        else
+            say "usb: FAILED to load $ko${args:+ $args}"
+            show /tmp/insmod.log
+        fi
+    done < "$payload/usb/load.order"
+
+    # What to look at, in the order it answers the questions.  The bus directory
+    # is the controller itself: usb1 appearing means musb bound and the root hub
+    # registered, which is already most of the bring-up.  Anything past usb1 is a
+    # device that enumerated.
+    if [ -d /sys/bus/usb/devices ]; then
+        say "usb devices:"
+        ls /sys/bus/usb/devices 2>/dev/null
+    else
+        say "usb: no /sys/bus/usb/devices -- usbcore did not register"
+    fi
+    if [ -e /dev/input/event0 ]; then
+        say "input devices:"
+        ls /dev/input 2>/dev/null
+    fi
+    if [ -d /sys/class/drm ]; then
+        say "drm nodes:"
+        ls /sys/class/drm 2>/dev/null
+    fi
+
+    # Said every time, because VBUS is the single most likely reason for a port
+    # that looks dead, and because on this board it is also the one thing in the
+    # payload that draws real current off the system rail.  The PHY driver logs
+    # the pad it drove; this says which of the two arrangements the card asked
+    # for, in the words the operator would have to change.
+    if [ "$usb_vbus" = 1 ]; then
+        say "usb: the port is sourcing 5 V off VBAT -- fit a cell, or say j36.usb=novbus"
+    else
+        say "usb: VBUS held off by j36.usb=novbus -- the hub must have its own power"
     fi
     return 0
 }
@@ -2326,7 +2624,7 @@ UNITNOTICE
 stage_from_boot
 
 if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || \
-   [ "$want_gl" = 1 ] || [ "$want_audio" = 1 ]; then
+   [ "$want_gl" = 1 ] || [ "$want_audio" = 1 ] || [ "$want_usb" = 1 ]; then
     # find_payload is called by each of the four rather than once here, so that a card
     # with no payload at all gets one message per word that was asked for, naming the
     # word -- and so that this block does not have to know which of them needs what.
@@ -2339,9 +2637,17 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || \
     # into.  The GL front end last, because it is the only one of the four that
     # is not finished when this script ends -- it is a message to systemd, and
     # systemd has not started yet.
+    # USB after mtkdrm and before the GL front end, and the position is not
+    # arbitrary: udl depends on drm_kms_helper and drm_shmem_helper, which the
+    # mtkdrm payload also carries, so letting mtkdrm go first means the shared
+    # pair is loaded once from the directory that has always owned it and run_usb
+    # skips its own copies.  The other way round works too -- run_mtkdrm has no
+    # such skip -- but it would print two module-load failures on a boot that is
+    # working correctly.
     if [ "$want_lima" = 1 ]; then run_lima; fi
     if [ "$want_mtkdrm" = 1 ]; then run_mtkdrm; fi
     if [ "$want_audio" = 1 ]; then run_audio; fi
+    if [ "$want_usb" = 1 ]; then run_usb; fi
     if [ "$want_gl" = 1 ]; then setup_es_gl; fi
 fi
 
@@ -2887,6 +3193,66 @@ if [[ "${J36_AUDIO:-1}" == 1 ]]; then
     fi
 else
     log "audio: J36_AUDIO=0, skipping the audio payload"
+fi
+
+# The USB host set: one controller, the HID pair, and the DisplayLink display.
+#
+# The roots, and why each one is a root rather than something the walk finds:
+#
+#   j36_mt6592_usb_phy  out-of-tree, so nothing in the kernel tree names it, and
+#                       it MUST be first in the load order -- it is the driver
+#                       that ungates the PERI clock, and the walk puts it first
+#                       for free because usbcore is the only thing under it.
+#   mediatek            drivers/usb/musb/mediatek.ko, the glue.  A root because
+#                       the relationship to musb_hdrc runs the other way: musb
+#                       exports the symbols, the glue is what binds the node.
+#                       The generic name is worth a second look if a kernel bump
+#                       ever adds another mediatek.ko -- collect_modules takes
+#                       the first match under $KERNEL_OUT and today there is
+#                       exactly one.
+#   musb_hdrc           named anyway rather than left to the glue's depends, so
+#                       that a build which somehow produced the glue without the
+#                       core fails here instead of at insmod time on the board.
+#   usbhid, hid-generic the mouse and the keyboard.  hid-generic is a root
+#                       because no symbol points at it: it is the driver that
+#                       claims any HID device no specific driver wanted, so a
+#                       walk seeded at usbhid alone would build a payload that
+#                       enumerates a mouse and binds nothing to it.
+#   udl                 the USB->HDMI adapter.  Also a root for a reason of its
+#                       own -- it hangs off usbcore and DRM, neither of which
+#                       knows it exists.
+#
+# usbcore, hid, phy-generic and roles are NOT roots and do not need to be: every
+# one of them is a `modinfo -F depends' edge from something above.  Hub support
+# has no symbol at all -- it is inside usbcore -- which is worth writing down
+# because "there is no CONFIG_USB_HUB" is the first thing anyone looks for.
+USB_MODULE_PATHS=()
+USB_MODULE_ORDER=()
+if [[ "${J36_USB:-1}" == 1 ]]; then
+    set +e
+    collect_modules usb USB_MODULE_ORDER USB_MODULE_PATHS \
+        j36_mt6592_usb_phy musb_hdrc mediatek usbhid hid-generic udl
+    usb_rc=$?
+    set -e
+    if (( usb_rc != 0 )); then
+        USB_MODULE_ORDER=()
+        USB_MODULE_PATHS=()
+        log "usb: modules not staged, see the error above -- the kernel payload is unaffected"
+    fi
+    # `mediatek' is the one root here with a name generic enough to collide.  The
+    # MUSB glue really is drivers/usb/musb/mediatek.ko, and collect_modules takes
+    # the first `find -name mediatek.ko' hit in the build tree, so say out loud
+    # which file that was rather than discover at insmod time that it was some
+    # other subsystem's driver of the same name.
+    if (( ${#USB_MODULE_ORDER[@]} > 0 )); then
+        for i in "${!USB_MODULE_ORDER[@]}"; do
+            [[ "${USB_MODULE_ORDER[$i]}" == mediatek.ko ]] || continue
+            [[ "${USB_MODULE_PATHS[$i]}" == */usb/* ]] || \
+                die "usb: mediatek.ko resolved to ${USB_MODULE_PATHS[$i]}, which is not the MUSB glue"
+        done
+    fi
+else
+    log "usb: J36_USB=0, skipping the USB payload"
 fi
 
 # ── The GL runtime, which turned out not to need building ─────────────────────
@@ -3882,6 +4248,30 @@ if (( ${#AUDIO_MODULE_ORDER[@]} > 0 )); then
     log "audio: staged ${#AUDIO_MODULE_ORDER[@]} modules into $PAYREL/audio/"
 fi
 
+# j36/usb/ is the host stack: the PHY, MUSB and its glue, the HID pair and udl.
+# Its own directory and its own load.order on the same terms as the other three,
+# and the removal contract matters here as much as it does for audio, for the
+# same class of reason: this is the payload whose failure mode is a bus stall.
+# An APB access to a clock-gated MediaTek peripheral hangs until the watchdog
+# fires, and while the PHY driver's whole job is to make sure that cannot happen,
+# it has not yet been proved on this board.  Delete this directory from any
+# machine that reads SD cards and j36.usb=1 finds nothing, says so, and the boot
+# carries on.
+#
+# The overlap with j36/mtkdrm/ is deliberate and not a mistake to clean up: udl
+# needs drm_kms_helper and drm_shmem_helper, so both directories carry a copy.
+# Two copies of a 200 KB pair is cheaper than a load order that spans payloads,
+# and run_usb skips whichever of them mtkdrm already loaded.
+if (( ${#USB_MODULE_ORDER[@]} > 0 )); then
+    mkdir -p "$PAYDIR/usb"
+    : > "$PAYDIR/usb/load.order"
+    for i in "${!USB_MODULE_ORDER[@]}"; do
+        cp "${USB_MODULE_PATHS[$i]}" "$PAYDIR/usb/${USB_MODULE_ORDER[$i]}"
+        printf '%s\n' "${USB_MODULE_ORDER[$i]}" >> "$PAYDIR/usb/load.order"
+    done
+    log "usb: staged ${#USB_MODULE_ORDER[@]} modules into $PAYREL/usb/"
+fi
+
 # j36/gl/ is the GL front end plus the links file that stands in for symlinks.  On the
 # OS partition it no longer has to -- ext2 holds symlinks -- and it is kept anyway
 # because /init reads the same file whichever partition the payload came off, and one
@@ -3953,19 +4343,22 @@ initrd=initrd.img
 # Every j36 word is removable on its own: delete one, or the matching directory
 # under /opt/mixos/j36 on the OS partition, and the boot carries straight on.
 # lima gives a render node, mtkdrm a display node, gl puts Mesa ahead of the
-# RK3326 blob, dash runs the MixOS dashboard, audio gives a sound card.
+# RK3326 blob, dash runs the MixOS dashboard, audio gives a sound card, usb
+# brings the one MUSB port up host-only.
 #
 # Only the four files the LK itself reads are on BOOT.  Everything else is in
 # sd-root.tar.gz, unpacked as /opt/mixos on the ext2 OS partition.
 #
 # j36.audio=speaker also powers the class-D amp, which hangs off VBAT -- the
 # system node -- so battery-less it pulls the board under its own lockout.
+# j36.usb=1 sources 5 V off that same VBAT.  Battery-less, or with a hub that
+# has its own supply, say j36.usb=novbus instead.
 # j36.gl=1 stages Mesa quietly.  j36.gl=debug adds Mesa's EGL trace and the full
 # node probes -- it is a diagnostic, not a default: those probes create EGL
 # contexts on lima, and a boot that ends with a frozen kernel and hundreds of
 # libEGL lines is that trace, not the dashboard.  j36.es is the old name for
 # j36.gl.  Drop j36.dash=1 and EmulationStation is neither masked nor replaced.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1 j36.usb=1
 CONF
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
@@ -4009,6 +4402,7 @@ changes nothing else:
   opt/mixos/j36/modules/   lima and its dependencies, plus load.order
   opt/mixos/j36/mtkdrm/    the MT6592 display driver set, plus load.order
   opt/mixos/j36/audio/     the ALSA core and the MT6592 AFE driver, plus load.order
+  opt/mixos/j36/usb/       the USB host stack -- PHY, MUSB, HID, udl -- plus load.order
   opt/mixos/j36/gl/        Mesa's GL front end, plus links
   opt/mixos/j36/eglprobe   -f reports and paints /dev/fb0 with no DRM at all and
                            runs on every boot; the other modes say what can create
@@ -4161,6 +4555,90 @@ j36.audio=speaker
     11 rather than at the vendor's maximum for the same reason.  Recovery from a
     board that will not stay up is to delete j36/audio from the card, or this word
     from mvii/boot.conf, from any machine that reads SD cards.
+
+j36.usb=1
+    Load the USB host stack from j36/usb/: the out-of-tree PHY driver, musb_hdrc
+    and its MediaTek glue, usbhid and hid-generic, and udl.  That is a keyboard, a
+    mouse, a hub, and a DisplayLink adapter as a second DRM node.  Same removal
+    story as the rest: delete the word or the directory and not one line of it is
+    loaded.
+
+    This SoC has exactly ONE USB core -- a MUSB at 0x11200000 -- and no EHCI, OHCI
+    or XHCI at all.  So the single port is the whole bus: whatever you want plugged
+    in at once goes through a hub, and every host controller symbol is refused at
+    kernel-config time rather than left to probe something that is not there.
+
+    IT SOURCES 5 V, off VBAT.  This used to say the opposite, and the old text was
+    wrong for a specific reason worth recording: VBUS on this board is not the
+    MT6322 boost that a phone reference design would use, it is a plain GPIO.  The
+    stock Android kernel proves it in four instructions.  mt_usb_set_vbus(), at
+    0xc052e938 -- located through the __func__ pointer its own printk loads, line
+    60 of MediaTek's musb glue -- does, on the `on' path and nothing else:
+
+      mt_set_gpio_mode(0x8000000f, 0);    ops slot 0x3c, GPIO base + 0x600
+      mt_set_gpio_out (0x8000000f, 1);    ops slot 0x30, GPIO base + 0x400
+
+    0x80000000 is MediaTek's marker on a GPIO_..._PIN constant, stripped by the
+    wrappers before they bounds-check the pad against 0xa8, so the pad is 15 and
+    the drive is active high.  Neither callee has a symbol in that image; both were
+    identified from the ops table by which register they write, and both offsets
+    are ones mt6592_led.c already drives on this board.  Pad 15 is loaded by
+    exactly two functions in the whole 12 MB kernel -- that one and the pad-config
+    routine beside it -- so nothing else here wants it.  The device tree carries it
+    as j36,drvvbus-pad = <15>, and j36_mt6592_usb_phy.ko raises it in .power_on
+    after the host role is forced, and drops it in .power_off.
+
+    So a bus-powered hub now enumerates.  FIT A CELL FIRST, for the same reason as
+    j36.audio=speaker above: the 5 V is a boost off VBAT, and VBAT on this PMIC is
+    the system node.  A bus-powered load on a cell-less board is the same class of
+    load as the class-D amp, which MVII measured pulling VBAT under the
+    undervoltage lockout.  DEVCTL bits 3 and 4 report whether VBUS is valid, which
+    is how to tell whether the port or the hub is carrying it.
+
+j36.usb=novbus
+    The same stack with the pad left exactly as the LK left it -- /init passes
+    vbus=0 to the PHY module, which is where it has to go, because a kernel-cmdline
+    modname.param= reaches built-in modules only and every one of these is
+    loadable.  Two cases want it: no cell fitted, and a self-powered hub, which
+    brings its own 5 V and has no use for the port's.
+
+    It is =m, and loaded from /init rather than built in, for a reason worth knowing
+    before changing it: an APB access to a clock-gated MediaTek peripheral does not
+    fault, it hangs the bus until the watchdog fires.  The PHY driver's .init is the
+    first hardware contact anything in this chain makes -- musb_core calls it before
+    reading a single MUSB register -- and ungating PERI is what it does there.
+    Nothing may probe 0x11200000 before that has run.
+
+    The interrupt is a MEASUREMENT, not a fact.  The MUSB IRQ number is not present
+    anywhere in the stock Android kernel image -- that driver passes no resources
+    and hardcodes the base -- so the device tree carries a best estimate, SPI 64,
+    extrapolated from MT6735's table against this SoC's known MSDC0.  Being wrong is
+    safe and says so: musb simply receives no interrupts and enumeration fails
+    quietly.  The PHY driver scans GICD_ISPENDR across power-on and prints
+
+      GIC INTID nnn became pending: device tree cell is <0 nnn-32 8>
+
+    because an unclaimed level-sensitive line latches pending whether or not it is
+    enabled.  One boot log with something plugged in yields the real number.
+
+j36.usb and HDMI
+    The HDMI on a USB dock is not this SoC's -- MT6592 has no HDMI or DP encoder of
+    any kind.  It is a DisplayLink chip, and the whole path is drivers/usb plus
+    udl.ko, which is why the word that switches it on is j36.usb and not a display
+    word.
+
+    Mainline udl speaks the USB 2.0 DL-1x0/DL-1x5 protocol only.  DL-3xxx and later
+    adapters are USB 3.0 and need the out-of-tree evdi driver, which is not here;
+    this port is USB 2.0 high speed, so those are the wrong adapter for this board
+    whatever the driver.
+
+    What you get when it works is a DRM card node with a connected output, listed by
+    run_usb at boot.  PAINTING it is a further step: DRM_FBDEV_EMULATION is off on
+    purpose -- it is a global bool, and turning it on for udl's sake would also make
+    mtk_drm create a second /dev/fb, which is exactly what keeping /dev/fb0 as
+    simplefb's is meant to prevent.  So the dashboard, which draws into /dev/fb0
+    with the CPU, does not appear on the dock by itself.  A compositor or a Qt
+    EGLFS-KMS front end pointed at that card node is what would put it there.
 
 j36.gl=1  (j36.es=1 is the old spelling of the same word)
     Stage j36/gl/ -- Debian's armhf Mesa -- into a tmpfs, so that a program looking
@@ -5023,9 +5501,11 @@ GNU General Public License, version 2 only:
     j36/modules/*.ko        lima and its dependencies -- kernel modules
     j36/mtkdrm/*.ko         mtk_drm, and MixOS's j36_jd9365_panel
     j36/audio/*.ko          the ALSA core, and MixOS's j36_mt6592_audio
+    j36/usb/*.ko            musb and its MediaTek glue, usbhid, udl, and MixOS's
+                            j36_mt6592_usb_phy
     j36_mt6592_input.ko     MixOS's keypad and GPIO key adapter
 
-    The three MixOS modules are GPL-2.0-only deliberately and are not Ms-PL: they
+    The four MixOS modules are GPL-2.0-only deliberately and are not Ms-PL: they
     derive from and link against GPL-2.0-only kernel internals, and Ms-PL is not
     GPL-compatible.
 
@@ -5260,6 +5740,12 @@ SD cards.
   j36/audio            the ALSA core and the MT6592 AFE adapter.  j36.audio=1;
                        j36.audio=speaker also powers the class-D amp, which hangs
                        off VBAT and so needs a cell fitted.
+  j36/usb              the host stack for the one MUSB port: the PHY, musb and its
+                       glue, usbhid, and udl for a DisplayLink dock's HDMI.  The
+                       PHY drives DRVVBUS, so the port sources 5 V off VBAT and a
+                       cell should be fitted; j36.usb=novbus leaves the pad alone.
+                       Two modules here also live in j36/mtkdrm; whichever loaded
+                       first wins.                             j36.usb=1
   j36/gl               Mesa's GL front end, bind-mounted at /run/j36/gl ahead of
                        the rootfs's RK3326 Mali blob.  links/ records the SONAME
                        aliases, kept from when this payload was on FAT.  j36.gl=1
