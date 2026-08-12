@@ -5523,7 +5523,8 @@ changes nothing else:
   opt/mixos/j36/audio/     the ALSA core and the MT6592 AFE driver, plus load.order
   opt/mixos/j36/usb/       the USB host stack -- PHY, MUSB, HID, udl, and the disk
                            set (scsi_mod, sd_mod, usb-storage, ntfs3) -- plus load.order
-  opt/mixos/j36/power/     the MT6592 PMIC: battery gauge, charger, poweroff
+  opt/mixos/j36/power/     the MT6592 PMIC: battery gauge, charger, poweroff --
+                           and the panel backlight, which is the same subject
   opt/mixos/j36/gl/        Mesa's GL front end, plus links
   opt/mixos/j36/eglprobe   -f reports and paints /dev/fb0 with no DRM at all and
                            runs on every boot; the other modes say what can create
@@ -5806,8 +5807,23 @@ j36.usb and HDMI
 
 j36.power=1
     The MT6592 PMIC: the battery gauge, the charger and a poweroff that actually
-    switches the board off.  One module, j36/power/j36_mt6592_pmic.ko, loaded
-    after the USB payload.
+    switches the board off -- and the panel backlight, which is the same subject
+    seen from the other end.  Two modules, j36/power/j36_mt6592_pmic.ko and
+    j36/power/j36_mt6592_backlight.ko, loaded after the USB payload.
+
+    The backlight half registers /sys/class/backlight/j36-backlight, with a
+    max_brightness of 1023 -- the 10-bit duty of the BLS block at 0x1400a000,
+    which is what the LK programs and what the TPS61161 in front of the LED
+    string dims on.  It does not pick a level: it reads the duty the LK left
+    behind and reports that, so brightness starts at whatever the loader handed
+    over.  Nothing in Linux writes the block until something asks for a
+    different number, and the dashboard's Settings -> Display page is what
+    normally does.
+
+    It never blanks by itself -- not at unload, not at shutdown.  The panel is
+    the only output this board has, and a backlight that goes dark when its
+    module is removed is one that can take the machine away from whoever is
+    trying to debug it.
 
     What it registers is two supplies, and their names are load-bearing rather
     than descriptive.  /sys/class/power_supply/battery is what batt_led.service
@@ -6764,10 +6780,10 @@ GNU General Public License, version 2 only:
     j36/usb/*.ko            musb and its MediaTek glue, usbhid, udl, the SCSI and
                             mass-storage set, ntfs3, and MixOS's
                             j36_mt6592_usb_phy
-    j36/power/*.ko          MixOS's j36_mt6592_pmic
+    j36/power/*.ko          MixOS's j36_mt6592_pmic and j36_mt6592_backlight
     j36_mt6592_input.ko     MixOS's keypad and GPIO key adapter
 
-    The five MixOS modules are GPL-2.0-only deliberately and are not Ms-PL: they
+    The six MixOS modules are GPL-2.0-only deliberately and are not Ms-PL: they
     derive from and link against GPL-2.0-only kernel internals, and Ms-PL is not
     GPL-compatible.
 
