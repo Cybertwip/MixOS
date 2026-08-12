@@ -1736,6 +1736,66 @@ QStringList powerSupplies()
     return out;
 }
 
+/*
+ * ONE SUPPLY OF A GIVEN TYPE, asked for rather than named.  The PMIC driver
+ * registers "battery" and "usb" and nothing else on this board registers either,
+ * but the class is keyed on `type' and not on a directory name for a reason: a
+ * USB-attached bank arriving as ucsi-source-psy would defeat a hardcoded name and
+ * does not defeat this.  Empty means no such supply, which on this machine means
+ * the PMIC module did not load.
+ */
+QString supplyOfType(const QString &type)
+{
+    const QString root = "/sys/class/power_supply";
+    const QStringList names = QDir(root).entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &name : names) {
+        if (readTrimmed(root + "/" + name + "/type") == type)
+            return root + "/" + name;
+    }
+    return QString();
+}
+
+/*
+ * A micro-unit attribute rendered in milli-units, because milli is the scale
+ * this board is actually discussed in: 4021 mV and 450 mA are the numbers in the
+ * driver's own logs and on the schematic, and 4.021 V is a number nobody has ever
+ * said out loud about this cell.
+ *
+ * Empty means the attribute is missing OR the driver answered -ENODATA, and those
+ * two collapsing into one answer is deliberate: "no such reading" and "no reading
+ * yet" are both a dash on the glass, and the caller has no different action for
+ * them.  `withSign' prefixes a plus, which matters for exactly one attribute --
+ * current_now is signed and positive INTO the cell, so +412 mA and -412 mA are a
+ * charge and a discharge and not a rounding difference.
+ */
+QString milliUnits(const QString &path, const QString &unit, bool withSign = false)
+{
+    bool ok = false;
+    const qlonglong micro = readTrimmed(path).toLongLong(&ok);
+    if (!ok)
+        return QString();
+    const qlonglong milli = micro / 1000;
+    return (withSign && milli > 0 ? QStringLiteral("+") : QString())
+           + QString::number(milli) + " " + unit;
+}
+
+/*
+ * usb_type, which sysfs writes as the whole SUPPORTED set with the live one in
+ * brackets -- "Unknown SDP [DCP] CDP" -- because the one attribute doubles as the
+ * driver's capability list.  Take what is inside the brackets when there are any
+ * and the whole string when there are not, so this keeps working whichever way
+ * the kernel decides to spell it.
+ */
+QString usbPortType(const QString &base)
+{
+    const QString raw = readTrimmed(base + "/usb_type");
+    const int open = raw.indexOf('[');
+    const int close = raw.indexOf(']', open + 1);
+    if (open >= 0 && close > open)
+        return raw.mid(open + 1, close - open - 1);
+    return raw;
+}
+
 /* Millidegrees, which is the only unit the thermal class speaks. */
 QStringList thermalZones()
 {
@@ -2132,10 +2192,79 @@ void InfoPage::refresh()
     /* ── Power ───────────────────────────────────────────────────────────── */
     addHeader(QStringLiteral("Power"));
 
+    /*
+     * mV and mA throughout, and both halves of every pair on ONE row, because
+     * neither half means anything alone.  A 5040 mV charger over a 4021 mV cell
+     * with +412 mA between them is a board that is charging.  The same two
+     * voltages with 0 mA between them is a board with a cable in and a charger
+     * that never armed -- which is the exact failure this section exists to make
+     * visible from the glass, on a handheld with no serial console attached.
+     *
+     * Two current numbers and they are not the same number: "Charger" carries
+     * what the PORT licensed after BC1.2, "Charging" carries what CHR_CON4 was
+     * then programmed to ask for.  They differ whenever the charger's table has
+     * no exact step for the licence -- a 500 mA SDP becomes the 450 mA step --
+     * and a board charging slower than the wall allows is that gap, which is why
+     * both are on the page rather than one being taken as the other.
+     */
+    const QString batt = supplyOfType(QStringLiteral("Battery"));
+    const QString usb = supplyOfType(QStringLiteral("USB"));
+
     bool charging = false;
     const int cap = SysInfo::batteryCapacity(&charging);
     add("Cell", cap < 0 ? QString("no power_supply class -- see Diagnostics")
                         : QString::number(cap) + "%" + QString(charging ? ", charging" : ""));
+
+    if (!batt.isEmpty()) {
+        const QString mv = milliUnits(batt + "/voltage_now", "mV");
+        const QString ma = milliUnits(batt + "/current_now", "mA", true);
+        QStringList bits;
+        if (!mv.isEmpty())
+            bits << mv;
+        if (!ma.isEmpty())
+            bits << ma + (ma.startsWith('-') ? " out of the cell" : " into the cell");
+        add("Battery", bits.isEmpty() ? QString("no sample yet") : bits.join(", "));
+
+        /*
+         * The IR-corrected open circuit voltage, which is the number the gauge
+         * actually converts to a percentage -- the loaded reading above it can
+         * sit two hundred millivolts lower under a game without the cell having
+         * lost anything.  Seeing the two disagree is normal; seeing them equal
+         * under load means the shunt is reading zero.
+         */
+        const QString ocv = milliUnits(batt + "/voltage_ocv", "mV");
+        if (!ocv.isEmpty())
+            add("Resting", ocv + " open circuit");
+
+        const QString cv = milliUnits(batt + "/constant_charge_voltage", "mV");
+        const QString cc = milliUnits(batt + "/constant_charge_current", "mA");
+        QStringList set;
+        if (!cv.isEmpty())
+            set << cv + " limit";
+        if (!cc.isEmpty())
+            set << cc + " asked for";
+        if (!set.isEmpty())
+            add("Charging", set.join(", "));
+    }
+
+    if (!usb.isEmpty()) {
+        const bool plugged = readTrimmed(usb + "/online") == QLatin1String("1");
+        if (!plugged) {
+            add("Charger", QStringLiteral("no cable"));
+        } else {
+            const QString mv = milliUnits(usb + "/voltage_now", "mV");
+            const QString ma = milliUnits(usb + "/current_max", "mA");
+            const QString port = usbPortType(usb);
+            QStringList bits;
+            bits << (mv.isEmpty() ? QString("cable in") : mv);
+            if (!ma.isEmpty())
+                bits << ma + " allowed";
+            if (!port.isEmpty() && port != QLatin1String("Unknown"))
+                bits << port;
+            add("Charger", bits.join(", "));
+        }
+    }
+
     addList("Supplies", powerSupplies(),
             "nothing in /sys/class/power_supply -- the PMIC has no driver yet");
 

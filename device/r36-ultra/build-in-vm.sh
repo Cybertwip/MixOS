@@ -247,52 +247,101 @@ stash_boot_payload() {
 # it ships the image.  A build root is not a database either way.  --sparse=always
 # keeps the 52 GiB image's holes.
 ROOTFS_SNAPSHOT="$STATE_DIR/rootfs-prefinal.img"
+# ── The second snapshot, and the two hours it is worth ────────────────────────
+#
+# cleanup_filesystem.sh is the single most expensive thing in this build after
+# Debian itself: it apt-removes a hundred -dev packages, autoremoves whatever that
+# orphans, apt-cleans the archive, and then REINSTALLS the hundred and fifty
+# runtime names from needed_packages.txt that the autoremove just took out --
+# every one of those a dpkg pass in an armhf chroot.  Up to two hours.
+#
+# It ran on every build, and not because anything had changed: the image is named
+# after the commit, so a new commit means a $DISK that does not exist, which
+# clears the finalization checkpoint, which re-runs the whole final stage on a
+# rootfs restored from the PRE-cleanup snapshot -- a rootfs that still has all
+# hundred -dev packages on it, so all of that work is genuinely there to do again.
+#
+# So there is a second snapshot, taken the moment cleanup_filesystem.sh returns.
+# Restore that instead and cleanup_filesystem.sh costs nothing at all, by its own
+# logic rather than by being skipped: install_package dpkg-queries the whole list
+# in one go and returns "all already installed", and `apt remove' on packages that
+# are already gone is a no-op.  Nothing is bypassed, so nothing can go stale --
+# the script still runs, still checks, and would still fix anything that had
+# drifted.  That is the whole trick, and it is why this needed no signature file
+# and no "is the cache still valid" logic.
+#
+# What made it possible is the reorder in the finalization stage below:
+# finishing_touches.sh now runs AFTER cleanup_filesystem.sh.  It has to, because
+# some of what it does is not idempotent -- it appends @reboot lines to root's
+# crontab -- so the state that gets cached has to be one where it has not run yet.
+ROOTFS_STRIPPED_SNAPSHOT="$STATE_DIR/rootfs-stripped.img"
 SNAPSHOT_ROOTFS="${DARKOS_R36_SNAPSHOT_ROOTFS:-1}"
 
+# snapshot_rootfs TARGET DESCRIPTION
 snapshot_rootfs() {
-    local need avail
+    local target="$1" what="$2" need avail
     [[ "$SNAPSHOT_ROOTFS" == 1 ]] || return 0
     [[ -f "$FILESYSTEM" ]] || return 0
-    [[ ! -s "$ROOTFS_SNAPSHOT" ]] || return 0
+    [[ ! -s "$target" ]] || return 0
 
     # Allocated bytes, not the 52 GiB apparent size: du's default is disk usage.
     need="$(du -B1 "$FILESYSTEM" 2>/dev/null | cut -f1)"
     need="${need:-0}"
     avail=$(( $(df -Pk "$STATE_DIR" | awk 'NR == 2 { print $4 }') * 1024 ))
     if (( need == 0 || avail < need + 4294967296 )); then
-        log "Not snapshotting the build root: it needs $need bytes and $avail are free"
-        log "The next build from a deleted filesystem will bootstrap Debian again"
+        log "Not snapshotting the $what root: it needs $need bytes and $avail are free"
+        log "The next build from a deleted filesystem will do that work again"
         return 0
     fi
 
-    log "Snapshotting the build root so a later run need not bootstrap Debian again"
+    log "Snapshotting the $what root so a later run need not build it again"
     sync
     # btrfs has a sync of its own that flushes its log trees; ext2 has no log to flush
     # and no such command, so the plain sync above is the whole of it.
     if [[ "$ROOT_FILESYSTEM_FORMAT" == btrfs ]]; then
         mountpoint -q Arkbuild && sudo btrfs filesystem sync Arkbuild 2>/dev/null || true
     fi
-    if ! sudo cp --reflink=auto --sparse=always "$FILESYSTEM" "$ROOTFS_SNAPSHOT.part"; then
+    if ! sudo cp --reflink=auto --sparse=always "$FILESYSTEM" "$target.part"; then
         log "Snapshot failed; continuing without one"
-        sudo rm -f "$ROOTFS_SNAPSHOT.part"
+        sudo rm -f "$target.part"
         return 0
     fi
-    sudo chown "$(id -u):$(id -g)" "$ROOTFS_SNAPSHOT.part"
-    mv -f "$ROOTFS_SNAPSHOT.part" "$ROOTFS_SNAPSHOT"
-    log "Build root snapshot: $(du -h "$ROOTFS_SNAPSHOT" | cut -f1)"
+    sudo chown "$(id -u):$(id -g)" "$target.part"
+    mv -f "$target.part" "$target"
+    log "$what root snapshot: $(du -h "$target" | cut -f1)"
 }
 
 # Only ever called when $FILESYSTEM is missing, which is the one case where a
 # snapshot is not a stale copy of something that already exists.
+#
+# WHICH OF THE TWO, and the rule is `marked userspace': the stripped root has no
+# compiler and no -dev package on it, so it is only the right answer when there is
+# nothing left to compile.  With a userspace component still to build -- an
+# operator who deleted a component-*.done, a new script in the list -- the
+# pre-final root is the only one that can build it, and paying cleanup's two hours
+# afterwards is the price of that.  Getting this backwards would be silent: the
+# checkpoint says build_deps.sh ran, so nothing would reinstall the compiler, and
+# the component build would fail hundreds of packages later.
 restore_rootfs_snapshot() {
-    [[ -s "$ROOTFS_SNAPSHOT" ]] || return 1
+    local source what
     [[ ! -f "$FILESYSTEM" ]] || return 1
     # A finished image is about to be verified and returned; copying ten gigabytes to
     # then exit immediately would be pure waste.  `marked finalization' and not merely
     # the image's existence: image_setup.sh creates $DISK long before it is finished.
     if marked finalization && [[ -s "$DISK" ]]; then return 1; fi
-    log "Restoring the pre-finalization build root; Debian will not be unpacked again"
-    if ! cp --reflink=auto --sparse=always "$ROOTFS_SNAPSHOT" "$FILESYSTEM.part"; then
+
+    if marked userspace && [[ -s "$ROOTFS_STRIPPED_SNAPSHOT" ]]; then
+        source="$ROOTFS_STRIPPED_SNAPSHOT"
+        what="stripped root; neither Debian nor the package cleanup runs again"
+    elif [[ -s "$ROOTFS_SNAPSHOT" ]]; then
+        source="$ROOTFS_SNAPSHOT"
+        what="pre-finalization build root; Debian will not be unpacked again"
+    else
+        return 1
+    fi
+
+    log "Restoring the $what"
+    if ! cp --reflink=auto --sparse=always "$source" "$FILESYSTEM.part"; then
         rm -f "$FILESYSTEM.part"
         return 1
     fi
@@ -566,14 +615,18 @@ discard_foreign_layout() {
     local target have keep part stale_loop recorded
     local rootfs_foreign=0 image_foreign=0 snapshot_ok=0
 
-    for target in "$FILESYSTEM" "$ROOTFS_SNAPSHOT"; do
+    for target in "$FILESYSTEM" "$ROOTFS_SNAPSHOT" "$ROOTFS_STRIPPED_SNAPSHOT"; do
         [[ -s "$target" ]] || continue
         have="$(sudo blkid -o value -s TYPE "$target" 2>/dev/null || true)"
         # No answer at all is not a mismatch: an image mid-write has no superblock yet,
         # and the stages below already handle a build root they cannot mount.
         [[ -n "$have" ]] || continue
         if [[ "$have" == "$ROOT_FILESYSTEM_FORMAT" ]]; then
-            [[ "$target" == "$ROOTFS_SNAPSHOT" ]] && snapshot_ok=1
+            # Either snapshot will do for the "old image, current build root" path
+            # below: both are states restore_rootfs_snapshot knows how to hand the
+            # finalization stage, and it picks between them itself.
+            [[ "$target" == "$ROOTFS_SNAPSHOT" || \
+               "$target" == "$ROOTFS_STRIPPED_SNAPSHOT" ]] && snapshot_ok=1
             continue
         fi
         rootfs_foreign=1
@@ -626,7 +679,8 @@ discard_foreign_layout() {
             [[ -n "$stale_loop" ]] && sudo losetup -d "$stale_loop" 2>/dev/null || true
         done < <(sudo losetup -j "$ROOT/$FILESYSTEM" 2>/dev/null | cut -d: -f1)
         sudo rm -f "$FILESYSTEM" "$FILESYSTEM.part" \
-                   "$ROOTFS_SNAPSHOT" "$ROOTFS_SNAPSHOT.part"
+                   "$ROOTFS_SNAPSHOT" "$ROOTFS_SNAPSHOT.part" \
+                   "$ROOTFS_STRIPPED_SNAPSHOT" "$ROOTFS_STRIPPED_SNAPSHOT.part"
         rm -f "$STATE_DIR"/partition.done "$STATE_DIR"/bootstrap.done \
               "$STATE_DIR"/userspace.done "$STATE_DIR"/component-*.done
     fi
@@ -869,11 +923,29 @@ verify_gui_architecture
 # and unmount the root filesystem. If it fails, the log identifies the exact
 # final script rather than silently starting over.
 if ! marked finalization; then
-    snapshot_rootfs
+    snapshot_rootfs "$ROOTFS_SNAPSHOT" "pre-finalization build"
+    # ── cleanup_filesystem.sh BEFORE finishing_touches.sh ─────────────────────
+    #
+    # It used to be the other way round, and the swap is what makes the stripped
+    # snapshot above possible: the cached state has to be one where nothing
+    # non-idempotent has run yet, and finishing_touches.sh appends to root's
+    # crontab, so re-running it on its own output would add a second @reboot line
+    # per build.  cleanup_filesystem.sh, by contrast, is safe to run any number of
+    # times -- it asks dpkg what is installed before it does anything.
+    #
+    # It is also the better order on its own merits.  cleanup's `apt remove' and
+    # `apt autoremove' pull out packages and run their maintainer scripts, which
+    # is exactly the kind of thing that can undo a `systemctl enable'; doing that
+    # first and configuring afterwards means the configuration is the last word.
+    #
+    # Neither script needs the other's output.  finishing_touches.sh makes its own
+    # loop device for the DATA partition (LOOP_ROM, at its line 461) and does not
+    # read anything cleanup writes; cleanup wants $extension from build_sdl2.sh,
+    # which the userspace stage above has already resolved.
     final_scripts=(
         device/r36-ultra/install_boot.sh
-        finishing_touches.sh
         cleanup_filesystem.sh
+        finishing_touches.sh
         write_rootfs.sh
         clean_mounts.sh
         device/r36-ultra/verify_boot.sh
@@ -890,6 +962,13 @@ if ! marked finalization; then
         printf '%s\n' "final:$script" > "$CURRENT_STAGE"
         log "Running final image stage: $script"
         source "./$script" || fail "$script failed"
+        # The one moment the rootfs holds exactly what ships and nothing has been
+        # written into it that a second run would write again.  After this,
+        # finishing_touches.sh configures it and write_rootfs.sh shrinks it to
+        # minimum size; neither state is one a later build can start from.
+        if [[ "$script" == cleanup_filesystem.sh ]]; then
+            snapshot_rootfs "$ROOTFS_STRIPPED_SNAPSHOT" "stripped"
+        fi
     done
     mark finalization
 fi

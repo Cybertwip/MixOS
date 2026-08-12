@@ -1261,6 +1261,71 @@ def generate(sources: dict[str, str]) -> str:
 \t}};
 
 \t/*
+\t * The MT6323 PMIC: battery gauge, charger and power-off.
+\t *
+\t * No reg, for the same reason gamepad-input below has none. This driver owns
+\t * no window at all -- the PMIC is not on any bus Linux can see, and every one
+\t * of its registers is reached by handing a 16-bit address to the PMIC wrapper
+\t * and waiting for the bridge to retire it. The four phandles are the four
+\t * blocks it borrows, and j36,pwrap-controller is the only one it cannot work
+\t * without: the AUXADC channels the gauge samples, the CHR_CON charger bank it
+\t * arms, the BC1.2 comparator that decides how many milliamps the wall will
+\t * give us, and the RTC latch that cuts the rail on poweroff are all on the
+\t * far side of it.
+\t *
+\t * j36,usb-phy-controller and j36,pericfg-controller are a pair, and a node
+\t * that names one without the other gets neither. BC1.2 needs exactly one bit
+\t * on the SoC side -- rg_usb20_gpio_ctl in the PHY's 0x1a, which hands D+/D-
+\t * to the PMIC's comparator -- and that register is behind the PERI clock gate
+\t * at 0x10003010. Reading a gated MediaTek peripheral does not fault; it
+\t * stalls the APB until the watchdog resets the board, so the driver clears
+\t * the gate itself before the first access and skips charger detection
+\t * entirely if it was not given the means to. The cost of skipping it is one
+\t * conservative input limit, not a dead port.
+\t *
+\t * j36,gpio-controller with j36,drvvbus-pad is the host-mode interlock, and it
+\t * is the same pad 15 as on usb_phy above, deliberately duplicated rather than
+\t * shared through a driver-to-driver call. When the port is a host, that pad
+\t * drives our own 5 V onto VBUS, and CHRDET inside the PMIC cannot tell our
+\t * boost from a charger -- it would arm the charger against a rail we are
+\t * sourcing. So the PMIC reads the pad's mode, direction and output value
+\t * directly, three register reads a second, and while it is asserted the
+\t * charger stays disarmed and the supply reports offline. Reading a pad costs
+\t * nothing and creates no ordering between the two modules; a symbol
+\t * dependency would.
+\t *
+\t * poll-interval-ms is the gauge cadence. A second is slow enough that the
+\t * AUXADC work is invisible and fast enough that the coulomb integrator, which
+\t * multiplies the measured current by the time since the previous sample,
+\t * never has to trust a long gap. The driver clamps whatever it is given to
+\t * 200..10000 ms, and a poll_ms= module argument overrides this.
+\t *
+\t * status is \"okay\" and costs nothing on a boot without the j36.power word,
+\t * the same as audio and the panel: with no module loaded there is nothing to
+\t * bind to the node.
+\t *
+\t * ONE FACT ABOUT THIS BOARD EXPLAINS MOST OF THE DRIVER. There is no
+\t * power-path FET, so VBAT is the system node, not a battery-only rail. Every
+\t * live ADC channel measures what the whole board is doing, the terminal
+\t * voltage moves with the amplifier and the backlight rather than with charge
+\t * state, and a cell-less board sitting on a charger reads a full battery.
+\t * That is why the gauge is seeded from the hardware OCV latch the PMIC
+\t * captured at wakeup, why current comes from a differential across the sense
+\t * resistor rather than from the rail, why the charge voltage is only ever
+\t * raised, and why the battery supply has no PRESENT property to lie with.
+\t */
+\tpmic: pmic {{
+\t\tcompatible = \"j36,j36-ultra-pmic\";
+\t\tj36,pwrap-controller = <&pwrap>;
+\t\tj36,usb-phy-controller = <&usb_phy>;
+\t\tj36,pericfg-controller = <&pericfg>;
+\t\tj36,gpio-controller = <&gpio>;
+\t\tj36,drvvbus-pad = <15>;
+\t\tpoll-interval-ms = <1000>;
+\t\tstatus = \"okay\";
+\t}};
+
+\t/*
 \t * The Mali-450 MP4, for DRM lima.
 \t *
 \t * Every number here was read out of hardware descriptions this board

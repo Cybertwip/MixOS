@@ -665,6 +665,24 @@ for symbol in USB_GADGET USB_EHCI_HCD USB_OHCI_HCD USB_XHCI_HCD \
     config_n "$symbol"
 done
 
+# ── The power supply class, for the PMIC ──────────────────────────────────────
+#
+# =y and not =m, which is the opposite of the rule everything else in this file
+# follows, and the reason is that this is a class rather than a driver.  It
+# registers no hardware, touches nothing at boot and costs a few kilobytes; what
+# it provides is /sys/class/power_supply and the registration entry points that
+# j36_mt6592_pmic.ko -- which IS =m, and staged behind j36.power -- links
+# against.  A modular class would mean a second file in load.order for no gain
+# and one more thing to get out of order.
+#
+# It is asked for by name rather than left to arrive by dependency because
+# nothing else in this configuration selects it.  multi_v7_defconfig gets it
+# from battery and charger drivers for boards that are not this one, so a future
+# ARCH prune taking those out would take the class with them, and the failure
+# would surface as a PMIC module that builds fine and fails to insmod with
+# unresolved symbols on the board.
+config_y POWER_SUPPLY
+
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
     CROSS_COMPILE=arm-linux-gnueabihf- olddefconfig
 
@@ -702,7 +720,7 @@ for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 DEVTMPFS DEVTMPFS_MOUNT TMPFS TMPFS_XATTR TMPFS_POSIX_ACL \
                 PROC_FS PROC_SYSCTL SYSFS \
                 EXT2_FS_XATTR EXT2_FS_POSIX_ACL BTRFS_FS_POSIX_ACL \
-                DRM DEVMEM SOUND \
+                DRM DEVMEM SOUND POWER_SUPPLY \
                 USB_SUPPORT USB_PHY GENERIC_PHY HID_SUPPORT \
                 USB_MUSB_HOST MUSB_PIO_ONLY USB_ANNOUNCE_NEW_DEVICES; do
     grep -q "^CONFIG_${required}=y$" "$CONFIG" || \
@@ -961,7 +979,7 @@ verify_armv7_kernel "$ZIMAGE" "the zImage"
 fits_in "$ZIMAGE" $((0x01800000)) "the zImage"
 log "Verified a 32-bit ARMv7 zImage: $(stat -c %s "$ZIMAGE") bytes"
 
-log "Building the out-of-tree J36 modules: the input adapter, the panel, the AFE and the USB PHY"
+log "Building the out-of-tree J36 modules: the input adapter, the panel, the AFE, the USB PHY and the PMIC"
 mkdir -p "$MODULE_SRC"
 rsync -a --delete "$ROOT/device/j36-ultra/linux/" "$MODULE_SRC/"
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
@@ -993,6 +1011,15 @@ verify_arm_elf "$AUDIO_MODULE" "the audio module"
 USB_PHY_MODULE="$MODULE_SRC/j36_mt6592_usb_phy.ko"
 [[ -s "$USB_PHY_MODULE" ]] || die "USB PHY module was not produced"
 verify_arm_elf "$USB_PHY_MODULE" "the USB PHY module"
+# And the PMIC, staged as its own power payload.  It is the only module here that
+# writes registers which outlive a reboot -- the MT6323 charger bank keeps its
+# settings across a warm reset -- which is why it lives behind its own j36.power
+# word rather than in the initramfs, and why it is worth failing the build over a
+# missing .ko rather than discovering it as a silent absence of
+# /sys/class/power_supply/battery on a board that then never reports a charge.
+PMIC_MODULE="$MODULE_SRC/j36_mt6592_pmic.ko"
+[[ -s "$PMIC_MODULE" ]] || die "PMIC module was not produced"
+verify_arm_elf "$PMIC_MODULE" "the PMIC module"
 fits_in "$DTB_OUT/mt6592-j36-ultra.dtb" $((0x00040000)) "the device tree"
 
 if [[ ! -d "$BUSYBOX_SRC/.git" ]]; then
@@ -1398,6 +1425,8 @@ want_audio=0
 audio_speaker=0
 want_usb=0
 usb_vbus=1
+want_power=0
+power_charge=1
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         j36.audio|j36.audio=1)
@@ -1441,6 +1470,28 @@ for arg in $(cat /proc/cmdline); do
         j36.usb=novbus)
             want_usb=1
             usb_vbus=0
+            ;;
+        # The PMIC: the battery gauge, the charger and a poweroff that actually
+        # cuts the rail.  Behind a word like the rest, and for the sharpest
+        # version of the usual reason -- this is the only payload that writes
+        # registers a reboot does not clear.  The MT6323 charger bank keeps its
+        # constant voltage, its current-sense threshold and its enable bits
+        # across a warm reset, so if the arming sequence here is wrong, the next
+        # boot starts from the wrong state whether or not the module loads.
+        # Dropping the word from boot.conf is the recovery, and it works from
+        # any machine that reads SD cards.
+        j36.power|j36.power=1)
+            want_power=1
+            ;;
+        # The read-only half.  The gauge samples, the plug edge is reported, the
+        # supplies appear in /sys and poweroff still cuts the rail -- and nothing
+        # in Linux touches CHR_CON, so the charger keeps exactly the settings the
+        # LK left it with.  This is the word to reach for on a board with no cell
+        # fitted, and the one to compare against when something about charging
+        # behaves differently after this driver landed.
+        j36.power=nocharge)
+            want_power=1
+            power_charge=0
             ;;
         # Mesa, staged where the loader will find it ahead of the RK3326 blob.
         # j36.es is the name this word had while EmulationStation was the thing
@@ -1910,6 +1961,78 @@ run_usb() {
         say "usb: the port is sourcing 5 V off VBAT -- fit a cell, or say j36.usb=novbus"
     else
         say "usb: VBUS held off by j36.usb=novbus -- the hub must have its own power"
+    fi
+    return 0
+}
+
+# ── The PMIC, if the command line asks ───────────────────────────────────────
+#
+# One module, and the smallest payload on the card by a wide margin.  What it
+# buys is not small: without it nothing in Linux knows this board has a battery,
+# so the dashboard's meter has nothing to read, batt_led.service has no
+# /sys/class/power_supply/battery/capacity to poll, and `poweroff' halts the CPU
+# with the rail still up -- the board sits there warm until the cell runs out or
+# somebody holds the power button.
+#
+# LOAD IT AFTER USB, not before, and the ordering is real rather than tidiness.
+# The PMIC reads GPIO pad 15 every poll to find out whether this port is
+# sourcing 5 V, because CHRDET cannot tell our own boost from a charger and
+# arming the charger against a rail we are driving is the one genuinely bad
+# outcome available here.  Loading the PHY first means the pad is already in
+# whatever state the boot asked for by the time the first poll looks at it,
+# rather than the driver seeing the LK's state once and reporting a charger that
+# is not there.  It recovers either way -- the interlock is re-read every second
+# -- but the first second of log is worth getting right.
+#
+# j36.power=nocharge becomes charge=0 on the insmod line, for the same reason
+# j36.usb=novbus becomes vbus=0: a kernel-cmdline `modname.param=' only reaches
+# modules built into the image, and this one is loadable.
+run_power() {
+    if ! find_payload; then return 1; fi
+    if [ ! -f "$payload/power/load.order" ]; then
+        say "power: j36.power was asked for but j36/power/load.order is not on the card"
+        return 1
+    fi
+    while IFS= read -r ko; do
+        case "$ko" in ''|'#'*) continue ;; esac
+        args=""
+        case "$ko" in
+            j36_mt6592_pmic.ko)
+                [ "$power_charge" = 1 ] || args="charge=0"
+                ;;
+        esac
+        if insmod "$payload/power/$ko" $args >/tmp/insmod.log 2>&1; then
+            say "power: loaded $ko${args:+ $args}"
+        else
+            say "power: FAILED to load $ko${args:+ $args}"
+            show /tmp/insmod.log
+        fi
+    done < "$payload/power/load.order"
+
+    # The two supplies are the whole test, and they are worth listing by name:
+    # `battery' and `usb' are not arbitrary.  mixdash walks
+    # /sys/class/power_supply/* looking for one whose type is Battery, and
+    # batt_led.service reads /sys/class/power_supply/battery/capacity by that
+    # literal path, so the directory being called `battery' is what makes both
+    # of them work without either one being told about this driver.
+    if [ -d /sys/class/power_supply ]; then
+        say "power supplies:"
+        ls /sys/class/power_supply 2>/dev/null
+    else
+        say "power: no /sys/class/power_supply -- the driver did not register"
+    fi
+
+    # The first capacity reading, said out loud.  It comes from the PMIC's own
+    # wakeup OCV latch rather than from a curve fit against the live rail, which
+    # is the one number on this board that means what it says: there is no
+    # power-path FET here, so VBAT is the system node and every live sample
+    # moves with the backlight and the amp rather than with charge state.
+    if [ -r /sys/class/power_supply/battery/capacity ]; then
+        say "power: battery reads $(cat /sys/class/power_supply/battery/capacity 2>/dev/null)%"
+    fi
+
+    if [ "$power_charge" != 1 ]; then
+        say "power: charger left as the LK set it by j36.power=nocharge"
     fi
     return 0
 }
@@ -3392,8 +3515,8 @@ stage "Checking for an update"
 progress 28
 stage_from_boot
 
-if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || \
-   [ "$want_gl" = 1 ] || [ "$want_audio" = 1 ] || [ "$want_usb" = 1 ]; then
+if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_gl" = 1 ] || \
+   [ "$want_audio" = 1 ] || [ "$want_usb" = 1 ] || [ "$want_power" = 1 ]; then
     # find_payload is called by each of the four rather than once here, so that a card
     # with no payload at all gets one message per word that was asked for, naming the
     # word -- and so that this block does not have to know which of them needs what.
@@ -3433,6 +3556,15 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || \
     if [ "$want_usb" = 1 ]; then
         stage "Starting USB"; detail "MUSB host, hub, HID"
         progress 68; run_usb
+    fi
+    # After USB, and one module, so it costs almost nothing in the bar.  The
+    # order against run_usb is the interlock described on run_power: the PMIC
+    # samples the DRVVBUS pad to decide whether the 5 V on the port is ours, and
+    # letting the PHY set that pad first means the very first poll sees the
+    # truth instead of the LK's leftovers.
+    if [ "$want_power" = 1 ]; then
+        stage "Starting power management"; detail "MT6323 gauge, charger, poweroff"
+        progress 71; run_power
     fi
     if [ "$want_gl" = 1 ]; then
         stage "Staging OpenGL"; detail "Mesa, EGL, GLESv2"
@@ -4086,6 +4218,40 @@ if [[ "${J36_USB:-1}" == 1 ]]; then
     fi
 else
     log "usb: J36_USB=0, skipping the USB payload"
+fi
+
+# The PMIC, which is a payload of exactly one module.
+#
+# j36_mt6592_pmic is out-of-tree and has no depends at all: the power supply
+# class is =y, asserted by name in the config section above, the sys-off handler
+# is core, and everything else it touches it reaches through a phandle and an
+# ioremap.  So the walk finds one file and one file is the whole payload -- which
+# is worth stating, because a load.order with a single line looks like a
+# truncated one.
+#
+# It is a payload rather than an initramfs module for a reason the other four do
+# not have: it is the only one that writes registers a reboot does not clear.
+# The MT6323's charger bank keeps CV, the current-sense threshold and the enable
+# bits across a warm reset, so a bad charger sequence is a state the next boot
+# inherits.  Behind its own word and its own directory, the recovery is the same
+# as for audio -- delete j36/power/ from any machine that reads SD cards, or drop
+# the word, and the board boots with the charger in whatever state the LK left it,
+# which is the state it shipped in.
+POWER_MODULE_PATHS=()
+POWER_MODULE_ORDER=()
+if [[ "${J36_POWER:-1}" == 1 ]]; then
+    set +e
+    collect_modules power POWER_MODULE_ORDER POWER_MODULE_PATHS \
+        j36_mt6592_pmic
+    power_rc=$?
+    set -e
+    if (( power_rc != 0 )); then
+        POWER_MODULE_ORDER=()
+        POWER_MODULE_PATHS=()
+        log "power: modules not staged, see the error above -- the kernel payload is unaffected"
+    fi
+else
+    log "power: J36_POWER=0, skipping the PMIC payload"
 fi
 
 # ── The GL runtime, which turned out not to need building ─────────────────────
@@ -5152,6 +5318,29 @@ if (( ${#USB_MODULE_ORDER[@]} > 0 )); then
     log "usb: staged ${#USB_MODULE_ORDER[@]} modules into $PAYREL/usb/"
 fi
 
+# j36/power/ is the PMIC, and it is the payload with the largest consequence per
+# kilobyte on the card: 40 KB of module is the difference between a dashboard that
+# draws a battery and one that draws nothing, and between a `poweroff' that halts
+# the CPU with the rail still up and one that actually switches the board off.
+#
+# Same removal contract as the rest, and here it is a real recovery rather than a
+# formality.  This is the one payload that programs a charger, and a charger is
+# the one peripheral that can be wrong in a way you cannot see: a bad current
+# limit is a warm battery, not a log line.  Delete this directory, or drop the
+# j36.power word, and nothing in Linux touches CHR_CON again -- the LK's own
+# settings stand, which is how every boot before this driver existed ran.
+# j36.power=nocharge is the middle setting: the gauge and the power-off path stay,
+# and the charger bank is left exactly as found.
+if (( ${#POWER_MODULE_ORDER[@]} > 0 )); then
+    mkdir -p "$PAYDIR/power"
+    : > "$PAYDIR/power/load.order"
+    for i in "${!POWER_MODULE_ORDER[@]}"; do
+        cp "${POWER_MODULE_PATHS[$i]}" "$PAYDIR/power/${POWER_MODULE_ORDER[$i]}"
+        printf '%s\n' "${POWER_MODULE_ORDER[$i]}" >> "$PAYDIR/power/load.order"
+    done
+    log "power: staged ${#POWER_MODULE_ORDER[@]} modules into $PAYREL/power/"
+fi
+
 # j36/gl/ is the GL front end plus the links file that stands in for symlinks.  On the
 # OS partition it no longer has to -- ext2 holds symlinks -- and it is kept anyway
 # because /init reads the same file whichever partition the payload came off, and one
@@ -5237,7 +5426,7 @@ initrd=initrd.img
 # Drop j36.dash=1 and EmulationStation is neither masked nor replaced, and
 # j36.splash=0 boots to text.  loglevel=4 keeps the panel clear until the
 # splash starts; errors and warnings still print, and dmesg keeps the rest.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service systemd.mask=batt_led.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1 j36.usb=1 j36.splash=1
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1 j36.usb=1 j36.power=1 j36.splash=1
 CONF
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
@@ -5284,6 +5473,7 @@ changes nothing else:
   opt/mixos/j36/audio/     the ALSA core and the MT6592 AFE driver, plus load.order
   opt/mixos/j36/usb/       the USB host stack -- PHY, MUSB, HID, udl, and the disk
                            set (scsi_mod, sd_mod, usb-storage, ntfs3) -- plus load.order
+  opt/mixos/j36/power/     the MT6592 PMIC: battery gauge, charger, poweroff
   opt/mixos/j36/gl/        Mesa's GL front end, plus links
   opt/mixos/j36/eglprobe   -f reports and paints /dev/fb0 with no DRM at all and
                            runs on every boot; the other modes say what can create
@@ -5342,21 +5532,36 @@ systemd.mask=firstboot.service
     that partition to exfat, though this kernel still has exfat and vfat built in
     for cards written before the change.
 
-systemd.mask=batt_led.service
+batt_led.service, no longer masked
     The RK3326 battery LED daemon, and the first unit the forwarded log caught:
 
       batt_life_warning.py[829]: FileNotFoundError: [Errno 2] No such file or
         directory: '/sys/class/power_supply/battery/capacity'
       batt_led.service: Scheduled restart job, restart counter is at 21.
 
-    It reads that capacity file and writes /sys/class/gpio/gpio77/value, and this
-    kernel has neither: no power_supply driver for the MT6592 PMIC, and no sysfs
-    GPIO export.  Its unit is Restart=always, RestartSec=2 and
-    StartLimitIntervalSec=0 -- explicitly unbounded -- so it is a Python
-    traceback on the console every 2.3 s for as long as the machine is up.
-    Fitting a cell does not change it; the file is missing because the driver is,
-    and the fix is a power_supply for the MT6592 PMIC, which is also what would
-    make the LED daemon work unmodified.
+    It reads that capacity file and writes /sys/class/gpio/gpio77/value, and for
+    every build up to this one the kernel had neither, so the unit was masked
+    here: Restart=always, RestartSec=2, StartLimitIntervalSec=0 -- explicitly
+    unbounded -- is a Python traceback on the console every 2.3 s for as long as
+    the machine is up.
+
+    Half of that is now fixed rather than masked.  j36.power=1 loads the MT6592
+    PMIC driver, which registers its battery supply under exactly that name, so
+    the capacity file the daemon opens first is there and the traceback is gone.
+    The GPIO half is not: this kernel has no sysfs GPIO export, so the daemon
+    still cannot write gpio77 and still exits -- but it now exits on the LED,
+    which is a bounded and specific failure, and it exits having read a real
+    charge percentage.  It is left unmasked deliberately: a unit that fails on
+    the second thing it tries is evidence that the first thing works, and this is
+    the cheapest standing check that the power_supply registration survived a
+    kernel bump.  Add systemd.mask=batt_led.service back to boot.conf if the
+    noise is not worth it on a particular card; nothing else depends on it.
+
+    Worth knowing when reading its output: with no power-path FET on this board,
+    VBAT is the system node, so the percentage the daemon reads is the gauge's
+    integrated estimate seeded from the PMIC's wakeup OCV latch, not a direct
+    reading of a battery-only rail.  It is honest, and it moves slowly on
+    purpose.
 
     Other RK3326-only units are left alone on purpose: 351mp.service (power LED,
     backlight, amixer), audiopath, audiostate and wifi_importer are all
@@ -5548,6 +5753,67 @@ j36.usb and HDMI
     simplefb's is meant to prevent.  So the dashboard, which draws into /dev/fb0
     with the CPU, does not appear on the dock by itself.  A compositor or a Qt
     EGLFS-KMS front end pointed at that card node is what would put it there.
+
+j36.power=1
+    The MT6592 PMIC: the battery gauge, the charger and a poweroff that actually
+    switches the board off.  One module, j36/power/j36_mt6592_pmic.ko, loaded
+    after the USB payload.
+
+    What it registers is two supplies, and their names are load-bearing rather
+    than descriptive.  /sys/class/power_supply/battery is what batt_led.service
+    opens by that literal path, and it is also what mixdash finds when it walks
+    the directory looking for a supply whose type is Battery -- so calling it
+    `battery' is what makes two programs that know nothing about this driver work
+    unmodified.  Beside it, /sys/class/power_supply/usb reports online,
+    usb_type (SDP, CDP, DCP or an Apple brick) and current_max, which is what the
+    BC1.2 handshake decided the wall will actually give us.
+
+    THE ONE FACT THAT EXPLAINS THE REST: this board has no power-path FET, so
+    VBAT is the system node rather than a battery-only rail.  Every live ADC
+    channel measures what the whole board is doing at that instant -- the
+    backlight, the amp, the GPU -- not the state of the cell.  So the gauge does
+    not read a voltage and look it up in a curve.  It seeds from the OCV the PMIC
+    latched at wakeup, when nothing was running, and from there integrates
+    current measured as a differential across the sense resistor.  The percentage
+    moves slowly and does not jump when the backlight changes, which is the point.
+    There is deliberately no PRESENT property: with VBAT tied to VSYS there is no
+    honest way to answer it, and a battery supply that claims a cell is fitted
+    when none is would be worse than one that declines to say.
+
+    poweroff goes through the PMIC's RTC BBPU latch, unlocked with the two key
+    words and retired through the wrapper's busy flag.  Without this module,
+    `poweroff' reaches the end of systemd's shutdown and halts the CPU with the
+    rail still up: the panel goes dark and the board stays warm until somebody
+    holds the power button.  Pass poweroff=0 to the module to keep the old
+    behaviour.
+
+    The charger is armed once per plug event, at the limit BC1.2 negotiated, and
+    the constant voltage is only ever raised -- never lowered below the node,
+    because lowering it on a board where VBAT is VSYS is a way to brown out the
+    machine you are charging.  If it was given no pericfg/usb-phy pair in the
+    device tree it cannot run BC1.2 at all and falls back to a conservative
+    limit; that is a working charger, just a slow one.
+
+    While the USB port is sourcing 5 V -- j36.usb=1 without novbus -- the charger
+    is disarmed and the supply reports offline, because CHRDET inside the PMIC
+    cannot tell our own boost from a wall charger.  The driver reads GPIO pad 15
+    directly to find out, three registers per poll, which is why it loads after
+    the PHY rather than before.
+
+j36.power=nocharge
+    Everything above except CHR_CON.  The gauge samples, the supplies appear, the
+    plug edge is reported and poweroff still cuts the rail -- and the charger
+    keeps exactly the settings the LK left it with.  Two cases want it: a board
+    with no cell fitted, and any session where the question is whether a change
+    in charging behaviour came from this driver.  /init translates it to charge=0
+    on the insmod line, the same mechanism and the same reason as j36.usb=novbus.
+
+    Deleting j36/power/ from the card is the harder version of the same thing and
+    works from any machine that reads SD cards.  It is worth knowing that this is
+    the only payload whose writes outlive a reboot: the MT6323 charger bank keeps
+    its CV, its current-sense threshold and its enable bits across a warm reset,
+    so a boot without the word starts from whatever the last boot with it left
+    behind, not from a clean slate.
 
 j36.gl=1  (j36.es=1 is the old spelling of the same word)
     Stage j36/gl/ -- Debian's armhf Mesa -- into a tmpfs, so that a program looking
@@ -6448,9 +6714,10 @@ GNU General Public License, version 2 only:
     j36/usb/*.ko            musb and its MediaTek glue, usbhid, udl, the SCSI and
                             mass-storage set, ntfs3, and MixOS's
                             j36_mt6592_usb_phy
+    j36/power/*.ko          MixOS's j36_mt6592_pmic
     j36_mt6592_input.ko     MixOS's keypad and GPIO key adapter
 
-    The four MixOS modules are GPL-2.0-only deliberately and are not Ms-PL: they
+    The five MixOS modules are GPL-2.0-only deliberately and are not Ms-PL: they
     derive from and link against GPL-2.0-only kernel internals, and Ms-PL is not
     GPL-compatible.
 
