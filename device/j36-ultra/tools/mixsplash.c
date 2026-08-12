@@ -1039,6 +1039,7 @@ static int msgs_next(struct msgs *m, char *line, size_t linesz)
 {
     char *nl;
     ssize_t got;
+    size_t space;
 
     for (;;) {
         nl = memchr(m->buf, '\n', m->len);
@@ -1054,21 +1055,34 @@ static int msgs_next(struct msgs *m, char *line, size_t linesz)
         if (m->fd < 0)
             return 0;
         /*
+         * ── SATURATE FIRST, THEN DECIDE ──
+         *
+         * This line is dead code and it is here on purpose.  m->len is only ever
+         * assigned bytes that fit, so it cannot exceed the buffer -- but GCC does
+         * not know that, because it does not know read() returns no more than the
+         * count it was given, and it re-enters this loop with whatever range that
+         * leaves.  Under -O2 the fortified read() then reports writing "528 or
+         * more bytes into a region of size 512": that number is not a real code
+         * path, it is what `sizeof(m->buf) - m->len' looks like once len is
+         * allowed to be bigger than the buffer and the subtraction wraps.
+         *
+         * A comparison cannot fix that, and `>=' in place of `==' did not: a test
+         * that RETURNS on the bad range still leaves the compiler carrying it into
+         * the next iteration.  An assignment ends the range instead of branching
+         * on it, so everything below is provably 0..512 and the read gets a count
+         * it can check.  One redundant compare per line of splash text is a fair
+         * price for a clean build.
+         */
+        if (m->len > sizeof(m->buf))
+            m->len = sizeof(m->buf);
+
+        /*
          * A writer with no newline in half a kilobyte.  Take what is there rather
          * than wedging: the alternative is a splash that stops updating because
-         * somebody echoed -n.
-         *
-         * `>=' AND NOT `==', which is the same test for every value m->len can
-         * actually hold and a different one for the compiler.  Past an equality
-         * test GCC still has to assume len could be larger than the buffer, so
-         * the `sizeof(m->buf) - m->len' below is an expression it reads as capable
-         * of wrapping to something enormous -- and it says so, at -O2, as a
-         * stringop-overflow on the read.  A `>=' bounds the variable instead of
-         * excluding one value from it, and the arithmetic after it is provably in
-         * range.  The clamp is against sizeof(m->buf) rather than against m->len
-         * for the same reason: what limits the copy is the buffer, not the count.
+         * somebody echoed -n.  The clamp is against sizeof(m->buf) and not against
+         * m->len because what limits the copy is the buffer, not the count.
          */
-        if (m->len >= sizeof(m->buf)) {
+        if (m->len == sizeof(m->buf)) {
             size_t copy = sizeof(m->buf) < linesz - 1 ? sizeof(m->buf) : linesz - 1;
 
             memcpy(line, m->buf, copy);
@@ -1087,9 +1101,15 @@ static int msgs_next(struct msgs *m, char *line, size_t linesz)
                 m->len = 0;
             }
         }
-        got = read(m->fd, m->buf + m->len, sizeof(m->buf) - m->len);
+        space = sizeof(m->buf) - m->len;
+        got = read(m->fd, m->buf + m->len, space);
         if (got <= 0)
             return 0;
+        /* read() cannot return more than it was asked for.  Said out loud so the
+         * count that comes back is bounded on the way in to the next iteration,
+         * which is where the saturate above got its bad range from. */
+        if ((size_t)got > space)
+            got = (ssize_t)space;
         m->len += (size_t)got;
         m->pos += got;
     }
