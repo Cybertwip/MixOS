@@ -520,6 +520,7 @@ struct j36_pmic {
 	ktime_t soc_car_time;
 	ktime_t soc_charge_time;
 	unsigned int full_count;
+	unsigned int recharge_count;	/* consecutive samples under the recharge line */
 	bool topoff_seen;
 	bool charge_full;
 
@@ -1556,9 +1557,9 @@ static void j36_charger_arm(struct j36_pmic *p, bool online)
 
 /*
  * The termination ladder.  Full is a sequence, not a threshold: six consecutive
- * samples under 150 mA, and only after the node has been seen at or above the
- * top-off voltage at least once in this charge run.  Once full, only dropping
- * below the recharge voltage clears it.
+ * samples within 150 mA of zero, and only after the node has been seen at or
+ * above the top-off voltage at least once in this charge run.  Once full, only
+ * dropping below the recharge voltage clears it.
  */
 static void j36_ladder_advance(struct j36_pmic *p, bool online, int bat_mv,
 			       int ma, bool ma_valid)
@@ -1567,6 +1568,7 @@ static void j36_ladder_advance(struct j36_pmic *p, bool online, int bat_mv,
 		/* Unplugged: nothing about full is meaningful, and the next plug
 		 * must re-earn top-off from scratch. */
 		p->full_count = 0;
+		p->recharge_count = 0;
 		p->topoff_seen = false;
 		p->charge_full = false;
 		return;
@@ -1576,25 +1578,72 @@ static void j36_ladder_advance(struct j36_pmic *p, bool online, int bat_mv,
 		p->topoff_seen = true;
 
 	if (p->charge_full) {
+		/*
+		 * ── LEAVING FULL IS ALSO A SEQUENCE ──
+		 *
+		 * AND THIS IS THE 99-100-99 FLICKER.  Earning full takes six samples
+		 * in a row; losing it took ONE, and the one it took was a comparison
+		 * against 4110 mV of a node that sits only a little above that at the
+		 * charger's setpoint.  A single ADC sample dipping a few counts under
+		 * the line therefore threw the latch away, the level fell back to the
+		 * 99% cap, the ladder spent another six seconds re-earning it, and the
+		 * display walked 99 - 100 - 99 forever.
+		 *
+		 * A real recharge is not a sample, it is a condition: the pack has
+		 * genuinely relaxed away from the setpoint and stayed there.  Requiring
+		 * the same six in a row costs six seconds of latency on a transition
+		 * that only matters over hours, and it makes the latch mean what its
+		 * name says.
+		 */
 		if (bat_mv > 0 && bat_mv < J36_RECHARGING_MV) {
-			p->charge_full = false;
-			p->full_count = 0;
+			if (++p->recharge_count >= J36_FULL_CHECK_TIMES) {
+				p->charge_full = false;
+				p->full_count = 0;
+				p->recharge_count = 0;
+				dev_info(p->dev, "battery no longer full (%d mV, under the %d mV recharge line)\n",
+					 bat_mv, J36_RECHARGING_MV);
+			}
+		} else {
+			p->recharge_count = 0;
 		}
 		return;
 	}
+	p->recharge_count = 0;
 
 	if (!p->topoff_seen)
 		return;
 
 	/* An unknown current is not a small current. */
-	if (!ma_valid || ma < 0 || ma > J36_CHARGING_FULL_CURRENT_MA) {
+	if (!ma_valid) {
+		p->full_count = 0;
+		return;
+	}
+
+	/*
+	 * ── A BAND AROUND ZERO, NOT A ONE-SIDED THRESHOLD ──
+	 *
+	 * AND THIS IS WHY THE LEVEL SAT AT 99 AND NEVER MOVED.  At termination the
+	 * charger holds the node at its CV setpoint and the pack takes nothing, so
+	 * what this driver measures is a couple of millivolts across a 68 mOhm
+	 * shunt -- a handful of ADC counts, which is noise, and noise has a sign.
+	 * Rejecting `ma < 0' therefore threw away the negative half of a reading
+	 * centred on zero: the six-in-a-row count was cleared every second or two,
+	 * charge_full could never be earned, and the 99% cap in the gauge -- which
+	 * is only meant to hold until the ladder says otherwise -- had no way out.
+	 *
+	 * What disqualifies a full pack is CURRENT, in either direction.  In means
+	 * it is still filling; more than a trickle out means the charger cannot
+	 * carry the system and the pack is being drained.  Both are the same
+	 * question about magnitude, so one threshold answers both ends of it.
+	 */
+	if (ma > J36_CHARGING_FULL_CURRENT_MA || ma < -J36_CHARGING_FULL_CURRENT_MA) {
 		p->full_count = 0;
 		return;
 	}
 	if (++p->full_count >= J36_FULL_CHECK_TIMES) {
 		p->full_count = 0;
 		p->charge_full = true;
-		dev_info(p->dev, "battery full (six samples under %d mA past top-off)\n",
+		dev_info(p->dev, "battery full (six samples within %d mA of zero past top-off)\n",
 			 J36_CHARGING_FULL_CURRENT_MA);
 	}
 }
@@ -1753,13 +1802,41 @@ static int j36_gauge_percent(struct j36_pmic *p, bool online, int bat_mv,
 		p->soc_slew = now;
 	}
 
+	/*
+	 * ── FULL IS 100, AND THE INTEGRATOR IS TOLD SO ──
+	 *
+	 * The ladder terminating IS what full means on this board: the node has
+	 * been at or above top-off in this run and the pack has taken nothing for
+	 * six samples together.  Against that, the integrator is not the better
+	 * authority -- it has been counting coulombs into a pack that stopped
+	 * accepting them -- so the level is SET to 100 here rather than merely
+	 * displayed as 100 further down.
+	 *
+	 * Setting it matters at the unplug.  A gauge left at, say, 97 while the
+	 * display was forced to 100 would snap back to 97 the moment the cable came
+	 * out, which is the same lie told in the other direction and the one that
+	 * looks like a fault.  Ending the coulomb run with it means a recharge
+	 * cycle re-bases from 100 instead of billing this pin to the accumulator.
+	 *
+	 * It cannot flap: charge_full is cleared only by the pack dropping under
+	 * the recharge voltage, or by the cable coming out, so this pins the level
+	 * for exactly as long as the pack is actually full.
+	 */
+	if (p->charge_full) {
+		p->soc_dep = 0;
+		p->soc_car_base = -1;
+		p->soc_car = 0;
+	}
+
 	p->soc_dep = clamp(p->soc_dep, 0, 100);
 	pct = 100 - p->soc_dep;
 
-	/* 100% is the ladder's word, not the curve's -- stock's
+	/* Short of that, 100% is the ladder's word and not the curve's -- stock's
 	 * mt_battery_100Percent_tracking_check(): "charging is not full, UI keep
 	 * 99% if reaching 100%".  Kept because showing full while still drawing
-	 * current is the one reading an operator will call a lie. */
+	 * current is the one reading an operator will call a lie; it is a holding
+	 * position now rather than a destination, because the ladder above can
+	 * always get out of it. */
 	if (online && !p->charge_full && pct >= 100)
 		pct = 99;
 	return pct;
