@@ -979,7 +979,7 @@ verify_armv7_kernel "$ZIMAGE" "the zImage"
 fits_in "$ZIMAGE" $((0x01800000)) "the zImage"
 log "Verified a 32-bit ARMv7 zImage: $(stat -c %s "$ZIMAGE") bytes"
 
-log "Building the out-of-tree J36 modules: the input adapter, the panel, the AFE, the USB PHY and the PMIC"
+log "Building the out-of-tree J36 modules: the input adapter, the panel, the AFE, the USB PHY, the PMIC and the backlight"
 mkdir -p "$MODULE_SRC"
 rsync -a --delete "$ROOT/device/j36-ultra/linux/" "$MODULE_SRC/"
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
@@ -1020,6 +1020,15 @@ verify_arm_elf "$USB_PHY_MODULE" "the USB PHY module"
 PMIC_MODULE="$MODULE_SRC/j36_mt6592_pmic.ko"
 [[ -s "$PMIC_MODULE" ]] || die "PMIC module was not produced"
 verify_arm_elf "$PMIC_MODULE" "the PMIC module"
+# And the backlight, which rides along in the same power payload.  It is the only
+# module here that the user can see working without reading a log: it is what puts
+# /sys/class/backlight/j36-backlight on the board, and therefore what the
+# dashboard's Display page writes to.  Worth failing the build over for the same
+# reason as the PMIC -- a missing .ko is a load.order line naming a file that is
+# not there, discovered as a brightness slider that does nothing.
+BACKLIGHT_MODULE="$MODULE_SRC/j36_mt6592_backlight.ko"
+[[ -s "$BACKLIGHT_MODULE" ]] || die "backlight module was not produced"
+verify_arm_elf "$BACKLIGHT_MODULE" "the backlight module"
 fits_in "$DTB_OUT/mt6592-j36-ultra.dtb" $((0x00040000)) "the device tree"
 
 if [[ ! -d "$BUSYBOX_SRC/.git" ]]; then
@@ -4220,14 +4229,25 @@ else
     log "usb: J36_USB=0, skipping the USB payload"
 fi
 
-# The PMIC, which is a payload of exactly one module.
+# The PMIC and the backlight, which are a payload of exactly two modules.
 #
-# j36_mt6592_pmic is out-of-tree and has no depends at all: the power supply
-# class is =y, asserted by name in the config section above, the sys-off handler
-# is core, and everything else it touches it reaches through a phandle and an
-# ioremap.  So the walk finds one file and one file is the whole payload -- which
-# is worth stating, because a load.order with a single line looks like a
-# truncated one.
+# Neither has any depends at all: the power supply class and the backlight class
+# are both =y, asserted by name in the config section above, the sys-off handler
+# is core, and everything else either of them touches it reaches through a
+# phandle and an ioremap.  So the walk finds two files and those two files are
+# the whole payload -- which is worth stating, because a load.order with two
+# lines looks like a truncated one.
+#
+# THE BACKLIGHT IS HERE AND NOT WITH mtkdrm, and the reason is what the word
+# means rather than what the block is.  j36.mtkdrm is the modesetting experiment
+# -- it is allowed to be off, and the board still shows a picture without it,
+# because the LK's simple-framebuffer scanout does not need DRM.  Brightness is
+# not part of that experiment: it is the largest single load on this battery, it
+# is the setting a handheld gets asked for first, and it belongs with the word
+# that is about what the board draws.  It also has no relationship to the DRM
+# module set at all -- it binds the BLS block directly and registers a backlight
+# device, so putting it in mtkdrm's load.order would have coupled it to a chain
+# of five modules it neither needs nor is needed by.
 #
 # It is a payload rather than an initramfs module for a reason the other four do
 # not have: it is the only one that writes registers a reboot does not clear.
@@ -4242,7 +4262,7 @@ POWER_MODULE_ORDER=()
 if [[ "${J36_POWER:-1}" == 1 ]]; then
     set +e
     collect_modules power POWER_MODULE_ORDER POWER_MODULE_PATHS \
-        j36_mt6592_pmic
+        j36_mt6592_pmic j36_mt6592_backlight
     power_rc=$?
     set -e
     if (( power_rc != 0 )); then

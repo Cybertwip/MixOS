@@ -710,11 +710,35 @@ def generate(sources: dict[str, str]) -> str:
 \t\t\tstatus = \"okay\";
 \t\t}};
 
+\t\t/*
+\t\t * The BLS -- the panel backlight, and the only brightness control this
+\t\t * board has. j36_mt6592_backlight.ko binds this node and registers
+\t\t * /sys/class/backlight/j36-backlight, which is what the dashboard's
+\t\t * Display page writes to.
+\t\t *
+\t\t * It is NOT a pwm_chip and the #pwm-cells below is a leftover of the
+\t\t * disabled pwm-backlight node further down still naming it. Registering
+\t\t * a real PWM provider here would be the tidier shape and it would buy
+\t\t * nothing: the one consumer on this board is the backlight itself, and
+\t\t * routing it through the PWM core would put pwm-backlight's GPIO
+\t\t * requirement back in the way -- see the comment on that node.
+\t\t *
+\t\t * The two phandles are how the driver reaches the pieces of this block
+\t\t * that are not inside its own register window: the pad, because the PWM
+\t\t * output only leaves the SoC when pad 90 is muxed to mode 1 and there is
+\t\t * no gpiochip driver for MT6592 anywhere to ask, and MMSYS, because the
+\t\t * BLS counter runs behind an MM clock gate. Both are the same
+\t\t * phandle-plus-ioremap idiom j36_mt6592_input and j36_mt6592_usb_phy
+\t\t * already use, and for the same reason: gpiod and the clock framework
+\t\t * both defer forever against providers that bind nothing.
+\t\t */
 \t\tdisp_pwm: pwm@1400a000 {{
 \t\t\tcompatible = \"j36,mt6592-disp-pwm\";
 \t\t\treg = <0x1400a000 0x1000>;
 \t\t\t#pwm-cells = <3>;
 \t\t\tmediatek,pwm-pin = <{backlight_gpio}>;
+\t\t\tj36,gpio-controller = <&gpio>;
+\t\t\tj36,mmsys-controller = <&mmsys>;
 \t\t\tstatus = \"okay\";
 \t\t}};
 
@@ -772,11 +796,17 @@ def generate(sources: dict[str, str]) -> str:
 \t\t\t\t * No backlight phandle, and that is a fix, not an omission.
 \t\t\t\t * drm_panel_of_backlight -> of_find_backlight returns
 \t\t\t\t * -EPROBE_DEFER for as long as the referenced node has not
-\t\t\t\t * registered a backlight device, and the backlight node below is
-\t\t\t\t * disabled precisely because its PWM and GPIO providers have no
-\t\t\t\t * drivers in this profile. A phandle here would defer the panel
-\t\t\t\t * forever, and with it the whole DRM master. The LK switched this
-\t\t\t\t * backlight on before Linux started and nothing here turns it off.
+\t\t\t\t * registered a backlight device. There is one now --
+\t\t\t\t * j36_mt6592_backlight.ko on &disp_pwm -- and that is exactly
+\t\t\t\t * why the phandle is still not here: that module ships in the
+\t\t\t\t * power payload, so a boot without j36.power, or a card with
+\t\t\t\t * j36/power/ deleted, legitimately has no backlight device. A
+\t\t\t\t * phandle would make the panel -- and with it the whole DRM
+\t\t\t\t * master, and /dev/dri/card0 -- conditional on a module that is
+\t\t\t\t * allowed to be absent. The LK switched this backlight on before
+\t\t\t\t * Linux started and nothing here turns it off, so the cost of
+\t\t\t\t * leaving it unlinked is that DPMS does not dim the panel, which
+\t\t\t\t * is a shell's job on this board anyway.
 \t\t\t\t *
 \t\t\t\t * reset-gpios and mediatek,power-gpios are the same story in
 \t\t\t\t * reverse: they record what the LK does, and the panel driver
@@ -1406,12 +1436,15 @@ def generate(sources: dict[str, str]) -> str:
 \t}};
 
 \t/*
-\t * Disabled, and it must stay disabled while this profile has no GPIO or
-\t * PWM driver.
+\t * Disabled, superseded, and kept only as the record of what the hardware
+\t * is wired like.
 \t *
-\t * pwm-backlight consumes two providers that do not exist here: &disp_pwm
-\t * (j36,mt6592-disp-pwm, no driver) and &gpio (j36,mt6592-gpio, no driver).
-\t * An enabled consumer with an unresolvable provider does not fail -- it
+\t * There IS a backlight device on this board now -- j36_mt6592_backlight.ko
+\t * binds &disp_pwm directly and registers it -- but it is emphatically not
+\t * this node. pwm-backlight consumes two providers that still do not exist
+\t * here: a pwm_chip on &disp_pwm, which that driver does not register, and
+\t * a gpiochip on &gpio, which is j36,mt6592-gpio and binds nothing. An
+\t * enabled consumer with an unresolvable provider does not fail -- it
 \t * defers, and keeps deferring until driver_deferred_probe_timeout expires.
 \t * That is the ten-second gap between the last input message at 0.87 s and
 \t *
@@ -1420,6 +1453,10 @@ def generate(sources: dict[str, str]) -> str:
 \t *
 \t * on a board whose backlight the LK already switched on before Linux
 \t * started. The node bought nothing and cost ten seconds of every boot.
+\t *
+\t * brightness-levels stays because it is the measured scale: ten steps of a
+\t * 1023-count duty, which is exactly the range the driver exposes as
+\t * max_brightness.
 \t */
 \tbacklight: backlight {{
 \t\tcompatible = \"pwm-backlight\";

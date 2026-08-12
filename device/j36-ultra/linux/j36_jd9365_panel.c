@@ -22,10 +22,13 @@
  * fail it:
  *
  *   - backlight would be a pwm-backlight on &disp_pwm, which is
- *     j36,mt6592-disp-pwm and binds nothing. of_find_backlight returns
- *     -EPROBE_DEFER until a backlight device registers, which never happens.
- *     The panel node therefore has no backlight phandle and this driver never
- *     calls drm_panel_of_backlight.
+ *     j36,mt6592-disp-pwm and registers no pwm_chip. of_find_backlight returns
+ *     -EPROBE_DEFER until a backlight device registers on the node it was
+ *     pointed at. j36_mt6592_backlight.ko does register one on &disp_pwm now,
+ *     and the phandle is still deliberately absent: that module ships in the
+ *     power payload and is allowed to be missing, so linking to it would make
+ *     the DRM master conditional on it. The panel node therefore has no
+ *     backlight phandle and this driver never calls drm_panel_of_backlight.
  *   - reset-gpios and mediatek,power-gpios point at &gpio, which is
  *     j36,mt6592-gpio and binds nothing either. devm_gpiod_get would defer the
  *     same way, so this driver never asks gpiod for anything. Those properties

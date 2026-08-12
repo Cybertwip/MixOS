@@ -29,6 +29,7 @@
 #define MIXDASH_POINTER_H
 
 #include <QElapsedTimer>
+#include <QEvent>
 #include <QPointF>
 #include <QPointer>
 #include <QWidget>

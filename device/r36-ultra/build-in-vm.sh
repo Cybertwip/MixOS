@@ -274,6 +274,13 @@ ROOTFS_SNAPSHOT="$STATE_DIR/rootfs-prefinal.img"
 # finishing_touches.sh now runs AFTER cleanup_filesystem.sh.  It has to, because
 # some of what it does is not idempotent -- it appends @reboot lines to root's
 # crontab -- so the state that gets cached has to be one where it has not run yet.
+#
+# WHAT A RESTORED RUN LOOKS LIKE IN THE LOG, so it is not read as a fault: cleanup
+# also deletes /var/lib/apt/lists, so its own `apt remove' on the next run cannot
+# resolve those hundred names and prints a screen of "Unable to locate package".
+# There is nothing there to remove -- the snapshot is the state after they were
+# removed -- and every step that matters afterwards asks dpkg directly, which
+# needs no lists.  That noise is what a cleanup with nothing to do looks like.
 ROOTFS_STRIPPED_SNAPSHOT="$STATE_DIR/rootfs-stripped.img"
 SNAPSHOT_ROOTFS="${DARKOS_R36_SNAPSHOT_ROOTFS:-1}"
 
@@ -322,8 +329,14 @@ snapshot_rootfs() {
 # afterwards is the price of that.  Getting this backwards would be silent: the
 # checkpoint says build_deps.sh ran, so nothing would reinstall the compiler, and
 # the component build would fail hundreds of packages later.
+# Whether the build root this run is working on came from the stripped snapshot --
+# read once, at the top of the finalization stage, so a run that started from a
+# rootfs with no compiler on it cannot go on to save that rootfs as the copy a
+# later run compiles from.
+RESTORED_STRIPPED=0
+
 restore_rootfs_snapshot() {
-    local source what
+    local from what
     [[ ! -f "$FILESYSTEM" ]] || return 1
     # A finished image is about to be verified and returned; copying ten gigabytes to
     # then exit immediately would be pure waste.  `marked finalization' and not merely
@@ -331,21 +344,22 @@ restore_rootfs_snapshot() {
     if marked finalization && [[ -s "$DISK" ]]; then return 1; fi
 
     if marked userspace && [[ -s "$ROOTFS_STRIPPED_SNAPSHOT" ]]; then
-        source="$ROOTFS_STRIPPED_SNAPSHOT"
+        from="$ROOTFS_STRIPPED_SNAPSHOT"
         what="stripped root; neither Debian nor the package cleanup runs again"
     elif [[ -s "$ROOTFS_SNAPSHOT" ]]; then
-        source="$ROOTFS_SNAPSHOT"
+        from="$ROOTFS_SNAPSHOT"
         what="pre-finalization build root; Debian will not be unpacked again"
     else
         return 1
     fi
 
     log "Restoring the $what"
-    if ! cp --reflink=auto --sparse=always "$source" "$FILESYSTEM.part"; then
+    if ! cp --reflink=auto --sparse=always "$from" "$FILESYSTEM.part"; then
         rm -f "$FILESYSTEM.part"
         return 1
     fi
     mv -f "$FILESYSTEM.part" "$FILESYSTEM"
+    [[ "$from" == "$ROOTFS_STRIPPED_SNAPSHOT" ]] && RESTORED_STRIPPED=1
     # Finalization is destructive and its checkpoint describes a rootfs that no
     # longer exists in that state.  Everything before it is exactly what the
     # snapshot holds.
@@ -923,7 +937,16 @@ verify_gui_architecture
 # and unmount the root filesystem. If it fails, the log identifies the exact
 # final script rather than silently starting over.
 if ! marked finalization; then
-    snapshot_rootfs "$ROOTFS_SNAPSHOT" "pre-finalization build"
+    # Not when this run started from the stripped root: that copy has no compiler
+    # and no -dev package on it, and saving it under the name the userspace stage
+    # restores from would turn one cached cleanup into a build root that cannot
+    # build anything.  The pre-final snapshot is written by a run that unpacked
+    # Debian, or it is not written at all.
+    if (( RESTORED_STRIPPED )); then
+        log "Started from the stripped root, so it is not saved as a build root"
+    else
+        snapshot_rootfs "$ROOTFS_SNAPSHOT" "pre-finalization build"
+    fi
     # ── cleanup_filesystem.sh BEFORE finishing_touches.sh ─────────────────────
     #
     # It used to be the other way round, and the swap is what makes the stripped
@@ -968,6 +991,17 @@ if ! marked finalization; then
         # minimum size; neither state is one a later build can start from.
         if [[ "$script" == cleanup_filesystem.sh ]]; then
             snapshot_rootfs "$ROOTFS_STRIPPED_SNAPSHOT" "stripped"
+            # cleanup_filesystem.sh ends by deleting the chroot's resolv.conf,
+            # which was right while it was the last thing to touch the chroot and
+            # is not any more: finishing_touches.sh pip-installs `inputs' inside
+            # it, and that needs DNS.  Put it back for the rest of the stage --
+            # after the snapshot, so the cached copy is exactly what cleanup
+            # produced -- and take it away again below, before the rootfs is
+            # written into the image.
+            printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | \
+                sudo tee Arkbuild/etc/resolv.conf >/dev/null
+        elif [[ "$script" == finishing_touches.sh ]]; then
+            sudo rm -f Arkbuild/etc/resolv.conf
         fi
     done
     mark finalization
