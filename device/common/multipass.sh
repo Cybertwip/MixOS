@@ -105,6 +105,13 @@ DARKOS_SYNC_EXCLUDES=(
     '*.img'
     '*.img.7z*'
     'device/r36-ultra/boot-payload/'
+    # Nothing a workstation happens to have made is a build input.  build/ is where
+    # a by-hand run of build-j36-ultra-dtb.sh puts its outputs, .DS_Store is Finder's
+    # and __pycache__ is CPython's -- and this rsync is --delete, so carrying a macOS
+    # .pyc into a Linux VM is worth nobody's second.
+    'build/'
+    '.DS_Store'
+    '__pycache__/'
 )
 
 # darkos_vm_prepare_once NAME STAMP PACKAGE...

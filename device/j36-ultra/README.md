@@ -42,13 +42,20 @@ hardware. The generator's assertions are what turn an MVII pad-mux change into a
 build failure here rather than seven dead keys on the device, and they only mean
 something while they are reading real driver source.
 
-Outputs:
+Outputs — three files, and **not inside this directory**:
 
 ```text
-device/j36-ultra/generated/mt6592-j36-ultra.dts
-device/j36-ultra/generated/mt6592-j36-ultra.dtb
-device/j36-ultra/generated/mt6592-j36-ultra.roundtrip.dts
+$J36_DTB_OUT_DIR/mt6592-j36-ultra.dts
+$J36_DTB_OUT_DIR/mt6592-j36-ultra.dtb
+$J36_DTB_OUT_DIR/mt6592-j36-ultra.roundtrip.dts
 ```
+
+`build-in-vm.sh` sets `J36_DTB_OUT_DIR` to `$J36_WORK_DIR/dtb` inside the VM, and
+that is the copy the image is built from; it runs the generator first thing, before
+the kernel is cloned, so a pad-mux regression costs a second. Run
+`./build-j36-ultra-dtb.sh` by hand with nothing set and the three land in `build/`,
+which is gitignored. They used to default into `device/j36-ultra/generated/`, and the
+DTB that ended up on the card was never that one — it was the VM's.
 
 This is a **bring-up hardware description**, not a complete Linux port. It
 contains the panel timing/init records, power sequence, framebuffer handoff,
@@ -73,7 +80,7 @@ Then append this DTB to the ARM `zImage` before wrapping it as the MediaTek
 
 ```sh
 cat arch/arm/boot/zImage \
-    device/j36-ultra/generated/mt6592-j36-ultra.dtb \
+    "$J36_DTB_OUT_DIR/mt6592-j36-ultra.dtb" \
     > zImage-j36-ultra
 ```
 

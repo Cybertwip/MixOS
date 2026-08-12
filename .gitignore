@@ -14,3 +14,22 @@ rg351/
 *.img
 .img.*
 wget-log*
+
+# Anything generated on a workstation rather than in the VM.  The builds run in
+# Multipass and write into their own work directories in there; this is for the few
+# things that can still be produced by hand outside it.
+/build/
+
+# Finder metadata.  It appears in any directory that has been opened, holds icon
+# positions and nothing else, and there is no way to stop it being written.
+.DS_Store
+
+# Python bytecode.  The build runs its helpers as scripts, which writes none of
+# this, but py_compile and a stray `import' from a debugging session do.
+__pycache__/
+*.py[cod]
+
+# The device tree's three build products.  They were written here by default until
+# build-j36-ultra-dtb.sh learnt to put them under build/ instead; the copy that the
+# image is actually built from has always been the one made inside the VM.
+device/j36-ultra/generated/

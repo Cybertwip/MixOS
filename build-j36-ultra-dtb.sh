@@ -3,8 +3,13 @@
 # Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
 # device/j36-ultra/LICENSE for the full text and for what it does not cover.
 # Generate and compile the J36 Ultra MT6592 bring-up DTB from the MVII board
-# sources vendored under device/j36-ultra/mvii-board. Those are read-only inputs;
-# generated files stay under device/j36-ultra/generated.
+# sources vendored under device/j36-ultra/mvii-board. Those are read-only inputs.
+#
+# NOTHING IS WRITTEN INSIDE device/. The build that matters is build-in-vm.sh's,
+# which runs this with J36_DTB_OUT_DIR pointing into its own work directory in the
+# VM; a run by hand on a workstation lands in build/j36-ultra-dtb instead, which is
+# gitignored. The default used to be device/j36-ultra/generated, and three build
+# products in the middle of the source tree is what that cost.
 #
 # This needs no PowerEngine checkout. The five files the generator parses are
 # committed here, refreshed by device/j36-ultra/sync-mvii-board.sh when the MVII
@@ -13,9 +18,15 @@
 
 set -Eeuo pipefail
 
+# No __pycache__ beside the generator. It is imported by nothing, so this changes
+# nothing about the build -- but py_compile or an `import generate_dts' from a
+# debugging session leaves a .pyc in device/j36-ultra otherwise, and the tree should
+# not depend on nobody having done that.
+export PYTHONDONTWRITEBYTECODE=1
+
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 DRIVERS="${J36_DRIVERS_DIR:-$ROOT/device/j36-ultra/mvii-board}"
-OUT_DIR="${J36_DTB_OUT_DIR:-$ROOT/device/j36-ultra/generated}"
+OUT_DIR="${J36_DTB_OUT_DIR:-$ROOT/build/j36-ultra-dtb}"
 DTS="$OUT_DIR/mt6592-j36-ultra.dts"
 DTB="$OUT_DIR/mt6592-j36-ultra.dtb"
 ROUNDTRIP="$OUT_DIR/mt6592-j36-ultra.roundtrip.dts"

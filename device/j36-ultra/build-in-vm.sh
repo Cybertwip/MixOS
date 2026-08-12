@@ -7,6 +7,12 @@
 
 set -Eeuo pipefail
 
+# Every python helper here is run as a script, which writes no bytecode -- but this
+# script is also runnable straight out of a checkout on a Linux box, and one stray
+# `import' would then leave a __pycache__ in device/j36-ultra.  Build products belong
+# in $WORK, not in the tree.
+export PYTHONDONTWRITEBYTECODE=1
+
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 WORK="${J36_WORK_DIR:-$HOME/j36-ultra-work}"
 # The MVII board sources are vendored in this checkout, so nothing here reaches
@@ -51,6 +57,24 @@ if [[ ! -f "$WORK/.deps-installed" ]]; then
         python3 rsync xz-utils
     touch "$WORK/.deps-installed"
 fi
+
+# ── the device tree, first, and in here rather than on the workstation ─────────
+#
+# FIRST, because the generator asserts on the JD9365 record table and on the keypad
+# pad mux, and those assertions are the whole reason it parses real MVII driver
+# source instead of a frozen JSON.  A pad-mux change that would leave seven keys
+# dead on the device should cost a second, not a kernel build -- so this runs before
+# the kernel is even cloned.  Nothing here depends on the kernel; only dtc, fdtget
+# and python3, which the block above just installed.
+#
+# IN HERE, because it used to run on the workstation as well, in build-j36-ultra.sh,
+# and that copy wrote its three outputs into device/j36-ultra/generated/ -- inside
+# the source tree, on the machine that only edits it.  Nothing consumed them: this
+# is the run whose output is used, into $WORK/dtb in the VM.  The macOS run only
+# dirtied the checkout and demanded dtc and fdtget on a Mac.
+log "Regenerating the J36 DTB from the vendored MVII board sources"
+J36_DRIVERS_DIR="$DRIVERS" J36_DTB_OUT_DIR="$DTB_OUT" \
+    "$ROOT/build-j36-ultra-dtb.sh"
 
 if [[ ! -d "$KERNEL_SRC/.git" ]]; then
     log "Cloning Linux $KERNEL_BRANCH once; later runs reuse this checkout"
@@ -605,10 +629,6 @@ verify_arm_elf "$KERNEL_OUT/vmlinux" "the kernel"
 verify_armv7_kernel "$ZIMAGE" "the zImage"
 fits_in "$ZIMAGE" $((0x01800000)) "the zImage"
 log "Verified a 32-bit ARMv7 zImage: $(stat -c %s "$ZIMAGE") bytes"
-
-log "Regenerating the J36 DTB from the current PowerEngine Drivers"
-J36_DRIVERS_DIR="$DRIVERS" J36_DTB_OUT_DIR="$DTB_OUT" \
-    "$ROOT/build-j36-ultra-dtb.sh"
 
 log "Building the out-of-tree J36 modules: the input adapter, the panel and the AFE"
 mkdir -p "$MODULE_SRC"

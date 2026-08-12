@@ -12,8 +12,12 @@
 # R36 wrapper owns the VM and the base image, this script resumes it, and what is
 # left here is only what is J36-specific:
 #
-#   - the DTB, generated on the host from the vendored MVII board sources;
-#   - the ARMv7 kernel workspace, input module and boot.img built in the VM.
+#   - the ARMv7 kernel workspace, DTB, input module and boot.img built in the VM.
+#
+# Nothing is generated on the workstation.  This script reads the checkout, warns
+# about drift, drives Multipass and copies artifacts out; every file the build makes
+# is made in the VM, under its own work directory, and arrives here only as an
+# artifact under ${ROOT}-artifacts.
 #
 # It is self-contained: no PowerEngine checkout is needed.  The five MVII board
 # files the DTB generator parses are committed at device/j36-ultra/mvii-board and
@@ -130,12 +134,16 @@ if [[ -d "$DRIVERS_HOST" && -f "$BOARD_SRC/PROVENANCE.txt" ]]; then
     fi
 fi
 
-# The DTB is generated on the host from those board sources, and its generator
-# asserts on the panel record table and on the keypad pad mux.  Run it before
-# anything slow: a keymap or pad-mux regression should fail in a second, not after
-# the base image has been rebuilt.
-darkos_log "Regenerating the DTB from the vendored MVII board sources"
-"$ROOT/build-j36-ultra-dtb.sh"
+# THE DTB IS NOT BUILT HERE.  It used to be, and the reason given was a good one --
+# its generator asserts on the JD9365 record table and the keypad pad mux, and those
+# assertions should fail in a second rather than after a base image has been rebuilt.
+# But building it here wrote three files into device/j36-ultra/generated/, inside the
+# checkout, on the one machine in this build that does nothing but edit the checkout;
+# it also asked macOS for dtc, fdtget and python3.  Nothing ever read them: the DTB
+# that ends up in the image is the one build-in-vm.sh generates into its own work
+# directory inside the VM.  So the generation moved there, and moved to the TOP of
+# that script -- before the kernel is even cloned -- which keeps the fast failure and
+# leaves this tree clean.
 
 if [[ "$RESUME_R36" == "1" ]]; then
     darkos_log "Resuming the R36 Ultra base build; completed stages are skipped"
