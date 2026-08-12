@@ -1010,6 +1010,29 @@ static int msgs_open(struct msgs *m, const char *path)
     return 0;
 }
 
+/*
+ * Copy a message into the fixed slot it is drawn from, truncating if it does not
+ * fit.
+ *
+ * snprintf(dst, sizeof dst, "%s", src) did this, and did it correctly, until GCC
+ * started pointing out that a 512-byte line cannot fit a 96-byte slot.  It is
+ * right, and the truncation is the intent: `stage' is one centred line under a
+ * spinner on a 640-pixel panel, so anything past the first few dozen characters
+ * was never going to be drawn whatever this function did with it.  Saying so with
+ * a copy that stops on purpose is clearer than a format string that stops by
+ * accident -- and it keeps printf's parser off a path that runs once per message
+ * on a machine that is still in early boot.
+ */
+static void set_text(char *dst, size_t dstsz, const char *src)
+{
+    size_t n = strlen(src);
+
+    if (n > dstsz - 1)
+        n = dstsz - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 /* Pull whatever is waiting and hand back complete lines one at a time.  Returns
  * 1 and fills `line' when there was one, 0 when there was not. */
 static int msgs_next(struct msgs *m, char *line, size_t linesz)
@@ -1030,12 +1053,26 @@ static int msgs_next(struct msgs *m, char *line, size_t linesz)
         }
         if (m->fd < 0)
             return 0;
-        if (m->len == sizeof(m->buf)) {
-            /* A writer with no newline in half a kilobyte.  Take what is there
-             * rather than wedging: the alternative is a splash that stops
-             * updating because somebody echoed -n. */
-            memcpy(line, m->buf, linesz - 1 < m->len ? linesz - 1 : m->len);
-            line[linesz - 1 < m->len ? linesz - 1 : m->len] = '\0';
+        /*
+         * A writer with no newline in half a kilobyte.  Take what is there rather
+         * than wedging: the alternative is a splash that stops updating because
+         * somebody echoed -n.
+         *
+         * `>=' AND NOT `==', which is the same test for every value m->len can
+         * actually hold and a different one for the compiler.  Past an equality
+         * test GCC still has to assume len could be larger than the buffer, so
+         * the `sizeof(m->buf) - m->len' below is an expression it reads as capable
+         * of wrapping to something enormous -- and it says so, at -O2, as a
+         * stringop-overflow on the read.  A `>=' bounds the variable instead of
+         * excluding one value from it, and the arithmetic after it is provably in
+         * range.  The clamp is against sizeof(m->buf) rather than against m->len
+         * for the same reason: what limits the copy is the buffer, not the count.
+         */
+        if (m->len >= sizeof(m->buf)) {
+            size_t copy = sizeof(m->buf) < linesz - 1 ? sizeof(m->buf) : linesz - 1;
+
+            memcpy(line, m->buf, copy);
+            line[copy] = '\0';
             m->len = 0;
             return 1;
         }
@@ -1197,7 +1234,7 @@ int main(int argc, char **argv)
         msgs.fd = -1;
     }
 
-    snprintf(stage, sizeof(stage), "%s", first_stage);
+    set_text(stage, sizeof(stage), first_stage);
     detail[0] = '\0';
     t0 = now_seconds();
     last_msg = t0;
@@ -1209,10 +1246,10 @@ int main(int argc, char **argv)
         while (msgs_next(&msgs, line, sizeof(line))) {
             last_msg = now_seconds();
             if (!strncmp(line, "stage:", 6)) {
-                snprintf(stage, sizeof(stage), "%s", line + 6);
+                set_text(stage, sizeof(stage), line + 6);
                 detail[0] = '\0';
             } else if (!strncmp(line, "detail:", 7)) {
-                snprintf(detail, sizeof(detail), "%s", line + 7);
+                set_text(detail, sizeof(detail), line + 7);
             } else if (!strncmp(line, "progress:", 9)) {
                 int pc = atoi(line + 9);
                 target = (pc < 0 ? 0 : pc > 100 ? 100 : pc) / 100.0;
@@ -1236,7 +1273,7 @@ int main(int argc, char **argv)
                 handover = 0;
                 g_quit = 1;
             } else if (line[0]) {
-                snprintf(stage, sizeof(stage), "%s", line);
+                set_text(stage, sizeof(stage), line);
                 detail[0] = '\0';
             }
             note("msg %s", line);
