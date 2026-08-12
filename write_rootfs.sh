@@ -72,14 +72,27 @@ elif [[ "${ROOT_FILESYSTEM_FORMAT}" == *"ext"* ]]; then
   # MiB is the number a human compares against STORAGE_SIZE without arithmetic.
   fs_mib=$(( ((fs_blocks * fs_bsize) + 1048575) / 1048576 ))
   echo -e "Root filesystem shrank to ${fs_mib} MB of the ${STORAGE_SIZE} MB partition"
+  # The partition is sized by the rule "the rootfs, rounded up to the next whole
+  # 1000 MB" -- see STORAGE_SIZE in device/r36-ultra/build-in-vm.sh.  It cannot be
+  # applied automatically: the partition table is written in the `image' stage and this
+  # is the first moment the rootfs has a size at all.  So the number is computed here
+  # and the two cases below say it out loud -- one as a failure, one as a warning --
+  # instead of leaving a reader to do the arithmetic.
+  fs_next_step=$(( ((fs_mib + 999) / 1000) * 1000 ))
   if [[ ${fs_mib} -gt ${STORAGE_SIZE} ]]; then
     printf "\n\nThe root filesystem needs %s MB and the partition is %s MB.\n" "${fs_mib}" "${STORAGE_SIZE}"
     printf "btrfs hid this behind compress=zlib:1; ext2 does not compress, so the\n"
-    printf "rootfs now costs what it actually weighs.  Raise STORAGE_SIZE in\n"
-    printf "setup_partition.sh (and in the copy of those values in the device\n"
-    printf "build-in-vm.sh) or take content out of the build root.\n"
-    printf "Refusing to dd over the ROMS partition.  Exiting...\n\n"
+    printf "rootfs now costs what it actually weighs.\n\n"
+    printf "  Set STORAGE_SIZE=%s in device/r36-ultra/build-in-vm.sh\n\n" "${fs_next_step}"
+    printf "That is %s MB rounded up to the next whole 1000 MB, which is the rule this\n" "${fs_mib}"
+    printf "layout is sized by.  setup_partition.sh reads that value, so it is the only\n"
+    printf "place to change.  Taking content out of the build root works too.\n"
+    printf "Refusing to dd over the DATA partition.  Exiting...\n\n"
     exit 1
+  fi
+  if [[ $(( STORAGE_SIZE - fs_mib )) -lt 256 ]]; then
+    echo -e "The OS partition has only $(( STORAGE_SIZE - fs_mib )) MB spare, which the J36 payload alone can fill"
+    echo -e "Set STORAGE_SIZE=$(( fs_next_step + 1000 )) in device/r36-ultra/build-in-vm.sh if the next build fails on space"
   fi
   sudo truncate -s "${fs_mib}M" "${FILESYSTEM}"
   sync
@@ -94,8 +107,12 @@ elif [[ "${ROOT_FILESYSTEM_FORMAT}" == *"ext"* ]]; then
   # journal and every dpkg on the R36S would meet the same wall.
   #
   # Nothing on the device fixes it: firstboot resizes the DATA partition, not this one.
-  # So it is grown here, to the end of its own partition.  The image does not get bigger
-  # in any way that matters -- the blocks this adds are zeros, and 7z is what ships.
+  # So it is grown here, to the end of its own partition.
+  #
+  # The blocks this adds are zeros, and they used to cost nothing because a .7z was what
+  # shipped.  The raw image ships now, so they cost their full size -- which is the whole
+  # reason STORAGE_SIZE is the rootfs rounded up to the next 1000 MB instead of a flat
+  # 7500: unused partition is unused bytes in every copy of the image.
   #
   # The loop device is sizelimited to the partition, so resize2fs cannot run past its end.
   rootfs_loop="$(sudo losetup --find --show \

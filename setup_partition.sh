@@ -71,7 +71,23 @@ DATA_MOUNT_OPTIONS="defaults,auto,noatime,nofail"
 DATA_MOUNT_POINT="/home/virtua"
 
 SYSTEM_SIZE=100      # FAT32 boot partition size in MB
-STORAGE_SIZE=7500    # Root filesystem size in MB
+# The OS partition, and the number that decides how big the shipped image is.
+#
+# HOW 4000 WAS ARRIVED AT, AND THE RULE FOR CHANGING IT.  write_rootfs.sh shrinks the
+# build root to what it actually weighs and prints that: "Root filesystem shrank to
+# 3384 MB".  4000 is that number rounded up to the next whole 1000 MB, which is the
+# rule -- keep the base system compact and give it one round step of headroom, no more.
+# It was 7500, which put 4 GB of zeros in every image and 4 GB of nothing on every card;
+# that cost nothing while btrfs compressed the image and a .7z shipped it, and both of
+# those are gone.  If the rootfs ever outgrows this, write_rootfs.sh refuses to dd over
+# the DATA partition and names the next 1000 MB step to put here.
+#
+# Assigned conditionally so that a caller which already set it wins: this file is
+# sourced by the checkpointed build in device/r36-ultra/build-in-vm.sh, which sets the
+# same geometry for the runs where this stage is skipped.  Two unconditional copies of
+# one number is one number that goes stale, and a build whose partition table and image
+# disagree about where p2 ends writes p2 over p3.
+STORAGE_SIZE="${STORAGE_SIZE:-4000}"    # Root filesystem size in MB
 ROM_PART_SIZE=300    # DATA partition size in MB (ext2, grown by firstboot)
 BUILD_SIZE=52000     # Initial file system size in MB during the build.  Then will be reduced to the DISK_SIZE or below upon completion
 

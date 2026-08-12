@@ -139,7 +139,22 @@ DATA_MOUNT_OPTIONS="defaults,auto,noatime,nofail"
 # The mount point is a home directory, not a rom library -- see setup_partition.sh.
 DATA_MOUNT_POINT="/home/virtua"
 SYSTEM_SIZE=100
-STORAGE_SIZE=7500
+# 4000 MB for the OS partition, not 7500.  write_rootfs.sh reports what the rootfs
+# actually weighs -- "Root filesystem shrank to 3384 MB" -- and 4000 is that rounded up
+# to the next whole 1000 MB: compact base system, one round step of headroom.  The old
+# 7500 put 4 GB of zeros in the image and 4 GB nothing would ever use on the card, which
+# was free only while btrfs compressed the image and a .7z shipped it.  Both are gone, so
+# the image is now 4417 MB instead of 7917 MB and every copy of it is that much shorter.
+#
+# THE RULE IF THE BASE SYSTEM OUTGROWS IT: round up to the next 1000 MB step and change
+# it here.  Nothing has to guess -- write_rootfs.sh refuses to dd a rootfs that would run
+# over the DATA partition and prints the exact value to set.  It cannot be derived
+# automatically, because image_setup.sh writes the partition table in the `image' stage
+# and the rootfs is not measurable until finalization, thousands of packages later.
+#
+# setup_partition.sh reads this rather than setting its own copy (`${STORAGE_SIZE:-4000}'),
+# so the sourced partition stage and the resumed build that skips it cannot disagree.
+STORAGE_SIZE=4000
 ROM_PART_SIZE=300
 BUILD_SIZE=52000
 SYSTEM_PART_START=32768
@@ -441,7 +456,16 @@ verify_gui_architecture() {
 # whether the checkpoints beside it describe the layout it is being asked for.  A
 # finished build writes it; a build from before this existed has no file, which reads
 # as "unknown" and is treated as foreign.
-layout_signature() { printf 'rootfs=%s data=%s\n' "$ROOT_FILESYSTEM_FORMAT" "$DATA_FILESYSTEM_FORMAT"; }
+# The geometry is in here as well as the two formats, because "the layout changed" has
+# to include "the partitions moved".  STORAGE_SIZE went from 7500 to 4000, which shifts
+# where p3 begins; an image built before that is not a smaller version of this one, it is
+# a different card.  Adding the sizes also invalidates every layout file written by an
+# earlier build, which is correct: those all describe the 7500 MB layout.
+layout_signature() {
+    printf 'rootfs=%s data=%s boot=%sMB os=%sMB data_part=%sMB\n' \
+        "$ROOT_FILESYSTEM_FORMAT" "$DATA_FILESYSTEM_FORMAT" \
+        "$SYSTEM_SIZE" "$STORAGE_SIZE" "$ROM_PART_SIZE"
+}
 
 # What is actually IN the finished image, which is the only evidence that survives the
 # build root being deleted -- and the evidence the last run had in front of it and did
@@ -452,21 +476,57 @@ layout_signature() { printf 'rootfs=%s data=%s\n' "$ROOT_FILESYSTEM_FORMAT" "$DA
 # Field 5 is a probe of the partition's contents, not the MBR type byte, so it says
 # ext2 for an ext2 partition even when the table calls it fat32.  An empty field is a
 # partition with no filesystem yet -- an image mid-build -- and is not a mismatch.
+#
+# `unit s' so the boundaries can be compared as well as the filesystems, exactly: the
+# table was written by image_setup.sh with `parted -a min unit s mkpart' from these same
+# numbers, so a match is a match to the sector.  WHY THAT MATTERS: the recorded-signature
+# path below only gets a say once the image has been deleted, and a STORAGE_SIZE change on
+# an UNCOMMITTED tree does not change the image's name -- the name carries the committed
+# id.  So the old 7500 MB image would sit there under exactly the name this build wants,
+# with an ext2 p2 and an ext2 p3, pass the format check, get verified as "finished" and be
+# shipped as though it were the new layout.  Two ext2 partitions in the wrong places is
+# still the wrong card.
+# To within 1 MiB, not exactly: parted is free to nudge a requested boundary to satisfy
+# alignment, and an exact comparison that it ever failed would put this build in a rebuild
+# loop it could not get out of.  The difference being looked for is 7,168,000 sectors --
+# 7500 MB against 4000 -- so 2048 sectors of slack costs nothing and removes the whole
+# class of false positives.  A non-numeric or empty value means parted said something this
+# does not understand, and that is not evidence of anything.
+sectors_agree() {
+    local have="$1" want="$2"
+    [[ "$have" =~ ^[0-9]+$ ]] || return 0
+    (( (have > want ? have - want : want - have) <= 2048 ))
+}
+
 image_layout_is_foreign() {
     local img="$1" num begin end size fs rest
     [[ -s "$img" ]] || return 1
     while IFS=: read -r num begin end size fs rest; do
+        begin="${begin%s}"
+        end="${end%s}"
         case "$num" in
             2)  [[ -n "$fs" && "$fs" != "$ROOT_FILESYSTEM_FORMAT" ]] && {
                     log "$img: the OS partition holds $fs, not $ROOT_FILESYSTEM_FORMAT"
                     return 0
-                } ;;
+                }
+                if ! sectors_agree "$begin" "$STORAGE_PART_START" ||
+                   ! sectors_agree "$end" "$STORAGE_PART_END"; then
+                    log "$img: the OS partition is sectors $begin..$end, and this layout"
+                    log "$img: puts it at $STORAGE_PART_START..$STORAGE_PART_END (${STORAGE_SIZE} MB)"
+                    return 0
+                fi ;;
             3)  [[ -n "$fs" && "$fs" != "$DATA_FILESYSTEM_FORMAT" ]] && {
                     log "$img: the DATA partition holds $fs, not $DATA_FILESYSTEM_FORMAT"
                     return 0
-                } ;;
+                }
+                if ! sectors_agree "$begin" "$ROM_PART_START" ||
+                   ! sectors_agree "$end" "$ROM_PART_END"; then
+                    log "$img: the DATA partition is sectors $begin..$end, and this layout"
+                    log "$img: puts it at $ROM_PART_START..$ROM_PART_END"
+                    return 0
+                fi ;;
         esac
-    done < <(parted -m -s "$img" print 2>/dev/null || true)
+    done < <(parted -m -s "$img" unit s print 2>/dev/null || true)
     return 1
 }
 

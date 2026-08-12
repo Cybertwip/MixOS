@@ -5489,18 +5489,24 @@ IMAGE_STAMP="$WORK/.image-export"
 #
 # WHY THIS IS NEEDED BEFORE ANYTHING CAN BE WRITTEN TO p2.  write_rootfs.sh runs
 # `resize2fs -M' on the build root before it dds it into the image: the filesystem is
-# shrunk to the smallest size that holds its own contents, which is what keeps the
-# released .img compressible.  What that leaves in p2, though, is an ext2 with ZERO free
-# blocks sitting in a 7500 MB partition.  So the payload's first mkdir answered "No space
-# left on device", and every file after it "No such file or directory" -- because its
-# parent directory was the mkdir that had just failed.
+# shrunk to the smallest size that holds its own contents, so that the dd copies what the
+# rootfs weighs rather than the 52 GB build root.  What that leaves in p2, though, is an
+# ext2 with ZERO free blocks in a partition several hundred megabytes bigger than it.  So
+# the payload's first mkdir answered "No space left on device", and every file after it
+# "No such file or directory" -- because its parent directory was the mkdir that had just
+# failed.
 #
 # Nothing on the device fixes it either.  firstboot.service is masked in bootargs, and
 # even unmasked, what it resizes is the DATA partition.  So the filesystem is grown here,
 # to the end of its own partition, which is what both machines want anyway: an OS
-# partition whose filesystem stops 7 GB short of its own end is not a smaller image, it
-# is 7 GB that the running system cannot use.  The loop device is sizelimited to the
-# partition, so `resize2fs' with no size cannot run past the partition's end.
+# partition whose filesystem stops short of its own end is not a smaller image, it is
+# space the running system cannot use.  The loop device is sizelimited to the partition,
+# so `resize2fs' with no size cannot run past the partition's end.
+#
+# The gap is now the rootfs rounded up to the next 1000 MB minus the rootfs -- around
+# 600 MB, where it used to be 4 GB, because STORAGE_SIZE went from 7500 to 4000.  Which
+# is also why this still matters rather than becoming academic: 600 MB is comfortable for
+# /opt/mixos and nothing like enough to be ignored.
 grow_to_partition() {
     local loop="$1" fstype="$2" fsck_rc=0
 

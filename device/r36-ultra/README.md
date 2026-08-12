@@ -131,3 +131,12 @@ fortnight apart from identical sources got different names, and two flashed the 
 afternoon from different commits got the same one. The commit id is also what the boot
 image and the dashboard stamp themselves with, so a running card can be matched to the
 build that made it (`/etc/j36-build`).
+
+Because the raw image is the deliverable, an oversized OS partition is no longer free:
+every unused megabyte of it is a megabyte of zeros in the file, on the card, and in
+every copy either of them travels in. So `STORAGE_SIZE` in `build-in-vm.sh` is sized by
+the rootfs and not by a guess — the number `write_rootfs.sh` prints ("Root filesystem
+shrank to N MB"), rounded up to the next whole 1000 MB. At 3384 MB of rootfs that is
+4000, and the image is 4417 MB rather than the 7917 MB the old flat 7500 produced. If
+the rootfs ever passes it, `write_rootfs.sh` stops the build and names the value to set
+rather than dd'ing p2 over p3.
