@@ -275,7 +275,7 @@ void SettingsPage::rebuild()
           OpenFiles },
         { "Diagnostics", "Display, GPU, input, sound, USB, power", GlyphChip,
           Theme::pink(), OpenDiagnostics },
-        { "System information", "Kernel, memory, framebuffer", GlyphInfo,
+        { "System information", "CPU, memory, disks, USB, network", GlyphInfo,
           Theme::ink3(), OpenSystem }
     };
     for (uint i = 0; i < sizeof(dests) / sizeof(dests[0]); ++i) {

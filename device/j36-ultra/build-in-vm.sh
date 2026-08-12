@@ -260,6 +260,62 @@ for symbol in \
     config_y "$symbol"
 done
 
+# ── The other disks: SCSI, as a module, for USB mass storage only ─────────────
+#
+# A USB stick is a SCSI target.  That is not an analogy: usb-storage registers as
+# a SCSI host adapter, wraps SCSI command blocks in Bulk-Only Transport, and
+# sd_mod claims the LUN and creates /dev/sda.  Drop any one of the three and the
+# port enumerates the device, prints its VID:PID, and produces no block device --
+# which reads in a log exactly like a broken cable.
+#
+# =m FOR ALL THREE, for a reason that has nothing to do with the clock-gate
+# argument the rest of this file keeps making.  Here it is simply the 9 MiB
+# BOOTIMG budget and the containment that goes with it: scsi_mod, sd_mod and
+# usb-storage are ~250 KB together, they are useless without the USB stack that
+# is already =m behind j36.usb=1, and they are staged into j36/usb/ and insmodded
+# by the same run_usb that loads musb.  A boot without the word loads none of it.
+#
+# THE PRUNE IS THE POINT OF THE LOOP.  drivers/scsi is one of the largest menus
+# in the tree and multi_v7_defconfig turns on a dozen entries in it -- HBA drivers
+# for hardware that is not here, the tape and CD-ROM upper layers, the transport
+# attribute helpers.  With SCSI refused outright those all fell out for free; with
+# SCSI back they would return at their defconfig values, so the allowlist is the
+# core, its two hidden helpers, procfs support and sd_mod, and everything else
+# that starts with SCSI_ is turned off by name.  Same shape as the USB and HID
+# prunes further down, and for the same reason: an allowlist is the only kind of
+# list that stays correct across a kernel bump.
+#
+#   BLK_DEV_SR / CHR_DEV_ST / CHR_DEV_SG are the CD, tape and passthrough upper
+#   layers.  None of them is a disk, all three are `default y' under some
+#   dependency defconfig satisfies, and sg in particular hands a raw command
+#   channel to anything that can open the node.
+while IFS='=' read -r option _value; do
+    symbol="${option#CONFIG_}"
+    case "$symbol" in
+        SCSI|SCSI_MOD|SCSI_COMMON|SCSI_DMA|SCSI_PROC_FS) ;;
+        SCSI_*) config_n "$symbol" ;;
+    esac
+done < <(grep -E '^CONFIG_SCSI[A-Z0-9_]*=(y|m)$' "$CONFIG")
+for symbol in BLK_DEV_SR CHR_DEV_ST CHR_DEV_SG; do
+    config_n "$symbol"
+done
+config_m SCSI
+config_m BLK_DEV_SD
+
+# NTFS3, and it is the one filesystem here that is NOT for this card.  Every
+# partition MixOS writes is ext2, vfat or exfat and all three are =y above; this
+# is for the disk somebody plugs in, which on any desk with a Windows machine on
+# it is NTFS more often than not.  ntfs3 is the in-tree read-write driver (the old
+# read-only NTFS_FS was deleted in 6.9, so there is no second option), it selects
+# NLS_UCS2_UTILS for the UTF-16 name conversion, and =m puts it in the same
+# j36/usb/ payload as the stack that will need it -- the card itself never does.
+#
+# A dirty volume -- one Windows fast-booted out of rather than shut down -- is
+# refused read-write by design.  mixos-automount handles that by falling back to
+# a read-only mount rather than forcing it, which is the difference between a
+# disk you can read and a filesystem with two owners.
+config_m NTFS3_FS
+
 # ── What the shared rootfs's PID 1 needs to exist at all ──────────────────────
 #
 # The card mounts, switch_root succeeds, and then systemd 257 aborts:
@@ -533,6 +589,7 @@ while IFS='=' read -r option _value; do
         USB|USB_SUPPORT|USB_COMMON|USB_PHY|USB_HID|USB_ROLE_SWITCH) ;;
         USB_MUSB_HDRC|USB_MUSB_MEDIATEK|USB_MUSB_HOST) ;;
         USB_ANNOUNCE_NEW_DEVICES|USB_DEFAULT_PERSIST) ;;
+        USB_STORAGE) ;;
         USB_*) config_n "$symbol" ;;
     esac
 done < <(grep -E '^CONFIG_USB[A-Z0-9_]*=(y|m)$' "$CONFIG")
@@ -563,6 +620,11 @@ config_m USB_ROLE_SWITCH
 config_m HID
 config_m USB_HID
 config_m HID_GENERIC
+# The mass-storage class driver.  Its two dependencies are settled elsewhere --
+# USB is =m two lines up, SCSI is =m in the storage section -- and =m is the only
+# value it could take anyway with both of them modular.  See that section for why
+# SCSI came back at all.
+config_m USB_STORAGE
 # The USB->HDMI half.  DRM_UDL is asked for here rather than in the DRM section
 # because its dependency is USB, not the display block -- `depends on DRM && USB
 # && MMU'.  DRM is =y, USB is =m, so =m is the only value it can take, which is
@@ -579,12 +641,16 @@ config_m DRM_UDL
 #                   host controller driver for hardware that does not exist.
 #   USB_DWC2/DWC3/  the same, for the three other IP cores an ARM defconfig
 #   CHIPIDEA        commonly carries.  This SoC has MUSB and only MUSB.
-#   USB_STORAGE     it selects SCSI, which is in the disable list at the top of
-#                   this file, and a mass-storage stack is not what was asked
-#                   for.  Refused rather than pruned so the SCSI decision and
-#                   this one cannot silently disagree.
+#   USB_UAS         the OTHER mass-storage protocol, and the one entry here that
+#                   is a judgement rather than absent hardware.  UAS is worth
+#                   having when the controller can queue and stream -- this one
+#                   is MUSB with MUSB_PIO_ONLY, where every byte crosses on the
+#                   CPU and there is nothing for command queueing to overlap.
+#                   What it would add is uas's quirk table and a second protocol
+#                   that has to be blacklisted per enclosure when it misbehaves.
+#                   usb-storage drives the same devices with BOT.
 for symbol in USB_GADGET USB_EHCI_HCD USB_OHCI_HCD USB_XHCI_HCD \
-    USB_DWC2 USB_DWC3 USB_CHIPIDEA USB_STORAGE; do
+    USB_DWC2 USB_DWC3 USB_CHIPIDEA USB_UAS; do
     config_n "$symbol"
 done
 
@@ -741,6 +807,23 @@ for wanted_module in USB USB_COMMON USB_MUSB_HDRC USB_MUSB_MEDIATEK \
         die "CONFIG_${wanted_module}=m was not selected; the USB stack must be modular because an APB access to the clock-gated MUSB window hangs the bus, so nothing may probe before /init has ungated PERI"
 done
 
+# The mass-storage half, asserted as its own list because it fails as a set and in
+# a way that is hard to read on the board: SCSI without BLK_DEV_SD enumerates a
+# target and creates no /dev/sda, BLK_DEV_SD without USB_STORAGE creates the upper
+# layer with no host adapter under it, and either arrangement produces a port that
+# lights the stick's LED and mounts nothing.  =m for all four for the reason in the
+# storage section -- the 9 MiB budget, and the same containment as the rest of the
+# USB payload.
+#
+# NTFS3_FS is in this list rather than with the filesystems above because it is
+# part of the same payload and shares its fate: it is staged into j36/usb/ and
+# insmodded by run_usb, so a build that produced the disk stack without it would
+# mount every plugged-in disk except the ones people actually carry.
+for wanted_module in SCSI BLK_DEV_SD USB_STORAGE NTFS3_FS; do
+    grep -q "^CONFIG_${wanted_module}=m$" "$CONFIG" || \
+        die "CONFIG_${wanted_module}=m was not selected; external USB disks need scsi_mod, sd_mod, usb-storage and ntfs3 together, all modular, staged into j36/usb/"
+done
+
 # No host controller driver may come back, because there is no host controller on
 # this SoC to drive -- MT6592 has one MUSB core and nothing else. =y and =m are
 # both refusals: /init loads modules by filename from a text file, so a stray one
@@ -751,9 +834,20 @@ done
 # of host-only, and the board would then wait for a role switch that nothing
 # performs while the powered hub sits there unenumerated.
 for refused in USB_EHCI_HCD USB_OHCI_HCD USB_XHCI_HCD USB_DWC2 USB_DWC3 \
-               USB_CHIPIDEA USB_GADGET USB_STORAGE; do
+               USB_CHIPIDEA USB_GADGET; do
     if grep -qE "^CONFIG_${refused}=(y|m)$" "$CONFIG"; then
         die "CONFIG_${refused} came back after olddefconfig; MT6592 has exactly one USB core (MUSB at 0x11200000) and it is driven host-only"
+    fi
+done
+
+# The storage refusals, kept apart from the list above because the reasons are
+# different in kind.  ATA is absent hardware.  USB_UAS is a choice -- see the USB
+# section for why BOT is the protocol on a PIO-only controller.  The three upper
+# layers are drivers for device classes nobody is going to plug into a handheld,
+# and CHR_DEV_SG additionally exports a raw SCSI command channel.
+for refused in ATA USB_UAS BLK_DEV_SR CHR_DEV_ST CHR_DEV_SG; do
+    if grep -qE "^CONFIG_${refused}=(y|m)$" "$CONFIG"; then
+        die "CONFIG_${refused} came back after olddefconfig; SCSI is on for USB mass storage only and the rest of that menu stays off"
     fi
 done
 
@@ -770,6 +864,12 @@ log "DRM configuration: $(grep -E '^CONFIG_(DRM|MTK_|PHY_MTK_).*=(y|m)$' "$CONFI
 # -- SOUND=y and four =m -- is the expected shape; a long one means a codec came
 # back and the allowlist needs a look.
 log "Sound configuration: $(grep -E '^CONFIG_(SOUND|SND)[A-Z0-9_]*=(y|m)$' "$CONFIG" | tr '\n' ' ')"
+
+# And for the SCSI menu, which is the newest allowlist in this file and therefore
+# the one most likely to be wrong.  The expected shape is short: SCSI=m, its two
+# hidden helpers, SCSI_PROC_FS and BLK_DEV_SD=m.  Anything else on this line is a
+# driver for hardware that is not in this handheld.
+log "Storage configuration: $(grep -E '^CONFIG_(SCSI|BLK_DEV_SD|BLK_DEV_SR|CHR_DEV_|USB_STORAGE|NTFS3)[A-Z0-9_]*=(y|m)$' "$CONFIG" | tr '\n' ' ')"
 
 log "Building the incremental ARMv7 kernel and its symbol table"
 export CCACHE_DIR="${CCACHE_DIR:-$ROOT/Arkbuild_ccache}"
@@ -935,9 +1035,17 @@ bb_disable() {
 # copied there by hand loses every SONAME symlink and every execute bit.  A tarball
 # does not, so the tarball is what crosses, and this initramfs unpacks it onto the OS
 # partition -- on Linux, as root, where symlinks and modes still mean something.
+# sed and printf were the next two to be missing, and they were missing in the quiet
+# way: both are inside `$( )', so a "not found" goes to stderr and the substitution
+# yields the empty string instead of failing anything.  What that cost was the
+# build-identity check -- setup_dash reads /etc/j36-build with sed to learn which
+# mixdash this boot image expects, got nothing, and skipped passing MIXDASH_EXPECT,
+# so a stale dashboard on the OS partition looked exactly like a current one.  ash
+# has a printf builtin and probably always resolved it; the symlink costs nothing
+# and takes the question away.
 INIT_APPLETS=(sh mount umount mkdir mknod cat cp ln ls tr grep echo sleep dmesg
               insmod hexdump setsid cttyhack switch_root sync poweroff reboot
-              uname chmod rmdir tar gunzip)
+              uname chmod rmdir tar gunzip sed printf)
 
 # Most applets are CONFIG_<applet in caps>; three are not, and guessing would
 # assert a symbol that does not exist, which greps false and dies on a correct
@@ -1757,6 +1865,20 @@ run_usb() {
         ls /sys/class/drm 2>/dev/null
     fi
 
+    # The disk half, reported separately because it fails separately.  A stick that
+    # enumerated shows up in the bus listing above whether or not usb-storage bound
+    # it; what says the mass-storage stack is working is a /dev/sd* node, and what
+    # says a partition table was read is a numbered one beside it.  Nothing is
+    # mounted here -- that is udev's and mixos-automount's job after switch_root,
+    # and a read-only mount from the initramfs would only be in their way.
+    for blk in /dev/sd[a-z]; do
+        if [ ! -b "$blk" ]; then continue; fi
+        say "usb: mass storage is up --"
+        ls -l /dev/sd[a-z] /dev/sd[a-z][0-9]* 2>/dev/null
+        say "     left unmounted on purpose; /media is filled in after switch_root"
+        break
+    done
+
     # Said every time, because VBUS is the single most likely reason for a port
     # that looks dead, and because on this board it is also the one thing in the
     # payload that draws real current off the system rail.  The PHY driver logs
@@ -2402,7 +2524,8 @@ mount_card() {
     if grep -q " /newroot/run/j36/card " /proc/mounts 2>/dev/null; then return 0; fi
 
     # Where the rootfs intends to mount it, read out of its own fstab rather than
-    # assumed.  Pure shell: this initramfs has no awk, sed or cut -- see INIT_APPLETS.
+    # assumed.  Pure shell rather than awk: this initramfs has neither awk nor cut,
+    # and `read' splits a line into fields for free -- see INIT_APPLETS.
     home_mp=""
     if [ -r /newroot/etc/fstab ]; then
         while read -r fs_spec fs_mp fs_rest; do
@@ -2413,8 +2536,16 @@ mount_card() {
     fi
     [ -n "$home_mp" ] || home_mp=/home/virtua
 
+    # mmcblk ONLY, and /dev/sd* was deliberately taken out of this glob.  It used to
+    # be here and it used to be dead: with SCSI refused there was no path by which a
+    # /dev/sda could exist on this board.  There is one now -- usb-storage is in the
+    # j36/usb/ payload and run_usb has already loaded it by the time this runs -- so
+    # a stick left in the port while a card had no home partition would be mounted
+    # read-only as "the card" and the Files page would open on somebody's USB drive.
+    # External disks are not the card.  They are handled after switch_root, by udev
+    # and mixos-automount, and they land under /media with their own names on them.
     mkdir -p /newroot/run/j36/card
-    for dev in /dev/mmcblk*p* /dev/sd*; do
+    for dev in /dev/mmcblk*p*; do
         if [ ! -b "$dev" ]; then continue; fi
         if [ "$dev" = "$rootdev" ] || [ "$dev" = "$bootdev" ]; then continue; fi
         for fs in exfat vfat ext2 ext4 btrfs; do
@@ -2741,6 +2872,407 @@ UNITDBGREPLAY
     return 0
 }
 
+# ── External USB disks, mounted the way every other Linux does it ─────────────
+#
+# WHAT THIS BOARD DID BEFORE.  Nothing.  A stick went in, musb enumerated it, and
+# usb-storage was not in the kernel at all -- SCSI was refused at the top of the
+# build script and the class driver with it -- so the port printed a VID:PID and
+# produced no block device.  That half is fixed in the kernel configuration; this
+# is the other half, and without it a /dev/sda would appear and sit there.
+#
+# THREE FILES AND NOT A DAEMON.  What a desktop distribution runs here is udisks2
+# behind a session bus, a policy engine and a file manager asking it for things.
+# None of those three exists on this image and none of them is needed: udev already
+# runs blkid on every block device that appears, so the filesystem type and the
+# label are known before anything of ours runs, and systemd already tracks device
+# units.  So the whole mechanism is a rule that says "want this unit", a template
+# unit bound to the device, and a shell script that mounts.  Unplug is handled by
+# BindsTo=: when the device unit goes away systemd stops the instance, which runs
+# ExecStop, which unmounts.  Nothing polls.
+#
+# WRITTEN FROM THE INITRAMFS INTO /run, like every other unit this file generates,
+# and here that placement is more than habit.  The kernel modules that make a USB
+# disk possible are on the BOOT partition, in j36/usb/, staged by the same build
+# that produced this initramfs.  Putting the userspace half in the rootfs would let
+# the two drift: a card whose /opt/mixos came from an older sd-root.tar.gz would
+# have the modules and not the rules.  Here they ship and update together, and a
+# card pulled into an R36S carries none of it.
+#
+# WHY IT IS SAFE TO MATCH sd*.  On this SoC there is no SATA, no PATA and no other
+# SCSI host of any kind -- ATA is refused by name in the kernel configuration -- so
+# a /dev/sd* node can only have arrived through usb-storage.  The card itself is
+# mmcblk0 and is never matched.
+setup_automount() {
+    if ! ensure_run_tmpfs; then
+        say "automount: no tmpfs on the rootfs /run, so no rules can be written"
+        return 1
+    fi
+    mkdir -p /newroot/run/j36/bin /newroot/run/udev/rules.d /newroot/run/systemd/system
+
+    # ── the rule ─────────────────────────────────────────────────────────────
+    #
+    # /run/udev/rules.d is read alongside /etc/udev/rules.d and
+    # /usr/lib/udev/rules.d, and this is written before switch_root, so udevd has
+    # not started yet and there is nothing to reload.
+    #
+    # ID_FS_USAGE is what blkid decided the thing is, imported by udev's own
+    # 60-persistent-storage.rules long before a 99- file runs.  "filesystem" is the
+    # one value worth acting on: a partitioned whole disk has no usage at all, a
+    # LUKS container reads "crypto", and a RAID member reads "raid".  Testing it is
+    # what makes one rule handle both a partitioned stick (three events, one per
+    # partition, the disk itself ignored) and a superfloppy-formatted one (one
+    # event, on the disk).
+    #
+    # SYSTEMD_WANTS is the documented hand-off from udev to PID 1 and the reason
+    # there is no RUN+= here.  A RUN+= command runs inside udev's own event worker:
+    # it is killed after 180 s, it cannot survive the event, and mounting from
+    # inside it is a known way to deadlock udev against the mount it just made.
+    # SYSTEMD_WANTS starts a real unit, in its own cgroup, with its own lifetime.
+    cat > /newroot/run/udev/rules.d/99-mixos-automount.rules <<'RULES'
+# Written by the J36 Ultra initramfs, into a tmpfs.  See setup_automount in /init.
+ACTION!="add", GOTO="mixos_automount_end"
+SUBSYSTEM!="block", GOTO="mixos_automount_end"
+# The only SCSI host on this board is usb-storage; there is no ATA and no other.
+KERNEL!="sd[a-z]*", GOTO="mixos_automount_end"
+ENV{ID_FS_USAGE}!="filesystem", GOTO="mixos_automount_end"
+TAG+="systemd"
+ENV{SYSTEMD_WANTS}+="mixos-automount@%k.service"
+LABEL="mixos_automount_end"
+RULES
+
+    # ── the unit ─────────────────────────────────────────────────────────────
+    #
+    # BindsTo AND After on the device unit, which is the whole unplug story.  BindsTo
+    # is what makes the instance stop when the device unit goes away -- and it goes
+    # away the moment udev sees the remove event, whether the disk was pulled or
+    # powered off.  After orders the start so the node exists before ExecStart runs.
+    #
+    # Conflicts=umount.target and Before=umount.target put the unmount in the right
+    # place at shutdown as well, ahead of the point where systemd starts taking
+    # filesystems down itself.
+    #
+    # /bin/sh with the script as an argument, rather than the script as ExecStart:
+    # it lives in /run, and while systemd does not mount /run noexec, a distribution
+    # that decided to would turn this into a permission error at unplug time -- the
+    # one moment there is nobody watching a console.  Running it through sh cannot
+    # care.
+    #
+    # Type=oneshot with RemainAfterExit: the mount outlives the process that made
+    # it, so the unit has to be considered active after ExecStart returns or systemd
+    # would never run ExecStop.
+    cat > /newroot/run/systemd/system/mixos-automount@.service <<'UNITMOUNT'
+# Written by the J36 Ultra initramfs, into a tmpfs.  One instance per volume.
+[Unit]
+Description=Automount the USB volume on %I
+BindsTo=dev-%i.device
+After=dev-%i.device
+DefaultDependencies=no
+Conflicts=umount.target
+Before=umount.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /run/j36/bin/mixos-automount add %I
+ExecStop=/bin/sh /run/j36/bin/mixos-automount remove %I
+# A disk that has been yanked mid-write can take a while to give up its writeback.
+# The script falls back to a lazy unmount, so this is the ceiling on the tidy path
+# rather than on the whole thing.
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+UNITMOUNT
+
+    # ── the script ───────────────────────────────────────────────────────────
+    #
+    # This one runs in the ROOTFS, not in the initramfs, so it is ordinary POSIX
+    # shell with Debian's userland under it -- the applet list in the build script
+    # has nothing to say about it.
+    cat > /newroot/run/j36/bin/mixos-automount <<'AUTOMOUNT'
+#!/bin/sh
+# mixos-automount -- mount and unmount external USB volumes on the J36 Ultra.
+#
+# Written by the initramfs into /run.  Called only by mixos-automount@.service,
+# which udev instantiates for a block device carrying a filesystem:
+#
+#     mixos-automount add    sda1
+#     mixos-automount remove sda1
+#
+# The argument is a KERNEL NAME, never a path.  Everything this script decides is
+# derived from it: /dev/<name> is the node, and the udev database is asked what is
+# on it.  Nothing is passed in from the rule, because a rule's environment does not
+# reach a unit started through SYSTEMD_WANTS.
+#
+# set -f, and it is not decoration.  Splitting a mountinfo line into fields is done
+# with `set -- $line', which is field splitting AND pathname expansion -- and a
+# mount option or a volume label holding a `*' would then be replaced by whatever
+# happens to be in the current directory.  Nothing here wants a glob.
+set -u
+set -f
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+STATEDIR=/run/mixos/volumes
+
+say() { echo "mixos-automount: $*"; }
+
+action="${1:-}"
+name="${2:-}"
+if [ -z "$action" ] || [ -z "$name" ]; then
+    say "usage: mixos-automount add|remove <kernel name>"
+    exit 64
+fi
+# A kernel name and not a path, asserted rather than assumed: everything below
+# builds paths out of it, and this is the only place it can be checked once.
+case "$name" in
+    */*|.|..|"") say "refusing \"$name\": that is not a kernel device name"; exit 64 ;;
+esac
+dev="/dev/$name"
+state="$STATEDIR/$name"
+
+# Every mount point currently carrying $1 as its source, one per line.
+#
+# Parsed out of /proc/self/mountinfo rather than asked of findmnt, for one reason:
+# this runs at unplug, when the device node is already gone.  mountinfo keeps the
+# source as the string it was mounted with, so it still answers; a tool that stats
+# the device does not.  The line splits on " - ", with the mount point as field 5
+# of the front half and the source as field 2 of the back half.
+mounts_of() {
+    _want="$1"
+    while IFS= read -r _line; do
+        case "$_line" in *" - "*) ;; *) continue ;; esac
+        _pre="${_line%% - *}"
+        _post="${_line#* - }"
+        # shellcheck disable=SC2086
+        set -- $_post
+        [ "${2:-}" = "$_want" ] || continue
+        # shellcheck disable=SC2086
+        set -- $_pre
+        [ -n "${5:-}" ] && printf '%s\n' "$5"
+    done < /proc/self/mountinfo
+}
+
+case "$action" in
+add)
+    # What is on it, from the udev database first.  udev has already run blkid for
+    # this device -- that is what set ID_FS_USAGE, which is what made the rule fire
+    # -- so this is a lookup and not a second probe of the disk.  blkid is the
+    # fallback for the case where this was invoked by hand.
+    props="$(udevadm info --query=property --name="$dev" 2>/dev/null || true)"
+    fstype="$(printf '%s\n' "$props" | sed -n 's/^ID_FS_TYPE=//p' | head -n 1)"
+    label="$(printf '%s\n' "$props" | sed -n 's/^ID_FS_LABEL=//p' | head -n 1)"
+    if [ -z "$fstype" ]; then
+        fstype="$(blkid -o value -s TYPE "$dev" 2>/dev/null || true)"
+        label="$(blkid -o value -s LABEL "$dev" 2>/dev/null || true)"
+    fi
+    if [ -z "$fstype" ]; then
+        say "$dev carries no filesystem udev could name; leaving it alone"
+        exit 0
+    fi
+
+    # Already mounted somewhere -- by fstab, by hand, or by a previous run of this
+    # script that systemd has restarted.  Mounting a second time would give the
+    # same filesystem two mount points and two chances to be the one nobody
+    # unmounts.
+    existing="$(mounts_of "$dev" | head -n 1)"
+    if [ -n "$existing" ]; then
+        say "$dev is already mounted at $existing"
+        exit 0
+    fi
+
+    # The name on the glass.  A label is what the operator wrote on the disk, so it
+    # is the first choice, but it arrives from a filesystem somebody else formatted
+    # and may hold anything at all -- slashes, spaces, control characters, four
+    # hundred bytes of it.  tr keeps the characters that can be a directory name and
+    # nothing else; cut bounds the length; the kernel name is the fallback for a
+    # disk with no label or a label that sanitised away to nothing.
+    safe="$(printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-32)"
+    # Trim what the substitution left at the ends, so " Backup " does not become
+    # "_Backup_" -- and so a label written entirely in characters this cannot keep
+    # collapses to nothing and falls through to the kernel name below.
+    while :; do
+        case "$safe" in
+            _*) safe="${safe#_}" ;;
+            *_) safe="${safe%_}" ;;
+            *)  break ;;
+        esac
+    done
+    case "$safe" in
+        ''|.|..) safe="" ;;
+    esac
+    [ -n "$safe" ] || safe="$name"
+
+    # /media if the rootfs will take it, /run/media if it will not.  The second is
+    # where systemd's own tooling puts removable media and is always writable,
+    # being a tmpfs; the first is where anyone looking for it would look first.
+    base=/media
+    mkdir -p "$base" 2>/dev/null || true
+    if [ ! -d "$base" ] || [ ! -w "$base" ]; then
+        base=/run/media
+        mkdir -p "$base" || { say "no writable place to mount $dev"; exit 1; }
+    fi
+
+    # Two disks both labelled BACKUP is not a hypothetical.  Anything already there
+    # and in use gets a suffix rather than a mount over the top of it.
+    target="$base/$safe"
+    i=1
+    while [ -e "$target" ] && [ -n "$(ls -A "$target" 2>/dev/null || true)" ]; do
+        i=$((i + 1))
+        if [ "$i" -gt 16 ]; then
+            say "$base has too many volumes called $safe"
+            exit 1
+        fi
+        target="$base/${safe}_$i"
+    done
+    mkdir -p "$target" || { say "cannot create $target"; exit 1; }
+
+    # Who owns the files.  vfat, exfat and ntfs3 have no on-disk ownership, so
+    # whatever uid is passed at mount time is the uid of every file on the volume;
+    # pass none and that uid is root, which makes a stick read-only to the person
+    # holding the handheld.  The login user is looked up rather than assumed,
+    # because this rootfs is shared with another machine whose user is called
+    # something else.
+    ouid=""; ogid=""
+    for candidate in virtua ark; do
+        while IFS=: read -r u _p uid gid _rest; do
+            [ "$u" = "$candidate" ] || continue
+            ouid="$uid"; ogid="$gid"
+            break
+        done < /etc/passwd
+        [ -n "$ouid" ] && break
+    done
+    [ -n "$ouid" ] || { ouid=1000; ogid=1000; }
+
+    # nosuid and nodev on everything, because this is somebody else's disk and a
+    # setuid root binary or a device node on it would be theirs to choose.  exec is
+    # NOT taken away: this is meant to be a console PC station, and a program run
+    # off a stick is a thing people do on one.
+    common="nosuid,nodev,noatime"
+    case "$fstype" in
+        vfat)
+            opts="rw,$common,uid=$ouid,gid=$ogid,umask=0002,flush,iocharset=utf8,shortname=mixed" ;;
+        exfat)
+            # No flush option in this driver, and passing one it does not know is a
+            # failed mount rather than an ignored word.
+            opts="rw,$common,uid=$ouid,gid=$ogid,umask=0002,iocharset=utf8" ;;
+        ntfs|ntfs3)
+            # ntfs3 is the only NTFS driver in this kernel, and it spells the
+            # charset option `nls' where the FAT drivers spell it `iocharset'.
+            fstype=ntfs3
+            opts="rw,$common,uid=$ouid,gid=$ogid,umask=0002,nls=utf8" ;;
+        iso9660|udf)
+            opts="ro,$common,uid=$ouid,gid=$ogid" ;;
+        *)
+            # ext2/3/4, btrfs, f2fs, xfs and anything else: real on-disk ownership,
+            # so uid= would be rejected and is not wanted.
+            opts="rw,$common" ;;
+    esac
+
+    # The ladder, and each rung is a different thing having gone wrong.  Tuned
+    # options first.  Then the same type with nothing but the safety options, which
+    # is the answer to a driver that did not recognise one of them.  Then read-only,
+    # which is the answer to a dirty NTFS volume -- Windows fast-booted out of
+    # rather than shut down -- and to a filesystem with errors.  Then read-only with
+    # no type at all, letting the kernel try each one it has.
+    #
+    # err is kept so the message says what the LAST attempt said, which is the one
+    # that matters.
+    mounted=0
+    err=""
+    for attempt in "$fstype|$opts" "$fstype|rw,$common" "$fstype|ro,$common" "|ro,$common"; do
+        t="${attempt%%|*}"
+        o="${attempt#*|}"
+        if [ -n "$t" ]; then
+            err="$(mount -t "$t" -o "$o" "$dev" "$target" 2>&1)" && { mounted=1; break; }
+        else
+            err="$(mount -o "$o" "$dev" "$target" 2>&1)" && { mounted=1; break; }
+        fi
+    done
+    if [ "$mounted" != 1 ]; then
+        rmdir "$target" 2>/dev/null || true
+        say "could not mount $dev ($fstype): $err"
+        exit 1
+    fi
+
+    # Read-only or not, asked of the kernel rather than inferred from which rung of
+    # the ladder succeeded: a driver is free to downgrade a mount by itself, and
+    # ntfs3 does exactly that.  Field 6 of a mountinfo line is the per-mount option
+    # list, and `ro' or `rw' is always the first word in it.
+    ro=0
+    while IFS= read -r line; do
+        case "$line" in *" - "*) ;; *) continue ;; esac
+        set -- ${line%% - *}
+        [ "${5:-}" = "$target" ] || continue
+        case "${6:-}" in ro|ro,*) ro=1 ;; esac
+        break
+    done < /proc/self/mountinfo
+
+    # A state file, so that remove does not have to re-derive any of this and the
+    # dashboard can list what is mounted without parsing mountinfo itself.  In /run,
+    # so it cannot outlive the boot that made it.
+    mkdir -p "$STATEDIR" 2>/dev/null || true
+    {
+        echo "device=$dev"
+        echo "mountpoint=$target"
+        echo "fstype=$fstype"
+        echo "label=$label"
+        echo "readonly=$ro"
+    } > "$state" 2>/dev/null || true
+
+    if [ "$ro" = 1 ]; then
+        say "mounted $dev ($fstype) read-only at $target"
+    else
+        say "mounted $dev ($fstype) at $target"
+    fi
+    exit 0
+    ;;
+
+remove)
+    # The state file first, because it is exact.  mountinfo is the fallback for a
+    # mount this script did not make, or one whose state file went with a /run that
+    # was remounted.
+    target=""
+    if [ -r "$state" ]; then
+        target="$(sed -n 's/^mountpoint=//p' "$state" | head -n 1)"
+    fi
+    [ -n "$target" ] || target="$(mounts_of "$dev" | head -n 1)"
+    if [ -z "$target" ]; then
+        rm -f "$state" 2>/dev/null || true
+        exit 0
+    fi
+
+    # Plain unmount first: it flushes, and on a disk that is still physically there
+    # -- a "safely remove" from the dashboard, a shutdown -- that is the one that
+    # matters.  Lazy second, because after a yank the writeback has nowhere to go
+    # and a plain unmount would block until the timeout with the mount still in the
+    # tree afterwards.  Nothing is forced on the first try.
+    if ! umount "$target" 2>/dev/null; then
+        sync
+        umount -l "$target" 2>/dev/null || true
+    fi
+
+    # Only ever the directory this script made, only when it is empty, and never
+    # the mount root itself.
+    case "$target" in
+        /media/?*|/run/media/?*) rmdir "$target" 2>/dev/null || true ;;
+    esac
+    rm -f "$state" 2>/dev/null || true
+    say "unmounted $target"
+    exit 0
+    ;;
+
+*)
+    say "unknown action \"$action\""
+    exit 64
+    ;;
+esac
+AUTOMOUNT
+    chmod 0755 /newroot/run/j36/bin/mixos-automount
+
+    say "automount: USB disks land under /media, one directory per volume label"
+    return 0
+}
+
 # ── EmulationStation, taken out of the boot ───────────────────────────────────
 #
 # The mask and the drop-in described above setup_dash.  Called on the failure path
@@ -2914,6 +3446,22 @@ if [ "$want_dash" = 1 ]; then
     stage "Preparing the dashboard"
     progress 82
     setup_dash
+    # Not inside setup_dash, and not conditional on it having worked.  setup_dash
+    # returns early when there is no /opt/mixos on the card, and a machine with no
+    # dashboard is exactly the machine somebody is about to plug a USB disk into to
+    # fix it.  The rules only need a rootfs with a /run, which is checked inside.
+    #
+    # It is under want_dash for one reason: j36.dash=0 means "do not touch what this
+    # rootfs starts by itself", and a udev rule dropped into /run is touching it.
+    if [ "$want_usb" = 1 ]; then
+        stage "Preparing removable disks"
+        detail "udev rule, mount unit, /media"
+        progress 85
+        setup_automount
+    else
+        say "automount: j36.usb is not set, so there is no USB stack and no disks"
+        say "           to mount.  The rules are not written."
+    fi
 else
     say "dash: j36.dash is not in the kernel command line, so no shell is staged"
     say "      and whatever the rootfs starts by itself is what you get.  Add"
@@ -3472,17 +4020,29 @@ fi
 #   udl                 the USB->HDMI adapter.  Also a root for a reason of its
 #                       own -- it hangs off usbcore and DRM, neither of which
 #                       knows it exists.
+#   usb-storage, sd_mod the external disk.  Two roots and not one, because the
+#                       edge between them runs through neither: usb-storage is a
+#                       SCSI HOST and sd_mod is a SCSI UPPER LAYER, they are
+#                       siblings under scsi_mod rather than parent and child, and
+#                       a walk seeded at usb-storage alone stages a payload that
+#                       enumerates the disk and never creates /dev/sda.  scsi_mod
+#                       itself is not a root: it is a depends edge from both.
+#   ntfs3               the filesystem on the disk somebody actually plugs in.  A
+#                       root because no module points at a filesystem driver --
+#                       nothing does until mount(2) asks for the type by name,
+#                       which is far too late to discover it was never staged.
 #
-# usbcore, hid, phy-generic and roles are NOT roots and do not need to be: every
-# one of them is a `modinfo -F depends' edge from something above.  Hub support
-# has no symbol at all -- it is inside usbcore -- which is worth writing down
-# because "there is no CONFIG_USB_HUB" is the first thing anyone looks for.
+# usbcore, hid, phy-generic, roles and scsi_mod are NOT roots and do not need to
+# be: every one of them is a `modinfo -F depends' edge from something above.  Hub
+# support has no symbol at all -- it is inside usbcore -- which is worth writing
+# down because "there is no CONFIG_USB_HUB" is the first thing anyone looks for.
 USB_MODULE_PATHS=()
 USB_MODULE_ORDER=()
 if [[ "${J36_USB:-1}" == 1 ]]; then
     set +e
     collect_modules usb USB_MODULE_ORDER USB_MODULE_PATHS \
-        j36_mt6592_usb_phy musb_hdrc mediatek usbhid hid-generic udl
+        j36_mt6592_usb_phy musb_hdrc mediatek usbhid hid-generic udl \
+        usb-storage sd_mod ntfs3
     usb_rc=$?
     set -e
     if (( usb_rc != 0 )); then
@@ -4545,7 +5105,8 @@ if (( ${#AUDIO_MODULE_ORDER[@]} > 0 )); then
     log "audio: staged ${#AUDIO_MODULE_ORDER[@]} modules into $PAYREL/audio/"
 fi
 
-# j36/usb/ is the host stack: the PHY, MUSB and its glue, the HID pair and udl.
+# j36/usb/ is the host stack: the PHY, MUSB and its glue, the HID pair, udl, and
+# the mass-storage set that turns a plugged-in disk into /dev/sda and mounts it.
 # Its own directory and its own load.order on the same terms as the other three,
 # and the removal contract matters here as much as it does for audio, for the
 # same class of reason: this is the payload whose failure mode is a bus stall.
@@ -4699,7 +5260,8 @@ changes nothing else:
   opt/mixos/j36/modules/   lima and its dependencies, plus load.order
   opt/mixos/j36/mtkdrm/    the MT6592 display driver set, plus load.order
   opt/mixos/j36/audio/     the ALSA core and the MT6592 AFE driver, plus load.order
-  opt/mixos/j36/usb/       the USB host stack -- PHY, MUSB, HID, udl -- plus load.order
+  opt/mixos/j36/usb/       the USB host stack -- PHY, MUSB, HID, udl, and the disk
+                           set (scsi_mod, sd_mod, usb-storage, ntfs3) -- plus load.order
   opt/mixos/j36/gl/        Mesa's GL front end, plus links
   opt/mixos/j36/eglprobe   -f reports and paints /dev/fb0 with no DRM at all and
                            runs on every boot; the other modes say what can create
@@ -4855,10 +5417,38 @@ j36.audio=speaker
 
 j36.usb=1
     Load the USB host stack from j36/usb/: the out-of-tree PHY driver, musb_hdrc
-    and its MediaTek glue, usbhid and hid-generic, and udl.  That is a keyboard, a
-    mouse, a hub, and a DisplayLink adapter as a second DRM node.  Same removal
+    and its MediaTek glue, usbhid and hid-generic, udl, and the mass-storage set --
+    scsi_mod, sd_mod, usb-storage and ntfs3.  That is a keyboard, a mouse, a hub, a
+    DisplayLink adapter as a second DRM node, and external disks.  Same removal
     story as the rest: delete the word or the directory and not one line of it is
     loaded.
+
+    EXTERNAL DISKS MOUNT THEMSELVES, which is new and is the reason SCSI is in this
+    kernel at all -- a USB disk is a SCSI target, and usb-storage without sd_mod
+    enumerates one and creates no /dev/sda.  /init does not mount them; it writes
+    three files into the rootfs's /run and lets udev and systemd do it:
+
+      /run/udev/rules.d/99-mixos-automount.rules   sd* carrying a filesystem
+      /run/systemd/system/mixos-automount@.service one instance per volume
+      /run/j36/bin/mixos-automount                 the script that mounts
+
+    A volume lands at /media/<its label>, or at /media/sda1 when it has no label,
+    or under /run/media when the rootfs is read-only.  vfat, exfat and NTFS are
+    mounted owned by the login user, because none of those three has ownership on
+    disk and the default would be root; ext and btrfs keep their own.  Everything
+    is mounted nosuid,nodev -- somebody else's disk does not get to bring a setuid
+    binary or a device node -- but NOT noexec, so a program on a stick still runs.
+
+    UNPLUG IS HANDLED BY BindsTo=dev-<name>.device, which is systemd's own device
+    tracking: pull the disk, the device unit goes away, the instance stops, and its
+    ExecStop unmounts.  A tidy unmount is tried first and a lazy one after it, so a
+    disk yanked mid-write cannot wedge the boot.  Nothing polls, and there is no
+    udisks2 or dbus involved -- neither is on this image.
+
+    A dirty NTFS volume -- a Windows machine that fast-booted instead of shutting
+    down -- is mounted READ-ONLY rather than forced.  That is ntfs3's own refusal
+    and it is the right one: forcing it means two operating systems believing they
+    own the same journal.  Shut Windows down properly and it mounts read-write.
 
     This SoC has exactly ONE USB core -- a MUSB at 0x11200000 -- and no EHCI, OHCI
     or XHCI at all.  So the single port is the whole bus: whatever you want plugged
@@ -5833,7 +6423,8 @@ GNU General Public License, version 2 only:
     j36/modules/*.ko        lima and its dependencies -- kernel modules
     j36/mtkdrm/*.ko         mtk_drm, and MixOS's j36_jd9365_panel
     j36/audio/*.ko          the ALSA core, and MixOS's j36_mt6592_audio
-    j36/usb/*.ko            musb and its MediaTek glue, usbhid, udl, and MixOS's
+    j36/usb/*.ko            musb and its MediaTek glue, usbhid, udl, the SCSI and
+                            mass-storage set, ntfs3, and MixOS's
                             j36_mt6592_usb_phy
     j36_mt6592_input.ko     MixOS's keypad and GPIO key adapter
 
@@ -6073,11 +6664,13 @@ SD cards.
                        j36.audio=speaker also powers the class-D amp, which hangs
                        off VBAT and so needs a cell fitted.
   j36/usb              the host stack for the one MUSB port: the PHY, musb and its
-                       glue, usbhid, and udl for a DisplayLink dock's HDMI.  The
-                       PHY drives DRVVBUS, so the port sources 5 V off VBAT and a
-                       cell should be fitted; j36.usb=novbus leaves the pad alone.
-                       Two modules here also live in j36/mtkdrm; whichever loaded
-                       first wins.                             j36.usb=1
+                       glue, usbhid, udl for a DisplayLink dock's HDMI, and the
+                       disk set -- scsi_mod, sd_mod, usb-storage and ntfs3 -- which
+                       is what makes an external drive appear and automount under
+                       /media.  The PHY drives DRVVBUS, so the port sources 5 V off
+                       VBAT and a cell should be fitted; j36.usb=novbus leaves the
+                       pad alone.  Two modules here also live in j36/mtkdrm;
+                       whichever loaded first wins.            j36.usb=1
   j36/gl               Mesa's GL front end, bind-mounted at /run/j36/gl ahead of
                        the rootfs's RK3326 Mali blob.  links/ records the SONAME
                        aliases, kept from when this payload was on FAT.  j36.gl=1

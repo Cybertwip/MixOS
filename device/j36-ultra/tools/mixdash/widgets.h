@@ -353,13 +353,33 @@ private:
 /*
  * The information sheet -- what the boot log has had to be read for until now,
  * on the glass instead: the framebuffer geometry the panel is actually running
- * at, whether card0 and controlC0 exist, which j36 words this boot carried.
+ * at, what the CPU is and how fast it is being clocked, which disks the kernel
+ * found and where they ended up mounted, what is sitting on the USB bus, and
+ * which j36 words this boot carried.  It is the page to open before asking
+ * anyone else what the hardware is doing.
+ *
+ * Everything on it is read out of /proc and /sys, fresh, on a timer.  Nothing
+ * here opens a device node and nothing here writes: an information page that
+ * can change the machine it is describing is a bug waiting for a stray button.
  */
 class InfoPage : public PageWidget
 {
     Q_OBJECT
 
 public:
+    /*
+     * A row is either a section header -- label only, drawn as a rule across the
+     * sheet -- or a label/value pair.  Keeping both in one vector keeps the
+     * scrolling arithmetic to a single index, and makes headers scroll with
+     * their section instead of floating above it, which is what you want when a
+     * section is longer than the sheet is tall.
+     */
+    struct Row {
+        QString label;
+        QString value;
+        bool header;
+    };
+
     explicit InfoPage(QWidget *parent = nullptr);
 
     void setInputSummary(const QString &summary);
@@ -374,7 +394,27 @@ protected:
     void wheelEvent(QWheelEvent *event) override;
 
 private:
-    QVector<QPair<QString, QString> > m_rows;
+    void addHeader(const QString &text);
+    void add(const QString &label, const QString &value);
+    /*
+     * One label, many values: the first line carries the label and the rest are
+     * left blank under it, which is how a list of six USB devices reads as one
+     * entry rather than as six repetitions of the word "USB".  `empty' is what
+     * to say when there are none, and saying something is the point -- a section
+     * that vanishes when it is empty looks like a section that was never coded.
+     */
+    void addList(const QString &label, const QStringList &values, const QString &empty);
+
+    /* The body rect paintSheet will hand back at the current size. */
+    QRectF sheetBody() const;
+    /* Largest first-row index that still fills the sheet, and one screenful. */
+    int maxScroll() const;
+    int pageStep() const;
+    void scrollBy(int rows);
+    /* The section the topmost visible row belongs to, for the sheet header. */
+    QString sectionAt(int index) const;
+
+    QVector<Row> m_rows;
     QString m_inputs;
     int m_scroll = 0;
 };

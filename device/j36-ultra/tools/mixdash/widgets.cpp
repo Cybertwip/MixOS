@@ -7,12 +7,27 @@
 #include "joypad.h"
 #include "theme.h"
 
+/*
+ * The same generated header main.cpp picks up, and picked up the same way: the
+ * information sheet names the build it is, and a tree built by hand with a plain
+ * qmake has no buildid.h and simply says "unknown" instead of failing to compile.
+ */
+#if defined(__has_include)
+#  if __has_include("buildid.h")
+#    include "buildid.h"
+#  endif
+#endif
+#ifndef MIXDASH_BUILD_ID
+#define MIXDASH_BUILD_ID "unknown"
+#endif
+
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QFontMetrics>
 #include <QGuiApplication>
+#include <QMap>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
@@ -21,9 +36,14 @@
 #include <QTimer>
 #include <QWheelEvent>
 
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <linux/fb.h>
+#include <netinet/in.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 namespace SysInfo {
@@ -129,11 +149,16 @@ int wirelessQuality()
         const QStringList cols = line.mid(colon + 1).split(' ', Qt::SkipEmptyParts);
         if (cols.size() < 2)
             continue;
+        /* The kernel prints this column as "70." -- the trailing dot marks it as
+         * an updated value, and it has to come off before the number parses.  A
+         * copy, because at() hands back a const reference and remove() writes. */
+        QString link = cols.at(1);
+        link.remove('.');
         bool ok = false;
-        const double link = cols.at(1).remove('.').toDouble(&ok);
-        if (!ok || link <= 0.0)
+        const double value = link.toDouble(&ok);
+        if (!ok || value <= 0.0)
             continue;
-        return qBound(1, (int)(link * 100.0 / 70.0), 100);
+        return qBound(1, (int)(value * 100.0 / 70.0), 100);
     }
     return -1;
 }
@@ -819,9 +844,12 @@ QVector<QRectF> Dock::slotRects() const
 
 void Dock::mousePressEvent(QMouseEvent *event)
 {
-    const QVector<QRectF> slots = slotRects();
-    for (int i = 0; i < slots.size(); ++i) {
-        if (!slots[i].contains(QPointF(event->pos())))
+    /* `slots' is a Qt keyword -- qobjectdefs.h defines it away to nothing -- so it
+     * cannot be a variable name in a translation unit that has not asked for
+     * QT_NO_KEYWORDS, and this one has not. */
+    const QVector<QRectF> boxes = slotRects();
+    for (int i = 0; i < boxes.size(); ++i) {
+        if (!boxes[i].contains(QPointF(event->pos())))
             continue;
         emit pageClicked(i);
         event->accept();
@@ -841,15 +869,15 @@ void Dock::paintEvent(QPaintEvent *)
     const QFont f = Theme::font(12, true);
     p.setFont(f);
 
-    const QVector<QRectF> slots = slotRects();
-    if (slots.isEmpty())
+    const QVector<QRectF> boxes = slotRects();
+    if (boxes.isEmpty())
         return;
 
     /* Slots sized to their labels, so the bar is as wide as it needs to be and
      * centred -- which is what makes it read as a dock and not as a tab strip. */
     const qreal pad = 8.0;
-    const QRectF bar(slots.first().x() - pad, slots.first().y() - 5,
-                     slots.last().right() - slots.first().x() + pad * 2, 40.0);
+    const QRectF bar(boxes.first().x() - pad, boxes.first().y() - 5,
+                     boxes.last().right() - boxes.first().x() + pad * 2, 40.0);
 
     Theme::softShadow(p, bar, 16, 6, 30);
     QColor glass = Theme::dock();
@@ -861,8 +889,8 @@ void Dock::paintEvent(QPaintEvent *)
     p.setPen(QPen(QColor(255, 255, 255, 40), 1.0));
     p.drawRoundedRect(bar.adjusted(0.5, 0.5, -0.5, -0.5), 16, 16);
 
-    for (int i = 0; i < m_pages.size() && i < slots.size(); ++i) {
-        const QRectF slot = slots[i];
+    for (int i = 0; i < m_pages.size() && i < boxes.size(); ++i) {
+        const QRectF slot = boxes[i];
         if (i == m_current) {
             Theme::vgrad(p, slot, Theme::blue(), Theme::blueLow(), 11);
             p.setPen(Theme::ink());
@@ -1317,13 +1345,478 @@ void ListPane::paintEvent(QPaintEvent *)
 
 /* ── InfoPage ────────────────────────────────────────────────────────────── */
 
+namespace {
+
+/*
+ * Row geometry, in one place because three functions have to agree on it: the
+ * one that draws, the one that decides how far down the list you can scroll and
+ * the one that pages.  Headers are taller than they need to be on purpose --
+ * the extra six pixels are drawn as air above the text, which is what separates
+ * one section from the tail of the one before it.
+ */
+const qreal kRowH = 20.0;
+const qreal kHeadH = 26.0;
+const qreal kPadTop = 7.0;
+const qreal kPadBottom = 6.0;
+
+/* Bytes the way a disk is talked about, and the same shape MediaPage prints for
+ * files, so the same stick reads the same size on every page of this dashboard. */
+QString humanBytes(qulonglong bytes)
+{
+    if (bytes >= 1024ULL * 1024 * 1024)
+        return QString::number(bytes / (1024.0 * 1024 * 1024), 'f', 1) + " GB";
+    if (bytes >= 1024 * 1024)
+        return QString::number(bytes / (1024.0 * 1024), 'f', 1) + " MB";
+    if (bytes >= 1024)
+        return QString::number(bytes / 1024) + " kB";
+    return QString::number(bytes) + " B";
+}
+
+/* /proc/device-tree properties are NUL-terminated strings; the NUL survives
+ * readTrimmed, and a QString with a NUL in it draws as a box. */
+QString readDT(const QString &path)
+{
+    QString s = readTrimmed(path);
+    const int nul = s.indexOf(QChar('\0'));
+    if (nul >= 0)
+        s.truncate(nul);
+    return s.trimmed();
+}
+
+/*
+ * The mount table escapes space, tab, newline and backslash as octal, so a stick
+ * labelled "My Disk" arrives as /media/My\040Disk.  Undoing it here is what makes
+ * the automounted volumes on this page match what the Files page shows.
+ */
+QString unescapeMount(const QString &s)
+{
+    QString out;
+    for (int i = 0; i < s.size(); ++i) {
+        if (s.at(i) == QLatin1Char('\\') && i + 3 < s.size()) {
+            bool ok = false;
+            const int c = s.mid(i + 1, 3).toInt(&ok, 8);
+            if (ok && c > 0) {
+                out.append(QChar(c));
+                i += 3;
+                continue;
+            }
+        }
+        out.append(s.at(i));
+    }
+    return out;
+}
+
+/*
+ * The CPU, from the only file that knows.  On ARM there is no "model name" line
+ * -- the kernel prints the implementer and the part number and leaves the naming
+ * to userspace, which is why every ARM board says "Processor: ARMv7 rev 3" in
+ * tools that stopped reading at the first line.  The J36 is 0x41/0xc07, and
+ * saying "Cortex-A7" out loud is worth the ten-entry table.
+ */
+QString armPartName(const QString &implementer, const QString &part)
+{
+    if (implementer.toLower() != QLatin1String("0x41")) /* not ARM Ltd */
+        return QString();
+
+    static const struct { const char *id; const char *name; } parts[] = {
+        { "0xc05", "Cortex-A5" },  { "0xc07", "Cortex-A7" },
+        { "0xc08", "Cortex-A8" },  { "0xc09", "Cortex-A9" },
+        { "0xc0d", "Cortex-A12" }, { "0xc0e", "Cortex-A17" },
+        { "0xc0f", "Cortex-A15" }, { "0xd03", "Cortex-A53" },
+        { "0xd04", "Cortex-A35" }, { "0xd08", "Cortex-A72" },
+    };
+    for (unsigned i = 0; i < sizeof parts / sizeof parts[0]; ++i)
+        if (part.toLower() == QLatin1String(parts[i].id))
+            return QString::fromLatin1(parts[i].name);
+    return QString();
+}
+
+struct CpuInfo {
+    QString model;    /* "Cortex-A7 (ARMv7, rev 3)" or whatever could be had */
+    QString hardware; /* the board line, when the kernel still prints one */
+    int cores;
+};
+
+CpuInfo cpuInfo()
+{
+    CpuInfo info;
+    info.cores = 0;
+
+    QFile f("/proc/cpuinfo");
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return info;
+
+    QString name, impl, part, arch, rev;
+    while (!f.atEnd()) {
+        const QString line = QString::fromLatin1(f.readLine());
+        const int colon = line.indexOf(':');
+        if (colon < 0)
+            continue;
+        const QString key = line.left(colon).trimmed();
+        const QString val = line.mid(colon + 1).trimmed();
+        if (key == QLatin1String("processor"))
+            ++info.cores;
+        else if (key == QLatin1String("model name"))
+            name = val;
+        else if (key == QLatin1String("Hardware"))
+            info.hardware = val;
+        else if (key == QLatin1String("CPU implementer"))
+            impl = val;
+        else if (key == QLatin1String("CPU part"))
+            part = val;
+        else if (key == QLatin1String("CPU architecture"))
+            arch = val;
+        else if (key == QLatin1String("CPU revision"))
+            rev = val;
+    }
+
+    const QString decoded = armPartName(impl, part);
+    QStringList bits;
+    if (!decoded.isEmpty())
+        bits << decoded;
+    else if (!name.isEmpty())
+        bits << name.section('(', 0, 0).trimmed();
+    else if (!part.isEmpty())
+        bits << "part " + part;
+
+    QStringList paren;
+    if (!arch.isEmpty())
+        paren << "ARMv" + arch;
+    if (!rev.isEmpty())
+        paren << "rev " + rev;
+    if (!paren.isEmpty())
+        bits << "(" + paren.join(", ") + ")";
+
+    info.model = bits.join(" ");
+    return info;
+}
+
+/*
+ * Whole disks only.  A partition has a `partition' file in its sysfs directory
+ * and a disk does not, which is the distinction sysfs actually makes; matching
+ * on the name instead gets it wrong for both mmcblk0p1 and for a disk called
+ * sda1 that does not exist.  ram, loop and zram are skipped because they are
+ * kernel bookkeeping and this section is about hardware you can hold.
+ */
+QStringList blockDisks()
+{
+    QStringList out;
+    const QDir dir("/sys/class/block");
+    const QStringList names = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &name : names) {
+        if (name.startsWith("ram") || name.startsWith("loop") || name.startsWith("zram"))
+            continue;
+        const QString base = "/sys/class/block/" + name;
+        if (QFileInfo::exists(base + "/partition"))
+            continue;
+
+        const qulonglong sectors = readTrimmed(base + "/size").toULongLong();
+        if (sectors == 0)
+            continue;
+
+        QStringList bits;
+        /* The kernel reports capacity in 512-byte sectors whatever the device's
+         * own block size is; that is the one unit sysfs never varies. */
+        bits << name << humanBytes(sectors * 512ULL);
+        bits << (readTrimmed(base + "/removable") == QLatin1String("1") ? QString("removable")
+                                                                       : QString("fixed"));
+
+        /* USB disks answer through SCSI and have vendor/model; the eMMC and the
+         * SD card answer through the MMC layer and have name/type instead. */
+        QString id = (readTrimmed(base + "/device/vendor") + " "
+                      + readTrimmed(base + "/device/model")).simplified();
+        if (id.isEmpty())
+            id = readTrimmed(base + "/device/name");
+        if (!id.isEmpty())
+            bits << id;
+
+        const int parts = QDir(base).entryList(QStringList() << name + "*",
+                                               QDir::Dirs | QDir::NoDotAndDotDot).size();
+        if (parts > 0)
+            bits << QString("%1 partition%2").arg(parts).arg(QString(parts == 1 ? "" : "s"));
+
+        out << bits.join("  ");
+    }
+    return out;
+}
+
+/*
+ * Everything mounted off a block device, with how full it is.  Sources that do
+ * not start with /dev/ are skipped -- proc, sysfs, devtmpfs, the dozen tmpfs
+ * mounts systemd makes -- because none of them is a disk and all of them would
+ * bury the two lines that are.  This is where the automounted /media volumes
+ * show up, and showing them is half the reason this section exists.
+ */
+QStringList mountedVolumes()
+{
+    QStringList out;
+    QFile f("/proc/self/mounts");
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return out;
+
+    while (!f.atEnd()) {
+        const QStringList c =
+            QString::fromLatin1(f.readLine()).split(' ', Qt::SkipEmptyParts);
+        if (c.size() < 4 || !c.at(0).startsWith("/dev/"))
+            continue;
+
+        const QString dev = unescapeMount(c.at(0));
+        const QString mnt = unescapeMount(c.at(1));
+
+        QStringList bits;
+        bits << mnt << dev.section('/', -1) << c.at(2);
+
+        /*
+         * statvfs and not the size in sysfs: this is the filesystem's own idea of
+         * how much room is left, which is the number anyone asking has in mind.
+         *
+         * Guarded on the device node still existing, and the guard is not
+         * theoretical: a stick pulled without ejecting loses /dev/sda1 the
+         * instant the kernel notices, while the mount lingers the second or two
+         * systemd needs to run the automount unit's ExecStop.  statvfs on a
+         * mount whose disk has left blocks on I/O, and this runs on the thread
+         * that draws, so blocking here is a frozen dashboard.
+         */
+        struct statvfs vs;
+        if (QFileInfo::exists(dev)
+            && ::statvfs(QFile::encodeName(mnt).constData(), &vs) == 0 && vs.f_blocks > 0) {
+            const qulonglong unit = vs.f_frsize ? vs.f_frsize : vs.f_bsize;
+            bits << QString("%1 free of %2")
+                        .arg(humanBytes((qulonglong)vs.f_bavail * unit),
+                             humanBytes((qulonglong)vs.f_blocks * unit));
+        }
+        /* The first option is always rw or ro.  Read-only is worth saying:
+         * on an NTFS volume it means the disk was unplugged from Windows
+         * without ejecting it, and ntfs3 refused to touch a dirty journal. */
+        if (c.at(3) == QLatin1String("ro") || c.at(3).startsWith("ro,"))
+            bits << "read-only";
+
+        out << bits.join("  ");
+    }
+    return out;
+}
+
+/*
+ * The USB bus as the kernel has it.  Directories with a colon in the name are
+ * interfaces of a device already listed, so they are skipped; what is left is
+ * one line per physical thing plugged in, plus the root hub, which is named
+ * rather than hidden because "usb1  root hub" is how you tell an empty bus from
+ * a bus that never came up at all.
+ */
+QStringList usbDevices()
+{
+    QStringList out;
+    const QDir dir("/sys/bus/usb/devices");
+    const QStringList names = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &name : names) {
+        if (name.contains(':'))
+            continue;
+        const QString base = "/sys/bus/usb/devices/" + name;
+        const QString vid = readTrimmed(base + "/idVendor");
+        if (vid.isEmpty())
+            continue;
+
+        QString what = (readTrimmed(base + "/manufacturer") + " "
+                        + readTrimmed(base + "/product")).simplified();
+        if (what.isEmpty())
+            what = "class " + readTrimmed(base + "/bDeviceClass");
+
+        QStringList bits;
+        bits << name << what << vid + ":" + readTrimmed(base + "/idProduct");
+        const QString speed = readTrimmed(base + "/speed");
+        if (!speed.isEmpty())
+            bits << speed + " Mbit/s";
+        if (name.startsWith("usb"))
+            bits << "root hub";
+
+        out << bits.join("  ");
+    }
+    return out;
+}
+
+/* Every evdev node with the name its driver gave it -- the D-pad, the sticks,
+ * the volume keys, and whatever was plugged into the USB port. */
+QStringList inputDevices()
+{
+    QStringList out;
+    const QDir dir("/sys/class/input");
+    const QStringList nodes = dir.entryList(QStringList() << "event*",
+                                            QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &node : nodes) {
+        const QString name = readTrimmed("/sys/class/input/" + node + "/device/name");
+        out << node + "  " + (name.isEmpty() ? QString("unnamed") : name);
+    }
+    return out;
+}
+
+/*
+ * The interfaces, with their addresses.  getifaddrs and not a file, because the
+ * IPv4 address of an interface is the one thing about it that sysfs does not
+ * carry -- /proc/net/fib_trie has it, in a shape nobody should have to parse.
+ */
+QStringList netInterfaces()
+{
+    QMap<QString, QString> addrs;
+    struct ifaddrs *list = nullptr;
+    if (::getifaddrs(&list) == 0) {
+        for (struct ifaddrs *p = list; p; p = p->ifa_next) {
+            if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET || !p->ifa_name)
+                continue;
+            char buf[INET_ADDRSTRLEN];
+            const struct sockaddr_in *in = (const struct sockaddr_in *)p->ifa_addr;
+            if (::inet_ntop(AF_INET, &in->sin_addr, buf, sizeof buf))
+                addrs.insert(QString::fromLatin1(p->ifa_name), QString::fromLatin1(buf));
+        }
+        ::freeifaddrs(list);
+    }
+
+    QStringList out;
+    const QDir dir("/sys/class/net");
+    const QStringList names = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &name : names) {
+        if (name == QLatin1String("lo"))
+            continue;
+        const QString base = "/sys/class/net/" + name;
+
+        QStringList bits;
+        bits << name << readTrimmed(base + "/operstate");
+        if (addrs.contains(name))
+            bits << addrs.value(name);
+        const QString mac = readTrimmed(base + "/address");
+        if (!mac.isEmpty() && mac != QLatin1String("00:00:00:00:00:00"))
+            bits << mac;
+        if (QFileInfo::exists(base + "/phy80211") || QFileInfo::exists(base + "/wireless"))
+            bits << "wireless";
+
+        out << bits.join("  ");
+    }
+    return out;
+}
+
+/*
+ * The power_supply class, listed rather than reduced to a percentage.  Until the
+ * MT6592 PMIC driver lands this is empty, and empty is the answer: it is the one
+ * place on this machine that says out loud why the status bar draws a dash where
+ * the battery should be.  When the driver does land, the charger appears here as
+ * a second supply and its `online' flips as the cable goes in and out.
+ */
+QStringList powerSupplies()
+{
+    QStringList out;
+    const QString root = "/sys/class/power_supply";
+    const QStringList names = QDir(root).entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &name : names) {
+        const QString base = root + "/" + name;
+
+        QStringList bits;
+        bits << name;
+        const QString type = readTrimmed(base + "/type");
+        if (!type.isEmpty())
+            bits << type.toLower();
+        const QString online = readTrimmed(base + "/online");
+        if (!online.isEmpty())
+            bits << (online == QLatin1String("1") ? "plugged in" : "not plugged in");
+        const QString status = readTrimmed(base + "/status");
+        if (!status.isEmpty())
+            bits << status.toLower();
+        const QString cap = readTrimmed(base + "/capacity");
+        if (!cap.isEmpty())
+            bits << cap + "%";
+
+        /* The kernel reports microvolts and microamps for everything. */
+        const QString uv = readTrimmed(base + "/voltage_now");
+        if (!uv.isEmpty())
+            bits << QString::number(uv.toDouble() / 1000000.0, 'f', 2) + " V";
+        const QString ua = readTrimmed(base + "/current_now");
+        if (!ua.isEmpty())
+            bits << QString::number(ua.toDouble() / 1000.0, 'f', 0) + " mA";
+
+        out << bits.join("  ");
+    }
+    return out;
+}
+
+/* Millidegrees, which is the only unit the thermal class speaks. */
+QStringList thermalZones()
+{
+    QStringList out;
+    const QString root = "/sys/class/thermal";
+    const QStringList zones = QDir(root).entryList(QStringList() << "thermal_zone*",
+                                                   QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &zone : zones) {
+        bool ok = false;
+        const double c = readTrimmed(root + "/" + zone + "/temp").toDouble(&ok) / 1000.0;
+        if (!ok)
+            continue;
+        const QString type = readTrimmed(root + "/" + zone + "/type");
+        out << QString("%1  %2 C").arg(type.isEmpty() ? zone : type, QString::number(c, 'f', 1));
+    }
+    return out;
+}
+
+/* "0 [Audio ]: mt6592-sound - MT6592 Audio", minus the bracket bookkeeping.
+ * The second line of each entry has no bracket, which is how it is skipped. */
+QStringList soundCards()
+{
+    QStringList out;
+    QFile f("/proc/asound/cards");
+    if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        while (!f.atEnd()) {
+            const QString line = QString::fromLatin1(f.readLine());
+            if (!line.contains('['))
+                continue;
+            const QString what = line.section(':', 1).trimmed();
+            if (!what.isEmpty())
+                out << line.trimmed().section(' ', 0, 0) + "  " + what;
+        }
+    }
+    if (out.isEmpty() && QFileInfo::exists("/dev/snd/controlC0"))
+        out << "controlC0, but /proc/asound says nothing";
+    return out;
+}
+
+} /* namespace */
+
 InfoPage::InfoPage(QWidget *parent)
     : PageWidget(parent)
 {
+    /*
+     * Three seconds, not the two this page used when it was ten rows long.  A
+     * refresh now walks four sysfs classes and statvfs's every mount, and while
+     * that is still only a handful of milliseconds on this SoC, none of what it
+     * reads changes fast enough to be worth doing more often.
+     */
     QTimer *t = new QTimer(this);
-    t->setInterval(2000);
+    t->setInterval(3000);
     connect(t, &QTimer::timeout, this, &InfoPage::refresh);
     t->start();
+}
+
+void InfoPage::addHeader(const QString &text)
+{
+    Row r;
+    r.label = text;
+    r.header = true;
+    m_rows.append(r);
+}
+
+void InfoPage::add(const QString &label, const QString &value)
+{
+    Row r;
+    r.label = label;
+    r.value = value;
+    r.header = false;
+    m_rows.append(r);
+}
+
+void InfoPage::addList(const QString &label, const QStringList &values, const QString &empty)
+{
+    if (values.isEmpty()) {
+        add(label, empty);
+        return;
+    }
+    for (int i = 0; i < values.size(); ++i)
+        add(i == 0 ? label : QString(), values.at(i));
 }
 
 void InfoPage::setInputSummary(const QString &summary)
@@ -1338,16 +1831,88 @@ void InfoPage::showEvent(QShowEvent *event)
     QWidget::showEvent(event);
 }
 
+/*
+ * The rect paintSheet returns at this size.  It is worked out twice -- there and
+ * here -- because the scroll arithmetic needs it outside a paint event, and a
+ * scroll limit computed against a guess at the sheet's height is a page whose
+ * last row you can never quite reach.  paintSheet lays its title bar out at a
+ * fixed 34 pixels and gives back the inside of the card below it; keep the two
+ * in step if that ever changes.
+ */
+QRectF InfoPage::sheetBody() const
+{
+    const QRectF card(Theme::Margin, Theme::Margin,
+                      width() - 2.0 * Theme::Margin, height() - 2.0 * Theme::Margin);
+    return QRectF(card.x() + 1, card.y() + 35, card.width() - 2, card.height() - 36);
+}
+
+/*
+ * Walking backwards from the last row is what makes "scrolled all the way down"
+ * mean the last row is on the glass rather than one row past it, and it is the
+ * only way to get that right when headers are taller than the rows under them.
+ */
+int InfoPage::maxScroll() const
+{
+    const qreal avail = sheetBody().height() - kPadTop - kPadBottom;
+    qreal used = 0;
+    int i = m_rows.size() - 1;
+    for (; i >= 0; --i) {
+        used += m_rows.at(i).header ? kHeadH : kRowH;
+        if (used > avail)
+            break;
+    }
+    /* Never past the last row, however small the sheet has been made: a limit of
+     * m_rows.size() is a page scrolled to a blank, and this is called before the
+     * widget has been laid out at least once. */
+    return qBound(0, i + 1, qMax(0, m_rows.size() - 1));
+}
+
+int InfoPage::pageStep() const
+{
+    const qreal avail = sheetBody().height() - kPadTop - kPadBottom;
+    /* One row of overlap, so the eye has something to land on after the jump. */
+    return qMax(1, (int)(avail / kRowH) - 1);
+}
+
+void InfoPage::scrollBy(int rows)
+{
+    const int was = m_scroll;
+    m_scroll = qBound(0, m_scroll + rows, maxScroll());
+    if (m_scroll != was)
+        update();
+}
+
+/* The section the row at `index' belongs to, by looking back for its header.
+ * Drawn in the sheet's title bar, so scrolling never loses which list you are
+ * halfway down. */
+QString InfoPage::sectionAt(int index) const
+{
+    for (int i = qMin(index, m_rows.size() - 1); i >= 0; --i)
+        if (m_rows.at(i).header)
+            return m_rows.at(i).label;
+    return QString();
+}
+
 bool InfoPage::handleNav(int action)
 {
     switch (action) {
     case Joypad::NavUp:
-        m_scroll = qMax(0, m_scroll - 1);
-        update();
+        scrollBy(-1);
         return true;
     case Joypad::NavDown:
-        m_scroll = qMin(qMax(0, m_rows.size() - 4), m_scroll + 1);
-        update();
+        scrollBy(1);
+        return true;
+    /*
+     * Left and right page rather than doing nothing.  Neither means anything
+     * else here -- the dashboard drops them when a page declines them -- and
+     * this sheet is several screens long on a machine whose only scroll wheel
+     * is a thumbstick nudged one row at a time.
+     */
+    case Joypad::NavLeft:
+        scrollBy(-pageStep());
+        return true;
+    case Joypad::NavRight:
+        scrollBy(pageStep());
         return true;
     default:
         return false;
@@ -1361,8 +1926,7 @@ void InfoPage::wheelEvent(QWheelEvent *event)
         event->ignore();
         return;
     }
-    m_scroll = qBound(0, m_scroll - notches, qMax(0, m_rows.size() - 4));
-    update();
+    scrollBy(-notches);
     event->accept();
 }
 
@@ -1372,6 +1936,107 @@ void InfoPage::refresh()
         return;
 
     m_rows.clear();
+
+    /* ── System ──────────────────────────────────────────────────────────── */
+    addHeader(QStringLiteral("System"));
+
+    /* The board's own name for itself, out of the device tree the bootloader
+     * handed the kernel -- the one string on this page nothing in userspace
+     * chose. */
+    const QString model = readDT("/proc/device-tree/model");
+    if (!model.isEmpty())
+        add("Device", model);
+
+    QString kernel = firstWords(readTrimmed("/proc/version"), 3);
+    if (kernel.isEmpty())
+        kernel = readTrimmed("/proc/sys/kernel/osrelease");
+    add("Kernel", kernel.isEmpty() ? QString("unknown") : kernel);
+    add("Dashboard", QString("build %1, Qt %2, %3")
+                         .arg(QString(MIXDASH_BUILD_ID), QString(QT_VERSION_STR),
+                              QGuiApplication::platformName()));
+
+    const QString up = readTrimmed("/proc/uptime").section(' ', 0, 0);
+    if (!up.isEmpty()) {
+        const int secs = (int)up.toDouble();
+        add("Uptime", secs >= 3600
+                          ? QString("%1h %2m").arg(secs / 3600).arg((secs / 60) % 60)
+                          : QString("%1m %2s").arg(secs / 60).arg(secs % 60));
+    }
+
+    /* Only our own words: the rest of the command line is long and known. */
+    QStringList words;
+    for (const QString &w : readTrimmed("/proc/cmdline").split(' ', Qt::SkipEmptyParts))
+        if (w.startsWith("j36."))
+            words << w;
+    add("Boot words", words.isEmpty() ? QString("none") : words.join(' '));
+
+    /* ── Processor ───────────────────────────────────────────────────────── */
+    addHeader(QStringLiteral("Processor"));
+
+    const CpuInfo cpu = cpuInfo();
+    add("Chip", cpu.model.isEmpty() ? QString("unknown") : cpu.model);
+    if (!cpu.hardware.isEmpty())
+        add("Platform", cpu.hardware);
+    /* Present, not online: this SoC hotplugs cores out under thermal load, and a
+     * quad-core that says "1 core" is exactly the thing worth noticing. */
+    const QString present = readTrimmed("/sys/devices/system/cpu/present");
+    add("Cores", QString("%1 online%2").arg(cpu.cores)
+                     .arg(present.isEmpty() ? QString() : ", " + present + " present"));
+
+    const QString freq = "/sys/devices/system/cpu/cpu0/cpufreq/";
+    const QString cur = readTrimmed(freq + "scaling_cur_freq");
+    if (!cur.isEmpty()) {
+        const QString max = readTrimmed(freq + "cpuinfo_max_freq");
+        const QString gov = readTrimmed(freq + "scaling_governor");
+        QString line = QString("%1 MHz").arg(cur.toLongLong() / 1000);
+        if (!max.isEmpty())
+            line += QString(" of %1 MHz").arg(max.toLongLong() / 1000);
+        if (!gov.isEmpty())
+            line += ", " + gov;
+        add("Clock", line);
+    }
+
+    const QString load = readTrimmed("/proc/loadavg");
+    if (!load.isEmpty())
+        add("Load", firstWords(load, 3));
+
+    addList("Thermal", thermalZones(), "no thermal zones -- the SoC sensor has no driver");
+
+    /* ── Memory ──────────────────────────────────────────────────────────── */
+    addHeader(QStringLiteral("Memory"));
+
+    QFile mem("/proc/meminfo");
+    if (mem.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        long total = 0, avail = 0, swapTotal = 0, swapFree = 0;
+        while (!mem.atEnd()) {
+            const QString line = QString::fromLatin1(mem.readLine());
+            const QString value = line.section(':', 1).trimmed().section(' ', 0, 0);
+            if (line.startsWith("MemTotal:"))
+                total = value.toLong();
+            else if (line.startsWith("MemAvailable:"))
+                avail = value.toLong();
+            else if (line.startsWith("SwapTotal:"))
+                swapTotal = value.toLong();
+            else if (line.startsWith("SwapFree:"))
+                swapFree = value.toLong();
+        }
+        if (total > 0)
+            add("RAM", QString("%1 free of %2")
+                           .arg(humanBytes((qulonglong)avail * 1024),
+                                humanBytes((qulonglong)total * 1024)));
+        add("Swap", swapTotal > 0 ? QString("%1 free of %2")
+                                        .arg(humanBytes((qulonglong)swapFree * 1024),
+                                             humanBytes((qulonglong)swapTotal * 1024))
+                                  : QString("none"));
+    } else {
+        /* A section header with nothing under it reads as a page that broke
+         * halfway through drawing, so every section on this sheet says something
+         * even when the file behind it would not open. */
+        add("RAM", "no /proc/meminfo");
+    }
+
+    /* ── Display ─────────────────────────────────────────────────────────── */
+    addHeader(QStringLiteral("Display"));
 
     /*
      * The framebuffer, asked rather than assumed.  This is the one row worth the
@@ -1395,47 +2060,17 @@ void InfoPage::refresh()
         }
         ::close(fb);
     }
-    m_rows.append(qMakePair(QString("Panel"), fbLine));
-    m_rows.append(qMakePair(QString("Painted by"),
-                            QString("Qt %1, %2").arg(QT_VERSION_STR, QGuiApplication::platformName())));
+    add("Panel", fbLine);
 
-    m_rows.append(qMakePair(QString("Kernel"), firstWords(readTrimmed("/proc/version"), 3)));
-
-    const QString up = readTrimmed("/proc/uptime").section(' ', 0, 0);
-    if (!up.isEmpty()) {
-        const int secs = (int)up.toDouble();
-        m_rows.append(qMakePair(QString("Uptime"),
-                                QString("%1m %2s").arg(secs / 60).arg(secs % 60)));
+    const QStringList lights =
+        QDir("/sys/class/backlight").entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    if (!lights.isEmpty()) {
+        const QString base = "/sys/class/backlight/" + lights.first();
+        const QString now = readTrimmed(base + "/brightness");
+        const QString top = readTrimmed(base + "/max_brightness");
+        if (!now.isEmpty() && !top.isEmpty())
+            add("Backlight", QString("%1 of %2 (%3)").arg(now, top, lights.first()));
     }
-
-    /* Memory, from the two lines that matter. */
-    QFile mem("/proc/meminfo");
-    if (mem.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        long total = 0;
-        long avail = 0;
-        while (!mem.atEnd()) {
-            const QString line = QString::fromLatin1(mem.readLine());
-            if (line.startsWith("MemTotal:"))
-                total = line.section(':', 1).trimmed().section(' ', 0, 0).toLong();
-            else if (line.startsWith("MemAvailable:"))
-                avail = line.section(':', 1).trimmed().section(' ', 0, 0).toLong();
-        }
-        if (total > 0)
-            m_rows.append(qMakePair(QString("Memory"),
-                                    QString("%1 MB free of %2 MB").arg(avail / 1024).arg(total / 1024)));
-    }
-
-    bool charging = false;
-    const int cap = SysInfo::batteryCapacity(&charging);
-    m_rows.append(qMakePair(QString("Cell"),
-                            cap < 0 ? QString("no power_supply class -- see Diagnostics")
-                                    : QString::number(cap) + "%"
-                                          + QString(charging ? ", charging" : "")));
-
-    m_rows.append(qMakePair(QString("Sound"),
-                            QFileInfo::exists("/dev/snd/controlC0")
-                                ? QString("controlC0")
-                                : QString("no /dev/snd/controlC0 -- add j36.audio=1")));
 
     /*
      * The DRI nodes, classified rather than counted.  eglprobe answered
@@ -1453,12 +2088,8 @@ void InfoPage::refresh()
     const QDir cls("/sys/class/drm");
     const QStringList nodes =
         cls.entryList(QStringList() << "card[0-9]", QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
-    if (nodes.isEmpty()) {
-        m_rows.append(qMakePair(QString("DRM"),
-                                QString("nothing in /sys/class/drm -- the dashboard does not need it")));
-    }
-    for (int i = 0; i < nodes.size(); ++i) {
-        const QString node = nodes.at(i);
+    QStringList drm;
+    for (const QString &node : nodes) {
         const QString driver =
             QFileInfo("/sys/class/drm/" + node + "/device/driver").symLinkTarget().section('/', -1);
 
@@ -1469,27 +2100,52 @@ void InfoPage::refresh()
             conns << c.section('-', 1) + (status.isEmpty() ? QString() : " " + status);
         }
 
-        m_rows.append(qMakePair(i == 0 ? QString("DRM") : QString(),
-                                QString("%1 %2 -- %3")
-                                    .arg(node, driver.isEmpty() ? QString("?") : driver,
-                                         conns.isEmpty()
-                                             ? QString("render only, no connector, no modesetting")
-                                             : conns.join(", "))));
+        drm << QString("%1 %2 -- %3")
+                   .arg(node, driver.isEmpty() ? QString("?") : driver,
+                        conns.isEmpty() ? QString("render only, no connector, no modesetting")
+                                        : conns.join(", "));
     }
+    addList("DRM", drm, "nothing in /sys/class/drm -- the dashboard does not need it");
 
+    /* ── Storage ─────────────────────────────────────────────────────────── */
+    addHeader(QStringLiteral("Storage"));
+
+    addList("Disks", blockDisks(), "no block devices -- which cannot be, since you booted");
+    addList("Mounted", mountedVolumes(), "nothing mounted from a block device");
+
+    /* ── Peripherals ─────────────────────────────────────────────────────── */
+    addHeader(QStringLiteral("Peripherals"));
+
+    addList("USB", usbDevices(),
+            QFileInfo::exists("/sys/bus/usb")
+                ? QString("the bus is up and empty")
+                : QString("no USB stack -- add j36.usb=1 to the command line"));
+    addList("Input", inputDevices(), "no /dev/input nodes");
     if (!m_inputs.isEmpty())
-        m_rows.append(qMakePair(QString("Input"), m_inputs));
+        add("Reading", m_inputs);
 
-    /* Only our own words: the rest of the command line is long and known. */
-    QStringList words;
-    for (const QString &w : readTrimmed("/proc/cmdline").split(' ', Qt::SkipEmptyParts))
-        if (w.startsWith("j36."))
-            words << w;
-    m_rows.append(qMakePair(QString("Boot words"),
-                            words.isEmpty() ? QString("none") : words.join(' ')));
+    /* ── Network ─────────────────────────────────────────────────────────── */
+    addHeader(QStringLiteral("Network"));
 
-    if (m_scroll > qMax(0, m_rows.size() - 4))
-        m_scroll = qMax(0, m_rows.size() - 4);
+    addList("Interfaces", netInterfaces(), "none besides loopback");
+
+    /* ── Power ───────────────────────────────────────────────────────────── */
+    addHeader(QStringLiteral("Power"));
+
+    bool charging = false;
+    const int cap = SysInfo::batteryCapacity(&charging);
+    add("Cell", cap < 0 ? QString("no power_supply class -- see Diagnostics")
+                        : QString::number(cap) + "%" + QString(charging ? ", charging" : ""));
+    addList("Supplies", powerSupplies(),
+            "nothing in /sys/class/power_supply -- the PMIC has no driver yet");
+
+    /* ── Sound ───────────────────────────────────────────────────────────── */
+    addHeader(QStringLiteral("Sound"));
+
+    addList("Cards", soundCards(), "no card -- add j36.audio=1 to the command line");
+
+    if (m_scroll > maxScroll())
+        m_scroll = maxScroll();
 
     update();
 }
@@ -1499,30 +2155,84 @@ void InfoPage::paintEvent(QPaintEvent *)
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
 
+    /*
+     * The section name in the title bar, but only once its own header has
+     * scrolled off the top: while the header is still on the glass it would just
+     * be the same word twice.  Halfway down a long list it is the only thing
+     * saying which list you are in.
+     */
+    const bool atHeader = m_scroll < m_rows.size() && m_rows.at(m_scroll).header;
     const QRectF card(Theme::Margin, Theme::Margin,
                       width() - 2.0 * Theme::Margin, height() - 2.0 * Theme::Margin);
-    const QRectF body = paintSheet(p, card, QStringLiteral("System"));
+    const QRectF body = paintSheet(p, card, QStringLiteral("System"),
+                                   atHeader ? QString() : sectionAt(m_scroll));
 
+    const QFont headFont = Theme::font(11, true);
     const QFont labelFont = Theme::font(12, true);
     const QFont valueFont = Theme::font(12);
+    const QFontMetrics headMetrics(headFont);
     const QFontMetrics valueMetrics(valueFont);
-    const qreal labelW = 96.0;
-    const qreal rowH = 21.0;
-    qreal y = body.y() + 8;
+
+    const qreal left = card.x() + 14;
+    const qreal right = card.right() - 14;
+    const qreal labelW = 84.0;
+    const qreal vx = left + labelW + 12;
+    const qreal vw = right - vx;
+    qreal y = body.y() + kPadTop;
 
     for (int i = m_scroll; i < m_rows.size(); ++i) {
-        if (y + rowH > body.bottom() - 6)
+        const Row &row = m_rows.at(i);
+        const qreal h = row.header ? kHeadH : kRowH;
+        if (y + h > body.bottom() - kPadBottom)
             break;
-        p.setFont(labelFont);
-        p.setPen(Theme::ink3());
-        p.drawText(QRectF(card.x() + 14, y, labelW, rowH),
-                   Qt::AlignRight | Qt::AlignVCenter, m_rows[i].first);
-        p.setFont(valueFont);
-        p.setPen(Theme::ink());
-        const qreal vx = card.x() + 14 + labelW + 12;
-        const qreal vw = card.right() - 14 - vx;
-        p.drawText(QRectF(vx, y, vw, rowH), Qt::AlignLeft | Qt::AlignVCenter,
-                   valueMetrics.elidedText(m_rows[i].second, Qt::ElideRight, (int)vw));
-        y += rowH;
+
+        if (row.header) {
+            /*
+             * Bottom-aligned, so the six pixels a header has over a row land as
+             * air above it rather than being split either side.  The rule runs
+             * from the end of the text to the edge of the sheet, which reads as
+             * a divider without needing a second colour on the page.
+             */
+            p.setFont(headFont);
+            p.setPen(Theme::teal());
+            p.drawText(QRectF(left, y, right - left, h),
+                       Qt::AlignLeft | Qt::AlignBottom, row.label);
+            const qreal tw = headMetrics.horizontalAdvance(row.label);
+            const qreal ly = qRound(y + h - headMetrics.height() / 2.0) - 0.5;
+            if (left + tw + 10 < right) {
+                p.setPen(QPen(Theme::separator(), 1.0));
+                p.drawLine(QPointF(left + tw + 10, ly), QPointF(right, ly));
+            }
+        } else {
+            if (!row.label.isEmpty()) {
+                p.setFont(labelFont);
+                p.setPen(Theme::ink3());
+                p.drawText(QRectF(left, y, labelW, h), Qt::AlignRight | Qt::AlignVCenter,
+                           row.label);
+            }
+            p.setFont(valueFont);
+            p.setPen(Theme::ink());
+            p.drawText(QRectF(vx, y, vw, h), Qt::AlignLeft | Qt::AlignVCenter,
+                       valueMetrics.elidedText(row.value, Qt::ElideRight, (int)vw));
+        }
+
+        y += h;
+    }
+
+    /*
+     * A scrollbar, and on this page it earns its pixels: the sheet is long
+     * enough that without one there is no way to tell a section boundary from
+     * the end of the list.  Proportional to rows rather than to pixels, which is
+     * close enough when all but nine of them are the same height.
+     */
+    const int limit = maxScroll();
+    if (limit > 0) {
+        const qreal trackY = body.y() + kPadTop;
+        const qreal trackH = body.height() - kPadTop - kPadBottom;
+        const qreal barH = qMax(24.0, trackH * (qreal)(m_rows.size() - limit) / m_rows.size());
+        const qreal barY = trackY + (trackH - barH) * m_scroll / limit;
+        p.setPen(Qt::NoPen);
+        p.setBrush(Theme::dockHi());
+        p.drawRoundedRect(QRectF(right + 6, barY, 3, barH), 1.5, 1.5);
     }
 }
