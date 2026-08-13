@@ -1491,6 +1491,13 @@ usb_vbus=1
 want_power=0
 power_charge=1
 want_wifi=0
+# The only j36 word that defaults to ON, and the reason is that it is the word you
+# cannot ask for after the fact: it writes the file that says why the boot went
+# wrong, and by the time somebody wants that file the boot has already gone wrong
+# and the card is in another machine.  It loads nothing and it holds the FAT open
+# for about a second per pass -- see setup_logdump -- so the cost of it being on
+# by default is smaller than the cost of one boot where it was not.
+want_log=1
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         j36.audio|j36.audio=1)
@@ -1597,6 +1604,13 @@ for arg in $(cat /proc/cmdline); do
         # staging anything at all -- that is the boot that says what is missing.
         j36.dash|j36.dash=1)
             want_dash=1
+            ;;
+        # Off, for the one board that is being watched on the serial cable while
+        # somebody edits the card between boots: the log is redundant then, and the
+        # two mounts it makes are two chances to leave a FAT dirty under a reader
+        # that already has the answer.  Nothing else turns it off.
+        j36.log=0|nolog)
+            want_log=0
             ;;
         root=/dev/*)
             root_hint="${arg#root=}"
@@ -3607,6 +3621,379 @@ AUTOMOUNT
     return 0
 }
 
+# ── the log somebody can actually read ────────────────────────────────────────
+#
+# WHY THIS EXISTS.  "Send me the log" has had no answer on this board.  The panel
+# is the only output it has, the dashboard covers the panel a few seconds in, and
+# the two partitions that hold anything are ext2 -- the one filesystem the machine
+# that flashed this card will not mount.  The journal does not survive either:
+# cleanup_filesystem.sh deletes /var/log/journal from the shared rootfs, so
+# journald falls back to /run and the whole boot's log dies with the power.  What
+# was left was photographing a 640x480 screen, which is how the last four bugs
+# were reported.
+#
+# BOOT IS THE ANSWER BECAUSE BOOT IS FAT.  It is the one partition every machine
+# that can write this card can also read -- 100 MB, of which the launcher uses
+# about twelve, so a megabyte of text is free and the file lands at the top level
+# where it is the first thing in the window.
+#
+# IT IS MOUNTED FOR AS LONG AS IT TAKES TO WRITE ONE FILE AND NOT A SECOND LONGER.
+# This is a handheld with a power switch, and a FAT left mounted read-write when
+# somebody flicks it is a dirty FAT on the partition the bootloader reads.  So a
+# pass mounts, writes under a temporary name, syncs, renames over the previous
+# log, syncs again and unmounts: a power cut during the write loses the new log
+# and keeps the old one, and a power cut at any other moment finds BOOT not
+# mounted at all.
+#
+# It is staged from here, in a tmpfs, for the same reason everything else is:
+# nothing on the shared rootfs is written, so this lands on a card that was
+# flashed months ago without rebuilding anything on it.
+setup_logdump() {
+    if [ -z "$rootdev" ]; then
+        say "logdump: no rootfs was found, so there is no systemd to run the dump"
+        return 1
+    fi
+    if ! ensure_run_tmpfs; then
+        say "logdump: no tmpfs on the rootfs /run, so nothing can be staged"
+        return 1
+    fi
+    mkdir -p /newroot/run/j36/bin /newroot/run/systemd/system
+
+    # The one thing the rootfs cannot work out as cheaply as we can: this partition
+    # has already been mounted and looked inside for mvii/, so hand the answer over
+    # rather than making the script repeat the search.  It still knows how to search
+    # -- bootdev is empty on a boot where mount_bootfs never ran -- and an empty
+    # file is a legitimate value that means exactly that.
+    printf '%s\n' "$bootdev" > /newroot/run/j36/bootdev
+
+    cat > /newroot/run/j36/bin/j36-logdump <<'LOGDUMP'
+#!/bin/sh
+# j36-logdump -- write one diagnostic file onto the FAT BOOT partition.
+#
+# Written by the J36 Ultra initramfs into /run, and started by j36-logdump.service:
+#
+#     j36-logdump boot     wait, write, wait longer, write again
+#     j36-logdump now      write once, immediately -- the shutdown pass
+#
+# The output is /mixos-log.txt at the root of BOOT, which is the partition a Mac or
+# a Windows machine mounts when the card goes into a reader.
+#
+# This one runs in the ROOTFS, not in the initramfs, so it is ordinary POSIX shell
+# with Debian's userland under it -- but it is a DIAGNOSTIC, which changes what it
+# may assume.  A general-purpose Debian need not carry iw, rfkill or usbutils, and
+# the whole value of this file is that a missing tool leaves a line saying so
+# instead of truncating everything after it.  Hence run() below, and hence no
+# `set -e': the one thing this script must not do is stop early.
+#
+# No `set -f' either, unlike its sibling mixos-automount, because the search for
+# the boot partition is a glob over /dev/mmcblk*p* and needs one.  Nothing else
+# here expands: every value that comes from outside is a device path and is quoted.
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+# Both, because journalctl and systemctl each check their own and a pager here
+# would be a process waiting forever for a terminal that does not exist.
+SYSTEMD_PAGER=
+SYSTEMD_COLORS=0
+export SYSTEMD_PAGER SYSTEMD_COLORS
+
+MNT=/run/j36/bootmnt
+NAME=mixos-log.txt
+TMP=mixos-log.new
+BOOTDEV=""
+
+# ── finding and mounting BOOT ─────────────────────────────────────────────────
+#
+# Identified by looking inside it, not by partition number: numbering here follows
+# whichever MMC host attached first.  mvii/ is what the LK reads and the one
+# directory BOOT always carries; j36/ is accepted because that is what a card from
+# an older layout has.
+#
+# Mounting a block device that is already mounted elsewhere is safe on Linux -- the
+# second mount finds the existing superblock and shares it rather than making a
+# second one -- so no check for that is needed, and a card whose fstab does mount
+# BOOT still gets its log.
+mount_boot() {
+    _saved=""
+    if [ -r /run/j36/bootdev ]; then
+        _saved="$(cat /run/j36/bootdev 2>/dev/null)"
+    fi
+    mkdir -p "$MNT"
+    for _d in $_saved /dev/mmcblk*p*; do
+        [ -b "$_d" ] || continue
+        mount -t vfat -o rw,noatime "$_d" "$MNT" 2>/dev/null || continue
+        if [ -d "$MNT/mvii" ] || [ -d "$MNT/j36" ]; then
+            BOOTDEV="$_d"
+            return 0
+        fi
+        umount "$MNT" 2>/dev/null || true
+    done
+    return 1
+}
+
+# ── the four emitters everything below is built from ──────────────────────────
+sec() { printf '\n\n===== %s =====\n' "$*"; }
+
+# A command, its output, and what happened to it.  The exit status is printed
+# rather than swallowed: `ip link' exiting 1 and `ip link' printing nothing are
+# different findings, and on a board with no network interface it is the second.
+run() {
+    sec "$*"
+    if command -v "$1" >/dev/null 2>&1; then
+        "$@" 2>&1 || printf '(exited %s)\n' "$?"
+    else
+        printf '(%s: not installed on this rootfs)\n' "$1"
+    fi
+}
+
+show() {
+    sec "$1"
+    if [ -r "$1" ]; then cat "$1" 2>&1; else printf '(absent)\n'; fi
+}
+
+# /sys is full of one-value files and the value means nothing without the path it
+# came from, so every one is named as it goes.  The label is separate because the
+# caller passes an expanded glob and a header made of twenty paths is not a header.
+showall() {
+    _lbl="$1"; shift
+    sec "$_lbl"
+    _any=0
+    for _f in "$@"; do
+        [ -e "$_f" ] || continue
+        _any=1
+        printf -- '--- %s\n' "$_f"
+        cat "$_f" 2>/dev/null || printf '(unreadable)\n'
+    done
+    [ "$_any" = 1 ] || printf '(nothing matched)\n'
+}
+
+# The whole ring buffer is at the end of this file.  These are the same lines
+# pulled forward under the name of the bug they belong to, because the difference
+# between a log that gets read and one that does not is whether the answer is in
+# the first screen.
+kgrep() {
+    _lbl="$1"; _pat="$2"
+    sec "kernel messages about $_lbl"
+    dmesg 2>/dev/null | grep -iE "$_pat" || printf '(no line matched)\n'
+}
+
+dump() {
+    printf 'MixOS -- J36 Ultra boot diagnostic\n'
+    printf 'pass: %s\n' "$1"
+    printf 'Read the four numbered sections first; the raw dmesg and journal are\n'
+    printf 'at the end.  Nothing here is secret except any Wi-Fi passphrase you\n'
+    printf 'typed, and none is included.\n'
+    run date
+    run uptime
+    run uname -a
+    show /proc/cmdline
+    show /etc/j36-build
+    show /etc/os-release
+
+    printf '\n\n########## 0.  WHAT FAILED ##########\n'
+    run systemctl --no-pager --no-legend --failed
+    run systemctl --no-pager --no-legend list-units --state=activating
+    sec "the last 400 lines at warning or worse"
+    journalctl -b --no-pager -p warning -n 400 2>&1 || printf '(journalctl failed)\n'
+
+    printf '\n\n########## 1.  WI-FI ##########\n'
+    run ls -l /sys/class/net
+    run ip -d link
+    run ip addr
+    run iw dev
+    run rfkill list
+    run systemctl --no-pager status wpa_supplicant
+    showall "the CONSYS/WMT nodes, if the driver made any" \
+        /sys/class/misc/wmtdetect/uevent /dev/wmtWifi /dev/stpwmt
+    kgrep "Wi-Fi and the connectivity MCU" \
+        'wlan|wifi|wmt|consys|stp_|btif|mt66|mt76|cfg80211|ieee80211|nl80211'
+
+    printf '\n\n########## 2.  BATTERY AND CHARGER ##########\n'
+    run ls -l /sys/class/power_supply
+    showall "every power supply this kernel registered" \
+        /sys/class/power_supply/*/uevent
+    kgrep "the PMIC, the gauge and the ADC" \
+        'pmic|mt6323|battery|charger|auxadc|adc|power_supply|vchr|vbat'
+
+    printf '\n\n########## 3.  GAMEPAD AND JOYSTICKS ##########\n'
+    show /proc/bus/input/devices
+    run ls -l /dev/input
+    showall "what each input device calls itself" /sys/class/input/input*/name
+    showall "and what it says it can do (EV bits)" /sys/class/input/input*/capabilities/ev
+    showall "absolute axes, which is where a dead stick shows" \
+        /sys/class/input/input*/capabilities/abs
+    kgrep "input devices" 'input|joystick|gamepad|js[0-9]|event[0-9]|j36_input|adc.*key'
+
+    printf '\n\n########## 4.  USB ##########\n'
+    run lsusb
+    run ls -l /sys/bus/usb/devices
+    showall "what is plugged in, as the devices describe themselves" \
+        /sys/bus/usb/devices/*/product /sys/bus/usb/devices/*/manufacturer
+    kgrep "USB, the PHY and MUSB" 'usb|musb|phy|xhci|ehci|hub |otg|vbus'
+
+    printf '\n\n########## 5.  THE PANEL, THE SPLASH AND THE DASHBOARD ##########\n'
+    run ls -l /dev/fb0 /dev/dri
+    showall "framebuffer geometry" \
+        /sys/class/graphics/fb0/virtual_size /sys/class/graphics/fb0/bits_per_pixel \
+        /sys/class/graphics/fb0/name /sys/class/graphics/fb0/state
+    show /sys/class/tty/tty0/active
+    run ps -eo pid,ppid,stat,etimes,args
+    run systemctl --no-pager status mixdash
+    run systemctl --no-pager status batt_led
+    kgrep "the display stack" 'fb0|fbcon|drm|mtkfb|mtkdrm|lima|mali|backlight'
+
+    printf '\n\n########## 6.  MODULES ##########\n'
+    show /proc/modules
+
+    printf '\n\n########## 7.  THE WHOLE KERNEL RING BUFFER ##########\n'
+    sec "dmesg"
+    dmesg 2>&1 || printf '(dmesg failed)\n'
+
+    printf '\n\n########## 8.  THE JOURNAL FOR THIS BOOT ##########\n'
+    sec "journalctl -b, last 4000 lines"
+    journalctl -b --no-pager -n 4000 2>&1 || printf '(journalctl failed)\n'
+
+    printf '\n\n===== end of diagnostic =====\n'
+}
+
+write_once() {
+    if ! mount_boot; then
+        echo "j36-logdump: no FAT partition on this card carries mvii/ or j36/"
+        return 1
+    fi
+    dump "$1" > "$MNT/$TMP" 2>&1
+    _bytes="$(wc -c < "$MNT/$TMP" 2>/dev/null || echo 0)"
+    sync
+    mv -f "$MNT/$TMP" "$MNT/$NAME" 2>/dev/null || true
+    sync
+    umount "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null || true
+    echo "j36-logdump: wrote /$NAME on $BOOTDEV, $_bytes bytes ($1)"
+    return 0
+}
+
+case "${1:-boot}" in
+boot)
+    # Two passes, and the first one is the point.  The failures worth reading are
+    # the ones that make somebody give up and pull the power, so there has to be a
+    # file on the card before that happens; twenty seconds in is after systemd has
+    # finished starting things and before anybody has lost patience.  The second is
+    # late enough that a restart loop or a ninety-second unit timeout has had room
+    # to show its shape, and it overwrites the first, so the card ends up with
+    # whichever picture is the more complete one the board survived to write.
+    sleep 20
+    write_once "boot+20s"
+    sleep 55
+    write_once "boot+75s"
+    ;;
+now|shutdown)
+    write_once "shutdown"
+    ;;
+*)
+    echo "usage: j36-logdump boot|now"
+    exit 64
+    ;;
+esac
+exit 0
+LOGDUMP
+    chmod 0755 /newroot/run/j36/bin/j36-logdump
+
+    # ── the unit ─────────────────────────────────────────────────────────────
+    #
+    # Type=simple and not oneshot, and RemainAfterExit is what makes ExecStop mean
+    # what it says.  A oneshot that sleeps for 75 s holds the multi-user.target job
+    # open for 75 s, which delays nothing real but makes systemd-analyze and every
+    # "startup finished" message wrong.  Simple starts, returns, and gets out of the
+    # way -- and with RemainAfterExit the unit stays active after the script exits,
+    # so ExecStop runs at shutdown rather than immediately after the second pass.
+    #
+    # DefaultDependencies are left on, which is what puts Before=shutdown.target on
+    # this unit and gives the shutdown pass a block device that still exists.
+    #
+    # StandardOutput=journal and not journal+console: this is the unit whose whole
+    # purpose is that nobody has to read the panel.
+    cat > /newroot/run/systemd/system/j36-logdump.service <<'UNITLOG'
+# Written by the J36 Ultra initramfs, into a tmpfs.  See setup_logdump in /init.
+[Unit]
+Description=Write a MixOS boot diagnostic onto the BOOT partition
+# Late, but not ordered after the target that wants it -- that is a knot.  This is
+# the last thing systemd starts on the way to a login, so it is the right anchor.
+After=systemd-user-sessions.service
+
+[Service]
+Type=simple
+RemainAfterExit=yes
+ExecStart=/bin/sh /run/j36/bin/j36-logdump boot
+ExecStop=/bin/sh /run/j36/bin/j36-logdump now
+# The shutdown pass mounts a FAT, writes about a megabyte and unmounts it.  Thirty
+# seconds is generous for that on a slow card and still short enough that a board
+# which cannot do it does not hang the shutdown.
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+UNITLOG
+    mkdir -p /newroot/run/systemd/system/multi-user.target.wants
+    ln -sf ../j36-logdump.service \
+           /newroot/run/systemd/system/multi-user.target.wants/j36-logdump.service
+
+    say "logdump: BOOT:/mixos-log.txt, written 20 s and 75 s in and again at shutdown"
+    say "         Take the card out and open it on any machine -- BOOT is the FAT one."
+    return 0
+}
+
+# ── the restart loop that paints over the picture ─────────────────────────────
+#
+# batt_led.service comes from the shared RG351MP rootfs and runs
+# /usr/local/bin/batt_life_warning.py, which on THAT board reads
+# /sys/class/power_supply/battery/capacity and writes /sys/class/gpio/gpio77/value.
+# Neither path exists here.  The unit is Restart=always with RestartSec=2 and
+# StartLimitIntervalSec=0 -- rate limiting explicitly turned off -- so a script
+# that exits nonzero is started again every two seconds for as long as the board
+# is on, and every attempt puts an eight-line Python traceback and two systemd
+# status lines on /dev/console.  On this board /dev/console is the panel.  That is
+# the splash being overwritten, once per 2.3 seconds, for ever.
+#
+# THE SCRIPT ITSELF WAS ALREADY FIXED -- it walks /sys/class/power_supply by type
+# now and treats a missing LED as normal -- but the fix is in the SHARED ROOTFS,
+# which the R36 half of this build makes and which a J36-only run does not rebuild.
+# So a card can carry a current kernel, a current dashboard and last season's
+# batt_life_warning.py, and this is exactly what that card does.  Written from the
+# initramfs, this reaches such a card without rebuilding anything on it.
+#
+# A DROP-IN AND NOT A MASK.  Masking takes the battery LED away from every board
+# that has one; this only says the unit may fail a few times and then has to stop
+# trying, and that what it prints goes to the journal.  A drop-in DIRECTORY merges
+# across /run, /etc and /lib -- unlike a unit FILE, which does not -- so this
+# reaches a unit installed in /etc/systemd/system without replacing it, and a card
+# that already carries the fixed script is unaffected: that one never exits, so a
+# start limit it never reaches costs it nothing.
+tame_batt_led() {
+    if [ -z "$rootdev" ]; then return 1; fi
+    if ! ensure_run_tmpfs; then return 1; fi
+    mkdir -p /newroot/run/systemd/system/batt_led.service.d
+    cat > /newroot/run/systemd/system/batt_led.service.d/zz-j36-bounded.conf <<'BATTCONF'
+# Written by the J36 Ultra initramfs, into a tmpfs.  See tame_batt_led in /init.
+[Unit]
+# Five starts in thirty seconds is a script that cannot run on this board.  systemd
+# then puts the unit in failed state and stops, which is the correct end of that
+# story and is what the unit's own StartLimitIntervalSec=0 asked it never to do.
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+# Whatever it has to say, it says to the journal.  The panel is showing a picture.
+StandardOutput=journal
+StandardError=journal
+BATTCONF
+    if [ -f /newroot/etc/systemd/system/batt_led.service ] || \
+       [ -f /newroot/lib/systemd/system/batt_led.service ] || \
+       [ -f /newroot/usr/lib/systemd/system/batt_led.service ]; then
+        say "power: batt_led.service bounded to 5 starts and kept off the console"
+    else
+        say "power: no batt_led.service on this rootfs; the drop-in is inert"
+    fi
+    return 0
+}
+
 # ── WHAT USED TO BE HERE, AND WHY NOTHING REPLACED IT ─────────────────────────
 #
 # neuter_es(), which masked emulationstation.service with a symlink to /dev/null in
@@ -3802,6 +4189,20 @@ else
     say "dash: j36.dash is not in the kernel command line, so no shell is staged"
     say "      and whatever the rootfs starts by itself is what you get.  Add"
     say "      j36.dash=1 to bootargs in mvii/boot.conf on the BOOT partition."
+fi
+
+# Outside every want_ block above, and last, which is the only placement that makes
+# sense for either of these.  The boots worth explaining are exactly the ones where
+# one of those words did not do its job, so a diagnostic conditional on them is a
+# diagnostic missing from the boot that needed it -- and the console the battery
+# daemon is scribbling on belongs to the splash whether or not a dashboard was
+# asked for.  Both need a rootfs and nothing else, which is what is checked inside.
+if [ -n "$rootdev" ] && [ "$want_log" = 1 ]; then
+    stage "Preparing the log"
+    detail "BOOT:/mixos-log.txt"
+    progress 86
+    tame_batt_led
+    setup_logdump
 fi
 
 if [ -n "$rootdev" ]; then
@@ -5650,7 +6051,8 @@ initrd=initrd.img
 # j36.gl=debug adds Mesa's EGL trace; a diagnostic, not a default.
 # j36.splash=0 with loglevel=7 boots to text, which is the pair
 # ./build-j36-ultra.sh --no-splash writes here.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1 j36.usb=1 j36.power=1 j36.wifi=1 j36.splash=1
+# Each boot writes mixos-log.txt at the top of this partition; j36.log=0 stops it.
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1 j36.usb=1 j36.power=1 j36.wifi=1 j36.splash=1
 CONF
 
 # ── --no-splash, applied to the line rather than written into it ──────────────
@@ -5702,8 +6104,10 @@ at the ARMv7 payload instead.
   LICENSE.txt               which licence covers which file above, and where the
                             GPL-2.0-only source is; keep it with the payload
 
-That is the whole partition, and the shortness is the design.  The MVII LK reads
-FAT32 and nothing else, so BOOT exists because the loader has to be able to open
+That is the whole partition as it is written, and the shortness is the design.
+The board adds one file of its own on every boot -- mixos-log.txt, described
+below -- and nothing else ever appears here.  The MVII LK reads FAT32 and nothing
+else, so BOOT exists because the loader has to be able to open
 it -- which makes it the launcher and only the launcher: the four files something
 other than Linux has to read.  Everything else went to the OS partition, which is
 ext2, and therefore holds symlinks and execute bits and is not a 100 MB partition
@@ -5754,6 +6158,45 @@ qualifies -- or if you delete root= from mvii/boot.conf -- it stops at a busybox
 shell on the panel and on the serial port instead, and prints /proc/partitions so
 you can see what the kernel did find.
 
+The log on this partition
+-------------------------
+
+mixos-log.txt, at the top level, beside zImage.  Take the card out, put it in any
+machine that can read a FAT, and open it: that is the whole procedure, and it is
+the only one this board has.
+
+WHY IT IS HERE AND NOT SOMEWHERE SENSIBLE.  The journal on this image is volatile
+-- the rootfs build deletes /var/log/journal, so journald keeps everything in /run
+and the whole boot's log dies with the power.  The two partitions that do hold
+things are ext2, which is the one filesystem a Mac will not mount.  And the panel,
+which is the only output the board has, belongs to the dashboard within a few
+seconds of the splash finishing.  So a diagnostic that is not on the FAT is a
+diagnostic that has to be photographed, which is how the last several bugs on this
+board were reported.
+
+WHAT IS IN IT.  The four sections at the top are the four things that go wrong on
+this board -- Wi-Fi, the battery and charger, the gamepad and its sticks, and USB
+-- each one being the sysfs nodes for that subsystem and the kernel messages that
+mention it, pulled out of the ring buffer and put under a heading.  Then the panel
+and dashboard, then the loaded modules, then the entire dmesg and the last 4000
+lines of the journal.  Section 0 is what systemd says failed.  Nothing is
+collected that is not already on the screen of a machine with a serial cable
+attached.
+
+WHEN IT IS WRITTEN.  Twenty seconds after systemd reaches the login target, again
+at seventy-five seconds, and once more if the board is shut down cleanly.  The
+second pass overwrites the first, so the file on the card is the most complete
+picture the board survived long enough to write; a board that hangs before twenty
+seconds leaves no file at all, and that is itself the finding.
+
+WHAT IT COSTS.  Each pass mounts this partition read-write, writes about a
+megabyte, syncs and unmounts -- a second or so, three times in a session.  The
+write goes to a temporary name and is renamed over the previous log only once it
+is complete, so pulling the power mid-write loses the new log and keeps the old
+one rather than leaving a truncated file under the name you were told to read.
+Outside those three windows BOOT is not mounted, which matters on a handheld with
+a physical power switch.  j36.log=0 in the bootargs turns the whole thing off.
+
 The command line, word by word
 ------------------------------
 
@@ -5765,11 +6208,27 @@ console=ttyS0,115200n8 console=tty0
     port that may have nothing plugged into it.  tty0 last puts /dev/console on
     the panel.
 
-systemd.journald.forward_to_console=1
-    The other half of the same problem: it copies the service log to
-    /dev/console, so the panel shows services starting and failing instead of a
-    blinking cursor.  Drop it once there is a shell or a network to read the
-    journal with -- it costs a redraw per line on a 640x480 framebuffer.
+systemd.journald.forward_to_console=1, gone
+    It copied every service log line to /dev/console, and /dev/console is the
+    panel, so the panel showed services starting and failing instead of a blinking
+    cursor.  That was the right trade while there was no other way to read the
+    journal.  There is one now -- mixos-log.txt, below -- and the word had a cost
+    the whole time: it is the mechanism by which anything a unit prints lands on
+    top of the boot splash, at a redraw per line on a 640x480 framebuffer.
+
+    Nothing worth reading was lost with it.  The units that have to reach the
+    panel say so themselves: mixdash.service and mixdash-missing.service are both
+    StandardOutput=journal+console, and the kernel's own printk never went through
+    journald at all -- it goes to both consoles because of the console= words
+    above, and loglevel=4 is what bounds it.  Put the word back in the bootargs
+    line if you want the running commentary; it is a diagnostic, not a default.
+
+j36.log=1
+    Default ON, and the only j36 word that is.  Twenty seconds into the boot, and
+    again at seventy-five, and once more on a clean shutdown, /init's staged
+    j36-logdump.service mounts this partition read-write, writes mixos-log.txt at
+    the top of it and unmounts again.  See "The log on this partition" below.
+    j36.log=0 turns it off.
 
 systemd.mask=firstboot.service
     MixOS's first-boot script is written for the RK3326 image and this
@@ -5823,6 +6282,17 @@ batt_led.service, no longer masked
     enables the unit -- so a card written by an older build still carries the
     crashing copy.  --mix-only does not refresh it; a full build does, the
     finalization stage running on a resume as well.
+
+    Which is why /init no longer relies on the script being current.  It writes
+    /run/systemd/system/batt_led.service.d/zz-j36-bounded.conf on every boot:
+    StartLimitIntervalSec=30 with StartLimitBurst=5, undoing the unit's own
+    "never give up", and StandardOutput/StandardError=journal so that whatever it
+    does have to say is not said on the picture.  A card carrying the old script
+    now gets five tracebacks in the journal and a failed unit instead of one
+    traceback on the panel every 2.3 s for ever; a card carrying the fixed script
+    never exits, so a start limit it cannot reach costs it nothing.  A drop-in
+    directory merges across /run, /etc and /lib -- a unit file does not -- which
+    is what lets a file in a tmpfs modify a unit installed in /etc.
 
     Worth knowing when reading its output: with no power-path FET on this board,
     VBAT is the system node, so the percentage the daemon reads is the gauge's
