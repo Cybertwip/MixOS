@@ -125,6 +125,7 @@
 #include <linux/workqueue.h>
 
 #include "j36_battery_curve.h"
+#include "j36_mt6592_pmic.h"
 
 /* ── module parameters ───────────────────────────────────────────────────────
  *
@@ -643,6 +644,75 @@ static int j36_pmic_field(struct j36_pmic *p, u32 adr, u32 mask, u32 shift, u32 
 {
 	return j36_pmic_update(p, adr, mask, (val << shift) & mask);
 }
+
+/*
+ * ══════════════════════════════════════════════════════════════════════════
+ * THE ONE DOOR ONTO PWRAP, and why it is a door rather than a second key.
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * j36_mt6592_wifi needs the four MT6323 connectivity rails -- VCN_1V8, VCN28 and
+ * the two halves of VCN33 -- and they are behind the same WACS2 bridge this
+ * driver reads the gauge through.  WACS2 is ONE state machine with ONE result
+ * register: a transaction is a write to CMD followed by a poll of RDATA followed
+ * by a write to VLDCLR, and there is nothing in the hardware that keeps two
+ * drivers' transactions apart.  Two modules each holding their own spinlock over
+ * their own ioremap of the same window is not two locks, it is no lock -- one
+ * would collect the other's result, clear the valid flag under it, and both would
+ * report a plausible wrong number.  On a gauge that is a wrong percentage; on a
+ * rail it is a regulator enable that silently did not happen.
+ *
+ * So the WiFi driver does not map pwrap at all.  It calls this, which runs on the
+ * same spinlock as every other transaction here.
+ *
+ * A singleton, and honestly so: there is one MT6592 die, one MT6323 companion and
+ * one bridge between them, and a second instance of this driver would be a device
+ * tree describing a board that does not exist.  The pointer is published at the
+ * end of probe (so a caller cannot catch a half-built state) and cleared by a
+ * devm action on the way out.
+ *
+ * The load-order consequence is deliberate and is the good kind: j36_mt6592_wifi
+ * links against this symbol, so insmod REFUSES it outright if this module is not
+ * loaded, in a log line naming the missing symbol.  The alternative -- an
+ * optional lookup that degrades -- would boot a radio whose transmit PA supply
+ * was never raised and leave it to be diagnosed as an RF fault.
+ */
+static struct j36_pmic *j36_pmic_singleton;
+
+/**
+ * j36_pmic_pwrap_update() - read-modify-write one MT6323 register
+ * @adr: the PMIC-side register address (16 bit)
+ * @clr: bits to clear
+ * @set: bits to set
+ *
+ * Returns 1 if the register changed, 0 if it already held that value, -ENODEV if
+ * the PMIC driver is not bound, and a negative transport error otherwise.
+ */
+int j36_pmic_pwrap_update(u32 adr, u32 clr, u32 set)
+{
+	struct j36_pmic *p = READ_ONCE(j36_pmic_singleton);
+
+	if (!p)
+		return -ENODEV;
+	return j36_pmic_update(p, adr, clr, set);
+}
+EXPORT_SYMBOL_GPL(j36_pmic_pwrap_update);
+
+/**
+ * j36_pmic_pwrap_read() - read one MT6323 register
+ * @adr: the PMIC-side register address (16 bit)
+ * @rdata: where the 16-bit value lands
+ *
+ * Returns 0, -ENODEV if the PMIC driver is not bound, or a transport error.
+ */
+int j36_pmic_pwrap_read(u32 adr, u32 *rdata)
+{
+	struct j36_pmic *p = READ_ONCE(j36_pmic_singleton);
+
+	if (!p)
+		return -ENODEV;
+	return j36_pmic_read(p, adr, rdata);
+}
+EXPORT_SYMBOL_GPL(j36_pmic_pwrap_read);
 
 /* INIT_DONE in the RDATA word.  Everything here is a no-op until it is set: the
  * bridge is brought up by the LK and this driver never initialises it. */
@@ -2387,6 +2457,15 @@ static void j36_pmic_cancel_poll(void *data)
 	cancel_delayed_work_sync(&p->poll_work);
 }
 
+/* Withdraw the door before the devm ioremaps behind it go away.  A WiFi bring-up
+ * in flight at this moment gets -ENODEV from its next rail write and fails the
+ * way it would have if this module had never loaded. */
+static void j36_pmic_unpublish(void *data)
+{
+	if (READ_ONCE(j36_pmic_singleton) == data)
+		WRITE_ONCE(j36_pmic_singleton, NULL);
+}
+
 static int j36_pmic_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -2496,6 +2575,13 @@ static int j36_pmic_probe(struct platform_device *pdev)
 
 	INIT_DELAYED_WORK(&p->poll_work, j36_pmic_poll);
 	ret = devm_add_action_or_reset(dev, j36_pmic_cancel_poll, p);
+	if (ret)
+		return ret;
+
+	/* Open the door only now: everything a caller could reach through it --
+	 * the pwrap mapping and the lock that serialises it -- is up. */
+	WRITE_ONCE(j36_pmic_singleton, p);
+	ret = devm_add_action_or_reset(dev, j36_pmic_unpublish, p);
 	if (ret)
 		return ret;
 

@@ -616,6 +616,26 @@ bool CardGrid::handleNav(int action)
     case Joypad::NavLeft:  moveBy(-1, 0); return true;
     case Joypad::NavRight: moveBy(1, 0); return true;
     case Joypad::NavOk:    activate(); return true;
+
+    /*
+     * THE SHOULDERS, WHICH ARE NOW SELECTION FIRST AND TABS SECOND.
+     *
+     * L1/L2 and R1/R2 arrive here as NavPrevPage and NavNextPage, and until now
+     * this page did not want them, so the shell's fallback ran and they jumped
+     * straight to the previous or next dock tab.  That is a tab strip and not a
+     * shortcut: a hand already on the shoulder had to move back to the D-pad to
+     * pick anything on the tab it had just landed on.
+     *
+     * So they step the selection, in reading order and without wrapping, and
+     * return false only at the two ends of the grid -- where falling through to
+     * the shell means the tab change still happens, one press later.  Held down,
+     * that walks the whole dashboard from either end without touching the pad,
+     * which is what "they're just shortcuts" asks for.  The D-pad is unchanged
+     * and still wraps within its row.
+     */
+    case Joypad::NavPrevPage: return stepBy(-1);
+    case Joypad::NavNextPage: return stepBy(1);
+
     default: return false;
     }
 }
@@ -731,6 +751,24 @@ void CardGrid::moveBy(int dx, int dy)
     m_index = candidate;
     update();
     emit indexChanged(m_index);
+}
+
+bool CardGrid::stepBy(int dx)
+{
+    if (m_entries.isEmpty())
+        return false;
+
+    /* Flat, not row-and-column: a shortcut that steps off the end of one row and
+     * onto the start of the next is the order the cards are read in, and it is
+     * the order that makes "hold R1 to get to the last card" behave. */
+    const int next = m_index + dx;
+    if (next < 0 || next >= m_entries.size())
+        return false;
+
+    m_index = next;
+    update();
+    emit indexChanged(m_index);
+    return true;
 }
 
 void CardGrid::activate()

@@ -199,6 +199,13 @@ public:
     QString currentTitle() const;
 
     void moveBy(int dx, int dy);
+    /*
+     * One card left or right in reading order, WITHOUT the wrap moveBy() does,
+     * and false when there is nowhere to go.  That false is the whole point: it
+     * is what lets the shoulder buttons step through the grid and then carry on
+     * into the next tab instead of chasing their own tail round one row.
+     */
+    bool stepBy(int dx);
     void activate();
 
     void setPageTitle(const QString &t) { m_pageTitle = t; }

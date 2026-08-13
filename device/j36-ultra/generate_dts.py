@@ -353,6 +353,30 @@ def generate(sources: dict[str, str]) -> str:
 \t\t\treg = <0x{fb_addr:08x} 0x{width * height * 4:08x}>;
 \t\t\tno-map;
 \t\t}};
+
+\t\t/*
+\t\t * The window the connectivity subsystem sees as its own EMI aperture.
+\t\t * Stock takes it with arm_memblock_steal(0x100000, 0x100000) before the
+\t\t * kernel has a page allocator; a reserved-memory node is the same thing
+\t\t * done in the device tree, and the stronger form of it -- the kernel
+\t\t * never had these pages rather than having them taken back.
+\t\t *
+\t\t * no-map is load-bearing twice over. It keeps the pages out of the
+\t\t * linear map, which is what lets the driver ioremap_wc() them at all --
+\t\t * ARM32 refuses to ioremap linear-mapped RAM, precisely so two mappings
+\t\t * of one page cannot disagree about cacheability -- and it stops the
+\t\t * kernel writing into memory a connectivity MCU is DMAing to.
+\t\t *
+\t\t * The address is fixed rather than dynamic because the subsystem's
+\t\t * mapping register holds it as twelve bits of 1 MiB units, so it has to
+\t\t * be megabyte aligned, and because it has to miss everything else the
+\t\t * boot already places by address: the LK handoff framebuffer ends at
+\t\t * 0x{fb_addr + width * height * 4:08x} and the ramdisk lands at 0x84000000.
+\t\t */
+\t\tconsys_emi: consys-emi@83100000 {{
+\t\t\treg = <0x83100000 0x00100000>;
+\t\t\tno-map;
+\t\t}};
 \t}};
 
 \tcpus {{
@@ -523,6 +547,53 @@ def generate(sources: dict[str, str]) -> str:
 \t\tinfracfg: syscon@10001000 {{
 \t\t\tcompatible = \"j36,mt6592-infracfg\", \"syscon\";
 \t\t\treg = <0x10001000 0x1000>;
+\t\t}};
+
+\t\t/*
+\t\t * The sleep-and-power controller, as a syscon for the same reason as the
+\t\t * two clock blocks above: there is no MT6592 entry in drivers/soc or
+\t\t * drivers/pmdomain, so nothing here can hand out a genpd, and the one
+\t\t * consumer that needs a power domain up reaches CONN_PWR_CON through a
+\t\t * phandle and walks MediaTek's own MTCMOS sequence over it.
+\t\t */
+\t\tspm: syscon@10006000 {{
+\t\t\tcompatible = \"j36,mt6592-spm\", \"syscon\";
+\t\t\treg = <0x10006000 0x1000>;
+\t\t}};
+
+\t\t/*
+\t\t * The connectivity subsystem. Not an SDIO combo chip and not on a bus:
+\t\t * CONSYS_6592 is on this die, so it is a platform device with three
+\t\t * windows of its own and phandles to the three shared blocks that gate
+\t\t * it.
+\t\t *
+\t\t *   btif     0x1100c000  the die-to-die UART the WMT link runs over
+\t\t *   conn-mcu 0x18070000  the connectivity MCU config block, chip id at +8
+\t\t *   hif      0x180f0000  the WLAN AHB HIF -- mapped, and untouched until
+\t\t *                        the firmware stage exists to use it
+\t\t *
+\t\t * memory-region is the EMI aperture the subsystem DMAs through, above.
+\t\t *
+\t\t * There is no j36,pwrap-controller phandle here and that is deliberate:
+\t\t * the MT6323 rails this needs are reached through j36_mt6592_pmic's two
+\t\t * exported calls, because WACS2 is one state machine with one result
+\t\t * register and a second mapping of it would not be a second lock.
+\t\t *
+\t\t * status is \"okay\" and costs nothing on a boot that does not ask for
+\t\t * Wi-Fi: the driver is a module on the boot partition, so with no
+\t\t * j36.wifi word nothing is ever loaded to bind to this node.
+\t\t */
+\t\twifi: wifi@1100c000 {{
+\t\t\tcompatible = \"j36,j36-ultra-wifi\";
+\t\t\treg = <0x1100c000 0x1000>,
+\t\t\t      <0x18070000 0x1000>,
+\t\t\t      <0x180f0000 0x10000>;
+\t\t\treg-names = \"btif\", \"conn-mcu\", \"hif\";
+\t\t\tmemory-region = <&consys_emi>;
+\t\t\tj36,infracfg-controller = <&infracfg>;
+\t\t\tj36,pericfg-controller = <&pericfg>;
+\t\t\tj36,spm-controller = <&spm>;
+\t\t\tstatus = \"okay\";
 \t\t}};
 
 \t\t/*

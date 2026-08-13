@@ -74,10 +74,24 @@ const Map kMap[] = {
     { KEY_Q,         Joypad::NavQuit }
 };
 
-/* Slot order matches the adc-joystick node: ABS_X, ABS_Y, ABS_Z, ABS_RY.
- * Slots 0 and 1 are the left stick and navigate; 2 and 3 are the right stick and
- * drive the pointer unless the user has turned the pointer off. */
-const int kAxis[4] = { ABS_X, ABS_Y, ABS_Z, ABS_RY };
+/*
+ * Slot order matches the device tree: ABS_X, ABS_Y, ABS_Z, ABS_RZ.  Slots 0 and
+ * 1 are the left stick and navigate; 2 and 3 are the right stick and drive the
+ * pointer unless the user has turned the pointer off.
+ *
+ * SLOT 3 IS ABS_RZ AND NOT ABS_RY, AND THAT IS WHY THE POINTER DID NOT WORK.
+ * generate_dts.py emits `j36,axis-map = <ch15 ABS_X 1  ch14 ABS_Y 1  ch12 ABS_Z 0
+ * ch13 ABS_RZ 0>' and j36_mt6592_input.c passes those codes to
+ * input_set_abs_params verbatim, so the fourth axis this board reports is code 5.
+ * This table asked for code 4.  The right stick's X arrived on slot 2 and its Y
+ * arrived on an axis nothing was listening to, so absSeen[3] was never set --
+ * and driveStick() skips a device outright unless BOTH of its right-stick axes
+ * have been seen, so the pointer was not half-broken, it never moved at all.
+ *
+ * The disabled adc-joystick node in the same DTS says <5> for its axis@3 too, so
+ * both descriptions of this hardware agree and it was only this file that did not.
+ */
+const int kAxis[4] = { ABS_X, ABS_Y, ABS_Z, ABS_RZ };
 
 const int kRepeatFirstMs = 380;
 const int kRepeatNextMs = 90;

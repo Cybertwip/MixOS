@@ -1159,6 +1159,49 @@ static int console_grab(void)
     return -1;
 }
 
+/*
+ * Take it back, once a second, for as long as this process is drawing.
+ *
+ * THE GRAB IS NOT A LOCK.  KD_GRAPHICS is a mode on the VT and any process that
+ * opens the same terminal can set it back, with no notification to whoever set
+ * it -- and on this board something does, every boot, at exactly the point the
+ * splash reaches "Starting system services".  From then on the panel carries a
+ * login banner, the forwarded journal and a Python traceback every two seconds
+ * drawn straight over the wallpaper, which is what "the splash goes scrambled"
+ * is: not a corrupt image, but fbcon painting text on top of one.
+ *
+ * The usual suspects all do it for good reasons of their own and none of them
+ * can be argued out of it:
+ *
+ *   - agetty resets the terminal it is given before printing the issue, and
+ *     `reset_vc' is KDSETMODE KD_TEXT.  getty@tty1.service is pulled in by
+ *     multi-user.target, which is the moment in question.
+ *   - systemd-vconsole-setup loads a font and a keymap on every VT.
+ *   - systemd itself resets the console it was told to log to.
+ *
+ * Masking them is the wrong trade: this board has no other way in when the
+ * dashboard will not start, and a recovery console is worth more than a tidy
+ * boot.  So the mode is simply re-taken rather than defended.  The cost is one
+ * ioctl a second against a process that is already redrawing a 640x480 canvas
+ * at 25 fps, and the failure mode is bounded and self-correcting -- whatever
+ * flipped it gets its own terminal reset, and the panel goes back to the splash
+ * within a frame of it.
+ *
+ * KDGETMODE first so the common case -- nobody touched it -- costs a read and
+ * no write, and so the note() only fires when something really did take it.
+ */
+static void console_hold(int fd)
+{
+    int mode = KD_GRAPHICS;
+
+    if (fd < 0)
+        return;
+    if (ioctl(fd, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS)
+        return;
+    if (ioctl(fd, KDSETMODE, KD_GRAPHICS) == 0)
+        note("something put the console back into text mode; taken again");
+}
+
 static void console_release(int fd, int keep_graphics)
 {
     if (fd < 0)
@@ -1208,7 +1251,7 @@ int main(int argc, char **argv)
     uint32_t *img, *canvas;
     char stage[96], detail[96], line[512];
     double target = 0.0, shown = 0.0;
-    double t0, last_msg, handover_at = -1.0;
+    double t0, last_msg, handover_at = -1.0, last_hold = 0.0;
     int console = -1, handover = 0, opt;
 
     while ((opt = getopt(argc, argv, "i:f:d:s:t:T:1kvh")) != -1) {
@@ -1376,6 +1419,14 @@ int main(int argc, char **argv)
         }
 
         keep_damage();
+
+        /* Once a second, not once a frame: whatever takes the VT does it once
+         * and then blocks on a read, so a second is fast enough to hide and
+         * slow enough that this never shows up in a profile. */
+        if (t - last_hold >= 1.0) {
+            last_hold = t;
+            console_hold(console);
+        }
 
         if (g_damage_all) {
             fb_blit(&fb, canvas, 0, 0, fb.w, fb.h);

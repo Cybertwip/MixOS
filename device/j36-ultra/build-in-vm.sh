@@ -1005,7 +1005,7 @@ verify_armv7_kernel "$ZIMAGE" "the zImage"
 fits_in "$ZIMAGE" $((0x01800000)) "the zImage"
 log "Verified a 32-bit ARMv7 zImage: $(stat -c %s "$ZIMAGE") bytes"
 
-log "Building the out-of-tree J36 modules: the input adapter, the panel, the AFE, the USB PHY, the PMIC and the backlight"
+log "Building the out-of-tree J36 modules: the input adapter, the panel, the AFE, the USB PHY, the PMIC, the backlight and the radio"
 mkdir -p "$MODULE_SRC"
 rsync -a --delete "$ROOT/device/j36-ultra/linux/" "$MODULE_SRC/"
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
@@ -1055,6 +1055,17 @@ verify_arm_elf "$PMIC_MODULE" "the PMIC module"
 BACKLIGHT_MODULE="$MODULE_SRC/j36_mt6592_backlight.ko"
 [[ -s "$BACKLIGHT_MODULE" ]] || die "backlight module was not produced"
 verify_arm_elf "$BACKLIGHT_MODULE" "the backlight module"
+# And the radio, staged as its own wifi payload.  It is the only module here built
+# from more than one translation unit -- main, consys and wmt -- and the only one
+# that links against another of these modules rather than against the kernel
+# alone: the PMIC exports the two wrapper accessors it needs, because the WACS2
+# bridge has one owner.  Both facts are why a missing .ko is worth failing over
+# and not worth guessing about.  If this line ever fires, read the modpost output
+# above it: an undefined j36_pmic_pwrap_* is the PMIC having been dropped from
+# this same M= directory, not the radio failing to compile.
+WIFI_MODULE="$MODULE_SRC/j36_mt6592_wifi.ko"
+[[ -s "$WIFI_MODULE" ]] || die "Wi-Fi module was not produced"
+verify_arm_elf "$WIFI_MODULE" "the Wi-Fi module"
 fits_in "$DTB_OUT/mt6592-j36-ultra.dtb" $((0x00040000)) "the device tree"
 
 if [[ ! -d "$BUSYBOX_SRC/.git" ]]; then
@@ -1463,6 +1474,7 @@ want_usb=0
 usb_vbus=1
 want_power=0
 power_charge=1
+want_wifi=0
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         j36.audio|j36.audio=1)
@@ -1529,6 +1541,22 @@ for arg in $(cat /proc/cmdline); do
             want_power=1
             power_charge=0
             ;;
+        # The connectivity subsystem: MT6323 rails, the CONSYS power domain, the
+        # BTIF link and the two ROM patches.  Behind its own word for the reason
+        # every payload here has one and for one more that is specific to it: the
+        # MTCMOS sequence brings up a power domain the AP shares a bus with, and
+        # a bus protection released in the wrong order on MediaTek does not fault
+        # -- it stalls until the watchdog resets the board.  Dropping the word, or
+        # deleting j36/wifi/, is the recovery, from any machine that reads SD
+        # cards.
+        #
+        # It implies j36.power and does not merely want it: the rails are on the
+        # MT6323 behind a PMIC wrapper with exactly one owner, so without that
+        # module the wifi module's symbols do not resolve and insmod refuses.  The
+        # implication is applied after this loop, where the ordering is visible.
+        j36.wifi|j36.wifi=1)
+            want_wifi=1
+            ;;
         # Mesa, staged where the loader will find it ahead of the RK3326 blob.
         #
         # j36.es and j36.es=debug were accepted here too, because this word was
@@ -1564,6 +1592,21 @@ for arg in $(cat /proc/cmdline); do
             ;;
     esac
 done
+
+# j36.wifi implies j36.power, and it is applied here rather than inside the case
+# so that it holds whichever order the two words appear in.  It is an implication
+# and not a warning because the alternative is a boot that says "FAILED to load
+# j36_mt6592_wifi.ko" with an unresolved-symbol dump in place of a reason: the
+# MT6323 connectivity rails are reached through j36_mt6592_pmic's two exported
+# calls, so the PMIC module is a hard link-time dependency rather than a
+# preference.  Saying so out loud matters because it means j36.wifi silently turns
+# the charger on, which is the one thing on this board that is worth being asked
+# about -- j36.power=nocharge beside it keeps the gauge and leaves CHR_CON alone.
+if [ "$want_wifi" = 1 ] && [ "$want_power" != 1 ]; then
+    want_power=1
+    say "wifi: j36.wifi needs the PMIC for the MT6323 rails, so j36.power is implied"
+    say "      (add j36.power=nocharge as well to leave the charger as the LK set it)"
+fi
 
 mkdir -p /newroot
 
@@ -2319,6 +2362,103 @@ run_power() {
         done
     else
         say "power: no /sys/class/backlight -- brightness cannot be changed from Linux"
+    fi
+    return 0
+}
+
+# ── The connectivity subsystem, if the command line asks ─────────────────────
+#
+# AFTER run_power, AND THE ORDER IS A LINKER FACT RATHER THAN A PREFERENCE.  The
+# MT6323 rails the radio needs are behind the PMIC wrapper, which is one state
+# machine with one result register and no arbitration, so there is exactly one
+# owner of it in this kernel and this module reaches it through two exported
+# symbols.  insmod of the wifi module before the PMIC module fails outright,
+# naming the symbol.  Loaded in this order it resolves, and the driver's probe
+# additionally defers until the PMIC's DEVICE has bound, which is the part a
+# symbol cannot express.
+#
+# THE FIRMWARE PATH IS SET BEFORE THE INSMOD, and that line is the whole reason
+# this works from an initramfs.  request_firmware() searches the filesystem that
+# is mounted now, and /init switch_roots a few seconds later; pointing the loader
+# at the payload's own directory means the images are read while that directory
+# is still there.  The driver reads both patches during probe rather than during
+# its bring-up work precisely so this insmod is the synchronisation point -- when
+# it returns, the images are in kernel memory and the card can be pulled out from
+# under it.
+#
+# Nothing is written to the rootfs and no /lib/firmware is populated: the blobs
+# ship inside j36/wifi/firmware/, so deleting j36/wifi/ takes the radio off the
+# card in one step, like every other payload here.
+run_wifi() {
+    if ! find_payload; then return 1; fi
+    if [ ! -f "$payload/wifi/load.order" ]; then
+        say "wifi: j36.wifi was asked for but j36/wifi/load.order is not on the card"
+        return 1
+    fi
+
+    if [ -w /sys/module/firmware_class/parameters/path ]; then
+        echo "$payload/wifi/firmware" > /sys/module/firmware_class/parameters/path
+        say "wifi: firmware search path is $payload/wifi/firmware"
+    else
+        say "wifi: no writable firmware_class path -- the ROM patches will not be found"
+    fi
+
+    # Same skip as run_usb, for the same reason and a different overlap: the
+    # dependency walk that built this load order followed j36_mt6592_wifi's link
+    # to j36_mt6592_pmic, so the PMIC is in here too -- and run_power has already
+    # loaded it, with its charge= argument, which this must not undo.
+    while IFS= read -r ko; do
+        case "$ko" in ''|'#'*) continue ;; esac
+        mod=$(printf '%s' "${ko%.ko}" | tr '-' '_')
+        if [ -d "/sys/module/$mod" ]; then
+            say "wifi: $ko is already loaded"
+            continue
+        fi
+        if insmod "$payload/wifi/$ko" >/tmp/insmod.log 2>&1; then
+            say "wifi: loaded $ko"
+        else
+            say "wifi: FAILED to load $ko"
+            show /tmp/insmod.log
+        fi
+    done < "$payload/wifi/load.order"
+
+    # The bring-up is a work item, not part of insmod, because it is seconds long
+    # -- a hundred patch fragments with a two-second ceiling on each answer -- and
+    # a radio that does not come up must not be able to hold up the panel.
+    #
+    # So this waits, and it waits with a bound that is deliberately shorter than
+    # the worst case.  A healthy bring-up lands in two or three seconds and the
+    # verdict is worth having in the boot log; an unhealthy one can spend ten
+    # seconds inside the RF calibration timeout alone, and standing here for that
+    # buys a message that dmesg already has.  Eight seconds covers the first and
+    # refuses the second.
+    #
+    # Nothing is lost by walking away: the work item holds no reference to any
+    # filesystem by this point, so it runs to completion across switch_root.
+    #
+    # Two plain greps rather than one alternation: `\|' is a GNU extension to basic
+    # regular expressions, and which regex engine busybox grep ends up using is a
+    # property of how busybox was configured.  A boot-time test that silently never
+    # matches would turn every healthy bring-up into the "still running" verdict.
+    i=0
+    while [ "$i" -lt 8 ]; do
+        if dmesg | grep -q 'j36-mt6592-wifi.*connectivity MCU up' ||
+           dmesg | grep -q 'j36-mt6592-wifi.*bring-up stopped'; then
+            break
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+
+    if dmesg | grep -q 'j36-mt6592-wifi.*connectivity MCU up'; then
+        dmesg | grep 'j36-mt6592-wifi' | tail -n 3
+        say "wifi: the connectivity MCU is up and patched.  There is still no network"
+        say "      interface: the WLAN firmware and cfg80211 are not in this build."
+    elif dmesg | grep -q 'j36-mt6592-wifi.*bring-up stopped'; then
+        dmesg | grep 'j36-mt6592-wifi' | tail -n 6
+        say "wifi: bring-up did not finish; the lines above say where it stopped"
+    else
+        say "wifi: bring-up is still running -- dmesg has the verdict after boot"
     fi
     return 0
 }
@@ -3531,7 +3671,8 @@ progress 28
 stage_from_boot
 
 if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_gl" = 1 ] || \
-   [ "$want_audio" = 1 ] || [ "$want_usb" = 1 ] || [ "$want_power" = 1 ]; then
+   [ "$want_audio" = 1 ] || [ "$want_usb" = 1 ] || [ "$want_power" = 1 ] || \
+   [ "$want_wifi" = 1 ]; then
     # find_payload is called by each of the four rather than once here, so that a card
     # with no payload at all gets one message per word that was asked for, naming the
     # word -- and so that this block does not have to know which of them needs what.
@@ -3580,6 +3721,15 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_gl" = 1 ] || \
     if [ "$want_power" = 1 ]; then
         stage "Starting power management"; detail "MT6323 gauge, charger, poweroff"
         progress 71; run_power
+    fi
+    # After the PMIC and not before it: the connectivity rails are on the MT6323
+    # and this module reaches them through symbols the PMIC module exports, so
+    # the other order does not fail late, it fails at insmod.  It is the widest
+    # step in the bar because it is the only one that waits on a peer -- see the
+    # bound on the wait in run_wifi.
+    if [ "$want_wifi" = 1 ]; then
+        stage "Starting Wi-Fi"; detail "CONSYS power, BTIF link, ROM patches"
+        progress 73; run_wifi
     fi
     if [ "$want_gl" = 1 ]; then
         stage "Staging OpenGL"; detail "Mesa, EGL, GLESv2"
@@ -4316,6 +4466,37 @@ if [[ "${J36_POWER:-1}" == 1 ]]; then
     fi
 else
     log "power: J36_POWER=0, skipping the PMIC payload"
+fi
+
+# The connectivity subsystem: one out-of-tree module built from three translation
+# units, plus the two ROM patches it sends the connectivity MCU.
+#
+# THE WALK FINDS THE PMIC AND THAT IS CORRECT, not something to filter out.
+# j36_mt6592_wifi links against j36_mt6592_pmic's two exported wrapper calls --
+# there is one owner of the WACS2 bridge in this kernel and this is not it -- so
+# `modinfo -F depends' reports the edge and the payload gets a second copy of a
+# 40 KB module.  Two copies is the same trade j36/usb/ makes with the DRM helper
+# pair, and it buys the same thing: j36/wifi/ is removable on its own, and its
+# load order is complete on its own.  run_wifi skips whichever of them run_power
+# already loaded, which on any boot that reaches it is the PMIC.
+#
+# Nothing else is a root.  cfg80211 is not here and should not be looked for: this
+# build stops at a patched connectivity MCU, there is no netdev and no wiphy, so a
+# payload carrying the wireless stack would be carrying it for nothing.
+WIFI_MODULE_PATHS=()
+WIFI_MODULE_ORDER=()
+if [[ "${J36_WIFI:-1}" == 1 ]]; then
+    set +e
+    collect_modules wifi WIFI_MODULE_ORDER WIFI_MODULE_PATHS j36_mt6592_wifi
+    wifi_rc=$?
+    set -e
+    if (( wifi_rc != 0 )); then
+        WIFI_MODULE_ORDER=()
+        WIFI_MODULE_PATHS=()
+        log "wifi: modules not staged, see the error above -- the kernel payload is unaffected"
+    fi
+else
+    log "wifi: J36_WIFI=0, skipping the connectivity payload"
 fi
 
 # ── The GL runtime, which turned out not to need building ─────────────────────
@@ -5311,6 +5492,46 @@ if (( ${#POWER_MODULE_ORDER[@]} > 0 )); then
     log "power: staged ${#POWER_MODULE_ORDER[@]} modules into $PAYREL/power/"
 fi
 
+# j36/wifi/ is the connectivity module set and, unlike every other payload here,
+# the firmware it needs travels with it.
+#
+# The blobs are MediaTek's, off this device's own stock system image, and they go
+# under j36/wifi/firmware/ rather than into the rootfs's /lib/firmware for the
+# invariant this whole card is built on: one Debian rootfs serves two machines and
+# nothing writes to it.  /init points the kernel's firmware_class path at this
+# directory before it insmods, which also solves a problem a /lib/firmware install
+# would not have solved anyway -- the module is loaded from the initramfs, before
+# switch_root, and the loader searches whatever is mounted at the time.
+#
+# The removal contract is therefore the cleanest of the five: delete j36/wifi/ and
+# both the driver and its firmware are gone in one step, with no orphaned blobs
+# left behind in a system directory.  That matters more here than for the others
+# because this payload brings up a power domain the AP shares a bus with.
+if (( ${#WIFI_MODULE_ORDER[@]} > 0 )); then
+    mkdir -p "$PAYDIR/wifi"
+    : > "$PAYDIR/wifi/load.order"
+    for i in "${!WIFI_MODULE_ORDER[@]}"; do
+        cp "${WIFI_MODULE_PATHS[$i]}" "$PAYDIR/wifi/${WIFI_MODULE_ORDER[$i]}"
+        printf '%s\n' "${WIFI_MODULE_ORDER[$i]}" >> "$PAYDIR/wifi/load.order"
+    done
+    log "wifi: staged ${#WIFI_MODULE_ORDER[@]} modules into $PAYREL/wifi/"
+
+    # The names under mediatek/mt6592/ are what request_firmware() asks for, so
+    # the tree is copied whole rather than the two files flattened.  A missing
+    # blob is a warning and not a build failure: the modules still stage, the
+    # bring-up still runs, and it reports rom-patch-missing at the exact stage it
+    # needed them -- which is a better answer than a build that refused.
+    WIFI_FW_SRC="$ROOT/device/j36-ultra/firmware"
+    if [[ -d "$WIFI_FW_SRC/mediatek/mt6592" ]]; then
+        mkdir -p "$PAYDIR/wifi/firmware/mediatek/mt6592"
+        cp "$WIFI_FW_SRC/mediatek/mt6592/"*.bin \
+           "$PAYDIR/wifi/firmware/mediatek/mt6592/"
+        log "wifi: staged $(ls -1 "$PAYDIR/wifi/firmware/mediatek/mt6592" | wc -l) firmware blobs into $PAYREL/wifi/firmware/"
+    else
+        log "wifi: $WIFI_FW_SRC/mediatek/mt6592 is missing -- the ROM patches are not on the card and the radio will stop at rom-patch-missing"
+    fi
+fi
+
 # j36/gl/ is the GL front end plus the links file that stands in for symlinks.  On the
 # OS partition it no longer has to -- ext2 holds symlinks -- and it is kept anyway
 # because /init reads the same file whichever partition the payload came off, and one
@@ -5369,7 +5590,9 @@ initrd=initrd.img
 # under /opt/mixos/j36 on the OS partition, and the boot carries straight on.
 # lima gives a render node, mtkdrm a display node, gl puts Mesa ahead of the
 # RK3326 blob, dash runs the MixOS dashboard, audio a sound card, usb the one
-# MUSB port host-only, splash the MixOS picture with the boot stage on it.
+# MUSB port host-only, splash the MixOS picture with the boot stage on it, wifi
+# powers and ROM-patches the connectivity MCU -- no network interface yet, and it
+# implies j36.power because the radio's rails come off the PMIC.
 #
 # Only the four files the LK reads are on BOOT; the rest is in sd-root.tar.gz,
 # unpacked as /opt/mixos on the ext2 OS partition.
@@ -5380,7 +5603,7 @@ initrd=initrd.img
 # j36.gl=debug adds Mesa's EGL trace; a diagnostic, not a default.
 # j36.splash=0 with loglevel=7 boots to text, which is the pair
 # ./build-j36-ultra.sh --no-splash writes here.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1 j36.usb=1 j36.power=1 j36.splash=1
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service systemd.journald.forward_to_console=1 j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1 j36.usb=1 j36.power=1 j36.wifi=1 j36.splash=1
 CONF
 
 # ── --no-splash, applied to the line rather than written into it ──────────────
@@ -5456,6 +5679,8 @@ changes nothing else:
                            set (scsi_mod, sd_mod, usb-storage, ntfs3) -- plus load.order
   opt/mixos/j36/power/     the MT6592 PMIC: battery gauge, charger, poweroff --
                            and the panel backlight, which is the same subject
+  opt/mixos/j36/wifi/      the CONSYS connectivity MCU: rails, BTIF link and the
+                           two ROM patches, which ship in wifi/firmware/ with it
   opt/mixos/j36/gl/        Mesa's GL front end, plus links
   opt/mixos/j36/eglprobe   -f reports and paints /dev/fb0 with no DRM at all and
                            runs on every boot; the other modes say what can create
@@ -5807,6 +6032,50 @@ j36.power=nocharge
     its CV, its current-sense threshold and its enable bits across a warm reset,
     so a boot without the word starts from whatever the last boot with it left
     behind, not from a clean slate.
+
+j36.wifi=1
+    The connectivity MCU.  One module, j36/wifi/j36_mt6592_wifi.ko, loaded after
+    the power payload, and it does the first two of the four things that stand
+    between a cold MT6592 and a network interface.
+
+    WHAT IT DOES.  It powers the CONSYS block -- the MT6323's VCN28/VCN33 rails
+    through the PMIC's wrapper, then MTCMOS, then the INFRA_CONNMCU clock, then
+    the EMI mapping register that tells the MCU which megabyte of DRAM is its own
+    -- and then talks to it.  The link is BTIF at 0x1100c000, a 4-wire UART with
+    no pins, running MediaTek's STP framing with WMT commands inside it, and what
+    goes down it is the pair of ROM patches in j36/wifi/firmware/.  A patched MCU
+    answers with its chip ID, and that is where this build stops.
+
+    WHAT IT DOES NOT DO, said plainly: there is no wlan0 after this word.  The
+    WLAN firmware proper (WIFI_RAM_CODE_SOC) goes down the AHB HIF at 0x180f0000,
+    and neither that stage nor the cfg80211 netdev on top of it is in this build.
+    The driver says so itself in the last line it prints.  Reading the boot log is
+    the whole test: "connectivity MCU up: chip 0x..." means both stages passed,
+    and "Wi-Fi bring-up stopped at [stage]" names the one that did not -- the
+    stage names are the driver's own, and consys-power, btif-link, rom-patch and
+    wmt-handshake are the ones worth grepping for.
+
+    WHY IT IMPLIES j36.power.  The PMIC wrapper is one hardware state machine with
+    one result register and no arbitration between users, so exactly one driver
+    owns it: j36_mt6592_pmic, which lends the other two accessors.  Ask for
+    j36.wifi without j36.power and /init turns j36.power on and says it did;
+    j36.power=nocharge alongside it is honoured, since the charger is a separate
+    question.  Load order follows from the same fact -- the radio probe defers
+    until the PMIC has bound.
+
+    WHERE THE FIRMWARE IS.  In j36/wifi/firmware/, with the driver, and not in the
+    rootfs's /lib/firmware.  Two reasons, and the second is the hard one: the
+    rootfs is shared with the R36S and nothing here writes to it, and the module
+    is insmodded from the initramfs, seconds before switch_root, so /lib/firmware
+    is not mounted yet whatever we put in it.  /init points the kernel's
+    firmware_class path at the payload directory instead.  The consequence worth
+    knowing: delete j36/wifi/ and the driver and its blobs leave together.
+
+    The two files are MediaTek's, off this device's stock system image, and their
+    names lie about their order -- ROMv1_patch_1_1_hdr.bin is patch 1 and
+    ROMv1_patch_1_0_hdr.bin is patch 2.  The driver reads the sequence out of byte
+    24 of each header and sorts on that, because sending them in filename order
+    makes the MCU stop answering rather than complain.
 
 j36.gl=1
     Stage j36/gl/ -- Debian's armhf Mesa -- into a tmpfs, so that a program looking
@@ -6581,14 +6850,19 @@ GNU General Public License, version 2 only:
                             mass-storage set, ntfs3, and MixOS's
                             j36_mt6592_usb_phy
     j36/power/*.ko          MixOS's j36_mt6592_pmic and j36_mt6592_backlight
+    j36/wifi/*.ko           MixOS's j36_mt6592_wifi -- the CONSYS connectivity
+                            MCU's power, BTIF link and ROM patch download
     j36_mt6592_input.ko     MixOS's keypad and GPIO key adapter
 
-    The six MixOS modules are GPL-2.0-only deliberately and are not Ms-PL: they
+    The seven MixOS modules are GPL-2.0-only deliberately and are not Ms-PL: they
     derive from and link against GPL-2.0-only kernel internals, and Ms-PL is not
     GPL-compatible.
 
 Their own terms:
 
+    j36/wifi/firmware/      MediaTek's connectivity ROM patches, redistributed
+                            unmodified as this device shipped them; MediaTek's
+                            terms, not MixOS's, and not GPL
     j36/gl/*.so*            Mesa, from Debian (MIT and others)
     qt/lib, qt/plugins      Qt 5.15 and its runtime closure, from Debian: LGPL-3
                             with Qt's own exceptions, and GPL/LGPL/MIT/others for
@@ -6823,6 +7097,15 @@ SD cards.
                        VBAT and a cell should be fitted; j36.usb=novbus leaves the
                        pad alone.  Two modules here also live in j36/mtkdrm;
                        whichever loaded first wins.            j36.usb=1
+  j36/power            the MT6592 PMIC -- battery gauge, charger and a poweroff
+                       that cuts the rail -- and the panel backlight.  j36.power=1;
+                       j36.power=nocharge keeps the charger as the LK set it.
+  j36/wifi             the CONSYS connectivity MCU: its rails, the BTIF link, and
+                       wifi/firmware/ holding the two ROM patches that go down it.
+                       There is no network interface yet -- the WLAN firmware and
+                       cfg80211 stages are not in this build, and the boot log
+                       says which stage it reached.  j36.wifi=1 implies j36.power,
+                       because one driver owns the PMIC wrapper.
   j36/gl               Mesa's GL front end, staged in /run/j36/gl ahead of the
                        rootfs's RK3326 Mali blob.  links/ records the SONAME
                        aliases, kept from when this payload was on FAT.  j36.gl=1

@@ -186,6 +186,9 @@ private:
 
     void activate(const AppEntry &entry);
     void launch(const QString &title, const QString &exe, const QStringList &args);
+    /* The Console card: a login shell on a VT of its own, with the dashboard
+     * still running behind it.  Blocks until the shell exits. */
+    void console();
     void toast(const QString &text, int ms = 2400);
     static QString firstExisting(const QStringList &candidates);
     static QString firstWad();

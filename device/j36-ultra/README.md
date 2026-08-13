@@ -211,6 +211,10 @@ j36/mfgpower           powers the Mali-450 and reads its ID back (j36.lima=1)
 j36/modules/           lima.ko and its dependencies, plus load.order
 j36/mtkdrm/            the MT6592 display set, plus load.order (j36.mtkdrm=1)
 j36/audio/             the ALSA core and the MT6592 AFE, plus load.order (j36.audio=1)
+j36/usb/               the MUSB host stack, HID, udl and the disk set (j36.usb=1)
+j36/power/             the MT6592 PMIC and the panel backlight (j36.power=1)
+j36/wifi/              the CONSYS connectivity MCU, plus firmware/ holding the two
+                       ROM patches that go down the BTIF link (j36.wifi=1)
 j36/gl/                Mesa's GL front end, plus links (vfat has no symlinks)
 j36/eglprobe           what can create a GL context, and with -p whether a frame
                        reaches the glass: five held colours, CPU then lima
@@ -605,8 +609,10 @@ and the exact per-file scope are in [LICENSE](LICENSE).
 Two things in this directory are **not** Ms-PL, and the distinction is not
 cosmetic:
 
-- `linux/j36_mt6592_input.c`, `linux/j36_mt6592_audio.c`,
-  `linux/j36_jd9365_panel.c` and the two `linux/*.patch` files are
+- Everything under `linux/` — the seven MixOS modules (`j36_mt6592_input.c`,
+  `j36_mt6592_audio.c`, `j36_jd9365_panel.c`, `j36_mt6592_usb_phy.c`,
+  `j36_mt6592_pmic.c`, `j36_mt6592_backlight.c` and the three-file
+  `j36_mt6592_wifi` build) and the two `linux/*.patch` files — is
   **`GPL-2.0-only`**. They derive from and link against GPL-2.0-only kernel
   internals, and Ms-PL is not GPL-compatible — its section 3(D) adds a condition
   GPLv2 section 6 forbids adding — so relicensing them is not this project's to
@@ -614,6 +620,9 @@ cosmetic:
 - `mvii-board/` is five verbatim MediaTek/MVII board headers and driver sources,
   redistributed unmodified with a SHA-256 each in `mvii-board/PROVENANCE.txt`.
   They are inputs the DTS generator parses, not MixOS work.
+- `firmware/mediatek/mt6592/` is two MediaTek connectivity ROM patches, taken off
+  this device's own stock system image and redistributed unmodified with a
+  SHA-256 each in `firmware/README.md`. MediaTek's terms, not this project's.
 
 A finished card is an aggregate: the Linux kernel, Mesa, Qt, SDL, busybox, the
 Freedoom IWAD and the Debian rootfs each arrive under their own terms.
