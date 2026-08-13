@@ -118,7 +118,7 @@ elif [[ "${J36_UPDATE_KERNEL:-0}" == 1 ]]; then
     git -C "$KERNEL_SRC" reset --hard FETCH_HEAD
 fi
 
-# ── The two changes this build makes to the kernel itself ─────────────────────
+# ── The three changes this build makes to the kernel itself ───────────────────
 #
 # mtk-sd carries no compatible for MT6592 and refuses to probe without pinctrl;
 # linux/0001-mtk-sd-mt6592.patch fixes both, and its header records why neither
@@ -130,6 +130,21 @@ fi
 # Its header records, register by register, what was measured against the MVII LK
 # and against the stock 3.4 kernel to prove the rest of the mt2701 driver data
 # exact.  Everything else that port needs is device tree, not code.
+#
+# linux/0003-musb-mediatek-mt6592.patch is USB, and it exists because MT6592's
+# MUSB predates the MT2701/MT7623 part drivers/usb/musb/mediatek.c was written
+# for by two generations.  MediaTek added the TXTOG/RXTOG toggle block at
+# 0x80..0x87 in that later part and moved the multipoint BUSCTL block to 0x480
+# to make room for it; MT6592 has neither, so BUSCTL is still at the stock MUSB
+# base of 0x80.  Driving it at 0x480 fails silently and completely -- every
+# device's function address is written into a hole, so each SET_ADDRESS is
+# followed by traffic still aimed at address 0 and nothing enumerates, with no
+# error logged.  The patch also moves the two toggle-register writes below
+# phy_init(), because on this SoC the PHY driver's .init is what ungates the
+# controller and a MUSB access before it stalls the APB until the watchdog
+# fires.  Its header records what was read out of the stock 3.10.72 kernel to
+# establish all of that, including the confirmation that INTID 96 is the right
+# interrupt and that 8 KB of FIFO RAM and endpoints 1..8 already match.
 #
 # Applied idempotently rather than from a stamp file, because this checkout
 # persists across runs and a stamp can outlive the tree it describes -- a
@@ -150,6 +165,7 @@ apply_kernel_patch() {
 }
 apply_kernel_patch 0001-mtk-sd-mt6592.patch "mtk-sd MT6592"
 apply_kernel_patch 0002-drm-mediatek-mt6592.patch "mtk_drm MT6592 display"
+apply_kernel_patch 0003-musb-mediatek-mt6592.patch "musb MT6592 USB host"
 
 mkdir -p "$KERNEL_OUT"
 if [[ ! -f "$KERNEL_OUT/.config" ]]; then
@@ -2323,11 +2339,12 @@ run_power() {
     done < "$payload/power/load.order"
 
     # The two supplies are the whole test, and they are worth listing by name:
-    # `battery' and `usb' are not arbitrary.  mixdash walks
-    # /sys/class/power_supply/* looking for one whose type is Battery, and
-    # batt_led.service reads /sys/class/power_supply/battery/capacity by that
-    # literal path, so the directory being called `battery' is what makes both
-    # of them work without either one being told about this driver.
+    # `battery' and `usb' are not arbitrary.  Both readers -- mixdash and
+    # batt_led.service -- walk /sys/class/power_supply/* and take the first
+    # entry whose type file says Battery, which is what makes them work without
+    # either one being told this driver exists.  The name is kept anyway,
+    # because /sys/class/power_supply/battery/capacity is the path every RK3326
+    # script and every forum answer for this family reaches for by hand.
     if [ -d /sys/class/power_supply ]; then
         say "power supplies:"
         ls /sys/class/power_supply 2>/dev/null
@@ -5749,17 +5766,33 @@ batt_led.service, no longer masked
     unbounded -- is a Python traceback on the console every 2.3 s for as long as
     the machine is up.
 
-    Half of that is now fixed rather than masked.  j36.power=1 loads the MT6592
-    PMIC driver, which registers its battery supply under exactly that name, so
-    the capacity file the daemon opens first is there and the traceback is gone.
-    The GPIO half is not: this kernel has no sysfs GPIO export, so the daemon
-    still cannot write gpio77 and still exits -- but it now exits on the LED,
-    which is a bounded and specific failure, and it exits having read a real
-    charge percentage.  It is left unmasked deliberately: a unit that fails on
-    the second thing it tries is evidence that the first thing works, and this is
-    the cheapest standing check that the power_supply registration survived a
-    kernel bump.  Add systemd.mask=batt_led.service back to boot.conf if the
-    noise is not worth it on a particular card; nothing else depends on it.
+    Both halves are now fixed rather than masked.  j36.power=1 loads the MT6592
+    PMIC driver, which registers a battery supply, and the daemon finds it by
+    walking /sys/class/power_supply and taking the first entry whose type file
+    says Battery -- by type, not by the RK3326 name, so it does not care what
+    this driver called it.  The LED half was the one that actually crashed: this
+    kernel has no sysfs GPIO export and no gpio77, EVERY branch of the old loop
+    read the LED including the "battery is fine" one, and the unit is
+    Restart=always with RestartSec=2 and StartLimitIntervalSec=0 -- explicitly
+    unbounded -- so the first pass raised and the console got an eight-line
+    traceback every 2.3 s for as long as the machine was up.  On a board whose
+    console IS the panel, that is the splash screen overdrawn with a traceback
+    forever.  batt_life_warning.py no longer assumes any path exists and nothing
+    in it is fatal: a missing LED means it has nothing to blink and it keeps
+    reading the gauge, a missing gauge means the driver has not come up yet and
+    it waits.  It does not exit, so it is never restarted.
+
+    It is left unmasked deliberately: it prints the percentage it is reading,
+    which is the cheapest standing check that the power_supply registration
+    survived a kernel bump.  Add systemd.mask=batt_led.service back to boot.conf
+    if even that is not worth it on a particular card; nothing else depends on
+    it.
+
+    That script lives in the Debian rootfs, not in the J36 payload --
+    finishing_touches.sh copies device/rg351mp/*.py to /usr/local/bin and
+    enables the unit -- so a card written by an older build still carries the
+    crashing copy.  --mix-only does not refresh it; a full build does, the
+    finalization stage running on a resume as well.
 
     Worth knowing when reading its output: with no power-path FET on this board,
     VBAT is the system node, so the percentage the daemon reads is the gauge's
@@ -5977,12 +6010,12 @@ j36.power=1
     module is removed is one that can take the machine away from whoever is
     trying to debug it.
 
-    What it registers is two supplies, and their names are load-bearing rather
-    than descriptive.  /sys/class/power_supply/battery is what batt_led.service
-    opens by that literal path, and it is also what mixdash finds when it walks
-    the directory looking for a supply whose type is Battery -- so calling it
-    `battery' is what makes two programs that know nothing about this driver work
-    unmodified.  Beside it, /sys/class/power_supply/usb reports online,
+    What it registers is two supplies.  Both readers -- batt_led.service and
+    mixdash -- walk /sys/class/power_supply and take the first entry whose type
+    file says Battery, so neither has to be told this driver exists.  It is
+    called `battery' anyway, that being the path every RK3326 script and every
+    forum answer for this family reaches for by hand.  Beside it,
+    /sys/class/power_supply/usb reports online,
     usb_type (SDP, CDP, DCP or an Apple brick) and current_max, which is what the
     BC1.2 handshake decided the wall will actually give us.
 
@@ -7246,7 +7279,7 @@ fi
         echo "reboot=mtk_wdt via watchdog@10007000 (mediatek,mt6589-wdt)"
         echo "console=tty0 last, journald forwarded to it"
         echo "firstboot=masked (RK3326 script, no /roms.tar in a GUI-mode build)"
-        echo "batt_led=masked (Restart=always on a power_supply this kernel has not got)"
+        echo "batt_led=enabled (batt_life_warning.py finds the battery by power_supply type and treats a missing LED as normal; it no longer exits, so Restart=always never fires)"
         echo "bootimg_kernel=zImage-j36-ultra (device tree appended, ATAG path)"
         echo "sd_kernel=sd-boot/zImage (plain, LK passes the tree in r2)"
         echo "display=stock-lk-simple-framebuffer"

@@ -447,14 +447,34 @@ batt_led.service: Scheduled restart job, restart counter is at 21.
 ```
 
 `batt_led.service` reads that capacity file and writes
-`/sys/class/gpio/gpio77/value`, and this kernel has neither — no `power_supply`
-driver for the MT6592 PMIC, and no sysfs GPIO export. What makes it worth a
+`/sys/class/gpio/gpio77/value`, and this kernel had neither — no `power_supply`
+driver for the MT6592 PMIC, and no sysfs GPIO export. What made it worth a
 command-line word is the unit, not the script: `Restart=always`, `RestartSec=2`
 and `StartLimitIntervalSec=0`, which is systemd's way of spelling *never give up*.
-It is a traceback on the console every 2.3 seconds for as long as the board is on.
-Fitting a cell does not help: the file is missing because the driver is missing,
-not because the bay is empty. A `power_supply` for the MT6592 PMIC is the real
-fix, and it would make this daemon work unmodified.
+It was a traceback on the console every 2.3 seconds for as long as the board was
+on — and on a board whose console *is* the panel, that is the splash screen being
+overdrawn with a traceback forever. Fitting a cell does not help: the file was
+missing because the driver was missing, not because the bay is empty.
+
+Both ends are fixed now. `j36.power=1` loads `j36_mt6592_pmic.ko`, which
+registers a `power_supply`, and `batt_life_warning.py` was rewritten to assume no
+path exists and to treat nothing as fatal. It finds the gauge by walking
+`/sys/class/power_supply` and taking the first supply whose `type` reads
+`Battery` — by type rather than by the RK3326 name, and skipping a charger that
+happens to publish a percentage. The LED is looked for at `gpio77` first and then
+in `/sys/class/leds/*/brightness`, and **not finding one is a normal answer**: the
+old loop read the LED on every branch including *battery is fine*, which is why a
+board with a working gauge still crashed on the first pass. Missing gauge means
+the driver has not come up yet, so it waits; missing LED means there is nothing to
+blink, so it keeps the percentage in the journal. It never exits, so `Restart=always`
+never fires. It is left unmasked deliberately — the percentage it prints is the
+cheapest standing check that the `power_supply` registration survived a kernel bump.
+
+That script is in the Debian rootfs, not the J36 payload: `finishing_touches.sh`
+copies `device/rg351mp/*.py` into `/usr/local/bin` and enables the unit. A card
+written before this change still carries the crashing copy, and `--mix-only` does
+not replace it — a full `./build-j36-ultra.sh` does, the finalization stage running
+on a resumed build too.
 
 The other RK3326-only units are deliberately left running. `351mp.service` (power
 LED, backlight, `amixer`), `audiopath`, `audiostate` and `wifi_importer` are all
@@ -598,6 +618,83 @@ lima is one of them:
 With all four closed, `j36/eglprobe` measures ES2 contexts current on an ARGB8888
 window surface. The dashboard itself needs none of it: it is Qt on `linuxfb`.
 
+## USB, and the register layout that decided it
+
+There is one USB controller on this SoC and no companion: a Mentor MUSBMHDRC
+dual-role core at `0x11200000` with its U2 PHY at `0x11210800`, and no EHCI, OHCI
+or XHCI anywhere in the map. Everything a port can do here — a disk, a mouse, a
+hub — goes through that one core in host mode. Both it and the PHY sit behind the
+same PERI clock gate, and an APB access to a gated MediaTek peripheral does not
+fault, it stalls the bus until the watchdog resets the board. That is why the PHY
+is a separate driver (`j36_mt6592_usb_phy.c`) rather than three writes inside the
+glue: it opens the gate in `.init`, which `musb_platform_init` calls before any
+MUSB register is touched.
+
+Everything above that was in place and the port still enumerated nothing —
+no disk, no mouse, no hub, and no error either. Each of the obvious causes was
+checked against the stock MT6592 Android kernel (3.10.72) and each came back
+matching mainline:
+
+| what was suspected | what the stock kernel says |
+| --- | --- |
+| wrong interrupt number | `mt_usb_init` writes 96 to `musb->nIrq`; INTID 96 is SPI 64, which is what the tree already said |
+| no MediaTek L1 aggregator on this generation | it writes `0xf` to `L1INTM` at `mregs+0xa4` and its ISR ANDs `L1INTS` with it, identically to mainline |
+| `MUSB_HSDMA_INTR` unmasked wrongly | `0xff0000ff` at `mregs+0x200`, the same value |
+| FIFO RAM smaller than `MTK_MUSB_RAM_BITS 11` | 8192 bytes, exactly `1 << (11 + 2)` |
+| fewer endpoints than `MTK_MUSB_MAX_EP_NUM 8` | endpoints 1..8, and a 16-entry FIFO table |
+
+What is *not* the same is the register map. Mainline's
+`drivers/usb/musb/mediatek.c` was written for MT2701/MT7623, which added a
+TXTOG/RXTOG block at `0x80..0x87` and, to make room for it, relocated the
+multipoint BUSCTL block to `0x480`. MT6592 is two generations older and has
+neither: the stock kernel touches no address in `0x80..0x87` and no
+`0x480 + 8 * epnum` address anywhere in its musb driver.
+
+Getting that base wrong is silent and total. `musb_core` writes every device's
+function address into `TXFUNCADDR`, so on the wrong base each `SET_ADDRESS` is
+followed by traffic still aimed at address 0, every enumeration times out, and
+nothing reports a fault because nothing faulted. That is the symptom, exactly.
+
+`linux/0003-musb-mediatek-mt6592.patch` adds an `mt6592_musb_ops` variant
+selected by a new `mediatek,mt6592-musb` compatible. It omits `.busctl_offset`,
+`.get_toggle` and `.set_toggle`, which is not a loss of function: `musb_core`
+substitutes `musb_default_busctl_offset()` — `0x80 + 8 * epnum + offset`, the
+stock base — and the default software toggle handlers, which is how every MUSB
+without MediaTek's toggle block has always worked. The patch fixes a second thing
+while it is there: `mtk_musb_init()` wrote the toggle registers **before**
+`phy_init()`, i.e. before the gate is open on this SoC, and that only survives
+today because the stock LK happens to leave the USB gate on.
+
+Both compatibles on the `usb@11200000` node are load-bearing. `mediatek,mtk-musb`
+is what `mtk_musb_probe` matches; `mediatek,mt6592-musb` is what picks the
+register layout.
+
+The board confirms or refutes all of this in one line of boot log. The PHY driver
+takes an optional `j36,musb-controller` phandle and, at `power_on` — after the
+gate is open, before `musb_start()` — writes a different pattern into
+`TXFUNCADDR` at each candidate base, reads both back and restores them. Whichever
+base held its pattern is where the block decodes. It also dumps `DEVCTL`, `POWER`,
+`FADDR`, `EPINFO`, `RAMINFO` and `L1INTM` then and again a few seconds later,
+which separates the failure modes that otherwise look alike: `VBUS` below the
+session-valid threshold means the 5 V never came up, `VBUS` at 3 with nothing else
+set means the rail is fine and nothing is attached, and `HM` clear on a node that
+asked for host means the role override did not take. `INTRUSB`, `INTRTX` and
+`INTRRX` are deliberately not among them — they clear on read, and reading them
+from here would swallow a connect interrupt before `musb_core` saw it.
+
+Two things about the port itself, neither of them software:
+
+- **The 5 V is a boost off VBAT, and VBAT on this PMIC is the system node.**
+  `j36,drvvbus-pad = <15>` drives it, transcribed from the stock
+  `mt_usb_set_vbus()`. A bus-powered hub on a board with no cell fitted is the
+  same class of load that pulls VBAT under the undervoltage lockout. Use a
+  self-powered hub, or pass `vbus=0` to the module, or fit a cell.
+- **A USB-C→HDMI dongle will not work, and cannot.** The cheap ones are
+  DisplayPort Alt Mode, which is a PHY-level capability MT6592 does not have at
+  all. The only adapter that can ever put a picture on HDMI here is a genuine
+  DisplayLink one, which is a USB device rather than a mode switch — `udl.ko` is
+  already staged in `j36/usb/load.order` for it.
+
 ## Licence and attribution
 
 The original MixOS work here — `build-in-vm.sh`, `generate_dts.py`,
@@ -612,7 +709,7 @@ cosmetic:
 - Everything under `linux/` — the seven MixOS modules (`j36_mt6592_input.c`,
   `j36_mt6592_audio.c`, `j36_jd9365_panel.c`, `j36_mt6592_usb_phy.c`,
   `j36_mt6592_pmic.c`, `j36_mt6592_backlight.c` and the three-file
-  `j36_mt6592_wifi` build) and the two `linux/*.patch` files — is
+  `j36_mt6592_wifi` build) and the three `linux/*.patch` files — is
   **`GPL-2.0-only`**. They derive from and link against GPL-2.0-only kernel
   internals, and Ms-PL is not GPL-compatible — its section 3(D) adds a condition
   GPLv2 section 6 forbids adding — so relicensing them is not this project's to

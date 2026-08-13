@@ -1205,16 +1205,23 @@ def generate(sources: dict[str, str]) -> str:
 \t * musb->ctrl_base, 0xf1200000 being the stock kernel's static mapping of
 \t * 0x11200000.
 \t *
-\t * mediatek,mtk-musb is the only compatible drivers/usb/musb/mediatek.c
-\t * matches; the mt6592 string in front of it is documentation. The glue is
-\t * the MT2701/MT8173 generation and is reused unmodified -- the same
-\t * argument as mtk_drm, and unlike mtk_drm it needed no patch at all.
+\t * BOTH compatibles are load-bearing, and the first one especially so.
+\t * mediatek,mtk-musb is what makes drivers/usb/musb/mediatek.c bind at all;
+\t * mediatek,mt6592-musb is what makes it bind CORRECTLY, because
+\t * linux/0003-musb-mediatek-mt6592.patch keys the register layout off it.
+\t * MT6592's MUSB predates the MT2701/MT7623 part that glue was written for:
+\t * it has no TXTOG/RXTOG block at 0x80..0x87, so its multipoint BUSCTL block
+\t * is still at the stock MUSB base of 0x80 rather than moved to 0x480. Drop
+\t * the mt6592 string and every device's function address is written into a
+\t * hole -- nothing enumerates, and nothing says why. The patch header records
+\t * how that was read out of the stock 3.10.72 kernel.
 \t *
-\t * dr_mode = \"host\" is a decision about power, not about the port. The core
-\t * is dual-role and the socket is OTG, but sourcing VBUS means the MT6322
-\t * boost, which nothing in this runtime enables. So the board never drives
-\t * VBUS and THE HUB HAS TO BE POWERED. mediatek.c reads this property with
-\t * usb_get_dr_mode() and refuses to probe if it is missing.
+\t * dr_mode = \"host\" is what makes this a port and not a socket. The core is
+\t * dual-role, and 5 V is a boost off VBAT driven by a plain GPIO rather than
+\t * a PMIC register -- j36_mt6592_usb_phy raises it, see j36,drvvbus-pad
+\t * below, so a bus-powered device works and A CELL HAS TO BE FITTED.
+\t * mediatek.c reads this property with usb_get_dr_mode() and refuses to
+\t * probe if it is missing.
 \t *
 \t * interrupt-names = \"mc\" IS MANDATORY and is the one line here that will
 \t * not announce itself if it goes missing. mediatek.c copies this node's
@@ -1228,36 +1235,38 @@ def generate(sources: dict[str, str]) -> str:
 \t * when it is not, so without this line the lookup returns -ENXIO and the
 \t * controller never probes, with a message that says nothing about names.
 \t *
-\t * ── The interrupt number, which is the one thing here that is a guess ─────
+\t * ── The interrupt number, which used to be the one guess here ────────────
 \t *
-\t * Every other SPI in this file was read out of the stock kernel. This one
-\t * could not be, and the search was run to exhaustion: mt_usb's
-\t * platform_device at 0xc0b31048 has num_resources == 0 and resource ==
-\t * NULL -- MediaTek's usb20 driver passes no resources at all -- the base is
-\t * hardcoded as above rather than coming from a resource array, nIrq is
-\t * initialised to -ENODEV and never assigned a constant in that function,
-\t * and the literal 0x11200000 does not occur once as a 32-bit word anywhere
-\t * in the 12 MB image. There is no MEM+IRQ resource pair for USB to read.
+\t * It is now read out of the stock kernel like every other SPI in this file.
+\t * The earlier search failed because it looked at mt_usb's platform_device
+\t * at 0xc0b31048, which has num_resources == 0 and resource == NULL --
+\t * MediaTek's usb20 driver passes no resources at all, the base is hardcoded
+\t * rather than coming from a resource array, and the literal 0x11200000 does
+\t * not occur once as a 32-bit word in the 12 MB image. There is no MEM+IRQ
+\t * resource pair for USB, so there was nothing to find that way.
 \t *
-\t * 64 is therefore an extrapolation, and a thin one. The only other
-\t * MediaTek interrupt table in this source tree is the MT6735 LK's
-\t * mt_irq.h, which has USB0 = 104 and MSDC0 = 111; MT6592's MSDC0 is INTID
-\t * 103, eight below MT6735's, so shifting USB0 by the same eight gives INTID
-\t * 96 and SPI 64. One anchor, across two SoC generations. Treat it as a
-\t * placeholder.
+\t * The number is assigned directly instead, in mt_usb_init, to the nIrq
+\t * field of struct musb at offset 0x290:
 \t *
-\t * Being wrong here is safe, which is why shipping a guess is acceptable:
-\t * musb requests an interrupt that never fires, enumeration times out, and
-\t * nothing crashes. It is also self-diagnosing. j36_mt6592_usb_phy scans
-\t * GICD_ISPENDR after power-on and prints every SPI that became pending, and
-\t * a wrong number here is exactly what makes the measurement work -- MUSB's
-\t * real line is level-sensitive, so with no handler registered on it the GIC
-\t * latches it pending and leaves it there. One boot log names the number.
+\t *   c052bb30:  e3a03060  mov  r3, #96   @ 0x60
+\t *   c052bb44:  e5843290  str  r3, [r4, #656]  @ 0x290
+\t *
+\t * INTID 96 is SPI 64, which is what this node already said. Two independent
+\t * cross-checks confirm the map it sits in, both against nodes in this file
+\t * that are known to work: the same image puts UART0 at INTID 115, which is
+\t * the <0 83 8> on the serial node, and Mali_GP at INTID 234, which is the
+\t * <0 202 8> on the GPU node.
+\t *
+\t * The GICD_ISPENDR scan in j36_mt6592_usb_phy was built to measure this and
+\t * is now off by default; scan_irq=1 still turns it on, which is worth doing
+\t * only if this cell is ever changed.
 \t */
 \tusb0: usb@11200000 {{
 \t\tcompatible = \"mediatek,mt6592-musb\", \"mediatek,mtk-musb\";
 \t\treg = <0x11200000 0x1000>;
-\t\tinterrupts = <0 64 8>; /* GUESS: SPI 64 = INTID 96, IRQ_TYPE_LEVEL_LOW */
+\t\t/* SPI 64 = INTID 96, IRQ_TYPE_LEVEL_LOW. Confirmed: stock
+\t\t * mt_usb_init writes 96 to musb->nIrq at 0xc052bb44. */
+\t\tinterrupts = <0 64 8>;
 \t\tinterrupt-names = \"mc\";
 \t\tclocks = <&usb_clk>, <&usb_clk>, <&usb_clk>;
 \t\tclock-names = \"main\", \"mcu\", \"univpll\";
@@ -1284,11 +1293,33 @@ def generate(sources: dict[str, str]) -> str:
 \t * reason the PHY is a separate driver rather than three writes inside the
 \t * glue.
 \t *
-\t * j36,gic-controller is read-only and exists for the measurement described
-\t * on the usb0 node above: the module maps the distributor to sample
-\t * GICD_ISPENDR, never to write it. GICD_ISPENDR reports the pending state
-\t * of a level-sensitive line whether or not it is enabled, so an unclaimed
-\t * MUSB interrupt shows up in it.
+\t * j36,gic-controller is read-only and exists for the interrupt measurement
+\t * described on the usb0 node above: the module maps the distributor to
+\t * sample GICD_ISPENDR, never to write it. That measurement has served its
+\t * purpose -- the number is INTID 96 and the stock kernel says so -- and the
+\t * scan is off by default now; scan_irq=1 brings it back.
+\t *
+\t * j36,musb-controller is also a measurement, and it points at usb0 so the
+\t * PHY can report the controller's own view of the port -- once as soon as
+\t * VBUS is up and again seconds later, which is the window a device gets
+\t * plugged in. DEVCTL says whether the core came up in host mode and whether
+\t * VBUS is above the session-valid threshold, which is the difference between
+\t * \"the 5 V never came up\" and \"the 5 V is fine and nothing is attached\";
+\t * EPINFO and RAMINFO say how many endpoints and how much FIFO RAM the
+\t * silicon actually has, against the 8 and the 8 KB mediatek.c hardcodes.
+\t *
+\t * It also writes, once, and this is the only write: a pattern into ep0's
+\t * TXFUNCADDR at both candidate multipoint bases, 0x080 and 0x480, read back
+\t * and restored. Whichever base holds it is where that block decodes, and
+\t * that is the one thing that decides whether this SoC needs the mt6592
+\t * variant added by linux/0003-musb-mediatek-mt6592.patch. It runs at
+\t * power_on, ahead of musb_start(), so no transfer can be in flight, and
+\t * musb_core rewrites that register before every transfer anyway.
+\t *
+\t * Nothing that changes behaviour hangs off the property; drop it and the PHY
+\t * works exactly the same, minus the log lines. The registers it reads are
+\t * chosen to exclude every read-to-clear one -- INTRTX, INTRRX and INTRUSB
+\t * are all absent -- so it cannot steal an interrupt from musb_core.
 \t *
 \t * j36,drvvbus-pad is the 5 V. It is not a PMIC boost on this board: the
 \t * stock Android kernel's mt_usb_set_vbus() -- 0xc052e938, line 60, found
@@ -1331,6 +1362,7 @@ def generate(sources: dict[str, str]) -> str:
 \t\tj36,pericfg-controller = <&pericfg>;
 \t\tj36,gic-controller = <&gic>;
 \t\tj36,gpio-controller = <&gpio>;
+\t\tj36,musb-controller = <&usb0>;
 \t\tj36,drvvbus-pad = <15>;
 \t\t#phy-cells = <0>;
 \t\tstatus = \"okay\";

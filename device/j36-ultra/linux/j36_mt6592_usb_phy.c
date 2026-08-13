@@ -40,15 +40,30 @@
  * 0x2e, set 0x6d 0x3e -- is not a wake-up, it is MTK's force-DEVICE-mode
  * override, which is why the stock LK ends up a gadget. Host mode is its exact
  * mirror (set 0x6d 0x3c, set 0x6c bit 4, clear 0x6c 0x2c), taken from MVII's
- * musb_phy_force_host(). Be clear about the standing of the two: the device
- * sequence is proven -- the LK enumerates with it -- and the host sequence has
- * NEVER RUN on this board, because MVII's host driver is compiled out behind
- * MVII_MT6592_ENABLE_USB_HOST for the clock-gate reason above. Making it run is
- * what this whole payload is for. .set_mode picks between them, so the role
- * does not depend on how the OTG ID pin happens to float. The kernel is
- * configured USB_MUSB_HOST and the device tree says dr_mode = "host", so in
- * practice only the host branch runs -- but the device branch is what
- * phy_power_off leaves behind, which is also the low-power state.
+ * musb_phy_force_host() -- which had never run on this board, because MVII's
+ * host driver is compiled out behind MVII_MT6592_ENABLE_USB_HOST for the
+ * clock-gate reason above.
+ *
+ * It no longer rests on MVII alone. The stock Android kernel's own host switch,
+ * at 0xc052eaa4, is these three writes and nothing else:
+ *
+ *   c052eaa4:  strb r2, [r3, #0x86d]   // 0x6d |= 0x3c
+ *   c052eacc:  strb r2, [r3, #0x86c]   // 0x6c |= 0x10
+ *   c052eaf4:  strb r2, [r3, #0x86c]   // 0x6c &= 0xd3, i.e. clear 0x2c
+ *
+ * on the stock kernel's 0xf1210000 mapping of the SIFSLV window, so +0x86c and
+ * +0x86d are this file's 0x6c and 0x6d. Byte for byte j36_phy_force_host().
+ * The exit-host path at 0xc052eb8c is its inverse (0x6d &= 0xc3, 0x6c &= 0xc3).
+ * One thing the stock does first that this does not: it clears DEVCTL.SESSION
+ * in the MUSB core before touching the PHY. That belongs to musb_core, which
+ * sets the session bit itself when it starts the host, and is not the PHY's to
+ * take away.
+ *
+ * .set_mode picks between the two sequences, so the role does not depend on how
+ * the OTG ID pin happens to float. The kernel is configured USB_MUSB_HOST and
+ * the device tree says dr_mode = "host", so in practice only the host branch
+ * runs -- but the device branch is what phy_power_off leaves behind, which is
+ * also the low-power state.
  *
  * VBUS. It is a GPIO on this board, not a PMIC boost register, and the stock
  * Android kernel says so in four instructions. mt_usb_set_vbus() -- found at
@@ -79,30 +94,53 @@
  * pad as well is not a short -- the pad feeds a load switch, not the rail --
  * but it is also not needed, and vbus=0 is the honest setting for that case.
  *
- * ── AND ONE MEASUREMENT ───────────────────────────────────────────────────────
+ * ── AND THE MEASUREMENTS ──────────────────────────────────────────────────────
  *
- * The MUSB GIC interrupt number is the only SPI in this device tree that is a
- * guess, and it is a guess because it is not in the stock kernel to be read:
- * mt_usb's platform_device at 0xc0b31048 has num_resources == 0 and
- * resource == NULL, the base is built inline with a movt rather than coming from
- * a resource array, nIrq is initialised to -ENODEV and never assigned, and the
- * literal 0x11200000 does not appear once as a 32-bit word in the whole 12 MB
- * image. MediaTek's usb20 driver simply did not describe itself.
+ * The interrupt number used to be a guess and used to be measured from here, by
+ * snapshotting GICD_ISPENDR and watching for a level-sensitive line that went
+ * pending and stayed pending because nothing had claimed it. That is answered
+ * now: mt_usb_init in the stock kernel assigns it outright,
  *
- * So this driver measures it, and the measurement works BECAUSE the guess is
- * probably wrong. MUSB's interrupt is level-sensitive. If the device tree names
- * the wrong SPI, nobody has registered a handler on the real line, so once MUSB
- * asserts it the GIC latches it pending and it stays pending forever -- and
- * GICD_ISPENDR reports the pending state of a level-sensitive interrupt whether
- * or not it is enabled, which is what makes it readable from here. Snapshot the
- * eight ISPENDR words at power-on, sample them again a few seconds later, and
- * whatever turned up in between is a very short list with the answer in it.
+ *   c052bb30:  mov r3, #96
+ *   c052bb44:  str r3, [r4, #0x290]     // musb->nIrq = 96
  *
- * Both outcomes are informative: SPIs appear and one of them is USB's, or
- * nothing appears and the device tree already had it right, which the enumerated
- * device says anyway. The distributor is mapped read-only and never written.
+ * INTID 96 is SPI 64, which is what the device tree already said, and the map it
+ * sits in cross-checks twice against nodes that work today -- UART0 at INTID 115
+ * and Mali_GP at INTID 234. So scan_irq now defaults off. The code stays because
+ * it costs one delayed work and is the only way to answer the question again if
+ * the cell is ever changed.
+ *
+ * What is NOT answered, and what j36,musb-controller is for, is the controller's
+ * own view of the port. This driver already has the PERI gate open before
+ * anything reads MUSB, so it is the one place that can look at the MAC early and
+ * cheaply. It reads, once at power-on and again a few seconds later:
+ *
+ *   DEVCTL  0x60   HOSTMODE, and the two VBUS bits -- the difference between
+ *                  "5 V never came up" and "5 V is fine, nothing attached"
+ *   POWER   0x01   HS enable, reset, suspend
+ *   FADDR   0x00   the function address the core is actually addressing
+ *   EPINFO  0x78   TX and RX endpoint counts, from the silicon
+ *   RAMINFO 0x79   FIFO RAM address width and DMA channel count
+ *   L1INTM  0xa4   whether the MediaTek L1 aggregator was unmasked
+ *
+ * Every one of those is a plain register. The read-to-clear ones -- INTRUSB,
+ * INTRTX, INTRRX -- are deliberately NOT among them, because reading those from
+ * here would swallow a connect interrupt out from under musb_core.
+ *
+ * And one active probe, at power-on only, before musb_core has started: write a
+ * pattern to the ep0 function-address register at BOTH candidate busctl bases,
+ * 0x080 and 0x480, read each back, then restore. MediaTek moved that block to
+ * 0x480 in the MT2701 generation to make room for a TXTOG/RXTOG block at
+ * 0x80..0x87, and mainline's mediatek.c assumes the move unconditionally. The
+ * stock MT6592 kernel touches neither address, which is why
+ * linux/0003-musb-mediatek-mt6592.patch puts this part back on the stock MUSB
+ * base of 0x80 -- and this probe is what confirms or refutes that from the
+ * board, in one line of boot log. Whichever base holds the pattern is the real
+ * one. Writing there is safe because musb_core reprograms the function address
+ * before every transfer, and this runs before it has started any.
  */
 
+#include <linux/bits.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -113,9 +151,18 @@
 #include <linux/platform_device.h>
 #include <linux/workqueue.h>
 
-/* PERI clock gates. PDN_CLR clears power-down bits, i.e. turns clocks ON. */
+/* PERI clock gates. PDN_CLR clears power-down bits, i.e. turns clocks ON.
+ *
+ * PDN0 has 27 gates, not 32: the stock clkmgr's CG_PERI record at 0xc0b38670
+ * carries 0x07ffffff as its valid mask, and bits 27..31 do not decode. Bit 17 is
+ * USB2.0 and bit 18 is USBSIF, which is the whole of USB's clocking here -- the
+ * MUSB MAC and the U2 PHY sit behind the pair, which is why a read of either
+ * window before this write stalls the APB rather than faulting. */
 #define J36_PERI_PDN0_CLR		0x0010
 #define J36_PERI_PDN0_STA		0x0018
+#define J36_PERI_PDN0_VALID		0x07ffffff
+#define J36_PERI_PDN0_USB20		BIT(17)
+#define J36_PERI_PDN0_USBSIF		BIT(18)
 
 /* GIC distributor. Eight words of Set-Pending cover INTID 0..255, which is the
  * whole of this SoC's map: SPI = INTID - 32, and MT6592's polarity block covers
@@ -123,6 +170,44 @@
 #define J36_GICD_ISPENDR		0x0200
 #define J36_GICD_ISPENDR_WORDS		8
 #define J36_GIC_INTID_SPI_BASE		32
+
+/* MUSB MAC, read-only from here except for the one layout probe below. These are
+ * the stock Mentor common-register offsets, unchanged since the core existed, and
+ * they are the same numbers musb_core.h uses -- spelled out rather than included
+ * because that header is private to drivers/usb/musb and this is a PHY driver.
+ *
+ * INTRTX 0x02, INTRRX 0x04 and INTRUSB 0x0a are deliberately absent: they clear
+ * on read, so a read from here would consume a connect or reset interrupt before
+ * musb_core's handler ever saw it. */
+#define J36_MUSB_FADDR			0x00
+#define J36_MUSB_POWER			0x01
+#define J36_MUSB_POWER_SUSPENDM		BIT(1)
+#define J36_MUSB_POWER_RESET		BIT(3)
+#define J36_MUSB_POWER_HSMODE		BIT(4)
+#define J36_MUSB_POWER_HSENAB		BIT(5)
+#define J36_MUSB_DEVCTL			0x60
+#define J36_MUSB_DEVCTL_SESSION		BIT(0)
+#define J36_MUSB_DEVCTL_HR		BIT(1)
+#define J36_MUSB_DEVCTL_HM		BIT(2)
+#define J36_MUSB_DEVCTL_VBUS		GENMASK(4, 3)
+#define J36_MUSB_DEVCTL_VBUS_SHIFT	3
+#define J36_MUSB_DEVCTL_LSDEV		BIT(5)
+#define J36_MUSB_DEVCTL_FSDEV		BIT(6)
+#define J36_MUSB_DEVCTL_BDEVICE		BIT(7)
+#define J36_MUSB_HWVERS			0x6c
+#define J36_MUSB_EPINFO			0x78
+#define J36_MUSB_RAMINFO		0x79
+#define J36_MUSB_L1INTM			0xa4
+
+/* The two candidate bases for the multipoint block's TXFUNCADDR, which is what
+ * the layout probe writes. 0x080 is the stock MUSB one and 0x480 is where
+ * MediaTek relocated it in the MT2701 generation. The two patterns differ so
+ * that an aliasing window cannot read as a hit on both, and both fit in
+ * TXFUNCADDR's seven bits so that neither is truncated where it does decode. */
+#define J36_MUSB_BUSCTL_LEGACY		0x080
+#define J36_MUSB_BUSCTL_LEGACY_VAL	0x2a
+#define J36_MUSB_BUSCTL_MTK		0x480
+#define J36_MUSB_BUSCTL_MTK_VAL		0x55
 
 /* U2 PHY registers, byte-wide, offsets from 0x11210800. Named where the stock
  * decompile named them and left as bare offsets where it did not -- an invented
@@ -189,20 +274,22 @@
 #define J36_GPIO_MODE_GPIO		0
 #define J36_GPIO_PIN_MAX		0xa8
 
-static unsigned int pdn_mask = 0xffffffff;
+static unsigned int pdn_mask = J36_PERI_PDN0_VALID;
 module_param(pdn_mask, uint, 0444);
 MODULE_PARM_DESC(pdn_mask,
-		 "PERI PDN0 bits to ungate at phy_init (default: all of them). "
-		 "Which bit is USB's has never been established on this SoC, so "
-		 "the default is MVII's blunt one; PDN0_STA is logged before and "
-		 "after, and the difference is the data that would narrow it.");
+		 "PERI PDN0 bits to ungate at phy_init (default: every bit the "
+		 "register has, 0x07ffffff). USB is bits 17 and 18 -- USB2.0 and "
+		 "USBSIF -- but MT6592 has no clock driver in this tree, so "
+		 "nothing else ungates the rest of that bus either and the "
+		 "default stays wide; pdn_mask=0x60000 narrows it to USB alone.");
 
-static bool scan_irq = true;
+static bool scan_irq;
 module_param(scan_irq, bool, 0444);
 MODULE_PARM_DESC(scan_irq,
 		 "after power-on, sample GICD_ISPENDR and report SPIs that "
-		 "became pending -- the MUSB interrupt number is not recoverable "
-		 "from the stock kernel and this is how it gets measured");
+		 "became pending. Off by default: the MUSB interrupt is INTID 96 "
+		 "and the stock kernel assigns it outright. scan_irq=1 measures "
+		 "it again if the device tree cell is ever changed.");
 
 static unsigned int scan_delay_ms = 3000;
 module_param(scan_delay_ms, uint, 0444);
@@ -219,12 +306,22 @@ MODULE_PARM_DESC(vbus,
 		 "a self-powered hub, and use it if no cell is fitted, because "
 		 "the 5 V is a boost off VBAT and VBAT here is the system node.");
 
+static bool musb_probe_layout = true;
+module_param(musb_probe_layout, bool, 0444);
+MODULE_PARM_DESC(musb_probe_layout,
+		 "at power-on, write a pattern to TXFUNCADDR at both candidate "
+		 "multipoint bases (0x080 and 0x480) and report which one holds "
+		 "it, then restore. This is what says whether the busctl base in "
+		 "linux/0003-musb-mediatek-mt6592.patch is right. Runs before "
+		 "musb_core starts, so no transfer can be in flight.");
+
 struct j36_usb_phy {
 	struct device *dev;
 	void __iomem *phy;
 	void __iomem *pericfg;
 	void __iomem *gicd;
 	void __iomem *gpio;
+	void __iomem *musb;
 	struct phy *generic;
 
 	int vbus_pin;			/* -1 when the device tree names none */
@@ -390,7 +487,140 @@ static void j36_phy_savecurrent(struct j36_usb_phy *p)
 	j36_phy_force_device(p);
 }
 
-/* ── the interrupt measurement ───────────────────────────────────────────────── */
+/* ── the MUSB readout ─────────────────────────────────────────────────────────
+ *
+ * Read-only, and every offset here is a plain register -- see the note beside
+ * the defines for why the three interrupt-status registers are not among them.
+ *
+ * The value of doing this from the PHY driver rather than from musb is that the
+ * PHY is what ungates the MAC, so this is the earliest point at which MUSB can
+ * be read at all, and it is still readable in the delayed sample seconds later
+ * whether or not musb_hdrc ever bound. A port that never enumerates says
+ * different things in DEVCTL depending on why: VBUS below the session-valid
+ * threshold means the 5 V never came up, VBUS at 3 with nothing else set means
+ * the rail is fine and nothing is attached, and HM clear on a node that asked
+ * for host means the role override did not take.
+ */
+
+static const char *j36_musb_vbus_str(u8 devctl)
+{
+	static const char * const level[] = {
+		"below SessionEnd",		/* 0 */
+		"above SessionEnd, below AValid",
+		"above AValid, below VBusValid",
+		"above VBusValid",		/* 3 -- the only usable one */
+	};
+
+	return level[(devctl & J36_MUSB_DEVCTL_VBUS) >> J36_MUSB_DEVCTL_VBUS_SHIFT];
+}
+
+static void j36_musb_dump(struct j36_usb_phy *p, const char *when)
+{
+	u8 faddr, power, devctl, epinfo, raminfo;
+	u16 hwvers;
+	u32 l1intm;
+
+	if (!p->musb)
+		return;
+
+	faddr	= readb(p->musb + J36_MUSB_FADDR);
+	power	= readb(p->musb + J36_MUSB_POWER);
+	devctl	= readb(p->musb + J36_MUSB_DEVCTL);
+	hwvers	= readw(p->musb + J36_MUSB_HWVERS);
+	epinfo	= readb(p->musb + J36_MUSB_EPINFO);
+	raminfo	= readb(p->musb + J36_MUSB_RAMINFO);
+	l1intm	= readl(p->musb + J36_MUSB_L1INTM);
+
+	dev_info(p->dev,
+		 "MUSB %s: DEVCTL %02x [%s%s%s%s%s%s] VBUS %s, POWER %02x [%s%s%s%s], FADDR %u\n",
+		 when, devctl,
+		 devctl & J36_MUSB_DEVCTL_SESSION ? "SESSION " : "",
+		 devctl & J36_MUSB_DEVCTL_HM	  ? "HOST "    : "PERIPHERAL ",
+		 devctl & J36_MUSB_DEVCTL_HR	  ? "HOSTREQ " : "",
+		 devctl & J36_MUSB_DEVCTL_BDEVICE ? "BDEV "    : "ADEV ",
+		 devctl & J36_MUSB_DEVCTL_FSDEV	  ? "FSDEV "   : "",
+		 devctl & J36_MUSB_DEVCTL_LSDEV	  ? "LSDEV"    : "",
+		 j36_musb_vbus_str(devctl), power,
+		 power & J36_MUSB_POWER_HSENAB	  ? "HSENAB "  : "",
+		 power & J36_MUSB_POWER_HSMODE	  ? "HSMODE "  : "",
+		 power & J36_MUSB_POWER_RESET	  ? "RESET "   : "",
+		 power & J36_MUSB_POWER_SUSPENDM  ? "SUSPEND"  : "",
+		 faddr & 0x7f);
+
+	/* EPINFO is TX count in [3:0] and RX count in [7:4], neither counting
+	 * ep0; RAMINFO is the FIFO RAM address width in [3:0] and the DMA
+	 * channel count in [7:4]. Both come from the silicon, so they are the
+	 * check on MTK_MUSB_MAX_EP_NUM and MTK_MUSB_RAM_BITS, which mainline
+	 * hardcodes at 8 and 11. */
+	dev_info(p->dev,
+		 "MUSB %s: RTL %u.%u%s, %u TX + %u RX endpoints, FIFO RAM %u bytes, %u DMA channels, L1INTM %08x\n",
+		 when, (hwvers >> 10) & 0x1f, hwvers & 0x3ff,
+		 hwvers & BIT(15) ? " RC" : "",
+		 epinfo & 0xf, (epinfo >> 4) & 0xf,
+		 1u << ((raminfo & 0xf) + 2), (raminfo >> 4) & 0xf, l1intm);
+}
+
+/*
+ * Which base the multipoint block decodes at, answered by writing to it.
+ *
+ * TXFUNCADDR for ep0 is the first register of that block, and it is plain
+ * read/write storage in both layouts -- musb_core rewrites it before every
+ * transfer to whatever address the device being talked to has. So a pattern
+ * written to it is either held, which means the block is there, or read back as
+ * zero, which means the write landed in a hole.
+ *
+ * 0x480 is the decisive one and it is decisive in one direction only, which is
+ * why it is read first: on the MT2701 layout it IS TXFUNCADDR, and on the legacy
+ * layout there is nothing there at all. So a pattern that survives at 0x480
+ * settles it outright.
+ *
+ * 0x080 corroborates but cannot settle it alone, because on the MT2701 layout
+ * that address is not empty either -- it is MUSB_RXTOG, whose writes are gated
+ * by MUSB_RXTOGEN, which is zero out of reset. It is written with a different
+ * pattern so that the two cannot be confused if the window aliases.
+ *
+ * Both are restored to 0 afterwards, which is what musb_core would find on a
+ * fresh core anyway, and this runs at power_on -- before musb_start(), before
+ * any device has been addressed. It is never run from the delayed work, where a
+ * transfer could be live and where clobbering a function address mid-transaction
+ * would be a real fault rather than a measurement.
+ *
+ * Writing to whichever base turns out to be the hole is safe, and this board has
+ * already demonstrated it: the unpatched mediatek.c writes 0x480 on every single
+ * transfer, and what the board does in response is fail to enumerate, not hang.
+ * An undecoded offset inside a peripheral window that IS decoded and IS ungated
+ * drops the write. The hang case is the gated one, and the PERI gate was opened
+ * in .init long before this runs.
+ */
+static void j36_musb_probe_busctl(struct j36_usb_phy *p)
+{
+	u8 legacy, mtk;
+
+	if (!p->musb || !musb_probe_layout)
+		return;
+
+	writeb(J36_MUSB_BUSCTL_LEGACY_VAL, p->musb + J36_MUSB_BUSCTL_LEGACY);
+	writeb(J36_MUSB_BUSCTL_MTK_VAL, p->musb + J36_MUSB_BUSCTL_MTK);
+	legacy = readb(p->musb + J36_MUSB_BUSCTL_LEGACY);
+	mtk    = readb(p->musb + J36_MUSB_BUSCTL_MTK);
+	writeb(0, p->musb + J36_MUSB_BUSCTL_LEGACY);
+	writeb(0, p->musb + J36_MUSB_BUSCTL_MTK);
+
+	if (mtk == J36_MUSB_BUSCTL_MTK_VAL)
+		dev_warn(p->dev,
+			 "MUSB multipoint block is at 0x480 (0x080 read back %02x): the MT2701 layout, so linux/0003-musb-mediatek-mt6592.patch has it wrong and should be dropped\n",
+			 legacy);
+	else if (legacy == J36_MUSB_BUSCTL_LEGACY_VAL)
+		dev_info(p->dev,
+			 "MUSB multipoint block is at 0x080 (0x480 read back %02x): the legacy layout, which is what linux/0003-musb-mediatek-mt6592.patch assumes\n",
+			 mtk);
+	else
+		dev_warn(p->dev,
+			 "MUSB multipoint probe is inconclusive: 0x080 read back %02x and 0x480 read back %02x, neither holding what was written\n",
+			 legacy, mtk);
+}
+
+/* ── the interrupt measurement, and the delayed sample that carries it ──────── */
 
 static void j36_usb_phy_sample_pending(struct j36_usb_phy *p, u32 *out)
 {
@@ -400,12 +630,23 @@ static void j36_usb_phy_sample_pending(struct j36_usb_phy *p, u32 *out)
 		out[i] = readl(p->gicd + J36_GICD_ISPENDR + i * 4);
 }
 
+/*
+ * The delayed sample, which is both measurements: MUSB's own view of the port,
+ * and -- when scan_irq asks for it -- whatever turned up pending at the GIC.
+ * It runs twice, once soon after power-on and once well after, because a device
+ * plugged in a few seconds into boot is the case worth catching.
+ */
 static void j36_usb_phy_scan(struct work_struct *work)
 {
 	struct j36_usb_phy *p = container_of(to_delayed_work(work),
 					     struct j36_usb_phy, scan_work);
 	u32 now[J36_GICD_ISPENDR_WORDS];
 	unsigned int word, bit, found = 0;
+
+	j36_musb_dump(p, p->scans_left > 1 ? "settled" : "late");
+
+	if (!scan_irq || !p->gicd)
+		goto again;
 
 	j36_usb_phy_sample_pending(p, now);
 
@@ -434,6 +675,7 @@ static void j36_usb_phy_scan(struct work_struct *work)
 		dev_info(p->dev,
 			 "no new pending SPI (either the device tree already names MUSB's interrupt, or nothing on the port has asked for one yet)\n");
 
+again:
 	if (--p->scans_left)
 		schedule_delayed_work(&p->scan_work,
 				      msecs_to_jiffies(scan_delay_ms * 2));
@@ -441,15 +683,20 @@ static void j36_usb_phy_scan(struct work_struct *work)
 
 static void j36_usb_phy_scan_arm(struct j36_usb_phy *p)
 {
-	if (!scan_irq || !p->gicd)
+	bool gic = scan_irq && p->gicd;
+
+	if (!gic && !p->musb)
 		return;
 
-	j36_usb_phy_sample_pending(p, p->pending_baseline);
+	if (gic) {
+		j36_usb_phy_sample_pending(p, p->pending_baseline);
+		dev_info(p->dev,
+			 "sampling GICD_ISPENDR in %u ms and again %u ms after that; an unclaimed level interrupt stays pending, so MUSB's line will show up if the device tree has the wrong one\n",
+			 scan_delay_ms, scan_delay_ms * 2);
+	}
+
 	p->scans_left = 2;
 	schedule_delayed_work(&p->scan_work, msecs_to_jiffies(scan_delay_ms));
-	dev_info(p->dev,
-		 "sampling GICD_ISPENDR in %u ms and again %u ms after that; an unclaimed level interrupt stays pending, so MUSB's line will show up if the device tree has the wrong one\n",
-		 scan_delay_ms, scan_delay_ms * 2);
 }
 
 /* ── phy_ops ─────────────────────────────────────────────────────────────────── */
@@ -462,20 +709,22 @@ static int j36_usb_phy_init(struct phy *phy)
 	/*
 	 * This write is the whole reason the ordering matters, and it happens
 	 * before the first read of the PHY window below -- that window is behind
-	 * the same gate.
+	 * the same gate, and so is every MUSB register the readout touches.
 	 *
-	 * Blunt on purpose. Which PDN0 bit is USB's has never been established on
-	 * MT6592: MVII ungates everything here with the same comment, and the
-	 * board enumerated. PDN0_STA is logged on both sides so the one line in
-	 * the boot log carries the data that would narrow it -- the bits that read
-	 * as gated beforehand are the candidates, and pdn_mask= exists to test
-	 * one of them without editing this file.
+	 * Still blunt, and still on purpose. USB's own gates are bits 17 and 18
+	 * and those are reported by name below, but MT6592 has no clock driver in
+	 * this tree, so the peripherals reached through PERICFG have nothing else
+	 * ungating them either; MVII cleared the whole register here and the board
+	 * enumerated. pdn_mask= narrows it without editing this file.
 	 */
 	before = readl(p->pericfg + J36_PERI_PDN0_STA);
 	writel(pdn_mask, p->pericfg + J36_PERI_PDN0_CLR);
 	after = readl(p->pericfg + J36_PERI_PDN0_STA);
-	dev_info(p->dev, "PERI PDN0_STA %08x -> %08x (ungated mask %08x)\n",
-		 before, after, pdn_mask);
+	dev_info(p->dev,
+		 "PERI PDN0_STA %08x -> %08x (ungated mask %08x); USB2.0 %s, USBSIF %s\n",
+		 before, after, pdn_mask,
+		 after & J36_PERI_PDN0_USB20  ? "STILL GATED" : "on",
+		 after & J36_PERI_PDN0_USBSIF ? "STILL GATED" : "on");
 
 	j36_phy_recover(p);
 	return 0;
@@ -501,6 +750,16 @@ static int j36_usb_phy_power_on(struct phy *phy)
 	 * against a port that was still a B-device.
 	 */
 	j36_usb_phy_vbus(p, true);
+
+	/*
+	 * Both of these are here rather than in phy_init because VBUS has just
+	 * been raised and DEVCTL's VBUS field is the reading worth having, and
+	 * because power_on is still ahead of musb_start() -- which is what makes
+	 * the busctl write safe. Dump first, probe second, so the dump shows the
+	 * function address as musb left it rather than as the probe restored it.
+	 */
+	j36_musb_dump(p, "at power-on");
+	j36_musb_probe_busctl(p);
 
 	j36_usb_phy_scan_arm(p);
 	return 0;
@@ -640,6 +899,19 @@ static int j36_usb_phy_probe(struct platform_device *pdev)
 	if (IS_ERR(p->gicd)) {
 		dev_info(dev, "no j36,gic-controller phandle: the ISPENDR scan is off\n");
 		p->gicd = NULL;
+	}
+
+	/*
+	 * Optional too, and mapped without claiming for the same reason as the
+	 * others: the MUSB window belongs to musb_hdrc, which does claim it, and
+	 * an exclusive request from here would stop that driver binding. This
+	 * mapping is read-only apart from the one restored write in the layout
+	 * probe, and both drivers can hold a mapping of the same page.
+	 */
+	p->musb = j36_iomap_phandle(dev, "j36,musb-controller");
+	if (IS_ERR(p->musb)) {
+		dev_info(dev, "no j36,musb-controller phandle: MUSB is not read back\n");
+		p->musb = NULL;
 	}
 
 	/*

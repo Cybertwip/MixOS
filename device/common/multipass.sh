@@ -15,6 +15,13 @@
 #
 # Source it, do not execute it. The caller sets DARKOS_LOG_TAG first if it wants
 # its own prefix on these messages.
+#
+# ONE RULE FOR EVERY `multipass exec' ADDED HERE OR IN A WRAPPER: never send its
+# stdout to /dev/null on this side. Multipass 1.16.1 spins at 100% CPU forever
+# when it does, whatever the remote command is -- `multipass exec vm -- echo hello
+# >/dev/null' never returns. Redirecting to a file, to a pipe or to a terminal is
+# fine, and so is `2>/dev/null', so a command whose chatter is not wanted gets the
+# redirect inside the quoted remote command instead, where it costs nothing.
 
 DARKOS_LOG_TAG="${DARKOS_LOG_TAG:-darkos}"
 
@@ -152,14 +159,94 @@ darkos_vm_ensure() {
     fi
 }
 
+# darkos_vm_ensure_sshfs NAME
+#
+# `multipass mount' is sshfs, and the daemon finds sshfs by running
+#
+#     snap run multipass-sshfs.env
+#
+# over SSH AS THE DEFAULT USER.  When that probe fails for any reason at all,
+# Multipass reports one thing:
+#
+#     Error enabling mount support in '<vm>'
+#     Please install the 'multipass-sshfs' snap manually inside the instance.
+#
+# which is a misdiagnosis in the case that actually happens.  The snap is
+# installed.  What breaks is the per-user systemd manager: an apt upgrade of
+# systemd or a snapd refresh re-executes it, it comes back having lost the cgroup
+# delegation for its own app.slice, and every later `snap run' as that user dies
+# in the journal with
+#
+#     Couldn't move process N to requested cgroup
+#       .../user@1000.service/app.slice/snap....scope: Input/output error
+#     Failed to add PIDs to scope's control group: Permission denied
+#
+# `sudo snap run' keeps working the whole time, because as root the scope is
+# created by the SYSTEM manager instead -- which is why every by-hand check an
+# operator is likely to try comes back clean while the daemon still cannot mount.
+# Restarting the user manager fixes it, and nothing in this build owns a process
+# under it, so the restart is free.
+#
+# Probe the way the daemon does: as the default user, without sudo, and test what
+# the daemon actually needs.  `multipass-sshfs.env' prints an environment block,
+# out of which the daemon takes SNAP= and runs $SNAP/bin/sshfs; a zero exit alone
+# does not promise that line is there, so match it.  The `timeout' is a backstop
+# against a wedged snapd rather than a fix for anything seen here, and it sits
+# inside the VM because a signal to `multipass exec' on the host does not reach
+# the remote process.
+#
+# Note the redirect that is NOT here: see the /dev/null rule at the top of this
+# file.  An earlier version of this probe ended in `>/dev/null 2>&1' on the host
+# side and hung the build for as long as it was left running.
+darkos_vm_sshfs_works() {
+    multipass exec "$1" -- bash -lc \
+        'timeout 15 snap run multipass-sshfs.env 2>/dev/null | grep -q "^SNAP="'
+}
+
+# Repair the two things that can genuinely be wrong, in that order: the second is
+# a network round trip to the store and the first is not.  A VM still broken
+# after both gets a warning naming the command to run by hand, and the mount
+# below is left to fail on its own terms rather than being pre-empted here.
+darkos_vm_ensure_sshfs() {
+    local name=$1
+
+    if darkos_vm_sshfs_works "$name"; then
+        return 0
+    fi
+
+    darkos_log "Repairing sshfs mount support in $name"
+    multipass exec "$name" -- bash -lc \
+        'timeout 60 sudo systemctl restart "user@$(id -u).service" >/dev/null 2>&1 || true
+         sleep 2' || true
+    if darkos_vm_sshfs_works "$name"; then
+        return 0
+    fi
+
+    multipass exec "$name" -- bash -lc \
+        'timeout 300 sudo snap install multipass-sshfs >/dev/null 2>&1 || true' || true
+    if darkos_vm_sshfs_works "$name"; then
+        return 0
+    fi
+
+    darkos_warn "multipass-sshfs still will not run in $name, so the mounts below will fail"
+    darkos_warn "see it for yourself with: multipass exec $name -- snap run multipass-sshfs.env"
+    return 0
+}
+
 # darkos_vm_remount NAME HOST_PATH:VM_PATH [HOST_PATH:VM_PATH ...]
 #
 # Unmount first so that moving the checkout or the artifact directory on the host
-# is handled rather than silently serving the old path.
+# is handled rather than silently serving the old path.  Unmounting also clears a
+# mount Multipass has recorded but failed to activate: it refuses a second
+# `mount' at a path it believes is already mounted, so a single failed attempt
+# would otherwise answer "already mounted" for the rest of the instance's life
+# while the directory in the VM does not exist.
 darkos_vm_remount() {
     local name=$1
     shift
     local pair host vm
+
+    darkos_vm_ensure_sshfs "$name"
 
     for pair in "$@"; do
         host="${pair%%:*}"
