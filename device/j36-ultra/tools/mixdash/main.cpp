@@ -72,7 +72,7 @@
  * thirty lines tall.
  */
 #include "dashboard.h"
-#include "strings.h"
+#include "stringsdb.h"
 #include "trace.h"
 
 /*

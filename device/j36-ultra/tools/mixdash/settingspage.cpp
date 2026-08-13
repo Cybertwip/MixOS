@@ -19,7 +19,7 @@
 #include <QSysInfo>
 
 #include "joypad.h"
-#include "strings.h"
+#include "stringsdb.h"
 #include "theme.h"
 
 namespace {

@@ -3,9 +3,9 @@
  * Copyright (c) 2025-2026 the MixOS project and contributors
  * See device/j36-ultra/LICENSE for the licence text and what it covers.
  *
- * strings.cpp -- the six-column phrase table, and the translator over it.
+ * stringsdb.cpp -- the six-column phrase table, and the translator over it.
  *
- * See strings.h for why this is a table in .rodata and not a .qm file.  What
+ * See stringsdb.h for why this is a table in .rodata and not a .qm file.  What
  * follows is what the table means and how to add to it.
  *
  * COLUMN 0 IS THE ENGLISH, AND IT IS ALSO THE KEY.  A row is looked up by the
@@ -44,7 +44,7 @@
  * the tree changes.  A row left short is a compile error, which is the point of
  * writing it as a fixed-width array.
  */
-#include "strings.h"
+#include "stringsdb.h"
 
 #include <QByteArray>
 #include <QCoreApplication>
@@ -2201,7 +2201,7 @@ const QHash<QByteArray, int> &phraseIndex()
  * thing in this program -- "open" is the security of a Wi-Fi network and nothing
  * else -- so a per-class context would only be six copies of the same row.  n is
  * ignored because there are no numerus forms here at all, which is why %n is
- * banned in this codebase's tr() calls: see the note in strings.h.
+ * banned in this codebase's tr() calls: see the note in stringsdb.h.
  *
  * RETURNS A NULL QString FOR ANYTHING IT DOES NOT HAVE, and that is load-bearing
  * rather than lazy.  QCoreApplication::translate tests isNull(), not isEmpty(),

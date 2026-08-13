@@ -3,11 +3,22 @@
  * Copyright (c) 2025-2026 the MixOS project and contributors
  * See device/j36-ultra/LICENSE for the licence text and what it covers.
  *
- * strings.h -- the strings database, and the translator that reads it.
+ * stringsdb.h -- the strings database, and the translator that reads it.
+ *
+ * THE NAME IS NOT `strings.h', AND MUST NOT GO BACK TO BEING `strings.h'.  There is a
+ * <strings.h> in the C library -- the one with strcasecmp in it -- and glibc's own
+ * <string.h> includes it, at /usr/include/string.h:462, from inside __BEGIN_DECLS.
+ * qmake puts -I. on every compile line and -I paths are searched before the system
+ * ones, so a file of this name in this directory answers that include.  What glibc
+ * then got, in the middle of an extern "C" block, was the QObject include below, and
+ * the compiler said `error: template with C linkage' about eight hundred times in
+ * <type_traits> before giving up.  It survived a long time because nothing here
+ * included a system header early enough to trigger it; trace.cpp's <execinfo.h> does,
+ * and the whole dashboard stopped building the day it was added.
  *
  * SIX LANGUAGES: English, French, Italian, German, Portuguese, Spanish.  That is
  * the EU handheld market this board is sold into, and it is a closed set on
- * purpose -- adding a seventh is a column in one table in strings.cpp and nothing
+ * purpose -- adding a seventh is a column in one table in stringsdb.cpp and nothing
  * else in the tree changes.
  *
  * WHY A COMPILED-IN TABLE AND NOT .ts/.qm.  Qt has a perfectly good translation
@@ -38,8 +49,8 @@
  * handheld: a half-translated screen is usable, a screen full of
  * MIXDASH_SETTINGS_TITLE is not.
  */
-#ifndef MIXDASH_STRINGS_H
-#define MIXDASH_STRINGS_H
+#ifndef MIXDASH_STRINGSDB_H
+#define MIXDASH_STRINGSDB_H
 
 #include <QObject>
 #include <QString>
@@ -112,4 +123,4 @@ private:
     int m_language = Lang::English;
 };
 
-#endif /* MIXDASH_STRINGS_H */
+#endif /* MIXDASH_STRINGSDB_H */

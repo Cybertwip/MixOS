@@ -12,7 +12,7 @@
 #include "packages.h"
 #include "pointer.h"
 #include "settingspage.h"
-#include "strings.h"
+#include "stringsdb.h"
 #include "terminal.h"
 #include "theme.h"
 #include "trace.h"

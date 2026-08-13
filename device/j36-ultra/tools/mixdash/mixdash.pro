@@ -43,7 +43,7 @@ SOURCES += \
     widgets.cpp \
     joypad.cpp \
     settings.cpp \
-    strings.cpp \
+    stringsdb.cpp \
     pointer.cpp \
     keyboard.cpp \
     settingspage.cpp \
@@ -60,7 +60,7 @@ HEADERS += \
     joypad.h \
     theme.h \
     settings.h \
-    strings.h \
+    stringsdb.h \
     pointer.h \
     keyboard.h \
     settingspage.h \
