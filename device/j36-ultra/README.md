@@ -180,7 +180,7 @@ partition" is a step that cannot be performed at all from the machine doing the
 flashing.
 
 **`--mix-only` ships two directories**, and nothing else — no `boot.img` copy, no
-bare `zImage`, no `.cpio.gz`, no checksums. Those are intermediates that the image
+bare `zImage`, no `.cpio.xz`, no checksums. Those are intermediates that the image
 already contains, and having them sit next to a flashable image is how a stale one
 gets picked up:
 

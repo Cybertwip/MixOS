@@ -3942,13 +3942,43 @@ init=$(sha256sum "$INITROOT/init" | cut -c1-12)
 mixdash=$MIXDASH_BUILD_ID
 BUILDID
 
+# XZ AND NOT GZIP, AND THE 9 MiB BOOTIMG SLOT IS THE WHOLE REASON.
+#
+# boot.img is a header, the zImage with its device tree appended, and this file,
+# each padded to a 2048-byte page.  BOOTIMG cannot grow: it is a fixed partition
+# in the stock scatter with RECOVERY starting exactly 9 MiB later.  The kernel is
+# 7,857,760 bytes of that budget on its own, so the ramdisk is the only part with
+# any give, and gzip -9 stopped having enough of it -- gzip packs this tree to
+# 1,582,806 bytes, and the build that found this came out 10,240 bytes past the
+# slot, which is not an image that can be written.
+#
+# The same tree at xz is 1,194,912 bytes and the image 9,058,304, so the slot has
+# 370 KiB spare rather than being 10 KiB short.
+#
+# THIS EXACT INVOCATION IS THE KERNEL'S OWN.  cmd_xzmisc in scripts/Makefile.lib
+# packs initramfs images with `--check=crc32 --lzma2=dict=1MiB' and nothing else,
+# and both halves earn their place.  The kernel's XZ decoder is built without
+# CRC64, so a stream carrying xz's default check is refused outright.  And the
+# dictionary is allocated before there is a rootfs to page against, so it stays
+# at 1 MiB instead of the 64 MiB `-9e' would ask for; a 3.4 MB tree cannot use
+# more than a fraction of that anyway, and the whole difference is 41 KB against
+# a decoder already known to handle this shape.
+#
+# WHAT MAKES THE IMAGE BOOT is CONFIG_RD_XZ, which this config sets.  Losing it
+# would not fail the build -- it would produce an image that stops before it can
+# print why -- so it is asserted here rather than assumed.
+grep -q '^CONFIG_RD_XZ=y' "$CONFIG" || \
+    die "the kernel config has lost CONFIG_RD_XZ, so an xz initramfs cannot decompress"
+
 log "Packing the bring-up initramfs"
 (
     cd "$INITROOT"
-    find . -print0 | cpio --null -o --format=newc --owner=0:0 2>/dev/null | gzip -9
-) > "$ARTIFACTS/initramfs-j36-ultra.cpio.gz"
+    find . -print0 | cpio --null -o --format=newc --owner=0:0 2>/dev/null |
+        xz --check=crc32 --lzma2=dict=1MiB
+) > "$ARTIFACTS/initramfs-j36-ultra.cpio.xz"
 
-fits_in "$ARTIFACTS/initramfs-j36-ultra.cpio.gz" $((0x06000000)) "the initramfs"
+fits_in "$ARTIFACTS/initramfs-j36-ultra.cpio.xz" $((0x06000000)) "the initramfs"
+log "initramfs: $(stat -c %s "$ARTIFACTS/initramfs-j36-ultra.cpio.xz") bytes xz"
 
 # TWO KERNEL PAYLOADS, AND THEY ARE NOT INTERCHANGEABLE.
 #
@@ -3973,7 +4003,7 @@ cp "$CONFIG" "$ARTIFACTS/kernel.config"
 log "Creating the stock-LK-compatible BOOTIMG payload"
 python3 "$ROOT/device/j36-ultra/create_boot_image.py" \
     --kernel "$ARTIFACTS/zImage-j36-ultra" \
-    --ramdisk "$ARTIFACTS/initramfs-j36-ultra.cpio.gz" \
+    --ramdisk "$ARTIFACTS/initramfs-j36-ultra.cpio.xz" \
     --output "$ARTIFACTS/boot.img"
 
 # Every comment in this file that says "the fixed 9 MiB BOOTIMG slot" is quoting
@@ -5398,7 +5428,7 @@ esac
 log "payload: j36/ goes to $PAYREL (J36_PAYLOAD_ON=$PAYLOAD_ON)"
 cp "$ZIMAGE" "$SDBOOT/zImage"
 cp "$DTB_OUT/mt6592-j36-ultra.dtb" "$SDBOOT/"
-cp "$ARTIFACTS/initramfs-j36-ultra.cpio.gz" "$SDBOOT/initrd.img"
+cp "$ARTIFACTS/initramfs-j36-ultra.cpio.xz" "$SDBOOT/initrd.img"
 
 # $PAYDIR from here down, which is opt/mixos/j36 in the OS partition unless
 # J36_PAYLOAD_ON=boot.  Everything in it is read by /init, never by the LK, so nothing
@@ -7210,7 +7240,7 @@ fi
     # The Doom payload is optional, and sha256sum takes a missing operand as an
     # error, so it is named only when it was staged.
     sums=(boot.img zImage zImage-j36-ultra mt6592-j36-ultra.dtb
-          j36_mt6592_input.ko initramfs-j36-ultra.cpio.gz
+          j36_mt6592_input.ko initramfs-j36-ultra.cpio.xz
           sd-boot/zImage sd-boot/mvii/boot.conf)
     if [[ -f sd-root/opt/mixos/bin/mixdash ]]; then
         sums+=(sd-root/opt/mixos/bin/mixdash)
