@@ -1,12 +1,9 @@
 #!/bin/bash
+# See finish.sh: the bye.gif this used to play went with the roms tree it lived in.
 if [ ! -e "/home/virtua/.config/.SWAPPOWERANDSUSPEND" ]; then
   sudo systemctl suspend
 else
   printf "\033c" >> /dev/tty1
-  if [ -e "/roms/shutdownimages/bye.gif" ]; then
-    ffplay -x 1280 -y 720 -loglevel quiet /roms/shutdownimages/bye.gif &
-    (sleep 2s; kill -9 $(pidof ffplay))
-  fi
   printf "\n\n\n\n\n\n\n      PEACE!" >> /dev/tty1
   sudo systemctl poweroff
 fi

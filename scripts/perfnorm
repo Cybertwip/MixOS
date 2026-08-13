@@ -8,48 +8,14 @@ else
   gpu="fde60000"
 fi
 
-if [ -e "/home/virtua/.config/.GameLoadingIModeASCII" ] && [[ $(tty) != *"pts"* ]]; then
-  if [ -f "/roms/launchimages/loading.ascii" ]; then
-    echo -en "\033[21m" > /dev/tty1 && cat /roms/launchimages/loading.ascii > /dev/tty1
-  else
-    continue
-  fi
-elif [ -e "/home/virtua/.config/.GameLoadingIModeGIF" ] && [[ $(tty) != *"pts"* ]]; then
-  #if [ -e "/home/virtua/.config/.IMAGEDELAYTIME" ]; then
-  #  delay="$(cat /home/virtua/.config/.IMAGEDELAYTIME)"
-  #else
-    delay="1.5"
-  #fi
-  if [ -f "/roms/launchimages/loading.gif" ]; then
-    sudo -u virtua ffplay -x 1280 -y 720 -loglevel quiet -autoexit /roms/launchimages/loading.gif &
-    (sleep ${delay}s; kill -9 $(pidof ffplay))
-  else
-    continue
-  fi
-
-elif [ -e "/home/virtua/.config/.GameLoadingIModeVID" ] && [[ $(tty) != *"pts"* ]]; then
-  if [ -f "/roms/launchimages/loading.mp4" ]; then
-    sudo -u virtua ffplay -x 1280 -y 720 -loglevel quiet -autoexit /roms/launchimages/loading.mp4 &
-    (sleep 4s; kill -9 $(pidof ffplay))
-  else
-    continue
-  fi
-elif [ -e "/home/virtua/.config/.GameLoadingIModePIC" ] && [[ $(tty) != *"pts"* ]]; then
-  #if [ -e "/home/virtua/.config/.IMAGEDELAYTIME" ]; then
-  #  delay="$(cat /home/virtua/.config/.IMAGEDELAYTIME)"
-  #else
-    delay="1.5"
-  #fi
-  if [ -f "/roms/launchimages/loading.jpg" ]; then
-    image-viewer /roms/launchimages/loading.jpg &
-    PROC=$!
-    (sleep ${delay}s; kill -9 $PROC)
-  else
-    continue
-  fi
-else
-  clear > /dev/tty1
-fi
+# A four-way branch on /home/virtua/.config/.GameLoadingIMode{ASCII,GIF,VID,PIC} used to
+# be here, each arm playing /roms/launchimages/loading.{ascii,gif,mp4,jpg} through ffplay
+# or image-viewer while a game started.  It was EmulationStation's per-game loading
+# screen: the front end set those flag files from its Options menu and the images came
+# out of the roms tree.  Both are gone, launchimages/ was never created by this build in
+# the first place, and every arm ended in a bare `continue' outside any loop -- which
+# bash reports as an error on the one path it could ever have taken.
+clear > /dev/tty1
 
 echo simple_ondemand > /sys/devices/platform/${gpu}.gpu/devfreq/${gpu}.gpu/governor
 echo ondemand > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor

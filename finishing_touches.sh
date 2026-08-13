@@ -95,10 +95,14 @@ sudo chroot MixOSBuild/ bash -c "systemctl disable killer_daemon"
 # vfat's umask/uid/gid, which mount would refuse on ext2 outright.
 #
 # It is mounted at ${DATA_MOUNT_POINT} -- /home/virtua, the login user's home directory
-# -- and not at /roms.  The tools bind mount below therefore reaches one level further
-# in, at the legacy roms/ tree inside that partition, and names the real path rather
-# than going through the /roms compatibility symlink: a bind mount is the one place
-# where resolving through a symlink to a not-yet-mounted partition can order wrong.
+# -- and not at /roms, which no longer exists in any form.
+#
+# A fourth line used to sit at the bottom of this file: a bind of
+# ${DATA_MOUNT_POINT}/roms/tools onto /opt/system/Tools.  It went with the roms tree.
+# The one thing that read through it was global/importwifi.sh, which looks for
+# wifikeyfile.txt in /opt/system/Tools and does nothing when it is not there -- so it is
+# inert rather than broken, and its replacement belongs with the network stack this
+# board does not have yet.
 if [ "$ROOT_FILESYSTEM_FORMAT" == "btrfs" ]; then
   ROOT_FILESYSTEM_MOUNT_OPTIONS="${ROOT_FILESYSTEM_MOUNT_OPTIONS},ssd_spread"
 fi
@@ -107,7 +111,6 @@ LABEL=ROOTFS / ${ROOT_FILESYSTEM_FORMAT} ${ROOT_FILESYSTEM_MOUNT_OPTIONS} 0 0
 
 LABEL=BOOT /boot vfat defaults 0 2
 LABEL=${DATA_LABEL} ${DATA_MOUNT_POINT} ${DATA_FILESYSTEM_FORMAT} ${DATA_MOUNT_OPTIONS} 0 2
-${DATA_MOUNT_POINT}/roms/tools /opt/system/Tools none nofail,x-systemd.device-timeout=7,bind
 EOF
 
 # Disable getty on tty0 and tty1
@@ -173,9 +176,12 @@ sudo chroot MixOSBuild/ bash -c "ln -sf /usr/share/zoneinfo/America/New_York /et
 # front end this image does not have.  MixOS gets its own updater when there is a
 # network stack to carry it.
 #
-# The directory itself stays: line 110 puts a bind of ${DATA_MOUNT_POINT}/roms/tools on
-# /opt/system/Tools in the fstab, and global/importwifi.sh reads wifikeyfile.txt out of
-# it -- which is how a handheld with no configured network gets its first credentials.
+# The directory itself stays because the LED scripts land in it -- "Change LED to Red.sh"
+# is copied here a few lines down -- and for no other reason.  /opt/system/Tools used to
+# be a bind mount of the roms tree's tools/ directory, which is where global/importwifi.sh
+# looked for wifikeyfile.txt; the roms tree is gone and so is the bind, which leaves that
+# script looking at a path that does not exist and doing nothing, which is what it does on
+# any card without a key file anyway.
 # /opt/system/Advanced is not created any more either.  It was the second level of the
 # front end's Options menu, and the only things that ever landed in it were the emulator
 # settings tools and a few self-replacing toggles that copy their own opposite in from
@@ -290,21 +296,15 @@ echo "export SDL_VIDEO_EGL_DRIVER=libEGL.so" | sudo tee MixOSBuild/etc/profile.d
 dNAME=`echo $NAME | tr '[:lower:]' '[:upper:]'`
 echo "$dNAME" | sudo tee MixOSBuild${DATA_MOUNT_POINT}/.config/.DEVICE
 
-# Configure default samba share setup.  The real path, not /roms: that is a symlink into
-# the DATA partition now, and samba defaults to "wide links = no" -- it refuses to follow
-# a symlink that leaves the share, so a share rooted on one is a share that shows nothing.
+# Configure default samba share setup.  Two shares, and there used to be four.
+#
+# [roms] pointed at ${DATA_MOUNT_POINT}/roms and [roms2] at /roms2.  Both were named for
+# a directory layout EmulationStation invented, the first is gone with that layout, and
+# the second never existed on any image this tree builds -- it was a share on a path
+# nothing ever created, which samba reports as a share that cannot be connected to.
+# [home] already covers everything [roms] did: the partition mounts AT the home
+# directory, so the whole of it is one share with the name the operator expects.
 cat <<EOF | sudo tee -a MixOSBuild/etc/samba/smb.conf
-[roms]
-   comment = ROMS
-   path = ${DATA_MOUNT_POINT}/roms
-   browsable = yes
-   read only = no
-   map archive = no
-   map system = no
-   map hidden = no
-   guest ok = yes
-   read list = guest
-
 [opt]
    comment = OPT
    path = /opt
@@ -327,20 +327,6 @@ cat <<EOF | sudo tee -a MixOSBuild/etc/samba/smb.conf
    guest ok = yes
    read list = guest
 EOF
-if [[ "$UNIT" != *"rgb10"* ]] && [[ "$UNIT" != "rk2020" ]] && [[ "$UNIT" != *"oga"* ]]; then
-  cat <<EOF | sudo tee -a MixOSBuild/etc/samba/smb.conf
-[roms2]
-   comment = ROMS2
-   path = /roms2
-   browsable = yes
-   read only = no
-   map archive = no
-   map system = no
-   map hidden = no
-   guest ok = yes
-   read list = guest
-EOF
-  fi
 
 sudo chroot MixOSBuild/ bash -c "systemctl disable smbd"
 sudo chroot MixOSBuild/ bash -c "systemctl disable nmbd"
@@ -419,43 +405,31 @@ sudo mkfs.${DATA_FILESYSTEM_FORMAT} ${DATA_FILESYSTEM_FORMAT_PARAMETERS} ${LOOP_
 data_mountpoint=mnt/data
 mkdir -p ${data_mountpoint}
 sudo mount -t ${DATA_FILESYSTEM_FORMAT} ${LOOP_ROM} ${data_mountpoint}
-fat32_mountpoint=${data_mountpoint}/roms
-sudo mkdir -p ${fat32_mountpoint}
 
-# /roms on the rootfs becomes a symlink into the home partition.  The RK3326 scripts,
-# the samba share and firstboot still say /roms, and they keep resolving through this;
-# nothing has to be renamed to move the partition.
-# If an earlier stage already put real files in MixOSBuild/roms they are moved onto the
-# partition rather than lost, because replacing a populated directory with a symlink
-# would silently drop whatever was in it.
-if [[ -d MixOSBuild/roms && ! -L MixOSBuild/roms ]]; then
-  if [[ -n "$(sudo ls -A MixOSBuild/roms 2>/dev/null)" ]]; then
-    echo -e "Moving the existing MixOSBuild/roms contents onto the DATA partition\n"
-    sudo cp -a MixOSBuild/roms/. ${fat32_mountpoint}/
-  fi
-  sudo rm -rf MixOSBuild/roms
-fi
-# Relative on purpose: an absolute target would make a host-side
-# `cp something MixOSBuild/roms/...` write to /home/virtua/roms on the BUILD MACHINE.
-# Stripping the leading slash makes it relative to whatever root it is read from, so it
-# resolves to MixOSBuild${DATA_MOUNT_POINT}/roms here and /home/virtua/roms on the device.
-sudo ln -sfn "${DATA_MOUNT_POINT#/}/roms" MixOSBuild/roms
-# The media tree.  This used to be one directory per entry in game_systems.txt -- a
-# hundred and some emulator folders, wolf/ and alg/ and scummvm/ and pico-8/carts/ --
-# followed by a PortMaster installer, a ThemeMaster unzip, five pico-8 cartridges pulled
-# from lexaloffle, a theme cloned from GitHub and the scanner scripts each application
-# shipped.  Every one of those existed to be read by an emulator or by the front end
-# that launched it, and both are gone; what is left is the handful of places the system
-# itself writes to.  Seven mkdir calls in place of six network fetches.
-media_directories=(backup bgmusic bios shutdownimages themes tools)
-for directory in "${media_directories[@]}"; do
-  echo -e "Creating ${fat32_mountpoint}/${directory}\n"
-  sudo mkdir -p "${fat32_mountpoint}/${directory}"
-done
-
-# The one image still read at runtime: finish.sh and pause.sh play it on shutdown.
-sudo cp shutdownimages/bye.gif ${fat32_mountpoint}/shutdownimages/
-sync
+# ── THE roms/ TREE, AND WHY THERE IS NOTHING HERE ANY MORE ───────────────────
+#
+# This is where a roms/ directory was created on the DATA partition, with
+# backup/ bgmusic/ bios/ shutdownimages/ themes/ tools/ inside it, a bye.gif
+# copied into shutdownimages/, and /roms on the rootfs symlinked to the lot.
+#
+# Every one of those is an EmulationStation artefact.  themes/ and bgmusic/ were
+# read by the front end and by nothing else; bios/ was read by emulators; backup/
+# was the front end's save-state copy; tools/ held the /opt/system menu's scripts;
+# shutdownimages/ held one animated GIF that finish.sh and pause.sh played through
+# ffplay on the way down.  There is no front end on this image, no emulator, and
+# no /opt/system menu, so all six were directories that existed to be empty.
+#
+# The tree itself came earlier from one directory per line of game_systems.txt --
+# a hundred and some emulator folders, a PortMaster installer, a ThemeMaster
+# unzip, five pico-8 cartridges fetched from lexaloffle and a theme cloned from
+# GitHub.  That went when the emulators did; this is the rest of it.
+#
+# THE PARTITION IS UNAFFECTED.  It is the login user's home directory -- it mounts
+# at ${DATA_MOUNT_POINT} -- and it is seeded from the rootfs copy of that home
+# directory just below, exactly as it was.  What is gone is one subdirectory of
+# it and the /roms symlink that pointed at that subdirectory.  A card written by
+# an older build still HAS roms/ in its home directory; nothing here deletes it,
+# and nothing reads it either.
 
 # The home directory itself.  useradd -m in setup_virtua_user built this tree on the ROOTFS,
 # under what is about to become a mount point: the skeleton, .config and the two
@@ -475,8 +449,8 @@ fi
 # read.  Contents are for whoever finds it with a card reader; only the name matters.
 cat <<EOF | sudo tee ${data_mountpoint}/.mixos-home > /dev/null
 This partition is the MixOS home directory: it mounts at ${DATA_MOUNT_POINT}.
-Label ${DATA_LABEL}, ${DATA_FILESYSTEM_FORMAT}, owned by uid 1000.  roms/ inside it is
-the legacy media tree, which /roms still points at.
+Label ${DATA_LABEL}, ${DATA_FILESYSTEM_FORMAT}, owned by uid 1000.  It is yours to fill;
+nothing on the image expects any particular directory inside it.
 Do not delete this file: the J36 Ultra initramfs reads it to tell this partition apart
 from a plain data partition, and without it the boot mounts this one read-only.
 EOF
@@ -505,9 +479,11 @@ sync
 # the archive; the matching half is on the extract side, in expandtoexfat.sh, which used
 # to pass --no-same-owner because the destination was exfat and could not hold it.
 #
-# The archive is now the whole partition -- the home directory with roms/ inside it --
-# rather than a single roms/ top level, so firstboot extracts it AT ${DATA_MOUNT_POINT}
-# and not at /.  lost+found is excluded: the recreated filesystem has its own.
+# The archive is the whole partition -- the home directory -- rather than a single roms/
+# top level, so firstboot extracts it AT ${DATA_MOUNT_POINT} and not at /.  lost+found is
+# excluded: the recreated filesystem has its own.  The NAME roms.tar is the last trace of
+# the old layout and is kept on purpose: expandtoexfat.sh and firstboot.sh both open it by
+# that name off /boot, and renaming a file three scripts agree on buys nothing.
 sudo tar -C ${data_mountpoint} --exclude=./lost+found -cvf MixOSBuild/roms.tar .
 
 sudo umount ${data_mountpoint}

@@ -20,71 +20,13 @@ if [[ ! -z "$isitrk3326" ]] && [[ $(tty) != *"pts"* ]]; then
   rm /home/virtua/.asoundrc
 fi
 
-if [ -e "/home/virtua/.config/.GameLoadingIModeASCII" ] && [[ $(tty) != *"pts"* ]]; then
-  if [ -f "/roms/launchimages/loading.ascii" ]; then
-    echo -en "\033[21m" > /dev/tty1 && cat /roms/launchimages/loading.ascii > /dev/tty1
-  else
-    continue
-  fi
-elif [ -e "/home/virtua/.config/.GameLoadingIModeGIF" ] && [[ $(tty) != *"pts"* ]]; then
-  if [ -e "/home/virtua/.config/.IMAGEDELAYTIME" ]; then
-    delay="$(cat /home/virtua/.config/.IMAGEDELAYTIME)"
-  else
-    delay="1.5"
-  fi
-  if [ -f "/roms/launchimages/loading.gif" ]; then
-    sudo -u virtua ffplay -x 1280 -y 720 -loglevel quiet -autoexit /roms/launchimages/loading.gif &
-    (sleep ${delay}s; kill -9 $(pidof ffplay))
-  else
-    continue
-  fi
-elif [ -e "/home/virtua/.config/.GameLoadingIModeVID" ] && [[ $(tty) != *"pts"* ]]; then
-  if [ -e "/home/virtua/.config/.IMAGEDELAYTIME" ]; then
-    delay="$(cat /home/virtua/.config/.IMAGEDELAYTIME)"
-  else
-    delay="1.5"
-  fi
-  if [ -f "/roms/launchimages/loading.mp4" ]; then
-    sudo -u virtua ffplay -x 1280 -y 720 -loglevel quiet -autoexit /roms/launchimages/loading.mp4 &
-    PROC=$!
-    (sleep ${delay}s; kill -9 $(pidof ffplay))
-  else
-    continue
-  fi
-elif [ -e "/home/virtua/.config/.GameLoadingIModePIC" ] && [[ $(tty) != *"pts"* ]]; then
-  directory=$(echo "$(dirname "$2")"/images)
-  basefile="$(basename -- "$2")"
-  basefilenoext="${basefile%.*}"
-  if [ -e "/home/virtua/.config/.IMAGEDELAYTIME" ]; then
-    delay="$(cat /home/virtua/.config/.IMAGEDELAYTIME)"
-  else
-    delay="1.5"
-  fi
-  if [ -e "/home/virtua/.config/.LOADING_IMAGE_MARQUEE" ]; then
-    image="marquee"
-  elif [ -e "/home/virtua/.config/.LOADING_IMAGE_THUMB" ]; then
-    image="thumb"
-  elif [ -e "/home/virtua/.config/.LOADING_IMAGE_IMAGE" ]; then
-    image="image"
-  else
-    image=""
-  fi
-  if [ -e "${directory}/${basefilenoext}-${image}.png" ]; then
-    image-viewer "${directory}/${basefilenoext}-${image}.png" &
-    PROC=$!
-    (sleep ${delay}s; kill -9 $PROC)
-  else
-    if [ -f "/roms/launchimages/loading.jpg" ]; then
-      image-viewer /roms/launchimages/loading.jpg &
-      PROC=$!
-      (sleep ${delay}s; kill -9 $PROC)
-    else
-      continue
-    fi
-  fi
-else
-  clear > /dev/tty1
-fi
+# See perfnorm: the same four-way .GameLoadingIMode branch was here, with one extra arm.
+# That arm read $2 as a ROM path and looked for a scraped image beside it in an images/
+# directory -- "<game>-marquee.png", "-thumb", "-image" -- which is EmulationStation's
+# media layout, populated by its scraper, selected by three more flag files its Options
+# menu wrote.  There is no front end to pass a ROM path in $2, no scraper, and no roms
+# tree for the fallback to fall back to.
+clear > /dev/tty1
 
 chmod 777 /sys/devices/platform/${gpu}.gpu/devfreq/${gpu}.gpu/governor
 chmod 777 /sys/devices/system/cpu/cpufreq/policy0/scaling_governor
