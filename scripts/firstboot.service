@@ -1,5 +1,5 @@
 [Unit]
-Description=ArkOS firstboot
+Description=MixOS firstboot
 
 [Service]
 Type=oneshot

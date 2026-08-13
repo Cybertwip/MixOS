@@ -9,9 +9,9 @@ fi
 
 # Cleanup to reduce image size and remove build remnants
 echo -e "Cleaning up filesystem"
-call_chroot "rm -rf /home/ark/libgo2"
-call_chroot "rm -rf /home/ark/linux-rga"
-call_chroot "rm -rf /home/ark/${CHIPSET}_core_builds"
+call_chroot "rm -rf /home/virtua/libgo2"
+call_chroot "rm -rf /home/virtua/linux-rga"
+call_chroot "rm -rf /home/virtua/${CHIPSET}_core_builds"
 if [[ "${CHIPSET}" == "rk3566" ]]; then
   call_chroot "apt-mark hold ffmpeg"
 fi
@@ -116,7 +116,7 @@ BUILD_ONLY_PACKAGES=(
 REMOVABLE_PACKAGES=()
 while read -r INSTALLED_PACKAGE; do
   REMOVABLE_PACKAGES+=( "$INSTALLED_PACKAGE" )
-done < <(sudo chroot Arkbuild/ dpkg-query -W \
+done < <(sudo chroot MixOSBuild/ dpkg-query -W \
     -f '${Package}:${Architecture} ${db:Status-Status}\n' "${BUILD_ONLY_PACKAGES[@]}" 2>/dev/null |
     awk '$NF == "installed" { print $1 }')
 
@@ -142,20 +142,14 @@ if [[ -z "$SELECTED_USERSPACE_ARCH" && "${BUILD_ARMHF}" == "y" ]]; then
   if (( ${#ARMHF_PACKAGES[@]} )); then
     install_package armhf "${ARMHF_PACKAGES[@]}"
   fi
-  sync Arkbuild
+  sync MixOSBuild
 fi
 
-# Ensure additional needed packages for Kodi are still in place if Kodi is built
-if [[ "$CHIPSET" == *"3566"* ]] && [[ "$BUILD_KODI" == "y" ]]; then
-  KODI_PACKAGES=()
-  while read -r KODI_NEEDED_PACKAGE; do
-    [[ "$KODI_NEEDED_PACKAGE" == *"-dev"* ]] || KODI_PACKAGES+=( "$KODI_NEEDED_PACKAGE" )
-  done < <(read_package_list kodi_needed_dev_packages.txt)
-  if (( ${#KODI_PACKAGES[@]} )); then
-    install_package 64 "${KODI_PACKAGES[@]}"
-    protect_package 64 "${KODI_PACKAGES[@]}"
-  fi
-fi
+# Kodi's runtime packages were reinstalled here when CHIPSET was rk3566 and BUILD_KODI
+# was y.  Neither can hold: this tree builds rk3326 only, standalone_kodi.sh -- the only
+# thing that ever set BUILD_KODI -- is gone with the rest of the source builds, and
+# kodi_needed_dev_packages.txt went with it.  Nothing this block installed is missing
+# from the image, because the block never ran on a build anyone made.
 
 RUNTIME_PACKAGES=()
 while read -r NEEDED_PACKAGE; do
@@ -181,7 +175,7 @@ if [[ "$BUILD_BLUEALSA" == "y" ]]; then
 fi
 
 if [[ "$SELECTED_USERSPACE_ARCH" == armhf || ( -z "$SELECTED_USERSPACE_ARCH" && "${BUILD_ARMHF}" == "y" ) ]]; then
-  cd Arkbuild/usr/lib/arm-linux-gnueabihf
+  cd MixOSBuild/usr/lib/arm-linux-gnueabihf
   for LIB in libEGL.so libEGL.so.1 libGLES_CM.so libGLES_CM.so.1 libGLESv1_CM.so libGLESv1_CM.so.1 libGLESv1_CM.so.1.1.0 libGLESv2.so libGLESv2.so.2 libGLESv2.so.2.0.0 libGLESv2.so.2.1.0 libGLESv3.so libGLESv3.so.3 libgbm.so libgbm.so.1 libgbm.so.1.0.0 libmali.so libmali.so.1 libMaliOpenCL.so libOpenCL.so libwayland-egl.so libwayland-egl.so.1 libwayland-egl.so.1.0.0
   do
     sudo rm -fv ${LIB}
@@ -201,7 +195,7 @@ if [[ "$SELECTED_USERSPACE_ARCH" == armhf || ( -z "$SELECTED_USERSPACE_ARCH" && 
 	sleep 10
   done
   dpkg --fsys-tarfile libasound2_1.2.8-1+b1_armhf.deb | tar -xO ./usr/lib/arm-linux-gnueabihf/libasound.so.2.0.0 > libasound.so.2.0.0
-  sudo mv -f libasound.so.2.0.0 Arkbuild/usr/lib/arm-linux-gnueabihf/
+  sudo mv -f libasound.so.2.0.0 MixOSBuild/usr/lib/arm-linux-gnueabihf/
   call_chroot "chown root:root /usr/lib/arm-linux-gnueabihf/libasound.so.2.0.0"
   rm -f libasound2_1.2.8-1+b1_armhf.deb
 fi
@@ -211,7 +205,7 @@ if [[ "$SELECTED_USERSPACE_ARCH" == armhf ]]; then
   call_chroot "ln -sfv /usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0.${extension} /usr/lib/arm-linux-gnueabihf/libSDL2.so"
   call_chroot "ln -sfv /usr/lib/arm-linux-gnueabihf/bin/sdl2-config /usr/bin/sdl2-config"
 else
-  cd Arkbuild/usr/lib/aarch64-linux-gnu
+  cd MixOSBuild/usr/lib/aarch64-linux-gnu
   for LIB in libEGL.so libEGL.so.1 libGLES_CM.so libGLES_CM.so.1 libGLESv1_CM.so libGLESv1_CM.so.1 libGLESv1_CM.so.1.1.0 libGLESv2.so libGLESv2.so.2 libGLESv2.so.2.0.0 libGLESv2.so.2.1.0 libGLESv3.so libGLESv3.so.3 libgbm.so libgbm.so.1 libgbm.so.1.0.0 libmali.so libmali.so.1 libMaliOpenCL.so libOpenCL.so libwayland-egl.so libwayland-egl.so.1 libwayland-egl.so.1.0.0
   do
     sudo rm -fv ${LIB}
@@ -220,7 +214,7 @@ else
   cd ../../../../
 
   # Make sure the built librga shared libs are still available in aarch64.
-  sudo cp -av Arkbuild/usr/lib/librga.so* Arkbuild/usr/lib/aarch64-linux-gnu/ || true
+  sudo cp -av MixOSBuild/usr/lib/librga.so* MixOSBuild/usr/lib/aarch64-linux-gnu/ || true
   call_chroot "ln -sfv /usr/lib/aarch64-linux-gnu/libSDL2.so /usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0"
   call_chroot "ln -sfv /usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0.${extension} /usr/lib/aarch64-linux-gnu/libSDL2.so"
   if [[ -z "$SELECTED_USERSPACE_ARCH" && "${BUILD_ARMHF}" == "y" ]]; then
@@ -231,8 +225,8 @@ else
 fi
 
 if [[ "${ENABLE_CACHE}" == "y" ]]; then
-  sudo rm -f Arkbuild/etc/apt/apt.conf.d/99proxy
-  sudo sed -i '/127.0.0.1:3142\//s///' Arkbuild/etc/apt/sources.list
+  sudo rm -f MixOSBuild/etc/apt/apt.conf.d/99proxy
+  sudo sed -i '/127.0.0.1:3142\//s///' MixOSBuild/etc/apt/sources.list
 fi
 # Ensure sdl-image is symlinked properly -- IF THERE IS ONE TO SYMLINK.
 #
@@ -254,25 +248,25 @@ fi
 call_chroot "ldconfig"
 
 # The ccache bind mount.  This used to be twenty lines of unmount-wait-then-rm here and
-# another set of them in utils.sh's remove_arkbuild, and both got the guard wrong in the
+# another set of them in utils.sh's remove_mixosbuild, and both got the guard wrong in the
 # same way -- see drop_ccache_mount in utils.sh, which is now the only copy, for what
 # `rm -rf' does to the host's ccache when the mount is still up and for the three
 # reasons a /proc/mounts check does not catch it.
-drop_ccache_mount Arkbuild/home/ark/Arkbuild_ccache
-sudo rm -rf Arkbuild/var/log/journal
+drop_ccache_mount MixOSBuild/home/virtua/MixOSBuild_ccache
+sudo rm -rf MixOSBuild/var/log/journal
 # -f: this is written by bootstrap_rootfs.sh and removed here, so a resumed build that
 # reaches this stage twice finds it already gone.
-sudo rm -f Arkbuild/usr/sbin/policy-rc.d
-sudo rm -f Arkbuild/etc/resolv.conf
-sudo rm -f Arkbuild/etc/network/interfaces
-sudo rm -rf Arkbuild/usr/share/man/*
-#for i in {1..8}; do sudo mkdir -p Arkbuild/usr/share/man/man"$i"; done
-sudo rm -rf Arkbuild/var/lib/apt/lists/*
-sudo rm -f Arkbuild/var/log/*.log
-sudo rm -f Arkbuild/var/log/apt/*.log
-sudo rm -f Arkbuild/tmp/reboot-needed
+sudo rm -f MixOSBuild/usr/sbin/policy-rc.d
+sudo rm -f MixOSBuild/etc/resolv.conf
+sudo rm -f MixOSBuild/etc/network/interfaces
+sudo rm -rf MixOSBuild/usr/share/man/*
+#for i in {1..8}; do sudo mkdir -p MixOSBuild/usr/share/man/man"$i"; done
+sudo rm -rf MixOSBuild/var/lib/apt/lists/*
+sudo rm -f MixOSBuild/var/log/*.log
+sudo rm -f MixOSBuild/var/log/apt/*.log
+sudo rm -f MixOSBuild/tmp/reboot-needed
 if [[ "${CHIPSET}" == "rk3566" ]]; then
-  sudo rm -f Arkbuild/usr/share/vulkan/icd.d/*_icd.*
+  sudo rm -f MixOSBuild/usr/share/vulkan/icd.d/*_icd.*
 fi
 
 # Ensure the legacy arm64 Vulkan loader is symlinked properly.  The armhf-only

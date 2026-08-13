@@ -17,7 +17,7 @@
 # Nothing is generated on the workstation.  This script reads the checkout, warns
 # about drift, drives Multipass and copies artifacts out; every file the build makes
 # is made in the VM, under its own work directory, and arrives here only as an
-# artifact under ${ROOT}-artifacts.
+# artifact under MixOS-Artifacts, next to the checkout.
 #
 # It is self-contained: no PowerEngine checkout is needed.  The five MVII board
 # files the DTB generator parses are committed at device/j36-ultra/mvii-board and
@@ -54,13 +54,14 @@ UBUNTU_IMAGE="${DARKOS_UBUNTU_IMAGE:-24.04}"
 BOARD_SRC="$ROOT/device/j36-ultra/mvii-board"
 POWERENGINE_ROOT="${POWERENGINE_ROOT:-$(dirname "$ROOT")/PowerEngineV3/PowerEngine}"
 DRIVERS_HOST="${J36_DRIVERS_DIR:-$POWERENGINE_ROOT/OS/MVII/Kernel/ARM/MediaTek/J36Ultra/Drivers}"
+# Where build-r36-ultra.sh puts the image and latest-image.txt.  Derived the same way it
+# derives it -- same helper, same two overrides -- because the payload-carrying image has
+# to land there and nowhere else; see the hand-over at the bottom.
+BASE_ARTIFACT_DIR="${MIXOS_ARTIFACT_DIR:-${DARKOS_ARTIFACT_DIR:-$(darkos_artifact_dir "$ROOT")}}"
 # Only --mix-only writes here, and it holds exactly two directories: boot/ and root/.
-# See the MIX_ONLY block below for why a full build leaves this untouched.
-ARTIFACT_DIR="${J36_ARTIFACT_DIR:-${ROOT}-artifacts/j36-ultra}"
-# Where build-r36-ultra.sh puts the image and latest-image.txt.  Spelt the same way it
-# spells it, and honouring the same override, because the payload-carrying image has to
-# land there and nowhere else -- see the hand-over at the bottom.
-BASE_ARTIFACT_DIR="${DARKOS_ARTIFACT_DIR:-${ROOT}-artifacts}"
+# See the MIX_ONLY block below for why a full build leaves this untouched.  Hung off the
+# base directory rather than computed again, so an operator who moves one moves both.
+ARTIFACT_DIR="${J36_ARTIFACT_DIR:-${BASE_ARTIFACT_DIR}/j36-ultra}"
 RESUME_R36="${J36_RESUME_R36:-1}"
 MIX_ONLY=0
 # --no-splash.  Passed to the VM as J36_SPLASH and applied to the bootargs line in
@@ -68,7 +69,7 @@ MIX_ONLY=0
 SPLASH=1
 VM_SOURCE_MOUNT="/mnt/darkos-host"
 VM_ARTIFACT_MOUNT="/mnt/j36-artifacts"
-VM_BASE_ARTIFACT_MOUNT="/mnt/darkos-artifacts"
+VM_BASE_ARTIFACT_MOUNT="/mnt/mixos-artifacts"
 VM_BUILD_DIR="/home/ubuntu/dArkOS"
 VM_WORK_DIR="/home/ubuntu/j36-ultra-work"
 

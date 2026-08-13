@@ -1,12 +1,12 @@
 #!/bin/bash
 
 # Unmount chroot binds
-remove_arkbuild
+remove_mixosbuild
 if [[ "${BUILD_ARMHF}" == "y" ]]; then
-  remove_arkbuild32
+  remove_mixosbuild32
 fi
-if grep -qs "$PWD/Arkbuild_ccache" /proc/mounts; then
-  sudo umount $PWD/Arkbuild_ccache
+if grep -qs "$PWD/MixOSBuild_ccache" /proc/mounts; then
+  sudo umount $PWD/MixOSBuild_ccache
 fi
 if grep -qs "${mountpoint}" /proc/mounts; then
   sync ${mountpoint}

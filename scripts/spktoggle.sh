@@ -5,7 +5,7 @@
 
 spktoggle=$(amixer | grep "Item0: 'SPK'")
 
-if [ "$(cat /home/ark/.config/.DEVICE)" == "RGB30" ] || [ "$(cat /home/ark/.config/.DEVICE)" == "RK2023" ]; then
+if [ "$(cat /home/virtua/.config/.DEVICE)" == "RGB30" ] || [ "$(cat /home/virtua/.config/.DEVICE)" == "RK2023" ]; then
   presses="spktogglepress1 spktogglepress2 spktogglepress3 spktogglepress4 spktogglepress5"
 
   if [[ ! -z $(amixer | grep "Item0: 'OFF'") ]]; then
@@ -36,7 +36,7 @@ if [ "$(cat /home/ark/.config/.DEVICE)" == "RGB30" ] || [ "$(cat /home/ark/.conf
 else
   if [ -z "$spktoggle" ]
   then
-    if [ "$(cat /home/ark/.config/.DEVICE)" != "A10MINI" ]; then
+    if [ "$(cat /home/virtua/.config/.DEVICE)" != "A10MINI" ]; then
       amixer -q sset 'Playback Path' SPK_HP
     else
       amixer -q sset 'Playback Path' SPK
@@ -47,11 +47,11 @@ else
       /usr/sbin/alsactl restore -f /var/local/asound.state
 	  sudo rm -f /var/local/asound.state
   fi
-  if [ "$(cat /home/ark/.config/.DEVICE)" == "MINILOONG" ] && [ ! -f "/home/ark/.config/.SPKTOGGLE" ]; then
+  if [ "$(cat /home/virtua/.config/.DEVICE)" == "MINILOONG" ] && [ ! -f "/home/virtua/.config/.SPKTOGGLE" ]; then
    sleep 5
    amixer -q sset 'Playback Path' RCV
    amixer -q sset 'Playback Path' SPK
-   touch /home/ark/.config/.SPKTOGGLE
+   touch /home/virtua/.config/.SPKTOGGLE
   fi
 fi
 

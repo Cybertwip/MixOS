@@ -96,7 +96,7 @@ Three things used to be redone anyway, and are not any more:
   output still exists. `boot_stash_ready` checks, and a checkpoint with no payload
   behind it is cleared rather than believed.
 
-The copy is crash-consistent rather than quiesced: `Arkbuild` is still mounted, so
+The copy is crash-consistent rather than quiesced: `MixOSBuild` is still mounted, so
 it is synced and then copied. That is what btrfs' log replay is for, and a build
 root is not a database.
 
@@ -104,12 +104,13 @@ root is not a database.
 
 ```sh
 BUILD_JOBS=8 ./build-r36-ultra.sh
-USERSPACE_ARCH=arm64 BUILD_BUNDLED_APPS=y ./build-r36-ultra.sh   # full app set
+USERSPACE_ARCH=arm64 ./build-r36-ultra.sh
 DARKOS_VM_CPUS=4 DARKOS_VM_MEMORY=8G ./build-r36-ultra.sh
 ```
 
-`BUILD_BUNDLED_APPS=y` is rejected on an armhf userspace: the emulator and
-application list is maintained for the arm64 profile only.
+`BUILD_BUNDLED_APPS` used to pick between this image and one carrying the
+emulators, the ports and their compatibility libraries.  That source is out of
+the tree, so there is one profile and the variable is ignored if it is set.
 
 ## The one artifact
 

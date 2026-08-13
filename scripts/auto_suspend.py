@@ -6,7 +6,7 @@ import subprocess
 import time
 from evdev import InputDevice, ecodes, list_devices
 
-TIMEOUT_FILE = "/home/ark/.config/.TIMEOUT"
+TIMEOUT_FILE = "/home/virtua/.config/.TIMEOUT"
 AC_STATUS_FILE = "/sys/devices/platform/rockchip-system-monitor/subsystem/devices/rk817-charger/power_supply/ac/status"
 PROCESS_CHECK = "/usr/local/bin/processcheck.sh"
 WAKE_KEYSTROKE = "sudo /usr/local/bin/keystroke.py || true"

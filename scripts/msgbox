@@ -6,7 +6,7 @@
 ##################################################################
 
 if [[ ! -e "/dev/input/by-path/platform-odroidgo2-joypad-event-joystick" ]]; then
-  if test ! -z "$(cat /home/ark/.config/.DEVICE | grep RGB20PRO | tr -d '\0')"
+  if test ! -z "$(cat /home/virtua/.config/.DEVICE | grep RGB20PRO | tr -d '\0')"
   then
     sudo setfont /usr/share/consolefonts/Lat7-TerminusBold32x16.psf.gz
   else
@@ -23,7 +23,7 @@ printf "\033c" > /dev/tty1
 if [[ -z $(pgrep -f gptokeyb) ]] && [[ -z $(pgrep -f oga_controls) ]]; then
   sudo chmod 666 /dev/uinput
   export SDL_GAMECONTROLLERCONFIG_FILE="/opt/inttools/gamecontrollerdb.txt"
-  if [[ $(cat /home/ark/.config/.DEVICE) == "MINILOONG" ]]; then
+  if [[ $(cat /home/virtua/.config/.DEVICE) == "MINILOONG" ]]; then
     export HOTKEY="guide"
   fi
   /opt/inttools/gptokeyb -1 "dialog" -c "/opt/inttools/keys.gptk" > /dev/null &
@@ -38,7 +38,7 @@ dialog --clear
 height="10"
 width="20"
 
-if test ! -z "$(grep -E 'RG503|MINILOONG' /home/ark/.config/.DEVICE | tr -d '\0')"
+if test ! -z "$(grep -E 'RG503|MINILOONG' /home/virtua/.config/.DEVICE | tr -d '\0')"
 then
   height="15"
   width="60"

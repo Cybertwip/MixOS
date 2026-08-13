@@ -54,7 +54,7 @@ def detect_joypad():
     return fallback_device, JOY_MAPPINGS["GO-Advance Gamepad"]
 
 # Detect device and keymap
-arkos_joypad, keymap = detect_joypad()
+joypad, keymap = detect_joypad()
 
 # Run a shell command
 def runcmd(cmd, *args, **kw):
@@ -71,7 +71,7 @@ async def handle_event(device):
 
 # Main run loop
 def run():
-    asyncio.ensure_future(handle_event(arkos_joypad))
+    asyncio.ensure_future(handle_event(joypad))
     loop = asyncio.get_event_loop()
     loop.run_forever()
 

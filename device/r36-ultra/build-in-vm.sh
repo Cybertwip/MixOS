@@ -29,13 +29,21 @@ BUILD_JOBS="${BUILD_JOBS:-4}"
 ENABLE_CACHE="${ENABLE_CACHE:-y}"
 CHIPSET=rk3326
 UNIT=rg351mp
-# One profile now, because BUILD_BUNDLED_APPS is gone with the source trees it
-# selected.  The string is still `gui' and not something truer only because it is
-# part of the intermediate image's filename: renaming it here would orphan the
-# build root of any run currently in flight.  It gets its real name when the
-# artifact rename lands and the whole ArkOS_R36_ prefix goes with it.
+# One profile now, because BUILD_BUNDLED_APPS is gone with the source trees it selected,
+# so this no longer selects anything.  It survives for exactly one reason: STATE_DIR
+# below is built from it, and build-r36-ultra.sh mirrors that expression with `gui' spelt
+# as a literal.  The word names the checkpoint directory every build VM already has on
+# disk, and dropping it would rename that directory -- a full debootstrap to say nothing
+# new.  It is no longer part of any filename.
 BUILD_PROFILE=gui
-FILESYSTEM="ArkOS_R36_${DEBIAN_CODE_NAME}_${USERSPACE_ARCH}_${BUILD_PROFILE}_File_System.img"
+# The BUILD ROOT: the loopback ext2 the rootfs is assembled in, not the image that ships
+# (that is DISK, below).  The profile is out of the name because there is one profile and
+# nothing left to collide with, and the ArkOS_ prefix is out of it because the project is
+# not called that.  Nothing in flight is orphaned by the rename: the STATE_KEY bump to v4
+# already discards every checkpoint that could have referred to a build root under the
+# old name.  One may still be sitting in the build directory using disk; `make clean'
+# sweeps both spellings.
+FILESYSTEM="MixOS_R36_${DEBIAN_CODE_NAME}_${USERSPACE_ARCH}_File_System.img"
 export DEBIAN_CODE_NAME USERSPACE_ARCH BUILD_ARMHF BUILD_JOBS
 export ENABLE_CACHE CHIPSET UNIT BUILD_PROFILE FILESYSTEM
 
@@ -49,7 +57,11 @@ nproc() { printf '%s\n' "$BUILD_JOBS"; }
 export -f nproc
 
 STATE_ROOT="${DARKOS_R36_STATE_DIR:-$HOME/darkos-r36-state}"
-STATE_DIR="$STATE_ROOT/${DEBIAN_CODE_NAME}-userspace-${USERSPACE_ARCH}-profile-${BUILD_PROFILE}-v3"
+# THE SAME STRING IS BUILT IN build-r36-ultra.sh (STATE_KEY), which needs it on the host
+# to find `latest-image' after this script exits.  The two are separate expressions and
+# have to be changed together -- including the -vN suffix.  See the note there for why
+# it is at v4.
+STATE_DIR="$STATE_ROOT/${DEBIAN_CODE_NAME}-userspace-${USERSPACE_ARCH}-profile-${BUILD_PROFILE}-v4"
 mkdir -p "$STATE_DIR"
 LOG="$STATE_DIR/resume.log"
 CURRENT_STAGE="$STATE_DIR/current-stage"
@@ -251,7 +263,7 @@ stash_boot_payload() {
 # write_rootfs.sh shrinks it to fit the image.  A later run whose $FILESYSTEM is
 # gone restores that copy and keeps its bootstrap/userspace checkpoints.
 #
-# The copy is crash-consistent rather than quiesced -- Arkbuild is still mounted, so it
+# The copy is crash-consistent rather than quiesced -- MixOSBuild is still mounted, so it
 # is synced and then copied.  On btrfs that was what log replay was for; on ext2 there
 # is no log, and what a torn copy needs is the e2fsck that write_rootfs.sh runs before
 # it ships the image.  A build root is not a database either way.  --sparse=always
@@ -316,7 +328,7 @@ snapshot_rootfs() {
     # btrfs has a sync of its own that flushes its log trees; ext2 has no log to flush
     # and no such command, so the plain sync above is the whole of it.
     if [[ "$ROOT_FILESYSTEM_FORMAT" == btrfs ]]; then
-        mountpoint -q Arkbuild && sudo btrfs filesystem sync Arkbuild 2>/dev/null || true
+        mountpoint -q MixOSBuild && sudo btrfs filesystem sync MixOSBuild 2>/dev/null || true
     fi
     if ! sudo cp --reflink=auto --sparse=always "$FILESYSTEM" "$target.part"; then
         log "Snapshot failed; continuing without one"
@@ -384,32 +396,32 @@ boot_stash_ready() {
 
 ensure_rootfs_mounts() {
     [[ -f "$FILESYSTEM" ]] || return 0
-    mkdir -p Arkbuild
-    if ! mountpoint -q Arkbuild; then
+    mkdir -p MixOSBuild
+    if ! mountpoint -q MixOSBuild; then
         log "Remounting the preserved $ROOT_FILESYSTEM_FORMAT build root"
-        # Fatal, and it was not before.  An unchecked failure here leaves Arkbuild as an
+        # Fatal, and it was not before.  An unchecked failure here leaves MixOSBuild as an
         # ordinary directory on the VM's own disk, and everything below -- the bind
         # mounts, debootstrap, every chroot stage -- then builds Debian into the build
         # machine while `mark partition' records the stage as done.  The image that comes
         # out has an empty OS partition, which is the shape of the bug that shipped.
         sudo mount -t "$ROOT_FILESYSTEM_FORMAT" -o "$ROOT_FILESYSTEM_MOUNT_OPTIONS",loop \
-            "$FILESYSTEM" Arkbuild || \
+            "$FILESYSTEM" MixOSBuild || \
             fail "Could not mount $FILESYSTEM as $ROOT_FILESYSTEM_FORMAT -- if this build root predates the ext2 layout, delete it and $ROOTFS_SNAPSHOT and run again"
     fi
-    sudo mkdir -p Arkbuild/{dev/pts,proc,sys}
-    mountpoint -q Arkbuild/dev || sudo mount --bind /dev Arkbuild/dev
-    mountpoint -q Arkbuild/dev/pts || \
-        sudo mount -t devpts none Arkbuild/dev/pts -o newinstance,ptmxmode=0666
-    mountpoint -q Arkbuild/proc || sudo mount --bind /proc Arkbuild/proc
-    mountpoint -q Arkbuild/sys || sudo mount --bind /sys Arkbuild/sys
+    sudo mkdir -p MixOSBuild/{dev/pts,proc,sys}
+    mountpoint -q MixOSBuild/dev || sudo mount --bind /dev MixOSBuild/dev
+    mountpoint -q MixOSBuild/dev/pts || \
+        sudo mount -t devpts none MixOSBuild/dev/pts -o newinstance,ptmxmode=0666
+    mountpoint -q MixOSBuild/proc || sudo mount --bind /proc MixOSBuild/proc
+    mountpoint -q MixOSBuild/sys || sudo mount --bind /sys MixOSBuild/sys
     printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | \
-        sudo tee Arkbuild/etc/resolv.conf >/dev/null
+        sudo tee MixOSBuild/etc/resolv.conf >/dev/null
 }
 
 ensure_ccache_mount() {
-    sudo mkdir -p Arkbuild/home/ark/Arkbuild_ccache
-    if ! mountpoint -q Arkbuild/home/ark/Arkbuild_ccache; then
-        sudo mount --bind "$ROOT/Arkbuild_ccache" Arkbuild/home/ark/Arkbuild_ccache
+    sudo mkdir -p MixOSBuild/home/virtua/MixOSBuild_ccache
+    if ! mountpoint -q MixOSBuild/home/virtua/MixOSBuild_ccache; then
+        sudo mount --bind "$ROOT/MixOSBuild_ccache" MixOSBuild/home/virtua/MixOSBuild_ccache
     fi
 }
 
@@ -454,19 +466,19 @@ clear_stale_boot_mount() {
 
 clear_foreign_rootfs_mount() {
     local mounted_source
-    mountpoint -q Arkbuild || return 0
-    mounted_source="$(findmnt -n -o SOURCE Arkbuild || true)"
+    mountpoint -q MixOSBuild || return 0
+    mounted_source="$(findmnt -n -o SOURCE MixOSBuild || true)"
     if ! sudo losetup -j "$ROOT/$FILESYSTEM" 2>/dev/null | \
         cut -d: -f1 | grep -Fxq "$mounted_source"; then
         log "Unmounting root filesystem left by a different R36 build profile"
-        remove_arkbuild
+        remove_mixosbuild
     fi
 }
 
 clear_legacy_multiarch_root() {
-    if [[ -d Arkbuild32 ]]; then
+    if [[ -d MixOSBuild32 ]]; then
         log "Removing legacy secondary armhf build root; this profile is single-architecture"
-        remove_arkbuild32
+        remove_mixosbuild32
     fi
 }
 
@@ -507,11 +519,11 @@ verify_boot_kernel_arch() {
 
 verify_native_userspace() {
     local actual foreign
-    actual="$(sudo chroot Arkbuild dpkg --print-architecture)" || \
+    actual="$(sudo chroot MixOSBuild dpkg --print-architecture)" || \
         fail "Could not query the Debian userspace architecture"
     [[ "$actual" == "$USERSPACE_ARCH" ]] || \
         fail "Expected ${USERSPACE_ARCH} userspace, found ${actual}"
-    foreign="$(sudo chroot Arkbuild dpkg --print-foreign-architectures)" || \
+    foreign="$(sudo chroot MixOSBuild dpkg --print-foreign-architectures)" || \
         fail "Could not query foreign Debian architectures"
     [[ -z "$foreign" ]] || \
         fail "Single-architecture build unexpectedly contains foreign architectures: ${foreign}"
@@ -519,7 +531,7 @@ verify_native_userspace() {
 }
 
 # verify_gui_architecture IS GONE, and nothing replaced it.  It read the ELF header
-# of Arkbuild/usr/bin/emulationstation/emulationstation and asserted ELF32/ARM or
+# of MixOSBuild/usr/bin/emulationstation/emulationstation and asserted ELF32/ARM or
 # ELF64/AArch64 to catch a GUI built for the wrong architecture -- a real risk when
 # one build script cross-compiled and the next did not.  There is no GUI in this
 # image any more: mixdash is built by the J36 layer, from its own toolchain, and
@@ -614,7 +626,7 @@ image_layout_is_foreign() {
 #
 #   * ensure_rootfs_mounts mounts it with -t $ROOT_FILESYSTEM_FORMAT, so the mount
 #     fails outright while `mark partition' just above records the stage as done.  The
-#     build then walks into an unmounted Arkbuild and packages an image with no
+#     build then walks into an unmounted MixOSBuild and packages an image with no
 #     userspace in it.
 #   * write_rootfs.sh dds this very file into the image, so the image's p2 keeps the
 #     old format no matter what these variables say.
@@ -676,7 +688,7 @@ discard_foreign_layout() {
         if (( snapshot_ok )); then
             log "The image predates this layout but the build root does not"
             log "Reverting to the pre-finalization snapshot rather than unpacking Debian again"
-            mountpoint -q Arkbuild && remove_arkbuild
+            mountpoint -q MixOSBuild && remove_mixosbuild
             sudo rm -f "$FILESYSTEM" "$FILESYSTEM.part"
         else
             log "The image predates this layout and there is no pre-finalization snapshot"
@@ -688,8 +700,8 @@ discard_foreign_layout() {
     if (( rootfs_foreign )); then
         log "Discarding the old build root; Debian will be unpacked again, which is the"
         log "only way the image's OS partition changes format"
-        mountpoint -q Arkbuild && remove_arkbuild
-        # remove_arkbuild unmounts lazily, so a loop device can still be holding the
+        mountpoint -q MixOSBuild && remove_mixosbuild
+        # remove_mixosbuild unmounts lazily, so a loop device can still be holding the
         # image after the umount returns.  Detach it before the file goes: otherwise
         # losetup keeps the unlinked inode alive and clear_foreign_rootfs_mount below
         # compares the new build root against a loop that points at a deleted one.
@@ -738,7 +750,7 @@ if [[ -f "$FILESYSTEM" ]]; then
     ensure_rootfs_mounts
     mark partition
 fi
-if [[ -f Arkbuild/etc/debian_version && -d Arkbuild/home/ark ]]; then
+if [[ -f MixOSBuild/etc/debian_version && -d MixOSBuild/home/virtua ]]; then
     mark bootstrap
 fi
 if [[ -s "$DISK" && $(stat -c %s "$DISK") -ge $((DISK_SIZE * 1024 * 1024)) ]]; then
@@ -863,8 +875,8 @@ if ! marked userspace; then
     if marked component-build_deps; then
         ensure_ccache_mount
     fi
-    if ! marked component-build_deps && mountpoint -q Arkbuild/home/ark/Arkbuild_ccache; then
-        sudo umount -l Arkbuild/home/ark/Arkbuild_ccache || true
+    if ! marked component-build_deps && mountpoint -q MixOSBuild/home/virtua/MixOSBuild_ccache; then
+        sudo umount -l MixOSBuild/home/virtua/MixOSBuild_ccache || true
     fi
     userspace_scripts=(
         build_deps.sh
@@ -896,7 +908,7 @@ else
         extension="$(cat "$STATE_DIR/sdl2-extension")"
     else
         extension="$(grep -oP '(?<=extension=").*?(?=")' \
-            Arkbuild/home/ark/${CHIPSET}_core_builds/scripts/sdl2.sh 2>/dev/null || true)"
+            MixOSBuild/home/virtua/${CHIPSET}_core_builds/scripts/sdl2.sh 2>/dev/null || true)"
     fi
 fi
 # Again, and not by oversight: it ran once after the bootstrap, and build_deps.sh
@@ -971,9 +983,9 @@ if ! marked finalization; then
             # produced -- and take it away again below, before the rootfs is
             # written into the image.
             printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | \
-                sudo tee Arkbuild/etc/resolv.conf >/dev/null
+                sudo tee MixOSBuild/etc/resolv.conf >/dev/null
         elif [[ "$script" == finishing_touches.sh ]]; then
-            sudo rm -f Arkbuild/etc/resolv.conf
+            sudo rm -f MixOSBuild/etc/resolv.conf
         fi
     done
     mark finalization

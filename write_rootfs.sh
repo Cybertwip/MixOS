@@ -1,25 +1,25 @@
 #!/bin/bash
 
 # Write rootfs to disk
-sync Arkbuild
+sync MixOSBuild
 if [ "${ROOT_FILESYSTEM_FORMAT}" == "xfs" ]; then
-  mkdir Arkbuild-final
-  sudo mount -o loop ${LOOP_DEV}p4 Arkbuild-final/
-  sudo rsync -av --exclude={'home/ark/Arkbuild_ccache','proc','dev','sys'} Arkbuild/ Arkbuild-final/
-  sudo umount Arkbuild-final/
-  sudo rm -rf Arkbuild-final/
+  mkdir MixOSBuild-final
+  sudo mount -o loop ${LOOP_DEV}p4 MixOSBuild-final/
+  sudo rsync -av --exclude={'home/virtua/MixOSBuild_ccache','proc','dev','sys'} MixOSBuild/ MixOSBuild-final/
+  sudo umount MixOSBuild-final/
+  sudo rm -rf MixOSBuild-final/
 elif [[ "${ROOT_FILESYSTEM_FORMAT}" == *"ext"* ]]; then
   # e2fsck and resize2fs both need the filesystem OFF-LINE, and nothing before this
   # point unmounts it -- clean_mounts.sh, which does, runs after this script.  Handing
   # a mounted image to e2fsck is not caught for us either: ext2fs_check_if_mounted()
   # looks its argument up in /proc/mounts, and what is listed there is the autoloop
   # device, not this file, so e2fsck would cheerfully "repair" a live filesystem
-  # underneath the mount.  Unmount first.  remove_arkbuild guards every umount on
+  # underneath the mount.  Unmount first.  remove_mixosbuild guards every umount on
   # /proc/mounts, so clean_mounts.sh calling it again a few lines later is a no-op.
   echo -e "Unmounting the build root before checking and shrinking it"
-  remove_arkbuild
+  remove_mixosbuild
   if [[ "${BUILD_ARMHF}" == "y" ]]; then
-    remove_arkbuild32
+    remove_mixosbuild32
   fi
   # umount -l only promises to detach the tree from the namespace; the filesystem can
   # still be in flight behind it, and the autoloop device stays until the last
@@ -27,12 +27,12 @@ elif [[ "${ROOT_FILESYSTEM_FORMAT}" == *"ext"* ]]; then
   # image -- e2fsck reads the file, and a loop device with dirty pages would have it
   # reading a version of the filesystem that is not the one on disk.
   for _ in $(seq 1 30); do
-    mountpoint -q Arkbuild || break
+    mountpoint -q MixOSBuild || break
     sync
     sleep 1
   done
-  if mountpoint -q Arkbuild; then
-    printf "\n\nArkbuild is still mounted; refusing to fsck a live filesystem.  Exiting...\n\n"
+  if mountpoint -q MixOSBuild; then
+    printf "\n\nMixOSBuild is still mounted; refusing to fsck a live filesystem.  Exiting...\n\n"
     exit 1
   fi
   for stubborn_loop in $(sudo losetup -j "${FILESYSTEM}" -O NAME --noheadings 2>/dev/null); do
@@ -166,21 +166,21 @@ elif [[ "${ROOT_FILESYSTEM_FORMAT}" == *"ext"* ]]; then
   echo -e "OS partition written: ${STORAGE_SIZE} MB of filesystem holding ${fs_mib} MB, so $(( STORAGE_SIZE - fs_mib )) MB free on the card"
   sync
 elif [ "${ROOT_FILESYSTEM_FORMAT}" == "btrfs" ]; then
-  sudo btrfs balance start --full-balance Arkbuild
-  sudo sync Arkbuild
+  sudo btrfs balance start --full-balance MixOSBuild
+  sudo sync MixOSBuild
   sizes=(8000 7700 7300 7250 7100)
   i=0
   count=0
   while [[ $i -lt ${#sizes[@]} ]]; do
     size=${sizes[$i]}
-    sudo btrfs filesystem resize "${size}M" Arkbuild/
+    sudo btrfs filesystem resize "${size}M" MixOSBuild/
     if [ $? -eq 0 ]; then
       tsize=$((size + 350))
       ((i++)) || true
     else
       if [[ -z $tsize ]] && [[ $count -le 4 ]]; then
-        sudo btrfs balance start --full-balance Arkbuild
-        sudo sync Arkbuild
+        sudo btrfs balance start --full-balance MixOSBuild
+        sudo sync MixOSBuild
         ((count++)) || true
         i=0
       else
@@ -189,14 +189,14 @@ elif [ "${ROOT_FILESYSTEM_FORMAT}" == "btrfs" ]; then
     fi
   done
   #verify_action
-  sync Arkbuild
+  sync MixOSBuild
   if [[ ! -z $tsize ]]; then
     sudo truncate -s ${tsize}MB ${FILESYSTEM}
   else
-    printf "\n\nFailed to resize Arkbuild.  Exiting...\n\n"
+    printf "\n\nFailed to resize MixOSBuild.  Exiting...\n\n"
     exit 1
   fi
-  sync Arkbuild
+  sync MixOSBuild
   # Same as the ext branch above: a byte seek so the block size can be a block size.
   sudo dd if="${FILESYSTEM}" of="${DISK}" bs=8M iflag=fullblock \
       oflag=seek_bytes seek=$(( STORAGE_PART_START * 512 )) conv=fsync,notrunc

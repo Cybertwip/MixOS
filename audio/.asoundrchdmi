@@ -1,8 +1,0 @@
-pcm.!default {
-    type plug
-    slave.pcm "plughw:CARD=rockchiphdmi,DEV=0"
-}
-ctl.!default {
-    type hw
-    card rockchiphdmi
-}

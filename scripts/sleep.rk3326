@@ -16,7 +16,7 @@ case $1 in
 	# if this is a OGA BE unit, remove the wifi driver and restore on wake
 	if [ "$esp" = "esp8089" ]; then
 		rmmod esp8089
-		touch /home/ark/.config/esp8089exists
+		touch /home/virtua/.config/esp8089exists
 	fi
 	;;
    post)
@@ -28,9 +28,9 @@ case $1 in
 	# sudo systemctl restart ogage
 	systemctl is-active --quiet killer_daemon && sudo systemctl restart killer_daemon
 	systemctl is-active --quiet batt_led.service && sudo systemctl restart batt_led
-	if [ -f "/home/ark/.config/esp8089exists" ]; then
+	if [ -f "/home/virtua/.config/esp8089exists" ]; then
 		modprobe -i esp8089
-		rm /home/ark/.config/esp8089exists
+		rm /home/virtua/.config/esp8089exists
 	fi
 	;;
 esac

@@ -1,16 +1,16 @@
 #!/bin/bash
 
-function remove_ark_devenv() {
+function remove_mixos_devenv() {
   for m in proc dev/pts dev dev sys
   do
-    if grep -qs "Ark_devenv${bit}/${m} " /proc/mounts; then
-      sudo umount -l Ark_devenv${bit}/${m}
+    if grep -qs "MixOS_devenv${bit}/${m} " /proc/mounts; then
+      sudo umount -l MixOS_devenv${bit}/${m}
       verify_action
       sync
       sleep 1
     fi
   done
-  (cat /proc/mounts | grep -qs "Ark_devenv${bit}") && sudo umount -l Ark_devenv${bit}
+  (cat /proc/mounts | grep -qs "MixOS_devenv${bit}") && sudo umount -l MixOS_devenv${bit}
   return 0
 }
 
@@ -20,4 +20,4 @@ else
   bit=""
 fi
 
-remove_ark_devenv
+remove_mixos_devenv

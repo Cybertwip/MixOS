@@ -88,29 +88,40 @@ make r36-ultra
 The default is four parallel build jobs and an armhf-only userspace:
 
 ```bash
-BUILD_JOBS=4 USERSPACE_ARCH=armhf BUILD_BUNDLED_APPS=n ./build-r36-ultra.sh
+BUILD_JOBS=4 USERSPACE_ARCH=armhf ./build-r36-ultra.sh
 ```
 
 - Change `BUILD_JOBS` to control internal Make/CMake/Meson parallelism.
 - Set `USERSPACE_ARCH=arm64` to build a single-architecture arm64 userspace
   instead.  The R36 helper never produces an arm64+armhf multiarch rootfs.
-- The complete emulator/application bundle is retained only for the arm64
-  profile (`USERSPACE_ARCH=arm64 BUILD_BUNDLED_APPS=y`).
 
 **Notes**
 - To build on a different release of Debian, change the DEBIAN_CODE_NAME export in the Makefile or add DEBIAN_CODE_NAME=<release> as a variable to `make`.  Other debian code names can be found at https://www.debian.org/releases/
-- Standard device targets (other than `r36-ultra` and `j36-ultra`) build with both a 64bit and 32bit userspace by default.  This is primarily to support some 32bit ports available through PortMaster.  There are also some 32bit retroarch emulators available but the performance seems to be similar to the 64bit retroarch emulators at this point.
- - To build without 32bit support, change the BUILD_ARMHF export in the Makefile to n or add BUILD_ARMHF=n as a variable to `make`.
-- For RK3566, you can add Kodi to your build.  Just change the BUILD_KODI export in the Makefile to y or add BUILD_KODI=y as a variavble to `make`.  Kodi is also available as a prepackaged build in the extra_packages/rk3566 subfolder.  Just copy it to your tools folder and launch from Options/Tools in the start menu.
- - Be aware that building Kodi will add a significant amount of time to your build.  Could be double or triple the build time.
+- `r36-ultra` and `j36-ultra` are the only build targets.  The twelve other boards
+  each had their own `build_<unit>.sh`; none of those scripts is in the tree, and the
+  targets that called them are gone too.  `USERSPACE_ARCH` is what picks the
+  architecture on both of the remaining targets, and it defaults to armhf; the older
+  `BUILD_ARMHF=y` arm64+armhf multiarch path is still in the bootstrap scripts but
+  nothing that survives reaches it, because setting `USERSPACE_ARCH` at all takes
+  precedence.  The 32bit userspace used to exist for PortMaster's prebuilt ports and
+  the 32bit emulator builds; here it is simply the native architecture of the J36's
+  Cortex-A7.
 - Initial build time on an Intel I7-8700 65w unit with a 512GB NVME SSD and 32GB of DDR4 memory is a little over 19 hours.  Subsequent builds are about 3 hours thanks to ccache.
-- Some directories, environment variables and shell functions still spell the old
-  name: the `dArkOS-artifacts/` output directory, the `DARKOS_*` build variables,
-  the `darkos_*` shell helpers, the `darkos-r36` build VM and its
-  `~/darkos-r36-state` checkpoints, and `dArkOS_Tools/` in the rootfs.  Those are
-  paths and interfaces rather than branding, and renaming them would orphan
-  existing build state, cached checkpoints and cards already in the field, so they
-  are deliberately left as they are.
+- Builds land in `MixOS-Artifacts/`, a sibling of the checkout.  It used to be
+  `dArkOS-artifacts/` — named after whatever the working copy happened to be
+  called rather than after the project — and the first build after the rename
+  *moves* the old directory across instead of starting an empty one beside it,
+  because `Reference/BOOT` lives in there and no part of this pipeline can
+  rebuild it.  Set `MIXOS_ARTIFACT_DIR` to put the output somewhere else;
+  `DARKOS_ARTIFACT_DIR` is still honoured for anyone who has it in a shell
+  profile.
+- Some environment variables and shell functions still spell the old name: the
+  rest of the `DARKOS_*` build variables, the `darkos_*` shell helpers, and the
+  `darkos-r36` build VM with its `~/darkos-r36-state` checkpoints.  Those are
+  interfaces rather than branding, and renaming them would orphan existing build
+  state and cached checkpoints, so they are deliberately left as they are.  The
+  tools that ship on the card come from `MixOS_Tools/` in this checkout and land
+  in `/opt/system` on the image.
 
 # Licence
 

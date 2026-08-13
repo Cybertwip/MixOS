@@ -40,10 +40,18 @@ if [[ "${ENABLE_CACHE}" == "y" ]]; then
 fi
 
 
-# Create ccache if it does not exist already
-if [ ! -d "Arkbuild_ccache" ]; then
-  mkdir Arkbuild_ccache
+# Create ccache if it does not exist already.  The same one-time migration as the
+# package cache in utils.sh: a VM that last built before the Arkbuild -> MixOSBuild
+# rename has every object it has ever compiled under the old name, and an empty ccache
+# is a full rebuild rather than an error.  Drop this once no build VM predates it.
+if [ ! -d "MixOSBuild_ccache" ]; then
+  if [ -d "Arkbuild_ccache" ]; then
+    echo -e "Moving Arkbuild_ccache to MixOSBuild_ccache\n"
+    mv Arkbuild_ccache MixOSBuild_ccache
+  else
+    mkdir MixOSBuild_ccache
+  fi
 fi
-export CCACHE_DIR=${PWD}/Arkbuild_ccache
+export CCACHE_DIR=${PWD}/MixOSBuild_ccache
 sudo /usr/sbin/update-ccache-symlinks
 [ -z $(echo $PATH | grep ccache) ] && export PATH=/usr/lib/ccache:$PATH

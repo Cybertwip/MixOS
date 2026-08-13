@@ -4,8 +4,8 @@ After=firstboot.service
 
 [Service]
 Type=oneshot
-User=ark
-WorkingDirectory=/home/ark
+User=virtua
+WorkingDirectory=/home/virtua
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/spktoggle.sh
 

@@ -32,11 +32,11 @@ dialog --clear
 height="15"
 width="55"
 
-if test ! -z "$(grep -E 'RG503|MINILOONG' /home/ark/.config/.DEVICE | tr -d '\0')"
+if test ! -z "$(grep -E 'RG503|MINILOONG' /home/virtua/.config/.DEVICE | tr -d '\0')"
 then
   height="20"
   width="60"
-elif test ! -z "$(cat /home/ark/.config/.DEVICE | grep RGB20PRO | tr -d '\0')"
+elif test ! -z "$(cat /home/virtua/.config/.DEVICE | grep RGB20PRO | tr -d '\0')"
 then
   height="20"
   width="70"
@@ -46,13 +46,13 @@ export TERM=linux
 export XDG_RUNTIME_DIR=/run/user/$UID/
 
 if [[ ! -e "/dev/input/by-path/platform-odroidgo2-joypad-event-joystick" ]]; then
-  if test ! -z "$(cat /home/ark/.config/.DEVICE | grep RG503 | tr -d '\0')"
+  if test ! -z "$(cat /home/virtua/.config/.DEVICE | grep RG503 | tr -d '\0')"
   then
     sudo setfont /usr/share/consolefonts/Lat7-TerminusBold20x10.psf.gz
-  elif test ! -z "$(cat /home/ark/.config/.DEVICE | grep RGB20PRO | tr -d '\0')"
+  elif test ! -z "$(cat /home/virtua/.config/.DEVICE | grep RGB20PRO | tr -d '\0')"
   then
     sudo setfont /usr/share/consolefonts/Lat7-TerminusBold32x16.psf.gz
-  elif test ! -z "$(cat /home/ark/.config/.DEVICE | grep MINILOONG | tr -d '\0')"
+  elif test ! -z "$(cat /home/virtua/.config/.DEVICE | grep MINILOONG | tr -d '\0')"
   then
     sudo setfont /usr/share/consolefonts/Lat7-TerminusBold28x14.psf.gz
   else
@@ -74,7 +74,7 @@ export SDL_GAMECONTROLLERCONFIG_FILE="/opt/inttools/gamecontrollerdb.txt"
 if [[ ! -z $(pgrep -f gptokeyb) ]]; then
   pgrep -f gptokeyb | sudo xargs kill -9
 fi
-if [[ $(cat /home/ark/.config/.DEVICE) == "MINILOONG" ]]; then
+if [[ $(cat /home/virtua/.config/.DEVICE) == "MINILOONG" ]]; then
   export HOTKEY="guide"
 fi
 /opt/inttools/gptokeyb -1 "Bluetooth.sh" -c "/opt/inttools/keys.gptk" > /dev/null 2>&1 &
@@ -393,7 +393,7 @@ MainMenu() {
   fi
 
   HOTKEY="Select"
-  if [[ ! -z $(grep -q MINILOONG /home/ark/.config/.DEVICE) ]]; then
+  if [[ ! -z $(grep -q MINILOONG /home/virtua/.config/.DEVICE) ]]; then
     HOTKEY="Menu"
   fi
   mainoptions=( 1 "Turn Bluetooth $BT_Stat" 2 "Connect to new Bluetooth device" 3 "Activate existing Bluetooth device" 4 "Deactivate existing Bluetooth device" 5 "Delete exiting Bluetooth device" 6 "Currently paired Bluetooth devices" 7 "Exit" )

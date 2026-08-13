@@ -23,10 +23,10 @@ elif [[ -e "/dev/input/by-path/platform-odroidgo2-joypad-event-joystick" ]] \
   event_num="2"
 elif [[ -e "/dev/input/by-path/platform-singleadc-joypad-event-joystick" ]]; then
   event_num=`ls -l /dev/input/by-path/platform-singleadc-joypad-event-joystick | awk '{print $11}' | cut -b 9`
-  if [[ -e "/home/ark/.config/.DEVICE" ]]; then
-    if [ "$(cat /home/ark/.config/.DEVICE)" == "RG503" ] \
-       || [ "$(cat /home/ark/.config/.DEVICE)" == "RGB30" ] \
-       || [ "$(cat /home/ark/.config/.DEVICE)" == "RK2023" ]; then
+  if [[ -e "/home/virtua/.config/.DEVICE" ]]; then
+    if [ "$(cat /home/virtua/.config/.DEVICE)" == "RG503" ] \
+       || [ "$(cat /home/virtua/.config/.DEVICE)" == "RGB30" ] \
+       || [ "$(cat /home/virtua/.config/.DEVICE)" == "RK2023" ]; then
       event_btn_hk="BTN_THUMBR"
     fi
   fi

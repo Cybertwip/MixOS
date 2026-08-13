@@ -49,7 +49,7 @@ DATA_FILESYSTEM_FORMAT_PARAMETERS="-F -b 1024 -L ${DATA_LABEL}"
 # No umask/uid/gid: those are vfat and exfat options, and mount REFUSES them on ext2
 # -- an fstab line carrying them is a partition that does not come up at all.  ext2
 # stores real ownership instead, so the build chowns the tree to uid/gid 1000 once and
-# the ark user can write to it from then on.
+# the virtua user can write to it from then on.
 #
 # nofail, which the old /roms line did not have: this partition is now the user's home
 # and not a rom library, and a card whose p3 is missing, unformatted or half-written
@@ -64,11 +64,12 @@ DATA_MOUNT_OPTIONS="defaults,auto,noatime,nofail"
 # say so.  Under /home rather than a top-level /virtua because it is a home directory
 # and nothing else, and $HOME under /home is what every tool on the card assumes.
 #
-# The account is still named ark, uid 1000: the name appears in ~800 lines of the
-# emulator build scripts, in the sudoers drop-ins and in six group memberships, and
-# renaming it buys nothing the home directory move does not already give.  /home/ark
-# is a symlink to here, so those lines keep resolving.
-DATA_MOUNT_POINT="/home/virtua"
+# The account is named `virtua', uid 1000, after the directory rather than the other way
+# round.  It used to be `ark' with /home/ark a symlink to here, which meant one directory
+# answered to two names in every script that touched it; the scripts now say the one
+# name and the link is gone.  A card written before that still has `ark', which is why
+# the J36's USB mount helper looks the login user up instead of assuming it.
+DATA_MOUNT_POINT="${DATA_MOUNT_POINT:-/home/virtua}"
 
 SYSTEM_SIZE=100      # FAT32 boot partition size in MB
 # The OS partition, and the number that decides how big the shipped image is.
@@ -102,10 +103,10 @@ DISK_START_PADDING=$(( (SYSTEM_PART_START + 2048 - 1) / 2048 ))
 DISK_SIZE=$(( DISK_START_PADDING + SYSTEM_SIZE + STORAGE_SIZE + ROM_PART_SIZE + 1 ))
 # Device-specific builders may supply a profile-specific filesystem name so a
 # minimal image cannot accidentally reuse a full application build.
-FILESYSTEM="${FILESYSTEM:-ArkOS_File_System.img}"
+FILESYSTEM="${FILESYSTEM:-MixOS_File_System.img}"
 
 # Create filesystem image
 dd if=/dev/zero of="${FILESYSTEM}" bs=1M count=0 seek="${BUILD_SIZE}" conv=fsync
 sudo mkfs.${ROOT_FILESYSTEM_FORMAT} ${ROOT_FILESYSTEM_FORMAT_PARAMETERS} "${FILESYSTEM}"
-mkdir -p Arkbuild/
-sudo mount -t ${ROOT_FILESYSTEM_FORMAT} -o ${ROOT_FILESYSTEM_MOUNT_OPTIONS},loop ${FILESYSTEM} Arkbuild/
+mkdir -p MixOSBuild/
+sudo mount -t ${ROOT_FILESYSTEM_FORMAT} -o ${ROOT_FILESYSTEM_MOUNT_OPTIONS},loop ${FILESYSTEM} MixOSBuild/

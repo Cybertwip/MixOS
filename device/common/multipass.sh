@@ -53,6 +53,36 @@ darkos_image_name() {
     printf 'MixOS_%s_%s_%s.img\n' "$arch" "$codename" "$commit"
 }
 
+# darkos_artifact_dir ROOT
+#
+# The host directory the finished images land in: MixOS-Artifacts, a sibling of the
+# checkout.
+#
+# It used to be "${ROOT}-artifacts", so a checkout directory called dArkOS produced
+# dArkOS-artifacts -- the output was named after whatever the working copy happened to
+# be called rather than after the project, and a second clone under another name grew a
+# second artifact tree beside it.  The name is a literal now.
+#
+# THE OLD DIRECTORY IS MOVED ACROSS, not left behind, and that is why this is a function
+# and not just a changed default.  DARKOS_R36_BOOT_PAYLOAD points inside it, at
+# Reference/BOOT: the R36S device tree, the u-boot panel variants, the dtb selector and
+# the off-charging bitmaps -- a payload this pipeline has never produced and does not
+# download.  A rename that orphaned it would still build, and the images would simply
+# not boot; the only sign would be one warning in a very long log.  Moving is free on
+# one filesystem and keeps every image already built alongside it.
+#
+# Drop the migration once no workstation has a *-artifacts directory left.
+darkos_artifact_dir() {
+    local root=$1 current legacy
+    current="$(dirname -- "$root")/MixOS-Artifacts"
+    legacy="${root}-artifacts"
+    if [[ ! -d "$current" && -d "$legacy" ]]; then
+        darkos_log "Moving ${legacy} to ${current}"
+        mv -- "$legacy" "$current"
+    fi
+    printf '%s\n' "$current"
+}
+
 # darkos_report_stale_images DIR KEEP_NAME
 #
 # One image per commit means the artifact directory grows by another 8 GB every time a
@@ -136,6 +166,15 @@ darkos_vm_remount() {
         vm="${pair#*:}"
         multipass umount "$name:$vm" >/dev/null 2>&1 || true
     done
+    # And the paths this project mounted before a rename.  Multipass remembers a mount
+    # for the life of the instance, so one whose host directory has moved fails at every
+    # VM start and leaves behind an empty directory in the VM that looks exactly like the
+    # real one -- a build that wrote its images there would report success and hand over
+    # nothing.  Unmounting what is not mounted is a no-op, so this costs one failed
+    # command per refresh.  Drop it once no build VM predates the rename.
+    for vm in /mnt/darkos-artifacts; do
+        multipass umount "$name:$vm" >/dev/null 2>&1 || true
+    done
     for pair in "$@"; do
         host="${pair%%:*}"
         vm="${pair#*:}"
@@ -147,6 +186,15 @@ darkos_vm_remount() {
 # host: they are either enormous, machine-generated inside the VM, or both.
 DARKOS_SYNC_EXCLUDES=(
     '.git/'
+    'MixOSBuild/'
+    'MixOSBuild32/'
+    'MixOSBuild_ccache/'
+    'MixOSBuild_package_cache/'
+    # The names these four had before the rename.  They are listed because this rsync
+    # is --delete and the host has no such directories: an existing VM's ccache and
+    # package cache would be deleted on the first sync after the rename, which costs a
+    # re-debootstrap and a full rebuild.  The build migrates them across on its next
+    # run (utils.sh, prepare.sh); these entries are what keep them alive until it does.
     'Arkbuild/'
     'Arkbuild32/'
     'Arkbuild_ccache/'

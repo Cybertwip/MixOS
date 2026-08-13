@@ -7,7 +7,7 @@ StartLimitIntervalSec=0
 Type=simple
 Restart=always
 RestartSec=1
-EnvironmentFile=/home/ark/.config/KILLIT
+EnvironmentFile=/home/virtua/.config/KILLIT
 ExecStart=/usr/local/bin/killer_daemon.py ${VAR}
 
 [Install]

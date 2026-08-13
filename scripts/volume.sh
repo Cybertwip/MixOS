@@ -1,6 +1,6 @@
 #!/bin/bash
 
-if [ -e "/home/ark/.config/.SWAPVOLUMEBUTTONS" ] && [[ "${1}" != *"%"* ]]; then
+if [ -e "/home/virtua/.config/.SWAPVOLUMEBUTTONS" ] && [[ "${1}" != *"%"* ]]; then
   if [[ "${1}" == *"+"* ]]; then
     value="$(sed '/+/s//-/' <<< $1)"
   else
@@ -10,7 +10,7 @@ else
   value="${1}"
 fi
 
-if test ! -z "$(cat /home/ark/.asoundrc | grep softvol)"
+if test ! -z "$(cat /home/virtua/.asoundrc | grep softvol)"
 then
   amixer -q sset Master ${value}
 else

@@ -70,9 +70,12 @@ FilesPage::FilesPage(QWidget *parent)
      * reach it.  It is also the only directory here whose contents the operator put
      * there, which makes it the useful place to open on.  The home directories are
      * the fallback for a boot without that mount, and / for a rootfs with neither.
+     * /home/virtua is the login user's home and the DATA partition's mount point;
+     * /home/ark is what a card written before the rename calls the same directory.
      */
     Trace::step("FilesPage: choosing a base directory");
     m_base = QFileInfo::exists("/run/j36/card") ? QString("/run/j36/card")
+           : QFileInfo::exists("/home/virtua")  ? QString("/home/virtua")
            : QFileInfo::exists("/home/ark")     ? QString("/home/ark")
            : QFileInfo::exists("/root")         ? QString("/root")
                                                 : QString("/");

@@ -11,7 +11,7 @@ then
       sudo systemctl stop bluealsa
       sudo systemctl disable bluealsa
       sudo systemctl restart ogage
-      cp -f /home/ark/.asoundrcbak /home/ark/.asoundrc
+      cp -f /home/virtua/.asoundrcbak /home/virtua/.asoundrc
 else
       sudo systemctl start bluetooth
       sudo systemctl enable bluetooth

@@ -24,23 +24,23 @@ if [ -f "${DEV_LOG}" ]; then
 fi
 (
 # Setup some functions
-function setup_ark_user() {
-  sudo chroot ${CHROOT_DIR}/ useradd ark -k /etc/skel -d /home/ark -m -s /bin/bash
-  sudo chroot ${CHROOT_DIR}/ bash -c "echo ark:ark | chpasswd"
-  sudo chroot ${CHROOT_DIR}/ chage -I -1 -m 0 -M 99999 -E -1 ark
+function setup_virtua_user() {
+  sudo chroot ${CHROOT_DIR}/ useradd virtua -k /etc/skel -d /home/virtua -m -s /bin/bash
+  sudo chroot ${CHROOT_DIR}/ bash -c "echo virtua:virtua | chpasswd"
+  sudo chroot ${CHROOT_DIR}/ chage -I -1 -m 0 -M 99999 -E -1 virtua
   sudo mkdir -p ${CHROOT_DIR}/etc/sudoers.d
-  echo "ark     ALL= NOPASSWD: ALL" | sudo tee ${CHROOT_DIR}/etc/sudoers.d/ark-no-sudo-password
-  echo "Defaults        !secure_path" | sudo tee ${CHROOT_DIR}/etc/sudoers.d/ark-no-secure-path
-  sudo chmod 0440 ${CHROOT_DIR}/etc/sudoers.d/ark-no-sudo-password
-  sudo chmod 0440 ${CHROOT_DIR}/etc/sudoers.d/ark-no-secure-path
-  sudo chroot ${CHROOT_DIR}/ usermod -G video,sudo,netdev,input,audio,adm,ark ark
+  echo "virtua     ALL= NOPASSWD: ALL" | sudo tee ${CHROOT_DIR}/etc/sudoers.d/virtua-no-sudo-password
+  echo "Defaults        !secure_path" | sudo tee ${CHROOT_DIR}/etc/sudoers.d/virtua-no-secure-path
+  sudo chmod 0440 ${CHROOT_DIR}/etc/sudoers.d/virtua-no-sudo-password
+  sudo chmod 0440 ${CHROOT_DIR}/etc/sudoers.d/virtua-no-secure-path
+  sudo chroot ${CHROOT_DIR}/ usermod -G video,sudo,netdev,input,audio,adm,virtua virtua
   directories=(".config")
   for dir in "${directories[@]}"; do
-    sudo mkdir -p "${CHROOT_DIR}/home/ark/${dir}"
+    sudo mkdir -p "${CHROOT_DIR}/home/virtua/${dir}"
   done
-  echo -e "export LC_All=en_US.UTF-8" | sudo tee -a ${CHROOT_DIR}/home/ark/.bashrc > /dev/null
-  echo -e "export LC_CTYPE=en_US.UTF-8" | sudo tee -a ${CHROOT_DIR}/home/ark/.bashrc > /dev/null
-  sudo chroot ${CHROOT_DIR}/ chown -R ark:ark /home/ark/
+  echo -e "export LC_All=en_US.UTF-8" | sudo tee -a ${CHROOT_DIR}/home/virtua/.bashrc > /dev/null
+  echo -e "export LC_CTYPE=en_US.UTF-8" | sudo tee -a ${CHROOT_DIR}/home/virtua/.bashrc > /dev/null
+  sudo chroot ${CHROOT_DIR}/ chown -R virtua:virtua /home/virtua/
 }
 
 updateapt="N"
@@ -81,11 +81,11 @@ function verify_action() {
 if [ "$1" == "32" ]; then
   BIT="32"
   ARCH="arm-linux-gnueabihf"
-  CHROOT_DIR="Ark_devenv32"
+  CHROOT_DIR="MixOS_devenv32"
 else
   BIT="64"
   ARCH="aarch64-linux-gnu"
-  CHROOT_DIR="Ark_devenv"
+  CHROOT_DIR="MixOS_devenv"
 fi
 if [ -d "${CHROOT_DIR}" ]; then
   echo -e "${CHROOT_DIR} environment already exists.  Please delete it and rerun this make to create this new devenv\n\n"
@@ -129,7 +129,7 @@ sudo chroot ${CHROOT_DIR}/ bash -c "locale-gen"
 # Install libmali, DRM, and GBM libraries for ${CHIPSET}
 sudo chroot ${CHROOT_DIR}/ eatmydata apt-get install -y libdrm-dev libgbm1
 
-setup_ark_user
+setup_virtua_user
 sleep 10
 echo -e "Installing build dependencies and needed packages...\n\n"
 
@@ -156,7 +156,7 @@ sudo chroot ${CHROOT_DIR}/ ldconfig
 sudo chroot ${CHROOT_DIR}/ bash -c "git clone https://github.com/mesonbuild/meson.git && ln -s /meson/meson.py /usr/bin/meson"
 
 # Build and install librga
-sudo chroot ${CHROOT_DIR}/ bash -c "cd /home/ark &&
+sudo chroot ${CHROOT_DIR}/ bash -c "cd /home/virtua &&
   git clone https://github.com/christianhaitian/linux-rga.git &&
   cd linux-rga &&
   git checkout 1fc02d56d97041c86f01bc1284b7971c6098c5fb &&
@@ -169,7 +169,7 @@ sudo chroot ${CHROOT_DIR}/ bash -c "cd /home/ark &&
   "
 
 # Build and install libgo2
-sudo chroot ${CHROOT_DIR}/ bash -c "cd /home/ark &&
+sudo chroot ${CHROOT_DIR}/ bash -c "cd /home/virtua &&
   git clone https://github.com/OtherCrashOverride/libgo2.git &&
   cd libgo2 &&
   premake4 gmake &&

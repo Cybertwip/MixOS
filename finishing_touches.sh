@@ -1,13 +1,12 @@
 #!/bin/bash
 
-BUILD_BUNDLED_APPS="${BUILD_BUNDLED_APPS:-y}"
-
 # Create boot.ini
-if [ "$UNIT" == "rg351mp" ]; then
-  INITRD_LOADERADDRESS="0x01100000"
-else
-  INITRD_LOADERADDRESS="0x04000000"
-fi
+#
+# 0x01100000 is the RG351MP's initrd load address, and it is a literal now because
+# UNIT is one.  device/r36-ultra/build-in-vm.sh sets UNIT=rg351mp and is the only thing
+# that runs this file; the other branch held 0x04000000 for the eleven boards whose
+# build scripts and Makefile targets are gone.
+INITRD_LOADERADDRESS="0x01100000"
 cat <<EOF | sudo tee ${mountpoint}/boot.ini
 odroidgoa-uboot-config
 
@@ -26,11 +25,9 @@ load mmc 1:1 \${dtb_loadaddr} ${BOOT_KERNEL_DTB:-${KERNEL_DTB}}
 booti \${loadaddr} \${initrd_loadaddr} \${dtb_loadaddr}
 EOF
 
-if [ "$UNIT" == "rgb10" ] || [ "$UNIT" == "rk2020" ]; then
-  sudo cp logos/rotated/logo.bmp ${mountpoint}/
-else
-  sudo cp logos/unrotated/logo.bmp ${mountpoint}/
-fi
+# logos/rotated/ went with it: the RGB10 and RK2020 panels were mounted a quarter turn
+# round, so they got a pre-rotated copy of the same bitmap.  Neither board is built here.
+sudo cp logos/unrotated/logo.bmp ${mountpoint}/
 
 if [ -d "optional" ]; then
   if [ ! -z "$(find optional/ -mindepth 1 -maxdepth 1)" ]; then
@@ -39,63 +36,57 @@ if [ -d "optional" ]; then
 fi
 
 # Tell systemd to ignore PowerKey presses.  Let the Global Hotkey daemon handle that
-echo "HandlePowerKey=ignore" | sudo tee -a Arkbuild/etc/systemd/logind.conf
+echo "HandlePowerKey=ignore" | sudo tee -a MixOSBuild/etc/systemd/logind.conf
 
-# Add some important exports to .bashrc for user ark
-echo "export PATH=\"\$PATH:/usr/sbin\"" | sudo tee -a Arkbuild/home/ark/.bashrc
-sudo chroot Arkbuild/ bash -c "chown ark:ark /home/ark/.bashrc"
+# Add some important exports to .bashrc for user virtua
+echo "export PATH=\"\$PATH:/usr/sbin\"" | sudo tee -a MixOSBuild${DATA_MOUNT_POINT}/.bashrc
+sudo chroot MixOSBuild/ bash -c "chown virtua:virtua ${DATA_MOUNT_POINT}/.bashrc"
 
-# Set the name in the hostname and add it to the hosts file
-if [[ "$UNIT" == *"353"* ]] || [[ "$UNIT" == *"503"* ]]; then
-  NAME="rg${UNIT}"
-else
-  NAME="${UNIT}"
-fi
-echo "$NAME" | sudo tee Arkbuild/etc/hostname
-echo -e "# This host address\n127.0.1.1\t${NAME}" | sudo tee -a Arkbuild/etc/hosts
+# Set the name in the hostname and add it to the hosts file.  The `rg' prefix branch was
+# for the RG353x and RG503, whose UNIT strings were bare numbers; those boards are gone.
+NAME="${UNIT}"
+echo "$NAME" | sudo tee MixOSBuild/etc/hostname
+echo -e "# This host address\n127.0.1.1\t${NAME}" | sudo tee -a MixOSBuild/etc/hosts
 
 # Copy the necessary .asoundrc file for proper audio
-sudo cp audio/.asoundrc Arkbuild/home/ark/.asoundrc
-sudo cp audio/.asoundrcbak Arkbuild/home/ark/.asoundrcbak
-sudo chroot Arkbuild/ bash -c "chown ark:ark /home/ark/.asoundrc*"
-sudo chroot Arkbuild/ bash -c "ln -sfv /home/ark/.asoundrc /etc/asound.conf"
-sudo chroot Arkbuild/ bash -c "cp -fv /usr/share/alsa/alsa.conf /usr/share/alsa/alsa.conf.mednafen"
-sudo chroot Arkbuild/ bash -c "sed -i '/\"\~\/.asoundrc\"/s//\"\~\/.asoundrc.mednafen\"/' /usr/share/alsa/alsa.conf.mednafen"
-sudo chroot Arkbuild/ bash -c "cp -fv /usr/share/alsa/alsa.conf /usr/share/alsa/alsa.conf.gametank"
-sudo chroot Arkbuild/ bash -c "sed -i '/\"\~\/.asoundrc\"/s//\"\~\/.asoundrc.gametank\"/' /usr/share/alsa/alsa.conf.gametank"
+sudo cp audio/.asoundrc MixOSBuild${DATA_MOUNT_POINT}/.asoundrc
+sudo cp audio/.asoundrcbak MixOSBuild${DATA_MOUNT_POINT}/.asoundrcbak
+sudo chroot MixOSBuild/ bash -c "chown virtua:virtua ${DATA_MOUNT_POINT}/.asoundrc*"
+sudo chroot MixOSBuild/ bash -c "ln -sfv ${DATA_MOUNT_POINT}/.asoundrc /etc/asound.conf"
+sudo chroot MixOSBuild/ bash -c "cp -fv /usr/share/alsa/alsa.conf /usr/share/alsa/alsa.conf.mednafen"
+sudo chroot MixOSBuild/ bash -c "sed -i '/\"\~\/.asoundrc\"/s//\"\~\/.asoundrc.mednafen\"/' /usr/share/alsa/alsa.conf.mednafen"
+sudo chroot MixOSBuild/ bash -c "cp -fv /usr/share/alsa/alsa.conf /usr/share/alsa/alsa.conf.gametank"
+sudo chroot MixOSBuild/ bash -c "sed -i '/\"\~\/.asoundrc\"/s//\"\~\/.asoundrc.gametank\"/' /usr/share/alsa/alsa.conf.gametank"
 
 # Sleep script
-sudo mkdir -p Arkbuild/usr/lib/systemd/system-sleep
-sudo cp scripts/sleep.${CHIPSET} Arkbuild/usr/lib/systemd/system-sleep/sleep
-sudo chmod 777 Arkbuild/usr/lib/systemd/system-sleep/sleep
+sudo mkdir -p MixOSBuild/usr/lib/systemd/system-sleep
+sudo cp scripts/sleep.${CHIPSET} MixOSBuild/usr/lib/systemd/system-sleep/sleep
+sudo chmod 777 MixOSBuild/usr/lib/systemd/system-sleep/sleep
 
 # Set performance governor to ondemand on boot
-sudo chroot Arkbuild/ bash -c "(crontab -l 2>/dev/null; echo \"@reboot /usr/local/bin/perfnorm quiet &\") | crontab -"
+sudo chroot MixOSBuild/ bash -c "(crontab -l 2>/dev/null; echo \"@reboot /usr/local/bin/perfnorm quiet &\") | crontab -"
 
 # Speaker Toggle to set audio output to SPK on boot
-sudo mkdir -p Arkbuild/usr/local/bin
-sudo cp scripts/spktoggle.sh Arkbuild/usr/local/bin/
-sudo chmod 777 Arkbuild/usr/local/bin/spktoggle.sh
-sudo chroot Arkbuild/ bash -c "(crontab -l 2>/dev/null; echo \"@reboot /usr/local/bin/spktoggle.sh &\") | crontab -"
-sudo cp scripts/audiopath.service Arkbuild/etc/systemd/system/audiopath.service
-sudo cp scripts/audiostate.service Arkbuild/etc/systemd/system/audiostate.service
-sudo chroot Arkbuild/ bash -c "systemctl enable audiopath"
-sudo chroot Arkbuild/ bash -c "systemctl enable audiostate"
+sudo mkdir -p MixOSBuild/usr/local/bin
+sudo cp scripts/spktoggle.sh MixOSBuild/usr/local/bin/
+sudo chmod 777 MixOSBuild/usr/local/bin/spktoggle.sh
+sudo chroot MixOSBuild/ bash -c "(crontab -l 2>/dev/null; echo \"@reboot /usr/local/bin/spktoggle.sh &\") | crontab -"
+sudo cp scripts/audiopath.service MixOSBuild/etc/systemd/system/audiopath.service
+sudo cp scripts/audiostate.service MixOSBuild/etc/systemd/system/audiostate.service
+sudo chroot MixOSBuild/ bash -c "systemctl enable audiopath"
+sudo chroot MixOSBuild/ bash -c "systemctl enable audiostate"
 
 # Copy necessary tools for expansion of ROOTFS and convert fat32 games partition to exfat on initial boot
 sudo cp scripts/expandtoexfat.sh.${CHIPSET} ${mountpoint}/expandtoexfat.sh
 sudo cp scripts/firstboot.sh ${mountpoint}/firstboot.sh
-sudo cp scripts/firstboot.service Arkbuild/etc/systemd/system/firstboot.service
-sudo chroot Arkbuild/ bash -c "systemctl enable firstboot"
+sudo cp scripts/firstboot.service MixOSBuild/etc/systemd/system/firstboot.service
+sudo chroot MixOSBuild/ bash -c "systemctl enable firstboot"
 
 # Add hotkeydaemon service and python script
-sudo cp hotkeydaemon/killer_daemon.service Arkbuild/etc/systemd/system/killer_daemon.service
-sudo cp hotkeydaemon/killer_daemon.py Arkbuild/usr/local/bin/killer_daemon.py
-sudo chmod 777 Arkbuild/usr/local/bin/killer_daemon.py
-sudo chroot Arkbuild/ bash -c "systemctl disable killer_daemon"
-
-# Add amiga script
-sudo cp amiga/amiga.sh Arkbuild/usr/local/bin/
+sudo cp hotkeydaemon/killer_daemon.service MixOSBuild/etc/systemd/system/killer_daemon.service
+sudo cp hotkeydaemon/killer_daemon.py MixOSBuild/usr/local/bin/killer_daemon.py
+sudo chmod 777 MixOSBuild/usr/local/bin/killer_daemon.py
+sudo chroot MixOSBuild/ bash -c "systemctl disable killer_daemon"
 
 # Generate the fstab firstboot installs after it has grown the partitions.  Still
 # called fstab.exfat because that is the name expandtoexfat.sh copies from /boot, and
@@ -120,22 +111,22 @@ ${DATA_MOUNT_POINT}/roms/tools /opt/system/Tools none nofail,x-systemd.device-ti
 EOF
 
 # Disable getty on tty0 and tty1
-sudo chroot Arkbuild/ bash -c "systemctl disable getty@tty0.service getty@tty1.service"
+sudo chroot MixOSBuild/ bash -c "systemctl disable getty@tty0.service getty@tty1.service"
 
 # Disable some other unneeded services
-sudo chroot Arkbuild/ bash -c "systemctl disable ModemManager polkit"
+sudo chroot MixOSBuild/ bash -c "systemctl disable ModemManager polkit"
 
 # Disable ssh service from automatically starting
-sudo chroot Arkbuild/ bash -c "systemctl disable ssh"
+sudo chroot MixOSBuild/ bash -c "systemctl disable ssh"
 
 # Update Messaage of the Day
-sudo cp -f scripts/00-header Arkbuild/etc/update-motd.d/00-header
-sudo cp -f scripts/10-help-text Arkbuild/etc/update-motd.d/10-help-text
-sudo rm -f Arkbuild/etc/motd
-sudo chmod 777 Arkbuild/etc/update-motd.d/*
+sudo cp -f scripts/00-header MixOSBuild/etc/update-motd.d/00-header
+sudo cp -f scripts/10-help-text MixOSBuild/etc/update-motd.d/10-help-text
+sudo rm -f MixOSBuild/etc/motd
+sudo chmod 777 MixOSBuild/etc/update-motd.d/*
 
 # Disable some unneeded interfaces in NetworkManager
-cat <<EOF | sudo tee -a Arkbuild/etc/NetworkManager/NetworkManager.conf
+cat <<EOF | sudo tee -a MixOSBuild/etc/NetworkManager/NetworkManager.conf
 
 [device]
 wifi.scan-rand-mac-address=no
@@ -145,7 +136,7 @@ unmanaged-devices=interface-name:p2p0;interface-name:ap0
 EOF
 
 # Remove requirement of sudo for controlling nmcli
-cat <<EOF | sudo tee -a Arkbuild/etc/polkit-1/rules.d/10-networkmanager.rules
+cat <<EOF | sudo tee -a MixOSBuild/etc/polkit-1/rules.d/10-networkmanager.rules
 polkit.addRule(function(action, subject) {
     if (action.id.indexOf("org.freedesktop.NetworkManager") == 0 &&
         subject.isInGroup("netdev")) {
@@ -155,83 +146,67 @@ polkit.addRule(function(action, subject) {
 EOF
 
 # Default set timezone to New York
-sudo chroot Arkbuild/ bash -c "ln -sf /usr/share/zoneinfo/America/New_York /etc/localtime"
+sudo chroot MixOSBuild/ bash -c "ln -sf /usr/share/zoneinfo/America/New_York /etc/localtime"
 
-# Fetch older Debian library versions only for the optional application/port
-# bundle.  The GUI-only image does not ship PortMaster or those applications.
-if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
-  source ./fetch_compat_libs.sh
-fi
-
-# Various tools available through Options added here
-sudo mkdir -p Arkbuild/opt/system/Advanced
-if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
-  sudo cp dArkOS_Tools/*.sh Arkbuild/opt/system/
-  if compgen -G "dArkOS_Tools/${CHIPSET}/*.sh" >/dev/null; then
-    sudo cp dArkOS_Tools/${CHIPSET}/*.sh Arkbuild/opt/system/Advanced/
-  fi
-  sudo cp dArkOS_Tools/Advanced/*.sh Arkbuild/opt/system/Advanced/
-  if [[ "$UNIT" == *"rgb10"* ]] || [[ "$UNIT" == "rk2020" ]] || [[ "$UNIT" == *"oga"* ]]; then
-    sudo cp dArkOS_Tools/OGA/*.sh Arkbuild/opt/system/Advanced/
-  else
-    sudo cp scripts/Switch* Arkbuild/usr/local/bin/
-    sudo cp scripts/"Switch to SD2 for Roms.sh" Arkbuild/opt/system/Advanced/
-  fi
-else
-  gui_tools=(
-    "Change Password.sh"
-    "Disable Remote Services.sh"
-    "Enable Remote Services.sh"
-    "Network Info.sh"
-    "Remove ._ Files.sh"
-    "System Info.sh"
-    "USB Drive Mount.sh"
-    "USB Drive Unmount.sh"
-    "Update.sh"
-    "Wifi.sh"
-  )
-  for tool in "${gui_tools[@]}"; do
-    sudo cp "dArkOS_Tools/$tool" Arkbuild/opt/system/
-  done
-fi
-sudo chroot Arkbuild/ bash -c "chown -R ark:ark /opt"
-sudo chmod -R 777 Arkbuild/opt/system/
-
-# Add tool copy game roms for device RGB10
-if [[ "$UNIT" == *"rgb10"* ]]; then
-  sudo cp dArkOS_Tools/RGB10/*.sh Arkbuild/opt/system/
-fi
+# fetch_compat_libs.sh used to run here: nineteen wget calls pulling Debian 10 and 11
+# library sonames out of snapshot.debian.org so PortMaster's prebuilt ports could find
+# the libavcodec, libx264 and libssh versions they were linked against.  Nothing on this
+# image is linked against any of them now that the ports and the emulators are gone, so
+# what it installed was nineteen stale shared objects and a hard build dependency on
+# archive.debian.org staying up.
+#
+# Various tools available through Options added here.  Only the ones that do something
+# on an image with no front end and no emulators: the rest of MixOS_Tools drove
+# RetroArch, Drastic, PPSSPP, ECWolf and EmulationStation's collections, and is gone.
+#
+# /opt/system/Advanced is not created any more either.  It was the second level of the
+# front end's Options menu, and the only things that ever landed in it were the emulator
+# settings tools and a few self-replacing toggles that copy their own opposite in from
+# /usr/local/bin -- toggles for devices this tree no longer builds.
+sudo mkdir -p MixOSBuild/opt/system
+system_tools=(
+  "Change Password.sh"
+  "Disable Remote Services.sh"
+  "Enable Remote Services.sh"
+  "Network Info.sh"
+  "Remove ._ Files.sh"
+  "System Info.sh"
+  "USB Drive Mount.sh"
+  "USB Drive Unmount.sh"
+  "Update.sh"
+  "Wifi.sh"
+)
+for tool in "${system_tools[@]}"; do
+  sudo cp "MixOS_Tools/$tool" MixOSBuild/opt/system/
+done
+sudo chroot MixOSBuild/ bash -c "chown -R virtua:virtua /opt"
+sudo chmod -R 777 MixOSBuild/opt/system/
 
 # Copy performance scripts
-sudo cp scripts/perf* Arkbuild/usr/local/bin/
+sudo cp scripts/perf* MixOSBuild/usr/local/bin/
 
 # Add preservation of SDL_VIDEO_EGL_DRIVER to sudoers
-cat <<EOF | sudo tee Arkbuild/etc/sudoers.d/ark_preserve_sdl_video_egl_driver
+cat <<EOF | sudo tee MixOSBuild/etc/sudoers.d/virtua_preserve_sdl_video_egl_driver
 Defaults        env_keep += "SDL_VIDEO_EGL_DRIVER"
 EOF
-sudo chmod 0440 Arkbuild/etc/sudoers.d/ark_preserve_sdl_video_egl_driver
+sudo chmod 0440 MixOSBuild/etc/sudoers.d/virtua_preserve_sdl_video_egl_driver
 
 # Add USB DAC Support
 echo -e "Generating 20-usb-alsa.rules udev for usb dac support"
-echo -e "KERNEL==\"controlC[0-9]*\", DRIVERS==\"usb\", SYMLINK=\"snd/controlC7\"" | sudo tee Arkbuild/etc/udev/rules.d/20-usb-alsa.rules
-sudo chroot Arkbuild/ bash -c "(crontab -l 2>/dev/null; echo \"@reboot /usr/local/bin/checknswitchforusbdac.sh &\") | crontab -"
-
-# Fix LEDs on A10 Mini to default to the nice dim blue light while powered on
-if [[ "$UNIT" == "a10mini" ]]; then
-  sudo chroot Arkbuild/ bash -c "(crontab -l 2>/dev/null; echo \"@reboot /usr/local/bin/fix_power_led &\") | crontab -"
-fi
+echo -e "KERNEL==\"controlC[0-9]*\", DRIVERS==\"usb\", SYMLINK=\"snd/controlC7\"" | sudo tee MixOSBuild/etc/udev/rules.d/20-usb-alsa.rules
+sudo chroot MixOSBuild/ bash -c "(crontab -l 2>/dev/null; echo \"@reboot /usr/local/bin/checknswitchforusbdac.sh &\") | crontab -"
 
 # Disable requirement for sudo for setting niceness
-echo "ark              -       nice            -20" | sudo tee -a Arkbuild/etc/security/limits.conf
+echo "virtua              -       nice            -20" | sudo tee -a MixOSBuild/etc/security/limits.conf
 
 # Copy various other backend tools
-sudo cp scripts/checkbrightonboot Arkbuild/usr/local/bin/
-sudo cp scripts/current_* Arkbuild/usr/local/bin/
-sudo cp scripts/finish.sh Arkbuild/usr/local/bin/
-sudo cp scripts/pause.sh Arkbuild/usr/local/bin/
-sudo cp scripts/speak_bat_life.sh Arkbuild/usr/local/bin/
-sudo cp scripts/spktoggle.sh Arkbuild/usr/local/bin/
-sudo cp scripts/timezones Arkbuild/usr/local/bin/
+sudo cp scripts/checkbrightonboot MixOSBuild/usr/local/bin/
+sudo cp scripts/current_* MixOSBuild/usr/local/bin/
+sudo cp scripts/finish.sh MixOSBuild/usr/local/bin/
+sudo cp scripts/pause.sh MixOSBuild/usr/local/bin/
+sudo cp scripts/speak_bat_life.sh MixOSBuild/usr/local/bin/
+sudo cp scripts/spktoggle.sh MixOSBuild/usr/local/bin/
+sudo cp scripts/timezones MixOSBuild/usr/local/bin/
 # Quick Mode used to be installed here: BaRT_QuickMode.sh, its Enable/Disable pair,
 # .qm and .orig copies of finish.sh and pause.sh, get_last_played.sh, and the
 # isitpng.sh/wasitpng.sh hooks that ES ran at game-start and game-end.  All of it
@@ -239,101 +214,79 @@ sudo cp scripts/timezones Arkbuild/usr/local/bin/
 # it read that game out of ~/.emulationstation.  With no front end on this image
 # there is no last game to read and nothing to skip past, so the whole cluster is
 # gone rather than left installed and inert.
-sudo cp scripts/arkos_ap_mode.sh Arkbuild/usr/local/bin/
-sudo cp scripts/auto_suspend* Arkbuild/usr/local/bin/
-sudo cp scripts/processcheck.sh Arkbuild/usr/local/bin/
-sudo cp scripts/autosuspend.service Arkbuild/etc/systemd/system/
-sudo chroot Arkbuild/ bash -c "pip install --break-system-packages --root-user-action ignore inputs"
-sudo chroot Arkbuild/ bash -c "systemctl disable autosuspend"
-sudo cp scripts/wifi_importer.service Arkbuild/etc/systemd/system/
-sudo chroot Arkbuild/ bash -c "systemctl enable wifi_importer"
-sudo cp scripts/keystroke.py Arkbuild/usr/local/bin/
-sudo cp scripts/b2.sh Arkbuild/usr/local/bin/
-sudo cp scripts/freej2me.sh Arkbuild/usr/local/bin/
-sudo cp scripts/easyrpg.sh Arkbuild/usr/local/bin/
-sudo cp scripts/gx4000.sh Arkbuild/usr/local/bin/
-sudo cp scripts/neogeocd.sh Arkbuild/usr/local/bin/
-sudo cp scripts/netplay.sh Arkbuild/usr/local/bin/
-sudo mkdir -p Arkbuild/etc/hostapd
-sudo cp hostapd/hostapd.conf Arkbuild/etc/hostapd/
-sudo cp dnsmasq/dnsmasq.conf Arkbuild/etc/
-sudo cp scripts/sleep_governors.sh Arkbuild/usr/local/bin/
-sudo cp global/* Arkbuild/usr/local/bin/
+sudo cp scripts/ap_mode.sh MixOSBuild/usr/local/bin/
+sudo cp scripts/auto_suspend* MixOSBuild/usr/local/bin/
+sudo cp scripts/processcheck.sh MixOSBuild/usr/local/bin/
+sudo cp scripts/autosuspend.service MixOSBuild/etc/systemd/system/
+sudo chroot MixOSBuild/ bash -c "pip install --break-system-packages --root-user-action ignore inputs"
+sudo chroot MixOSBuild/ bash -c "systemctl disable autosuspend"
+sudo cp scripts/wifi_importer.service MixOSBuild/etc/systemd/system/
+sudo chroot MixOSBuild/ bash -c "systemctl enable wifi_importer"
+sudo cp scripts/keystroke.py MixOSBuild/usr/local/bin/
+# Seven emulator launcher wrappers went here -- amiga.sh, b2.sh, freej2me.sh,
+# easyrpg.sh, gx4000.sh, neogeocd.sh and netplay.sh.  Each one existed to be
+# exec'd by the front end with a rom path, and each one ended in a RetroArch
+# command line naming a libretro core that is no longer built.
+sudo mkdir -p MixOSBuild/etc/hostapd
+sudo cp hostapd/hostapd.conf MixOSBuild/etc/hostapd/
+sudo cp dnsmasq/dnsmasq.conf MixOSBuild/etc/
+sudo cp scripts/sleep_governors.sh MixOSBuild/usr/local/bin/
+sudo cp global/* MixOSBuild/usr/local/bin/
 # Disable winbind as connectivity to Active Directory is not needed
-sudo chroot Arkbuild/ bash -c "systemctl disable winbind"
+sudo chroot MixOSBuild/ bash -c "systemctl disable winbind"
 # Disable samba-ad-dc as connectivity to Active Directory is not needed as well as some other services
-sudo chroot Arkbuild/ bash -c "systemctl disable samba-ad-dc dnsmasq hostapd"
+sudo chroot MixOSBuild/ bash -c "systemctl disable samba-ad-dc dnsmasq hostapd"
 # Disable e2scrub_reap if ext file system is not being used for rootfs
 if [ "$ROOT_FILESYSTEM_FORMAT" == "xfs" ] || [ "$ROOT_FILESYSTEM_FORMAT" == "btrfs" ]; then
-  sudo chroot Arkbuild/ bash -c "systemctl disable e2scrub_reap"
+  sudo chroot MixOSBuild/ bash -c "systemctl disable e2scrub_reap"
 fi
 # Set the default graphical target to multi-user instead of graphical"
-sudo chroot Arkbuild/ bash -c "systemctl set-default multi-user.target"
-if [[ "$UNIT" == "rgb10" ]]; then
-  sudo cp device/rgb10/* Arkbuild/usr/local/bin/
-elif [[ "$UNIT" == "rg351mp" ]] || [[ "$UNIT" == "g350" ]] || [[ "$UNIT" == "a10mini" ]]; then
-  sudo cp device/rg351mp/*.sh Arkbuild/usr/local/bin/
-  sudo cp device/rg351mp/*.py Arkbuild/usr/local/bin/
-  sudo cp device/rg351mp/*.green Arkbuild/usr/local/bin/
-  sudo cp device/rg351mp/*.red Arkbuild/usr/local/bin/
-  sudo cp device/rg351mp/fix_power_led Arkbuild/usr/local/bin/
-  sudo cp device/rg351mp/checkbrightonboot Arkbuild/usr/local/bin/
-  if [[ "$UNIT" == "a10mini" ]]; then
-    sudo cp device/a10mini/"Change LED to Green.sh" Arkbuild/opt/system/"Change LED to Orange.sh"
-    sudo sed -i '/Green.sh/s//Orange.sh/g' Arkbuild/opt/system/"Change LED to Orange.sh"
-	sudo sed -i '/Red.sh/s//Blue.sh/g' Arkbuild/opt/system/"Change LED to Orange.sh"
-    sudo cp Arkbuild/opt/system/"Change LED to Orange.sh" Arkbuild/usr/local/bin/"Change LED to Orange.sh"
-    sudo rm Arkbuild/usr/local/bin/"Change LED to Green.sh"
-    sudo mv -f Arkbuild/usr/local/bin/"Change LED to Red.sh" Arkbuild/usr/local/bin/"Change LED to Blue.sh"
-    sudo sed -i '/Red.sh/s//Blue.sh/g' Arkbuild/usr/local/bin/"Change LED to Blue.sh"
-	sudo sed -i '/Green.sh/s//Orange.sh/g' Arkbuild/usr/local/bin/"Change LED to Blue.sh"
-    sudo chroot Arkbuild/ bash -c "chown -R ark:ark /opt"
-    sudo chmod 777 Arkbuild/opt/system/"Change LED to Orange.sh"
-  else
-    sudo cp device/rg351mp/"Change LED to Red.sh" Arkbuild/opt/system/
-    sudo chroot Arkbuild/ bash -c "chown -R ark:ark /opt"
-    sudo chmod 777 Arkbuild/opt/system/"Change LED to Red.sh"
-  fi
-  sudo cp device/rg351mp/*.service Arkbuild/etc/systemd/system/
-  sudo chroot Arkbuild/ bash -c "systemctl enable 351mp batt_led"
-fi
-if [[ "$UNIT" == "g350" ]]; then
-  sudo cp scripts/g350/*.sh Arkbuild/usr/local/bin/
-  sudo cp scripts/g350/logo.service Arkbuild/etc/systemd/system/logo.service
-  sudo chroot Arkbuild/ bash -c "systemctl enable logo"
-fi
+sudo chroot MixOSBuild/ bash -c "systemctl set-default multi-user.target"
+# The RG351MP board scripts: brightness, volume, the battery LED and its two colour
+# states.  This used to be a four-way branch -- device/rgb10 for the RGB10, device/a10mini
+# for the A10 Mini's inverted LED naming (Green became Orange, Red became Blue, applied by
+# sed to copies of the RG351MP scripts), and scripts/g350 for the G350's boot logo unit.
+# All three trees are gone with their build scripts, and UNIT is rg351mp for every build
+# this file can be reached from, so the branch is one path now.
+sudo cp device/rg351mp/*.sh MixOSBuild/usr/local/bin/
+sudo cp device/rg351mp/*.py MixOSBuild/usr/local/bin/
+sudo cp device/rg351mp/*.green MixOSBuild/usr/local/bin/
+sudo cp device/rg351mp/*.red MixOSBuild/usr/local/bin/
+sudo cp device/rg351mp/fix_power_led MixOSBuild/usr/local/bin/
+sudo cp device/rg351mp/checkbrightonboot MixOSBuild/usr/local/bin/
+sudo cp device/rg351mp/"Change LED to Red.sh" MixOSBuild/opt/system/
+sudo chroot MixOSBuild/ bash -c "chown -R virtua:virtua /opt"
+sudo chmod 777 MixOSBuild/opt/system/"Change LED to Red.sh"
+sudo cp device/rg351mp/*.service MixOSBuild/etc/systemd/system/
+sudo chroot MixOSBuild/ bash -c "systemctl enable 351mp batt_led"
 
 # Make all scripts in /usr/local/bin executable, world style
-sudo chmod 777 Arkbuild/usr/local/bin/*
+sudo chmod 777 MixOSBuild/usr/local/bin/*
 
 # Three symlink sets used to be written here -- /etc/emulationstation/themes,
 # ~/.emulationstation/themes and ~/.emulationstation/music, all pointing into the
 # rom partition.  There is no front end on this image to read any of them, so they
 # were three dangling links and a directory tree created for their sake.
 
-# The GUI-only image does not build image-viewer, so use the built-in ASCII
-# loading screen instead of leaving a launcher dependency on a skipped app.
-if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
-  sudo chroot Arkbuild/ touch /home/ark/.config/.GameLoadingIModePIC
-else
-  sudo chroot Arkbuild/ touch /home/ark/.config/.GameLoadingIModeASCII
-fi
+# A .GameLoadingIModePIC or .GameLoadingIModeASCII stamp was dropped here to tell the
+# game launcher which kind of loading screen to draw between the front end and the
+# emulator.  There is neither a front end nor an emulator on this image, so nothing ever
+# reads the stamp and there is no moment for it to describe.
 
 # Set default volume
-sudo cp audio/asound.state.${CHIPSET} Arkbuild/var/local/asound.state
+sudo cp audio/asound.state.${CHIPSET} MixOSBuild/var/local/asound.state
 
 # Set SDL Video Driver for bash
-echo "export SDL_VIDEO_EGL_DRIVER=libEGL.so" | sudo tee Arkbuild/etc/profile.d/SDL_VIDEO.sh
+echo "export SDL_VIDEO_EGL_DRIVER=libEGL.so" | sudo tee MixOSBuild/etc/profile.d/SDL_VIDEO.sh
 
 # Set device name 
 dNAME=`echo $NAME | tr '[:lower:]' '[:upper:]'`
-echo "$dNAME" | sudo tee Arkbuild/home/ark/.config/.DEVICE
+echo "$dNAME" | sudo tee MixOSBuild${DATA_MOUNT_POINT}/.config/.DEVICE
 
-# Configure default samba share setup.  Real paths, not /roms and /home/ark: those are
-# symlinks into the DATA partition now, and samba defaults to "wide links = no" -- it
-# refuses to follow a symlink that leaves the share, so a share rooted on one is a share
-# that shows nothing.
-cat <<EOF | sudo tee -a Arkbuild/etc/samba/smb.conf
+# Configure default samba share setup.  The real path, not /roms: that is a symlink into
+# the DATA partition now, and samba defaults to "wide links = no" -- it refuses to follow
+# a symlink that leaves the share, so a share rooted on one is a share that shows nothing.
+cat <<EOF | sudo tee -a MixOSBuild/etc/samba/smb.conf
 [roms]
    comment = ROMS
    path = ${DATA_MOUNT_POINT}/roms
@@ -356,8 +309,8 @@ cat <<EOF | sudo tee -a Arkbuild/etc/samba/smb.conf
    guest ok = yes
    read list = guest
 
-[ark]
-   comment = ark
+[home]
+   comment = HOME
    path = ${DATA_MOUNT_POINT}
    browsable = yes
    read only = no
@@ -368,7 +321,7 @@ cat <<EOF | sudo tee -a Arkbuild/etc/samba/smb.conf
    read list = guest
 EOF
 if [[ "$UNIT" != *"rgb10"* ]] && [[ "$UNIT" != "rk2020" ]] && [[ "$UNIT" != *"oga"* ]]; then
-  cat <<EOF | sudo tee -a Arkbuild/etc/samba/smb.conf
+  cat <<EOF | sudo tee -a MixOSBuild/etc/samba/smb.conf
 [roms2]
    comment = ROMS2
    path = /roms2
@@ -382,40 +335,40 @@ if [[ "$UNIT" != *"rgb10"* ]] && [[ "$UNIT" != "rk2020" ]] && [[ "$UNIT" != *"og
 EOF
   fi
 
-sudo chroot Arkbuild/ bash -c "systemctl disable smbd"
-sudo chroot Arkbuild/ bash -c "systemctl disable nmbd"
+sudo chroot MixOSBuild/ bash -c "systemctl disable smbd"
+sudo chroot MixOSBuild/ bash -c "systemctl disable nmbd"
 
 # Set distro identification and version
-sudo mkdir -p Arkbuild/usr/share/plymouth/themes/
-cat <<EOF | sudo tee Arkbuild/usr/share/plymouth/themes/text.plymouth
+sudo mkdir -p MixOSBuild/usr/share/plymouth/themes/
+cat <<EOF | sudo tee MixOSBuild/usr/share/plymouth/themes/text.plymouth
 title=MixOS (${BUILD_DATE})
 EOF
-echo "${BUILD_DATE}" | sudo tee Arkbuild/home/ark/.config/.VERSION
+echo "${BUILD_DATE}" | sudo tee MixOSBuild${DATA_MOUNT_POINT}/.config/.VERSION
 
 # Set boot up welcome text with distro and version
-sudo cp scripts/boot_text.sh Arkbuild/usr/local/bin/
-sudo chmod 777 Arkbuild/usr/local/bin/boot_text.sh
-sudo cp scripts/welcome-message.service Arkbuild/etc/systemd/system/welcome-message.service
-sudo chroot Arkbuild/ bash -c "systemctl enable welcome-message"
+sudo cp scripts/boot_text.sh MixOSBuild/usr/local/bin/
+sudo chmod 777 MixOSBuild/usr/local/bin/boot_text.sh
+sudo cp scripts/welcome-message.service MixOSBuild/etc/systemd/system/welcome-message.service
+sudo chroot MixOSBuild/ bash -c "systemctl enable welcome-message"
 
 # Mark completed MixOS updates with this current build
 release_tags=( $(git -c 'versionsort.suffix=-' ls-remote --tags --sort='v:refname' https://github.com/christianhaitian/darkos-updates.git | cut -d/ -f3- | sed 's/^v//I') )
 if [[ ! -z "$release_tags" ]]; then
   for release_tag in "${release_tags[@]}"
   do
-    sudo touch Arkbuild/home/ark/.config/.update${release_tag}
+    sudo touch MixOSBuild${DATA_MOUNT_POINT}/.config/.update${release_tag}
   done
 fi
 
-# Set the ownver of the ark folder and all sub content to ark
-sudo chroot Arkbuild/ bash -c "chown -R ark:ark /home/ark"
+# Set the owner of the home directory and everything under it to the login user
+sudo chroot MixOSBuild/ bash -c "chown -R virtua:virtua ${DATA_MOUNT_POINT}"
 
 # /tempthemes was six git clones of front-end themes, staged on the rootfs for
 # firstboot to untar onto the rom partition.  Nothing reads a theme on this image, so
 # the clones are gone and with them six network fetches in the middle of a build.
 # The directory itself stays: firstboot.sh moves it if it is there and says nothing
 # if it is not, and an empty one keeps that path the same on every image.
-sudo mkdir -p Arkbuild/tempthemes
+sudo mkdir -p MixOSBuild/tempthemes
 
 sync
 sudo umount -l ${mountpoint}
@@ -465,108 +418,49 @@ sudo mount -t ${DATA_FILESYSTEM_FORMAT} ${LOOP_ROM} ${data_mountpoint}
 fat32_mountpoint=${data_mountpoint}/roms
 sudo mkdir -p ${fat32_mountpoint}
 
-# /roms on the rootfs becomes a symlink into the home partition.  Some 200 lines across
-# the RK3326 scripts and the PortMaster tooling say /roms,
-# and they keep resolving through this; nothing has to be renamed to move the partition.
-# If an earlier stage already put real files in Arkbuild/roms they are moved onto the
+# /roms on the rootfs becomes a symlink into the home partition.  The RK3326 scripts,
+# the samba share and firstboot still say /roms, and they keep resolving through this;
+# nothing has to be renamed to move the partition.
+# If an earlier stage already put real files in MixOSBuild/roms they are moved onto the
 # partition rather than lost, because replacing a populated directory with a symlink
 # would silently drop whatever was in it.
-if [[ -d Arkbuild/roms && ! -L Arkbuild/roms ]]; then
-  if [[ -n "$(sudo ls -A Arkbuild/roms 2>/dev/null)" ]]; then
-    echo -e "Moving the existing Arkbuild/roms contents onto the DATA partition\n"
-    sudo cp -a Arkbuild/roms/. ${fat32_mountpoint}/
+if [[ -d MixOSBuild/roms && ! -L MixOSBuild/roms ]]; then
+  if [[ -n "$(sudo ls -A MixOSBuild/roms 2>/dev/null)" ]]; then
+    echo -e "Moving the existing MixOSBuild/roms contents onto the DATA partition\n"
+    sudo cp -a MixOSBuild/roms/. ${fat32_mountpoint}/
   fi
-  sudo rm -rf Arkbuild/roms
+  sudo rm -rf MixOSBuild/roms
 fi
-# Relative, for the same reason /home/ark is: an absolute target would make a host-side
-# `cp something Arkbuild/roms/...` write to /home/virtua/roms on the BUILD MACHINE.
+# Relative on purpose: an absolute target would make a host-side
+# `cp something MixOSBuild/roms/...` write to /home/virtua/roms on the BUILD MACHINE.
 # Stripping the leading slash makes it relative to whatever root it is read from, so it
-# resolves to Arkbuild/home/virtua/roms here and /home/virtua/roms on the device.
-sudo ln -sfn "${DATA_MOUNT_POINT#/}/roms" Arkbuild/roms
-if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
-  while read GAME_SYSTEM; do
-    if [[ ! "$GAME_SYSTEM" =~ ^# ]]; then
-      echo -e "Creating ${fat32_mountpoint}/${GAME_SYSTEM}\n"
-      sudo mkdir -p ${fat32_mountpoint}/${GAME_SYSTEM}
-    fi
-  done <game_systems.txt
-else
-  # The GUI-only image needs only system data and theme/media locations.  Do
-  # not populate emulator folders, PortMaster, ThemeMaster, or sample games.
-  gui_directories=(backup bgmusic bios launchimages shutdownimages themes tools)
-  for directory in "${gui_directories[@]}"; do
-    echo -e "Creating ${fat32_mountpoint}/${directory}\n"
-    sudo mkdir -p "${fat32_mountpoint}/${directory}"
-  done
-fi
+# resolves to MixOSBuild${DATA_MOUNT_POINT}/roms here and /home/virtua/roms on the device.
+sudo ln -sfn "${DATA_MOUNT_POINT#/}/roms" MixOSBuild/roms
+# The media tree.  This used to be one directory per entry in game_systems.txt -- a
+# hundred and some emulator folders, wolf/ and alg/ and scummvm/ and pico-8/carts/ --
+# followed by a PortMaster installer, a ThemeMaster unzip, five pico-8 cartridges pulled
+# from lexaloffle, a theme cloned from GitHub and the scanner scripts each application
+# shipped.  Every one of those existed to be read by an emulator or by the front end
+# that launched it, and both are gone; what is left is the handful of places the system
+# itself writes to.  Seven mkdir calls in place of six network fetches.
+media_directories=(backup bgmusic bios shutdownimages themes tools)
+for directory in "${media_directories[@]}"; do
+  echo -e "Creating ${fat32_mountpoint}/${directory}\n"
+  sudo mkdir -p "${fat32_mountpoint}/${directory}"
+done
 
-if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
-  # Add latest version of PortMaster install to roms/tools folder
-  for (( ; ; ))
-  do
-   #wget -t 3 -T 60 --no-check-certificate https://github.com/PortsMaster/PortMaster-GUI/releases/download/8.5.22_0528/PortMaster.zip
-   PMver=$(curl --silent -qI https://github.com/PortsMaster/PortMaster-GUI/releases/latest | awk -F '/' '/^location/ {print  substr($NF, 1, length($NF)-1)}')
-   wget -t 3 -T 60 --no-check-certificate https://github.com/PortsMaster/PortMaster-GUI/releases/download/${PMver}/Install.PortMaster.sh
-   if [ $? == 0 ]; then
-    break
-   fi
-   sleep 10
-  done
-  sudo mv -f Install.PortMaster.sh ${fat32_mountpoint}/tools/Install.PortMaster.sh
-  chmod 777 ${fat32_mountpoint}/tools/Install.PortMaster.sh
-
-  # Add latest version of ThemeMaster to roms/tools folder
-  for (( ; ; ))
-  do
-   wget -t 3 -T 60 --no-check-certificate https://github.com/JohnIrvine1433/ThemeMaster/archive/refs/heads/master.zip
-   if [ $? == 0 ]; then
-    break
-   fi
-   sleep 10
-  done
-  sudo unzip -X -o master.zip -d ${fat32_mountpoint}/tools/
-  sudo rm -rf ${fat32_mountpoint}/tools/ThemeMaster
-  sudo mv -f ${fat32_mountpoint}/tools/ThemeMaster-master/ThemeMaster ${fat32_mountpoint}/tools/
-  sudo mv -f ${fat32_mountpoint}/tools/ThemeMaster-master/ThemeMaster.sh ${fat32_mountpoint}/tools/
-  sudo rm -rf ${fat32_mountpoint}/tools/ThemeMaster-master/
-  rm -f master.zip
-
-  # Get some sample pico-8 games.  ${fat32_mountpoint} and not /roms: this line named an
-  # absolute path, so it cleared the BUILD HOST's /roms rather than the partition being
-  # populated two lines below.  Harmless while no such directory existed on the host and
-  # not something to leave standing in a script that runs as root.
-  sudo rm -rf ${fat32_mountpoint}/pico-8/carts/*
-  sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/1/15133.p8.png -O ${fat32_mountpoint}/pico-8/carts/celeste.p8.png
-  sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/sc/scrap_boy-6.p8.png -O ${fat32_mountpoint}/pico-8/carts/scrap_boy-6.p8.png
-  sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/di/dinkykong-0.p8.png -O ${fat32_mountpoint}/pico-8/carts/dinkykong-0.p8.png
-  sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/po/poom_0-9.p8.png -O ${fat32_mountpoint}/pico-8/carts/poom_0-9.p8.png
-  sudo wget -t 3 -T 60 --no-check-certificate https://www.lexaloffle.com/bbs/cposts/ch/cherrybomb-0.p8.png -O ${fat32_mountpoint}/pico-8/carts/cherrybomb-0.p8.png
-fi
-
-# Copy default GUI launch and shutdown images.
-sudo cp launchimages/loading.ascii.${UNIT} ${fat32_mountpoint}/launchimages/loading.ascii
-sudo cp launchimages/loading.jpg.${UNIT} ${fat32_mountpoint}/launchimages/loading.jpg
+# The one image still read at runtime: finish.sh and pause.sh play it on shutdown.
 sudo cp shutdownimages/bye.gif ${fat32_mountpoint}/shutdownimages/
-
-if [[ "$BUILD_BUNDLED_APPS" == y ]]; then
-  # Copy application-specific scanners and seed the pre-expansion theme folder.
-  sudo cp -a ecwolf/Scan* ${fat32_mountpoint}/wolf/
-  sudo cp -a scummvm/scripts/Scan* ${fat32_mountpoint}/scummvm/
-  sudo cp -a hypseus-singe/scripts/Scan* ${fat32_mountpoint}/alg/
-  sudo cp -a scummvm/scripts/menu.scummvm ${fat32_mountpoint}/scummvm/
-  sudo git clone --depth=1 https://github.com/Jetup13/es-theme-nes-box.git ${fat32_mountpoint}/themes/es-theme-nes-box
-fi
 sync
 
-# The home directory itself.  useradd -m in setup_ark_user built this tree on the ROOTFS,
+# The home directory itself.  useradd -m in setup_virtua_user built this tree on the ROOTFS,
 # under what is about to become a mount point: the skeleton, .config and the two
 # locale lines in .bashrc.  Once p3 mounts over it none of that is reachable,
 # so the same tree is copied onto the partition and the mounted and unmounted cases look
-# alike.  Anything an emulator build dropped in /home/ark came here too -- that path is a
-# symlink to this directory now, so those builds wrote into this very tree.
-if [[ -d "Arkbuild${DATA_MOUNT_POINT}" ]]; then
+# alike.
+if [[ -d "MixOSBuild${DATA_MOUNT_POINT}" ]]; then
   echo -e "Seeding ${DATA_MOUNT_POINT} on the DATA partition from the rootfs copy\n"
-  sudo cp -a "Arkbuild${DATA_MOUNT_POINT}/." ${data_mountpoint}/ || \
+  sudo cp -a "MixOSBuild${DATA_MOUNT_POINT}/." ${data_mountpoint}/ || \
     echo "⚠️  Could not copy the whole home tree onto p3 -- ${ROM_PART_SIZE:-300} MB may be too small for what is in it"
 fi
 
@@ -589,9 +483,9 @@ sync
 # chown is new here and vfat never needed it: vfat has no ownership at all, and the old
 # fstab line handed the whole partition to uid 1000 with umask=000.  ext2 does have
 # ownership, so it has to be set once, here, while the partition is a loop device --
-# no mount option will do it afterwards.  1000:1000 is the ark user, created by
-# setup_ark_user in bootstrap_rootfs.sh; numeric because this is the host's mount and
-# the host has no such user.  775 so the ark group can write and everyone can read.
+# no mount option will do it afterwards.  1000:1000 is the virtua user, created by
+# setup_virtua_user in bootstrap_rootfs.sh; numeric because this is the host's mount and
+# the host has no such user.  775 so the virtua group can write and everyone can read.
 #
 # The whole partition and not just the rom library: its root is $HOME, and a home
 # directory owned by root is a login that cannot write its own dotfiles.  chmod skips
@@ -610,7 +504,7 @@ sync
 # The archive is now the whole partition -- the home directory with roms/ inside it --
 # rather than a single roms/ top level, so firstboot extracts it AT ${DATA_MOUNT_POINT}
 # and not at /.  lost+found is excluded: the recreated filesystem has its own.
-sudo tar -C ${data_mountpoint} --exclude=./lost+found -cvf Arkbuild/roms.tar .
+sudo tar -C ${data_mountpoint} --exclude=./lost+found -cvf MixOSBuild/roms.tar .
 
 sudo umount ${data_mountpoint}
 sudo losetup -d ${LOOP_ROM}

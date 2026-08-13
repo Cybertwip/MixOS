@@ -6,7 +6,7 @@ After=network-pre.target
 [Service]
 Type=oneshot
 User=root
-WorkingDirectory=/home/ark
+WorkingDirectory=/home/virtua
 ExecStart=/usr/local/bin/importwifi.sh
 Restart=no
 

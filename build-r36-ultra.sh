@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: MS-PL
 # Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
 # device/j36-ultra/LICENSE for the full text and for what it does not cover.
-# Build the MixOS RG351MP base used for R36 Ultra bring-up.  The default
-# profile is a native armhf Debian userspace with no front end and with bundled
-# applications disabled.  The RK3326 kernel/boot chain remains arm64.
+# Build the MixOS RG351MP base used for R36 Ultra bring-up.  It is a native armhf
+# Debian userspace with no front end and no emulators on it.  The RK3326
+# kernel/boot chain remains arm64.
 #
 # macOS: builds inside a persistent Ubuntu 24.04 Multipass VM.
 # Linux: runs the same checkpointed build directly on the host.
@@ -15,7 +15,7 @@
 #   DARKOS_VM_MEMORY=16G
 #   DARKOS_VM_DISK=160G
 #   DARKOS_UBUNTU_IMAGE=24.04
-#   DARKOS_ARTIFACT_DIR=/path/to/output
+#   MIXOS_ARTIFACT_DIR=/path/to/output
 #
 # The build produces exactly one artifact worth flashing, uncompressed:
 #   MixOS_<arch>_<debian>_<commit>.img
@@ -34,7 +34,6 @@
 #   DEBIAN_CODE_NAME=trixie
 #   USERSPACE_ARCH=armhf          # armhf (default) or arm64; never multiarch.
 #   BUILD_JOBS=4
-#   BUILD_BUNDLED_APPS=n         # plain Debian userspace only (default).
 #   ENABLE_CACHE=y
 
 set -Eeuo pipefail
@@ -51,19 +50,32 @@ VM_CPUS="${DARKOS_VM_CPUS:-8}"
 VM_MEMORY="${DARKOS_VM_MEMORY:-16G}"
 VM_DISK="${DARKOS_VM_DISK:-160G}"
 UBUNTU_IMAGE="${DARKOS_UBUNTU_IMAGE:-24.04}"
-ARTIFACT_DIR="${DARKOS_ARTIFACT_DIR:-${SCRIPT_DIR}-artifacts}"
+# DARKOS_ARTIFACT_DIR is still honoured because it is an operator's knob rather than an
+# internal name: it lives in shell profiles and in whatever the operator types, and the
+# failure mode of dropping it is silent -- the build would write to the default and the
+# override would simply not happen.  darkos_artifact_dir supplies the default and moves
+# an older *-artifacts directory to it; see the note there for why moving matters.
+ARTIFACT_DIR="${MIXOS_ARTIFACT_DIR:-${DARKOS_ARTIFACT_DIR:-$(darkos_artifact_dir "$SCRIPT_DIR")}}"
 BOOT_PAYLOAD_DIR="${DARKOS_R36_BOOT_PAYLOAD:-${ARTIFACT_DIR}/Reference/BOOT}"
 DEBIAN_RELEASE="${DEBIAN_CODE_NAME:-trixie}"
 USERSPACE_ARCH="${USERSPACE_ARCH:-armhf}"
 BUILD_JOBS="${BUILD_JOBS:-8}"
-BUNDLED_APPS="${BUILD_BUNDLED_APPS:-n}"
 CACHE="${ENABLE_CACHE:-y}"
-if [[ "$BUNDLED_APPS" == "y" ]]; then
-    BUILD_PROFILE="full"
-else
-    BUILD_PROFILE="gui"
-fi
-STATE_KEY="${DEBIAN_RELEASE}-userspace-${USERSPACE_ARCH}-profile-${BUILD_PROFILE}-v3"
+# `profile-gui' is a literal on purpose.  BUILD_PROFILE was `full' or `gui' depending on
+# BUILD_BUNDLED_APPS, and with the emulators and ports out of the tree there is only one
+# profile left -- but this string names the checkpoint directory in the build VM, and
+# every checkpoint anyone has on disk was written under `gui'.  Dropping the word would
+# rename the directory and cost a full debootstrap on the next run to say nothing new.
+#
+# v4 AND WHY THIS ONE IS WORTH A REBUILD.  v3 checkpoints were bootstrapped when the
+# login account was `ark' with /home/ark a symlink to the home partition's mount point.
+# The account, its group, its two sudoers drop-ins and its home directory are written by
+# the bootstrap stage and by nothing after it, so a resumed v3 build would keep the old
+# account and then fail in finishing_touches.sh on `chown -R virtua:virtua' -- and an
+# in-place usermod on a half-built root is more machinery than the one clean run it
+# saves.  The debootstrap tarball in MixOSBuild_package_cache and the ccache both live
+# outside the state directory and are not affected, so this is a rebuild, not a cold one.
+STATE_KEY="${DEBIAN_RELEASE}-userspace-${USERSPACE_ARCH}-profile-gui-v4"
 # Computed here and passed in, because .git/ does not ride into the build VM.  Named
 # after the commit rather than the date -- see darkos_image_name.
 IMAGE_NAME="$(darkos_image_name "$SCRIPT_DIR" "$USERSPACE_ARCH" "$DEBIAN_RELEASE")"
@@ -73,7 +85,7 @@ IMAGE_NAME="$(darkos_image_name "$SCRIPT_DIR" "$USERSPACE_ARCH" "$DEBIAN_RELEASE
 # image is still in the VM and the next run copies it out.
 DEFER_IMAGE_COPY="${DARKOS_DEFER_IMAGE_COPY:-0}"
 VM_SOURCE_MOUNT="/mnt/darkos-host"
-VM_ARTIFACT_MOUNT="/mnt/darkos-artifacts"
+VM_ARTIFACT_MOUNT="/mnt/mixos-artifacts"
 VM_BUILD_DIR="/home/ubuntu/dArkOS"
 
 usage() {
@@ -82,8 +94,7 @@ Usage: ./build-r36-ultra.sh
 
 Builds the RG351MP/RK3326 base image used for R36 Ultra bring-up.  By default
 this produces one native armhf (32-bit) Debian userspace with no front end on
-it.  It does not add an arm64 userspace or build the bundled emulators and
-standalone applications.  The existing arm64 RK3326 kernel/boot
+it; it does not add an arm64 userspace.  The existing arm64 RK3326 kernel/boot
 chain is retained, and the R36 Ultra-specific DTB is not yet injected.
 
 On macOS the script automatically creates or reuses a Multipass VM. Failed
@@ -99,10 +110,9 @@ Common overrides:
   DARKOS_VM_CPUS=4 DARKOS_VM_MEMORY=8G ./build-r36-ultra.sh
   BUILD_JOBS=8 ./build-r36-ultra.sh
   USERSPACE_ARCH=arm64 ./build-r36-ultra.sh
-  USERSPACE_ARCH=arm64 BUILD_BUNDLED_APPS=y ./build-r36-ultra.sh
 
 Defaults:
-  BUILD_JOBS=4 USERSPACE_ARCH=armhf BUILD_BUNDLED_APPS=n
+  BUILD_JOBS=4 USERSPACE_ARCH=armhf
 USAGE
 }
 
@@ -115,19 +125,17 @@ elif [[ $# -ne 0 ]]; then
 fi
 
 [[ "$USERSPACE_ARCH" == "armhf" || "$USERSPACE_ARCH" == "arm64" ]] || darkos_die "USERSPACE_ARCH must be armhf or arm64."
-[[ "$BUNDLED_APPS" == "y" || "$BUNDLED_APPS" == "n" ]] || darkos_die "BUILD_BUNDLED_APPS must be y or n."
 [[ "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || darkos_die "BUILD_JOBS must be a positive integer."
 [[ "$CACHE" == "y" || "$CACHE" == "n" ]] || darkos_die "ENABLE_CACHE must be y or n."
 [[ "$DEFER_IMAGE_COPY" == "0" || "$DEFER_IMAGE_COPY" == "1" ]] || darkos_die "DARKOS_DEFER_IMAGE_COPY must be 0 or 1."
 
 run_make() {
     cd "$SCRIPT_DIR"
-    darkos_log "Building or resuming RG351MP (Debian ${DEBIAN_RELEASE}, userspace=${USERSPACE_ARCH}, profile=${BUILD_PROFILE}, jobs=${BUILD_JOBS}, cache=${CACHE})"
+    darkos_log "Building or resuming RG351MP (Debian ${DEBIAN_RELEASE}, userspace=${USERSPACE_ARCH}, jobs=${BUILD_JOBS}, cache=${CACHE})"
     env DEBIAN_CODE_NAME="$DEBIAN_RELEASE" \
         DARKOS_IMAGE_NAME="$IMAGE_NAME" \
         USERSPACE_ARCH="$USERSPACE_ARCH" \
         BUILD_JOBS="$BUILD_JOBS" \
-        BUILD_BUNDLED_APPS="$BUNDLED_APPS" \
         ENABLE_CACHE="$CACHE" \
         DARKOS_R36_STATE_DIR="${DARKOS_R36_STATE_DIR:-$HOME/darkos-r36-state}" \
         DARKOS_R36_BOOT_PAYLOAD="$BOOT_PAYLOAD_DIR" \
@@ -199,7 +207,6 @@ multipass exec "$VM_NAME" -- env \
     DARKOS_IMAGE_NAME="$IMAGE_NAME" \
     USERSPACE_ARCH="$USERSPACE_ARCH" \
     BUILD_JOBS="$BUILD_JOBS" \
-    BUILD_BUNDLED_APPS="$BUNDLED_APPS" \
     ENABLE_CACHE="$CACHE" \
     DARKOS_R36_STATE_DIR="/home/ubuntu/darkos-r36-state" \
     DARKOS_R36_BOOT_PAYLOAD="$VM_BOOT_PAYLOAD" \

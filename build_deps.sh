@@ -7,19 +7,19 @@ echo -e "Installing build dependencies and needed packages...\n\n"
 if [[ "${USERSPACE_ARCH:-}" == "armhf" ]]; then
   BIT="native"
   ARCH="arm-linux-gnueabihf"
-  CHROOT_DIR="Arkbuild"
+  CHROOT_DIR="MixOSBuild"
 elif [[ "${USERSPACE_ARCH:-}" == "arm64" ]]; then
   BIT="64"
   ARCH="aarch64-linux-gnu"
-  CHROOT_DIR="Arkbuild"
+  CHROOT_DIR="MixOSBuild"
 elif [ "$1" == "32" ]; then
   BIT="32"
   ARCH="arm-linux-gnueabihf"
-  CHROOT_DIR="Arkbuild32"
+  CHROOT_DIR="MixOSBuild32"
 else
   BIT="64"
   ARCH="aarch64-linux-gnu"
-  CHROOT_DIR="Arkbuild"
+  CHROOT_DIR="MixOSBuild"
 fi
 
 # Install additional needed packages and protect them from autoremove.
@@ -59,11 +59,11 @@ fi
 # resume runner mounts it too, so an unconditional `mount --bind' stacks one layer per
 # attempt on the same directory -- which is what left a mount behind after the single
 # umount at cleanup and produced the "Device or resource busy" on the way out.
-[ ! -d "${CHROOT_DIR}/home/ark/Arkbuild_ccache" ] && sudo mkdir -p ${CHROOT_DIR}/home/ark/Arkbuild_ccache
-if ! mountpoint -q ${CHROOT_DIR}/home/ark/Arkbuild_ccache; then
-  sudo mount --bind ${PWD}/Arkbuild_ccache ${CHROOT_DIR}/home/ark/Arkbuild_ccache
+[ ! -d "${CHROOT_DIR}/home/virtua/MixOSBuild_ccache" ] && sudo mkdir -p ${CHROOT_DIR}/home/virtua/MixOSBuild_ccache
+if ! mountpoint -q ${CHROOT_DIR}/home/virtua/MixOSBuild_ccache; then
+  sudo mount --bind ${PWD}/MixOSBuild_ccache ${CHROOT_DIR}/home/virtua/MixOSBuild_ccache
 fi
-sudo chroot ${CHROOT_DIR}/ bash -c "[ -z \$(echo \$CCACHE_DIR | grep ccache) ]" && echo -e "export CCACHE_DIR=/home/ark/Arkbuild_ccache" | sudo tee -a ${CHROOT_DIR}/root/.bashrc > /dev/null
+sudo chroot ${CHROOT_DIR}/ bash -c "[ -z \$(echo \$CCACHE_DIR | grep ccache) ]" && echo -e "export CCACHE_DIR=/home/virtua/MixOSBuild_ccache" | sudo tee -a ${CHROOT_DIR}/root/.bashrc > /dev/null
 sudo chroot ${CHROOT_DIR}/ bash -c "[ -z \$(echo \$PATH | grep ccache) ]" && echo -e "export PATH=/usr/lib/ccache:\$PATH" | sudo tee -a ${CHROOT_DIR}/root/.bashrc > /dev/null
 sudo chroot ${CHROOT_DIR}/ bash -c "/usr/sbin/update-ccache-symlinks"
 
@@ -88,10 +88,10 @@ do
   else
     FOLDER="armhf"
   fi
-  sudo mkdir -p Arkbuild/usr/lib/${ARCHITECTURE}/
+  sudo mkdir -p MixOSBuild/usr/lib/${ARCHITECTURE}/
   wget --retry-connrefused --retry-on-http-error=429 --waitretry=20 -t 65 -T 60 --no-check-certificate -O ${whichmali} https://github.com/christianhaitian/${CHIPSET}_core_builds/raw/refs/heads/master/mali/${FOLDER}/${whichmali}
-  sudo mv ${whichmali} Arkbuild/usr/lib/${ARCHITECTURE}/.
-  cd Arkbuild/usr/lib/${ARCHITECTURE}
+  sudo mv ${whichmali} MixOSBuild/usr/lib/${ARCHITECTURE}/.
+  cd MixOSBuild/usr/lib/${ARCHITECTURE}
   sudo ln -sf ${whichmali} libMali.so
   for LIB in libEGL.so libEGL.so.1 libEGL.so.1.1.0 libGLES_CM.so libGLES_CM.so.1 libGLESv1_CM.so libGLESv1_CM.so.1 libGLESv1_CM.so.1.1.0 libGLESv2.so libGLESv2.so.2 libGLESv2.so.2.0.0 libGLESv2.so.2.1.0 libGLESv3.so libGLESv3.so.3 libgbm.so libgbm.so.1 libgbm.so.1.0.0 libmali.so libmali.so.1 libMaliOpenCL.so libOpenCL.so libwayland-egl.so libwayland-egl.so.1 libwayland-egl.so.1.0.0
   do
@@ -100,7 +100,7 @@ do
   done
   cd ../../../../
 done
-sudo chroot Arkbuild/ ldconfig
+sudo chroot MixOSBuild/ ldconfig
 
 # THE THREE BLOCKS BELOW HAVE TO SURVIVE A SECOND RUN.
 #
@@ -126,7 +126,7 @@ sudo chroot ${CHROOT_DIR}/ bash -c "
 if ls /usr/lib/${ARCH}/librga.so* > /dev/null 2>&1 && [ -f /usr/local/include/rga/RgaApi.h ]; then
   echo 'librga is already installed in this chroot, skipping'
 else
-  cd /home/ark &&
+  cd /home/virtua &&
   rm -rf linux-rga &&
   git clone https://github.com/christianhaitian/linux-rga.git &&
   cd linux-rga &&
@@ -145,7 +145,7 @@ sudo chroot ${CHROOT_DIR}/ bash -c "
 if ls /usr/lib/${ARCH}/libgo2.so* > /dev/null 2>&1 && ls /usr/include/go2/*.h > /dev/null 2>&1; then
   echo 'libgo2 is already installed in this chroot, skipping'
 else
-  cd /home/ark &&
+  cd /home/virtua &&
 	  rm -rf libgo2 &&
 	  git clone https://github.com/OtherCrashOverride/libgo2.git &&
 	  cd libgo2 &&

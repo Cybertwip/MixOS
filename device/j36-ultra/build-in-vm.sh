@@ -58,6 +58,21 @@ die() { printf '\n[build-j36-ultra] ERROR: %s\n' "$*" >&2; exit 1; }
 [[ "$(uname -s)" == Linux ]] || die "build-in-vm.sh must run on Linux"
 [[ -d "$DRIVERS" ]] || die "MVII J36 Drivers not found: $DRIVERS"
 
+# The two caches in the checkout root were called Arkbuild_ccache and
+# Arkbuild_package_cache until the rename, and a VM that last built before it still has
+# them under those names.  Neither is a build input this script can do without cheaply:
+# the ccache is every object the ARMv7 kernel build has compiled, and the package cache
+# holds the armhf debootstrap tarball ensure_armhf_chroot prefers over debootstrapping
+# again.  Missing, both are silent -- a cold ccache and a fallback path -- so move them
+# rather than let a rename cost an hour.  The R36 build does the same in utils.sh and
+# prepare.sh; this script sources neither.  Drop this once no VM predates the rename.
+for legacy_cache in ccache package_cache; do
+    if [[ -d "$ROOT/Arkbuild_$legacy_cache" && ! -d "$ROOT/MixOSBuild_$legacy_cache" ]]; then
+        log "Moving Arkbuild_$legacy_cache to MixOSBuild_$legacy_cache"
+        mv "$ROOT/Arkbuild_$legacy_cache" "$ROOT/MixOSBuild_$legacy_cache"
+    fi
+done
+
 mkdir -p "$WORK" "$CACHE" "$ARTIFACTS"
 # Only --mix-only exports anything, so only --mix-only gets a directory.  A full build
 # ships one image and an empty export/ next to it would read as "the artifacts are
@@ -923,7 +938,7 @@ log "Sound configuration: $(grep -E '^CONFIG_(SOUND|SND)[A-Z0-9_]*=(y|m)$' "$CON
 log "Storage configuration: $(grep -E '^CONFIG_(SCSI|BLK_DEV_SD|BLK_DEV_SR|CHR_DEV_|USB_STORAGE|NTFS)[A-Z0-9_]*=(y|m)$' "$CONFIG" | tr '\n' ' ')"
 
 log "Building the incremental ARMv7 kernel and its symbol table"
-export CCACHE_DIR="${CCACHE_DIR:-$ROOT/Arkbuild_ccache}"
+export CCACHE_DIR="${CCACHE_DIR:-$ROOT/MixOSBuild_ccache}"
 mkdir -p "$CCACHE_DIR"
 if [[ -d /usr/lib/ccache ]]; then export PATH="/usr/lib/ccache:$PATH"; fi
 # `modules' is not optional here even though this configuration selects almost no
@@ -2484,11 +2499,11 @@ setup_gl() {
 # says to do, and then on every other partition of the card -- a tree extracted onto
 # a data partition works, read-only mounted, without a keyboard and without a shell.
 #
-# WHY User=root.  The unit ES ran under is User=ark, and three things the dashboard
-# does are not ark's: it puts /dev/tty0 into KD_GRAPHICS at its first paint so the
+# WHY User=root.  The obvious unit runs as the login user, and three things the dashboard
+# does are not that user's: it puts /dev/tty0 into KD_GRAPHICS at its first paint so the
 # kernel's console stops drawing over the dashboard -- and back into KD_TEXT if it
 # fails or is stopped, which is the only reason a failure on this board is readable at
-# all -- and that is an ioctl on a device ark cannot open; the Restart and Power off
+# all -- and that is an ioctl on a device an unprivileged login cannot open; the Restart and Power off
 # cards call reboot and poweroff; and the 3D cube card needs DRM master for its
 # modeset.  None of them is worth a polkit rule on a card that cannot be edited.
 #
@@ -3290,9 +3305,10 @@ add)
     # Who owns the files.  vfat, exfat and ntfs3 have no on-disk ownership, so
     # whatever uid is passed at mount time is the uid of every file on the volume;
     # pass none and that uid is root, which makes a stick read-only to the person
-    # holding the handheld.  The login user is looked up rather than assumed,
-    # because this rootfs is shared with another machine whose user is called
-    # something else.
+    # holding the handheld.  The login user is looked up rather than assumed:
+    # `virtua' is what this tree builds, and `ark' is what it was called before the
+    # rename -- which matters because --mix-only drops this payload onto a card that
+    # is already out there rather than onto a rootfs this run made.
     ouid=""; ogid=""
     for candidate in virtua ark; do
         while IFS=: read -r u _p uid gid _rest; do
@@ -4591,7 +4607,7 @@ armhf_chroot_run() {
 # with one left it is what stops a re-run from doing the qtbase5-dev apt again.
 ensure_armhf_chroot() {
     local suite="${DEBIAN_RELEASE:-trixie}" base m
-    base="$ROOT/Arkbuild_package_cache/debian_${suite}_userspace-armhf_rootfs.tar.gz"
+    base="$ROOT/MixOSBuild_package_cache/debian_${suite}_userspace-armhf_rootfs.tar.gz"
 
     # The rename described above ARMHF_CHROOT, done once and quietly.  Guarded on the
     # stamp file so a half-made or already-migrated tree is left alone, and on the
@@ -4610,7 +4626,7 @@ ensure_armhf_chroot() {
             log "chroot: unpacking the armhf $suite rootfs from the MixOS package cache"
             sudo tar -xpzf "$base" -C "$WORK/armhf-chroot-x" || return 1
             # The cache tarball carries MixOS's own chroot name at the top.
-            sudo mv "$WORK/armhf-chroot-x/Arkbuild" "$ARMHF_CHROOT" || return 1
+            sudo mv "$WORK/armhf-chroot-x/MixOSBuild" "$ARMHF_CHROOT" || return 1
         else
             log "chroot: no armhf rootfs in the package cache, debootstrapping one"
             command -v qemu-arm-static >/dev/null || {

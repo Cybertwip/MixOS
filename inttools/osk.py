@@ -620,7 +620,7 @@ class OSK:
 def parse_arguments(args):
     parser = ArgumentParser(description="Reads a string using an On Screen Keyboard")
 
-    parser.add_argument('--backtitle', type=str, help='Window title', default="dArkOS", required=False)
+    parser.add_argument('--backtitle', type=str, help='Window title', default="MixOS", required=False)
     parser.add_argument('--inputbox', type=str, help='Name of the string being captured', required=False)
     parser.add_argument(
         '--minchars', type=int, nargs='?',
@@ -638,7 +638,7 @@ def main():
     backtitle, inputbox, minchars, value = parse_arguments(sys.argv)
     # get the terminal size to detect small display
     cols, rows = get_terminal_size(1)
-    #f = open("/home/ark/terminalsize.txt", "a")
+    #f = open("/home/virtua/terminalsize.txt", "a")
     #f.write(str(cols))
     #f.write(str(rows))
     #f.close()

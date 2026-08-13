@@ -5,7 +5,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=ark
+User=virtua
 Restart=always
 RestartSec=1
 

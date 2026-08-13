@@ -21,9 +21,17 @@ else
   echo "Using existing local toolchain at $LOCAL_TOOLCHAIN_DIR"
 fi
 
-# Verify package cache directory exists
-if [ ! -d "Arkbuild_package_cache/${CHIPSET}" ]; then
-  mkdir -p Arkbuild_package_cache/${CHIPSET}
+# Verify package cache directory exists.  A build VM that last ran before the
+# Arkbuild -> MixOSBuild rename still holds the debootstrap tarball under the old
+# name, and not finding it is not an error -- bootstrap_rootfs.sh simply debootstraps
+# again, which is the 30-to-60 minute half of a cold build.  So move it across rather
+# than create an empty one next to it.  Drop this once no build VM predates the rename.
+if [ -d "Arkbuild_package_cache" ] && [ ! -d "MixOSBuild_package_cache" ]; then
+  echo -e "Moving Arkbuild_package_cache to MixOSBuild_package_cache\n"
+  mv Arkbuild_package_cache MixOSBuild_package_cache
+fi
+if [ ! -d "MixOSBuild_package_cache/${CHIPSET}" ]; then
+  mkdir -p MixOSBuild_package_cache/${CHIPSET}
 fi
 
 # Setup the necessary exports
@@ -56,26 +64,34 @@ function get_file() {
 }
 
 function call_chroot() {
-  sudo chroot Arkbuild bash -c "source /root/.bashrc && $@"
+  sudo chroot MixOSBuild bash -c "source /root/.bashrc && $@"
 }
 
 function call_chroot32() {
-  if [ ! -d Arkbuild32 ]; then
-    setup_arkbuild32
+  if [ ! -d MixOSBuild32 ]; then
+    setup_mixosbuild32
   fi
-  sudo chroot Arkbuild32 bash -c "source /root/.bashrc && $@"
+  sudo chroot MixOSBuild32 bash -c "source /root/.bashrc && $@"
 }
 
-function setup_ark_user() {
+function setup_virtua_user() {
   if [ "$1" == "32" ]; then
-    CHROOT_DIR="Arkbuild32"
+    CHROOT_DIR="MixOSBuild32"
   else
-    CHROOT_DIR="Arkbuild"
+    CHROOT_DIR="MixOSBuild"
   fi
-  # The home directory is the DATA partition's mount point, /home/virtua, and not
-  # /home/ark: p3 is where the user's files are meant to live, so a login has to land
-  # on it or every file the operator creates goes onto the rootfs instead.  bash starts
-  # in $HOME, so this one field is what makes a shell open on the writable partition.
+  # The login user is `virtua' and its home directory is the DATA partition's mount
+  # point.  The two names match on purpose: p3 is where the user's files are meant to
+  # live, so a login has to land on it or every file the operator creates goes onto the
+  # rootfs instead.  bash starts in $HOME, so this one field is what makes a shell open
+  # on the writable partition.
+  #
+  # It used to be `ark', with /home/ark a symlink to the mount point, because the
+  # emulator build scripts wrote 800-odd lines into /home/ark and the runtime scripts
+  # read from it.  Those build scripts are out of the tree and the runtime scripts now
+  # name the real path, so there is one name for one directory and no link in the middle
+  # -- which is worth having, because that link was relative for reasons that took a
+  # paragraph to explain and broke silently for any mount point outside /home.
   #
   # -m creates it on the ROOTFS as well, under what will be the mount point, and that
   # is deliberate: it is the fallback.  A card with no p3, or a p3 that failed its
@@ -83,82 +99,63 @@ function setup_ark_user() {
   # line means such a boot carries on, and it would otherwise carry on into a $HOME
   # that does not exist.  finishing_touches.sh copies this tree onto p3 so the mounted
   # and unmounted cases look the same.
-  ARK_HOME="${DATA_MOUNT_POINT:-/home/virtua}"
-  sudo chroot ${CHROOT_DIR}/ useradd ark -k /etc/skel -d "${ARK_HOME}" -m -s /bin/bash
-  # /home/ark is a symlink to it.  Around 800 lines of the emulator build scripts write
-  # into /home/ark, and dozens of runtime scripts read from it; the symlink means all of
-  # them keep working, at build time inside the chroot and on the device, without a
-  # rename that would touch every one of those files.
-  #
-  # RELATIVE, and that is the whole trick.  Most of those 800 lines are host-side writes
-  # of the form `sudo tee Arkbuild/home/ark/.config/.DEVICE`, and an absolute symlink
-  # would send them to /home/virtua on the BUILD MACHINE -- outside the build tree
-  # entirely, failing if the path does not exist there and quietly writing to somebody's
-  # real home directory if it does.  A link to "virtua" resolves within whichever /home
-  # it is read from, so the same symlink is correct on the host, in the chroot, and on
-  # the device.  A mount point outside /home cannot have that and gets the absolute form.
-  if [[ "$(dirname "${ARK_HOME}")" == "/home" ]]; then
-    sudo chroot ${CHROOT_DIR}/ ln -sfnv "$(basename "${ARK_HOME}")" /home/ark
-  else
-    sudo chroot ${CHROOT_DIR}/ ln -sfnv "${ARK_HOME}" /home/ark
-  fi
-  sudo chroot ${CHROOT_DIR}/ bash -c "echo ark:ark | chpasswd"
-  sudo chroot ${CHROOT_DIR}/ chage -I -1 -m 0 -M 99999 -E -1 ark
+  MIXOS_HOME="${DATA_MOUNT_POINT:-/home/virtua}"
+  sudo chroot ${CHROOT_DIR}/ useradd virtua -k /etc/skel -d "${MIXOS_HOME}" -m -s /bin/bash
+  sudo chroot ${CHROOT_DIR}/ bash -c "echo virtua:virtua | chpasswd"
+  sudo chroot ${CHROOT_DIR}/ chage -I -1 -m 0 -M 99999 -E -1 virtua
   sudo mkdir -p ${CHROOT_DIR}/etc/sudoers.d
-  echo "ark     ALL= NOPASSWD: ALL" | sudo tee ${CHROOT_DIR}/etc/sudoers.d/ark-no-sudo-password
-  echo "Defaults        !secure_path" | sudo tee ${CHROOT_DIR}/etc/sudoers.d/ark-no-secure-path
-  sudo chmod 0440 ${CHROOT_DIR}/etc/sudoers.d/ark-no-sudo-password
-  sudo chmod 0440 ${CHROOT_DIR}/etc/sudoers.d/ark-no-secure-path
-  sudo chroot ${CHROOT_DIR}/ usermod -G video,sudo,render,netdev,input,audio,adm,ark ark
+  echo "virtua     ALL= NOPASSWD: ALL" | sudo tee ${CHROOT_DIR}/etc/sudoers.d/virtua-no-sudo-password
+  echo "Defaults        !secure_path" | sudo tee ${CHROOT_DIR}/etc/sudoers.d/virtua-no-secure-path
+  sudo chmod 0440 ${CHROOT_DIR}/etc/sudoers.d/virtua-no-sudo-password
+  sudo chmod 0440 ${CHROOT_DIR}/etc/sudoers.d/virtua-no-secure-path
+  sudo chroot ${CHROOT_DIR}/ usermod -G video,sudo,render,netdev,input,audio,adm,virtua virtua
   directories=(".config")
   for dir in "${directories[@]}"; do
-    # ${ARK_HOME} and not /home/ark: the symlink above resolves inside the chroot, but
-    # only for chroot'd commands.  These mkdirs run on the HOST against a path in the
-    # build tree, where /home/ark points at an absolute path that means something quite
-    # different on the host -- so they name the real directory.
-    sudo mkdir -p "${CHROOT_DIR}${ARK_HOME}/${dir}"
+    # ${MIXOS_HOME} rather than a literal: these mkdirs run on the HOST against a path
+    # inside the build tree, so they have to name whatever useradd was given above.
+    sudo mkdir -p "${CHROOT_DIR}${MIXOS_HOME}/${dir}"
   done
-  echo -e "export LC_All=en_US.UTF-8" | sudo tee -a ${CHROOT_DIR}${ARK_HOME}/.bashrc > /dev/null
-  echo -e "export LC_CTYPE=en_US.UTF-8" | sudo tee -a ${CHROOT_DIR}${ARK_HOME}/.bashrc > /dev/null
-  sudo chroot ${CHROOT_DIR}/ chown -R ark:ark "${ARK_HOME}/"
+  echo -e "export LC_All=en_US.UTF-8" | sudo tee -a ${CHROOT_DIR}${MIXOS_HOME}/.bashrc > /dev/null
+  echo -e "export LC_CTYPE=en_US.UTF-8" | sudo tee -a ${CHROOT_DIR}${MIXOS_HOME}/.bashrc > /dev/null
+  sudo chroot ${CHROOT_DIR}/ chown -R virtua:virtua "${MIXOS_HOME}/"
 }
 
-function setup_arkbuild32() {
-  if [ ! -d Arkbuild32 ]; then
+function setup_mixosbuild32() {
+  if [ ! -d MixOSBuild32 ]; then
 	    # Bootstrap base system
-	    sudo debootstrap --no-check-gpg --include=eatmydata --resolve-deps --arch=armhf --foreign ${DEBIAN_CODE_NAME} Arkbuild32 http://deb.debian.org/debian/
-	    sudo cp /usr/bin/qemu-arm-static Arkbuild32/usr/bin/
+	    sudo debootstrap --no-check-gpg --include=eatmydata --resolve-deps --arch=armhf --foreign ${DEBIAN_CODE_NAME} MixOSBuild32 http://deb.debian.org/debian/
+	    sudo cp /usr/bin/qemu-arm-static MixOSBuild32/usr/bin/
 	    if [[ "${ENABLE_CACHE}" == "y" ]]; then
-	      echo 'Acquire::http::proxy "http://127.0.0.1:3142";' | sudo tee Arkbuild32/etc/apt/apt.conf.d/99proxy
+	      echo 'Acquire::http::proxy "http://127.0.0.1:3142";' | sudo tee MixOSBuild32/etc/apt/apt.conf.d/99proxy
 	    fi
-    sudo chroot Arkbuild32/ apt -y update
-    sudo chroot Arkbuild32/ apt -y install eatmydata
-    sudo chroot Arkbuild32/ eatmydata /debootstrap/debootstrap --second-stage
+    sudo chroot MixOSBuild32/ apt -y update
+    sudo chroot MixOSBuild32/ apt -y install eatmydata
+    sudo chroot MixOSBuild32/ eatmydata /debootstrap/debootstrap --second-stage
 
     # Bind essential host filesystems into chroot for networking
-    sudo mount --bind /dev Arkbuild32/dev
-    sudo mount -t devpts none Arkbuild32/dev/pts -o newinstance,ptmxmode=0666
-    #sudo mount --bind /dev/pts Arkbuild32/dev/pts
-    sudo mount --bind /proc Arkbuild32/proc
-    sudo mount --bind /sys Arkbuild32/sys
-    echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" | sudo tee Arkbuild32/etc/resolv.conf > /dev/null
+    sudo mount --bind /dev MixOSBuild32/dev
+    sudo mount -t devpts none MixOSBuild32/dev/pts -o newinstance,ptmxmode=0666
+    #sudo mount --bind /dev/pts MixOSBuild32/dev/pts
+    sudo mount --bind /proc MixOSBuild32/proc
+    sudo mount --bind /sys MixOSBuild32/sys
+    echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" | sudo tee MixOSBuild32/etc/resolv.conf > /dev/null
     # Install libmali, DRM, and GBM libraries for rk3326 or rk3566
-    sudo chroot Arkbuild32/ apt install -y libdrm-dev libgbm1
-    setup_ark_user 32
-    sudo mkdir -p Arkbuild32/home/ark
-    #sudo chroot Arkbuild32/ umount /proc
+    sudo chroot MixOSBuild32/ apt install -y libdrm-dev libgbm1
+    setup_virtua_user 32
+    sudo mkdir -p MixOSBuild32/home/virtua
+    #sudo chroot MixOSBuild32/ umount /proc
     source build_deps.sh 32
     source build_sdl2.sh 32
-    sudo cp -a Arkbuild32/usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0.${extension} Arkbuild/usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0.${extension}
-    sudo chroot Arkbuild/ bash -c "ln -sfv /usr/lib/arm-linux-gnueabihf/libSDL2.so /usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0"
-    sudo chroot Arkbuild/ bash -c "ln -sfv /usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0.${extension} /usr/lib/arm-linux-gnueabihf/libSDL2.so"
-    sudo cp -a Arkbuild32/home/ark/linux-rga/build/librga.so* Arkbuild/usr/lib/arm-linux-gnueabihf/
-    sudo cp -a Arkbuild32/home/ark/libgo2/libgo2.so* Arkbuild/usr/lib/arm-linux-gnueabihf/
+    sudo cp -a MixOSBuild32/usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0.${extension} MixOSBuild/usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0.${extension}
+    sudo chroot MixOSBuild/ bash -c "ln -sfv /usr/lib/arm-linux-gnueabihf/libSDL2.so /usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0"
+    sudo chroot MixOSBuild/ bash -c "ln -sfv /usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0.${extension} /usr/lib/arm-linux-gnueabihf/libSDL2.so"
+    sudo cp -a MixOSBuild32/home/virtua/linux-rga/build/librga.so* MixOSBuild/usr/lib/arm-linux-gnueabihf/
+    sudo cp -a MixOSBuild32/home/virtua/libgo2/libgo2.so* MixOSBuild/usr/lib/arm-linux-gnueabihf/
     # Place libmali manually (assumes you have libmali.so or mali drivers ready)
-    sudo mkdir -p Arkbuild32/usr/lib/arm-linux-gnueabihf/
+    sudo mkdir -p MixOSBuild32/usr/lib/arm-linux-gnueabihf/
     wget -t 3 -T 60 --no-check-certificate https://github.com/christianhaitian/${CHIPSET}_core_builds/raw/refs/heads/master/mali/armhf/${whichmali}
-    sudo mv ${whichmali} Arkbuild32/usr/lib/arm-linux-gnueabihf/.
-    cd Arkbuild32/usr/lib/arm-linux-gnueabihf
+    sudo mv ${whichmali} MixOSBuild32/usr/lib/arm-linux-gnueabihf/.
+    cd MixOSBuild32/usr/lib/arm-linux-gnueabihf
     sudo ln -sf ${whichmali} libMali.so
     for LIB in libEGL.so libEGL.so.1 libEGL.so.1.1.0 libGLES_CM.so libGLES_CM.so.1 libGLESv1_CM.so libGLESv1_CM.so.1 libGLESv1_CM.so.1.1.0 libGLESv2.so libGLESv2.so.2 libGLESv2.so.2.0.0 libGLESv2.so.2.1.0 libGLESv3.so libGLESv3.so.3 libgbm.so libgbm.so.1 libgbm.so.1.0.0 libmali.so libmali.so.1 libMaliOpenCL.so libOpenCL.so libwayland-egl.so libwayland-egl.so.1 libwayland-egl.so.1.0.0
     do
@@ -166,13 +163,13 @@ function setup_arkbuild32() {
       sudo ln -sfv libMali.so ${LIB}
     done
     cd ../../../../
-	sudo chroot Arkbuild32/ ldconfig
+	sudo chroot MixOSBuild32/ ldconfig
   fi
 }
 
 # ── Taking down the ccache bind mount, and why it is not a plain rm -rf ───────
 #
-# <root>/home/ark/Arkbuild_ccache is a bind of the HOST's $PWD/Arkbuild_ccache, so an
+# <root>/home/virtua/MixOSBuild_ccache is a bind of the HOST's $PWD/MixOSBuild_ccache, so an
 # rm -rf that runs while it is still mounted does not fail safely: it recurses THROUGH
 # the mount, deletes the host's ccache, and reports only "Device or resource busy" for
 # the mount point itself -- which is why a build that printed that line came back to
@@ -195,7 +192,7 @@ function setup_arkbuild32() {
 # from `mountpoint' -- which asks the kernel about THIS path -- rather than from a
 # substring search of /proc/mounts.  If the directory survives regardless, what is left
 # is the empty underlying directory: nothing was deleted through anything, and a
-# shipped rootfs carrying an empty /home/ark/Arkbuild_ccache is not worth an error line
+# shipped rootfs carrying an empty /home/virtua/MixOSBuild_ccache is not worth an error line
 # from rm, so report the outcome and carry on.
 function drop_ccache_mount() {
   local mnt="$1" i
@@ -228,8 +225,8 @@ function drop_ccache_mount() {
   return 0
 }
 
-function remove_arkbuild() {
-  drop_ccache_mount Arkbuild/home/ark/Arkbuild_ccache
+function remove_mixosbuild() {
+  drop_ccache_mount MixOSBuild/home/virtua/MixOSBuild_ccache
   # `dev' was listed twice here, which is what a stacked bind mount needs and what the
   # other three would need just as much: ensure_rootfs_mounts binds only what is not
   # already mounted, the individual build_*.sh scripts bind unconditionally, so any of
@@ -239,40 +236,40 @@ function remove_arkbuild() {
   do
     for i in 1 2 3
     do
-      mountpoint -q Arkbuild/${m} || break
-      sudo umount -l Arkbuild/${m}
+      mountpoint -q MixOSBuild/${m} || break
+      sudo umount -l MixOSBuild/${m}
       verify_action
       sync
       sleep 1
     done
   done
-  (cat /proc/mounts | grep -qs "Arkbuild") && sudo umount -l Arkbuild
-  (cat /proc/mounts | grep -qs "Arkbuild-final") && sudo umount -l Arkbuild-final
+  (cat /proc/mounts | grep -qs "MixOSBuild") && sudo umount -l MixOSBuild
+  (cat /proc/mounts | grep -qs "MixOSBuild-final") && sudo umount -l MixOSBuild-final
   return 0
 }
 
-function remove_arkbuild32() {
-  drop_ccache_mount Arkbuild32/home/ark/Arkbuild_ccache
+function remove_mixosbuild32() {
+  drop_ccache_mount MixOSBuild32/home/virtua/MixOSBuild_ccache
   for m in proc dev/pts dev sys
   do
     for i in 1 2 3
     do
-      mountpoint -q Arkbuild32/${m} || break
-      sudo umount -l Arkbuild32/${m}
+      mountpoint -q MixOSBuild32/${m} || break
+      sudo umount -l MixOSBuild32/${m}
       verify_action
       sync
       sleep 1
     done
   done
-  (cat /proc/mounts | grep -qs "Arkbuild32") && sudo umount -l Arkbuild32
+  (cat /proc/mounts | grep -qs "MixOSBuild32") && sudo umount -l MixOSBuild32
   # The whole tree, so the ccache bind inside it is the thing this must not walk into:
-  # `rm -rf Arkbuild32' with that mount still up deletes the host's ccache through it
+  # `rm -rf MixOSBuild32' with that mount still up deletes the host's ccache through it
   # and says nothing about having done so.  drop_ccache_mount above prints why when it
   # cannot clear it; this only has to decline.
-  if mountpoint -q Arkbuild32/home/ark/Arkbuild_ccache; then
-    echo "Leaving Arkbuild32 in place: its ccache bind mount is still up"
-  elif [ -d "Arkbuild32" ]; then
-    sudo rm -rf Arkbuild32
+  if mountpoint -q MixOSBuild32/home/virtua/MixOSBuild_ccache; then
+    echo "Leaving MixOSBuild32 in place: its ccache bind mount is still up"
+  elif [ -d "MixOSBuild32" ]; then
+    sudo rm -rf MixOSBuild32
   fi
   return 0
 }
@@ -323,16 +320,16 @@ function apt_update_once() {
 function install_package() {
   if [ "$1" == "native" ]; then
     NEEDED_ARCH=""
-    CHROOT_DIR="Arkbuild"
+    CHROOT_DIR="MixOSBuild"
   elif [ "$1" == "32" ]; then
     NEEDED_ARCH=""
-    CHROOT_DIR="Arkbuild32"
+    CHROOT_DIR="MixOSBuild32"
   elif [ "$1" == "armhf" ]; then
     NEEDED_ARCH=":armhf"
-    CHROOT_DIR="Arkbuild"
+    CHROOT_DIR="MixOSBuild"
   else
     NEEDED_ARCH=":arm64"
-    CHROOT_DIR="Arkbuild"
+    CHROOT_DIR="MixOSBuild"
   fi
   local needed=( "${@:2}" )
   (( ${#needed[@]} )) || return 0
@@ -391,9 +388,9 @@ function install_package() {
 # installed" that filled the build log.
 function protect_package() {
   if [ "$1" == "32" ]; then
-    CHROOT_DIR="Arkbuild32"
+    CHROOT_DIR="MixOSBuild32"
   else
-    CHROOT_DIR="Arkbuild"
+    CHROOT_DIR="MixOSBuild"
   fi
   local protectlibs=( "${@:2}" )
   (( ${#protectlibs[@]} )) || return 0

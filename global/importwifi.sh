@@ -24,13 +24,13 @@ if [[ -f $(find /opt/system/Tools -maxdepth 1 -iname wifikeyfile.txt) ]]; then
 	  height="20"
 	  width="60"
 	elif [[ -e "/dev/input/by-path/platform-singleadc-joypad-event-joystick" ]]; then
-	  if test ! -z "$(cat /home/ark/.config/.DEVICE | grep RG503 | tr -d '\0')"
+	  if test ! -z "$(cat /home/virtua/.config/.DEVICE | grep RG503 | tr -d '\0')"
 	  then
 		sudo setfont /usr/share/consolefonts/Lat7-TerminusBold20x10.psf.gz
-	  elif test ! -z "$(cat /home/ark/.config/.DEVICE | grep RGB20PRO | tr -d '\0')"
+	  elif test ! -z "$(cat /home/virtua/.config/.DEVICE | grep RGB20PRO | tr -d '\0')"
 	  then
 		sudo setfont /usr/share/consolefonts/Lat7-TerminusBold32x16.psf.gz
-	  elif test ! -z "$(cat /home/ark/.config/.DEVICE | grep MINILOONG | tr -d '\0')"
+	  elif test ! -z "$(cat /home/virtua/.config/.DEVICE | grep MINILOONG | tr -d '\0')"
 	  then
 		sudo setfont /usr/share/consolefonts/Lat7-TerminusBold28x14.psf.gz
 	  else

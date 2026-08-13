@@ -12,7 +12,7 @@ export SDL_GAMECONTROLLERCONFIG_FILE="/opt/inttools/gamecontrollerdb.txt"
 # the whole test now.
 if [[ -e "/dev/input/by-path/platform-gameforce-gamepad-event-joystick" ]]; then
   export HOTKEY="l3"
-elif [[ $(cat /home/ark/.config/.DEVICE) == "MINILOONG" ]]; then
+elif [[ $(cat /home/virtua/.config/.DEVICE) == "MINILOONG" ]]; then
   export HOTKEY="guide"
 fi
 /opt/inttools/gptokeyb -1 "ffplay" -c "/opt/inttools/mediaplayer.gptk" &

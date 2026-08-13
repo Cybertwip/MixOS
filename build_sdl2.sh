@@ -11,24 +11,24 @@ fi
 if [[ "${USERSPACE_ARCH:-}" == "armhf" ]]; then
   BITNESS="32"
   ARCH="arm-linux-gnueabihf"
-  CHROOT_DIR="Arkbuild"
+  CHROOT_DIR="MixOSBuild"
 elif [[ "${USERSPACE_ARCH:-}" == "arm64" ]]; then
   BITNESS="64"
   ARCH="aarch64-linux-gnu"
-  CHROOT_DIR="Arkbuild"
+  CHROOT_DIR="MixOSBuild"
 elif [ "$1" == "32" ]; then
   BITNESS="32"
   ARCH="arm-linux-gnueabihf"
-  CHROOT_DIR="Arkbuild32"
+  CHROOT_DIR="MixOSBuild32"
 else
   BITNESS="64"
   ARCH="aarch64-linux-gnu"
-  CHROOT_DIR="Arkbuild"
+  CHROOT_DIR="MixOSBuild"
 fi
 
 # Build and install SDL2
 if [ "$ARCH" == "arm-linux-gnueabihf" ]; then
-	  sudo chroot ${CHROOT_DIR}/ bash -c "source /root/.bashrc && cd /home/ark &&
+	  sudo chroot ${CHROOT_DIR}/ bash -c "source /root/.bashrc && cd /home/virtua &&
 	    export MAKEFLAGS=\"-j${BUILD_JOBS}\" &&
 	    export CMAKE_BUILD_PARALLEL_LEVEL=\"${BUILD_JOBS}\" &&
 	    nproc() { printf '%s\\n' '${BUILD_JOBS}'; } && export -f nproc &&
@@ -42,7 +42,7 @@ if [ "$ARCH" == "arm-linux-gnueabihf" ]; then
     make install
     "
 else
-	  sudo chroot ${CHROOT_DIR}/ bash -c "source /root/.bashrc && cd /home/ark &&
+	  sudo chroot ${CHROOT_DIR}/ bash -c "source /root/.bashrc && cd /home/virtua &&
 	    export MAKEFLAGS=\"-j${BUILD_JOBS}\" &&
 	    export CMAKE_BUILD_PARALLEL_LEVEL=\"${BUILD_JOBS}\" &&
 	    nproc() { printf '%s\\n' '${BUILD_JOBS}'; } && export -f nproc &&
@@ -56,14 +56,14 @@ else
     "
 fi
 
-extension=$(grep -oP '(?<=extension=").*?(?=")' ${CHROOT_DIR}/home/ark/${CHIPSET}_core_builds/scripts/sdl2.sh)
+extension=$(grep -oP '(?<=extension=").*?(?=")' ${CHROOT_DIR}/home/virtua/${CHIPSET}_core_builds/scripts/sdl2.sh)
 if [[ "$UNIT" != *"rgb10"* ]] && [ "$UNIT" != "rk2020" ] && [ "$CHIPSET" == "rk3326" ]; then
-  sudo chroot ${CHROOT_DIR}/ bash -c "cp -f /home/ark/${CHIPSET}_core_builds/sdl2-${BITNESS}/libSDL2-2.0.so.0.$extension /usr/lib/${ARCH}/."
+  sudo chroot ${CHROOT_DIR}/ bash -c "cp -f /home/virtua/${CHIPSET}_core_builds/sdl2-${BITNESS}/libSDL2-2.0.so.0.$extension /usr/lib/${ARCH}/."
 fi
 sudo chroot ${CHROOT_DIR}/ bash -c "ln -sfv /usr/lib/${ARCH}/libSDL2.so /usr/lib/${ARCH}/libSDL2-2.0.so.0"
 sudo chroot ${CHROOT_DIR}/ bash -c "ln -sfv /usr/lib/${ARCH}/libSDL2-2.0.so.0.${extension} /usr/lib/${ARCH}/libSDL2.so"
 sudo chroot ${CHROOT_DIR}/ bash -c "ln -sfv /usr/include/SDL2 /usr/local/include/"
 sudo chroot ${CHROOT_DIR}/ bash -c "rm -f /usr/bin/sdl2-config"
 sudo chroot ${CHROOT_DIR}/ bash -c "ln -sfv /usr/lib/${ARCH}/bin/sdl2-config /usr/bin/sdl2-config"
-sudo cp -R ${CHROOT_DIR}/home/ark/${CHIPSET}_core_builds/SDL/include/* ${CHROOT_DIR}/usr/include/${ARCH}/SDL2/
-sudo rm -rf ${CHROOT_DIR}/home/ark/${CHIPSET}_core_builds/SDL
+sudo cp -R ${CHROOT_DIR}/home/virtua/${CHIPSET}_core_builds/SDL/include/* ${CHROOT_DIR}/usr/include/${ARCH}/SDL2/
+sudo rm -rf ${CHROOT_DIR}/home/virtua/${CHIPSET}_core_builds/SDL

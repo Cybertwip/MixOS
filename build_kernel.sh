@@ -41,7 +41,7 @@ verify_action
 cd ..
 
 # Install kernel modules
-sudo make -C $KERNEL_SRC ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- INSTALL_MOD_PATH=../Arkbuild modules_install
+sudo make -C $KERNEL_SRC ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- INSTALL_MOD_PATH=../MixOSBuild modules_install
 
 # Format boot partition
 BOOT_PART_OFFSET=$((SYSTEM_PART_START * 512))
@@ -53,8 +53,8 @@ mkdir -p ${mountpoint}
 sudo mount ${LOOP_BOOT} ${mountpoint}
 
 # Copy kernel, device tree, and modules into target rootfs
-KERNEL_VERSION=$(basename $(ls Arkbuild/lib/modules))
-sudo cp $KERNEL_SRC/.config Arkbuild/boot/config-${KERNEL_VERSION}
+KERNEL_VERSION=$(basename $(ls MixOSBuild/lib/modules))
+sudo cp $KERNEL_SRC/.config MixOSBuild/boot/config-${KERNEL_VERSION}
 sudo cp $KERNEL_SRC/arch/arm64/boot/Image ${mountpoint}/
 sudo cp $KERNEL_SRC/arch/arm64/boot/dts/rockchip/${KERNEL_DTB} ${mountpoint}/
 if [ "$UNIT" == "rg351mp" ] || [ "$UNIT" == "g350" ] || [ "$UNIT" == "a10mini" ]; then
@@ -72,13 +72,13 @@ if [[ "${USERSPACE_ARCH:-arm64}" == "armhf" ]]; then
 else
   QEMU_STATIC=qemu-aarch64-static
 fi
-sudo cp "/usr/bin/${QEMU_STATIC}" Arkbuild/usr/bin/
-KERNEL_VERSION=$(basename $(find Arkbuild/lib/modules -maxdepth 1 -mindepth 1 -type d))
+sudo cp "/usr/bin/${QEMU_STATIC}" MixOSBuild/usr/bin/
+KERNEL_VERSION=$(basename $(find MixOSBuild/lib/modules -maxdepth 1 -mindepth 1 -type d))
 # Create symlink so depmod/initramfs can find modules for uname -r (host kernel)
-sudo touch Arkbuild/lib/modules/${KERNEL_VERSION}/modules.builtin.modinfo
+sudo touch MixOSBuild/lib/modules/${KERNEL_VERSION}/modules.builtin.modinfo
 call_chroot "uname() { echo ${KERNEL_VERSION}; }; export -f uname; depmod ${KERNEL_VERSION}; update-initramfs -c -k ${KERNEL_VERSION}"
-sudo rm "Arkbuild/usr/bin/${QEMU_STATIC}"
-sudo cp Arkbuild/boot/initrd.img-* ${mountpoint}/initrd.img
+sudo rm "MixOSBuild/usr/bin/${QEMU_STATIC}"
+sudo cp MixOSBuild/boot/initrd.img-* ${mountpoint}/initrd.img
 if ! command -v mkimage &> /dev/null; then
   sudo apt -y update
   sudo apt -y install u-boot-tools
