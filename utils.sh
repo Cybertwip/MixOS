@@ -132,12 +132,15 @@ function setup_mixosbuild32() {
     sudo chroot MixOSBuild32/ apt -y install eatmydata
     sudo chroot MixOSBuild32/ eatmydata /debootstrap/debootstrap --second-stage
 
-    # Bind essential host filesystems into chroot for networking
-    sudo mount --bind /dev MixOSBuild32/dev
-    sudo mount -t devpts none MixOSBuild32/dev/pts -o newinstance,ptmxmode=0666
-    #sudo mount --bind /dev/pts MixOSBuild32/dev/pts
-    sudo mount --bind /proc MixOSBuild32/proc
-    sudo mount --bind /sys MixOSBuild32/sys
+    # Bind essential host filesystems into chroot for networking.  --rbind + rslave and
+    # no separate devpts: see bootstrap_rootfs.sh for why a shared bind here put a
+    # `newinstance' devpts on the build machine's own /dev/pts and broke sudo on it.
+    sudo mount --rbind /dev MixOSBuild32/dev
+    sudo mount --make-rslave MixOSBuild32/dev
+    sudo mount --rbind /proc MixOSBuild32/proc
+    sudo mount --make-rslave MixOSBuild32/proc
+    sudo mount --rbind /sys MixOSBuild32/sys
+    sudo mount --make-rslave MixOSBuild32/sys
     echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" | sudo tee MixOSBuild32/etc/resolv.conf > /dev/null
     # Install libmali, DRM, and GBM libraries for rk3326 or rk3566
     sudo chroot MixOSBuild32/ apt install -y libdrm-dev libgbm1

@@ -107,11 +107,15 @@ fi
 sudo chroot ${CHROOT_DIR}/ apt-get -y install ccache eatmydata
 sudo chroot ${CHROOT_DIR}/ eatmydata /debootstrap/debootstrap --second-stage
 
-# Bind essential host filesystems into chroot for networking
-sudo mount --bind /dev ${CHROOT_DIR}/dev
-sudo mount -t devpts none ${CHROOT_DIR}/dev/pts -o newinstance,ptmxmode=0666
-sudo mount --bind /proc ${CHROOT_DIR}/proc
-sudo mount --bind /sys ${CHROOT_DIR}/sys
+# Bind essential host filesystems into chroot for networking.  --rbind + rslave and no
+# separate devpts: see bootstrap_rootfs.sh for why a shared bind here put a `newinstance'
+# devpts on the build machine's own /dev/pts and broke sudo on it.
+sudo mount --rbind /dev ${CHROOT_DIR}/dev
+sudo mount --make-rslave ${CHROOT_DIR}/dev
+sudo mount --rbind /proc ${CHROOT_DIR}/proc
+sudo mount --make-rslave ${CHROOT_DIR}/proc
+sudo mount --rbind /sys ${CHROOT_DIR}/sys
+sudo mount --make-rslave ${CHROOT_DIR}/sys
 echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" | sudo tee ${CHROOT_DIR}/etc/resolv.conf > /dev/null
 
 #sudo chroot ${CHROOT_DIR}/ mount -t proc proc /proc

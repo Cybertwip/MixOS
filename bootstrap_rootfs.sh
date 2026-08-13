@@ -55,18 +55,40 @@ else
 		sudo tar -cpzf "${ROOTFS_CACHE}.tar.gz" MixOSBuild/
 fi
 
-# Bind essential host filesystems into chroot for networking
-sudo mount --bind /dev MixOSBuild/dev
-sudo mount -t devpts none MixOSBuild/dev/pts -o newinstance,ptmxmode=0666
-#sudo mount --bind /dev/pts MixOSBuild/dev/pts -o newinstance,ptmxmode=0666
-sudo mount --bind /proc MixOSBuild/proc
-sudo mount --bind /sys MixOSBuild/sys
+# ── Bind the host filesystems into the chroot, ONE WAY ───────────────────────
+#
+# --rbind followed by --make-rslave, not --bind.  Ubuntu mounts / shared, so a plain
+# bind puts the copy in the SAME peer group as the original: anything mounted underneath
+# it inside the chroot propagates straight back out onto the host's own directory.
+#
+# That is not a theoretical concern here, it is what the next line used to do.  Mounting
+# a `newinstance' devpts on MixOSBuild/dev/pts, through a shared bind of /dev, landed a
+# second devpts instance on the BUILD MACHINE's /dev/pts -- and from that moment every
+# sudo on the machine died with "unable to allocate pty: No such device", including the
+# ones this script had not run yet.  Nothing unmounted it either, so the VM stayed
+# broken across builds and looked like hardware.  `chroot ... mount -t proc proc /proc'
+# did the milder version of the same thing, stacking one more proc on the host's /proc
+# per run, and the matching `umount /proc' at the end took one of the HOST's layers off.
+#
+# rslave keeps propagation one-way: mounts the host makes still appear inside the
+# chroot, mounts the chroot makes stay in the chroot.  And --rbind carries /dev/pts and
+# /dev/shm across with /dev, so there is nothing left for a separate devpts mount to do.
+#
+# A VM already in the broken state cannot be repaired from here -- the stray mounts are
+# not this tree's to find.  Restart it.
+sudo mount --rbind /dev MixOSBuild/dev
+sudo mount --make-rslave MixOSBuild/dev
+sudo mount --rbind /proc MixOSBuild/proc
+sudo mount --make-rslave MixOSBuild/proc
+sudo mount --rbind /sys MixOSBuild/sys
+sudo mount --make-rslave MixOSBuild/sys
 echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" | sudo tee MixOSBuild/etc/resolv.conf > /dev/null
 
 # Avoid service autostarts
 echo "exit 101" | sudo tee MixOSBuild/usr/sbin/policy-rc.d > /dev/null
 sudo chmod 0755 MixOSBuild/usr/sbin/policy-rc.d
-sudo chroot MixOSBuild/ mount -t proc proc /proc
+# `chroot MixOSBuild/ mount -t proc proc /proc' was here.  /proc is rbound above, so it
+# was already there; see the propagation note for what the extra layer landed on.
 
 # Install base runtime packages
 sudo chroot MixOSBuild/ eatmydata apt-get -y update
@@ -120,4 +142,46 @@ ATTR{idVendor}==\"0bda\", ATTR{idProduct}==\"c811\", RUN+=\"/usr/sbin/usb_modesw
 LABEL=\"end_modeswitch\"" | sudo tee MixOSBuild/etc/udev/rules.d/40-usb_modeswitch.rules
 sudo chroot MixOSBuild/ sync
 sleep 5
-sudo chroot MixOSBuild/ umount /proc
+# The matching `chroot MixOSBuild/ umount /proc' is gone with the mount above.  The
+# later stages want /proc there, remove_mixosbuild in utils.sh is what takes these down,
+# and while the bind was shared this line was unmounting a layer of the host's /proc.
+
+# ── POSTCONDITION: DID ANY OF THAT ACTUALLY LAND? ────────────────────────────
+#
+# run_stage marks `bootstrap.done' from this file's exit status, and a sourced script's
+# exit status is whatever its last command returned.  That last command was `sleep 5',
+# which always returns 0 -- so this stage reported success unconditionally, including
+# the run where sudo stopped working at line 60 and every command after it failed.  What
+# that recorded as a completed Debian bootstrap was the unpacked debootstrap tarball and
+# nothing else: no fstab, no login user, none of the base packages.  Every later stage
+# skipped bootstrap on the strength of that file, and the image would have come out with
+# a partition that mounts and a system that cannot boot.
+#
+# So the stage ends by checking for the things it exists to produce, and names the
+# missing one.  Four cheap tests against a two-hour stage.
+bootstrap_verify() {
+  local missing=()
+
+  if ! sudo test -s MixOSBuild/etc/fstab || \
+     sudo grep -q 'UNCONFIGURED FSTAB' MixOSBuild/etc/fstab; then
+    missing+=("a generated /etc/fstab")
+  fi
+  if ! sudo chroot MixOSBuild/ id -u virtua >/dev/null 2>&1; then
+    missing+=("the virtua login user")
+  fi
+  if ! sudo chroot MixOSBuild/ bash -c 'command -v nmcli' >/dev/null 2>&1; then
+    missing+=("network-manager")
+  fi
+  if ! sudo test -f MixOSBuild/etc/udev/rules.d/10-standard.rules; then
+    missing+=("the 10-standard.rules udev file")
+  fi
+
+  if (( ${#missing[@]} )); then
+    echo "Bootstrap did not finish.  The rootfs is missing: ${missing[*]}" >&2
+    echo "Nothing downstream can be trusted, so this stage is not being marked done." >&2
+    return 1
+  fi
+  echo "Bootstrap verified: fstab, the virtua user and the base packages are on the rootfs."
+  return 0
+}
+bootstrap_verify

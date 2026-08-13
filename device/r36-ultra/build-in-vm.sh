@@ -408,12 +408,24 @@ ensure_rootfs_mounts() {
             "$FILESYSTEM" MixOSBuild || \
             fail "Could not mount $FILESYSTEM as $ROOT_FILESYSTEM_FORMAT -- if this build root predates the ext2 layout, delete it and $ROOTFS_SNAPSHOT and run again"
     fi
-    sudo mkdir -p MixOSBuild/{dev/pts,proc,sys}
-    mountpoint -q MixOSBuild/dev || sudo mount --bind /dev MixOSBuild/dev
-    mountpoint -q MixOSBuild/dev/pts || \
-        sudo mount -t devpts none MixOSBuild/dev/pts -o newinstance,ptmxmode=0666
-    mountpoint -q MixOSBuild/proc || sudo mount --bind /proc MixOSBuild/proc
-    mountpoint -q MixOSBuild/sys || sudo mount --bind /sys MixOSBuild/sys
+    # --rbind + --make-rslave, and no separate devpts.  A plain bind of /dev joins the
+    # host's peer group on a shared-/ machine, so the `newinstance' devpts that used to
+    # go on MixOSBuild/dev/pts propagated onto the BUILD VM's own /dev/pts and left every
+    # sudo on it failing with "unable to allocate pty".  This ran once per stage, so it
+    # stacked a fresh instance each time.  See bootstrap_rootfs.sh for the long version.
+    sudo mkdir -p MixOSBuild/{dev,proc,sys}
+    if ! mountpoint -q MixOSBuild/dev; then
+        sudo mount --rbind /dev MixOSBuild/dev
+        sudo mount --make-rslave MixOSBuild/dev
+    fi
+    if ! mountpoint -q MixOSBuild/proc; then
+        sudo mount --rbind /proc MixOSBuild/proc
+        sudo mount --make-rslave MixOSBuild/proc
+    fi
+    if ! mountpoint -q MixOSBuild/sys; then
+        sudo mount --rbind /sys MixOSBuild/sys
+        sudo mount --make-rslave MixOSBuild/sys
+    fi
     printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | \
         sudo tee MixOSBuild/etc/resolv.conf >/dev/null
 }

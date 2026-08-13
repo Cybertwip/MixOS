@@ -4646,8 +4646,17 @@ ensure_armhf_chroot() {
     # of /sys left inside a directory tree is something the next rsync of this
     # machine trips over, with an unlink() permission denied that names a sysfs
     # file and explains nothing.
+    #
+    # --make-rslave on each of them, because a shared bind is a two-way street: on a
+    # machine with / mounted shared, anything a maintainer script mounts under the
+    # chroot's /dev or /proc appears on the BUILD MACHINE's, and stays there.  That is
+    # how the r36 bootstrap left a stray devpts on the VM's own /dev/pts and broke sudo
+    # for every later build.  Nothing in here mounts anything today; slave costs one
+    # syscall and means it stays that way.
     for m in dev proc sys; do
-        mountpoint -q "$ARMHF_CHROOT/$m" || sudo mount --bind "/$m" "$ARMHF_CHROOT/$m" || return 1
+        mountpoint -q "$ARMHF_CHROOT/$m" && continue
+        sudo mount --bind "/$m" "$ARMHF_CHROOT/$m" || return 1
+        sudo mount --make-rslave "$ARMHF_CHROOT/$m" || return 1
     done
     printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | \
         sudo tee "$ARMHF_CHROOT/etc/resolv.conf" >/dev/null
