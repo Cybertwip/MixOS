@@ -119,9 +119,14 @@ BUILD_JOBS=4 USERSPACE_ARCH=armhf ./build-r36-ultra.sh
   rest of the `DARKOS_*` build variables, the `darkos_*` shell helpers, and the
   `darkos-r36` build VM with its `~/darkos-r36-state` checkpoints.  Those are
   interfaces rather than branding, and renaming them would orphan existing build
-  state and cached checkpoints, so they are deliberately left as they are.  The
-  tools that ship on the card come from `MixOS_Tools/` in this checkout and land
-  in `/opt/system` on the image.
+  state and cached checkpoints, so they are deliberately left as they are.
+- The inherited `/opt/system` tool menu, the hostapd/dnsmasq access point and the
+  OTA updater are gone.  All of them came from ArkOS, none of them could run on
+  an image built from this tree (they draw with `msgbox`/`osk`/`gptokeyb`, which
+  no live script installs), and the updater pulled its payload from upstream
+  dArkOS.  `/opt/system` itself remains, because `roms/tools` is bind-mounted
+  onto it and `importwifi.sh` reads credentials out of there.  Replacements
+  belong in mixdash once the board has a working network interface.
 
 # Licence
 

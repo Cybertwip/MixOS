@@ -17,7 +17,19 @@ else
 fi
 ROOTFS_CACHE="MixOSBuild_package_cache/debian_${DEBIAN_CODE_NAME}_${ROOTFS_VARIANT}_rootfs"
 if [ -f "${ROOTFS_CACHE}.tar.gz" ] && [ "$(cat "${ROOTFS_CACHE}.commit")" == "$(curl -s https://deb.debian.org/debian/dists/stable/Release | grep "^Version:" | cut -d' ' -f2)" ]; then
-    sudo tar -xvzpf "${ROOTFS_CACHE}.tar.gz"
+    # --strip-components=1 into a named destination, not a plain extract in $PWD.  The
+    # archive carries whatever its top-level directory was called when it was written,
+    # and a cache written before the Arkbuild -> MixOSBuild rename holds `Arkbuild/...'
+    # members.  prepare.sh moves the cache DIRECTORY across, so that stale tarball is
+    # found and trusted: tar unpacked a perfectly good rootfs into Arkbuild/, every
+    # command after this one addressed MixOSBuild/, and the build spent a hundred lines
+    # saying "No such file or directory" before dying with `stage bootstrap returned
+    # 127'.  Naming the destination makes the extract independent of what the archive
+    # calls its root -- for this rename and for the next one.
+    #
+    # -v is gone with it.  Listing forty thousand paths is what buried the real error.
+    sudo mkdir -p MixOSBuild
+    sudo tar -xzpf "${ROOTFS_CACHE}.tar.gz" --strip-components=1 -C MixOSBuild
 else
 	if [[ "${ENABLE_CACHE}" == "y" ]]; then
 	  export DEBIAN_LOCATION="http://127.0.0.1:3142/deb.debian.org/debian/"
@@ -40,7 +52,7 @@ else
 	  sudo chroot MixOSBuild/ eatmydata apt-get -y install libc6:armhf liblzma5:armhf libasound2t64:armhf libfreetype6:armhf libxkbcommon-x11-0:armhf libudev1:armhf libudev0:armhf libgbm1:armhf libstdc++6:armhf
 	fi
 		sudo cat MixOSBuild/etc/os-release | grep "^DEBIAN_VERSION_FULL=" | cut -d'=' -f2 > "${ROOTFS_CACHE}.commit"
-		sudo tar -cvpzf "${ROOTFS_CACHE}.tar.gz" MixOSBuild/
+		sudo tar -cpzf "${ROOTFS_CACHE}.tar.gz" MixOSBuild/
 fi
 
 # Bind essential host filesystems into chroot for networking

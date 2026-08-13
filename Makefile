@@ -78,9 +78,13 @@ clean:
 # MixOS_devenv32, they have their own clean targets, and a build environment that took an
 # hour to make is not something `make clean' should take with it.  The ArkOS_ glob stays
 # for one more release -- a build root written before the rename is 3 GB or more and
-# nothing else deletes it.  (Comments in column 0 rather than after the tab: make ignores
-# these, whereas a tab-indented one is handed to the shell and echoed.)
-	sudo rm -rf MixOSBuild MixOSBuild32 MixOSBuild-final main mnt odroidgoA-4.4.y MixOS_*.img ArkOS_*.img rg351 wget-*
+# nothing else deletes it.  Arkbuild/Arkbuild32 are here for the same one release: a
+# cached debootstrap tarball written before the rename unpacked itself into Arkbuild/,
+# and until bootstrap_rootfs.sh was taught to name its destination that is exactly what
+# a resumed build did -- so there are trees out there holding a couple of gigabytes that
+# no other target has ever heard of.  (Comments in column 0 rather than after the tab:
+# make ignores these, whereas a tab-indented one is handed to the shell and echoed.)
+	sudo rm -rf MixOSBuild MixOSBuild32 MixOSBuild-final Arkbuild Arkbuild32 main mnt odroidgoA-4.4.y MixOS_*.img ArkOS_*.img rg351 wget-*
 # -m 1 on BOTH greps.  Without it on the second, two matching loop devices come back as
 # one newline-separated argument, losetup -d rejects it, the device stays attached, and
 # the loop condition still matches -- so the while never ends.

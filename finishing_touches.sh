@@ -155,30 +155,32 @@ sudo chroot MixOSBuild/ bash -c "ln -sf /usr/share/zoneinfo/America/New_York /et
 # what it installed was nineteen stale shared objects and a hard build dependency on
 # archive.debian.org staying up.
 #
-# Various tools available through Options added here.  Only the ones that do something
-# on an image with no front end and no emulators: the rest of MixOS_Tools drove
-# RetroArch, Drastic, PPSSPP, ECWolf and EmulationStation's collections, and is gone.
+# THE /opt/system TOOL MENU IS GONE, all of it.  Ten scripts were installed here --
+# Change Password, Enable/Disable Remote Services, Network Info, Remove ._ Files, System
+# Info, USB Drive Mount/Unmount, Wifi and Update -- and not one of them could run on an
+# image built from this tree.  They draw with `msgbox' and `osk' and drive themselves
+# with `gptokeyb' reading /opt/inttools/keys.gptk: no live script has ever copied
+# scripts/msgbox, scripts/osk or inttools/ onto the rootfs, gptokeyb is not in this
+# repository at all, and the urwid .deb that osk.py imports was built for arm64 against
+# an armhf userspace.  They were the front end's Options menu; mixdash does not open
+# them, so the only way to reach one was to type its path at a terminal and watch it
+# fail on the first line.
 #
+# Update.sh is the one worth naming.  It fetched dArkOSUpdate.sh from
+# christianhaitian/darkos-updates and executed it, and the release-tag loop that used to
+# sit further down this file pre-marked every tag that repository already had -- so a
+# card would have applied the NEXT upstream dArkOS release, written for /home/ark and a
+# front end this image does not have.  MixOS gets its own updater when there is a
+# network stack to carry it.
+#
+# The directory itself stays: line 110 puts a bind of ${DATA_MOUNT_POINT}/roms/tools on
+# /opt/system/Tools in the fstab, and global/importwifi.sh reads wifikeyfile.txt out of
+# it -- which is how a handheld with no configured network gets its first credentials.
 # /opt/system/Advanced is not created any more either.  It was the second level of the
 # front end's Options menu, and the only things that ever landed in it were the emulator
 # settings tools and a few self-replacing toggles that copy their own opposite in from
 # /usr/local/bin -- toggles for devices this tree no longer builds.
 sudo mkdir -p MixOSBuild/opt/system
-system_tools=(
-  "Change Password.sh"
-  "Disable Remote Services.sh"
-  "Enable Remote Services.sh"
-  "Network Info.sh"
-  "Remove ._ Files.sh"
-  "System Info.sh"
-  "USB Drive Mount.sh"
-  "USB Drive Unmount.sh"
-  "Update.sh"
-  "Wifi.sh"
-)
-for tool in "${system_tools[@]}"; do
-  sudo cp "MixOS_Tools/$tool" MixOSBuild/opt/system/
-done
 sudo chroot MixOSBuild/ bash -c "chown -R virtua:virtua /opt"
 sudo chmod -R 777 MixOSBuild/opt/system/
 
@@ -214,7 +216,6 @@ sudo cp scripts/timezones MixOSBuild/usr/local/bin/
 # it read that game out of ~/.emulationstation.  With no front end on this image
 # there is no last game to read and nothing to skip past, so the whole cluster is
 # gone rather than left installed and inert.
-sudo cp scripts/ap_mode.sh MixOSBuild/usr/local/bin/
 sudo cp scripts/auto_suspend* MixOSBuild/usr/local/bin/
 sudo cp scripts/processcheck.sh MixOSBuild/usr/local/bin/
 sudo cp scripts/autosuspend.service MixOSBuild/etc/systemd/system/
@@ -227,9 +228,15 @@ sudo cp scripts/keystroke.py MixOSBuild/usr/local/bin/
 # easyrpg.sh, gx4000.sh, neogeocd.sh and netplay.sh.  Each one existed to be
 # exec'd by the front end with a rom path, and each one ended in a RetroArch
 # command line naming a libretro core that is no longer built.
-sudo mkdir -p MixOSBuild/etc/hostapd
-sudo cp hostapd/hostapd.conf MixOSBuild/etc/hostapd/
-sudo cp dnsmasq/dnsmasq.conf MixOSBuild/etc/
+# The access point configuration used to be installed here: hostapd/hostapd.conf into
+# /etc/hostapd, dnsmasq/dnsmasq.conf into /etc, and scripts/ap_mode.sh above to bring the
+# pair up on wlan0 with a static 192.168.1.1.  It came from ArkOS, where it existed for
+# RetroArch's local netplay, and it shipped a fixed WPA passphrase -- the same one on
+# every card ever built from this tree, in public git history.  There is no working
+# network interface on this board yet, so what it amounted to was a credential handed out
+# for a radio nothing can bring up.  The hostapd and dnsmasq PACKAGES are still in
+# needed_packages.txt and are disabled below; only the configuration is gone, so a MixOS
+# access point can be written against whatever the MT6592 WiFi ends up being.
 sudo cp scripts/sleep_governors.sh MixOSBuild/usr/local/bin/
 sudo cp global/* MixOSBuild/usr/local/bin/
 # Disable winbind as connectivity to Active Directory is not needed
@@ -351,14 +358,11 @@ sudo chmod 777 MixOSBuild/usr/local/bin/boot_text.sh
 sudo cp scripts/welcome-message.service MixOSBuild/etc/systemd/system/welcome-message.service
 sudo chroot MixOSBuild/ bash -c "systemctl enable welcome-message"
 
-# Mark completed MixOS updates with this current build
-release_tags=( $(git -c 'versionsort.suffix=-' ls-remote --tags --sort='v:refname' https://github.com/christianhaitian/darkos-updates.git | cut -d/ -f3- | sed 's/^v//I') )
-if [[ ! -z "$release_tags" ]]; then
-  for release_tag in "${release_tags[@]}"
-  do
-    sudo touch MixOSBuild${DATA_MOUNT_POINT}/.config/.update${release_tag}
-  done
-fi
+# The OTA bookkeeping was here: an ls-remote against christianhaitian/darkos-updates and
+# a .update<tag> marker touched for every tag it already had, so /opt/system/Update.sh
+# would skip the whole history and apply only what came after.  Both halves are gone --
+# see the note at the tool block above -- and with them a network round trip in the
+# middle of every build, against a repository this project does not control.
 
 # Set the owner of the home directory and everything under it to the login user
 sudo chroot MixOSBuild/ bash -c "chown -R virtua:virtua ${DATA_MOUNT_POINT}"
