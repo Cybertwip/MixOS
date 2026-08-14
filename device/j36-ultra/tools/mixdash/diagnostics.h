@@ -7,20 +7,30 @@
  *
  * THE CARD IT REPLACES ran eglprobe -c 20, which exited 1, and the dashboard said
  * "3D cube exited 1" -- true, useless, and the reason this page exists.  eglprobe
- * fails at display_node(): it walks /dev/dri looking for a card with a CRTC and a
- * connector to flip on, and on this board there is none.  lima registers as a
+ * failed at display_node(): it walks /dev/dri looking for a card with a CRTC and a
+ * connector to flip on, and back then there was none.  lima registers as a
  * RENDER-ONLY driver -- no DRIVER_MODESET, no CRTC, no connector, no
  * /sys/class/drm/card0-* at all -- because the display side of an MT6592 is
- * mtk_drm, which in this image is a module nobody loads.  Every derivative fails
+ * mtk_drm, which at the time was a module nobody loaded.  Every derivative failed
  * the same way for the same reason: mpv's gpu output, SDL's KMSDRM backend, kmscube.
- * There is exactly one thing that reaches this panel, and it is the LK's
- * simple-framebuffer at 0x82700000 that mixdash is drawing into right now.
  *
- * SO THE CUBE IS STILL HERE, and it still turns -- rasterised by QPainter into
- * that framebuffer instead of by the GPU into a buffer nothing can scan out.  It
- * is now a measurement rather than a demo: the frame rate it reports is what this
- * CPU can do at 640x480, which is the number every other decision on this device
- * has to be made against.
+ * MTK_DRM BINDS NOW, and that made the old card worse rather than better.  card1
+ * appears, display_node() finds it, and eglprobe -c gets the modeset it always
+ * wanted -- so the cube turns, and then the process exits, the kernel drops its
+ * framebuffers, dropping the framebuffer a CRTC scans out disables that CRTC, and
+ * with CONFIG_DRM_FBDEV_EMULATION=n nothing hands the pipe back.  The panel stays
+ * dark until the next reboot, and the LK's simple-framebuffer at 0x82700000 --
+ * which mixdash is drawing into right now, and which is a different path to the
+ * same glass -- goes on accepting writes that no longer reach anyone's eyes.
+ * That is why the GPU row on this page runs eglprobe -o and not -c: same cube,
+ * same shaders, same GPU, copied into /dev/fb0 instead of scanned out, so there
+ * is nothing to take away.  See onActivated().
+ *
+ * SO THE CPU CUBE IS STILL HERE TOO, and it still turns -- rasterised by QPainter
+ * into that framebuffer.  It is a measurement rather than a demo: the frame rate
+ * it reports is what this CPU can do at 640x480, which is the number every other
+ * decision on this device has to be made against, and the number the GPU row is
+ * worth comparing against.
  *
  * AND THE REST OF THE PAGE ANSWERS THE QUESTION THE CARD RAISED -- for the display
  * stack, the input devices, sound, USB and power.  Each row is a probe with the

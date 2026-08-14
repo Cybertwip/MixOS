@@ -614,9 +614,9 @@ void DiagnosticsPage::rebuild()
     if (!egl.isEmpty()) {
         ListRow probeRow;
         probeRow.kind = ListRow::Action;
-        probeRow.text = tr("Run eglprobe anyway");
-        probeRow.detail = tr("Expected to fail while KMS is absent.\n"
-                             "It can also keep the panel: reboot after.");
+        probeRow.text = tr("GPU render test");
+        probeRow.detail = tr("The same cube, drawn by lima through GLES2.\n"
+                             "Copied into this framebuffer, so the panel is safe.");
         probeRow.glyph = GlyphChip;
         probeRow.accent = Theme::orange();
         probeRow.id = RowEglProbe;
@@ -692,10 +692,27 @@ void DiagnosticsPage::onActivated(int index)
         update();
         return;
     case RowEglProbe:
+        /*
+         * -o, and never -c.  Both draw the same cube with the same shaders on the
+         * same GPU; the difference is where the result lands.  -c hands its buffer
+         * to a CRTC, and a DRM client that has set a mode and then exits leaves the
+         * panel dark for the rest of the boot -- the kernel drops the client's
+         * framebuffers on close, dropping the framebuffer a CRTC scans out disables
+         * that CRTC, and this kernel is CONFIG_DRM_FBDEV_EMULATION=n so nothing
+         * turns it back on.  It cost us a black screen every time this row was
+         * pressed, and the confirmation prompt that used to be here only made the
+         * black screen deliberate.
+         *
+         * -o renders into an FBO on the render node and copies the result into
+         * /dev/fb0 with the CPU.  No modesetting node is opened at all, so there is
+         * nothing to take away and nothing to hand back; when it exits the
+         * dashboard repaints over it.  It still proves the whole GL path -- lima,
+         * Mesa, both shaders, 36 vertices -- which is all this row was ever for.
+         */
         emit launchRequested(QStringLiteral("eglprobe"),
                              firstExisting(QStringList() << "/run/j36/eglprobe"
                                                          << "/opt/mixos/bin/eglprobe"),
-                             QStringList() << "-c" << "20", true);
+                             QStringList() << "-o" << "20", false);
         return;
     case RowRescanInput:
         if (m_pad)

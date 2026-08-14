@@ -98,6 +98,13 @@
  * shaders, hands over 36 vertices and page-flips the result, which is the
  * smallest thing that cannot be faked -- see cube() for what that adds.
  *
+ * With -o it draws the same cube WITHOUT a modeset, and this is the one to reach
+ * for when the question is "does the GPU work".  It opens the render node, renders
+ * into an FBO, reads the pixels back and stores them into /dev/fb0 with the CPU.
+ * Every part of the GL path is exercised -- lima, Mesa, both shaders, the same 36
+ * vertices -- and no modesetting node is opened at all, so the readback is the
+ * whole of what it gives up and the panel is not part of the price.  See offload().
+ *
  * WHAT -p AND -c COST, because it is not obvious and it is not undoable.  A DRM
  * client that sets a mode and then exits leaves the panel black: on close the
  * kernel runs drm_fb_release() over the client's framebuffers, and removing the
@@ -106,18 +113,26 @@
  * no in-kernel fbdev client for drm_client_dev_restore() to hand the pipe back to.
  * So -p and -c hold the panel until the next reboot, and /dev/fb0 -- which is
  * simple-framebuffer over the LK's memory, a different path to the same glass --
- * stops being visible even though writes to it still succeed.  That is why neither
- * one runs at boot any more, why the dashboard's cube card asks twice, and why -f
- * exists: everything -p was being used to prove about the panel, -f proves without
- * spending the panel to do it.
+ * stops being visible even though writes to it still succeed.
  *
- * Usage: eglprobe [-f [seconds] | -i | -s | -p | -c [seconds] | /dev/dri/node ...].
- * With no arguments it reports /dev/fb0 read-only and then probes the display node
- * and renderD128.  -f runs alone and needs no library.  Exit status: 0 if some API
- * created a context on some display (for -p, if the mode was set; for -c, if a frame
- * was drawn; for -i, if a modesetting node exists at all; for -f, if there was a
- * framebuffer to look at), 1 otherwise.  Apart from -f's bars, an unblank and a
- * backlight that measured zero, nothing is written anywhere; stdout is the output.
+ * This got worse rather than better the day mediatek-drm started binding: before
+ * that, display_node() found nothing and -c failed harmlessly, which is why the
+ * dashboard was allowed to run it behind a confirmation.  Now it succeeds, and a
+ * confirmation only makes a black screen deliberate.  So -p and -c REFUSE unless
+ * -y is also given (see spend_the_panel()), the dashboard's GPU row runs -o, and
+ * -f covers everything -p was being used to prove about the panel without spending
+ * the panel to prove it.
+ *
+ * Usage: eglprobe [-f [seconds] | -i | -s | -o [seconds] [/dev/dri/node] |
+ * -p | -c [seconds] | -y | /dev/dri/node ...].  With no arguments it reports
+ * /dev/fb0 read-only and then probes the display node and renderD128.  -f runs
+ * alone and needs no library.  -y is consent for -p and -c and does nothing on its
+ * own.  Exit status: 0 if some API created a context on some display (for -p, if
+ * the mode was set; for -c and -o, if a frame was drawn; for -i, if a modesetting
+ * node exists at all; for -f, if there was a framebuffer to look at), 1 otherwise
+ * -- and 1 for a -p or -c that refused.  Apart from -f's bars, -o's frames, an
+ * unblank and a backlight that measured zero, nothing is written anywhere; stdout
+ * is the output.
  */
 
 #define _GNU_SOURCE
@@ -2774,13 +2789,72 @@ struct fbtarget {
     uint32_t       w, h, stride, bpp;
     struct fb_var_screeninfo var;
     int            xrgb8888;   /* the one layout with a byte-swap fast path */
+    int            ttyfd;      /* /dev/tty0, held so the mode can be put back */
+    int            ttymode;    /* what KDGETMODE said before we changed it, or -1 */
 };
+
+/*
+ * KD_GRAPHICS for the length of the run, and then back to whatever was there.
+ *
+ * This is the opposite of what tty_report(1) does, and deliberately.  That repair
+ * is for a panel that is black because something died holding KD_GRAPHICS; the
+ * console text is the thing wanted back.  Here we are about to draw, and fbcon
+ * drawing at the same time is the problem, not the cure -- from a plain console
+ * every line this program prints to stdout would land on top of the cube.  And
+ * when the caller is the dashboard, KD_GRAPHICS is already set and Qt is relying
+ * on it: putting the console back to KD_TEXT under a live linuxfb app is how the
+ * cube gets a boot log painted over it and how the dashboard gets one afterwards.
+ *
+ * So take the mode, remember it, and restore it on the way out.  A caller that had
+ * it in KD_GRAPHICS gets it back in KD_GRAPHICS, and nothing has been spent.
+ */
+static void fb_tty_take(struct fbtarget *t)
+{
+    t->ttymode = -1;
+    t->ttyfd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
+    if (t->ttyfd < 0) {
+        printf("offload: /dev/tty0: %m -- the console cannot be quietened, so "
+               "anything it prints will land on top of the frames\n");
+        return;
+    }
+    if (ioctl(t->ttyfd, KDGETMODE, &t->ttymode) < 0) {
+        printf("offload: KDGETMODE: %m\n");
+        t->ttymode = -1;
+        return;
+    }
+    if (t->ttymode == KD_GRAPHICS) {
+        printf("offload: /dev/tty0 is already in KD_GRAPHICS -- something owns "
+               "this panel, and it will be given back exactly as found\n");
+        return;
+    }
+    if (ioctl(t->ttyfd, KDSETMODE, KD_GRAPHICS) < 0) {
+        printf("offload: KDSETMODE(KD_GRAPHICS): %m -- the console keeps "
+               "drawing, so expect text over the cube\n");
+        t->ttymode = -1;
+    }
+}
+
+static void fb_tty_give_back(struct fbtarget *t)
+{
+    if (t->ttyfd >= 0) {
+        if (t->ttymode >= 0)
+            (void)ioctl(t->ttyfd, KDSETMODE, t->ttymode);
+        close(t->ttyfd);
+    }
+    t->ttyfd = -1;
+    t->ttymode = -1;
+}
 
 static int fb_target_open(struct fbtarget *t)
 {
     struct fb_fix_screeninfo fix;
 
     memset(t, 0, sizeof(*t));
+    /* Not zero: zero is stdin, and every failure path below closes what it
+     * opened.  A half-built target that got as far as being closed twice would
+     * take the caller's standard input with it. */
+    t->ttyfd = -1;
+    t->ttymode = -1;
     t->fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
     if (t->fd < 0) {
         printf("offload: /dev/fb0: %m -- with no framebuffer there is nowhere to "
@@ -2830,14 +2904,14 @@ static int fb_target_open(struct fbtarget *t)
                    t->var.green.offset ==  8 && t->var.green.length == 8 &&
                    t->var.blue.offset  ==  0 && t->var.blue.length  == 8);
 
-    /* Both of the states that are black on purpose, undone before drawing into a
+    /* A blanked framebuffer is black on purpose, and undone before drawing into a
      * panel that would otherwise stay dark and be blamed on the GPU.  The unblank
      * is advisory and its result is deliberately dropped: a panel that was never
      * blanked answers ENOTTY or EINVAL and needs nothing done about it, and a
      * panel that refuses to unblank is a finding for the frame below, not a
      * reason to give up the target here. */
     (void)ioctl(t->fd, FBIOBLANK, FB_BLANK_UNBLANK);
-    tty_report(1);
+    fb_tty_take(t);
 
     printf("offload: /dev/fb0 \"%s\" %ux%u %ubpp stride %u at 0x%08lx, "
            "r%u+%u g%u+%u b%u+%u%s\n",
@@ -2851,6 +2925,7 @@ static int fb_target_open(struct fbtarget *t)
 
 static void fb_target_close(struct fbtarget *t)
 {
+    fb_tty_give_back(t);
     if (t->base && t->base != MAP_FAILED)
         munmap(t->base, t->len);
     if (t->fd >= 0)
@@ -3222,13 +3297,49 @@ out_fb:
     return rc;
 }
 
+/*
+ * The two modes that spend the panel say so and stop, unless the caller has
+ * already said it knows.  This is not timidity: -p and -c are unrecoverable on
+ * this kernel, the cost is a dark screen until the next reboot, and the cost is
+ * paid AFTER the useful output has already scrolled past.  A prompt in the
+ * dashboard was tried and it was worse -- it turned an accident into a decision
+ * without changing the outcome.  -o is the answer for anything that just wants to
+ * see the GPU draw; -y is the answer for a bring-up session that genuinely needs
+ * a modeset and is willing to reboot afterwards.
+ */
+static int spend_the_panel(const char *flag, int consent)
+{
+    if (consent)
+        return 1;
+
+    printf("%s wants the CRTC, and this kernel cannot give it back.  Setting a "
+           "mode and then exiting leaves the panel dark until the next reboot: on "
+           "close the kernel removes this process's framebuffers, removing the "
+           "framebuffer a CRTC is scanning out disables that CRTC, and there is no "
+           "in-kernel fbdev client here to restore it (CONFIG_DRM_FBDEV_EMULATION=n). "
+           "/dev/fb0 keeps accepting writes that nobody can see.\n", flag);
+    printf("  eglprobe -o 20   the same cube on the same GPU, copied into "
+           "/dev/fb0, no modeset -- this is almost certainly what you want\n");
+    printf("  eglprobe -f      colour bars into /dev/fb0, no DRM node opened at "
+           "all, tells a dark panel apart from an unpainted one\n");
+    printf("  eglprobe %s -y   run it anyway, and reboot when it is done\n", flag);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     int wins = 0, painted = -1, cubed = -1, listed = -1, offloaded = -1, i;
     const char *node;
     int fb_secs = 3;
+    int consent = 0;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
+
+    /* Scanned ahead of everything so it works on either side of the mode it
+     * applies to, the way a person would expect it to. */
+    for (i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "-y"))
+            consent = 1;
 
     /*
      * -f is handled here, before load(), and it runs alone.  It is the one mode
@@ -3258,19 +3369,29 @@ int main(int argc, char **argv)
         for (i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "-s")) {
                 wins += probe_surfaceless();
+            } else if (!strcmp(argv[i], "-y")) {
+                continue;	/* read above, before any mode ran */
             } else if (!strcmp(argv[i], "-i")) {
                 listed = display_node() ? 0 : 1;
             } else if (!strcmp(argv[i], "-p")) {
                 /* No node that modesets is not a reason to fall back to card0 -- that
                  * is precisely the assumption that made -p meaningless before. */
+                if (!spend_the_panel("-p", consent)) {
+                    painted = 1;
+                    continue;
+                }
                 node = display_node();
                 painted = node ? paint(node) : 1;
             } else if (!strcmp(argv[i], "-c")) {
-                /* An optional number of seconds after it, so the dashboard can ask
-                 * for a short one and a bring-up session for a long one. */
+                /* An optional number of seconds after it, so a bring-up session can
+                 * ask for a long one.  The dashboard asks for -o instead. */
                 int secs = CUBE_SECONDS;
                 if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
                     secs = atoi(argv[++i]);
+                if (!spend_the_panel("-c", consent)) {
+                    cubed = 1;
+                    continue;
+                }
                 node = display_node();
                 cubed = node ? cube(node, secs > 0 ? secs : CUBE_SECONDS) : 1;
             } else if (!strcmp(argv[i], "-o")) {

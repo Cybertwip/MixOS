@@ -6501,9 +6501,12 @@ changes nothing else:
                            two ROM patches, which ship in wifi/firmware/ with it
   opt/mixos/j36/gl/        Mesa's GL front end, plus links
   opt/mixos/j36/eglprobe   -f reports and paints /dev/fb0 with no DRM at all and
-                           runs on every boot; the other modes say what can create
-                           a GL context, and why not, and whether a frame reaches
-                           the glass.  See "j36/eglprobe -f" below.
+                           runs on every boot; -o draws the GPU's cube into
+                           /dev/fb0 without a modeset; the other modes say what can
+                           create a GL context, and why not, and whether a frame
+                           reaches the glass.  -p and -c take the panel for the
+                           rest of the boot and need -y.  See "j36/eglprobe -f",
+                           "-o" and "-p" below.
 
 A TARBALL AND NOT A DIRECTORY, on purpose: this payload's symlinks, modes and
 ownership are load-bearing -- the Qt SONAME aliases are symlinks, mfgpower and the
@@ -7097,7 +7100,11 @@ j36.gl=1
     anything can reach the panel through DRM.
 
     The dashboard itself does not need this: it is Qt drawing with the CPU into
-    /dev/fb0.  What needs it is the "3D cube" card, which runs eglprobe -c.
+    /dev/fb0.  What needs it is the Diagnostics page's "GPU render test", which
+    runs eglprobe -o: the cube on lima, read back and copied into /dev/fb0.  It
+    used to run eglprobe -c, which scans the cube out through DRM instead, and
+    that took the panel for the rest of the boot every time -- see the -o and -y
+    notes under j36/eglprobe below.
 
     j36.gl=debug adds Mesa's own EGL trace and runs the node probes before the
     dashboard starts, so the journal names every /dev/dri node and says which one
@@ -7391,9 +7398,9 @@ Mesa, and what GL on this board can do
 --------------------------------------
 
 The dashboard needs no GL at all: it is Qt drawing with the CPU into /dev/fb0.  GL
-is here for j36/eglprobe -- the display tests below, and the "3D cube" card, which
-is the dashboard running eglprobe -c -- and for anything added later that wants a
-context.  Four links had to close before any of that worked, each one measured
+is here for j36/eglprobe -- the display tests below, and the "GPU render test" row
+on the Diagnostics page, which is the dashboard running eglprobe -o -- and for
+anything added later that wants a context.  Four links had to close before any of that worked, each one measured
 rather than assumed, and the list is worth keeping because it is also the fault
 tree:
 
@@ -7647,14 +7654,19 @@ one is an eye.  It speaks DRM with raw ioctls -- the uapi structs are ABI and li
 a fourth library that can be missing -- and prints the connector, the mode it was
 given, the CRTC and whatever framebuffer was already on it.
 
-It is NOT run at boot, and the reason is worth knowing before running it by hand.
-A DRM client that sets a mode and exits leaves the panel black: on close the kernel
-runs drm_fb_release() over that client's framebuffers, and removing the framebuffer
-a CRTC is scanning out disables the CRTC.  This kernel is built
+It is NOT run at boot, it REFUSES to run without -y, and the reason is the same
+one.  A DRM client that sets a mode and exits leaves the panel black: on close the
+kernel runs drm_fb_release() over that client's framebuffers, and removing the
+framebuffer a CRTC is scanning out disables the CRTC.  This kernel is built
 CONFIG_DRM_FBDEV_EMULATION=n on purpose, so there is no in-kernel fbdev client for
 drm_client_dev_restore() to hand the pipe back to.  -p and -c therefore hold the
 panel until the next reboot, and /dev/fb0 keeps accepting writes that are no longer
 seen.  Run -f first, not after.
+
+This mattered less when mediatek-drm did not bind: -p and -c failed at
+display_node(), harmlessly, which is why the dashboard was once allowed to run -c
+behind a confirmation.  Now they succeed.  `eglprobe -p' on its own prints what it
+would cost and what to run instead; `eglprobe -p -y' runs it.
 
   1  RED, XR24, filled with memset()          modeset + DSI + panel + OVL, no
                                               alpha and no Mesa anywhere
@@ -7686,10 +7698,29 @@ Read it as four verdicts:
                            section above, and a self test and a per-frame draw
                            count are the evidence.
 
-`/run/j36/eglprobe -p' by hand does the same thing from a console at any time, and
-it keeps the panel afterwards for the reason above -- reboot when it is done.  The
-dashboard's own "3D cube" card runs -c the same way, which is why that card asks
-twice before it starts.
+`/run/j36/eglprobe -p -y' by hand does the same thing from a console at any time,
+and it keeps the panel afterwards for the reason above -- reboot when it is done.
+
+j36/eglprobe -o, and the cube that costs nothing
+------------------------------------------------
+
+-o draws the cube -c draws -- same two shaders, same 36 vertices, same lima -- and
+lands it somewhere else.  It opens /dev/dri/renderD128, renders into a
+renderbuffer-backed FBO at the panel's size, reads the pixels back with
+glReadPixels and stores them into /dev/fb0 with the CPU, converting to whatever
+the fb's bpp and colour offsets say.  No modesetting node is opened at all, so
+there is no CRTC to take and nothing to hand back; when it exits the dashboard
+repaints over it and the panel is exactly as it was.
+
+The readback is the price, and -o prints the split -- GL, read, blit -- per run so
+it is visible.  On this board it is the readback and not the drawing that sets the
+frame rate, which is itself the finding: it is the number a zero-copy path would
+have to beat, and the reason the dma-buf exporter for the LK carveout is worth
+building.
+
+This is what the Diagnostics page's "GPU render test" row runs, and what anything
+that just wants to see whether the GPU draws should run.  `eglprobe -o 20' for
+twenty seconds; `eglprobe -o 20 /dev/dri/card1' to force a particular node.
 
 Reading the dashboard's startup trace
 -------------------------------------
