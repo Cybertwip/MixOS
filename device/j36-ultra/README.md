@@ -1,7 +1,7 @@
 # J36 Ultra MT6592 bring-up DTB
 
 MediaTek MT6592 (Cortex-A7, ARMv7, Mali-450 MP4) support for **MixOS**.  This
-directory is licensed under the **Microsoft Public License** — see
+directory is dual-licensed, **MPL-2.0 or GPL-2.0-or-later** at your option — see
 [LICENSE](LICENSE), which also records file by file the parts that are
 `GPL-2.0-only` and why they are not relicensed.  Attribution and thanks are at the
 bottom of this file and in [../../LICENSES.md](../../LICENSES.md).

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MS-PL */
+/* SPDX-License-Identifier: MPL-2.0 OR GPL-2.0-or-later */
 /*
  * Copyright (c) 2025-2026 the MixOS project and contributors
  * See device/j36-ultra/LICENSE for the licence text and what it covers.

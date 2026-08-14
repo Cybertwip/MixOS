@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: MS-PL
-# Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
-# device/j36-ultra/LICENSE for the full text and for what it does not cover.
+# SPDX-License-Identifier: MPL-2.0 OR GPL-2.0-or-later
+# Copyright (c) 2025-2026 the MixOS project.  MPL-2.0 or GPL-2.0-or-later, at your
+# option; see device/j36-ultra/LICENSE for the texts and for what they do not cover.
 # Generate and compile the J36 Ultra MT6592 bring-up DTB from the MVII board
 # sources vendored under device/j36-ultra/mvii-board. Those are read-only inputs.
 #

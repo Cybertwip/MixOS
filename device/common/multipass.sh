@@ -1,7 +1,7 @@
 # shellcheck shell=bash
-# SPDX-License-Identifier: MS-PL
-# Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
-# device/j36-ultra/LICENSE for the full text and for what it does not cover.
+# SPDX-License-Identifier: MPL-2.0 OR GPL-2.0-or-later
+# Copyright (c) 2025-2026 the MixOS project.  MPL-2.0 or GPL-2.0-or-later, at your
+# option; see device/j36-ultra/LICENSE for the texts and for what they do not cover.
 #
 # The macOS build-VM plumbing that build-r36-ultra.sh and build-j36-ultra.sh both
 # need, in one place.
