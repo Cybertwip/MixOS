@@ -136,7 +136,11 @@ their authors set; `mvii-board/PROVENANCE.txt` records a SHA-256 for each.
 
 ### Trademarks
 
-"MixOS" is a backronym joke about how software gets named; see the README. MixOS is
-not affiliated with, endorsed by or sponsored by Microsoft Corporation, X Corp.,
-xAI, MediaTek Inc., Rockchip, the Debian project or the Qt Company, and every
-trademark named anywhere in this repository belongs to its respective owner.
+Neither half of the dual grant conveys any right in a trademark — MPL-2.0 §2.3 says
+so explicitly, and the GPL has never granted one. Every trademark named anywhere in
+this repository belongs to its respective owner, including "Microsoft", "X", "xAI",
+"MediaTek", "Rockchip", "Debian" and "Qt". Naming them identifies the hardware, the
+software and the parties involved; it transfers nothing.
+
+MixOS is not affiliated with or endorsed by the Debian project, MediaTek Inc.,
+Rockchip, the Mozilla Foundation or the Qt Company.

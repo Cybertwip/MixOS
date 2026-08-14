@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: MS-PL
-# Copyright (c) 2025-2026 the MixOS project.  Microsoft Public License; see
-# device/j36-ultra/LICENSE for the full text and for what it does not cover.
+# SPDX-License-Identifier: MPL-2.0 OR GPL-2.0-or-later
+# Copyright (c) 2025-2026 the MixOS project.  MPL-2.0 or GPL-2.0-or-later, at your
+# option; see device/j36-ultra/LICENSE for the full text and for what it does not
+# cover.
 # Incremental J36 Ultra ARMv7 bring-up builder. Run inside Ubuntu, normally via
 # ./build-j36-ultra.sh on macOS. It never invokes the RG351MP/R36 build target.
 
@@ -7725,18 +7726,24 @@ halt.  On battery, `poweroff' cuts the rail.
 Licence
 -------
 
-See LICENSE.txt beside this file.  In short: the MixOS bring-up work is under the
-Microsoft Public License, the three kernel modules and the kernel itself are
-GPL-2.0-only, and everything else on the card is Debian's under its own terms.
-MixOS is a divergent fork of dArkOS, which continues ArkOS; the operating system
-underneath is Debian.  MixOS supports the MediaTek line of processors, and this
-card is that support.
+See LICENSE.txt beside this file.  In short: the MixOS bring-up work is dual
+licensed, MPL-2.0 or GPL-2.0-or-later at your option; the seven MixOS kernel
+modules and the kernel itself are GPL-2.0-only; and everything else on the card
+is Debian's under its own terms.  The operating system underneath is Debian, and
+MixOS is a device port on top of it -- the build scripts descend from dArkOS,
+which continues ArkOS, and nothing else here does.  MixOS supports the MediaTek
+line of processors, and this card is that support.
 README
 
-# Ms-PL section 3(C) is the reason this is written and not just linked from the
-# repository: a card handed to somebody else is a distribution, and it has to carry
-# its notices with it.  It is not added to SHA256SUMS, for the same reason
-# README.txt is not -- the sums cover what the machine executes.
+# MPL-2.0 section 3.2 and GPLv2 section 3 are the reason this is written and not just
+# linked from the repository: a card handed to somebody else is a distribution, and a
+# binary distribution has to tell its recipient what the terms are and where the source
+# is.  It is not added to SHA256SUMS, for the same reason README.txt is not -- the sums
+# cover what the machine executes.
+#
+# The mapping below is written here because it is specific to this card; the two full
+# licence texts are appended from the repository just after the heredoc, so there is
+# one copy of each in the tree and no chance of the card's copy drifting from it.
 cat > "$SDBOOT/LICENSE.txt" <<'LICENCE'
 MixOS -- J36 Ultra (MediaTek MT6592, ARMv7) SD card payload
 Copyright (c) 2025-2026 the MixOS project and contributors
@@ -7763,7 +7770,8 @@ is FAT because the MVII LK reads FAT32 and nothing else:
 This payload is not licensed uniformly.  Saying otherwise would be a false
 statement about other people's code.
 
-Microsoft Public License (Ms-PL), in full below:
+MPL-2.0 OR GPL-2.0-or-later -- take either one, at your option.  Both texts are
+appended in full at the end of this file:
 
     bin/mixdash             the MixOS dashboard (Qt5 Widgets on linuxfb)
     bin/j36-mixmirror       the panel-to-USB-HDMI mirror
@@ -7789,9 +7797,10 @@ GNU General Public License, version 2 only:
                             WLAN firmware download over the AHB HIF
     j36_mt6592_input.ko     MixOS's keypad and GPIO key adapter
 
-    The seven MixOS modules are GPL-2.0-only deliberately and are not Ms-PL: they
-    derive from and link against GPL-2.0-only kernel internals, and Ms-PL is not
-    GPL-compatible.
+    The seven MixOS modules are GPL-2.0-ONLY deliberately, and are not part of
+    the dual grant above: they derive from and link against GPL-2.0-only kernel
+    internals, which is narrower than either half of it.  Code may move from the
+    dual-licensed list into them; it may not move back out.
 
 Their own terms:
 
@@ -7809,86 +7818,71 @@ Their own terms:
     the rootfs on ROOTFS    Debian.  Per-package terms are in
                             /usr/share/doc/*/copyright on the running device.
 
-SOURCE.  Everything GPL-2.0-only here is built from public source: Linux 6.12 LTS
-from kernel.org with the two patches in the MixOS repository under
-device/j36-ultra/linux/, the three MixOS modules in the same directory, and
-busybox, Mesa, Qt, the fonts and doomgeneric as Debian packages them.  The MixOS
-work is in the same repository: the dashboard in
-device/j36-ultra/tools/mixdash, eglprobe and mfgpower beside it.  The MixOS build
-script that assembled this card is device/j36-ultra/build-in-vm.sh, and it is the
-complete recipe -- nothing here was produced by hand.
+SOURCE.  This is the written offer both licences ask for, and it is a short one
+because everything here is built from public source.  Linux 6.12 LTS comes from
+kernel.org with the two patches in the MixOS repository under
+device/j36-ultra/linux/; the seven MixOS modules are in the same directory; and
+busybox, Mesa, Qt, the fonts and doomgeneric are as Debian packages them.  The
+dual-licensed MixOS work is in the same repository: the dashboard in
+device/j36-ultra/tools/mixdash, and eglprobe, mfgpower and j36-mixmirror beside
+it.  The MixOS build script that assembled this card is
+device/j36-ultra/build-in-vm.sh, and it is the complete recipe -- nothing here was
+produced by hand.
 
-ATTRIBUTION.  MixOS is a divergent fork of dArkOS, itself a Debian-based
-continuation of ArkOS by christianhaitian.  Divergent is meant literally: MixOS
-adds a second SoC vendor and a 32-bit kernel to a build system that assumed
-neither, and neither dArkOS nor ArkOS endorses it, is affiliated with it, or should
-receive its bug reports.  Thanks are owed to the Debian project above all -- the
-operating system this device runs is Debian, and MixOS is a device port on top of
-it -- and to ArkOS and dArkOS, to MediaTek's documentation and vendor sources, to
-Mesa for lima and kmsro, and to the Linux kernel, SDL and busybox projects.  MixOS
-is not affiliated with or endorsed by the Debian project, MediaTek, or Microsoft;
-"Ms-PL" is simply the licence chosen for the MixOS work.
+WHY TWO LICENCES FOR THE MIXOS WORK.  Commercial use had to stay permitted, the
+source had to stay under a copyleft that returns fixes, and it all had to be
+combinable with the kernel it drives.  MPL-2.0 is file-level copyleft that
+section 3.3 lets you combine with proprietary code in a Larger Work, and sections
+1.12 and 3.3 name the GPL family as Secondary Licenses, so MPL-2.0 code may be
+redistributed under the GPL when it meets GPL code.  Offering GPL-2.0-or-later
+outright alongside it removes the last of the ambiguity.  This work was
+previously under the Microsoft Public License, which is not GPL-compatible;
+copies obtained under Ms-PL stay under Ms-PL, and from that revision on the terms
+are the dual grant.
+
+ATTRIBUTION.  The operating system this device runs is Debian, and MixOS is a
+device port on top of it: a second SoC vendor and a 32-bit kernel added to a build
+pipeline that assumed neither.  That pipeline is the one thing here that descends
+from dArkOS, itself a Debian-based continuation of ArkOS by christianhaitian, and
+it keeps their copyright and their MIT licence; nothing MixOS runs comes from
+either any more.  Neither dArkOS nor ArkOS endorses MixOS, is affiliated with it,
+or should receive its bug reports.  Thanks are owed to the Debian project above
+all, and to ArkOS and dArkOS, to MediaTek's documentation and vendor sources, to
+Mesa for lima and kmsro, and to the Linux kernel, Qt, SDL and busybox projects.
+Neither half of the dual grant conveys any right in a trademark, and every
+trademark named here belongs to its owner.  MixOS is not affiliated with or
+endorsed by the Debian project, MediaTek, the Mozilla Foundation or the Qt
+Company.
 
 
-Microsoft Public License (Ms-PL)
-
-This license governs use of the accompanying software. If you use the software,
-you accept this license. If you do not accept the license, do not use the
-software.
-
-1. Definitions
-
-The terms "reproduce," "reproduction," "derivative works," and "distribution"
-have the same meaning here as under U.S. copyright law.
-
-A "contribution" is the original software, or any additions or changes to the
-software.
-
-A "contributor" is any person that distributes its contribution under this
-license.
-
-"Licensed patents" are a contributor's patent claims that read directly on its
-contribution.
-
-2. Grant of Rights
-
-(A) Copyright Grant- Subject to the terms of this license, including the license
-conditions and limitations in section 3, each contributor grants you a
-non-exclusive, worldwide, royalty-free copyright license to reproduce its
-contribution, prepare derivative works of its contribution, and distribute its
-contribution or any derivative works that you create.
-
-(B) Patent Grant- Subject to the terms of this license, including the license
-conditions and limitations in section 3, each contributor grants you a
-non-exclusive, worldwide, royalty-free license under its licensed patents to make,
-have made, use, sell, offer for sale, import, and/or otherwise dispose of its
-contribution in the software or derivative works of the contribution in the
-software.
-
-3. Conditions and Limitations
-
-(A) No Trademark License- This license does not grant you rights to use any
-contributors' name, logo, or trademarks.
-
-(B) If you bring a patent claim against any contributor over patents that you
-claim are infringed by the software, your patent license from such contributor to
-the software ends automatically.
-
-(C) If you distribute any portion of the software, you must retain all copyright,
-patent, trademark, and attribution notices that are present in the software.
-
-(D) If you distribute any portion of the software in source code form, you may do
-so only under this license by including a complete copy of this license with your
-distribution. If you distribute any portion of the software in compiled or binary
-form, you may do so only under a license that complies with this license.
-
-(E) The software is licensed "as-is." You bear the risk of using it. The
-contributors give no express warranties, guarantees, or conditions. You may have
-additional consumer rights under your local laws which this license cannot change.
-To the extent permitted under your local laws, the contributors exclude the
-implied warranties of merchantability, fitness for a particular purpose and
-non-infringement.
+The full text of both licences follows, appended to this file when the card was
+built: the Mozilla Public License 2.0 first, then the GNU General Public License
+version 2.  Either one covers the MixOS work listed above; you choose.
 LICENCE
+
+# The two texts themselves, appended verbatim from the repository rather than inlined
+# in this script.  One copy of each in the tree is the point: the card cannot end up
+# quoting a licence that differs from the one the source is offered under, and seven
+# hundred lines of legal text stay out of a build script.
+#
+# A missing file is a warning and not a failure.  A partial checkout still produces a
+# bootable card, the notice above already names both licences and says where to get
+# them, and refusing to write an SD card over a documentation file would be the wrong
+# trade in every direction.
+for licence_text in "$ROOT/device/j36-ultra/LICENSE.MPL-2.0" \
+                    "$ROOT/device/j36-ultra/LICENSE.GPL-2"; do
+    if [[ -f "$licence_text" ]]; then
+        {
+            printf '\n\n'
+            printf '%s\n\n' '================================================================================'
+            cat "$licence_text"
+        } >> "$SDBOOT/LICENSE.txt"
+    else
+        log "licence: $licence_text is missing; LICENSE.txt names it without quoting it"
+        printf '\n\n(%s was not in the source tree when this card was built.  Get it\nfrom the MixOS repository, or from the URL named above.)\n' \
+               "$(basename "$licence_text")" >> "$SDBOOT/LICENSE.txt"
+    fi
+done
 
 # ── The OS-partition payload: /opt/mixos, and the dashboard in it ─────────────
 #
@@ -7965,9 +7959,9 @@ if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" || -n "$MIXMIRROR_BIN" ]]; then
     fi
 fi
 
-# Ms-PL 3(C) again: mixdash is MixOS's own code, so the tree it ships in has to carry
-# its notice.  Short, and pointing at the full text on BOOT rather than repeating 40
-# lines of licence in two places on one card.
+# The same notice obligation again: mixdash is MixOS's own code, so the tree it ships
+# in has to carry its terms.  Short, and pointing at the full text on BOOT rather than
+# repeating seven hundred lines of licence in two places on one card.
 #
 # From here the test is the TREE and not the two binaries.  $SDROOT already holds
 # opt/mixos/j36 -- the lima and mtk_drm modules, mfgpower, the Mesa front end, the
@@ -8066,15 +8060,17 @@ partitions were searched.  Nothing is started in the dashboard's place either wa
 to hand the boot back to the rootfs's own shell, drop j36.dash=1 from the bootargs
 in mvii/boot.conf on the BOOT partition.
 
-Licence: the MixOS work here -- bin/mixdash, j36/mfgpower, j36/eglprobe -- is under
-the Microsoft Public License; the full text is in LICENSE.txt on the BOOT partition.
-Qt, its dependencies and the fonts are Debian's packages under their own terms
-(LGPL-3 with Qt's exceptions for Qt itself; see /usr/share/doc on a Debian machine).
-The kernel modules under j36/ are GPL-2.0, from the Linux tree they were built from.
-Mesa in j36/gl is under the MIT licence.  doomgeneric and Doom's engine source are
-id Software's under the GPL, as Debian and doomgeneric ship them.  MixOS is a
-divergent fork of dArkOS, which continues ArkOS; the operating system underneath is
-Debian.  MixOS supports the MediaTek line of processors.
+Licence: the MixOS work here -- bin/mixdash, bin/j36-mixmirror, j36/mfgpower and
+j36/eglprobe -- is dual licensed, MPL-2.0 or GPL-2.0-or-later at your option; both
+full texts are in LICENSE.txt on the BOOT partition.  Qt, its dependencies and the
+fonts are Debian's packages under their own terms (LGPL-3 with Qt's exceptions for Qt
+itself; see /usr/share/doc on a Debian machine).  The kernel modules under j36/ are
+GPL-2.0, from the Linux tree they were built from.  Mesa in j36/gl is under the MIT
+licence.  doomgeneric and Doom's engine source are id Software's under the GPL, as
+Debian and doomgeneric ship them.  The operating system underneath is Debian, and
+MixOS is a device port on top of it; the build scripts descend from dArkOS, which
+continues ArkOS, and nothing else here does.  MixOS supports the MediaTek line of
+processors.
 MIXOSREADME
 
     ( cd "$SDROOT" && tar -czf "$ARTIFACTS/sd-root.tar.gz" \
@@ -8175,7 +8171,7 @@ fi
     fi
     sha256sum "${sums[@]}" > SHA256SUMS
     {
-        echo "licence=Ms-PL for the MixOS bring-up work, GPL-2.0-only for the kernel and the three MixOS modules, per-payload in sd-boot/LICENSE.txt and summarised in sd-root/opt/mixos/README.txt"
+        echo "licence=MPL-2.0 OR GPL-2.0-or-later for the MixOS bring-up work, GPL-2.0-only for the kernel and the seven MixOS modules, per-payload in sd-boot/LICENSE.txt and summarised in sd-root/opt/mixos/README.txt"
         echo "kernel_branch=$KERNEL_BRANCH"
         echo "kernel_release=$KERNEL_RELEASE"
         echo "kernel_arch=arm (ARMv7, 32-bit)"

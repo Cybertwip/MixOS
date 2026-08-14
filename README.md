@@ -8,20 +8,20 @@
 
 ## The name
 
-Free software has a tradition of explaining itself through its acronym, and GNU set
-the bar: **G**NU's **N**ot **U**nix, a name that answers the only question anybody
-was going to ask, and answers it with itself, forever.
+Free software has a tradition of explaining itself through its acronym. GNU set the
+pattern — **G**NU's **N**ot **U**nix — where the name states the project's position
+before a line of documentation has been read.
 
-MixOS follows the tradition and misses the point entirely. It stands for
+MixOS is named the same way. It stands for
 
 > **M**icrosoft **I**ncorporates the **X** **O**perating **S**ystem
 
-which does not recurse, does not clarify, and name-drops two companies in five
-words. GNU's acronym is a philosophical position. This one is a press release that
-got away from somebody — the whole operating system, brought to you in partnership
-with X (now part of the xAI company), incorporated, at last, by Microsoft.
-
-What *is* true is the rest of this page.
+The base is Linux and Debian, which is where the freedoms and the obligations in the
+[Licence](#licence) section come from. The work on top of that base is a line of
+operating systems for handheld hardware, developed by Cybertwip and brought to the
+public in partnership with X, now part of xAI. The acronym records what the system
+is built on and who it is delivered with, which is what a name in this tradition is
+for.
 
 ## What it is
 
