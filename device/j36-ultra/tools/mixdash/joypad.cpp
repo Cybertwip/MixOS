@@ -153,6 +153,12 @@ int modifierFor(int code)
     }
 }
 
+/* The directory, listed the one way both callers here want it. */
+QStringList inputNodes()
+{
+    return QDir("/dev/input").entryList(QStringList() << "event*", QDir::System, QDir::Name);
+}
+
 qreal clampReal(qreal v, qreal lo, qreal hi)
 {
     if (v < lo)
@@ -170,6 +176,7 @@ Joypad::Joypad(QObject *parent)
     openDevices();
     m_heldSince.start();
     m_tick.start();
+    m_scanClock.start();
 
     m_timer = new QTimer(this);
     m_timer->setInterval(15);
@@ -184,83 +191,86 @@ Joypad::~Joypad()
 
 void Joypad::openDevices()
 {
-    const QStringList names =
-        QDir("/dev/input").entryList(QStringList() << "event*", QDir::System, QDir::Name);
+    for (const QString &n : inputNodes())
+        openNode(n);
+}
 
-    for (const QString &n : names) {
-        const QString path = "/dev/input/" + n;
-        const int fd = ::open(path.toLocal8Bit().constData(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd < 0)
-            continue;
+bool Joypad::openNode(const QString &node)
+{
+    const QString path = "/dev/input/" + node;
+    const int fd = ::open(path.toLocal8Bit().constData(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0)
+        return false;
 
-        /*
-         * A device with no keys, no axes and no relative motion is not an input we
-         * can navigate with -- on this board that is the power button's own node
-         * and anything a USB hub brings along.  Closed rather than polled.
-         */
-        unsigned long evbits = 0;
-        if (::ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), &evbits) < 0
-            || !((evbits & (1UL << EV_KEY)) || (evbits & (1UL << EV_ABS))
-                 || (evbits & (1UL << EV_REL)))) {
-            ::close(fd);
-            continue;
-        }
+    /*
+     * A device with no keys, no axes and no relative motion is not an input we
+     * can navigate with -- on this board that is the power button's own node
+     * and anything a USB hub brings along.  Closed rather than polled.
+     */
+    unsigned long evbits = 0;
+    if (::ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), &evbits) < 0
+        || !((evbits & (1UL << EV_KEY)) || (evbits & (1UL << EV_ABS))
+             || (evbits & (1UL << EV_REL)))) {
+        ::close(fd);
+        return false;
+    }
 
-        Dev d;
-        d.fd = fd;
+    Dev d;
+    d.fd = fd;
+    d.node = node;
 
-        char name[128] = { 0 };
-        if (::ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name) >= 0)
-            d.name = QString::fromLocal8Bit(name);
-        else
-            d.name = n;
+    char name[128] = { 0 };
+    if (::ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name) >= 0)
+        d.name = QString::fromLocal8Bit(name);
+    else
+        d.name = node;
 
-        /*
-         * Classification, and it decides two things: whether this device's keys
-         * become text in the Terminal, and whether its motion becomes pointer
-         * motion.  Both are asked of the device rather than of its name, because
-         * "SEM HID Device" is what half the USB dongles on this planet call
-         * themselves.
-         */
-        if (evbits & (1UL << EV_KEY)) {
-            unsigned long keys[(KEY_MAX / (8 * sizeof(unsigned long))) + 1];
-            ::memset(keys, 0, sizeof(keys));
-            if (::ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keys)), keys) >= 0) {
-                /* A real keyboard has letters.  A pad that reports BTN_* does not,
-                 * and a mouse reports BTN_LEFT and nothing alphabetic. */
-                d.keyboard = testBit(keys, KEY_A) && testBit(keys, KEY_Z)
-                    && testBit(keys, KEY_SPACE);
-                if (testBit(keys, BTN_LEFT) && (evbits & (1UL << EV_REL)))
-                    d.mouse = true;
-            }
-        }
-        if (evbits & (1UL << EV_REL)) {
-            unsigned long rels = 0;
-            if (::ioctl(fd, EVIOCGBIT(EV_REL, sizeof(rels)), &rels) >= 0
-                && (rels & (1UL << REL_X)) && (rels & (1UL << REL_Y)))
+    /*
+     * Classification, and it decides two things: whether this device's keys
+     * become text in the Terminal, and whether its motion becomes pointer
+     * motion.  Both are asked of the device rather than of its name, because
+     * "SEM HID Device" is what half the USB dongles on this planet call
+     * themselves.
+     */
+    if (evbits & (1UL << EV_KEY)) {
+        unsigned long keys[(KEY_MAX / (8 * sizeof(unsigned long))) + 1];
+        ::memset(keys, 0, sizeof(keys));
+        if (::ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keys)), keys) >= 0) {
+            /* A real keyboard has letters.  A pad that reports BTN_* does not,
+             * and a mouse reports BTN_LEFT and nothing alphabetic. */
+            d.keyboard = testBit(keys, KEY_A) && testBit(keys, KEY_Z)
+                && testBit(keys, KEY_SPACE);
+            if (testBit(keys, BTN_LEFT) && (evbits & (1UL << EV_REL)))
                 d.mouse = true;
         }
-
-        if (evbits & (1UL << EV_ABS)) {
-            for (int slot = 0; slot < 4; ++slot) {
-                struct input_absinfo info;
-                ::memset(&info, 0, sizeof(info));
-                if (::ioctl(fd, EVIOCGABS(kAxis[slot]), &info) < 0)
-                    continue;
-                if (info.maximum <= info.minimum)
-                    continue;
-                d.absCode[slot] = kAxis[slot];
-                d.absLo[slot] = info.minimum;
-                d.absHi[slot] = info.maximum;
-                /* Seed with the value the driver already has, so a stick that is
-                 * resting off-centre does not lurch on the first report. */
-                d.absRaw[slot] = info.value;
-                d.absSeen[slot] = true;
-            }
-        }
-
-        m_devs.append(d);
     }
+    if (evbits & (1UL << EV_REL)) {
+        unsigned long rels = 0;
+        if (::ioctl(fd, EVIOCGBIT(EV_REL, sizeof(rels)), &rels) >= 0
+            && (rels & (1UL << REL_X)) && (rels & (1UL << REL_Y)))
+            d.mouse = true;
+    }
+
+    if (evbits & (1UL << EV_ABS)) {
+        for (int slot = 0; slot < 4; ++slot) {
+            struct input_absinfo info;
+            ::memset(&info, 0, sizeof(info));
+            if (::ioctl(fd, EVIOCGABS(kAxis[slot]), &info) < 0)
+                continue;
+            if (info.maximum <= info.minimum)
+                continue;
+            d.absCode[slot] = kAxis[slot];
+            d.absLo[slot] = info.minimum;
+            d.absHi[slot] = info.maximum;
+            /* Seed with the value the driver already has, so a stick that is
+             * resting off-centre does not lurch on the first report. */
+            d.absRaw[slot] = info.value;
+            d.absSeen[slot] = true;
+        }
+    }
+
+    m_devs.append(d);
+    return true;
 }
 
 void Joypad::closeDevices()
@@ -271,6 +281,74 @@ void Joypad::closeDevices()
     m_devs.clear();
 }
 
+/*
+ * THE HOTPLUG.  Everything above this line was written for a machine whose input
+ * devices are soldered to it, which the pad and the sticks are -- and then a USB
+ * mouse goes into the one port on the side and none of it notices.  There is no
+ * udev here and there is no netlink listener either: this reads a directory.
+ *
+ * WHY A DIRECTORY LISTING RATHER THAN A UEVENT SOCKET.  A NETLINK_KOBJECT_UEVENT
+ * socket would be the notified version of this, and it is more code in the two
+ * places that matter -- it needs a second descriptor in the poll set, a parser
+ * for the uevent payload, and it still has to list the directory afterwards
+ * because the node the message names may not have been created yet when the
+ * message arrives.  The listing is the part that cannot be skipped, so this does
+ * only the part that cannot be skipped, once a second.
+ *
+ * WHAT IS DELIBERATELY NOT TOUCHED: everything already open.  The stick that is
+ * held over at the moment a hub enumerates keeps its axis state, its seeded
+ * centre and its descriptor, because a device that did not change has no reason
+ * to be reopened.  That is the entire difference between this and rescan(), and
+ * it is why rescan() is no longer on the hotplug path.
+ */
+void Joypad::syncDevices()
+{
+    const QStringList nodes = inputNodes();
+    bool changed = false;
+
+    /* Gone.  Backwards, so removing one does not renumber the ones not yet
+     * looked at. */
+    for (int i = m_devs.size() - 1; i >= 0; --i) {
+        if (nodes.contains(m_devs[i].node))
+            continue;
+        const QString name = m_devs[i].name;
+        if (m_devs[i].fd >= 0)
+            ::close(m_devs[i].fd);
+        m_devs.remove(i);
+        changed = true;
+        emit deviceRemoved(name);
+    }
+
+    /* Arrived. */
+    for (const QString &n : nodes) {
+        bool known = false;
+        for (const Dev &d : m_devs) {
+            if (d.node == n) {
+                known = true;
+                break;
+            }
+        }
+        if (known)
+            continue;
+        /*
+         * A node can exist for a moment before its permissions are set, and a
+         * device can be claimed by something else.  openNode() returning false is
+         * not an error to report -- the next sweep, a second later, tries again,
+         * and a node that is genuinely uninteresting (the power button, a hub's
+         * own descriptor) fails the same way every time and costs one open(2) a
+         * second, which is the price of not keeping a list of things to ignore.
+         */
+        if (!openNode(n))
+            continue;
+        changed = true;
+        const Dev &d = m_devs.last();
+        emit deviceAdded(d.name, d.mouse, d.keyboard);
+    }
+
+    if (changed)
+        emit devicesChanged();
+}
+
 void Joypad::rescan()
 {
     closeDevices();
@@ -278,6 +356,7 @@ void Joypad::rescan()
     m_held = NavNone;
     m_down = 0;
     m_mods = ModNone;
+    emit devicesChanged();
 }
 
 QStringList Joypad::deviceNames() const
@@ -321,6 +400,19 @@ void Joypad::setSuspended(bool suspended)
         m_down = 0;
         m_mods = ModNone;
     } else {
+        /*
+         * Sync BEFORE the drain, and both before the timer restarts.
+         *
+         * The tick is stopped while a child owns the screen, so nothing has been
+         * watching /dev/input for however long the game ran -- and a mouse plugged
+         * in during it, or the one pulled out to make room for a headset, is
+         * exactly the state this dashboard comes back to.  Doing it here rather
+         * than waiting for the next sweep also means the drain that follows flushes
+         * the devices that just appeared as well as the ones that were already
+         * open, which is the whole point of the drain.
+         */
+        syncDevices();
+        m_scanClock.restart();
         drain();
         m_tick.restart();
         m_timer->start();
@@ -337,6 +429,19 @@ void Joypad::drain()
 
 void Joypad::poll()
 {
+    /*
+     * BEFORE the early return below, and that ordering is the whole fix.  A board
+     * that booted with nothing in the port has an empty m_devs, and every version
+     * of this function before this one returned here and therefore could never
+     * open anything ever again.  The pad is soldered on so it never actually
+     * happened on this device -- which is exactly why it went unnoticed until a
+     * mouse was the first thing plugged into a running system.
+     */
+    if (m_scanClock.elapsed() >= 1000) {
+        m_scanClock.restart();
+        syncDevices();
+    }
+
     if (m_devs.isEmpty())
         return;
 
@@ -363,7 +468,29 @@ void Joypad::poll()
     }
 
     if (::poll(pfd, n, 0) > 0) {
+        /*
+         * Descriptors whose device stopped existing under them.  Collected rather
+         * than removed on the spot: pfd[i] was built from m_devs[i] and removing an
+         * element would renumber everything after it, so the list is drained once
+         * the read loop is done with the indices.
+         */
+        QVector<int> gone;
+
         for (int i = 0; i < n; ++i) {
+            /*
+             * THE UNPLUG, AND IT COSTS NOTHING TO NOTICE.  evdev_poll() sets
+             * EPOLLHUP|EPOLLERR the moment the input device behind the descriptor
+             * is gone, so a mouse pulled out of the port is known on the next 15 ms
+             * tick -- long before the once-a-second directory sweep would have got
+             * to it.  Reading on instead would give a hard -ENODEV forever and the
+             * while loop below would simply never see another event, which is how
+             * this used to end: a dead descriptor polled sixty-six times a second
+             * for the rest of the session.
+             */
+            if (pfd[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                gone.append(i);
+                continue;
+            }
             if (!(pfd[i].revents & POLLIN))
                 continue;
             Dev &d = m_devs[i];
@@ -420,6 +547,28 @@ void Joypad::poll()
                     }
                 }
             }
+        }
+
+        for (int i = gone.size() - 1; i >= 0; --i) {
+            const int idx = gone[i];
+            const QString name = m_devs[idx].name;
+            if (m_devs[idx].fd >= 0)
+                ::close(m_devs[idx].fd);
+            m_devs.remove(idx);
+            emit deviceRemoved(name);
+        }
+        if (!gone.isEmpty()) {
+            /*
+             * A button that was down on the device that just left is not coming
+             * back up: its release was going to arrive on the descriptor that no
+             * longer exists.  Forgetting the press here is what stops a held
+             * direction from repeating forever after the pad it was held on was
+             * unplugged.
+             */
+            m_held = NavNone;
+            m_down = 0;
+            m_mods = ModNone;
+            emit devicesChanged();
         }
     }
 

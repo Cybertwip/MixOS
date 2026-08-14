@@ -23,6 +23,13 @@
  * being the same code on every Qt 5.  It also puts key repeat and the suspend that
  * hands input to a launched child in one obvious place.
  *
+ * AND THE POLL TICK IS ALSO THE HOTPLUG.  There is no udev in this image and no
+ * uevent listener, so once a second the same tick lists /dev/input and opens what
+ * is new; an unplug is quicker than that because poll(2) reports the dead
+ * descriptor immediately.  See syncDevices().  This is the difference between a
+ * mouse that works when it is plugged in and a mouse that works after its owner
+ * has found the Diagnostics page, which is what this file used to require.
+ *
  * THREE KINDS OF OUTPUT, because this device has three kinds of input and the
  * dashboard should not have to know which one is plugged in:
  *
@@ -117,11 +124,39 @@ public:
     void setTextMode(bool textMode) { m_textMode = textMode; }
     bool textMode() const { return m_textMode; }
 
-    /* Re-scan /dev/input.  Called when a hotplug is suspected -- there is no udev
-     * in this image, so "suspected" means the user opened Diagnostics and asked. */
+    /*
+     * Throw every descriptor away and open /dev/input from scratch.
+     *
+     * NOT THE HOTPLUG PATH ANY MORE.  It used to be the only one, and the comment
+     * that stood here said so: "called when a hotplug is suspected -- there is no
+     * udev in this image, so suspected means the user opened Diagnostics and
+     * asked."  That was a mouse that did nothing until its owner found the right
+     * page and pressed a button on it, which is not what plugging a mouse in is
+     * supposed to feel like.  syncDevices() now runs from the poll tick and picks
+     * arrivals and departures up by itself.
+     *
+     * What is left for this to do is the heavier thing it was always better at:
+     * re-reading the axis ranges and the classification of devices that are ALREADY
+     * open, which nothing else ever revisits.  Diagnostics still offers it, and the
+     * shell calls nothing else.
+     */
     void rescan();
 
 signals:
+    /*
+     * A node appeared under /dev/input or went away, noticed by the poll tick.
+     *
+     * `mouse' and `keyboard' are this file's own classification -- what the device
+     * said about itself through EVIOCGBIT, not what its name looks like -- because
+     * the one thing a user wants to hear when a dongle goes in is whether the thing
+     * that arrived is the thing they plugged in.
+     */
+    void deviceAdded(const QString &name, bool mouse, bool keyboard);
+    void deviceRemoved(const QString &name);
+    /* Emitted once after any batch of the two above, for anything that only wants
+     * to know that the answer to deviceCount() has changed. */
+    void devicesChanged();
+
     /*
      * `repeat' is false for the press itself and true for every one of the
      * autorepeats that follow it while the key or the stick is held.
@@ -168,6 +203,12 @@ private slots:
 private:
     struct Dev {
         int fd = -1;
+        /* The directory entry this was opened from -- "event3", not the path and
+         * not the EVIOCGNAME string.  It is the key syncDevices() matches on, so it
+         * has to be the name the kernel uses and not the one the device chose:
+         * three identical dongles in a hub all call themselves "USB OPTICAL
+         * MOUSE". */
+        QString node;
         QString name;
         /* Only the four axes the device tree's adc-joystick declares. */
         int absCode[4] = { -1, -1, -1, -1 };
@@ -185,7 +226,16 @@ private:
     };
 
     void openDevices();
+    /* Open one entry of /dev/input and classify it.  True if it was kept. */
+    bool openNode(const QString &node);
     void closeDevices();
+    /*
+     * The hotplug.  Compares the directory against what is open, opens what is new
+     * and closes what is gone, and touches nothing that is unchanged -- so a mouse
+     * arriving in a hub does not reset the axis state of the stick that is being
+     * held at that moment.
+     */
+    void syncDevices();
     void drain();
     void feed(int action, bool pressed);
     void axis(Dev &d, int slot, int value);
@@ -220,6 +270,19 @@ private:
     /* Wall clock between poll ticks, so pointer speed is in pixels per second and
      * not pixels per however-often-the-event-loop-got-round-to-us. */
     QElapsedTimer m_tick;
+
+    /*
+     * When /dev/input was last listed.
+     *
+     * ONCE A SECOND, NOT EVERY TICK.  The poll tick is 15 ms and a directory
+     * listing is an opendir, a getdents and a QStringList of eight entries -- 66
+     * times a second of that on a Cortex-A7 is real work to notice a mouse that a
+     * human took a second to plug in anyway.  A second is under the time it takes
+     * to move a hand back to the buttons, which is the only latency that matters
+     * here.  An unplug is noticed sooner than that and from somewhere else: poll(2)
+     * reports the dead descriptor on the very next tick.
+     */
+    QElapsedTimer m_scanClock;
 
     /*
      * A mouse reports REL_X, REL_Y and then SYN_REPORT: one movement, three

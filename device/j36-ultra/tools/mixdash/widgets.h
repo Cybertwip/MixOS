@@ -12,8 +12,8 @@
  *
  * The chrome is genuinely translucent rather than a flat approximation of it.  A
  * child QWidget with no autoFillBackground has no background of its own, so Qt
- * repaints the Dashboard's wallpaper underneath before StatusBar and Dock paint
- * over it at MVII's own alphas.
+ * repaints the Dashboard's wallpaper underneath before StatusBar paints over it
+ * at MVII's own alpha.
  *
  * TWO INPUT PATHS, ONE WIDGET.  Everything selectable here answers to the D-pad
  * (through PageWidget::handleNav) AND to a pointer (through the ordinary
@@ -69,7 +69,7 @@ QRectF paintSheet(QPainter &p, const QRectF &card, const QString &title,
  * WHY AN INTERFACE AND NOT A SWITCH IN THE SHELL.  The first version of this
  * dashboard routed every button in one function in dashboard.cpp, with a chain of
  * `if (m_page == 1)'.  Four pages was already the limit of what could be read;
- * this build has eleven.  A page now says what it does with a button and what it
+ * this build has thirteen.  A page now says what it does with a button and what it
  * is called, and the shell only decides which page is on screen.
  */
 class PageWidget : public QWidget
@@ -278,19 +278,20 @@ public:
     void setIndex(int index);
     QString currentTitle() const;
 
-    /* False when the selection did not move -- the edge of the grid in that
-     * direction, or a grid with nothing in it.  handleNav hands that answer
-     * straight back to the shell, which turns a refused left or right into a
-     * change of root page. */
+    /* False when the selection did not move -- the first or last card, or a grid
+     * with nothing in it.  handleNav() used to hand that answer back to the shell
+     * so a refused left or right became a change of root page; nothing reads it
+     * now, and a step bigger than the grid is how the shoulder buttons reach the
+     * two ends without a second entry point. */
     bool moveBy(int dx, int dy);
     void activate();
 
     /* True while a card has been picked up and is following the selection.
      *
-     * The shell does not need to ask -- handleNav() consumes an edge press itself
-     * while carrying, so a card cannot be slid off the tab -- but a page that
-     * wants to know whether this grid is mid-gesture has no other way to find
-     * out, and the state is worth being able to see from outside. */
+     * The shell does not need to ask -- handleNav() consumes every direction
+     * itself, so a card cannot be slid off the page -- but a page that wants to
+     * know whether this grid is mid-gesture has no other way to find out, and the
+     * state is worth being able to see from outside. */
     bool carrying() const { return m_carry >= 0; }
 
     void setPageTitle(const QString &t) { m_pageTitle = t; }
@@ -340,6 +341,9 @@ private:
 
     int columns() const;
     int rowCount() const;
+    /* How many cards are in row r: columns() for every row but the last, and the
+     * remainder for the last.  It is what centres a short row -- see slotRect. */
+    int rowFill(int r) const;
     /* The slot's resting rectangle, in widget coordinates, scroll included. */
     QRectF slotRect(int i) const;
     /* Where card i is actually being drawn, motion and lift included. */
@@ -348,8 +352,9 @@ private:
      * of repaint for this page.  See the comment on selectTo() in widgets.cpp. */
     QRect dirtyRect(const QRectF &r) const;
     int cardAt(const QPoint &p) const;
-    /* The slot a point falls in, whether or not there is a card in it.  Used
-     * while carrying, where the empty tail of the grid is a valid target. */
+    /* The slot a point falls in, gutters included, for dropping a carried card.
+     * There is no longer an empty tail to aim at -- a short row is centred, so the
+     * space either side of it is margin and not a slot. */
     int slotAt(const QPoint &p) const;
 
     /* Rebuild m_motion for the current entry count, keeping what it can. */
@@ -376,9 +381,6 @@ private:
 
     void paintCard(QPainter &p, const AppEntry &e, const QRectF &r, bool selected,
                    qreal lift);
-    /* The dashed outline of a slot with nothing in it.  Drawn only while a card
-     * is in the air: at rest an empty slot is empty, not a box. */
-    void paintEmptySlot(QPainter &p, const QRectF &r) const;
 
     QVector<AppEntry> m_entries;
     QVector<Motion> m_motion;
@@ -413,31 +415,21 @@ private:
     int m_scroll = 0;
 };
 
-/* The dock: one slot per page, the active one lit.  Clickable, because a dock
- * that can only be reached with the shoulder buttons is a tab strip. */
-class Dock : public QWidget
-{
-    Q_OBJECT
-
-public:
-    explicit Dock(QWidget *parent = nullptr);
-
-    void setPages(const QStringList &names);
-    void setCurrent(int page);
-
-signals:
-    void pageClicked(int page);
-
-protected:
-    void paintEvent(QPaintEvent *event) override;
-    void mousePressEvent(QMouseEvent *event) override;
-
-private:
-    QVector<QRectF> slotRects() const;
-
-    QStringList m_pages;
-    int m_current = 0;
-};
+/*
+ * THERE WAS A DOCK HERE: three slots along the bottom of the panel -- Apps, Media,
+ * Settings -- with the current one lit, driven by the shoulder buttons and by a
+ * click.
+ *
+ * IT IS GONE BECAUSE IT WAS A SECOND KIND OF NAVIGATION.  This shell already had
+ * one: a grid of cards you walk with the D-pad and open with A.  The dock was a
+ * different thing in a different place with a different gesture, and it existed to
+ * reach exactly two pages -- both of which are now cards on that grid, next to the
+ * nine that were always cards.  One way in, for everything.
+ *
+ * It also cost 56 px of every page's height for a row of three labels, which on a
+ * 480-line panel is more than a row of cards.  See Dashboard::buildPages, and
+ * Theme::DockH, which went with it.
+ */
 
 /*
  * One row of a ListPane.  A tagged union in all but name: most rows are a label

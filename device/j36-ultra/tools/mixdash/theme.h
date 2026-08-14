@@ -57,20 +57,25 @@ inline QColor orange()      { return QColor(255, 159,  10); }
 inline QColor green()       { return QColor( 40, 200,  64); }
 inline QColor red()         { return QColor(255,  95,  86); }
 inline QColor yellow()      { return QColor(254, 188,  46); }
-inline QColor dock()        { return QColor( 60,  64,  74); }
+/* Named for the dock it was mixed for, kept because the unlit half of a segmented
+ * control and the trough of a slider are the same grey and there is no better
+ * name for it.  The dock itself is gone -- see widgets.h. */
 inline QColor dockHi()      { return QColor( 92,  96, 108); }
 
-/* The two alphas MVII names, and they are what make the chrome read as glass. */
-enum { ChromeAlpha = 232, DockAlpha = 220 };
+/* MVII names two alphas and this is the one that survived the dock: it is what
+ * makes the chrome read as glass. */
+enum { ChromeAlpha = 232 };
 
 /*
  * Metrics.  StatusH is 40 because DashboardLayout.hpp picks 40 for a panel
  * 480 rows or taller, and this panel is exactly 640x480 -- the LK's
  * simple-framebuffer node in the device tree says so.
+ *
+ * DockH was 56 and is gone with the dock, which is 56 more lines of page on a
+ * panel that has 480 of them.
  */
 enum {
     StatusH = 40,
-    DockH   = 56,
     Margin  = 14,
     Gap     = 12,
     Radius  = 14

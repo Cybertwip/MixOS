@@ -360,8 +360,8 @@ VolumeOverlay::VolumeOverlay(QWidget *parent)
 {
     /*
      * No background of its own, so the page underneath is repainted before this
-     * paints over it at the chrome's alpha -- the same bargain StatusBar and Dock
-     * strike, and what makes the panel read as glass rather than as a grey box.
+     * paints over it at the chrome's alpha -- the same bargain StatusBar strikes,
+     * and what makes the panel read as glass rather than as a grey box.
      */
     setAttribute(Qt::WA_TransparentForMouseEvents, true);
     hide();

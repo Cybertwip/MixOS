@@ -370,9 +370,6 @@ Dashboard::Dashboard(QWidget *parent)
     Trace::step("backlight/restore");
     DisplayPage::restoreSaved();
 
-    Trace::step("Dock");
-    m_dock = new Dock(this);
-
     Trace::step("toast label and its timer");
     m_toast = new QLabel(this);
     m_toast->setAlignment(Qt::AlignCenter);
@@ -424,7 +421,6 @@ Dashboard::Dashboard(QWidget *parent)
     m_pointer = new Pointer(this);
 
     Trace::step("page tables");
-    m_roots << m_apps << m_media << m_settings;
     m_all << m_apps << m_media << m_settings
           << m_files << m_terminal << m_wifi << m_sharing << m_packages
           << m_diagnostics << m_mouse << m_display << m_language << m_info;
@@ -453,7 +449,6 @@ Dashboard::Dashboard(QWidget *parent)
             this, &Dashboard::onTerminalRequested);
     connect(m_diagnostics, &DiagnosticsPage::launchRequested,
             this, &Dashboard::onLaunchRequested);
-    connect(m_dock, &Dock::pageClicked, this, &Dashboard::setRoot);
     connect(&Strings::instance(), &Strings::languageChanged,
             this, &Dashboard::retranslate);
 
@@ -463,21 +458,18 @@ Dashboard::Dashboard(QWidget *parent)
     connect(m_pad, &Joypad::pointerMove, m_pointer, &Pointer::onMove);
     connect(m_pad, &Joypad::pointerButton, m_pointer, &Pointer::onButton);
     connect(m_pad, &Joypad::pointerWheel, m_pointer, &Pointer::onWheel);
-
-    Trace::step("dock pages");
-    m_dock->setPages(QStringList() << tr("Apps") << tr("Media") << tr("Settings"));
+    connect(m_pad, &Joypad::deviceAdded, this, &Dashboard::onInputDeviceAdded);
+    connect(m_pad, &Joypad::deviceRemoved, this, &Dashboard::onInputDeviceRemoved);
+    connect(m_pad, &Joypad::devicesChanged, this, &Dashboard::refreshInputSummary);
 
     /* Stats every candidate executable and IWAD on the card. */
     Trace::step("buildPages -- looks for the apps on disk");
     buildPages();
 
-    m_info->setInputSummary(
-        m_pad->deviceCount() == 0
-            ? tr("no /dev/input/event* -- nothing to navigate with")
-            : QString("%1: %2").arg(m_pad->deviceCount()).arg(m_pad->deviceNames().join(", ")));
+    refreshInputSummary();
 
-    Trace::step("setRoot(0)");
-    setRoot(0);
+    Trace::step("goHome");
+    goHome();
     qApp->installEventFilter(this);
     Trace::step("constructed");
 }
@@ -549,23 +541,24 @@ QString Dashboard::firstWad()
 }
 
 /*
- * WHAT IS NOT ON THE APPS GRID, AND WHY.
+ * EVERYTHING IS ON THIS GRID NOW, AND THAT IS THE POINT.
  *
- * Media and Settings each used to have a card here as well as a slot in the dock,
- * and pressing the card did nothing but setRoot() to the tab that was already one
- * shoulder press away.  Two ways to reach the same page is not two features; it is
- * one feature and one piece of furniture the user has to learn is furniture.  The
- * dock is the way to a root page.  The grid is the way to the pages that have no
- * other way in.
+ * Media and Settings used to be dock tabs, and for a while they each had a card
+ * here as well that did nothing but switch to the tab -- two doors into one room,
+ * which is one feature and one piece of furniture the user has to learn is
+ * furniture.  The answer was the wrong one: the cards were deleted and the dock
+ * kept.  The dock is gone now and the cards are back, and they open their page the
+ * same way every other card here does.  One kind of thing on the screen, one
+ * gesture to open it, B to come back.
  *
- * WHY POWER IS NOT A TAB ANY MORE.  It was, and it held two cards -- Power off and
+ * WHY POWER IS NOT A TAB EITHER.  It was, and it held two cards -- Power off and
  * System -- on a page with room for eight.  A tab that is six-eighths empty is not
  * a section, it is a detour: three button presses to reach a thing, and a whole
  * root page's worth of navigation spent on it.  The two cards are at the end of
  * this list now, on a grid that has the room, and the tab is gone.  Power off is
- * LAST on purpose: the D-pad lands on the first card when the tab opens, and the
- * card that shuts the board down should be the furthest thing from where a
- * thumb rests.  It is still behind the two-press m_armed gate on top of that.
+ * LAST on purpose: the D-pad lands on the first card when the dashboard starts,
+ * and the card that shuts the board down should be the furthest thing from where
+ * a thumb rests.  It is still behind the two-press m_armed gate on top of that.
  *
  * EVERY ENTRY HAS A key.  It is the identity the saved arrangement is written in
  * -- see AppEntry -- so it is stable ASCII and it is not the title, which is
@@ -600,6 +593,19 @@ void Dashboard::buildPages()
     else if (wad.isEmpty())
         doom.reason = tr("No IWAD in /opt/mixos/share/doom.");
     apps.append(doom);
+
+    /*
+     * Second, because after "play a game" the next thing anybody does with a
+     * handheld is watch something on it, and because this is the card that took the
+     * dock's place: it has to be where a thumb lands, not at the end of a list.
+     */
+    AppEntry media;
+    media.key = QStringLiteral("media");
+    media.title = tr("Media");
+    media.accent = Theme::orange();
+    media.glyph = GlyphVideo;
+    media.internal = InternalMedia;
+    apps.append(media);
 
     AppEntry terminal;
     terminal.key = QStringLiteral("terminal");
@@ -679,6 +685,20 @@ void Dashboard::buildPages()
      * So: use Terminal.  See terminal.cpp.
      */
 
+    /*
+     * Near the end, next to System, because that is what it is: the two cards you
+     * open to change something about the board rather than to do something with it.
+     * It is also the card the Menu button opens from anywhere, so where it sits on
+     * the grid matters less than it does for the rest.
+     */
+    AppEntry settings;
+    settings.key = QStringLiteral("settings");
+    settings.title = tr("Settings");
+    settings.accent = Theme::teal();
+    settings.glyph = GlyphSettings;
+    settings.internal = InternalSettings;
+    apps.append(settings);
+
     AppEntry info;
     info.key = QStringLiteral("system");
     info.title = tr("System");
@@ -713,15 +733,14 @@ void Dashboard::buildPages()
  * A language was picked.  Everything that is rebuilt on the way into a page
  * retranslates itself the next time that page is entered -- which for a page you
  * had to walk to the Language list from is immediately, on the way back.  What is
- * left is the furniture: the card grid, built once in the constructor, and the
- * dock, which never leaves the glass.
+ * left is the card grid, built once in the constructor and never entered from
+ * anywhere: you arrive at it by leaving something else.
  */
 void Dashboard::retranslate()
 {
     const int apps = m_apps->index();
 
     m_apps->setPageTitle(tr("Apps"));
-    m_dock->setPages(QStringList() << tr("Apps") << tr("Media") << tr("Settings"));
     buildPages();
 
     /*
@@ -743,9 +762,7 @@ PageWidget *Dashboard::current() const
 {
     if (!m_stack.isEmpty())
         return m_stack.last();
-    if (m_page >= 0 && m_page < m_roots.size())
-        return m_roots[m_page];
-    return nullptr;
+    return m_apps;
 }
 
 /*
@@ -777,29 +794,17 @@ void Dashboard::showPage(PageWidget *page)
     applyChrome();
 }
 
-void Dashboard::setRoot(int page)
-{
-    m_page = qBound(0, page, m_roots.size() - 1);
-    /*
-     * Switching root pages empties the stack.  The alternative -- a stack per root
-     * -- means the shoulder buttons take you somewhere different depending on
-     * where you have been, which is not something a dock can show.
-     */
-    m_stack.clear();
-    showPage(m_roots[m_page]);
-}
-
 /*
- * One tab left or right, wrapping at both ends.  The wrap is the point: tabs in a
- * ring means the far one is one press away in the other direction rather than two
- * in this one, and there is no end of the dock to get stuck against.
+ * All the way back to the grid, however deep the stack got.
+ *
+ * There is no wrapping ring of tabs to step through any more, so this is what is
+ * left of setRoot(): one destination, and the only way to it that skips the stack.
+ * Used when a page closes itself and when the shell needs somewhere safe to be.
  */
-void Dashboard::stepRoot(int delta)
+void Dashboard::goHome()
 {
-    const int n = m_roots.size();
-    if (n <= 0)
-        return;
-    setRoot(((m_page + delta) % n + n) % n);
+    m_stack.clear();
+    showPage(m_apps);
 }
 
 void Dashboard::push(PageWidget *page)
@@ -831,14 +836,12 @@ void Dashboard::applyChrome()
     const bool full = page && page->wantsFullscreen();
 
     m_bar->setVisible(!full);
-    m_dock->setVisible(!full);
 
     const QRect normal(0, Theme::StatusH, width(),
-                       qMax(0, height() - Theme::StatusH - Theme::DockH));
+                       qMax(0, height() - Theme::StatusH));
     if (page)
         page->setGeometry(full ? rect() : normal);
 
-    m_dock->setCurrent(m_page);
     if (page)
         m_bar->setTitle(page->title());
 
@@ -878,10 +881,9 @@ void Dashboard::syncInputMode()
 void Dashboard::resizeEvent(QResizeEvent *event)
 {
     m_bar->setGeometry(0, 0, width(), Theme::StatusH);
-    m_dock->setGeometry(0, height() - Theme::DockH, width(), Theme::DockH);
 
     const QRect normal(0, Theme::StatusH, width(),
-                       qMax(0, height() - Theme::StatusH - Theme::DockH));
+                       qMax(0, height() - Theme::StatusH));
     for (PageWidget *page : m_all)
         page->setGeometry(normal);
 
@@ -891,8 +893,8 @@ void Dashboard::resizeEvent(QResizeEvent *event)
     m_keyboard->setGeometry(0, height() - kb, width(), kb);
 
     /* The volume bar is given the WHOLE panel and not `normal', because it has to
-     * be placeable over a page that took the status bar and the dock away -- the
-     * Media player at full screen is the main thing anybody presses VOL+ during. */
+     * be placeable over a page that took the status bar away -- the Media player
+     * at full screen is the main thing anybody presses VOL+ during. */
     m_volumeBar->placeIn(rect());
 
     applyChrome();
@@ -908,10 +910,10 @@ void Dashboard::onToastRequested(const QString &text, int ms)
 
 void Dashboard::onCloseRequested()
 {
+    /* No `else' any more.  A page that closes itself while the stack is empty is
+     * the grid, and the grid closing itself would be the dashboard quitting. */
     if (!m_stack.isEmpty())
         pop();
-    else if (m_page != 0)
-        setRoot(0);
 }
 
 void Dashboard::onTitleChanged()
@@ -981,6 +983,46 @@ void Dashboard::onKey(int code, bool pressed, int modifiers)
         page->keyPressed(code, pressed, modifiers);
 }
 
+void Dashboard::onInputDeviceAdded(const QString &name, bool mouse, bool keyboard)
+{
+    /*
+     * A mouse is worth its own word because it is the one arrival that changes how
+     * the whole shell is driven; a keyboard, because the Terminal is about to
+     * behave differently.  Anything else -- a gamepad, a hub's own node, whatever
+     * a docking station brings with it -- gets the neutral line, which is still
+     * more than the nothing this used to say.
+     */
+    if (mouse)
+        toast(tr("Mouse connected: %1").arg(name));
+    else if (keyboard)
+        toast(tr("Keyboard connected: %1").arg(name));
+    else
+        toast(tr("Input connected: %1").arg(name));
+
+    /*
+     * Show the cursor without moving it, so there is something on screen to aim
+     * with.  Only for a mouse: waking the pointer for a gamepad would put an arrow
+     * over a grid that is being driven with a D-pad.
+     */
+    if (mouse && m_pointer && Settings::instance().mouse().enabled)
+        m_pointer->wake();
+}
+
+void Dashboard::onInputDeviceRemoved(const QString &name)
+{
+    toast(tr("Input disconnected: %1").arg(name));
+}
+
+void Dashboard::refreshInputSummary()
+{
+    if (!m_info || !m_pad)
+        return;
+    m_info->setInputSummary(
+        m_pad->deviceCount() == 0
+            ? tr("no /dev/input/event* -- nothing to navigate with")
+            : QString("%1: %2").arg(m_pad->deviceCount()).arg(m_pad->deviceNames().join(", ")));
+}
+
 /* ── painting, toast, launching ──────────────────────────────────────────── */
 
 void Dashboard::paintEvent(QPaintEvent *)
@@ -1017,8 +1059,11 @@ void Dashboard::toast(const QString &text, int ms)
 {
     m_toast->setText(text);
     m_toast->adjustSize();
+    /* It used to be lifted clear of the dock; with the dock gone it sits on the
+     * same bottom margin every page's content does, which is where the eye
+     * already is after the last row of cards. */
     m_toast->move(qMax(0, (width() - m_toast->width()) / 2),
-                  qMax(0, height() - Theme::DockH - m_toast->height() - 6));
+                  qMax(0, height() - Theme::Margin - m_toast->height()));
     m_toast->show();
     m_toast->raise();
     m_pointer->raise();
@@ -1204,6 +1249,12 @@ void Dashboard::activate(const AppEntry &entry)
     case InternalDiagnostics:
         push(m_diagnostics);
         break;
+    case InternalMedia:
+        push(m_media);
+        break;
+    case InternalSettings:
+        push(m_settings);
+        break;
     case InternalInfo:
         m_info->refresh();
         push(m_info);
@@ -1238,8 +1289,11 @@ void Dashboard::onOpenRequested(const QString &path)
 {
     const QFileInfo info(path);
 
+    /* Pushed, not switched to: Media is on the stack ABOVE the browser now, so B
+     * out of the player lands back on the directory the file was chosen from
+     * instead of dropping the user at the grid. */
     if (m_media->openPath(path)) {
-        setRoot(1);
+        push(m_media);
         return;
     }
 
@@ -1312,58 +1366,39 @@ void Dashboard::onNav(int action, bool repeat)
     if (page && page->handleNav(action))
         return;
 
-    /* Whatever the page did not want. */
-    switch (action) {
-    case Joypad::NavPrevPage:
-        stepRoot(-1);
-        return;
-    case Joypad::NavNextPage:
-        stepRoot(1);
-        return;
-
     /*
-     * THE EDGES OF A ROOT PAGE ARE THE SHOULDER BUTTONS.
+     * Whatever the page did not want.
      *
-     * Left and right only reach this far when the page on the glass had nothing
-     * to do with them: the last card in a row of the grid, a settings row with no
-     * value to nudge, a file list that does not use them.  At that point the
-     * board's only remaining way to change tab was L1/R1, and a stick or a D-pad
-     * on its own could not leave the page it started on -- which is what "locked
-     * to one screen" meant.  So the edge does what the shoulder does, and the
-     * shoulders keep working from anywhere in the page for the hand that is
-     * already on them.
-     *
-     * ONLY FROM A ROOT PAGE, and the empty stack is the test.  A pushed page is
-     * something you are inside -- a Wi-Fi scan, a terminal, a folder several
-     * levels down -- and setRoot() drops the stack, so sliding sideways out of one
-     * would throw it away for a press aimed at moving a cursor.  B leaves those,
-     * and B is on the pad.
-     *
-     * AND ONLY ON A PRESS, WHICH IS WHAT `repeat' IS FOR.  Held directions repeat
-     * every ninety milliseconds, so walking a stick along a row and leaving it
-     * leaned would page through every tab and start again inside half a second.
-     * A repeat still moves the selection -- that is what makes a long list
-     * bearable -- but it stops dead at the edge, and the next press, made
-     * deliberately, is the one that changes tab.
+     * THIS SWITCH USED TO BE THE TAB BAR, and most of it has gone with the dock.
+     * L1/R1 stepped the root page, and left or right at the edge of a root page
+     * did the same thing so that a D-pad on its own could get off the screen it
+     * started on -- that gesture is why `repeat' is a parameter of this function.
+     * There is one root now and every page above it is left with B, so the
+     * shoulders belong to whatever is on the glass (the grid jumps to its ends
+     * with them) and a direction the page refused is a direction with nothing
+     * left to mean.  Joypad still reports the flag and this still takes it,
+     * because the flag is true of the signal whether or not the shell has a use
+     * for it and a slot that dropped it would have to be reconnected the day one
+     * appears.
      */
-    case Joypad::NavLeft:
-        if (m_stack.isEmpty() && !repeat)
-            stepRoot(-1);
-        return;
-    case Joypad::NavRight:
-        if (m_stack.isEmpty() && !repeat)
-            stepRoot(1);
-        return;
+    Q_UNUSED(repeat);
 
+    switch (action) {
     case Joypad::NavMenu:
-        /* Menu is the settings button when the page in front has no use for it. */
-        setRoot(m_current == m_settings ? 0 : 2);
+        /*
+         * Menu is the settings button when the page in front has no use for it.
+         * It is a toggle: pressing it inside Settings takes you back out, rather
+         * than pushing a page that is already on the stack and leaving B as the
+         * only way to undo a button that opened it.
+         */
+        if (current() == m_settings)
+            pop();
+        else
+            push(m_settings);
         return;
     case Joypad::NavBack:
         if (!m_stack.isEmpty())
             pop();
-        else if (m_page != 0)
-            setRoot(0);
         return;
     default:
         break;
@@ -1373,9 +1408,10 @@ void Dashboard::onNav(int action, bool repeat)
 /*
  * A button let go of, delivered to whatever is on the glass and nowhere else.
  *
- * NO FALLBACK, unlike onNav().  A press the page refused becomes a change of tab
- * up there; a release the page refused is nothing at all, because there is no
- * gesture in this shell that a release alone should start.  If the page has since
+ * NO FALLBACK, unlike onNav().  A press the page refused can still open Settings
+ * or pop the stack up there; a release the page refused is nothing at all,
+ * because there is no gesture in this shell that a release alone should start.
+ * If the page has since
  * changed -- a card was launched on the press and the launch pushed a page -- the
  * release lands on the new page, which will not know the action and will ignore
  * it.  That is the correct outcome and it is why this does not remember who was

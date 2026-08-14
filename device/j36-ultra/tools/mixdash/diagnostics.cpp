@@ -626,7 +626,7 @@ void DiagnosticsPage::rebuild()
     ListRow rescan;
     rescan.kind = ListRow::Action;
     rescan.text = tr("Re-scan input devices");
-    rescan.detail = tr("There is no udev here, so a hotplug needs asking for.");
+    rescan.detail = tr("Hotplug is automatic now; this re-reads the ones already open.");
     rescan.glyph = GlyphMouse;
     rescan.accent = Theme::teal();
     rescan.id = RowRescanInput;

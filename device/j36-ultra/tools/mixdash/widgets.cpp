@@ -818,6 +818,12 @@ int CardGrid::rowCount() const
     return qMax(1, (m_entries.size() + cols - 1) / cols);
 }
 
+int CardGrid::rowFill(int r) const
+{
+    const int cols = columns();
+    return qBound(0, m_entries.size() - r * cols, cols);
+}
+
 QRectF CardGrid::slotRect(int i) const
 {
     const int cols = columns();
@@ -838,8 +844,25 @@ QRectF CardGrid::slotRect(int i) const
 
     const int c = i % cols;
     const int r = i / cols;
-    return QRectF(Theme::Margin + c * (cw + Theme::Gap), top + r * (ch + Theme::Gap),
-                  cw, ch);
+
+    /*
+     * AND CENTRED HORIZONTALLY, ROW BY ROW.  Every row but the last is full, so
+     * this is zero for all of them; the last row is the remainder, and left-aligned
+     * it hangs off the left of a grid whose other rows reach both margins.  Two
+     * cards under four is not a row with two cards in it, it is a row with two
+     * cards and a hole, and the hole is the thing the eye lands on.
+     *
+     * The whole-slot arithmetic matters: the indent is a whole number of slot
+     * pitches halved, so a short row's cards sit on the same rhythm as the rows
+     * above -- either dead on a column or dead between two of them, never a few
+     * pixels off one.  With an odd number missing the row straddles the columns by
+     * half a card, which is what centred means and is what makes a lone card land
+     * in the middle rather than under the second column.
+     */
+    const qreal indent = (cols - qMax(1, rowFill(r))) * (cw + Theme::Gap) / 2.0;
+
+    return QRectF(Theme::Margin + indent + c * (cw + Theme::Gap),
+                  top + r * (ch + Theme::Gap), cw, ch);
 }
 
 QRectF CardGrid::drawRect(int i) const
@@ -887,9 +910,16 @@ int CardGrid::cardAt(const QPoint &p) const
 }
 
 /*
- * The slot a point is in, including the empty ones after the last card.  A card
- * being carried can be dropped past the end of the grid -- that is how it is put
- * last -- so this clamps to the final valid index rather than answering -1.
+ * The slot a point is in.
+ *
+ * IT USED TO ANSWER FOR THE EMPTY TAIL TOO.  A short last row left a run of unused
+ * slots at its right-hand end, they were outlined in dashes while a card was in the
+ * air, and aiming at one of them meant "put it last" -- this function mapped every
+ * one of them to the final index.  Centring the row removed the tail: the space
+ * beside a short row is now margin on BOTH sides and belongs to no slot, and the
+ * final index is reachable by aiming at the card that already sits there, which is
+ * what those slots resolved to anyway.  So the second loop went, and with it the
+ * dashed outlines it made into targets.
  */
 int CardGrid::slotAt(const QPoint &p) const
 {
@@ -903,18 +933,6 @@ int CardGrid::slotAt(const QPoint &p) const
     for (int i = 0; i < m_entries.size(); ++i) {
         if (slotRect(i).adjusted(-slop, -slop, slop, slop).contains(QPointF(p)))
             return i;
-    }
-
-    /*
-     * The dashed empty slots at the end of the last row.  They are the only place
-     * a pointer can aim at "after the last card", so landing in one means putting
-     * the card last rather than nowhere -- which is what makes the outline drawn
-     * there a target and not decoration.
-     */
-    const int lattice = rowCount() * columns();
-    for (int i = m_entries.size(); i < lattice; ++i) {
-        if (slotRect(i).adjusted(-slop, -slop, slop, slop).contains(QPointF(p)))
-            return m_entries.size() - 1;
     }
     return -1;
 }
@@ -1120,33 +1138,43 @@ bool CardGrid::moveBy(int dx, int dy)
 
     const int cols = columns();
     const int rows = rowCount();
+    const int last = m_entries.size() - 1;
     const int at = (m_carry >= 0) ? m_carry : m_index;
-    int c = at % cols;
-    int r = at / cols;
+    int candidate = at;
 
     if (dx) {
         /*
-         * HORIZONTAL CLAMPS, AND IT USED TO WRAP.  The old note here said it was a
-         * row of things and the ends should meet, which is true of a row on its
-         * own and false of a row on a page: the far edge of the grid is now where
-         * the shell changes root page, so a wrap would put the one gesture that
-         * leaves this page permanently out of reach of the D-pad.  Wrapping is
-         * also what made the ends NOT meet in the honest sense -- three cards
-         * right from the third card landed back on the third card.
+         * HORIZONTAL IS READING ORDER NOW: THE NEXT CARD, NOT THE NEXT COLUMN.
+         *
+         * It wrapped once, then it clamped at the end of the row.  Both were
+         * answers to a grid that had somewhere to fall off ONTO -- the far edge
+         * used to be where the shell changed root page, so the row end had to be
+         * a wall the D-pad could feel.  There are no root pages left; the end of
+         * a row is just the middle of the list of cards, and stopping there means
+         * the last card in a row and the first card in the next one are neighbours
+         * on the glass that the stick cannot get between.
+         *
+         * It also matters for CARRYING, which is the harder half.  Under the clamp
+         * a card sitting in the last column could not be moved into the next row
+         * at all: right was a wall, and down inserted it a whole row further on.
+         * Stepping by one index means a carried card crosses the row boundary the
+         * same way it crosses anything else -- one press, one place.
+         *
+         * Still no wrap.  The first card and the last card are opposite corners of
+         * the page, not neighbours, and joining them would make a single press
+         * from card 1 land on Power off.
          */
-        c = qBound(0, c + dx, cols - 1);
+        candidate = qBound(0, candidate + dx, last);
     }
     if (dy) {
-        /* Vertical does not: on two rows, wrapping makes up and down feel like
-         * one button. */
-        r = qBound(0, r + dy, rows - 1);
+        /* Vertical stays a column walk, and does not wrap either: on two rows,
+         * wrapping makes up and down feel like one button. */
+        const int c = candidate % cols;
+        const int r = qBound(0, candidate / cols + dy, rows - 1);
+        /* A short last row: land on its last card rather than nothing. */
+        candidate = qMin(r * cols + c, last);
     }
 
-    int candidate = r * cols + c;
-    if (candidate >= m_entries.size()) {
-        /* A short last row: land on its last card rather than nothing. */
-        candidate = m_entries.size() - 1;
-    }
     if (candidate == at)
         return false;
 
@@ -1252,17 +1280,16 @@ bool CardGrid::handleNav(int action)
     case Joypad::NavDown:  moveBy(0, 1); return true;
 
     /*
-     * Left and right are consumed only if they MOVED something.  At the far edge
-     * of the grid there is no card that way, and the shell reads the false as
-     * "then change root page" -- so the same push of the stick that walks along a
-     * row walks off the end of it onto the next tab.  See Dashboard::onNav.
+     * Left and right are ALWAYS consumed, however little they moved.
      *
-     * EXCEPT WHILE CARRYING, where the edge has to be a wall.  Sliding sideways
-     * off the grid with a card in hand would change tab and leave the card
-     * halfway through a move on a page nobody is looking at.
+     * They used to be consumed only when they moved something, so that the far
+     * edge of the grid fell through to the shell and changed root page.  There
+     * are no root pages now, so a false there would reach a switch in
+     * Dashboard::onNav with nothing to do -- and a press that reaches nothing is
+     * better refused here, where the reason is next to the movement.
      */
-    case Joypad::NavLeft:  return moveBy(-1, 0) || m_carry >= 0;
-    case Joypad::NavRight: return moveBy(1, 0) || m_carry >= 0;
+    case Joypad::NavLeft:  moveBy(-1, 0); return true;
+    case Joypad::NavRight: moveBy(1, 0); return true;
 
     case Joypad::NavOk:
         /*
@@ -1287,30 +1314,27 @@ bool CardGrid::handleNav(int action)
         return false;
 
     /*
-     * THE SHOULDERS ARE NOT HANDLED HERE, AND THAT IS THE POINT.
+     * THE SHOULDERS ARE THE TWO ENDS OF THE GRID.
      *
-     * L1/L2 and R1/R2 arrive as NavPrevPage and NavNextPage.  For one release
-     * this page consumed them to step the SELECTION card by card, on the theory
-     * that a hand already on the shoulder should not have to move back to the
-     * D-pad.  It is the wrong theory: the selection is what the D-pad is for, so
-     * the shoulders were a second, slower way to do the one thing the pad already
-     * does well, and the thing nothing else could do -- change which of the root
-     * pages is on the glass -- needed you to walk to the end of a grid first.
+     * L1/L2 and R1/R2 arrive as NavPrevPage and NavNextPage.  They stepped the
+     * selection one card at a time once, which was the D-pad's job done worse;
+     * then they changed root page, which was worth having and is gone with the
+     * dock.  What is left that the D-pad genuinely cannot do quickly is cross the
+     * whole grid: Power off is the last card and the first row is where you
+     * start, and on a television that is eight columns wide that is a lot of
+     * presses.  So a shoulder goes to the end, and the other one comes back.
      *
-     * So they fall through, every time, to Dashboard::onNav, whose stepRoot(-1)
-     * and stepRoot(+1) move the page left and right and wrap at both ends.  Both
-     * shoulders on a side do the same thing on purpose: L1 and L2 are one gesture
-     * to a thumb, and so are R1 and R2.
+     * A step bigger than the grid, rather than a jump written out, so that this
+     * inherits everything moveBy() knows: the clamp at both ends, the refusal to
+     * wrap, and -- the part that matters -- carrying.  With a card in hand these
+     * two send it to the front or the back of the page, which is the one
+     * rearrangement that would otherwise be a dozen presses.
      *
-     * The D-pad reaches the same two calls now, but only by walking to the edge
-     * of the grid first -- which is why the shoulders are still worth having:
-     * from the middle of a full page they are one press instead of three.
-     *
-     * Returning false rather than deleting the case labels would have been the
-     * same behaviour; there are no case labels at all so that the next person
-     * reading this switch does not see the shoulders listed and assume the grid
-     * has an opinion about them.
+     * Both shoulders on a side do the same thing on purpose: L1 and L2 are one
+     * gesture to a thumb, and so are R1 and R2.
      */
+    case Joypad::NavPrevPage: moveBy(-m_entries.size(), 0); return true;
+    case Joypad::NavNextPage: moveBy(m_entries.size(), 0); return true;
 
     default: return false;
     }
@@ -1473,17 +1497,6 @@ void CardGrid::resizeEvent(QResizeEvent *event)
 
 /* ── painting ────────────────────────────────────────────────────────────── */
 
-void CardGrid::paintEmptySlot(QPainter &p, const QRectF &r) const
-{
-    p.setBrush(Qt::NoBrush);
-    QColor edge = Theme::border();
-    edge.setAlpha(90);
-    QPen pen(edge, 1.0, Qt::DashLine);
-    pen.setDashPattern(QVector<qreal>() << 4 << 4);
-    p.setPen(pen);
-    p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), Theme::Radius, Theme::Radius);
-}
-
 void CardGrid::paintCard(QPainter &p, const AppEntry &e, const QRectF &r, bool selected,
                          qreal lift)
 {
@@ -1575,20 +1588,12 @@ void CardGrid::paintEvent(QPaintEvent *event)
     const QRegion dirty = event->region();
 
     /*
-     * The empty tail of the grid, outlined, and ONLY while a card is in the air.
-     * It is the answer to "where can I put this" on a grid whose last row is half
-     * full; at rest it would be a row of boxes around nothing, which is furniture.
+     * THE EMPTY TAIL USED TO BE OUTLINED HERE while a card was in the air -- a run
+     * of dashed boxes off the end of a half-full last row, answering "where can I
+     * put this".  A short row is centred now, so there is no tail to outline: the
+     * space beside those cards is margin, symmetrical, and the same at rest as it
+     * is mid-carry.  See slotRect() and slotAt().
      */
-    if (m_carry >= 0) {
-        /* `lattice' and not `slots': the latter is one of Qt's own keyword
-         * macros and does not survive being a variable name. */
-        const int lattice = rowCount() * columns();
-        for (int i = m_entries.size(); i < lattice; ++i) {
-            const QRectF r = slotRect(i);
-            if (dirty.intersects(dirtyRect(r)))
-                paintEmptySlot(p, r);
-        }
-    }
 
     for (int i = 0; i < m_entries.size(); ++i) {
         if (i == m_index || i == m_carry)
@@ -1610,121 +1615,6 @@ void CardGrid::paintEvent(QPaintEvent *event)
         const QRectF r = drawRect(m_carry);
         if (dirty.intersects(dirtyRect(r)))
             paintCard(p, m_entries[m_carry], r, true, m_motion.value(m_carry).lift);
-    }
-}
-
-/* ── Dock ────────────────────────────────────────────────────────────────── */
-
-Dock::Dock(QWidget *parent)
-    : QWidget(parent)
-{
-    setFixedHeight(Theme::DockH);
-}
-
-void Dock::setPages(const QStringList &names)
-{
-    m_pages = names;
-    update();
-}
-
-void Dock::setCurrent(int page)
-{
-    if (m_current == page)
-        return;
-    m_current = page;
-    update();
-}
-
-QVector<QRectF> Dock::slotRects() const
-{
-    QVector<QRectF> out;
-    if (m_pages.isEmpty())
-        return out;
-
-    const QFont f = Theme::font(12, true);
-    const QFontMetrics fm(f);
-
-    QVector<qreal> slotW;
-    qreal total = 0;
-    for (const QString &name : m_pages) {
-        const qreal sw = qMax(64.0, fm.horizontalAdvance(name) + 30.0);
-        slotW.append(sw);
-        total += sw;
-    }
-    const qreal pad = 8.0;
-    const qreal barW = total + pad * 2;
-    const qreal barH = 40.0;
-    const QRectF bar((width() - barW) / 2.0, (height() - barH) / 2.0, barW, barH);
-
-    qreal x = bar.x() + pad;
-    for (int i = 0; i < m_pages.size(); ++i) {
-        out.append(QRectF(x, bar.y() + 5, slotW[i], barH - 10));
-        x += slotW[i];
-    }
-    return out;
-}
-
-void Dock::mousePressEvent(QMouseEvent *event)
-{
-    /* `slots' is a Qt keyword -- qobjectdefs.h defines it away to nothing -- so it
-     * cannot be a variable name in a translation unit that has not asked for
-     * QT_NO_KEYWORDS, and this one has not. */
-    const QVector<QRectF> boxes = slotRects();
-    for (int i = 0; i < boxes.size(); ++i) {
-        if (!boxes[i].contains(QPointF(event->pos())))
-            continue;
-        emit pageClicked(i);
-        event->accept();
-        return;
-    }
-    event->ignore();
-}
-
-void Dock::paintEvent(QPaintEvent *)
-{
-    if (m_pages.isEmpty())
-        return;
-
-    QPainter p(this);
-    p.setRenderHint(QPainter::Antialiasing, true);
-
-    const QFont f = Theme::font(12, true);
-    p.setFont(f);
-
-    const QVector<QRectF> boxes = slotRects();
-    if (boxes.isEmpty())
-        return;
-
-    /* Slots sized to their labels, so the bar is as wide as it needs to be and
-     * centred -- which is what makes it read as a dock and not as a tab strip. */
-    const qreal pad = 8.0;
-    const QRectF bar(boxes.first().x() - pad, boxes.first().y() - 5,
-                     boxes.last().right() - boxes.first().x() + pad * 2, 40.0);
-
-    Theme::softShadow(p, bar, 16, 6, 30);
-    QColor glass = Theme::dock();
-    glass.setAlpha(Theme::DockAlpha);
-    p.setPen(Qt::NoPen);
-    p.setBrush(glass);
-    p.drawRoundedRect(bar, 16, 16);
-    p.setBrush(Qt::NoBrush);
-    p.setPen(QPen(QColor(255, 255, 255, 40), 1.0));
-    p.drawRoundedRect(bar.adjusted(0.5, 0.5, -0.5, -0.5), 16, 16);
-
-    for (int i = 0; i < m_pages.size() && i < boxes.size(); ++i) {
-        const QRectF slot = boxes[i];
-        if (i == m_current) {
-            Theme::vgrad(p, slot, Theme::blue(), Theme::blueLow(), 11);
-            p.setPen(Theme::ink());
-        } else {
-            QColor hi = Theme::dockHi();
-            hi.setAlpha(90);
-            p.setPen(Qt::NoPen);
-            p.setBrush(hi);
-            p.drawRoundedRect(slot, 11, 11);
-            p.setPen(Theme::ink2());
-        }
-        p.drawText(slot, Qt::AlignCenter, m_pages[i]);
     }
 }
 
@@ -2810,10 +2700,9 @@ bool InfoPage::handleNav(int action)
         return true;
     /*
      * Left and right page rather than doing nothing.  Nothing else wants them
-     * here -- this page is pushed, and the shell only turns a refused left or
-     * right into a change of tab from a root page -- and this sheet is several
-     * screens long on a machine whose only scroll wheel is a thumbstick nudged
-     * one row at a time.
+     * here -- the shell has no use left for a direction a page refused -- and
+     * this sheet is several screens long on a machine whose only scroll wheel is
+     * a thumbstick nudged one row at a time.
      */
     case Joypad::NavLeft:
         scrollBy(-pageStep());

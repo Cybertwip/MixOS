@@ -3,22 +3,25 @@
  * Copyright (c) 2025-2026 the MixOS project and contributors
  * See device/j36-ultra/LICENSE for the licence text and what it covers.
  *
- * dashboard.h -- the shell: three root pages, a stack above them, one input path.
+ * dashboard.h -- the shell: one grid of cards, a stack above it, one input path.
  *
  * WHAT CHANGED AND WHY.  The first version of this file was four pages and a
  * chain of `if (m_page == 1)' in onNav().  That was honest at four pages and
- * unreadable at twelve, and twelve is what this build has: Apps, Media and
- * Settings at the root, and Files, Terminal, Wi-Fi, Sharing, Packages,
- * Diagnostics, Mouse, Display, Language and System pushed on top of them.  Every
- * page now answers handleNav() for itself and the shell only decides WHICH page
- * is on screen.  The shell's remaining jobs are the ones no page can do alone:
+ * unreadable at twelve, and twelve is what this build has.  Every page answers
+ * handleNav() for itself and the shell only decides WHICH page is on screen.
+ *
+ * AND THEN THE TABS WENT.  There were three root pages -- Apps, Media, Settings --
+ * with a dock along the bottom to switch between them, the shoulder buttons doing
+ * the same thing, and the edges of the D-pad doing it a third time.  That is three
+ * gestures and 56 px of furniture to reach two pages that are perfectly good
+ * cards.  Now there is ONE root, the card grid, and everything else -- Media and
+ * Settings included -- is pushed on top of it and popped with B.  One way in, one
+ * way out, and the only thing on the glass besides the page is the status bar.
+ *
+ * The shell's remaining jobs are the ones no page can do alone:
  *
  *   - the stack.  Back falls through a page that does not consume it, and the
- *     shell pops.  That is the whole navigation model.
- *   - the tabs.  Left and right fall through the same way, and from a root page
- *     the shell reads that as "there was nothing that way on this page" and moves
- *     to the next one -- the D-pad's version of the shoulder buttons, so a board
- *     being driven with one thumb is not stuck on the tab it started on.
+ *     shell pops.  That is the whole navigation model, and now it is the only one.
  *   - the volume.  Two keys on the side of the case that no page ever sees.
  *   - launching.  A child process needs the pad suspended, the panel warned
  *     about and a toast afterwards; a page cannot do that to itself.
@@ -26,8 +29,10 @@
  *     text, and the answer goes back to whichever page asked.
  *   - the pointer.  One cursor over every page, above everything, asleep while a
  *     page owns the whole panel.
- *   - the chrome.  The status bar and the dock go away for a page that says
- *     wantsFullscreen(), and come back when it stops saying it.
+ *   - the chrome.  The status bar goes away for a page that says
+ *     wantsFullscreen(), and comes back when it stops saying it.
+ *   - the hotplug.  A mouse or a keyboard arriving is announced here, because the
+ *     page in front has no idea what is plugged into the board.
  */
 #ifndef MIXDASH_DASHBOARD_H
 #define MIXDASH_DASHBOARD_H
@@ -108,15 +113,18 @@ public:
     /*
      * A card with no exe does one of these instead of starting a process.
      *
-     * There is no InternalMedia or InternalSettings any more: those cards did
-     * nothing but setRoot() to a tab the dock already shows, so the cards are gone
-     * and so are the arms that served them.  InternalConsole went the same way for
-     * a worse reason -- it hung the dashboard.  The note where the card used to be
-     * built, in buildPages(), says why.
+     * InternalMedia and InternalSettings are back.  They were deleted when Media
+     * and Settings were dock tabs and the cards that led to them did nothing but
+     * switch tab -- two doors into one room.  There is no dock now, so these two
+     * are the only door, and they push their page like every other card here.
      *
-     * InternalReboot is gone too, and that one for no reason worse than the board
-     * having a power button that already does it.  A card that duplicates hardware
-     * is a card you can hit by accident.
+     * InternalConsole is NOT back, and that one was removed for a worse reason: it
+     * hung the dashboard.  The note where the card used to be built, in
+     * buildPages(), says why.
+     *
+     * InternalReboot is gone too, for no reason worse than the board having a power
+     * button that already does it.  A card that duplicates hardware is a card you
+     * can hit by accident.
      */
     enum Internal {
         InternalNone = 0,
@@ -126,6 +134,8 @@ public:
         InternalSharing,
         InternalPackages,
         InternalDiagnostics,
+        InternalMedia,
+        InternalSettings,
         InternalInfo,
         InternalPoweroff
     };
@@ -142,7 +152,7 @@ signals:
 
 public slots:
     /* `repeat' is Joypad's: false for a press, true for an autorepeat of one still
-     * being held.  Only the edge-of-page gesture reads it -- see onNav. */
+     * being held.  Nothing in the shell reads it since the tabs went -- see onNav. */
     void onNav(int action, bool repeat);
     /* The same action let go of.  Delivered to the current page and nowhere else;
      * one page listens.  See onNavReleased in dashboard.cpp. */
@@ -175,12 +185,29 @@ private slots:
     void onKey(int code, bool pressed, int modifiers);
 
     /*
+     * Something was plugged into the port, or pulled out of it.
+     *
+     * WHY THE SHELL SAYS SO OUT LOUD.  This device has one USB connector and no
+     * status LED on it, and the pointer only appears once it has been moved -- so
+     * a mouse that arrives silently is indistinguishable from a mouse that did not
+     * arrive at all until the user has already started doubting the cable.  One
+     * toast naming what the kernel saw ends that.  It is also the only feedback a
+     * keyboard gets, since a keyboard changes nothing on screen until something
+     * asks for text.
+     */
+    void onInputDeviceAdded(const QString &name, bool mouse, bool keyboard);
+    void onInputDeviceRemoved(const QString &name);
+    /* Re-file the device list into the System information page, which is the one
+     * place that lists them by name. */
+    void refreshInputSummary();
+
+    /*
      * The language changed under the shell's feet.
      *
-     * The cards and the dock are the only strings in this program built once and
-     * kept: every other page fills its rows in onEnter(), so walking back to a
-     * page is already enough to retranslate it.  These two are not walked back to
-     * -- the dock is always on the glass -- so they are rebuilt here.
+     * The cards are the only strings in this program built once and kept: every
+     * other page fills its rows in onEnter(), so walking back to a page is already
+     * enough to retranslate it.  The grid is not walked back to -- it is the root,
+     * and you arrive at it by leaving something else -- so it is rebuilt here.
      */
     void retranslate();
 
@@ -192,13 +219,12 @@ private:
 
     PageWidget *current() const;
     void showPage(PageWidget *page);
-    void setRoot(int page);
-    /* setRoot() one tab along, wrapping.  Both shoulders and, from a root page,
-     * both edges of the D-pad come through here. */
-    void stepRoot(int delta);
+    /* Empty the stack and show the grid.  What setRoot(0) used to be, with the
+     * other two roots and the number gone. */
+    void goHome();
     void push(PageWidget *page);
     void pop();
-    /* Status bar, dock, page geometry and the pointer, from whatever is current. */
+    /* Status bar, page geometry and the pointer, from whatever is current. */
     void applyChrome();
     void syncInputMode();
     void openDestination(int destination);
@@ -213,21 +239,19 @@ private:
     static QString firstWad();
 
     StatusBar *m_bar = nullptr;
-    Dock *m_dock = nullptr;
 
     /*
-     * The three root pages, in dock order.
+     * The root, and there is exactly one of it.
      *
-     * There were four.  The fourth was a second CardGrid holding Power off and
-     * System -- two cards on a page with room for eight, reached by a tab of its
-     * own.  Both cards are on the Apps grid now and the tab is gone; buildPages()
-     * says why at more length.
+     * There were four once: this grid, Media, Settings, and a second CardGrid
+     * holding nothing but Power off and System.  They are all cards on this one
+     * now; buildPages() says why at more length.
      */
     CardGrid *m_apps = nullptr;
+
+    /* Pushed on top of the grid. */
     MediaPage *m_media = nullptr;
     SettingsPage *m_settings = nullptr;
-
-    /* Pushed on top of a root page. */
     FilesPage *m_files = nullptr;
     TerminalPage *m_terminal = nullptr;
     WifiPage *m_wifi = nullptr;
@@ -239,9 +263,8 @@ private:
     LanguagePage *m_language = nullptr;
     InfoPage *m_info = nullptr;
 
-    QVector<PageWidget *> m_roots;
     QVector<PageWidget *> m_all;
-    /* Empty means a root page is on screen; otherwise the last one is. */
+    /* Empty means the card grid is on screen; otherwise the last one is. */
     QVector<PageWidget *> m_stack;
     PageWidget *m_current = nullptr;
 
@@ -260,7 +283,6 @@ private:
     VolumeOverlay *m_volumeBar = nullptr;
     Joypad *m_pad = nullptr;
 
-    int m_page = 0;
     bool m_firstPaint = false;
     int m_armed = InternalNone;
     /* The exe of a confirm-first card that has been pressed once.  Keyed on the path
