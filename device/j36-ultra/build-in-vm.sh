@@ -6451,6 +6451,10 @@ changes nothing else:
   opt/mixos/bin/mixdash    the dashboard: Qt5 Widgets straight into /dev/fb0
   opt/mixos/qt/            Qt 5.15 and its runtime closure, ~30 SONAME symlinks
   opt/mixos/bin/doom       framebuffer Doom, and share/doom/ its IWAD
+  opt/mixos/bin/j36-mixmirror
+                           copies /dev/fb0 onto a USB-HDMI (DisplayLink) adapter
+                           whenever one is plugged in, tile-diffed so a still
+                           screen costs no USB traffic.  See "j36.usb and HDMI"
   opt/mixos/j36/mfgpower   powers the Mali-450 and reads its ID back; the gate
   opt/mixos/j36/modules/   lima and its dependencies, plus load.order
   opt/mixos/j36/mtkdrm/    the MT6592 display driver set, plus load.order
@@ -7762,6 +7766,7 @@ statement about other people's code.
 Microsoft Public License (Ms-PL), in full below:
 
     bin/mixdash             the MixOS dashboard (Qt5 Widgets on linuxfb)
+    bin/j36-mixmirror       the panel-to-USB-HDMI mirror
     j36/eglprobe            the EGL/GBM/DRM scanout probe
     j36/mfgpower            the MFG power-domain bring-up probe
     mvii/boot.conf          the MVII LK hand-off
@@ -7900,7 +7905,7 @@ LICENCE
 # own units, and never looks in /opt.
 #
 # WHY IT IS A TARBALL AS WELL AS A TREE.  The SONAME aliases in qt/lib are symlinks and
-# mfgpower, eglprobe, mixdash and doom have to stay executable.  A tarball is the copy
+# mfgpower, eglprobe, mixdash, j36-mixmirror and doom have to stay executable.  A tarball is the copy
 # that cannot lose either -- or the ownership -- whatever machine does the copying, and
 # the reason it is not simply a directory to drag across in a file manager.
 #

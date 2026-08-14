@@ -1,64 +1,134 @@
-# <p align="center">Welcome to MixOS</p>
+# <p align="center">MixOS</p>
 
-### <p align="center">A Debian based operating system for portable gaming handhelds, with first-class support for the MediaTek line of processors alongside Rockchip RK3326 and RK3566.</p>
+### <p align="center">**M**icrosoft **I**ncorporates the **X** **OS**</p>
+
+### <p align="center">A Microsoft line of operating systems, based on Linux and Debian, brought to you by Cybertwip for MediaTek and legacy Rockchip handhelds.</p>
 
 [![Donate](https://img.shields.io/badge/Donate-PayPal-green.svg)](https://www.paypal.com/donate?hosted_button_id=RC72LJ4SSERSU)
 
-**MixOS supports the MediaTek line of processors.** That is the reason this fork
-exists and it is what makes it different from what it came from. The MediaTek
-MT6592 (Cortex-A7, ARMv7, Mali-450 MP4) is brought up natively here — a 32-bit ARM
-kernel, a mainline `mtk_drm` display path, `mtk-sd` storage, the MT6592 AFE for
-audio, a keypad adapter, and Mesa's lima/kmsro pair on the GPU — on
-the J36 Ultra. The MediaTek work lives in [`device/j36-ultra/`](device/j36-ultra/)
-and is licensed under the
-[Microsoft Public License](device/j36-ultra/LICENSE). Rockchip RK3326 and RK3566
-devices continue to be supported as they were.
+## The name
 
-The overarching goals of MixOS are as follows:
-1. MediaTek support, on real hardware, in the open
-1. Highly customizable 
-1. Performance
-1. Online Updates (Won't require SD card reflashing unless there are major structural changes like file system changes.)
-1. Enthusiats focused
+Free software has a tradition of explaining itself through its acronym, and GNU set
+the bar: **G**NU's **N**ot **U**nix, a name that answers the only question anybody
+was going to ask, and answers it with itself, forever.
 
-## This fork diverges
+MixOS follows the tradition and misses the point entirely. It stands for
 
-MixOS is a **divergent fork of dArkOS**, which is itself a Debian-based
-continuation of [ArkOS](https://github.com/christianhaitian/arkos/wiki).
-Divergent is meant literally: MixOS does not track dArkOS, and its changes are not
-a patch set that will be sent back. It adds a second SoC vendor and a 32-bit ARM
-kernel to a build system that assumed one vendor and arm64, and it edits shared
-files to do that. A MixOS card, artifact or bug is not dArkOS's concern and not
-ArkOS's — please do not report MixOS problems to either project.
+> **M**icrosoft **I**ncorporates the **X** **O**perating **S**ystem
 
-Everything outside `device/j36-ultra/` and `device/r36-ultra/` came from dArkOS and
-keeps its own copyright and licence — see [LICENSES.md](LICENSES.md). Neither
-dArkOS nor ArkOS endorses this fork or is responsible for it.
+which does not recurse, does not clarify, and name-drops two companies in five
+words. GNU's acronym is a philosophical position. This one is a press release that
+got away from somebody — the whole operating system, brought to you in partnership
+with X (now part of the xAI company), incorporated, at last, by Microsoft.
 
-This is intended to continue the work from ArkOS and dArkOS in a way that allows others to easily fork and modify the OS to their own taste.  If there's a feature not currently available that you want, you can fork this and add it yourself.
-Don't feel like building the OS from scratch or don't have the resources to do so?  Ok, just download one of the available prebuilt images and make changes right in the OS.  Since this OS is based on the latest stable version of Debian, you have
-access to over 64,000 packages you can install via the Debian Advanced Package Tool (APT).  Want to build the latest testing or bleeding edge release of Debian? See the notes below on how to accomplish this.
+What *is* true is the rest of this page.
 
-**Building instructions:**
-   - Suggested Environment - Ubuntu or related variants, version 24.04 or newer.  Windows Subsystem for Linux (WSL) is not supported and will not work due to no support for chroot. \
-     Because chroot is used in this process, heavy use of sudo is made.  To reduce the possibility of priviledge issues, \
-     it's best to be able to execute sudo without needing a password.  This can be done using one of the 2 methods below.
-      - Method 1: - Open a Terminal window and type `sudo visudo` \
-                    In the bottom of the file, add the following line: `$USER ALL=(ALL) NOPASSWD: ALL` \
-                    Where $USER is your username on your system. Save and close the sudoers file (if you haven't changed your \
-                    default terminal editor (you'll know if you have), press Ctl + x to exit nano and it'll prompt you to save).
-      - Method 2: - Clone this git repo then run `./FreeSudo.sh`.  If there were no errors, it should've completed this change for you. \
-                    You can verify this by checking if a `/etc/sudoers.d/$USER` file exists and contains `$USER ALL=(ALL) NOPASSWD: ALL` in it.
-     
-Now you should be able to just run make <device_name> to build for a supported device.  Example: `make rg353m`
+## What it is
 
-### J36 Ultra (MediaTek MT6592) bring-up build
+MixOS turns a cheap MediaTek handheld into a working Linux computer. Not a launcher
+bolted onto a vendor Android image — a real Debian rootfs, a mainline kernel built
+from source, device drivers written for the silicon that is actually in the case,
+and a shell you can drive with a thumbstick.
 
-The MediaTek target.  It builds a 32-bit ARM Linux 6.12 LTS kernel, the MT6592
-device tree, the display/audio/input modules, an initramfs and an SD `BOOT`
-payload that the device's own MVII little kernel hands control to — the ARMv7
-kernel and the RK3326 arm64 kernel coexist on one card and share one armhf Debian
-rootfs.
+The reference device is the **J36 Ultra**: MediaTek MT6592, eight Cortex-A7 cores at
+ARMv7, a Mali-450 MP4, a 640x480 MIPI panel, a keypad matrix, two analog sticks and
+a battery. It is a 2013 phone SoC in a 2024 games console shell, and nothing
+upstream supported it. The port lives in
+[`device/j36-ultra/`](device/j36-ultra/).
+
+Legacy **Rockchip** devices — RK3326 and RK3566 — continue to be supported the way
+they were, and share the same armhf Debian rootfs on the same card.
+
+On the device you get:
+
+* **mixdash**, the shell — Qt Widgets painted straight into `/dev/fb0`, no X, no
+  Wayland, no compositor. Apps, Media, Settings and Power at the root; Files,
+  Terminal, Wi-Fi, Sharing, Packages, Diagnostics, Mouse, Display, Language and
+  System Info pushed on top. Everything is reachable from the D-pad, and the tabs
+  are reachable by pushing left or right off the edge of a page, so a board being
+  driven with one thumb is never stuck.
+* **Six languages**, compiled in — English, French, Italian, German, Portuguese and
+  Spanish — switchable from Settings without a restart.
+* **The hardware, working.** Battery gauge and charger through the MT6592 PMIC.
+  Backlight that inherits whatever the bootloader left and never blanks itself.
+  Audio through the MT6592 AFE. Volume keys with an on-screen bar. Poweroff that
+  actually cuts the rail instead of parking the CPU with the screen on.
+* **USB host** — mice, keyboards, gamepads, mass storage that automounts, and a
+  USB-HDMI dock: plug in a DisplayLink adapter and the panel is mirrored onto the
+  TV, tile-diffed so a still screen costs no bus traffic. The handheld keeps its own
+  screen the whole time.
+* **Sharing** — the `DATA` partition (`/home/virtua`) offered over SMB to the
+  network and over USB, so getting files onto the device does not mean taking the
+  card out.
+* **Debian underneath**, which is the point: `apt install` works, and there are over
+  64,000 packages on the other end of it.
+
+## What it aims at
+
+1. **A full working mobile console PC station.** The handheld should be a computer
+   you can dock, type on, share files with and install software on — not an
+   appliance that plays one thing.
+2. **MediaTek support, on real hardware, in the open.** Every register in this tree
+   was found the hard way and is commented with why.
+3. **Nothing that cannot be removed.** Every payload on the card is a directory and
+   a word on the kernel command line. Delete the directory, or the word, and the
+   boot carries on and says what it could not find. There is no configuration state
+   that can only be repaired by reflashing.
+4. **Updates without reflashing.** It is Debian; `apt` is the update mechanism.
+   A new card is only needed for structural changes, like a partition layout.
+5. **Performance on hardware nobody optimises for any more**, and enthusiasts first
+   — if the feature you want is not here, fork it and add it.
+
+## How it works
+
+**The card is three partitions.** `BOOT` is FAT32 and holds only the four files the
+device's own MVII little kernel can read — the kernel, the device tree, the
+initramfs and `mvii/boot.conf`. `ROOTFS` is ext2 and is the shared armhf Debian
+userspace, the same one a Rockchip board on the same card boots. `DATA` is ext2,
+mounted at `/home/virtua`, and is where everything the user owns lives.
+
+**The boot is a hand-off, not a bootloader replacement.** The stock MVII LK reads
+`boot.conf`, loads the ARMv7 kernel and hands over with a framebuffer already
+running. The initramfs `/init` takes it from there: it finds the rootfs, reads the
+`j36.*` words off the kernel command line, and `insmod`s exactly the payloads those
+words ask for — `j36.gl`, `j36.usb`, `j36.power`, `j36.audio`, `j36.wifi`,
+`j36.dash` — each from its own directory under `/opt/mixos/j36/` with its own load
+order, each failing on its own without taking the boot down. Then it writes the
+dashboard's systemd unit into a tmpfs and switches root.
+
+**The build is three stages.** `./build-j36-ultra.sh` runs on the host, brings up a
+Multipass VM, and inside it `device/j36-ultra/build-in-vm.sh` does the real work:
+kernel, device tree, modules, initramfs, the Qt dashboard cross-built in an emulated
+armhf chroot, the Mesa payload, and the SD image. Everything is incremental and
+cached; the script checks its own output at every stage and refuses to ship a card
+that is half one build and half another.
+
+Start with [`device/j36-ultra/README.md`](device/j36-ultra/README.md). It documents
+the payload, every word of the kernel command line, and how to take any part of it
+off a card without a reflash.
+
+## Building
+
+**Suggested environment** — Ubuntu 24.04 or newer, or a related variant. Windows
+Subsystem for Linux is not supported and will not work, because this process uses
+`chroot`.
+
+Because `chroot` is used, heavy use is made of `sudo`. To reduce the chance of
+privilege problems it is best to be able to run `sudo` without a password:
+
+* **Method 1** — run `sudo visudo` and add `$USER ALL=(ALL) NOPASSWD: ALL` at the
+  bottom, where `$USER` is your username. Save and close.
+* **Method 2** — clone this repo and run `./FreeSudo.sh`. Check that
+  `/etc/sudoers.d/$USER` exists and contains that line.
+
+Then build for a supported device with `make <device_name>`, e.g. `make rg353m`.
+
+### J36 Ultra (MediaTek MT6592)
+
+Builds a 32-bit ARM Linux 6.12 LTS kernel, the MT6592 device tree, the
+display/audio/input/USB/PMIC modules, an initramfs and the SD `BOOT` payload the
+MVII little kernel hands control to. The ARMv7 kernel and the Rockchip arm64 kernel
+coexist on one card and share one armhf Debian rootfs.
 
 ```bash
 ./build-j36-ultra.sh
@@ -66,18 +136,12 @@ rootfs.
 ./build-j36-ultra-dtb.sh
 ```
 
-Read [`device/j36-ultra/README.md`](device/j36-ultra/README.md) first — it
-documents the payload, every word of the kernel command line, and how to remove
-any part of it from a card without a reflash.
+### R36 Ultra (Rockchip RK3326)
 
-### R36 Ultra bring-up build
-
-The R36 Ultra helper currently builds the RG351MP/RK3326 base image used for
-bring-up (the R36-specific DTB layer is still separate).  Its default profile
-is intentionally small: one native armhf (32-bit) Debian userspace is built,
-with no front end on it, while the arm64 userspace, bundled emulators and
-standalone applications are skipped.  The existing RK3326 kernel/U-Boot
-chain is still arm64; a 32-bit kernel would be a separate board port.
+Builds the RG351MP/RK3326 base image used for bring-up; the R36-specific DTB layer
+is still separate. The default profile is intentionally small — one native armhf
+Debian userspace with no front end on it, and no arm64 userspace, bundled emulators
+or standalone applications.
 
 ```bash
 ./build-r36-ultra.sh
@@ -85,71 +149,139 @@ chain is still arm64; a 32-bit kernel would be a separate board port.
 make r36-ultra
 ```
 
-The default is four parallel build jobs and an armhf-only userspace:
+The default is four parallel jobs and an armhf-only userspace:
 
 ```bash
 BUILD_JOBS=4 USERSPACE_ARCH=armhf ./build-r36-ultra.sh
 ```
 
-- Change `BUILD_JOBS` to control internal Make/CMake/Meson parallelism.
-- Set `USERSPACE_ARCH=arm64` to build a single-architecture arm64 userspace
-  instead.  The R36 helper never produces an arm64+armhf multiarch rootfs.
+* `BUILD_JOBS` controls internal Make/CMake/Meson parallelism.
+* `USERSPACE_ARCH=arm64` builds a single-architecture arm64 userspace instead. The
+  R36 helper never produces an arm64+armhf multiarch rootfs.
 
-**Notes**
-- To build on a different release of Debian, change the DEBIAN_CODE_NAME export in the Makefile or add DEBIAN_CODE_NAME=<release> as a variable to `make`.  Other debian code names can be found at https://www.debian.org/releases/
-- `r36-ultra` and `j36-ultra` are the only build targets.  The twelve other boards
-  each had their own `build_<unit>.sh`; none of those scripts is in the tree, and the
-  targets that called them are gone too.  `USERSPACE_ARCH` is what picks the
-  architecture on both of the remaining targets, and it defaults to armhf; the older
-  `BUILD_ARMHF=y` arm64+armhf multiarch path is still in the bootstrap scripts but
-  nothing that survives reaches it, because setting `USERSPACE_ARCH` at all takes
-  precedence.  The 32bit userspace used to exist for PortMaster's prebuilt ports and
-  the 32bit emulator builds; here it is simply the native architecture of the J36's
-  Cortex-A7.
-- Initial build time on an Intel I7-8700 65w unit with a 512GB NVME SSD and 32GB of DDR4 memory is a little over 19 hours.  Subsequent builds are about 3 hours thanks to ccache.
-- Builds land in `MixOS-Artifacts/`, a sibling of the checkout.  It used to be
-  `dArkOS-artifacts/` — named after whatever the working copy happened to be
-  called rather than after the project — and the first build after the rename
-  *moves* the old directory across instead of starting an empty one beside it,
-  because `Reference/BOOT` lives in there and no part of this pipeline can
-  rebuild it.  Set `MIXOS_ARTIFACT_DIR` to put the output somewhere else;
-  `DARKOS_ARTIFACT_DIR` is still honoured for anyone who has it in a shell
-  profile.
-- Some environment variables and shell functions still spell the old name: the
-  rest of the `DARKOS_*` build variables, the `darkos_*` shell helpers, and the
-  `darkos-r36` build VM with its `~/darkos-r36-state` checkpoints.  Those are
-  interfaces rather than branding, and renaming them would orphan existing build
-  state and cached checkpoints, so they are deliberately left as they are.
-- The inherited `/opt/system` tool menu, the hostapd/dnsmasq access point and the
-  OTA updater are gone.  All of them came from ArkOS, none of them could run on
-  an image built from this tree (they draw with `msgbox`/`osk`/`gptokeyb`, which
-  no live script installs), and the updater pulled its payload from upstream
-  dArkOS.  `/opt/system` itself remains only because the two RG351MP LED
-  scripts are copied into it.  The `roms/tools` bind mount that used to back
-  `/opt/system/Tools` went with the roms tree, so `importwifi.sh` now looks
-  for a `wifikeyfile.txt` under a path nothing creates — which is inert
-  rather than broken, since that is what it did on any card without a key
-  file.  Replacements belong in mixdash once the board has a working network
-  interface.
+### Notes
+
+* **Build time is about two hours** on a mid-range desktop, first run included, and
+  much less than that on a rebuild — the Debian bootstrap, the package set, the
+  emulated armhf chroot and the compiler output are all cached between runs, and a
+  finished base build is not re-partitioned or re-bootstrapped.
+* To build against a different Debian release, change the `DEBIAN_CODE_NAME` export
+  in the Makefile or pass `DEBIAN_CODE_NAME=<release>` to `make`. Release names are
+  at <https://www.debian.org/releases/>.
+* `r36-ultra` and `j36-ultra` are the only build targets. `USERSPACE_ARCH` picks the
+  architecture on both and defaults to armhf — which is simply the native
+  architecture of the J36's Cortex-A7.
+* Builds land in `MixOS-Artifacts/`, a sibling of the checkout. Set
+  `MIXOS_ARTIFACT_DIR` to put the output somewhere else.
+* Some environment variables, shell helpers and the build VM name still spell an
+  older project name. Those are interfaces rather than branding, and renaming them
+  would orphan existing build state and cached checkpoints, so they are deliberately
+  left alone.
+* The inherited `/opt/system` tool menu, the hostapd/dnsmasq access point and the
+  OTA updater are gone. None of them could run on an image built from this tree.
+  Their replacements belong in mixdash.
 
 # Licence
 
-MixOS is made up of many open-source components, each under its own licence; see
-[LICENSES.md](LICENSES.md).
+MixOS is assembled from many open-source components, each under its own licence.
+The full statement, file by file, is in [LICENSES.md](LICENSES.md). The short
+version is below, and the parts that are not negotiable are marked as such.
 
-- The MediaTek J36 Ultra device work is under the **Microsoft Public License
-  (Ms-PL)** — [`device/j36-ultra/LICENSE`](device/j36-ultra/LICENSE).
-- The Linux kernel modules and kernel patches in `device/j36-ultra/linux/` stay
-  **GPL-2.0-only**.  Ms-PL is not GPL-compatible and they are not relicensed.
-- Everything inherited from dArkOS keeps dArkOS's MIT licence and copyright.
+### The MixOS work is dual-licensed: MPL-2.0 **or** GPL-2.0-or-later
+
+```
+SPDX-License-Identifier: MPL-2.0 OR GPL-2.0-or-later
+```
+
+You may take any original MixOS file under **either** the
+[Mozilla Public License 2.0](https://www.mozilla.org/MPL/2.0/) **or** the
+[GNU General Public License, version 2 or later](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html),
+at your option.
+
+**Why this pair, and not something simpler.** The project needs three things at
+once, and no single licence gives all three:
+
+* **Commercial use has to stay open.** Both halves of this permit selling devices,
+  selling images and shipping MixOS inside a product. Neither has a
+  non-commercial clause, and the previous non-commercial framing of this repository
+  is gone.
+* **The source has to stay under control.** MPL-2.0 is *file-level* copyleft: a
+  modified MixOS file must be published under MPL-2.0, so improvements to this code
+  come back, while proprietary code in the same binary, the same product or the same
+  card is explicitly allowed to stay proprietary (MPL-2.0 §3.3). That is what keeps
+  a commercial device buildable on top of this without the vendor's own application
+  being conscripted.
+* **It has to be able to live next to Linux and Debian.** This is the part that
+  forced the change. The previous licence, Ms-PL, is *not* GPL-compatible — its
+  §3(D) adds a condition GPLv2 §6 forbids adding — so MixOS code could never be
+  combined with, linked into or derived from the kernel it runs on. MPL-2.0 solves
+  this deliberately and by design: §1.12 and §3.3 make it a *secondary-licence*
+  arrangement, meaning MPL-2.0 code may be relicensed under the GPL when it is
+  combined with GPL code. Offering GPL-2.0-or-later explicitly alongside it removes
+  the last doubt, so a MixOS file can be moved into a kernel module or a GPL project
+  without a lawyer being consulted first.
+
+The result is the freedom the GPL enables, applied to a codebase that can still be
+sold and still be built into a closed product — which is the position this project
+needs to be in.
+
+### The parts that are GPL because they cannot be anything else
+
+MixOS **inherits the GPL** from the two things it is made of, and this is a
+statement of fact rather than a choice:
+
+* **The Linux kernel is GPL-2.0-only.** Everything under
+  `device/j36-ultra/linux/` — the MT6592 input, audio, USB PHY, PMIC, backlight,
+  Wi-Fi and panel drivers, and the `mtk-sd` and `drm/mediatek` patches — is a Linux
+  kernel module or a Linux kernel patch. It derives from and links against
+  GPL-2.0-only kernel internals, it carries `SPDX-License-Identifier: GPL-2.0-only`
+  and `MODULE_LICENSE("GPL v2")`, and it is **not** dual-licensed and **not**
+  relicensable. If you distribute a device running this kernel you are distributing
+  GPL-2.0 software and you owe its recipients the corresponding source, which is
+  this repository plus the kernel tree it names.
+* **Debian is the operating system.** A MixOS card boots a Debian rootfs assembled
+  with Debian's own tools, and all but a handful of the packages on it are the
+  Debian project's work under their own licences — GPL, LGPL, MIT, BSD, Apache and
+  more, recorded per package in `/usr/share/doc/*/copyright` on a running device.
+  Debian's GPL packages carry Debian's GPL obligations, unchanged, onto every card.
+  MixOS does not and cannot relicense any of it.
+
+So a finished MixOS card is an aggregate: the MixOS scripts, drivers and dashboard
+that assembled it, on top of a kernel that is GPL-2.0-only, on top of a
+distribution that is thousands of licences deep. The dual licence above applies to
+the MixOS work. Everything else keeps its own terms, and shipping a card means
+honouring all of them.
+
+### The build scripts
+
+Everything outside `device/j36-ultra/`, `device/r36-ultra/` and `device/common/` —
+the inherited image-assembly scripts, the `Makefile` targets and the Rockchip
+tooling — came from **dArkOS** and keeps **dArkOS's MIT licence** and copyright,
+including the files MixOS has modified: the modifications are MixOS's, the files
+remain dArkOS's work under dArkOS's terms. dArkOS is in turn a Debian-based
+continuation of [ArkOS](https://github.com/christianhaitian/arkos/wiki).
+
+Nothing else in MixOS comes from either project any more. Please do not report
+MixOS problems to dArkOS or ArkOS; neither endorses this work or is responsible for
+it.
+
+### Vendor sources
+
+`device/j36-ultra/mvii-board/` holds verbatim MediaTek/MVII board headers and driver
+sources, redistributed unmodified so the device tree generator can be seen to parse
+real vendor source. They are inputs, not MixOS work, they carry whatever terms their
+authors set, and `mvii-board/PROVENANCE.txt` records a SHA-256 for each.
 
 # Credits and Thanks
+
 **[Debian](https://www.debian.org/)** — the operating system all of this is built on.  The rootfs a MixOS device boots *is* Debian, assembled with Debian's own tools, and all but a handful of the packages on the card are the Debian project's work.  MixOS is a set of device ports and a build system on top of Debian; the operating system itself is theirs.  MixOS is not affiliated with or endorsed by the Debian project. \
-**[ArkOS](https://github.com/christianhaitian/arkos/wiki)** and christianhaitian — the original handheld distribution, and the layout and tools menu this still uses \
-**dArkOS** — the Debian rebuild of ArkOS that this fork diverged from, and the origin of everything outside the `device/` ports \
+**[The Linux kernel](https://www.kernel.org/)** — the other half of the foundation, and the reason a 2013 phone SoC can be brought up at all in 2026 \
+**[ArkOS](https://github.com/christianhaitian/arkos/wiki)** and christianhaitian — the original handheld distribution \
+**dArkOS** — the Debian rebuild of ArkOS, and the origin of the build scripts this tree still uses \
 **MediaTek** — the MT6592 documentation and vendor driver sources the J36 Ultra port reads \
 **[Mesa](https://www.mesa3d.org/)** — lima and kmsro, which are the entire reason a Mali-450 from 2013 can run a GLES 2.0 UI \
-**The Linux kernel, SDL, busybox, doomgeneric and Freedoom** projects \
+**[Qt](https://www.qt.io/)** — the toolkit mixdash is painted with, on a framebuffer, with no window system under it \
+**The SDL, busybox, doomgeneric and Freedoom** projects \
 [ChatGPT](https://chatgpt.com/) for guidance on how to build a Debian image \
 Jetup13 for many themes \
 dani7959 for the replica theme \

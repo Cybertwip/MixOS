@@ -362,7 +362,9 @@ static int open_mirror_node(char *path, size_t pathsz)
     }
 
     while ((e = readdir(d)) != NULL) {
-        char candidate[64], name[32], desc[64];
+        /* Sized off d_name and not off "/dev/dri/cardN", because the compiler cannot
+         * know the entry is short and -Wformat-truncation is right to say so. */
+        char candidate[sizeof(e->d_name) + 32], name[32], desc[64];
         struct drm_version v;
         int fd;
 
@@ -1114,7 +1116,7 @@ int main(int argc, char **argv)
     sigaction(SIGHUP, &sa, NULL);
 
     if (scan_only) {
-        char node[64];
+        char node[288];
         int fd = open_mirror_node(node, sizeof(node));
         if (fd < 0) {
             note("mirror: no \"%s\" node in /dev/dri -- nothing to mirror onto",
@@ -1153,7 +1155,7 @@ int main(int argc, char **argv)
     }
 
     while (!stop_requested) {
-        char node[64];
+        char node[288];
         int fd = open_mirror_node(node, sizeof(node));
 
         if (fd < 0) {
