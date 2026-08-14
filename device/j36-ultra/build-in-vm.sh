@@ -1608,14 +1608,14 @@ for arg in $(cat /proc/cmdline); do
         # up only by the charger's current source, and the amp at output pulls it
         # under the undervoltage lockout.
         #
-        # It is in the shipped bootargs, because j36.audio=1 on its own gives a
-        # card that accepts audio and sends it nowhere, which is not audio.  What
-        # makes that the right default rather than a gamble is that the word is no
-        # longer the only way to reach the amp: it seeds a "Speaker Amp" mixer
-        # control, so a board that cannot hold the rail says
-        # `amixer -c0 set "Speaker Amp" off' and keeps its card, and one that can
-        # is not asking anybody to edit bootargs on a vfat partition first.  Drop
-        # back to j36.audio=1 to boot with it off.
+        # It is in the shipped bootargs because a handheld whose sound only comes
+        # out of a jack is half a handheld, and because the word is no longer the
+        # only way to reach the amp: it seeds a "Speaker Amp" mixer control, so a
+        # board that cannot hold the rail says `amixer -c0 set "Speaker Amp" off'
+        # and keeps its card, and one that can is not asking anybody to edit
+        # bootargs on a vfat partition first.  Drop back to j36.audio=1 to boot
+        # with the amp off -- that is not silence, it is the headphone jack, which
+        # comes up either way.
         j36.audio=speaker)
             want_audio=1
             audio_speaker=1
@@ -7061,8 +7061,11 @@ batt_led.service, no longer masked
     dozen SoC-specific ones -- that this card does not have.  A oneshot that fails
     on a missing control is the same bounded noise as before and is left alone; what
     would not be bounded is a control this card DOES have being set to something
-    unwanted, so "Master Playback Switch" and "Master Playback Volume" are the two
-    names to check against those scripts if the sound ever changes by itself.
+    unwanted, so "Master Playback Switch", "Master Playback Volume", "Speaker Amp
+    Switch" and "Headphone Switch" are the four names to check against those scripts
+    if the sound ever changes by itself.  "Headphone" is the likeliest collision of
+    the four, because an RK3326 audio script naming a route is naming something the
+    simple mixer will now find here.
 
 rdinit=/init root=/dev/mmcblk0p2 rw rootwait
     See above: /init does the mounting, so root= cannot panic the kernel.
@@ -7839,8 +7842,8 @@ without j36,preserve-lk-state in the tree rather than pretend it can bring a dar
 panel up.  Cold start is not implemented; the device tree keeps the init table,
 the PMIC sequence and the GPIO sequence so that it can be.
 
-Sound, and the two things about it that are not yet measured
-------------------------------------------------------------
+Sound, and where it comes out
+-----------------------------
 
 j36/audio/ is the ALSA core plus one driver, j36_mt6592_audio.ko, and the driver is
 ours: sound/soc/mediatek starts at MT2701, so there has never been an MT6592 audio
@@ -7861,22 +7864,39 @@ IRQ block is not in the reference material at all, and a period wakeup does not
 need it: DL1's read cursor is a register, so a delayed work item polls it at 5 ms
 and calls snd_pcm_period_elapsed, exactly as MVII paces its own playback.
 
-Two things it does are NOT proven on this board, and they are the reason it exists:
+Two things about it were open questions rather than code, and the first is now
+answered.  The AFE functional clock: MVII has the ungate sequence -- two power-down
+bits in TOPCKGEN CLK_CFG_3 and one in INFRACFG -- and compiles it out, so its audio
+is soft-paced silence and nobody had ever seen AFE_DL1_CUR advance on this SoC.
+This driver ungates, logs CLK_CFG_AUD before and after, and reports on the first
+stream whether the cursor moved; it moves, and the DMA feeds the DAC.  What is
+still not measured is the class-D speaker under load, and that is why it stays
+behind its own command-line word -- see j36.audio=speaker above for the VBAT story.
 
-  1. The AFE functional clock.  MVII has the ungate sequence -- two power-down bits
-     in TOPCKGEN CLK_CFG_3 and one in INFRACFG -- and compiles it out; its audio is
-     soft-paced silence.  So nobody has ever seen AFE_DL1_CUR advance on this SoC.
-     This driver ungates, logs CLK_CFG_AUD before and after, and reports on the
-     first stream whether the cursor moved.  That log line is the deliverable.
-  2. The class-D speaker.  It is off unless j36.audio=speaker asks for it, and even
-     then it is powered only after the cursor has been seen moving.  VBAT is the
-     system node on this PMIC, the amp is the largest load on the board, and MVII
-     recorded it pulling VBAT under the undervoltage lockout with no cell fitted.
-     The driver opens at level 8 of 11 and steps up one at a time.
+THERE ARE TWO ANALOG OUTPUTS AND THEY SHARE ONE FRONT END.  AUDTOP_CON0/CON4/CON6
+are the ABB downlink: the bias, the reference, and the input mux for the buffers
+hanging off it.  The value the old speaker path wrote into CON6, 0xB7F6, shorts the
+headphone inputs to ground -- which is what the vendor HAL does in its SPEAKER case
+and exactly the wrong thing when the sound is meant to leave through the jack.  So
+the driver no longer has a "speaker sequence"; it has j36_front_up(), which is
+handed the pair (headphone, speaker) and programs CON6 and CON4 for one of the
+three combinations the HAL knows -- 0xF5BA/0x007C for the jack, 0xB7F6/0x0014 for
+the speaker alone -- and then j36_speaker_up() adds the class-D on top if it was
+asked for.  Changing which outputs are live tears the front end down and rebuilds
+it, because the mux is not a runtime switch.
 
-So with the default word this card is silent by construction.  What it gains is
-/dev/snd, a PCM that accepts and paces audio, a controlC0 with a Master volume and
-switch, and one line in dmesg that says whether the hardware consumed any of it.
+NOTHING DETECTS A PLUG, so both outputs are switches and neither is a status.  The
+MT6592 has ACCDET, but no register map for it exists in the reference material --
+only the vendor HAL's ioctls on /dev/accdet, a kernel driver this tree does not
+have -- and the J36 board header brings no HP-detect pin out.  "Headphone" is
+therefore on by default (the buffers run off the reference the DAC already needs,
+and there is no rail for them to pull down) and "Speaker Amp" stays opt-in.
+
+Volume is analog on both.  "Master Playback Volume" writes the class-D level over
+SPK_CON9 and the headphone buffer gain into AUDTOP_CON5, whose two 4-bit fields are
+an 8-step -5..+9 dB attenuator -- the vendor's own HWgain[] table, which survives in
+AudioMachineDevice.cpp only as a comment.  That is why /etc/asound.conf carries no
+softvol: there is nothing left for software to attenuate.
 
 One thing that is NOT related, because it looked like it was: the boot log's
 
@@ -8638,9 +8658,11 @@ SD cards.
   j36/mfgpower         static ARMv7 helper that brings the GPU power domain up
                        through the SPM before lima probes.    j36.lima=1
   j36/mtkdrm           the display set and its own load.order.  j36.mtkdrm=1
-  j36/audio            the ALSA core and the MT6592 AFE adapter.  j36.audio=1;
-                       j36.audio=speaker also powers the class-D amp, which hangs
-                       off VBAT and so needs a cell fitted.
+  j36/audio            the ALSA core and the MT6592 AFE adapter.  j36.audio=1 gets
+                       the card and the headphone jack; j36.audio=speaker also
+                       powers the class-D amp, which hangs off VBAT and so needs a
+                       cell fitted.  Nothing detects a plug: "Speaker Amp" and
+                       "Headphone" are mixer switches, both may be on at once.
   j36/usb              the host stack for the one MUSB port: the PHY, musb and its
                        glue, usbhid, udl for a DisplayLink dock's HDMI, and the
                        disk set -- scsi_mod, sd_mod, usb-storage and ntfs3 -- which
@@ -8867,7 +8889,9 @@ fi
             echo "audio_core=CONFIG_SOUND=y (soundcore only); snd, snd-timer, snd-pcm are =m and staged here"
             echo "audio_snd_pcm=selected by SND_DUMMY=m, which is built and deliberately not staged"
             echo "audio_start=$(grep -o 'j36\.audio=[a-z0-9]*' sd-boot/mvii/boot.conf)"
-            echo "audio_clock=UNPROVEN: this is the first ungate of AFE_CG on this board; dmesg says whether DL1_CUR advances"
+            echo "audio_clock=first ungate of AFE_CG on this board; dmesg reports whether DL1_CUR advances on the first stream"
+            echo "audio_outputs=headphone jack (on by default) and class-D speaker; two mixer switches, no jack detect on this board"
+            echo "audio_volume=analog on both: SPK_CON9 level and AUDTOP_CON5 gain under one Master element, no softvol"
             echo "audio_speaker=off unless j36.audio=speaker, and then only after the cursor moves"
             echo "audio_speaker_hazard=class-D amp on VBAT, which is the system node; battery-less it trips the PMIC UVLO"
         else
