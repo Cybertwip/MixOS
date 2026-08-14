@@ -24,7 +24,7 @@ namespace {
 
 /* Rows that are not a destination.  Above every Destination value so one `id'
  * field can carry both without a second tag. */
-enum { RowVolume = 900, RowMute, RowInert };
+enum { RowVolume = 900, RowMute, RowInert, RowSpeaker, RowHeadphones };
 
 /*
  * The floor the brightness slider will not go below, in per cent.
@@ -161,6 +161,8 @@ void SettingsPage::onEnter()
      * said the last time somebody opened Settings would be a slider that lies.
      */
     Volume::read(&m_volume, &m_muted);
+    m_speaker = Volume::isOn(Volume::Speaker);
+    m_headphones = Volume::isOn(Volume::Headphones);
     rebuild();
 }
 
@@ -239,6 +241,40 @@ void SettingsPage::rebuild()
         r.text = tr("Mute");
         r.on = m_muted;
         r.id = RowMute;
+        rows << r;
+    }
+
+    /*
+     * Where the sound comes out.  Two switches and not one three-way row,
+     * because both at once is a real answer -- the amp and the jack are separate
+     * outputs off one DAC and the driver will drive both.
+     *
+     * OUTSIDE THE `else' ABOVE ON PURPOSE.  These are reachable even on a card
+     * with no level control at all: routing is not volume, and a board whose
+     * playback element failed to register still has a jack somebody may need to
+     * switch to.
+     *
+     * THE DETAIL LINE ON THE JACK IS NOT AN APOLOGY.  This board brings no
+     * jack-detect line out to anything the kernel can read, so plugging
+     * headphones in changes nothing by itself -- and a person who does not know
+     * that will plug them in, hear the speaker keep playing, and conclude the
+     * jack is broken.  One line here is the difference.
+     */
+    if (Volume::present(Volume::Speaker)) {
+        r = ListRow();
+        r.kind = ListRow::Toggle;
+        r.text = tr("Speaker");
+        r.on = m_speaker;
+        r.id = RowSpeaker;
+        rows << r;
+    }
+    if (Volume::present(Volume::Headphones)) {
+        r = ListRow();
+        r.kind = ListRow::Toggle;
+        r.text = tr("Headphones");
+        r.detail = tr("The jack has no detect line; switch to it here");
+        r.on = m_headphones;
+        r.id = RowHeadphones;
         rows << r;
     }
 
@@ -332,6 +368,34 @@ void SettingsPage::onValueChanged(int index, int value)
         m_muted = (value != 0);
         Volume::setMuted(m_muted);
         m_note = m_muted ? tr("Muted") : tr("Unmuted");
+        update();
+        return;
+    }
+
+    if (rows[index].id == RowSpeaker || rows[index].id == RowHeadphones) {
+        const bool jack = (rows[index].id == RowHeadphones);
+        const bool on = (value != 0);
+
+        Volume::setOn(jack ? Volume::Headphones : Volume::Speaker, on);
+        if (jack)
+            m_headphones = on;
+        else
+            m_speaker = on;
+
+        /*
+         * Said as where the sound is now rather than as what was just toggled,
+         * because that is the question the row was pressed to answer -- and
+         * because turning the last one off is worth seeing before the next
+         * track starts and nothing happens.
+         */
+        if (m_speaker && m_headphones)
+            m_note = tr("Speaker and headphones");
+        else if (m_headphones)
+            m_note = tr("Headphones");
+        else if (m_speaker)
+            m_note = tr("Speaker");
+        else
+            m_note = tr("No output selected");
         update();
     }
 }

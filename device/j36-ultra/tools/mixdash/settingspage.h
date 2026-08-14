@@ -93,6 +93,12 @@ private:
      * not this one. */
     int m_volume = -1;          /* per cent, -1 for "no control" */
     bool m_muted = false;
+    /* Which analog outputs are switched on.  Read on the way in like the two
+     * above, and for the same reason: something else may have moved them --
+     * alsa-restore at boot, an ssh session, the driver itself refusing to power
+     * the amp on a rail that will not hold it. */
+    bool m_speaker = false;
+    bool m_headphones = false;
     QString m_note;
 };
 

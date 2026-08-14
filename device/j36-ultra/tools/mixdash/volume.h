@@ -82,6 +82,31 @@ void setMuted(bool value);
 enum { Step = 5 };
 int nudge(int delta, bool *mutedOut = nullptr);
 
+/*
+ * WHERE THE SOUND COMES OUT.
+ *
+ * The J36's card carries two analog outputs and a switch for each: "Speaker Amp"
+ * for the class-D behind the built-in speaker, "Headphone" for the buffers
+ * behind the jack.  They are not exclusive -- both on is a real setting and it
+ * plays out of both.
+ *
+ * THIS IS A SETTING AND NOT A STATUS, and that is the part worth stating out
+ * loud.  The board brings no jack-detect line out to anything the kernel can
+ * read, so nothing anywhere in this system notices a plug going in.  A page that
+ * drew these as "Headphones (connected)" would be inventing the connected part.
+ * They are two switches, they say what they are, and the person holding the
+ * device is the detect line.
+ *
+ * present() is false for a card that has neither, which is every card but this
+ * one -- a USB headset or an HDMI adapter has no such controls and the rows are
+ * simply not drawn.  The level is unaffected either way: "Master" moves both
+ * outputs together, in the driver, so there is no per-output volume to show.
+ */
+enum Output { Speaker, Headphones };
+bool present(Output which);
+bool isOn(Output which);
+void setOn(Output which, bool on);
+
 } /* namespace Volume */
 
 /*

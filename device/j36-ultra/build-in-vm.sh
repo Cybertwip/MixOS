@@ -2332,6 +2332,11 @@ run_audio() {
     else
         say "audio: speaker amp off -- amixer -c0 set \"Speaker Amp\" on to try it"
     fi
+    # The jack is on unless somebody turns it off, and it is not behind a word:
+    # the headphone buffers run off the reference the DAC already needs, so unlike
+    # the class-D there is no rail to take down.  Nothing on this board detects a
+    # plug, so this is the only thing that decides it.
+    say "audio: headphone jack on -- amixer -c0 set Headphone off, or Settings > Sound"
     return 0
 }
 
@@ -3978,8 +3983,10 @@ pcm.!default {
 	slave.pcm "hw:CARD=j36,DEV=0"
 }
 
-# So that amixer and alsamixer with no -c land on the same card.  "Speaker Amp",
-# "Master Playback Volume" and "Master Playback Switch" are the controls here.
+# So that amixer and alsamixer with no -c land on the same card.  The controls
+# here are "Master Playback Volume", "Master Playback Switch", "Speaker Amp" and
+# "Headphone" -- the last two are which output the sound comes out of, and both
+# on at once is a real setting.  Master moves whichever of them is up.
 ctl.!default {
 	type hw
 	card j36
@@ -4156,6 +4163,95 @@ UNITASOUND
            /newroot/run/systemd/system/sysinit.target.wants/j36-asound.service
 
     say "asound: default is plug over hw:CARD=j36 for the whole system"
+    return 0
+}
+
+# ── the name the machine calls itself ─────────────────────────────────────────
+#
+# WHAT IS WRONG.  Every line of the journal on this board opens with `rg351mp'.  So
+# does the netbios name samba advertises, the prompt on a serial console, and the
+# name an mDNS browser shows.  It is not a cosmetic leftover of an old build: it is
+# the correct hostname for the image this rootfs was made as, and the J36 boots that
+# same rootfs.  /etc/hostname on p2 says rg351mp because device/r36-ultra's
+# finishing_touches.sh wrote it there with UNIT=rg351mp, and that is the R36's answer.
+#
+# WHY IT IS NOT FIXED WHERE IT IS WRITTEN.  Because p2 is SHARED.  Changing UNIT, or
+# the file it produces, renames the R36 image too -- and the whole arrangement here is
+# that one rootfs boots as either board and neither one edits it.  The J36 needs a
+# different answer to the same question, which is exactly the shape every other
+# correction in this file has: cover the file, do not rewrite it.
+#
+# WHY THERE IS NO UNIT FOR THIS ONE, unlike j36-asound.service.  systemd reads
+# /etc/hostname in PID 1 before it looks at a single unit -- there is no unit early
+# enough to beat it, and hostnamed setting the name a second later still leaves the
+# first hundred journal lines saying rg351mp.  But the initramfs runs before systemd
+# exists at all, /newroot/etc is already mounted here, and a bind put down now moves
+# with the root across switch_root.  So this is a plain bind and there is nothing to
+# schedule.
+#
+# AND /etc/hosts WITH IT, WHICH IS NOT OPTIONAL.  A hostname with no 127.0.1.1 line
+# to match is what makes sudo pause for ten seconds on `unable to resolve host', and
+# on a console with no keyboard that is a boot that looks hung.  The file is derived
+# from the rootfs's own rather than written from scratch, so anything an operator put
+# in it survives: drop whatever 127.0.1.1 claimed, rename any other mention, append
+# the new mapping.
+J36_HOSTNAME=virtua
+
+setup_hostname() {
+    if [ -z "$rootdev" ]; then
+        say "hostname: no rootfs was found, so there is no name to correct"
+        return 1
+    fi
+    if ! ensure_run_tmpfs; then
+        say "hostname: no tmpfs on the rootfs /run, so nothing can be staged"
+        return 1
+    fi
+    mkdir -p /newroot/run/j36
+
+    # tr rather than a shell trim, because the applet list has tr and the file
+    # ends in a newline that would otherwise become part of the comparison.
+    old=""
+    if [ -r /newroot/etc/hostname ]; then
+        old=$(cat /newroot/etc/hostname 2>/dev/null | tr -d ' \011\015\012')
+    fi
+
+    if [ "$old" = "$J36_HOSTNAME" ]; then
+        say "hostname: the rootfs already calls this board $J36_HOSTNAME"
+        return 0
+    fi
+
+    printf '%s\n' "$J36_HOSTNAME" > /newroot/run/j36/hostname
+    if ! mount --bind /newroot/run/j36/hostname /newroot/etc/hostname; then
+        say "hostname: could not cover /etc/hostname; staying ${old:-unnamed}"
+        return 1
+    fi
+
+    if [ -r /newroot/etc/hosts ]; then
+        # Two passes and they do different jobs.  The delete takes out the
+        # 127.0.1.1 line whatever it names, which is the one Debian writes and the
+        # one that has to end up pointing at us.  The substitution catches the
+        # other places the old name turns up -- some images put it on the
+        # 127.0.0.1 localhost line as well -- and is skipped entirely when the
+        # rootfs never had a name, since s//virtua/g on an empty pattern would
+        # rewrite every line in the file.
+        if [ -n "$old" ]; then
+            sed -e '/^127\.0\.1\.1[ \011]/d' -e "s/$old/$J36_HOSTNAME/g" \
+                /newroot/etc/hosts > /newroot/run/j36/hosts 2>/dev/null
+        else
+            sed -e '/^127\.0\.1\.1[ \011]/d' \
+                /newroot/etc/hosts > /newroot/run/j36/hosts 2>/dev/null
+        fi
+        printf '127.0.1.1\t%s\n' "$J36_HOSTNAME" >> /newroot/run/j36/hosts
+        if mount --bind /newroot/run/j36/hosts /newroot/etc/hosts; then
+            say "hostname: $J36_HOSTNAME, and 127.0.1.1 resolves to it"
+        else
+            # The name is already covered and that is the half that matters; say
+            # which half did not take rather than pretending the whole thing failed.
+            say "hostname: $J36_HOSTNAME, but /etc/hosts still says ${old:-nothing}"
+        fi
+    else
+        say "hostname: $J36_HOSTNAME (this rootfs has no /etc/hosts to match)"
+    fi
     return 0
 }
 
@@ -4741,6 +4837,14 @@ fi
 # diagnostic missing from the boot that needed it -- and the console the battery
 # daemon is scribbling on belongs to the splash whether or not a dashboard was
 # asked for.  Both need a rootfs and nothing else, which is what is checked inside.
+# Before the log and not after it, so that the very first line the journal writes
+# under the new root already carries the right name.  Gated on a rootfs and on
+# nothing else: this is not a feature any boot word turns on, it is who the machine
+# is, and a boot with j36.dash=0 and no audio still answers to it on the network.
+if [ -n "$rootdev" ]; then
+    setup_hostname
+fi
+
 if [ -n "$rootdev" ] && [ "$want_log" = 1 ]; then
     stage "Preparing the log"
     detail "BOOT:/mixos-log.txt"
@@ -6991,11 +7095,28 @@ j36.audio=1
     or the panel, and it is loaded before switch_root so systemd finds a card to
     restore into.  Same removal story as the rest.
 
-    It is SILENT, and that is deliberate rather than a shortfall.  What this word
-    switches on is the digital half: the AFE's DL1 memif, the interconnect route to
-    the I2S DAC, the MT6323 ABB downlink, and one 16-bit stereo playback PCM at
-    8-48 kHz.  What it does not switch on is the class-D speaker amp -- see the next
-    word.  So a stream opens, is accepted and is paced, and nothing comes out.
+    IT PLAYS OUT OF THE HEADPHONE JACK AND NOT OUT OF THE SPEAKER.  What this word
+    switches on is the digital half -- the AFE's DL1 memif, the interconnect route
+    to the I2S DAC, the MT6323 ABB downlink, and one 16-bit stereo playback PCM at
+    8-48 kHz -- plus the analog headphone buffers, which are on by default because
+    they run off the reference the DAC already needs and there is no rail for them
+    to take down.  What it does not switch on is the class-D speaker amp: that has
+    its own word, below, because it can switch the board off.
+
+    NOTHING ON THIS BOARD DETECTS A PLUG.  The MT6592 has an ACCDET block and the
+    vendor HAL drives it, but through an ioctl on a kernel driver that does not
+    exist here, and the J36 brings no headphone-detect GPIO out either.  So which
+    output is live is a setting and never a discovery.  Two mixer switches decide
+    it, both saved by alsa-restore, and the dashboard puts them on Settings > Sound:
+
+      amixer -c0 set Headphone off        speaker only
+      amixer -c0 set "Speaker Amp" off    jack only
+      both on                             both at once, which is a real setting
+
+    "Master Playback Volume" moves whichever of them is up: the class-D level and
+    the headphone buffer gain are two different registers under one element, so the
+    volume keys on the side of the case do not have to know where the sound is
+    going.
 
     The one line to read afterwards is the driver's own:
 
@@ -7047,6 +7168,9 @@ j36.audio=speaker
 
       pcm.!default { type plug  slave.pcm "hw:CARD=j36,DEV=0" }
       ctl.!default { type hw    card j36 }
+
+    No softvol layer over that, and there does not need to be one: the volume on
+    this card is analog on both outputs, so nothing has to attenuate in software.
 
     Three files, on the same pattern as the automounter under j36.usb below:
 

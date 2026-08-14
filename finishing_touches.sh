@@ -309,7 +309,7 @@ echo "export SDL_VIDEO_EGL_DRIVER=libEGL.so" | sudo tee MixOSBuild/etc/profile.d
 dNAME=`echo $NAME | tr '[:lower:]' '[:upper:]'`
 echo "$dNAME" | sudo tee MixOSBuild${DATA_MOUNT_POINT}/.config/.DEVICE
 
-# Configure default samba share setup.  Two shares, and there used to be four.
+# Configure default samba share setup.  One share, and there used to be four.
 #
 # [roms] pointed at ${DATA_MOUNT_POINT}/roms and [roms2] at /roms2.  Both were named for
 # a directory layout EmulationStation invented, the first is gone with that layout, and
@@ -317,18 +317,20 @@ echo "$dNAME" | sudo tee MixOSBuild${DATA_MOUNT_POINT}/.config/.DEVICE
 # nothing ever created, which samba reports as a share that cannot be connected to.
 # [home] already covers everything [roms] did: the partition mounts AT the home
 # directory, so the whole of it is one share with the name the operator expects.
+#
+# [opt] is gone too, and that one was not merely useless.  It exported /opt -- system
+# software, not user data -- guest-writable to every machine on the network.  Anything
+# that could reach the console could replace a binary under /opt and the console would
+# run it at the next boot, with no password asked at any point.  A share that hands out
+# write access to the system's own programs is not a convenience, and nothing on this
+# image needs /opt over the network: the data partition is what the operator copies
+# games and media into, and that is [home].
+#
+# [home] IS STILL GUEST-WRITABLE, AND THAT IS THE DELIBERATE PART.  It is the share the
+# Sharing page exists to turn on, on a handheld whose whole point is dragging files onto
+# it from a desktop, and both smbd and nmbd ship disabled -- nothing is exported until
+# somebody switches it on.  The exposure is the data partition and stops there.
 cat <<EOF | sudo tee -a MixOSBuild/etc/samba/smb.conf
-[opt]
-   comment = OPT
-   path = /opt
-   browsable = yes
-   read only = no
-   map archive = no
-   map system = no
-   map hidden = no
-   guest ok = yes
-   read list = guest
-
 [home]
    comment = HOME
    path = ${DATA_MOUNT_POINT}

@@ -59,11 +59,20 @@ QString runShort(const QString &program, const QStringList &args, int timeoutMs 
     return QString::fromLocal8Bit(p.readAll());
 }
 
-/* The probe, and the two answers it produces.  File-scope rather than a function
- * static so invalidate() has something to clear. */
+/* The probe, and the answers it produces.  File-scope rather than function
+ * statics so invalidate() has something to clear. */
 bool g_probed = false;
 bool g_haveAmixer = false;
 QString g_control;
+/* The two output switches, by the simple-control name amixer gives them.  Empty
+ * means this card does not have that one. */
+QString g_speakerCtl;
+QString g_headphoneCtl;
+
+QString outputControl(Volume::Output which)
+{
+    return which == Volume::Speaker ? g_speakerCtl : g_headphoneCtl;
+}
 
 /*
  * The last level this program set or read, and how long ago.  Only nudge() reads
@@ -132,6 +141,32 @@ void probe()
         << QStringLiteral("Speaker") << QStringLiteral("Headphone")
         << QStringLiteral("Digital") << QStringLiteral("DAC")
         << QStringLiteral("Playback");
+
+    /*
+     * The output switches, found in the same pass as the level -- one fork of
+     * amixer for all three, which matters because this runs at startup before
+     * anything is on screen.
+     *
+     * Taken by name and not by "has a switch and no volume", because the names
+     * are the contract: j36_mt6592_audio registers "Speaker Amp Switch" and
+     * "Headphone Switch" and amixer's simple layer strips the suffix.  A card
+     * that happens to have a control called Headphone with a level on it -- most
+     * desktop codecs -- is not this, and setOn() on it would mute somebody's
+     * output rather than route it.  So both have to be switch-only.
+     */
+    for (const QString &name : names) {
+        if (name != QLatin1String("Speaker Amp") && name != QLatin1String("Headphone"))
+            continue;
+        const QString caps = runShort(amixerPath(),
+                                      QStringList() << QStringLiteral("get") << name);
+        if (!caps.contains(QLatin1String("pswitch")) || caps.contains(QLatin1String("pvolume")))
+            continue;
+        if (name == QLatin1String("Headphone"))
+            g_headphoneCtl = name;
+        else
+            g_speakerCtl = name;
+    }
+
     for (const QString &want : preferred) {
         if (names.contains(want)) {
             g_control = want;
@@ -161,6 +196,8 @@ void Volume::invalidate()
     g_probed = false;
     g_haveAmixer = false;
     g_control.clear();
+    g_speakerCtl.clear();
+    g_headphoneCtl.clear();
     /* The remembered level goes with it: it was a level on the control that has
      * just been declared unknown. */
     g_level = -1;
@@ -226,6 +263,40 @@ void Volume::setMuted(bool value)
                                          << (value ? QStringLiteral("mute")
                                                    : QStringLiteral("unmute")));
     remember(g_level, value);
+}
+
+bool Volume::present(Output which)
+{
+    probe();
+    return !outputControl(which).isEmpty();
+}
+
+bool Volume::isOn(Output which)
+{
+    probe();
+    const QString ctl = outputControl(which);
+    if (ctl.isEmpty())
+        return false;
+
+    const QString out = runShort(amixerPath(),
+                                 QStringList() << QStringLiteral("get") << ctl);
+    /* [on] appears once per channel and these are mono, but the test is written
+     * as "any channel is on" for the same reason read() writes mute as "any
+     * channel is off": half an output is on. */
+    return out.contains(QLatin1String("[on]"));
+}
+
+void Volume::setOn(Output which, bool on)
+{
+    probe();
+    const QString ctl = outputControl(which);
+    if (ctl.isEmpty())
+        return;
+
+    runShort(amixerPath(), QStringList() << QStringLiteral("-q")
+                                         << QStringLiteral("set") << ctl
+                                         << (on ? QStringLiteral("on")
+                                                : QStringLiteral("off")));
 }
 
 int Volume::nudge(int delta, bool *mutedOut)

@@ -429,10 +429,15 @@ bool SharingPage::configIsOurs()
  * The gate in front of everything that makes smbd run.
  *
  * A card that has never had this page touched carries finishing_touches.sh's
- * [opt] and [home], both `guest ok = yes' and both writable -- so starting smbd
- * against that file would put /opt and the whole DATA partition on the network
- * with no password at all.  That is the exact failure this page exists not to
- * have, and the only reliable place to prevent it is here, before the start.
+ * [home] -- `guest ok = yes' and writable -- so starting smbd against that file
+ * would put the whole DATA partition on the network with no password at all.
+ * That is the exact failure this page exists not to have, and the only reliable
+ * place to prevent it is here, before the start.
+ *
+ * There used to be an [opt] beside it, on the same terms, exporting the system's
+ * own programs guest-writable.  It is gone from finishing_touches.sh, and this
+ * gate would have covered it anyway -- but a share nobody can name a use for is
+ * not something to leave standing behind a gate and hope the gate holds.
  */
 QString SharingPage::ensureConfigured()
 {

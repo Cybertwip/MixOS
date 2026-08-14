@@ -50,6 +50,16 @@
  * where the answer could not be revisited without a reboot. alsa-restore saves
  * the control with the rest of the mixer, so answering it once is enough.
  *
+ * AND THERE ARE TWO OUTPUTS NOW, not one. The class-D was the only one this
+ * driver knew about, so its power-up sequence wrote the whole analog block --
+ * including the two registers that decide whether the headphone jack is shorted
+ * out. It is: AUDTOP_CON6 at 0xB7F6 is the speaker path deliberately holding the
+ * HP inputs down. That is why a jack that is wired and a DAC that is running
+ * still produced nothing. The analog front end is now programmed from the pair
+ * (headphone, speaker) in one place, exactly as AudioMachineDevice does it with
+ * its three cases, and "Headphone Switch" is the other half of the pair. See the
+ * route section below, and read the note there on why there is no jack detect.
+ *
  * No interrupt. The AFE's IRQ block is not in the reference material at all, and
  * a period wakeup does not need it: the DL1 cursor is a register, so it is polled
  * from a delayed work item exactly as MVII polls it, and .pointer reads the
@@ -141,6 +151,11 @@
 #define J36_PMIC_SPK_CON12		0x006a
 #define J36_PMIC_AUDTOP_CON0		0x0700
 #define J36_PMIC_AUDTOP_CON4		0x0708
+/* CON5 is the headphone buffer's gain, and it is the register this driver had no
+ * use for while the class-D was the only output: the speaker path never touches
+ * it. Bits 13:12 and 5:4 are the R and L steps -- 0x0014 is the vendor's smallest
+ * (-5 dB), 0x2214 the -1 dB it settles at once the buffers are up. */
+#define J36_PMIC_AUDTOP_CON5		0x070a
 #define J36_PMIC_AUDTOP_CON6		0x070c
 #define J36_PMIC_AUDTOP_CON7		0x070e
 #define J36_PMIC_ABB_AFE_CON0		0x4000
@@ -159,6 +174,25 @@
 #define J36_SPK_LEVEL_MAX		11
 #define J36_SPK_LEVEL_SAFE		8
 #define J36_SPK_CON9_PGA_0DB		0x0100	/* stock is 0x0400, +6 dB */
+
+/*
+ * AUDTOP_CON5 is the headphone's, and the two three-bit fields in it are a real
+ * volume control rather than the two-state thing the vendor's live code makes
+ * them look like. AudioMachineDevice writes exactly two values -- 0x0014 with
+ * the comment "smallest -5dB" and 0x2214 with "-1dB" -- and the table that
+ * explains them is three lines above, commented out with the ramp it belonged
+ * to:
+ *
+ *	uint32 index = 7;
+ *	//const int HWgain[] = {-5, -3, -1, 1, 3, 5, 7, 9};
+ *
+ * Field 0 is -5 dB and field 2 is -1 dB, which is what those two writes decode
+ * to, so the field IS the index into that table: eight steps of 2 dB from -5 to
+ * +9. L is bits 14:12, R is bits 10:8, and the rest of the register is the fixed
+ * 0x0014 both of the vendor's values carry.
+ */
+#define J36_HP_GAIN_FIXED		0x0014
+#define J36_HP_GAIN_MAX			7	/* +9 dB; 0 is -5 dB */
 
 #define J36_AFE_BUFFER_BYTES		(64 * 1024)
 #define J36_AFE_PERIOD_MIN		4096
@@ -184,6 +218,29 @@ MODULE_PARM_DESC(speaker,
 		 "pulls VBAT, which is the system node, under the PMIC's "
 		 "undervoltage lockout -- so this only seeds the control, and the "
 		 "control can be turned back off without a reboot");
+
+/*
+ * THE HEADPHONE DEFAULTS ON, AND THE SPEAKER DOES NOT.
+ *
+ * They are not the same kind of decision. The class-D amp hangs off VBAT, the
+ * system node, and on a board with no cell fitted it pulls the rail under the
+ * PMIC's undervoltage lockout -- so `speaker' is a hazard and stays opt-in. The
+ * headphone buffers are inside the MT6323's audio block, they run off the 2.4 V
+ * reference this driver already brings up for the DAC, and the worst a pair of
+ * powered buffers with nothing plugged into them costs is a few milliamps.
+ *
+ * So the jack is on unless somebody says otherwise, because the alternative is
+ * a handheld where plugging headphones in does nothing at all and the fix is a
+ * command nobody can guess. `amixer -c0 set Headphone off' turns it back off,
+ * and alsa-restore saves that with the rest of the mixer.
+ */
+static bool headphone = true;
+module_param(headphone, bool, 0444);
+MODULE_PARM_DESC(headphone,
+		 "initial state of the \"Headphone\" control: power the MT6323 "
+		 "headphone buffers once the DL1 DMA is proven live. This board "
+		 "brings no jack-detect line out, so nothing can notice a plug "
+		 "going in -- the control is the switch, and this only seeds it");
 
 static int spk_level = J36_SPK_LEVEL_SAFE;
 module_param(spk_level, int, 0444);
@@ -217,12 +274,20 @@ struct j36_afe {
 	bool			cursor_reported;
 	bool			soft_paced;
 
+	/* The analog output, as three facts rather than one: whether the shared
+	 * front end (AUDTOP_CON0/4/5/6) is powered, and then which of the two
+	 * outputs hanging off it is up. j36_route_apply() owns all three and is
+	 * the only thing that writes them. */
+	bool			front_on;
+	bool			hp_on;
 	bool			amp_on;
-	/* Whether the amp is ALLOWED to be powered, as opposed to whether it is.
-	 * Seeded from the `speaker' parameter and then owned by the "Speaker Amp
-	 * Switch" control, because a 0444 module parameter is not a decision a
-	 * running system can revisit -- see the control below. */
+	/* Whether each output is ALLOWED to be powered, as opposed to whether it
+	 * is. Seeded from the `speaker' and `headphone' parameters and then owned
+	 * by the "Speaker Amp Switch" and "Headphone Switch" controls, because a
+	 * 0444 module parameter is not a decision a running system can revisit --
+	 * see the controls below. */
 	bool			amp_allowed;
+	bool			hp_allowed;
 	bool			mute;
 	unsigned int		level;		/* J36_SPK_LEVEL_MIN..MAX */
 };
@@ -521,7 +586,44 @@ fail:
 	return ret;
 }
 
-/* ---- the class-D speaker, opt-in and never on a dead DAC ----------------- */
+/* ---- the analog output: one front end, two things hanging off it ---------
+ *
+ * WHY THIS IS A ROUTE AND NOT TWO SWITCHES.
+ *
+ * The speaker used to be the only output this driver knew about, so its power-up
+ * sequence wrote the whole analog block -- AUDTOP_CON0, CON4 and CON6 as well as
+ * its own CON7 and the SPK_CON bank -- and that was correct while nothing else
+ * used those registers. It is not correct once the headphone exists, because the
+ * two paths disagree about exactly those three:
+ *
+ *   AUDTOP_CON4  0x0014 is bias + the left DAC, which is all the class-D needs.
+ *                0x007C adds the right DAC and both headphone buffers.
+ *   AUDTOP_CON6  0xB7F6 SHORTS THE HEADPHONE INPUTS -- it is what the speaker
+ *                path writes to keep the jack quiet. 0xF5BA releases the
+ *                pre-charge and takes the depop mux off the HP drivers.
+ *   AUDTOP_CON0  the 1.35 V VCM buffer, wanted by both, released by whichever
+ *                one goes down last.
+ *
+ * Written as two independent on/off functions, turning the speaker on after the
+ * headphone would short the headphone out, and turning the speaker off would
+ * pull the bias out from under it. AudioMachineDevice does not have that problem
+ * because it does not have two functions: it has THREE cases -- HEADSET,
+ * SPEAKER, and SPEAKER_HEADSET -- and programs the front end once from whichever
+ * one is being asked for.
+ *
+ * So this does the same thing, with the pair (headphone, speaker) as the state.
+ * j36_route_apply() is the only writer, it compares the wanted pair with the one
+ * that is up, and it reprograms only what has to change: adding the class-D to a
+ * headphone that is already running is the SPEAKER_HEADSET tail and nothing
+ * else, which is exactly what the vendor's combined case does.
+ *
+ * WHAT IT CANNOT DO. There is no jack detect. The MT6592 has an ACCDET block and
+ * the vendor HAL drives it, but through an ioctl on /dev/accdet -- the register
+ * map for it is in a kernel this project does not have, and the J36's board
+ * header brings no headphone-detect GPIO out either. Nothing here can notice a
+ * plug going in, which is why the headphone is a switch a person sets and not a
+ * state the driver discovers.
+ */
 
 static int j36_speaker_level(struct j36_afe *afe, unsigned int level)
 {
@@ -530,28 +632,125 @@ static int j36_speaker_level(struct j36_afe *afe, unsigned int level)
 	return j36_pmic_write(afe, J36_PMIC_AUDTOP_CON7, 0x3500 | (level << 4));
 }
 
+static int j36_headphone_gain(struct j36_afe *afe, unsigned int gain)
+{
+	gain = min(gain, (unsigned int)J36_HP_GAIN_MAX);
+	return j36_pmic_write(afe, J36_PMIC_AUDTOP_CON5,
+			      J36_HP_GAIN_FIXED | (gain << 12) | (gain << 8));
+}
+
 /*
- * AudioMachineDevice::AnalogOpen for SPEAKERL, ramped rather than opened wide.
- * Only ever called from the poll work, and only once the DL1 cursor has moved,
- * so the amp always starts against a clocked DAC carrying real samples.
+ * ONE VOLUME FOR BOTH OUTPUTS, and this function is the whole of the join.
+ *
+ * The two scales are not the same size -- the class-D level field has seven
+ * usable values and the headphone buffer has eight -- so something has to map
+ * one onto the other, and the alternative to doing it here is a second mixer
+ * element that the volume keys, the dashboard slider and alsa-restore would all
+ * have to learn about separately. They already drive "Master", they drive it
+ * from pages and from hardware buttons that know nothing about which output is
+ * up, and the answer somebody wants when they press VOL+ is "louder", not
+ * "louder on the speaker".
+ *
+ * Rounded to closest so both ends land exactly: step 0 is the quietest step of
+ * each scale and step 6 is the loudest of each. One value in the middle is
+ * skipped, which is what mapping seven onto eight costs.
  */
-static int j36_speaker_on(struct j36_afe *afe)
+static unsigned int j36_hp_gain_for_level(unsigned int level)
+{
+	unsigned int step = clamp(level, (unsigned int)J36_SPK_LEVEL_MIN,
+				  (unsigned int)J36_SPK_LEVEL_MAX) -
+			    J36_SPK_LEVEL_MIN;
+
+	return DIV_ROUND_CLOSEST(step * J36_HP_GAIN_MAX,
+				 J36_SPK_LEVEL_MAX - J36_SPK_LEVEL_MIN);
+}
+
+/*
+ * The shared front end, from AudioMachineDevice::AnalogOpen. All four callers of
+ * this file's route hold pmic_lock; these take no locks of their own.
+ *
+ * The ten-millisecond wait is the vendor's and it is not padding: it is the time
+ * the 2.4 V reference and the VCM buffer need to settle before anything is
+ * allowed to drive an output off them. Opening a buffer early is the pop.
+ */
+static int j36_front_up(struct j36_afe *afe, bool hp, bool spk)
+{
+	int ret;
+
+	/* The class-D's own depop goes first, ahead of the settle rather than
+	 * after it -- that is where the speaker-only sequence puts it, and it is
+	 * the write whose failure is worth reporting, because if WACS2 is not
+	 * answering here then nothing below it happened either. */
+	if (spk) {
+		ret = j36_pmic_write(afe, J36_PMIC_AUDTOP_CON7, 0x2400);
+		if (ret)
+			return ret;
+	}
+
+	if (hp) {
+		unsigned int want = j36_hp_gain_for_level(afe->level);
+		unsigned int g;
+
+		/* 2.4 V on, HalfV buffer on for the HP common mode, audio clock
+		 * on -- and the depop mux still in circuit, which is what the
+		 * second CON6 write below takes out. */
+		j36_pmic_write(afe, J36_PMIC_AUDTOP_CON6, 0xf7f2);
+		j36_pmic_rmw(afe, J36_PMIC_AUDTOP_CON0, 0x7000, 0xf000);
+		j36_headphone_gain(afe, 0);
+		/* Bias, both DACs, both HP buffers. */
+		j36_pmic_write(afe, J36_PMIC_AUDTOP_CON4, 0x007c);
+		usleep_range(10000, 12000);
+		j36_pmic_write(afe, J36_PMIC_AUDTOP_CON6, 0xf5ba);
+		afe->hp_on = true;
+
+		/* Up to the level Master is actually sitting at, a step at a
+		 * time. The vendor's live path jumps from the smallest step to
+		 * -1 dB in one write, which is only two steps; from -5 dB to
+		 * +9 dB it is seven, and seven 2 dB jumps into a pair of
+		 * headphones somebody is already wearing is worth a millisecond
+		 * each. The ramp the vendor commented out did the same. */
+		for (g = 1; g <= want; ++g) {
+			usleep_range(1000, 1500);
+			j36_headphone_gain(afe, g);
+		}
+	} else {
+		j36_pmic_write(afe, J36_PMIC_AUDTOP_CON6, 0xb7f6);
+		j36_pmic_rmw(afe, J36_PMIC_AUDTOP_CON0, 0x7000, 0xf000);
+		j36_pmic_write(afe, J36_PMIC_AUDTOP_CON4, 0x0014);
+		usleep_range(10000, 12000);
+	}
+
+	afe->front_on = true;
+	return 0;
+}
+
+static void j36_front_down(struct j36_afe *afe)
+{
+	if (afe->hp_on) {
+		/* AnalogClose for the headset, in front of the shared part:
+		 * gain back to the smallest step and the depop mux and VCM
+		 * generator back in circuit, so the buffers are holding a
+		 * reference while they lose their bias. */
+		j36_headphone_gain(afe, 0);
+		j36_pmic_write(afe, J36_PMIC_AUDTOP_CON6, 0xf7f2);
+		afe->hp_on = false;
+	}
+
+	j36_pmic_write(afe, J36_PMIC_AUDTOP_CON4, 0x0000);
+	j36_pmic_rmw(afe, J36_PMIC_AUDTOP_CON0, 0x0000, 0x1000);
+	j36_pmic_write(afe, J36_PMIC_AUDTOP_CON6, 0x37e2);
+	afe->front_on = false;
+}
+
+/*
+ * The class-D tail, ramped rather than opened wide. Only ever reached once the
+ * DL1 cursor has moved, so the amp always starts against a clocked DAC carrying
+ * real samples.
+ */
+static int j36_speaker_up(struct j36_afe *afe)
 {
 	unsigned int i;
 	int ret;
-
-	if (afe->amp_on || afe->mute)
-		return 0;
-
-	mutex_lock(&afe->pmic_lock);
-
-	ret = j36_pmic_write(afe, J36_PMIC_AUDTOP_CON7, 0x2400);
-	if (ret)
-		goto fail;
-	j36_pmic_write(afe, J36_PMIC_AUDTOP_CON6, 0xb7f6);
-	j36_pmic_rmw(afe, J36_PMIC_AUDTOP_CON0, 0x7000, 0xf000);
-	j36_pmic_write(afe, J36_PMIC_AUDTOP_CON4, 0x0014);	/* bias + LCH DAC */
-	usleep_range(10000, 12000);
 
 	j36_pmic_write(afe, J36_PMIC_AUDTOP_CON7, 0x3550);
 	j36_pmic_write(afe, J36_PMIC_TOP_CKPDN1_CLR, J36_PMIC_CKPDN1_SPK);
@@ -563,34 +762,26 @@ static int j36_speaker_on(struct j36_afe *afe)
 	j36_pmic_write(afe, J36_PMIC_SPK_CON0, 0x3001);		/* class-D on */
 	j36_pmic_write(afe, J36_PMIC_SPK_CON12, 0x0a00);
 
+	/* Powered as of that write, and recorded as powered before the ramp and
+	 * not after it: a PWRAP timeout half way up the ramp used to leave the
+	 * amp running with amp_on still false, which meant nothing would ever
+	 * take it back down again. */
+	afe->amp_on = true;
+
 	/* Up one step at a time from the vendor's starting level to ours, which is
 	 * below the vendor's maximum on purpose. */
 	for (i = 6; i <= afe->level; ++i) {
 		usleep_range(2000, 3000);
 		ret = j36_speaker_level(afe, i);
 		if (ret)
-			goto fail;
+			return ret;
 	}
-
-	afe->amp_on = true;
-	mutex_unlock(&afe->pmic_lock);
-	dev_info(afe->dev, "class-D speaker amp live at level %u\n", afe->level);
 	return 0;
-
-fail:
-	mutex_unlock(&afe->pmic_lock);
-	dev_warn(afe->dev, "class-D power-up failed (%d)\n", ret);
-	return ret;
 }
 
-static void j36_speaker_off(struct j36_afe *afe)
+static void j36_speaker_down(struct j36_afe *afe)
 {
 	unsigned int i;
-
-	if (!afe->amp_on)
-		return;
-
-	mutex_lock(&afe->pmic_lock);
 
 	/* Down from wherever the level currently is, never up to the vendor's
 	 * ramp-down start: stepping up first would raise the load on the way to
@@ -606,12 +797,97 @@ static void j36_speaker_off(struct j36_afe *afe)
 	j36_pmic_write(afe, J36_PMIC_TOP_CKPDN1_SET, J36_PMIC_CKPDN1_SPK);
 	j36_pmic_write(afe, J36_PMIC_AUDTOP_CON7, 0x2500);
 	j36_pmic_write(afe, J36_PMIC_AUDTOP_CON7, 0x2400);
-	j36_pmic_write(afe, J36_PMIC_AUDTOP_CON4, 0x0000);
-	j36_pmic_rmw(afe, J36_PMIC_AUDTOP_CON0, 0x0000, 0x1000);
-	j36_pmic_write(afe, J36_PMIC_AUDTOP_CON6, 0x37e2);
-
 	afe->amp_on = false;
+}
+
+static const char *j36_route_name(bool hp, bool spk)
+{
+	if (hp && spk)
+		return "headphone + speaker";
+	if (hp)
+		return "headphone";
+	if (spk)
+		return "speaker";
+	return "off";
+}
+
+/*
+ * Get to (hp, spk) from wherever we are, in the order that never leaves an
+ * output driving a front end that is being reprogrammed underneath it.
+ *
+ * The nine transitions this has to get right are the nine pairs; what makes them
+ * three rules rather than nine cases is that only the headphone changes the front
+ * end. Adding or removing the class-D on an unchanged headphone is the tail on
+ * its own, which is both the cheap path and the one the vendor takes.
+ */
+static void j36_route_apply(struct j36_afe *afe, bool hp, bool spk)
+{
+	bool rebuild;
+	int ret;
+
+	mutex_lock(&afe->pmic_lock);
+
+	if (hp == afe->hp_on && spk == afe->amp_on)
+		goto out;
+
+	rebuild = (hp != afe->hp_on);
+
+	/* The class-D comes down first whenever it is not wanted, and also when
+	 * the headphone is changing: an amp left running across a CON4/CON6
+	 * rewrite plays the transition into the speaker. */
+	if (afe->amp_on && (rebuild || !spk))
+		j36_speaker_down(afe);
+
+	/* Then the front end, if the headphone is changing or nothing is left
+	 * that wants it powered. */
+	if (afe->front_on && (rebuild || (!hp && !spk)))
+		j36_front_down(afe);
+
+	if (hp || spk) {
+		if (!afe->front_on) {
+			ret = j36_front_up(afe, hp, spk);
+			if (ret) {
+				dev_warn(afe->dev,
+					 "analog front end failed to come up (%d); no output\n",
+					 ret);
+				j36_front_down(afe);
+				goto out;
+			}
+		}
+		if (spk && !afe->amp_on) {
+			ret = j36_speaker_up(afe);
+			if (ret)
+				dev_warn(afe->dev,
+					 "class-D power-up failed (%d)\n", ret);
+		}
+	}
+
+	/* What it ended up as and not what was asked for: on a board where the
+	 * amp browns the rail out, those two differ and this is the line that
+	 * says so. */
+	dev_info(afe->dev, "analog output: %s\n",
+		 j36_route_name(afe->hp_on, afe->amp_on));
+
+out:
 	mutex_unlock(&afe->pmic_lock);
+}
+
+/*
+ * The route the current settings add up to, applied. Everything that can change
+ * the answer -- mute, either switch, the cursor coming alive, the stream ending
+ * -- goes through here rather than turning an output on by hand, so there is one
+ * place where "what should be playing" is decided.
+ *
+ * Both outputs wait for cursor_live for the same reason the speaker always has:
+ * the analog block is only ever powered against a DAC that is demonstrably being
+ * fed, which is what keeps a bring-up failure silent instead of a click and then
+ * a click.
+ */
+static void j36_route_sync(struct j36_afe *afe)
+{
+	bool live = afe->cursor_live && !afe->mute;
+
+	j36_route_apply(afe, live && afe->hp_allowed, live && afe->amp_allowed);
 }
 
 /* ---- the cursor, and what to do when it does not move -------------------- */
@@ -647,11 +923,10 @@ static void j36_afe_poll(struct work_struct *work)
 			 * above worked and the DAC is being fed; if it never
 			 * appears, everything below the memif is still dark. */
 			dev_info(afe->dev, "AFE DL1 DMA is live (cursor moving)\n");
-			if (afe->amp_allowed)
-				j36_speaker_on(afe);
-			else
+			j36_route_sync(afe);
+			if (!afe->amp_allowed && !afe->hp_allowed)
 				dev_info(afe->dev,
-					 "speaker amp is not allowed; `amixer -c0 set \"Speaker Amp\" on' or boot with j36.audio=speaker\n");
+					 "no output is allowed; `amixer -c0 set \"Speaker Amp\" on' or `amixer -c0 set Headphone on'\n");
 		}
 	} else if (!afe->cursor_live && !afe->soft_paced &&
 		   time_after(jiffies, afe->start_jiffies +
@@ -719,7 +994,12 @@ static int j36_afe_pcm_close(struct snd_pcm_substream *substream)
 	struct j36_afe *afe = snd_pcm_substream_chip(substream);
 
 	cancel_delayed_work_sync(&afe->poll_work);
-	j36_speaker_off(afe);
+	j36_route_apply(afe, false, false);
+	/* And the DMA is no longer proven, which matters because the mixer
+	 * controls are still reachable with no stream open: without this a
+	 * "Headphone on" between two tracks would power the buffers against a
+	 * DAC that stopped being clocked several seconds ago. */
+	afe->cursor_live = false;
 	/* Stop the consumer but keep the route programmed: an idle dashboard has
 	 * no reason to hold a clocked DAC, and the next stream reprograms
 	 * everything it depends on anyway. */
@@ -809,12 +1089,18 @@ static const struct snd_pcm_ops j36_afe_pcm_ops = {
 
 /* ---- mixer ---------------------------------------------------------------
  *
- * Two controls, and they exist as much for the userspace on the card as for a
+ * Four controls, and they exist as much for the userspace on the card as for a
  * person with amixer: alsa-restore wants a controlC0 to restore into, and the
  * MixOS units and the dashboard's volume page both look for a "Master" element
  * first. Seven
  * steps and not a hundred, because the class-D level field really is four bits
  * with seven usable values -- a 0..100 scale here would be a fiction.
+ *
+ * AND "Master" REACHES BOTH OUTPUTS, which is the one thing about this mixer
+ * worth knowing. It is two different registers underneath -- AUDTOP_CON7 for the
+ * class-D level, AUDTOP_CON5 for the headphone buffer gain -- and one element on
+ * top, because the volume keys on the side of the case do not know which output
+ * is up and should not have to. See j36_hp_gain_for_level().
  */
 static int j36_volume_info(struct snd_kcontrol *kcontrol,
 			   struct snd_ctl_elem_info *uinfo)
@@ -849,12 +1135,16 @@ static int j36_volume_put(struct snd_kcontrol *kcontrol,
 		return 0;
 
 	afe->level = level;
-	/* Written through only while the amp is actually powered. With the amp
-	 * down this is a remembered setting and not a PMIC transaction, which
-	 * matters on a board where every PMIC write is on the power path. */
-	if (afe->amp_on) {
+	/* Written through only to whichever output is actually powered. With
+	 * both down this is a remembered setting and not a PMIC transaction,
+	 * which matters on a board where every PMIC write is on the power path
+	 * -- and the next j36_front_up() picks it up from afe->level anyway. */
+	if (afe->amp_on || afe->hp_on) {
 		mutex_lock(&afe->pmic_lock);
-		j36_speaker_level(afe, level);
+		if (afe->amp_on)
+			j36_speaker_level(afe, level);
+		if (afe->hp_on)
+			j36_headphone_gain(afe, j36_hp_gain_for_level(level));
 		mutex_unlock(&afe->pmic_lock);
 	}
 	return 1;
@@ -879,10 +1169,7 @@ static int j36_switch_put(struct snd_kcontrol *kcontrol,
 		return 0;
 
 	afe->mute = mute;
-	if (mute)
-		j36_speaker_off(afe);
-	else if (afe->amp_allowed && afe->cursor_live)
-		j36_speaker_on(afe);
+	j36_route_sync(afe);
 	return 1;
 }
 
@@ -927,10 +1214,52 @@ static int j36_amp_put(struct snd_kcontrol *kcontrol,
 		return 0;
 
 	afe->amp_allowed = allowed;
-	if (!allowed)
-		j36_speaker_off(afe);
-	else if (!afe->mute && afe->cursor_live)
-		j36_speaker_on(afe);
+	j36_route_sync(afe);
+	return 1;
+}
+
+/*
+ * THE JACK, AND WHY IT IS A SWITCH RATHER THAN SOMETHING THAT NOTICES.
+ *
+ * Every phone this PMIC ever shipped in detected the plug: the MT6592 has an
+ * ACCDET block, it interrupts on insertion, and it is what tells a headset with
+ * a button apart from a pair of headphones. None of that is reachable from here.
+ * The vendor stack drives ACCDET through an ioctl on /dev/accdet, which is a
+ * kernel driver's interface and not a register map -- there is no ACCDET base
+ * address, no bit layout, nothing to program -- and this board's own header
+ * brings no headphone-detect GPIO out to fall back on either.
+ *
+ * So the honest thing is a switch. It behaves exactly like the speaker's: it is
+ * seeded from a module parameter, it can be changed on a running system, it only
+ * takes effect against a DAC that is proven to be running, and alsa-restore
+ * saves it. Turn the speaker off and this on and the sound comes out of the
+ * jack; leave both on and it comes out of both, which is the vendor's
+ * SPEAKER_HEADSET case and is what somebody sharing a screen actually wants.
+ *
+ * There is no separate headphone volume, on purpose: "Master Playback Volume"
+ * moves whichever outputs are up, the jack included. See
+ * j36_hp_gain_for_level().
+ */
+static int j36_hp_get(struct snd_kcontrol *kcontrol,
+		      struct snd_ctl_elem_value *ucontrol)
+{
+	struct j36_afe *afe = snd_kcontrol_chip(kcontrol);
+
+	ucontrol->value.integer.value[0] = afe->hp_allowed;
+	return 0;
+}
+
+static int j36_hp_put(struct snd_kcontrol *kcontrol,
+		      struct snd_ctl_elem_value *ucontrol)
+{
+	struct j36_afe *afe = snd_kcontrol_chip(kcontrol);
+	bool allowed = ucontrol->value.integer.value[0];
+
+	if (allowed == afe->hp_allowed)
+		return 0;
+
+	afe->hp_allowed = allowed;
+	j36_route_sync(afe);
 	return 1;
 }
 
@@ -962,6 +1291,18 @@ static const struct snd_kcontrol_new j36_afe_controls[] = {
 		.info	= snd_ctl_boolean_mono_info,
 		.get	= j36_amp_get,
 		.put	= j36_amp_put,
+	},
+	{
+		.iface	= SNDRV_CTL_ELEM_IFACE_MIXER,
+		/* "Headphone Switch" IS the standard name, unlike its neighbour:
+		 * this one really is an output mute, so a mixer applet that
+		 * finds it and toggles it is doing the right thing. amixer sees
+		 * it as the simple control "Headphone". */
+		.name	= "Headphone Switch",
+		.access	= SNDRV_CTL_ELEM_ACCESS_READWRITE,
+		.info	= snd_ctl_boolean_mono_info,
+		.get	= j36_hp_get,
+		.put	= j36_hp_put,
 	},
 };
 
@@ -1001,7 +1342,7 @@ static void j36_afe_shutdown(void *data)
 
 	afe->running = false;
 	cancel_delayed_work_sync(&afe->poll_work);
-	j36_speaker_off(afe);
+	j36_route_apply(afe, false, false);
 	j36_afe_rmw(afe, J36_AFE_DAC_CON0, 0,
 		    J36_AFE_DAC_CON0_DL1_EN | J36_AFE_DAC_CON0_AFE_ON);
 }
@@ -1023,6 +1364,7 @@ static int j36_afe_probe(struct platform_device *pdev)
 	afe->frame_bytes = 4;
 	afe->level = clamp(spk_level, J36_SPK_LEVEL_MIN, J36_SPK_LEVEL_MAX);
 	afe->amp_allowed = speaker;
+	afe->hp_allowed = headphone;
 	mutex_init(&afe->pmic_lock);
 	INIT_DELAYED_WORK(&afe->poll_work, j36_afe_poll);
 
@@ -1093,9 +1435,10 @@ static int j36_afe_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, afe);
 	dev_info(dev,
-		 "playback on DL1, %u KiB ring, speaker amp %s, downlink %s\n",
+		 "playback on DL1, %u KiB ring, speaker amp %s, headphone %s, downlink %s\n",
 		 J36_AFE_BUFFER_BYTES / 1024,
 		 speaker ? "enabled" : "OFF (speaker=1 asks for it)",
+		 headphone ? "enabled" : "OFF (headphone=1 asks for it)",
 		 codec ? "on" : "off");
 	return 0;
 }
