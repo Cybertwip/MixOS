@@ -6948,50 +6948,79 @@ j36.audio=speaker
     board that will not stay up is to delete j36/audio from the card, or this word
     from mvii/boot.conf, from any machine that reads SD cards.
 
-    WHAT `default' IS ON THIS CARD, AND WHY THE DASHBOARD DOES NOT USE IT.  The
-    shared rootfs links /etc/asound.conf to /home/virtua/.asoundrc -- see
-    finishing_touches.sh -- and that file is the RG351MP's:
+    WHAT `default' WAS ON THIS CARD.  The shared rootfs links /etc/asound.conf to
+    /home/virtua/.asoundrc -- see finishing_touches.sh -- and that file is the
+    RG351MP's:
 
       pcm.!default { type plug  slave.pcm "dmixer" }
       pcm.dmixer   { type dmix  ipc_key 1024
                      slave { pcm "hw:0,0" period_size 1024 buffer_size 4096
                              rate 44100 } }
 
-    So every stream that names `default' on this board goes through a shared-memory
+    So every stream that named `default' on this board went through a shared-memory
     software mixer carrying an RK3326-era buffer geometry, on top of an AFE that has
     no playback interrupt at all -- j36_mt6592_audio polls the DL1 cursor from a
     work item and calls snd_pcm_period_elapsed() from there.  dmix exists so several
-    processes can share one card.  This handheld has one audio consumer, which is
-    mixdash, so the layer buys nothing and stands between the player and the only
-    DAC on the machine.  The geometry it asks for is satisfiable -- 1024 frames of
-    stereo s16 is 4096 bytes, inside the driver's period range, and four periods fit
-    the 64 KiB ring -- so this is not a proven fault, it is an unnecessary layer with
-    a hard-coded shape that nothing here chose.
+    processes can share one card.  This handheld has one audio consumer at a time,
+    so the layer bought nothing and stood between the player and the only DAC on the
+    machine, with a hard-coded rate and buffer shape that nothing here chose.
 
-    THE DASHBOARD THEREFORE NAMES THE CARD.  MediaPage::alsaDevice() reads /dev/snd,
-    takes the lowest-numbered pcmC*D*p, and hands ffmpeg and aplay `plughw:C,D'.
-    plughw is the plug converter over the raw hw device -- it does the same rate,
-    format and channel conversion `default' would -- and it resolves entirely inside
-    alsa-lib's own definitions, so nothing in /etc/asound.conf can redirect it.  It
-    is read from the directory rather than assumed to be card 0 because a USB
-    headset or an HDMI adapter that enumerated first would make card 0 something
-    else.  The player prints the device it opened on its Output row, so "there is no
-    sound" and "there is no sound from plughw:0,0 at 48 kHz" are distinguishable
-    without a serial console.
+    WHAT `default' IS NOW.  With j36.audio in the command line the initramfs stages
+    its own two stanzas into /run/j36/asound.conf and j36-asound.service binds them
+    over the card's file before sysinit.target:
 
-    NOTHING HERE REWRITES THAT FILE, and the reason is the invariant this whole
+      pcm.!default { type plug  slave.pcm "hw:CARD=j36,DEV=0" }
+      ctl.!default { type hw    card j36 }
+
+    Three files, on the same pattern as the automounter under j36.usb below:
+
+      /run/j36/asound.conf                    the two stanzas above
+      /run/j36/bin/j36-asound                 the script that binds them
+      /run/systemd/system/j36-asound.service  which runs it once, early
+
+    plug over hw is what `default' has always meant: rate, format and channel
+    conversion in alsa-lib for anything that does not match this card's one PCM,
+    which is stereo s16 from 8 to 48 kHz.  CARD=j36 is the id the driver itself
+    passes to snd_devm_card_new, so it stays correct when a USB headset or an HDMI
+    adapter enumerates as card 0.  ctl.!default is there so amixer and alsamixer
+    with no -c land on the same card as the sound does.
+
+    THAT IS A BIND MOUNT AND NOT A WRITE, which is the invariant this whole
     initramfs is built on: nothing on the shared rootfs is written, and .asoundrc
-    lives on p3, which is the home partition an R36S boots from as well.  It cannot
-    be bind-mounted over either -- /etc/asound.conf is a symlink, so mount(2)
-    resolves it to a path that does not exist in the initramfs, and p3 is not
-    mounted until systemd does it after switch_root.  If you want the rest of the
-    system on this card to stop going through dmix, edit /home/virtua/.asoundrc on
-    p3 from a PC and make it one line:
+    lives on p3, the home partition an R36S boots from as well.  The bytes on the
+    card are untouched, the other launcher gets its own file back, and there is
+    nothing to undo.  The service resolves /etc/asound.conf, /home/virtua/.asoundrc
+    and /root/.asoundrc with readlink -f and binds each distinct target once, so the
+    symlink between the first two costs one mount rather than two.
 
-      pcm.!default { type plug  slave.pcm "hw:0,0" }
+    A conf.d drop-in would have been the polite way to do this and it cannot work.
+    alsa-lib reads /usr/share/alsa/alsa.conf.d/, then /etc/alsa/conf.d/, then
+    /etc/asound.conf, then ~/.asoundrc, and later wins: pcm.!default is an override
+    in both files, so the drop-in loses to the very file it is correcting.  The only
+    thing that beats ~/.asoundrc is ~/.asoundrc.
 
-    and know that you have changed it for the R36S too.  The dashboard does not care
-    either way.
+    NO dmix, AND THAT IS A DECISION.  It buys one thing -- several processes sharing
+    the DAC -- and the cost on an AFE with no playback interrupt is a software mixer
+    clocked off a polling work item.  The price is that the second opener gets EBUSY
+    while the first is playing.  To trade it back, put this in the file instead:
+
+      pcm.!default { type plug  slave.pcm "dmixer" }
+      pcm.dmixer   { type dmix  ipc_key 1024
+                     slave { pcm "hw:CARD=j36,DEV=0" rate 48000 } }
+
+    Either edit /home/virtua/.asoundrc on p3 from a PC and drop j36.audio back to a
+    word that does not stage the override -- there is none, so delete
+    /run/j36/asound.conf and restart j36-asound.service instead -- or change
+    setup_asound in the initramfs and rebuild.  Editing p3 changes it for the R36S
+    too; the /run file does not.
+
+    THE DASHBOARD STILL NAMES THE CARD, and that is independent of all of the above.
+    MediaPage::alsaDevice() reads /dev/snd, takes the lowest-numbered pcmC*D*p, and
+    hands ffmpeg `plughw:C,D'.  It resolves entirely inside alsa-lib's own
+    definitions, so the player keeps working on a card where none of this ran, and
+    it prints the device it opened on its Output row -- so "there is no sound" and
+    "there is no sound from plughw:0,0 at 48 kHz" are distinguishable without a
+    serial console.
 
 j36.usb=1
     Load the USB host stack from j36/usb/: the out-of-tree PHY driver, musb_hdrc

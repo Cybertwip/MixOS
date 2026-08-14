@@ -203,11 +203,50 @@ MODULE_PARM_DESC(chgreboot,
 #define J36_ADC_POLL_LIMIT		16
 
 /*
- * 1800 mV full range, x4 divider arm on channels 6 and 7: 3600 mV full scale,
- * which puts 19181 counts at 4214 mV -- a cell at its CV setpoint.  Channel 4
- * takes the x1 arm and a 330k/39k board divider instead.
+ * ── THE FULL SCALE ON CHANNELS 6 AND 7, AND WHY IT IS A PRODUCT ─────────────
+ *
+ * MediaTek's PMIC_IMM_GetOneChannelValue is two formulas, one per divider arm:
+ *
+ *     mV = value * 1800 * 4 >> 15        channels 6 and 7   (BATSNS, ISENSE)
+ *     mV = value * 1800     >> 15        channels 1,3,4,5,8
+ *
+ * and the cust-data initialiser those numbers come from holds them separately:
+ * VOLTAGE_FULL_RANGE 1800 at +0x1a4, R_BAT_SENSE 4 at +0x1a8.  They are written
+ * as two constants here for the same reason MVII's loader writes them as two --
+ * the 1800 is the ADC's reference and the 4 is the resistor arm in front of it,
+ * and folding them into one number is how the arm went missing.
+ *
+ * IT WAS 3600, WHICH IS HALF, AND THE BOARD SAID SO IN THREE PLACES.
+ *
+ *   The comment that used to sit here read "1800 mV full range, x4 divider arm:
+ *   3600 mV full scale, which puts 19181 counts at 4214 mV".  1800 x 4 is 7200,
+ *   and 19181 counts is 4214 mV only at 7200 -- at 3600 the same counts are
+ *   2107.  The sentence carried its own refutation.
+ *
+ *   MVII's board reports POWER_SUPPLY_CONSTANT_CHARGE_VOLTAGE=4162000, read out
+ *   of CHR_CON3 on this same PMIC.  A full-scale of 3600 cannot represent 4162
+ *   mV AT ALL: the 15-bit field saturates at 3600, so a charged cell pegs the
+ *   converter and every reading above three and a half volts is the same
+ *   reading.  A scale a working battery cannot fit inside is not a scale.
+ *
+ *   And the measured number: VBAT 1925 mV, on a console that was running the
+ *   panel, the GPU and eight A7s while it printed it.  This PMIC's own UVLO
+ *   would have switched the board off long before 1.9 V.  Doubled it is 3850
+ *   mV, which is an ordinary resting cell, and the gauge's 0% follows straight
+ *   from the halving -- 1925 mV is far below J36_V_0PERCENT_TRACKING_MV, so the
+ *   curve was being asked about a voltage no cell on this board has ever been
+ *   at.
+ *
+ * The x1 arm below is untouched: channel 4 takes it, and the 330k/39k board
+ * divider in front of that is what the two VCHR constants describe.
+ *
+ * If this ever needs backing out, it is one number -- put J36_ADC_R_BAT_SENSE
+ * to 2 and the old behaviour returns, with the same arithmetic on show.
  */
-#define J36_ADC_FULL_SCALE_MV		3600
+#define J36_ADC_VOLTAGE_FULL_RANGE_MV	1800
+#define J36_ADC_R_BAT_SENSE		4
+#define J36_ADC_FULL_SCALE_MV		(J36_ADC_VOLTAGE_FULL_RANGE_MV * \
+					 J36_ADC_R_BAT_SENSE)
 #define J36_ADC_VCHR_FULL_SCALE_MV	1800
 #define J36_VCHR_DIVIDER_NUM		369
 #define J36_VCHR_DIVIDER_DEN		39
@@ -1996,11 +2035,6 @@ static int j36_charger_online(struct j36_pmic *p)
  * needs a rebuild to turn on is a diagnostic nobody has when they need it.  At
  * one line per twenty seconds it costs the ring buffer nothing.
  */
-/* Twenty polls, which at the one-second default is one line per twenty seconds
- * -- slow enough to be free, fast enough that a plug event is never more than a
- * third of a minute from its first confirmation. */
-#define J36_CHARGING_LINE_EVERY		20
-
 static void j36_charging_line(struct j36_pmic *p, int online, int ma,
 			      bool ma_valid, int bat_mv)
 {

@@ -365,6 +365,28 @@
  * attached -- see j36_port_attached(). */
 #define J36_VBUS_FALL_MS		60
 
+/*
+ * And how long the rail is given to COME UP before DEVCTL.SESSION is set on it.
+ *
+ * This one was missing and it is the whole of "VBUS_ERROR in a_idle".  musb, on
+ * a session set as an A-device, starts otg_timer and expects the VBUS field to
+ * reach AValid inside a hundred milliseconds; if it does not, it logs
+ *
+ *     VBUS_ERROR in a_idle (80, <SessEnd), retry #0
+ *
+ * drops the session and retries.  The old order here set SESSION first and
+ * raised the pad afterwards, and MVII's log shows the error arriving 71 ms after
+ * the drop and 19 ms BEFORE the raise -- so the timer expired on a rail this
+ * driver had not put back yet, once per role poll, for the whole uptime.  HM
+ * never got set, the root port never scanned, and nothing enumerated.
+ *
+ * 50 ms is a load switch into a connector and whatever bulk is on the far side
+ * of it.  The USB spec gives a hub 100 ms to bring a port up and this is the
+ * same net with a smaller budget behind it, so the margin against musb's own
+ * window is comfortable at both ends.
+ */
+#define J36_VBUS_RISE_MS		50
+
 /* DEVCTL's VBUS field is four thresholds; this is the lowest one that means
  * somebody is actually driving the bus rather than leakage holding it off the
  * floor. */
@@ -443,9 +465,25 @@ MODULE_PARM_DESC(role_poll_ms,
 		 "(default 3000, 0 stops the poll and freezes whatever the "
 		 "power-on measurement decided). Plugging a charger into a running "
 		 "console is the normal case and there is no interrupt for it on "
-		 "this board, so it is a poll. It costs one DRVVBUS drop of "
-		 "J36_VBUS_FALL_MS and one 800 us settle, and it is skipped "
-		 "entirely whenever anything is attached to the port.");
+		 "this board, so it is a poll. It is skipped entirely whenever "
+		 "anything is attached to the port, and while the port is an "
+		 "idle host only every role_probe_every'th poll pays for the "
+		 "DRVVBUS drop -- see that parameter for why the drop is not "
+		 "something to do twenty times a minute.");
+
+static unsigned int role_probe_every = 5;
+module_param(role_probe_every, uint, 0644);
+MODULE_PARM_DESC(role_probe_every,
+		 "how many role polls to let pass between two DRVVBUS drops while "
+		 "the port is a host and idle (default 5, so one probe every 15 s "
+		 "at the 3000 ms poll; 1 probes every poll, 0 probes once at "
+		 "power-on and never again). Only the host answer costs anything "
+		 "to re-ask: a port already standing down has its pad low, so the "
+		 "measurement is free and runs every poll however this is set. "
+		 "The drop cycles 5 V on the connector, which is why it is no "
+		 "longer done every three seconds -- a device plugged in during "
+		 "the gap loses an attach attempt, and a port that gives one up "
+		 "twenty times a minute is a port nothing settles on.");
 
 static bool musb_session = true;
 module_param(musb_session, bool, 0644);
@@ -494,6 +532,10 @@ struct j36_usb_phy {
 	 * decided, so the first decision logs and applies even when it agrees
 	 * with what the sequences happen to have left behind. */
 	int role_host;
+	/* Polls since the last DRVVBUS drop.  Counts only while the port is a
+	 * host, because that is the only role whose re-measurement costs the
+	 * connector a power cycle -- see role_probe_every. */
+	unsigned int polls_since_probe;
 	struct delayed_work role_work;
 	/* The role poll runs off a workqueue and .set_mode / .power_on /
 	 * .power_off run off musb's probe and remove. The generic PHY framework
@@ -983,10 +1025,54 @@ static void j36_usb_phy_decide_role(struct j36_usb_phy *p)
 		goto apply;
 	}
 
-	if (p->role_host == 1 && j36_port_attached(p))
-		return;			/* busy; ask again next poll */
+	if (p->role_host == 1 && j36_port_attached(p)) {
+		/* Busy; ask again next poll -- and do not let the interval
+		 * toward the next probe run down while the port is in use, or
+		 * the first idle poll after a stick is unplugged spends its
+		 * whole budget at once. */
+		p->polls_since_probe = 0;
+		return;
+	}
+
+	/*
+	 * ── HOW OFTEN THE EXPENSIVE ANSWER IS RE-ASKED ──
+	 *
+	 * Measuring means dropping the pad, and dropping the pad means the
+	 * connector loses 5 V for J36_VBUS_FALL_MS plus a settle.  On a port
+	 * that is already standing down that costs nothing -- the pad is low
+	 * either way -- so the charger-came-out case still answers within one
+	 * poll.  On a port that is hosting it is a power cycle, and MVII's log
+	 * is what a power cycle every three seconds looks like: one VBUS_ERROR
+	 * per cycle for the whole uptime and nothing ever enumerating.
+	 *
+	 * So the host answer is re-asked every role_probe_every polls instead of
+	 * every one.  What that costs is latency on ONE transition -- a charger
+	 * plugged into an idle console is noticed in up to fifteen seconds
+	 * rather than three -- and what it buys is a port that holds still long
+	 * enough for a device to come up on it.
+	 *
+	 * p->role_host < 0 is the power-on case and is never skipped: there is
+	 * no answer yet to keep.
+	 */
+	if (p->role_host == 1) {
+		if (role_probe_every == 0)
+			return;			/* pinned by the first probe */
+		if (++p->polls_since_probe < role_probe_every)
+			return;
+	}
+	p->polls_since_probe = 0;
 
 	if (p->vbus_on != 0) {
+		/*
+		 * SESSION FIRST, AND THAT ORDER IS THE FIX.  musb holds an
+		 * A-device session against a rail this driver is about to take
+		 * away, and a session whose VBUS collapses is VBUS_ERROR --
+		 * musb's own recovery, entered once per poll, which is what the
+		 * log was full of.  Ending the session before the rail goes is
+		 * exactly what the stock host switch does and it turns a fault
+		 * into an ordinary role change.
+		 */
+		j36_musb_session(p, false);
 		/* -1 counts: the LK may have left the pad high and this driver
 		 * cannot read back which, so the first measurement pays the
 		 * fall time too rather than guessing it does not have to. */
@@ -1026,8 +1112,20 @@ apply:
 
 	if (host) {
 		j36_phy_force_host(p);
-		j36_musb_session(p, true);
+		/*
+		 * VBUS, THEN THE RAIL'S RISE TIME, THEN THE SESSION.  The other
+		 * order is what produced "VBUS_ERROR in a_idle" once per poll:
+		 * musb starts its A-device timer the moment SESSION goes in and
+		 * gives the VBUS field about a hundred milliseconds to reach
+		 * AValid, and this driver was raising the pad ninety
+		 * milliseconds later.  Raise first and the field is already
+		 * where the timer wants it, so the session comes up, HM is set
+		 * by the core, the root port scans, and a mouse or a hub
+		 * enumerates.
+		 */
 		j36_usb_phy_vbus(p, true);
+		msleep(J36_VBUS_RISE_MS);
+		j36_musb_session(p, true);
 	} else {
 		/* VBUS first. A B-device that went on driving 5 V would be
 		 * fighting whatever just plugged in, and on this board the
