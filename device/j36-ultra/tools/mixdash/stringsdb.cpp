@@ -146,6 +146,16 @@ const char *const kPhrases[][Lang::Count] = {
       "System",
       "Sistema",
       "Sistema" },
+    /* The status bar while a card is being carried across the grid.  A and B are
+     * the buttons as they are printed on the case, so they stay Latin letters in
+     * every language -- translating them would name a button that is not there.
+     * %1 is the card's own title, which is already translated by the row above it. */
+    { "Moving %1 -- A to place, B to cancel",
+      "Déplacement de %1 -- A pour poser, B pour annuler",
+      "Spostamento di %1 -- A per posare, B per annullare",
+      "%1 wird verschoben -- A zum Ablegen, B zum Abbrechen",
+      "A mover %1 -- A para colocar, B para cancelar",
+      "Moviendo %1 -- A para colocar, B para cancelar" },
     { "%1 is not on this card",
       "%1 n'est pas sur cette carte",
       "%1 non è su questa scheda",
@@ -200,12 +210,14 @@ const char *const kPhrases[][Lang::Count] = {
       "Hier öffnet nichts %1",
       "Nada aqui abre %1",
       "Nada aquí abre %1" },
-    { "Use the Power tab to power off",
-      "Utilisez l'onglet Alimentation pour éteindre",
-      "Usa la scheda Alimentazione per spegnere",
-      "Zum Ausschalten den Reiter Energie benutzen",
-      "Use o separador Energia para desligar",
-      "Usa la pestaña Energía para apagar" },
+    /* "Power off" and "Apps" both name things on the glass, so each language has
+     * to spell them here exactly as its own rows for those two strings do. */
+    { "Use the Power off card on the Apps grid",
+      "Utilisez la carte Éteindre sur la grille Applis",
+      "Usa la scheda Spegni nella griglia App",
+      "Die Karte Ausschalten im Raster Apps benutzen",
+      "Use o cartão Desligar na grelha Apps",
+      "Usa la tarjeta Apagar en la cuadrícula Apps" },
     { "poweroff is not on this card",
       "poweroff n'est pas sur cette carte",
       "poweroff non è su questa scheda",

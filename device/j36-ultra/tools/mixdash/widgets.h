@@ -86,6 +86,18 @@ public:
      * a page says "I am done, take me off the stack". */
     virtual bool handleNav(int action);
 
+    /*
+     * The button came back up.
+     *
+     * ALMOST NOTHING WANTS THIS, and that is deliberate: a press is a decision and
+     * acting on it when it is made is what makes a menu feel like it answers.  One
+     * page needs the other half -- the card grid, where holding A picks a card up
+     * and tapping it launches, and those two cannot be told apart until the button
+     * is either held long enough or let go.  So the default is empty and the shell
+     * delivers this to whatever is on the glass without asking.
+     */
+    virtual void handleNavRelease(int action);
+
     /* Shown and hidden.  Pages that poll, decode or hold a child process start
      * and stop here rather than running while nobody is looking at them. */
     virtual void onEnter();
@@ -131,6 +143,24 @@ public:
  * or not anything is wrong.
  */
 struct AppEntry {
+    /*
+     * A STABLE ASCII NAME FOR THIS CARD, AND IT IS NOT THE TITLE.
+     *
+     * The user's chosen order is written to the settings file as a list of these,
+     * so the identifier has to be the one thing about a card that does not move:
+     * the title is translated -- "Files" is "Fichiers" on a French boot -- and the
+     * position is the very thing being stored.  Six languages times one saved
+     * layout means a title-keyed order is a layout that resets when the language
+     * does.
+     *
+     * It is also the hook for the packages this grid is being made ready for: an
+     * installed application arrives with a key nothing here has seen, so it lands
+     * at the end of the grid rather than in the middle of somebody's arrangement,
+     * and it keeps whatever place it is dragged to across the reinstall that
+     * changes its version.
+     */
+    QString key;
+
     QString title;
     QColor accent;
     int glyph = GlyphGames;
@@ -180,9 +210,39 @@ private:
 };
 
 /*
- * The card grid.  Selection moves with the D-pad and wraps on the horizontal
- * axis only -- wrapping vertically on a two-row grid makes up and down feel like
- * the same button.
+ * The card grid: a lattice of fixed-size slots the user can rearrange.
+ *
+ * THREE THINGS LIVE HERE AND THEY ARE EASY TO CONFUSE.
+ *
+ *   the ORDER   -- m_entries, which is what the grid means.  Slot n holds
+ *                  m_entries[n], always.  Reordering the grid is reordering this
+ *                  vector and nothing else; there is no separate layout to keep
+ *                  in step with it, which is the bug a slot->card map would have
+ *                  been.
+ *   the SLOTS   -- geometry, computed from the page size by slotRect().  Nothing
+ *                  is stored: the grid is a function of the widget's width, so a
+ *                  panel that changes size (this build follows a USB-HDMI adapter
+ *                  to whatever it reports) relays itself with no state to update.
+ *   the MOTION  -- m_motion, one entry per card, which is where a card is being
+ *                  DRAWN as opposed to where it belongs.  It exists only so the
+ *                  cards can be seen moving between slots and is discarded and
+ *                  rebuilt whenever the entries are.
+ *
+ * GRAVITY, meaning what it means on a phone: cards fall towards the front of the
+ * grid and there are no holes in the middle of it.  Dropping a card into slot 4
+ * inserts it there and everything from 4 on shuffles one along -- it does not
+ * swap with whatever was in 4, and it does not leave slot 7 empty.  The animation
+ * is the same idea made visible: every card is on a spring towards its slot,
+ * slightly underdamped, so a rearrangement settles rather than snapping, and a
+ * card that has just been let go of is given a downward shove so it drops into
+ * place instead of sliding there.
+ *
+ * WHY THE ANIMATION COSTS NOTHING AT REST.  m_anim is a timer that is started
+ * when a card is off its mark and STOPS ITSELF the moment every card has settled.
+ * A dashboard sitting on the desk repaints exactly as often as it did before this
+ * file learned to move -- which on a Cortex-A7 with no 2D engine and a software
+ * rasteriser is not an optimisation, it is the difference between a pointer that
+ * tracks and one that stutters.
  */
 class CardGrid : public PageWidget
 {
@@ -191,8 +251,27 @@ class CardGrid : public PageWidget
 public:
     explicit CardGrid(QWidget *parent = nullptr);
 
+    /*
+     * `entries' is the natural order -- the order buildPages() writes them in.
+     * What lands in m_entries is that list permuted by the arrangement the user
+     * saved, with anything whose key is not in the saved list appended in the
+     * order given.  So a new card appears at the end of the grid, which is the
+     * only place it can appear without moving something the user put where it is.
+     */
     void setEntries(const QVector<AppEntry> &entries);
     const QVector<AppEntry> &entries() const { return m_entries; }
+
+    /*
+     * The arrangement the user saved last time, as keys in slot order.
+     *
+     * Set BEFORE setEntries and it is remembered, so the rebuild a language change
+     * causes does not also undo the arrangement.  This widget never opens the
+     * settings file itself -- the same split ListPane has, where the pane owns the
+     * value and the page owns writing it down.  What comes back out is
+     * orderChanged().
+     */
+    void setOrder(const QStringList &keys);
+    QStringList order() const;
     int index() const { return m_index; }
     /* Absolute, unlike moveBy(), which walks the grid a card at a time.  For
      * putting the selection back after setEntries() has reset it. */
@@ -206,38 +285,132 @@ public:
     bool moveBy(int dx, int dy);
     void activate();
 
+    /* True while a card has been picked up and is following the selection.
+     *
+     * The shell does not need to ask -- handleNav() consumes an edge press itself
+     * while carrying, so a card cannot be slid off the tab -- but a page that
+     * wants to know whether this grid is mid-gesture has no other way to find
+     * out, and the state is worth being able to see from outside. */
+    bool carrying() const { return m_carry >= 0; }
+
     void setPageTitle(const QString &t) { m_pageTitle = t; }
     QString title() const override;
     bool handleNav(int action) override;
+    void handleNavRelease(int action) override;
+    void onLeave() override;
 
 signals:
     void activated(int index);
     void indexChanged(int index);
+    /* The arrangement changed and should be written down.  The shell owns
+     * Settings; this widget owns the order.  Carries the keys in slot order. */
+    void orderChanged(const QStringList &keys);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
+    void wheelEvent(QWheelEvent *event) override;
+
+private slots:
+    /* The hold timer expired with A still down: the press was a long press. */
+    void onHoldExpired();
+    /* One frame of the spring.  Stops itself when everything has settled. */
+    void step();
 
 private:
-    QRectF cardRect(int i) const;
-    /* cardRect() plus the shadow and glow that are drawn outside it -- the unit
+    /*
+     * Where a card is being drawn, as against where it belongs.
+     *
+     * `lift' is 0 for a card in the grid and 1 for one that has been picked up,
+     * and it is animated rather than switched so the card grows into the hand
+     * instead of jumping.  It scales the card and deepens its shadow, which is
+     * the whole of "this one is in the air".
+     */
+    struct Motion {
+        qreal x = 0.0;
+        qreal y = 0.0;
+        qreal vx = 0.0;
+        qreal vy = 0.0;
+        qreal lift = 0.0;
+        bool placed = false;   /* false until the first layout gives it a home */
+    };
+
+    int columns() const;
+    int rowCount() const;
+    /* The slot's resting rectangle, in widget coordinates, scroll included. */
+    QRectF slotRect(int i) const;
+    /* Where card i is actually being drawn, motion and lift included. */
+    QRectF drawRect(int i) const;
+    /* slotRect/drawRect plus the shadow and glow drawn outside them -- the unit
      * of repaint for this page.  See the comment on selectTo() in widgets.cpp. */
-    QRect dirtyRect(int i) const;
+    QRect dirtyRect(const QRectF &r) const;
     int cardAt(const QPoint &p) const;
+    /* The slot a point falls in, whether or not there is a card in it.  Used
+     * while carrying, where the empty tail of the grid is a valid target. */
+    int slotAt(const QPoint &p) const;
+
+    /* Rebuild m_motion for the current entry count, keeping what it can. */
+    void resetMotion();
+    /* Wake the spring.  Idempotent; the timer stops itself. */
+    void wake();
+    /* Scroll so slot i is on screen, for a grid taller than the page. */
+    void ensureVisible(int i);
+    int maxScroll() const;
+
     /* Move the selection to `next', repaint only the two cards that changed, and
      * emit indexChanged().  Every caller that moves the selection goes through
      * here; nothing sets m_index by hand. */
     void selectTo(int next);
-    void paintCard(QPainter &p, const AppEntry &e, const QRectF &r, bool selected);
+    /* Take the card at m_index out of the grid and into the hand. */
+    void pickUp();
+    /* Put it down where it now sits, save the order, and drop it with a thump. */
+    void drop();
+    /* Put it back where it was picked up from and forget the whole thing. */
+    void cancelCarry();
+    /* The gravity move: take the card out of `from' and insert it at `to', so
+     * everything between shuffles by one.  NOT a swap -- see the class comment. */
+    void moveEntry(int from, int to);
+
+    void paintCard(QPainter &p, const AppEntry &e, const QRectF &r, bool selected,
+                   qreal lift);
+    /* The dashed outline of a slot with nothing in it.  Drawn only while a card
+     * is in the air: at rest an empty slot is empty, not a box. */
+    void paintEmptySlot(QPainter &p, const QRectF &r) const;
 
     QVector<AppEntry> m_entries;
+    QVector<Motion> m_motion;
     int m_index = 0;
     QString m_pageTitle;
     /* The card the press landed on, so a press that slides off it does not
      * activate the one it slid onto. */
     int m_pressed = -1;
+
+    /* -1 when nothing is being carried; otherwise the slot the carried card is
+     * currently sitting in, which is also its index in m_entries. */
+    int m_carry = -1;
+    /* Where it was picked up from, so B can put it back. */
+    int m_carryFrom = -1;
+    /* True between an A press and either its release or the hold expiring.  It is
+     * what makes a long press not also be a launch: the hold clears it. */
+    bool m_okArmed = false;
+    /* Set while the carried card is following the pointer rather than the slot
+     * grid, so the two input paths do not fight over its position. */
+    bool m_carryByPointer = false;
+    QPoint m_pointerAt;
+
+    QTimer *m_hold = nullptr;
+    QTimer *m_anim = nullptr;
+
+    /* The saved arrangement, kept so that a rebuild -- which is what a language
+     * change does to this page -- reapplies it instead of resetting it. */
+    QStringList m_order;
+
+    /* A grid with more cards than fit scrolls rather than paging.  Zero, and
+     * unreachable, until something is installed that makes it taller. */
+    int m_scroll = 0;
 };
 
 /* The dock: one slot per page, the active one lit.  Clickable, because a dock

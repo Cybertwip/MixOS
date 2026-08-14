@@ -687,7 +687,7 @@ int main(int argc, char **argv)
          * steps puts a QFileSystemModel on /run/j36/card, a read-only mount of a
          * partition on the same SD card this program was loaded from.
          */
-        Trace::phase("Dashboard -- four pages, the dock and the evdev map");
+        Trace::phase("Dashboard -- the pages, the dock and the evdev map");
         Dashboard dash;
 
         /*

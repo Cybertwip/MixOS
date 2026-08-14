@@ -430,6 +430,7 @@ PageWidget::PageWidget(QWidget *parent)
 }
 
 bool PageWidget::handleNav(int) { return false; }
+void PageWidget::handleNavRelease(int) {}
 void PageWidget::onEnter() {}
 void PageWidget::onLeave() {}
 bool PageWidget::wantsFullscreen() const { return false; }
@@ -600,16 +601,155 @@ void StatusBar::paintEvent(QPaintEvent *)
 
 /* ── CardGrid ────────────────────────────────────────────────────────────── */
 
+namespace {
+
+/*
+ * The spring, and the two numbers that make it read as weight.
+ *
+ * v = (v + (target - x) * kSpring) * kDamp, applied at kFrameMs.  kSpring 0.30
+ * with kDamp 0.66 is slightly UNDERdamped on purpose: a card overshoots its slot
+ * by two or three pixels and comes back, which is the difference between a card
+ * that settles and a card that arrives.  Critically damped looked like a
+ * dissolve, and a plain linear tween looked like a spreadsheet.
+ *
+ * 33 ms and not 16.  This panel is 640x480 of x8r8g8b8 composited by Qt's raster
+ * engine on a Cortex-A7 with no 2D block it can reach, and thirty frames of a
+ * rearrangement that lasts a third of a second is ten frames -- enough to see the
+ * motion, few enough that the pointer keeps tracking through it.
+ *
+ * kSettle is in pixels and applies to both the distance and the speed.  Below it
+ * the card is snapped exactly onto its slot: a spring approaches asymptotically
+ * and would otherwise repaint for ever, half a pixel at a time, and the whole
+ * point of this timer is that it stops.
+ */
+const qreal kSpring = 0.30;
+const qreal kDamp = 0.66;
+const qreal kSettle = 0.5;
+const int kFrameMs = 33;
+
+/*
+ * How far a card grows when it is picked up, and how fast it gets there.  1.08 is
+ * about nine pixels on a 110 px card -- enough that the lifted card is obviously
+ * in front of the others, small enough that it still fits its slot's neighbours
+ * on a grid with no room to spare.
+ */
+const qreal kLiftScale = 0.08;
+const qreal kLiftRate = 0.28;
+
+/*
+ * GRAVITY, LITERALLY, AND ONLY HERE.  A card that is let go of is given a shove
+ * downwards before the spring takes over, so it drops the last few pixels into
+ * its slot and bounces once rather than gliding in.  It is the one place in this
+ * file where the motion is not simply "go to where you belong", and it is what
+ * the gesture needs: without it, letting go looks exactly like moving one more
+ * slot, and there is no moment where the card is placed.
+ */
+const qreal kDropKick = 9.0;
+
+/* Long enough not to fire on a press, short enough to be discovered by accident,
+ * which is how anybody ever finds out that a grid can be rearranged. */
+const int kHoldMs = 500;
+
+} /* namespace */
+
 CardGrid::CardGrid(QWidget *parent)
     : PageWidget(parent)
 {
+    m_hold = new QTimer(this);
+    m_hold->setSingleShot(true);
+    m_hold->setInterval(kHoldMs);
+    connect(m_hold, &QTimer::timeout, this, &CardGrid::onHoldExpired);
+
+    m_anim = new QTimer(this);
+    m_anim->setInterval(kFrameMs);
+    connect(m_anim, &QTimer::timeout, this, &CardGrid::step);
 }
 
+void CardGrid::setOrder(const QStringList &keys)
+{
+    m_order = keys;
+    if (!m_entries.isEmpty()) {
+        /* Reapply to what is already here.  setEntries does the permuting, and
+         * handing it the current list is the same operation. */
+        const QVector<AppEntry> current = m_entries;
+        setEntries(current);
+    }
+}
+
+QStringList CardGrid::order() const
+{
+    QStringList keys;
+    keys.reserve(m_entries.size());
+    for (const AppEntry &e : m_entries)
+        keys << e.key;
+    return keys;
+}
+
+/*
+ * THE PERMUTATION, AND WHY IT IS WRITTEN THE LONG WAY.
+ *
+ * Sorting `entries' by indexOf(key) in m_order would be one line and would be
+ * wrong twice: a key that is not in the saved list has index -1 and would sort to
+ * the front, ahead of everything the user arranged, and QVector's sort is not
+ * stable, so two unsaved cards would come out in an order nobody chose.
+ *
+ * Two passes instead.  The saved keys first, in saved order, each taking the card
+ * that answers to it if there is one -- a card that has been uninstalled since is
+ * simply not there, and its slot closes up, which is the gravity rule applied to
+ * the passage of time.  Then everything left, in the order the caller gave, which
+ * for a new card means the end of the grid.
+ */
 void CardGrid::setEntries(const QVector<AppEntry> &entries)
 {
-    m_entries = entries;
+    const QString wasSelected = (m_index >= 0 && m_index < m_entries.size())
+                                    ? m_entries[m_index].key
+                                    : QString();
+
+    QVector<AppEntry> laid;
+    laid.reserve(entries.size());
+    QVector<bool> taken(entries.size(), false);
+
+    for (const QString &key : m_order) {
+        if (key.isEmpty())
+            continue;
+        for (int i = 0; i < entries.size(); ++i) {
+            if (taken[i] || entries[i].key != key)
+                continue;
+            taken[i] = true;
+            laid.append(entries[i]);
+            break;
+        }
+    }
+    for (int i = 0; i < entries.size(); ++i)
+        if (!taken[i])
+            laid.append(entries[i]);
+
+    m_entries = laid;
+    resetMotion();
+
+    /*
+     * The selection follows the CARD, not the slot number.  This function is what
+     * a language change calls, and landing back on "whatever is in slot 3 now"
+     * after picking a language would be a jump for no reason the user caused.
+     */
+    m_index = 0;
+    if (!wasSelected.isEmpty()) {
+        for (int i = 0; i < m_entries.size(); ++i) {
+            if (m_entries[i].key == wasSelected) {
+                m_index = i;
+                break;
+            }
+        }
+    }
     if (m_index >= m_entries.size())
         m_index = qMax(0, m_entries.size() - 1);
+
+    m_carry = -1;
+    m_carryFrom = -1;
+    m_okArmed = false;
+    m_hold->stop();
+    m_scroll = qBound(0, m_scroll, maxScroll());
+
     update();
     emit indexChanged(m_index);
 }
@@ -633,6 +773,18 @@ QString CardGrid::currentTitle() const
 
 QString CardGrid::title() const
 {
+    /*
+     * While a card is in the air the bar says so, because nothing else on the
+     * glass can: the grid looks the same as a grid being walked across, and the
+     * user has to know that the next press places something rather than opening
+     * it.  It also names the way out, which is the part a gesture discovered by
+     * accident most needs.
+     */
+    if (m_carry >= 0 && m_carry < m_entries.size()) {
+        return tr("Moving %1 -- A to place, B to cancel")
+            .arg(m_entries[m_carry].title);
+    }
+
     const QString t = currentTitle();
     if (m_pageTitle.isEmpty())
         return t;
@@ -641,90 +793,262 @@ QString CardGrid::title() const
     return m_pageTitle + " -- " + t;
 }
 
-bool CardGrid::handleNav(int action)
+/* ── geometry ────────────────────────────────────────────────────────────── */
+
+/*
+ * As many whole slots as fit, and never fewer than one.
+ *
+ * The card is then STRETCHED to share out the remainder, which is not the same as
+ * letting the card size float: at 640 the arithmetic gives exactly four 144 px
+ * slots with nothing over, and at a width that does not divide evenly the cards
+ * grow by a few pixels each rather than leaving a margin that looks like a
+ * mistake.  What does not happen is the old behaviour -- the number of columns is
+ * a property of the PANEL now, not of how many cards there are.
+ */
+int CardGrid::columns() const
 {
-    switch (action) {
-    case Joypad::NavUp:    moveBy(0, -1); return true;
-    case Joypad::NavDown:  moveBy(0, 1); return true;
-    /*
-     * Left and right are consumed only if they MOVED something.  At the far edge
-     * of the grid there is no card that way, and the shell reads the false as
-     * "then change root page" -- so the same push of the stick that walks along a
-     * row walks off the end of it onto the next tab.  See Dashboard::onNav.
-     */
-    case Joypad::NavLeft:  return moveBy(-1, 0);
-    case Joypad::NavRight: return moveBy(1, 0);
-    case Joypad::NavOk:    activate(); return true;
-
-    /*
-     * THE SHOULDERS ARE NOT HANDLED HERE, AND THAT IS THE POINT.
-     *
-     * L1/L2 and R1/R2 arrive as NavPrevPage and NavNextPage.  For one release
-     * this page consumed them to step the SELECTION card by card, on the theory
-     * that a hand already on the shoulder should not have to move back to the
-     * D-pad.  It is the wrong theory: the selection is what the D-pad is for, so
-     * the shoulders were a second, slower way to do the one thing the pad already
-     * does well, and the thing nothing else could do -- change which of the four
-     * root pages is on the glass -- needed you to walk to the end of a grid first.
-     *
-     * So they fall through, every time, to Dashboard::onNav, whose stepRoot(-1)
-     * and stepRoot(+1) move the page left and right and wrap at both ends.  Both
-     * shoulders on a side do the same thing on purpose: L1 and L2 are one gesture
-     * to a thumb, and so are R1 and R2.
-     *
-     * The D-pad reaches the same two calls now, but only by walking to the edge
-     * of the grid first -- which is why the shoulders are still worth having:
-     * from the middle of a full page they are one press instead of three.
-     *
-     * Returning false rather than deleting the case labels would have been the
-     * same behaviour; there are no case labels at all so that the next person
-     * reading this switch does not see the shoulders listed and assume the grid
-     * has an opinion about them.
-     */
-
-    default: return false;
-    }
+    const int usable = width() - 2 * Theme::Margin + Theme::Gap;
+    const int per = Theme::SlotW + Theme::Gap;
+    return qMax(1, usable / per);
 }
 
-QRectF CardGrid::cardRect(int i) const
+int CardGrid::rowCount() const
 {
-    /* qMin<int> spelled out: Theme::GridCols is an unnamed enum, so template
-     * deduction against an int has nothing to deduce and the two-argument form
-     * does not compile. */
-    const int cols = qMin<int>(Theme::GridCols, qMax(1, m_entries.size()));
-    const int rows = qMax(1, (m_entries.size() + cols - 1) / cols);
+    const int cols = columns();
+    return qMax(1, (m_entries.size() + cols - 1) / cols);
+}
 
+QRectF CardGrid::slotRect(int i) const
+{
+    const int cols = columns();
     const qreal availW = width() - 2.0 * Theme::Margin - (cols - 1) * Theme::Gap;
-    const qreal availH = height() - 2.0 * Theme::Margin - (rows - 1) * Theme::Gap;
     const qreal cw = availW / cols;
-    /*
-     * Capped, so a one-row page does not become three enormous slabs, and the
-     * block is then centred in what is left.  150 rather than the 190 this used
-     * to be: the cards carry a glyph and a name now and nothing else, and a card
-     * tall enough for two lines of description with no description in it is a
-     * card that reads as if something failed to load.
-     */
-    const qreal ch = qMin(availH / rows, 150.0);
+    const qreal ch = Theme::SlotH;
+
+    const int rows = rowCount();
     const qreal used = ch * rows + Theme::Gap * (rows - 1);
-    const qreal top = Theme::Margin + (height() - 2.0 * Theme::Margin - used) / 2.0;
+    /*
+     * Centred vertically when the grid is SHORTER than the page and pinned to the
+     * top when it is taller.  A grid that has outgrown the page scrolls, and a
+     * scrolling thing that is also centred jumps by half a row the moment it stops
+     * fitting.
+     */
+    const qreal slack = height() - 2.0 * Theme::Margin - used;
+    const qreal top = Theme::Margin + (slack > 0.0 ? slack / 2.0 : 0.0) - m_scroll;
 
     const int c = i % cols;
     const int r = i / cols;
-    return QRectF(Theme::Margin + c * (cw + Theme::Gap), top + r * (ch + Theme::Gap), cw, ch);
+    return QRectF(Theme::Margin + c * (cw + Theme::Gap), top + r * (ch + Theme::Gap),
+                  cw, ch);
+}
+
+QRectF CardGrid::drawRect(int i) const
+{
+    const QRectF home = slotRect(i);
+    if (i < 0 || i >= m_motion.size())
+        return home;
+
+    const Motion &m = m_motion[i];
+    const QRectF at(m.x, m.y, home.width(), home.height());
+    if (m.lift <= 0.001)
+        return at;
+
+    /* Grown about its own centre, so a lifted card does not also drift. */
+    const qreal grow = m.lift * kLiftScale;
+    const qreal dw = at.width() * grow;
+    const qreal dh = at.height() * grow;
+    return at.adjusted(-dw / 2.0, -dh / 2.0, dw / 2.0, dh / 2.0);
 }
 
 /*
  * Eight pixels of margin, and the number is derived rather than picked.  A card
- * draws OUTSIDE cardRect() twice: Theme::softShadow strokes out to `spread' (6)
+ * draws OUTSIDE its rectangle twice: Theme::softShadow strokes out to `spread' (6)
  * px, one further at the bottom, and a selected card adds an outline at
  * r.adjusted(-2.5, -2.5, 2.5, 2.5).  Eight covers the larger of those with a
  * pixel over for antialiasing, and toAlignedRect() rounds outwards so a card on
  * a half-pixel boundary does not leave a seam.
+ *
+ * A LIFTED card is drawn with a deeper shadow than that, so the caller passes
+ * drawRect(), which has already grown by the lift, and the twelve below covers
+ * the rest.  Being generous here costs a few pixels of repaint; being mean leaves
+ * a shadow smeared across the page when the card moves away.
  */
-QRect CardGrid::dirtyRect(int i) const
+QRect CardGrid::dirtyRect(const QRectF &r) const
 {
-    return cardRect(i).adjusted(-8, -8, 8, 8).toAlignedRect();
+    return r.adjusted(-12, -12, 12, 12).toAlignedRect();
 }
+
+int CardGrid::cardAt(const QPoint &p) const
+{
+    for (int i = 0; i < m_entries.size(); ++i)
+        if (drawRect(i).contains(QPointF(p)))
+            return i;
+    return -1;
+}
+
+/*
+ * The slot a point is in, including the empty ones after the last card.  A card
+ * being carried can be dropped past the end of the grid -- that is how it is put
+ * last -- so this clamps to the final valid index rather than answering -1.
+ */
+int CardGrid::slotAt(const QPoint &p) const
+{
+    if (m_entries.isEmpty())
+        return -1;
+
+    /* Grown by half a gap each way so the gutters belong to a slot and a pointer
+     * between two cards is over one of them rather than nowhere. */
+    const qreal slop = Theme::Gap / 2.0;
+
+    for (int i = 0; i < m_entries.size(); ++i) {
+        if (slotRect(i).adjusted(-slop, -slop, slop, slop).contains(QPointF(p)))
+            return i;
+    }
+
+    /*
+     * The dashed empty slots at the end of the last row.  They are the only place
+     * a pointer can aim at "after the last card", so landing in one means putting
+     * the card last rather than nowhere -- which is what makes the outline drawn
+     * there a target and not decoration.
+     */
+    const int lattice = rowCount() * columns();
+    for (int i = m_entries.size(); i < lattice; ++i) {
+        if (slotRect(i).adjusted(-slop, -slop, slop, slop).contains(QPointF(p)))
+            return m_entries.size() - 1;
+    }
+    return -1;
+}
+
+int CardGrid::maxScroll() const
+{
+    const qreal used = Theme::SlotH * rowCount() + Theme::Gap * (rowCount() - 1);
+    const qreal over = used - (height() - 2.0 * Theme::Margin);
+    return over > 0.0 ? (int)(over + 0.5) : 0;
+}
+
+void CardGrid::ensureVisible(int i)
+{
+    if (i < 0 || i >= m_entries.size() || maxScroll() == 0)
+        return;
+
+    /* slotRect() already has m_scroll in it, so this is a correction and not an
+     * absolute position -- which is what makes it work whichever way it moved. */
+    const QRectF r = slotRect(i);
+    const qreal topEdge = Theme::Margin;
+    const qreal bottomEdge = height() - Theme::Margin;
+
+    int want = m_scroll;
+    if (r.top() < topEdge)
+        want -= (int)(topEdge - r.top() + 0.5);
+    else if (r.bottom() > bottomEdge)
+        want += (int)(r.bottom() - bottomEdge + 0.5);
+
+    want = qBound(0, want, maxScroll());
+    if (want == m_scroll)
+        return;
+    m_scroll = want;
+    /* Every slot moved, so every card has a new target.  The spring carries them
+     * there, which makes scrolling look like the rest of this page. */
+    wake();
+    update();
+}
+
+/* ── motion ──────────────────────────────────────────────────────────────── */
+
+/*
+ * Rebuild the motion table for the current entries.
+ *
+ * Cards already on the glass keep where they are being drawn, so a rebuild that
+ * did not really change anything -- which is what a language change is -- does
+ * not throw every card back to its slot and slide it in again.  Anything new
+ * starts ON its slot rather than at the origin: a card appearing should appear
+ * where it belongs, not fly in from the top-left corner.
+ */
+void CardGrid::resetMotion()
+{
+    QVector<Motion> next(m_entries.size());
+    for (int i = 0; i < next.size(); ++i) {
+        if (i < m_motion.size() && m_motion[i].placed) {
+            next[i] = m_motion[i];
+            next[i].lift = 0.0;
+        } else {
+            const QRectF home = slotRect(i);
+            next[i].x = home.x();
+            next[i].y = home.y();
+            next[i].placed = true;
+        }
+    }
+    m_motion = next;
+}
+
+void CardGrid::wake()
+{
+    if (!m_anim->isActive())
+        m_anim->start();
+}
+
+void CardGrid::step()
+{
+    bool moving = false;
+    QRegion dirty;
+
+    for (int i = 0; i < m_motion.size() && i < m_entries.size(); ++i) {
+        Motion &m = m_motion[i];
+
+        /*
+         * Where this card is heading.  The carried card follows the pointer when
+         * there is one and its own slot otherwise; every other card heads for its
+         * slot, which is the whole of "the grid closes up behind it".
+         */
+        QRectF home = slotRect(i);
+        if (i == m_carry && m_carryByPointer) {
+            home.moveCenter(QPointF(m_pointerAt));
+        }
+
+        const qreal wantLift = (i == m_carry) ? 1.0 : 0.0;
+        const QRectF before = drawRect(i);
+
+        const qreal dx = home.x() - m.x;
+        const qreal dy = home.y() - m.y;
+        const qreal dl = wantLift - m.lift;
+
+        const bool atRest = qAbs(dx) < kSettle && qAbs(dy) < kSettle
+                            && qAbs(m.vx) < kSettle && qAbs(m.vy) < kSettle
+                            && qAbs(dl) < 0.01;
+        if (atRest) {
+            /* Snapped, not left a fraction of a pixel out.  A spring never
+             * actually arrives, and a timer that never stops is the one thing
+             * this animation must not be. */
+            if (m.x != home.x() || m.y != home.y() || m.lift != wantLift) {
+                m.x = home.x();
+                m.y = home.y();
+                m.lift = wantLift;
+                m.vx = 0.0;
+                m.vy = 0.0;
+                dirty += dirtyRect(before);
+                dirty += dirtyRect(drawRect(i));
+            }
+            continue;
+        }
+
+        m.vx = (m.vx + dx * kSpring) * kDamp;
+        m.vy = (m.vy + dy * kSpring) * kDamp;
+        m.x += m.vx;
+        m.y += m.vy;
+        m.lift += dl * kLiftRate;
+
+        moving = true;
+        dirty += dirtyRect(before);
+        dirty += dirtyRect(drawRect(i));
+    }
+
+    if (!dirty.isEmpty())
+        update(dirty);
+    if (!moving)
+        m_anim->stop();
+}
+
+/* ── selection and rearrangement ─────────────────────────────────────────── */
 
 /*
  * WHY MOVING THE SELECTION MARKS TWO RECTANGLES AND NOT THE WHOLE PAGE.
@@ -753,57 +1077,40 @@ void CardGrid::selectTo(int next)
     const int prev = m_index;
     m_index = next;
     if (prev >= 0 && prev < m_entries.size())
-        update(dirtyRect(prev));
+        update(dirtyRect(drawRect(prev)));
     if (next >= 0 && next < m_entries.size())
-        update(dirtyRect(next));
+        update(dirtyRect(drawRect(next)));
+    ensureVisible(next);
     emit indexChanged(m_index);
 }
 
-int CardGrid::cardAt(const QPoint &p) const
+/*
+ * The gravity move: OUT of one slot and INTO another, with everything between
+ * shuffling by one to close the hole and open a new one.
+ *
+ * Not a swap, and the difference is the whole feel of the gesture.  Swapping card
+ * 1 with card 5 leaves 1 sitting where 5 was, three slots from where the user was
+ * looking, and does it silently.  Removing and inserting moves the run between
+ * them by exactly one place each, which is a rearrangement the eye can follow --
+ * and which is what makes the grid have no holes in it, ever.
+ */
+void CardGrid::moveEntry(int from, int to)
 {
-    for (int i = 0; i < m_entries.size(); ++i)
-        if (cardRect(i).contains(QPointF(p)))
-            return i;
-    return -1;
-}
-
-void CardGrid::mouseMoveEvent(QMouseEvent *event)
-{
-    /* Hover selects.  The selection and the cursor are two different things on
-     * this device -- the pad owns one and the stick owns the other -- and having
-     * the cursor move the selection is what keeps them from disagreeing about
-     * what "the current card" is when the user switches hands mid-page. */
-    const int i = cardAt(event->pos());
-    if (i >= 0 && i != m_index)
-        selectTo(i);
-    event->accept();
-}
-
-void CardGrid::mousePressEvent(QMouseEvent *event)
-{
-    if (event->button() != Qt::LeftButton) {
-        event->ignore();
+    if (from == to || from < 0 || from >= m_entries.size())
         return;
-    }
-    m_pressed = cardAt(event->pos());
-    if (m_pressed >= 0 && m_pressed != m_index)
-        selectTo(m_pressed);
-    event->accept();
-}
+    to = qBound(0, to, m_entries.size() - 1);
 
-void CardGrid::mouseReleaseEvent(QMouseEvent *event)
-{
-    if (event->button() != Qt::LeftButton) {
-        event->ignore();
-        return;
-    }
-    /* Only if the release is on the card the press landed on, which is what lets
-     * a mis-aimed press be slid off and abandoned. */
-    const int i = cardAt(event->pos());
-    if (i >= 0 && i == m_pressed)
-        emit activated(i);
-    m_pressed = -1;
-    event->accept();
+    const AppEntry card = m_entries[from];
+    const Motion motion = m_motion.value(from);
+    m_entries.remove(from);
+    if (from < m_motion.size())
+        m_motion.remove(from);
+    m_entries.insert(to, card);
+    m_motion.insert(qMin(to, m_motion.size()), motion);
+
+    /* Every card between the two ends has a new slot to head for. */
+    wake();
+    update();
 }
 
 bool CardGrid::moveBy(int dx, int dy)
@@ -811,10 +1118,11 @@ bool CardGrid::moveBy(int dx, int dy)
     if (m_entries.isEmpty())
         return false;
 
-    const int cols = qMin<int>(Theme::GridCols, m_entries.size());
-    const int rows = qMax(1, (m_entries.size() + cols - 1) / cols);
-    int c = m_index % cols;
-    int r = m_index / cols;
+    const int cols = columns();
+    const int rows = rowCount();
+    const int at = (m_carry >= 0) ? m_carry : m_index;
+    int c = at % cols;
+    int r = at / cols;
 
     if (dx) {
         /*
@@ -839,8 +1147,19 @@ bool CardGrid::moveBy(int dx, int dy)
         /* A short last row: land on its last card rather than nothing. */
         candidate = m_entries.size() - 1;
     }
-    if (candidate == m_index)
+    if (candidate == at)
         return false;
+
+    if (m_carry >= 0) {
+        /* Carrying: the card goes to the new slot and the selection goes with it,
+         * because the carried card IS the selection until it is put down. */
+        moveEntry(m_carry, candidate);
+        m_carry = candidate;
+        m_index = candidate;
+        ensureVisible(candidate);
+        emit indexChanged(m_index);
+        return true;
+    }
 
     selectTo(candidate);
     return true;
@@ -852,9 +1171,326 @@ void CardGrid::activate()
         emit activated(m_index);
 }
 
-void CardGrid::paintCard(QPainter &p, const AppEntry &e, const QRectF &r, bool selected)
+void CardGrid::pickUp()
 {
-    Theme::softShadow(p, r, Theme::Radius, 6, selected ? 34 : 22);
+    if (m_index < 0 || m_index >= m_entries.size())
+        return;
+    m_carry = m_index;
+    m_carryFrom = m_index;
+    m_carryByPointer = false;
+    wake();
+    update();
+    /* The status bar is where the gesture explains itself -- see title(). */
+    emit titleChanged();
+}
+
+void CardGrid::drop()
+{
+    if (m_carry < 0)
+        return;
+
+    /* The thump.  See kDropKick: without it, letting go looks like one more move. */
+    if (m_carry < m_motion.size())
+        m_motion[m_carry].vy += kDropKick;
+
+    m_carry = -1;
+    m_carryFrom = -1;
+    m_carryByPointer = false;
+
+    /*
+     * THE GRID'S OWN COPY MOVES WITH THE CARDS, and it has to.  m_order is what
+     * setEntries() permutes by, and setEntries() is what a language change calls:
+     * left holding the arrangement that was loaded at startup, it would put every
+     * card back where it was before the user touched it, the moment they picked a
+     * language.  Emitting the same list is what gets it written down.
+     */
+    m_order = order();
+
+    wake();
+    update();
+    emit titleChanged();
+    emit orderChanged(m_order);
+}
+
+void CardGrid::cancelCarry()
+{
+    if (m_carry < 0)
+        return;
+    const int home = m_carryFrom;
+    const int here = m_carry;
+    m_carry = -1;
+    m_carryFrom = -1;
+    m_carryByPointer = false;
+    /* Put back, by the same move that brought it here -- so the grid unwinds
+     * visibly rather than the card teleporting home. */
+    moveEntry(here, home);
+    m_index = qBound(0, home, qMax(0, m_entries.size() - 1));
+    ensureVisible(m_index);
+    update();
+    emit indexChanged(m_index);
+    emit titleChanged();
+}
+
+/* ── input ───────────────────────────────────────────────────────────────── */
+
+void CardGrid::onHoldExpired()
+{
+    /*
+     * A was held past the threshold.  Clearing m_okArmed first is what stops the
+     * release that ends this same press from also counting as a tap -- otherwise
+     * picking a card up would launch it on the way.
+     */
+    m_okArmed = false;
+    if (m_carry < 0)
+        pickUp();
+}
+
+bool CardGrid::handleNav(int action)
+{
+    switch (action) {
+    case Joypad::NavUp:    moveBy(0, -1); return true;
+    case Joypad::NavDown:  moveBy(0, 1); return true;
+
+    /*
+     * Left and right are consumed only if they MOVED something.  At the far edge
+     * of the grid there is no card that way, and the shell reads the false as
+     * "then change root page" -- so the same push of the stick that walks along a
+     * row walks off the end of it onto the next tab.  See Dashboard::onNav.
+     *
+     * EXCEPT WHILE CARRYING, where the edge has to be a wall.  Sliding sideways
+     * off the grid with a card in hand would change tab and leave the card
+     * halfway through a move on a page nobody is looking at.
+     */
+    case Joypad::NavLeft:  return moveBy(-1, 0) || m_carry >= 0;
+    case Joypad::NavRight: return moveBy(1, 0) || m_carry >= 0;
+
+    case Joypad::NavOk:
+        /*
+         * A DOES NOT LAUNCH HERE.  It arms, and the release launches -- because a
+         * long press is a different gesture and the two cannot be told apart at
+         * the moment the button goes down.  The delay is invisible: nobody holds A
+         * for a tap, and handleNavRelease fires the instant they let go.
+         */
+        if (m_carry >= 0) {
+            drop();
+            return true;
+        }
+        m_okArmed = true;
+        m_hold->start();
+        return true;
+
+    case Joypad::NavBack:
+        if (m_carry >= 0) {
+            cancelCarry();
+            return true;
+        }
+        return false;
+
+    /*
+     * THE SHOULDERS ARE NOT HANDLED HERE, AND THAT IS THE POINT.
+     *
+     * L1/L2 and R1/R2 arrive as NavPrevPage and NavNextPage.  For one release
+     * this page consumed them to step the SELECTION card by card, on the theory
+     * that a hand already on the shoulder should not have to move back to the
+     * D-pad.  It is the wrong theory: the selection is what the D-pad is for, so
+     * the shoulders were a second, slower way to do the one thing the pad already
+     * does well, and the thing nothing else could do -- change which of the root
+     * pages is on the glass -- needed you to walk to the end of a grid first.
+     *
+     * So they fall through, every time, to Dashboard::onNav, whose stepRoot(-1)
+     * and stepRoot(+1) move the page left and right and wrap at both ends.  Both
+     * shoulders on a side do the same thing on purpose: L1 and L2 are one gesture
+     * to a thumb, and so are R1 and R2.
+     *
+     * The D-pad reaches the same two calls now, but only by walking to the edge
+     * of the grid first -- which is why the shoulders are still worth having:
+     * from the middle of a full page they are one press instead of three.
+     *
+     * Returning false rather than deleting the case labels would have been the
+     * same behaviour; there are no case labels at all so that the next person
+     * reading this switch does not see the shoulders listed and assume the grid
+     * has an opinion about them.
+     */
+
+    default: return false;
+    }
+}
+
+void CardGrid::handleNavRelease(int action)
+{
+    if (action != Joypad::NavOk)
+        return;
+
+    m_hold->stop();
+    if (!m_okArmed)
+        return;   /* the hold already claimed this press */
+    m_okArmed = false;
+    activate();
+}
+
+/*
+ * Leaving the page puts down whatever is in the air.
+ *
+ * A card carried off this page would come back to it still carried, with the
+ * status bar saying so on a page the user has since forgotten they were
+ * rearranging -- and the next A, aimed at launching something, would place it
+ * instead.  Cancelling rather than dropping is the conservative half of that: a
+ * rearrangement abandoned by walking away was not finished.
+ */
+void CardGrid::onLeave()
+{
+    m_hold->stop();
+    m_okArmed = false;
+    if (m_carry >= 0)
+        cancelCarry();
+}
+
+/* ── pointer ─────────────────────────────────────────────────────────────── */
+
+void CardGrid::mouseMoveEvent(QMouseEvent *event)
+{
+    if (m_carry >= 0 && m_carryByPointer) {
+        /* The card follows the cursor, and the slot under the cursor is where it
+         * would land -- so the grid reflows live, which is the feedback that says
+         * the drop will go where it looks like it will go. */
+        m_pointerAt = event->pos();
+        const int target = slotAt(m_pointerAt);
+        if (target >= 0 && target != m_carry) {
+            moveEntry(m_carry, target);
+            m_carry = target;
+            m_index = target;
+            emit indexChanged(m_index);
+        }
+        wake();
+        event->accept();
+        return;
+    }
+
+    /* A press that has started to slide is a drag, not a tap: cancel the hold so
+     * a moving finger cannot pick a card up by accident. */
+    if (m_pressed >= 0 && m_hold->isActive() && cardAt(event->pos()) != m_pressed)
+        m_hold->stop();
+
+    /* Hover selects.  The selection and the cursor are two different things on
+     * this device -- the pad owns one and the stick owns the other -- and having
+     * the cursor move the selection is what keeps them from disagreeing about
+     * what "the current card" is when the user switches hands mid-page. */
+    const int i = cardAt(event->pos());
+    if (i >= 0 && i != m_index)
+        selectTo(i);
+    event->accept();
+}
+
+void CardGrid::mousePressEvent(QMouseEvent *event)
+{
+    if (event->button() != Qt::LeftButton) {
+        event->ignore();
+        return;
+    }
+
+    m_pointerAt = event->pos();
+    if (m_carry >= 0) {
+        /* A click while something is in the air places it, the same as A does. */
+        drop();
+        m_pressed = -1;
+        event->accept();
+        return;
+    }
+
+    m_pressed = cardAt(event->pos());
+    if (m_pressed >= 0 && m_pressed != m_index)
+        selectTo(m_pressed);
+    /* Press and hold with the pointer is the same gesture as press and hold on
+     * the pad, and reaches the same pickUp() -- see onHoldExpired. */
+    if (m_pressed >= 0) {
+        m_okArmed = false;   /* the pointer's tap is decided in mouseRelease */
+        m_hold->start();
+    }
+    event->accept();
+}
+
+void CardGrid::mouseReleaseEvent(QMouseEvent *event)
+{
+    if (event->button() != Qt::LeftButton) {
+        event->ignore();
+        return;
+    }
+
+    const bool wasHolding = m_hold->isActive();
+    m_hold->stop();
+
+    if (m_carry >= 0) {
+        /* Released after a hold picked the card up: the card stays in the air and
+         * follows the cursor, and the next click places it.  A drag-and-release
+         * would be the other design, and it is the wrong one here -- the cursor on
+         * this board is a joystick, and letting go of a stick is not a decision. */
+        m_carryByPointer = true;
+        m_pressed = -1;
+        event->accept();
+        return;
+    }
+
+    /* Only if the release is on the card the press landed on, which is what lets
+     * a mis-aimed press be slid off and abandoned. */
+    const int i = cardAt(event->pos());
+    if (wasHolding && i >= 0 && i == m_pressed)
+        emit activated(i);
+    m_pressed = -1;
+    event->accept();
+}
+
+void CardGrid::wheelEvent(QWheelEvent *event)
+{
+    if (maxScroll() == 0) {
+        event->ignore();
+        return;
+    }
+    const int before = m_scroll;
+    m_scroll = qBound(0, m_scroll - event->angleDelta().y() / 2, maxScroll());
+    if (m_scroll != before) {
+        wake();
+        update();
+    }
+    event->accept();
+}
+
+void CardGrid::resizeEvent(QResizeEvent *event)
+{
+    /* Every slot moved.  The cards are put straight onto their new homes rather
+     * than sprung there: a resize on this board is a display being plugged in,
+     * and nine cards flying across the panel is not what that should look like. */
+    m_scroll = qBound(0, m_scroll, maxScroll());
+    for (int i = 0; i < m_motion.size() && i < m_entries.size(); ++i) {
+        const QRectF home = slotRect(i);
+        m_motion[i].x = home.x();
+        m_motion[i].y = home.y();
+        m_motion[i].vx = 0.0;
+        m_motion[i].vy = 0.0;
+        m_motion[i].placed = true;
+    }
+    PageWidget::resizeEvent(event);
+}
+
+/* ── painting ────────────────────────────────────────────────────────────── */
+
+void CardGrid::paintEmptySlot(QPainter &p, const QRectF &r) const
+{
+    p.setBrush(Qt::NoBrush);
+    QColor edge = Theme::border();
+    edge.setAlpha(90);
+    QPen pen(edge, 1.0, Qt::DashLine);
+    pen.setDashPattern(QVector<qreal>() << 4 << 4);
+    p.setPen(pen);
+    p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), Theme::Radius, Theme::Radius);
+}
+
+void CardGrid::paintCard(QPainter &p, const AppEntry &e, const QRectF &r, bool selected,
+                         qreal lift)
+{
+    /* A lifted card throws a deeper, wider shadow, which is the only cue on a flat
+     * theme that says one rectangle is above another. */
+    Theme::softShadow(p, r, Theme::Radius, lift > 0.01 ? 10 : 6,
+                      lift > 0.01 ? 54 : (selected ? 34 : 22));
 
     const QColor top = selected ? Theme::card().lighter(114) : Theme::card();
     const QColor bottom = selected ? Theme::cardLow().lighter(108) : Theme::cardLow();
@@ -877,8 +1513,10 @@ void CardGrid::paintCard(QPainter &p, const AppEntry &e, const QRectF &r, bool s
     p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), Theme::Radius, Theme::Radius);
     if (selected) {
         QColor glow = Theme::blue();
-        glow.setAlpha(70);
-        p.setPen(QPen(glow, 1.0));
+        /* Brighter while the card is in the air: the outline is doing double duty
+         * as "this is selected" and "this is the one you are holding". */
+        glow.setAlpha(70 + (int)(lift * 120.0));
+        p.setPen(QPen(glow, 1.0 + lift));
         p.drawRoundedRect(r.adjusted(-2.5, -2.5, 2.5, 2.5), Theme::Radius + 2, Theme::Radius + 2);
     }
 
@@ -888,7 +1526,7 @@ void CardGrid::paintCard(QPainter &p, const AppEntry &e, const QRectF &r, bool s
      * a fixed (16, 16) because the description hanging below it was what filled
      * the rest; with the description gone, a top-left icon leaves a hole where
      * the words used to be.  Measuring the block and centring it means the card
-     * looks deliberate at whatever height cardRect() lands on.
+     * looks deliberate at whatever height slotRect() lands on.
      */
     const qreal side = qMin(56.0, qMin(r.width() * 0.42, r.height() * 0.44));
     const qreal titleH = 22.0;
@@ -931,18 +1569,48 @@ void CardGrid::paintEvent(QPaintEvent *event)
      * page and this test would pass for everything.
      *
      * The neighbours of a changed card usually intersect it -- the gap is 12 px
-     * and dirtyRect() grows each side by 8 -- and repainting them is not waste but
+     * and dirtyRect() grows each side by 12 -- and repainting them is not waste but
      * correctness: their shadows are drawn into that same overlap.
      */
     const QRegion dirty = event->region();
 
-    for (int i = 0; i < m_entries.size(); ++i)
-        if (i != m_index && dirty.intersects(dirtyRect(i)))
-            paintCard(p, m_entries[i], cardRect(i), false);
+    /*
+     * The empty tail of the grid, outlined, and ONLY while a card is in the air.
+     * It is the answer to "where can I put this" on a grid whose last row is half
+     * full; at rest it would be a row of boxes around nothing, which is furniture.
+     */
+    if (m_carry >= 0) {
+        /* `lattice' and not `slots': the latter is one of Qt's own keyword
+         * macros and does not survive being a variable name. */
+        const int lattice = rowCount() * columns();
+        for (int i = m_entries.size(); i < lattice; ++i) {
+            const QRectF r = slotRect(i);
+            if (dirty.intersects(dirtyRect(r)))
+                paintEmptySlot(p, r);
+        }
+    }
 
-    /* The selected card last, so its glow is not painted over by a neighbour. */
-    if (m_index >= 0 && m_index < m_entries.size() && dirty.intersects(dirtyRect(m_index)))
-        paintCard(p, m_entries[m_index], cardRect(m_index), true);
+    for (int i = 0; i < m_entries.size(); ++i) {
+        if (i == m_index || i == m_carry)
+            continue;
+        const QRectF r = drawRect(i);
+        if (dirty.intersects(dirtyRect(r)))
+            paintCard(p, m_entries[i], r, false, 0.0);
+    }
+
+    /* The selected card last, so its glow is not painted over by a neighbour --
+     * and the carried one after that, because it is above everything including
+     * the cards flowing out of its way. */
+    if (m_index >= 0 && m_index < m_entries.size() && m_index != m_carry) {
+        const QRectF r = drawRect(m_index);
+        if (dirty.intersects(dirtyRect(r)))
+            paintCard(p, m_entries[m_index], r, true, 0.0);
+    }
+    if (m_carry >= 0 && m_carry < m_entries.size()) {
+        const QRectF r = drawRect(m_carry);
+        if (dirty.intersects(dirtyRect(r)))
+            paintCard(p, m_entries[m_carry], r, true, m_motion.value(m_carry).lift);
+    }
 }
 
 /* ── Dock ────────────────────────────────────────────────────────────────── */

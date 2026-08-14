@@ -11,7 +11,8 @@
  *     terminate called after throwing an instance of 'std::bad_alloc'
  *     mixdash: died in phase "Dashboard -- four pages, the dock and the evdev map"
  *
- * and that is everything the C++ runtime is willing to say.  std::bad_alloc carries
+ * -- quoted as it was printed, back when there were four root pages rather than
+ * three -- and that is everything the C++ runtime is willing to say.  std::bad_alloc carries
  * no size, no address and no stack; what::() returns the string "std::bad_alloc".
  * So the one number that decides what kind of bug this is -- HOW BIG the request was
  * -- is thrown away at the throw site and cannot be recovered afterwards.

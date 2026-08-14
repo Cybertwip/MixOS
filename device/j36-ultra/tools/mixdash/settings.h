@@ -22,6 +22,7 @@
 
 #include <QObject>
 #include <QString>
+#include <QStringList>
 
 class QSettings;
 
@@ -107,6 +108,24 @@ public:
     void setMediaShuffle(bool on);
 
     /*
+     * How the user arranged the cards on the Apps grid, as AppEntry keys in slot
+     * order.
+     *
+     * KEYS AND NOT INDICES, because the set of cards is not fixed: Doom appears
+     * when an IWAD is on the card and packages will add their own, and a saved
+     * list of slot numbers would silently mean something different the moment the
+     * number of cards changed.  A key that no longer matches anything is skipped
+     * on load, and a card whose key is not in this list lands at the end -- so
+     * this file never has to be migrated and never has to be complete.
+     *
+     * QStringList, which QSettings writes as a comma-separated value.  That is
+     * deliberate too: the file is a plain INI on a partition somebody will mount
+     * on a PC, and `cards=doom, terminal, files' explains itself there.
+     */
+    QStringList cardOrder() const { return m_cardOrder; }
+    void setCardOrder(const QStringList &keys);
+
+    /*
      * Screen brightness as a percentage, or -1 for "nobody has moved it here".
      *
      * It is remembered because nothing else remembers it.  The backlight driver
@@ -150,6 +169,7 @@ private:
     QString m_wifiInterface;
     QString m_mediaRoot;
     QString m_language;
+    QStringList m_cardOrder;
     int m_brightness = -1;
     int m_mediaRepeat = 0;
     bool m_mediaShuffle = false;

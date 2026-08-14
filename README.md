@@ -42,11 +42,16 @@ they were, and share the same armhf Debian rootfs on the same card.
 On the device you get:
 
 * **mixdash**, the shell — Qt Widgets painted straight into `/dev/fb0`, no X, no
-  Wayland, no compositor. Apps, Media, Settings and Power at the root; Files,
-  Terminal, Wi-Fi, Sharing, Packages, Diagnostics, Mouse, Display, Language and
-  System Info pushed on top. Everything is reachable from the D-pad, and the tabs
-  are reachable by pushing left or right off the edge of a page, so a board being
+  Wayland, no compositor. Apps, Media and Settings at the root; Files, Terminal,
+  Wi-Fi, Sharing, Packages, Diagnostics, Mouse, Display, Language and System Info
+  pushed on top. Everything is reachable from the D-pad, and the tabs are
+  reachable by pushing left or right off the edge of a page, so a board being
   driven with one thumb is never stuck.
+* **A dashboard you arrange yourself.** The Apps grid is fixed-size slots rather
+  than a fixed number of them, so it fits four cards across the 640×480 panel and
+  eight across a 1280-wide television. Hold A on a card to pick it up, move it
+  with the D-pad, A again to place it — the cards spring out of the way and the
+  arrangement is remembered. Ready for packages that install cards of their own.
 * **Six languages**, compiled in — English, French, Italian, German, Portuguese and
   Spanish — switchable from Settings without a restart.
 * **The hardware, working.** Battery gauge and charger through the MT6592 PMIC.

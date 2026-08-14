@@ -276,6 +276,7 @@ void Joypad::rescan()
     closeDevices();
     openDevices();
     m_held = NavNone;
+    m_down = 0;
     m_mods = ModNone;
 }
 
@@ -314,6 +315,10 @@ void Joypad::setSuspended(bool suspended)
     if (suspended) {
         m_timer->stop();
         m_held = NavNone;
+        /* Whatever was down when the child took the input devices is not down as
+         * far as this dashboard is concerned: the release will be delivered to
+         * the child, or discarded by drain() on the way back. */
+        m_down = 0;
         m_mods = ModNone;
     } else {
         drain();
@@ -556,12 +561,33 @@ void Joypad::driveStick(int ms)
 
 void Joypad::feed(int action, bool pressed)
 {
+    /* NavNone is what lookup() answers for a code this board does not map, and it
+     * is not a bit worth setting -- every unmapped key on a USB keyboard would
+     * share it and they would release each other. */
+    if (action == NavNone)
+        return;
+    const quint32 bit = 1u << (action & 31);
+
     if (!pressed) {
         if (repeats(action) && m_held == action)
             m_held = NavNone;
+        /* Only for a press this object saw.  See m_down in the header. */
+        if (m_down & bit) {
+            m_down &= ~bit;
+            emit navReleased(action);
+        }
         return;
     }
 
+    /*
+     * A REPEATED PRESS IS NOT A SECOND PRESS.  Two devices can report the same
+     * button -- the keypad matrix and a gamepad both map to BTN_SOUTH here -- and
+     * the second press would otherwise leave the bit set after the first release,
+     * so the second release would emit nothing and the card grid would sit
+     * waiting for a release that already went past.  nav() still fires either
+     * way: that is a press, and a page that acts on presses should hear it.
+     */
+    m_down |= bit;
     emit nav(action, false);
 
     if (repeats(action)) {

@@ -58,6 +58,42 @@ QString shellQuote(const QString &s)
     return "'" + out + "'";
 }
 
+/*
+ * A workstation keyboard's key, as one of the actions the pad produces.
+ *
+ * Out here rather than inline in eventFilter() because both halves of a key --
+ * the press and the release -- have to map identically, and two copies of a
+ * fourteen-case switch is two copies that can drift.  A release that mapped to a
+ * different action than its press would leave the card grid holding a card it
+ * thinks is still being pressed.
+ */
+int navForKey(int qtKey)
+{
+    switch (qtKey) {
+    case Qt::Key_Up:        return Joypad::NavUp;
+    case Qt::Key_Down:      return Joypad::NavDown;
+    case Qt::Key_Left:      return Joypad::NavLeft;
+    case Qt::Key_Right:     return Joypad::NavRight;
+    case Qt::Key_Return:
+    case Qt::Key_Enter:
+    case Qt::Key_Space:     return Joypad::NavOk;
+    case Qt::Key_Escape:
+    case Qt::Key_Backspace: return Joypad::NavBack;
+    case Qt::Key_PageUp:    return Joypad::NavPrevPage;
+    case Qt::Key_Tab:
+    case Qt::Key_PageDown:  return Joypad::NavNextPage;
+    case Qt::Key_M:         return Joypad::NavMenu;
+    case Qt::Key_Q:         return Joypad::NavQuit;
+    /* The two keys on the side of the case, for a workstation that has them.
+     * Most desktops grab these before Qt sees them, which costs nothing: the
+     * bar is still reachable there through the Settings slider. */
+    case Qt::Key_VolumeUp:   return Joypad::NavVolumeUp;
+    case Qt::Key_VolumeDown: return Joypad::NavVolumeDown;
+    default: break;
+    }
+    return Joypad::NavNone;
+}
+
 } /* namespace */
 
 /* ── FilesPage ───────────────────────────────────────────────────────────── */
@@ -292,13 +328,14 @@ Dashboard::Dashboard(QWidget *parent)
     Trace::step("CardGrid (apps)");
     m_apps = new CardGrid(this);
     m_apps->setPageTitle(tr("Apps"));
+    /* Before buildPages(), so the first setEntries() already lays the cards out
+     * the way this card was left rather than laying them out and then moving
+     * them. */
+    m_apps->setOrder(Settings::instance().cardOrder());
     Trace::step("MediaPage");
     m_media = new MediaPage(this);
     Trace::step("SettingsPage");
     m_settings = new SettingsPage(this);
-    Trace::step("CardGrid (power)");
-    m_power = new CardGrid(this);
-    m_power->setPageTitle(tr("Power"));
 
     Trace::step("FilesPage");
     m_files = new FilesPage(this);
@@ -387,8 +424,8 @@ Dashboard::Dashboard(QWidget *parent)
     m_pointer = new Pointer(this);
 
     Trace::step("page tables");
-    m_roots << m_apps << m_media << m_settings << m_power;
-    m_all << m_apps << m_media << m_settings << m_power
+    m_roots << m_apps << m_media << m_settings;
+    m_all << m_apps << m_media << m_settings
           << m_files << m_terminal << m_wifi << m_sharing << m_packages
           << m_diagnostics << m_mouse << m_display << m_language << m_info;
     for (PageWidget *page : m_all) {
@@ -398,14 +435,17 @@ Dashboard::Dashboard(QWidget *parent)
 
     Trace::step("connections");
     connect(m_apps, &CardGrid::activated, this, &Dashboard::onAppActivated);
-    connect(m_power, &CardGrid::activated, this, &Dashboard::onPowerActivated);
     connect(m_apps, &CardGrid::indexChanged, this, [this](int) {
         if (m_current == m_apps)
             m_bar->setTitle(m_apps->title());
     });
-    connect(m_power, &CardGrid::indexChanged, this, [this](int) {
-        if (m_current == m_power)
-            m_bar->setTitle(m_power->title());
+    /*
+     * The grid owns the arrangement and the shell owns writing it down -- the same
+     * split ListPane has with its sliders, and for the same reason: widgets.cpp
+     * has no business knowing where the settings file is.
+     */
+    connect(m_apps, &CardGrid::orderChanged, this, [](const QStringList &keys) {
+        Settings::instance().setCardOrder(keys);
     });
     connect(m_files, &FilesPage::openRequested, this, &Dashboard::onOpenRequested);
     connect(m_settings, &SettingsPage::openRequested, this, &Dashboard::onSettingsOpen);
@@ -418,14 +458,14 @@ Dashboard::Dashboard(QWidget *parent)
             this, &Dashboard::retranslate);
 
     connect(m_pad, &Joypad::nav, this, &Dashboard::onNav);
+    connect(m_pad, &Joypad::navReleased, this, &Dashboard::onNavReleased);
     connect(m_pad, &Joypad::key, this, &Dashboard::onKey);
     connect(m_pad, &Joypad::pointerMove, m_pointer, &Pointer::onMove);
     connect(m_pad, &Joypad::pointerButton, m_pointer, &Pointer::onButton);
     connect(m_pad, &Joypad::pointerWheel, m_pointer, &Pointer::onWheel);
 
     Trace::step("dock pages");
-    m_dock->setPages(QStringList() << tr("Apps") << tr("Media")
-                                   << tr("Settings") << tr("Power"));
+    m_dock->setPages(QStringList() << tr("Apps") << tr("Media") << tr("Settings"));
 
     /* Stats every candidate executable and IWAD on the card. */
     Trace::step("buildPages -- looks for the apps on disk");
@@ -480,7 +520,7 @@ QString Dashboard::firstWad()
      *     for (const QString &dir : QStringList() << "/opt/mixos/share/doom" << ...)
      *
      * -- this loop iterates freed memory, and it is the bad_alloc that killed the
-     * dashboard in phase "Dashboard -- four pages, the dock and the evdev map".
+     * dashboard in the phase that builds it.
      * QStringList::operator<< returns a REFERENCE to the temporary, so what the
      * range-for binds is `auto &&__range = <QStringList&>' -- a reference
      * initialised from another reference.  The lifetime-extension rule only fires
@@ -511,12 +551,27 @@ QString Dashboard::firstWad()
 /*
  * WHAT IS NOT ON THE APPS GRID, AND WHY.
  *
- * Media, Settings and Power each used to have a card here as well as a slot in
- * the dock, and pressing the card did nothing but setRoot() to the tab that was
- * already one shoulder press away.  Two ways to reach the same page is not two
- * features; it is one feature and one piece of furniture the user has to learn is
- * furniture.  The dock is the way to a root page.  The grid is the way to the
- * pages that have no other way in -- which is exactly the six below.
+ * Media and Settings each used to have a card here as well as a slot in the dock,
+ * and pressing the card did nothing but setRoot() to the tab that was already one
+ * shoulder press away.  Two ways to reach the same page is not two features; it is
+ * one feature and one piece of furniture the user has to learn is furniture.  The
+ * dock is the way to a root page.  The grid is the way to the pages that have no
+ * other way in.
+ *
+ * WHY POWER IS NOT A TAB ANY MORE.  It was, and it held two cards -- Power off and
+ * System -- on a page with room for eight.  A tab that is six-eighths empty is not
+ * a section, it is a detour: three button presses to reach a thing, and a whole
+ * root page's worth of navigation spent on it.  The two cards are at the end of
+ * this list now, on a grid that has the room, and the tab is gone.  Power off is
+ * LAST on purpose: the D-pad lands on the first card when the tab opens, and the
+ * card that shuts the board down should be the furthest thing from where a
+ * thumb rests.  It is still behind the two-press m_armed gate on top of that.
+ *
+ * EVERY ENTRY HAS A key.  It is the identity the saved arrangement is written in
+ * -- see AppEntry -- so it is stable ASCII and it is not the title, which is
+ * translated.  Changing one of these strings moves that card back to the end of
+ * the grid for everybody who had already arranged it, which is the only real cost
+ * of getting one wrong.
  */
 void Dashboard::buildPages()
 {
@@ -530,6 +585,7 @@ void Dashboard::buildPages()
      * when it exits, which nothing that sets a mode on this board does.
      */
     AppEntry doom;
+    doom.key = QStringLiteral("doom");
     doom.title = tr("Doom");
     doom.accent = Theme::blue();
     doom.glyph = GlyphGames;
@@ -546,6 +602,7 @@ void Dashboard::buildPages()
     apps.append(doom);
 
     AppEntry terminal;
+    terminal.key = QStringLiteral("terminal");
     terminal.title = tr("Terminal");
     terminal.accent = Theme::green();
     terminal.glyph = GlyphTerminal;
@@ -553,6 +610,7 @@ void Dashboard::buildPages()
     apps.append(terminal);
 
     AppEntry files;
+    files.key = QStringLiteral("files");
     files.title = tr("Files");
     files.accent = Theme::teal();
     files.glyph = GlyphFiles;
@@ -560,6 +618,7 @@ void Dashboard::buildPages()
     apps.append(files);
 
     AppEntry packages;
+    packages.key = QStringLiteral("packages");
     packages.title = tr("Packages");
     packages.accent = Theme::yellow();
     packages.glyph = GlyphPackage;
@@ -567,6 +626,7 @@ void Dashboard::buildPages()
     apps.append(packages);
 
     AppEntry wifi;
+    wifi.key = QStringLiteral("wifi");
     wifi.title = tr("Wi-Fi");
     wifi.accent = Theme::blue();
     wifi.glyph = GlyphWifi;
@@ -581,6 +641,7 @@ void Dashboard::buildPages()
      * together.
      */
     AppEntry sharing;
+    sharing.key = QStringLiteral("sharing");
     sharing.title = tr("Sharing");
     sharing.accent = Theme::pink();
     sharing.glyph = GlyphFiles;
@@ -594,81 +655,83 @@ void Dashboard::buildPages()
      * nothing to flip a rendered buffer onto.  The page says so, with the evidence.
      */
     AppEntry diag;
+    diag.key = QStringLiteral("diagnostics");
     diag.title = tr("Diagnostics");
     diag.accent = Theme::purple();
     diag.glyph = GlyphChip;
     diag.internal = InternalDiagnostics;
     apps.append(diag);
 
-    m_apps->setEntries(apps);
-
-    QVector<AppEntry> powers;
-
     /*
-     * There was a Restart card here, first on the page, and it is gone because the
-     * board has a power button that reboots it and a card cannot do that better.
-     * Everything else on this tab is something the hardware has no way to ask for --
-     * a clean poweroff, the system report -- and Restart was the one entry that was
-     * only ever a second way to press a button, sitting in the position the
-     * D-pad lands on when the tab opens.
-     */
-
-    AppEntry off;
-    off.title = tr("Power off");
-    off.accent = Theme::red();
-    off.glyph = GlyphPower;
-    off.internal = InternalPoweroff;
-    powers.append(off);
-
-    /*
-     * There was a Console card here, between Power off and System, and it is gone
-     * rather than fixed.  It forked a login shell onto a spare VT and blocked the
-     * event loop until that shell exited, and on this board opening it was a hang:
-     * the dashboard stops painting the moment the fork starts, and if the VT switch
-     * does not take -- which is what happens when the panel is a simplefb the
-     * kernel's console driver was never bound to -- then nothing is drawn on the
-     * glass by anyone, and the only input path left is the one that was suspended
-     * on purpose two lines earlier.  No frame, no pad, no way back.
+     * There was a Console card on the old Power tab, between Power off and System,
+     * and it is gone rather than fixed.  It forked a login shell onto a spare VT and
+     * blocked the event loop until that shell exited, and on this board opening it
+     * was a hang: the dashboard stops painting the moment the fork starts, and if
+     * the VT switch does not take -- which is what happens when the panel is a
+     * simplefb the kernel's console driver was never bound to -- then nothing is
+     * drawn on the glass by anyone, and the only input path left is the one that was
+     * suspended on purpose two lines earlier.  No frame, no pad, no way back.
      *
      * The recovery would have been VT_WAITACTIVE timeouts, a watchdog on the child
      * and a fallback that undoes the mode switch, which is a console driver's worth
-     * of work to reach a prompt that the Terminal card on the Apps grid already
-     * gives -- in-process, on the panel that is known to draw, with the pad still
-     * live.  So: use Terminal.  See terminal.cpp.
+     * of work to reach a prompt that the Terminal card above already gives --
+     * in-process, on the panel that is known to draw, with the pad still live.
+     * So: use Terminal.  See terminal.cpp.
      */
 
     AppEntry info;
+    info.key = QStringLiteral("system");
     info.title = tr("System");
     info.accent = Theme::ink3();
     info.glyph = GlyphInfo;
     info.internal = InternalInfo;
-    powers.append(info);
+    apps.append(info);
 
-    m_power->setEntries(powers);
+    /*
+     * Last, and the header of this function says why.  There was a Restart card
+     * beside it once and it is gone because the board has a power button that
+     * reboots it and a card cannot do that better -- it was only ever a second way
+     * to press a button.
+     *
+     * "Last" is the DEFAULT position, not a fixed one: a user who wants Power off
+     * first can pick it up and put it there, and the grid will remember.  That is
+     * the same freedom every other card has, and taking it away from this one alone
+     * would be pretending the two-press gate is not the real guard.
+     */
+    AppEntry off;
+    off.key = QStringLiteral("poweroff");
+    off.title = tr("Power off");
+    off.accent = Theme::red();
+    off.glyph = GlyphPower;
+    off.internal = InternalPoweroff;
+    apps.append(off);
+
+    m_apps->setEntries(apps);
 }
 
 /*
  * A language was picked.  Everything that is rebuilt on the way into a page
  * retranslates itself the next time that page is entered -- which for a page you
  * had to walk to the Language list from is immediately, on the way back.  What is
- * left is the furniture: the two card grids, built once in the constructor, and
- * the dock, which never leaves the glass.
+ * left is the furniture: the card grid, built once in the constructor, and the
+ * dock, which never leaves the glass.
  */
 void Dashboard::retranslate()
 {
     const int apps = m_apps->index();
-    const int power = m_power->index();
 
     m_apps->setPageTitle(tr("Apps"));
-    m_power->setPageTitle(tr("Power"));
-    m_dock->setPages(QStringList() << tr("Apps") << tr("Media")
-                                   << tr("Settings") << tr("Power"));
+    m_dock->setPages(QStringList() << tr("Apps") << tr("Media") << tr("Settings"));
     buildPages();
 
-    /* setEntries resets the selection; putting it back is what keeps a language
-     * change from also being a jump to the first card. */
+    /*
+     * setEntries resets the selection; putting it back is what keeps a language
+     * change from also being a jump to the first card.  The ARRANGEMENT needs no
+     * such help -- buildPages() hands over the same keys in the same order and the
+     * grid re-applies the saved order to them, so translating the titles moves
+     * nothing.  Which is the whole reason the order is keyed rather than titled.
+     */
     m_apps->setIndex(apps);
-    m_power->setIndex(power);
 
     applyChrome();
     update();
@@ -727,9 +790,9 @@ void Dashboard::setRoot(int page)
 }
 
 /*
- * One tab left or right, wrapping at both ends.  The wrap is the point: four tabs
- * in a ring means the far one is two presses away in the other direction rather
- * than three in this one, and there is no end of the dock to get stuck against.
+ * One tab left or right, wrapping at both ends.  The wrap is the point: tabs in a
+ * ring means the far one is one press away in the other direction rather than two
+ * in this one, and there is no end of the dock to get stuck against.
  */
 void Dashboard::stepRoot(int delta)
 {
@@ -1166,13 +1229,6 @@ void Dashboard::onAppActivated(int index)
         activate(entries[index]);
 }
 
-void Dashboard::onPowerActivated(int index)
-{
-    const QVector<AppEntry> &entries = m_power->entries();
-    if (index >= 0 && index < entries.size())
-        activate(entries[index]);
-}
-
 /*
  * A file chosen in the browser.  Media is asked first because it is the only
  * thing here that can actually SHOW a file; everything else is handed to the
@@ -1245,10 +1301,10 @@ void Dashboard::onNav(int action, bool repeat)
         /* Deliberately not qApp->quit(): mixdash.service is Restart=on-failure, so
          * a clean exit is a clean stop and systemd does not bring the dashboard
          * back.  Quitting here would be a one-way door whose only way back is a
-         * power cycle -- which is what the old Console card was.  Power off is on
-         * the Power tab and does the thing properly; restarting is the board's own
+         * power cycle -- which is what the old Console card was.  The Power off card
+         * on the Apps grid does the thing properly; restarting is the board's own
          * power button, which is why there is no card for it. */
-        toast(tr("Use the Power tab to power off"));
+        toast(tr("Use the Power off card on the Apps grid"));
         return;
     }
 
@@ -1285,9 +1341,9 @@ void Dashboard::onNav(int action, bool repeat)
      *
      * AND ONLY ON A PRESS, WHICH IS WHAT `repeat' IS FOR.  Held directions repeat
      * every ninety milliseconds, so walking a stick along a row and leaving it
-     * leaned would page through all four tabs and start again inside half a
-     * second.  A repeat still moves the selection -- that is what makes a long
-     * list bearable -- but it stops dead at the edge, and the next press, made
+     * leaned would page through every tab and start again inside half a second.
+     * A repeat still moves the selection -- that is what makes a long list
+     * bearable -- but it stops dead at the edge, and the next press, made
      * deliberately, is the one that changes tab.
      */
     case Joypad::NavLeft:
@@ -1312,6 +1368,34 @@ void Dashboard::onNav(int action, bool repeat)
     default:
         break;
     }
+}
+
+/*
+ * A button let go of, delivered to whatever is on the glass and nowhere else.
+ *
+ * NO FALLBACK, unlike onNav().  A press the page refused becomes a change of tab
+ * up there; a release the page refused is nothing at all, because there is no
+ * gesture in this shell that a release alone should start.  If the page has since
+ * changed -- a card was launched on the press and the launch pushed a page -- the
+ * release lands on the new page, which will not know the action and will ignore
+ * it.  That is the correct outcome and it is why this does not remember who was
+ * in front at press time: remembering would mean delivering a release to a page
+ * that is no longer visible.
+ *
+ * The volume keys are filtered out for the same reason they are intercepted in
+ * onNav(): no page ever hears about them, and a release is still hearing about
+ * them.
+ */
+void Dashboard::onNavReleased(int action)
+{
+    if (action == Joypad::NavVolumeUp || action == Joypad::NavVolumeDown)
+        return;
+    if (m_keyboard->isVisible())
+        return;
+
+    PageWidget *page = current();
+    if (page)
+        page->handleNavRelease(action);
 }
 
 bool Dashboard::eventFilter(QObject *watched, QEvent *event)
@@ -1355,35 +1439,43 @@ bool Dashboard::eventFilter(QObject *watched, QEvent *event)
             }
         }
 
-        int action = Joypad::NavNone;
-        switch (key->key()) {
-        case Qt::Key_Up:        action = Joypad::NavUp; break;
-        case Qt::Key_Down:      action = Joypad::NavDown; break;
-        case Qt::Key_Left:      action = Joypad::NavLeft; break;
-        case Qt::Key_Right:     action = Joypad::NavRight; break;
-        case Qt::Key_Return:
-        case Qt::Key_Enter:
-        case Qt::Key_Space:     action = Joypad::NavOk; break;
-        case Qt::Key_Escape:
-        case Qt::Key_Backspace: action = Joypad::NavBack; break;
-        case Qt::Key_PageUp:    action = Joypad::NavPrevPage; break;
-        case Qt::Key_Tab:
-        case Qt::Key_PageDown:  action = Joypad::NavNextPage; break;
-        case Qt::Key_M:         action = Joypad::NavMenu; break;
-        case Qt::Key_Q:         action = Joypad::NavQuit; break;
-        /* The two keys on the side of the case, for a workstation that has them.
-         * Most desktops grab these before Qt sees them, which costs nothing: the
-         * bar is still reachable there through the Settings slider. */
-        case Qt::Key_VolumeUp:   action = Joypad::NavVolumeUp; break;
-        case Qt::Key_VolumeDown: action = Joypad::NavVolumeDown; break;
-        default: break;
-        }
+        const int action = navForKey(key->key());
         if (action != Joypad::NavNone) {
             /* X11 and Wayland both synthesise a held key as a stream of presses
              * with this flag set, which is the same thing Joypad's own repeat
              * means -- so the edge-of-page gesture behaves the same on both. */
             onNav(action, key->isAutoRepeat());
             return true;
+        }
+    }
+
+    /*
+     * The other half of a press, so that a workstation build can tell a tap from
+     * a hold the way the pad can.  Without this the card grid could be picked up
+     * with a long press on the device and never put down on a desk, because the
+     * press that arms the launch is only ever completed by a release.
+     *
+     * AUTO-REPEAT RELEASES ARE DROPPED.  X11 delivers a held key as an endless
+     * release/press pair with isAutoRepeat() set on both, and every one of those
+     * releases would look like the user letting go -- which would fire the tap
+     * action over and over while the key was still down.
+     *
+     * The wantsKeys() branch above has no counterpart here on purpose: pages that
+     * asked for raw keys are given presses only, so there is no release of theirs
+     * to steal.  The guard below is what keeps a release from arriving as a nav
+     * action while the Terminal is being typed into.
+     */
+    if (event->type() == QEvent::KeyRelease) {
+        QKeyEvent *key = static_cast<QKeyEvent *>(event);
+        PageWidget *page = current();
+        const bool typing = m_keyboard->isVisible() || (page && page->wantsKeys());
+        const bool escapes = key->key() == Qt::Key_Escape;
+        if (!key->isAutoRepeat() && (escapes || !typing)) {
+            const int action = navForKey(key->key());
+            if (action != Joypad::NavNone) {
+                onNavReleased(action);
+                return true;
+            }
         }
     }
     return QWidget::eventFilter(watched, event);

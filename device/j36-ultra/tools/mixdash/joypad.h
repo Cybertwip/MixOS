@@ -135,6 +135,22 @@ signals:
      */
     void nav(int action, bool repeat);
 
+    /*
+     * The same action, let go of.
+     *
+     * ADDED FOR ONE GESTURE and it is worth saying which, because a release
+     * signal invites everything to start acting on releases and that would make
+     * this dashboard feel slack.  The card grid tells a tap from a long press --
+     * launch the card, or pick it up and rearrange the grid -- and those two are
+     * indistinguishable at the moment the button goes down.  Nothing else listens.
+     *
+     * Emitted at most once per press.  m_down is what guarantees that: a release
+     * with no matching press -- which is what the input core hands over after a
+     * suspend, and what two devices reporting the same button produce -- is
+     * dropped rather than delivered.
+     */
+    void navReleased(int action);
+
     /* Pixels, already scaled and accelerated.  Fractional because at low speeds a
      * 15 ms tick moves less than a pixel and truncating each tick would stop the
      * pointer dead rather than move it slowly. */
@@ -189,6 +205,17 @@ private:
     int m_held = NavNone;
     QElapsedTimer m_heldSince;
     qint64 m_nextRepeat = 0;
+
+    /*
+     * Which actions are down, one bit per Nav value.
+     *
+     * A quint32 and not a QSet: there are fourteen actions and this is tested on
+     * every key event.  It exists so navReleased() cannot fire for a press that
+     * never happened -- the keypad matrix and a USB gamepad both map to BTN_SOUTH
+     * here, so one physical press can arrive twice, and setSuspended() throws
+     * presses away whose releases arrive afterwards.
+     */
+    quint32 m_down = 0;
 
     /* Wall clock between poll ticks, so pointer speed is in pixels per second and
      * not pixels per however-often-the-event-loop-got-round-to-us. */

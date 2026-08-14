@@ -73,9 +73,34 @@ enum {
     DockH   = 56,
     Margin  = 14,
     Gap     = 12,
-    Radius  = 14,
-    GridCols = 3,
-    GridRows = 2
+    Radius  = 14
+};
+
+/*
+ * THE CARD GRID IS SLOTS OF A FIXED SIZE, NOT A FIXED NUMBER OF SLOTS.
+ *
+ * It was GridCols = 3 and GridRows = 2, and the card was whatever shape six of
+ * them made out of the page -- so adding a seventh card made all seven shorter,
+ * and a tab with two cards on it drew two slabs and a hole.  Both of those are
+ * the same bug: the layout was derived from the contents.
+ *
+ * These two numbers are the contract instead.  A slot is 144x110 and stays 144x110
+ * whether there are three cards or thirty; the column count is however many whole
+ * slots fit across the page, and the row count is however many the cards need.
+ * That is what makes the grid sortable -- a slot the user can point at exists
+ * whether or not anything is in it -- and it is what makes an installed package
+ * able to appear on this page without redesigning it.
+ *
+ * NOMINAL, and the width is stretched: 640 - 2*14 margin - 3*12 gap is 576, which
+ * is exactly four of these, and a panel that is not 640 wide gets as many columns
+ * as fit and shares the remainder between them.  That matters on this build --
+ * the dashboard follows a USB-HDMI adapter to whatever it reports, and eight
+ * columns of the same 144 px card is the right answer on a 1280-wide television,
+ * not four cards stretched to 300.
+ */
+enum {
+    SlotW = 144,
+    SlotH = 110
 };
 
 /*

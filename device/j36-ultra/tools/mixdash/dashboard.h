@@ -3,15 +3,15 @@
  * Copyright (c) 2025-2026 the MixOS project and contributors
  * See device/j36-ultra/LICENSE for the licence text and what it covers.
  *
- * dashboard.h -- the shell: four root pages, a stack above them, one input path.
+ * dashboard.h -- the shell: three root pages, a stack above them, one input path.
  *
  * WHAT CHANGED AND WHY.  The first version of this file was four pages and a
  * chain of `if (m_page == 1)' in onNav().  That was honest at four pages and
- * unreadable at twelve, and twelve is what this build has: Apps, Media, Settings
- * and Power at the root, and Files, Terminal, Wi-Fi, Packages, Diagnostics,
- * Mouse and System pushed on top of them.  Every page now answers handleNav()
- * for itself and the shell only decides WHICH page is on screen.  The shell's
- * remaining jobs are the ones no page can do alone:
+ * unreadable at twelve, and twelve is what this build has: Apps, Media and
+ * Settings at the root, and Files, Terminal, Wi-Fi, Sharing, Packages,
+ * Diagnostics, Mouse, Display, Language and System pushed on top of them.  Every
+ * page now answers handleNav() for itself and the shell only decides WHICH page
+ * is on screen.  The shell's remaining jobs are the ones no page can do alone:
  *
  *   - the stack.  Back falls through a page that does not consume it, and the
  *     shell pops.  That is the whole navigation model.
@@ -108,11 +108,11 @@ public:
     /*
      * A card with no exe does one of these instead of starting a process.
      *
-     * There is no InternalMedia, InternalSettings or InternalPower any more: those
-     * three cards did nothing but setRoot() to a tab the dock already shows, so
-     * the cards are gone and so are the arms that served them.  InternalConsole
-     * went the same way for a worse reason -- it hung the dashboard.  The note
-     * where the card used to be built, in buildPages(), says why.
+     * There is no InternalMedia or InternalSettings any more: those cards did
+     * nothing but setRoot() to a tab the dock already shows, so the cards are gone
+     * and so are the arms that served them.  InternalConsole went the same way for
+     * a worse reason -- it hung the dashboard.  The note where the card used to be
+     * built, in buildPages(), says why.
      *
      * InternalReboot is gone too, and that one for no reason worse than the board
      * having a power button that already does it.  A card that duplicates hardware
@@ -144,6 +144,9 @@ public slots:
     /* `repeat' is Joypad's: false for a press, true for an autorepeat of one still
      * being held.  Only the edge-of-page gesture reads it -- see onNav. */
     void onNav(int action, bool repeat);
+    /* The same action let go of.  Delivered to the current page and nowhere else;
+     * one page listens.  See onNavReleased in dashboard.cpp. */
+    void onNavReleased(int action);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -154,7 +157,6 @@ protected:
 
 private slots:
     void onAppActivated(int index);
-    void onPowerActivated(int index);
     void onOpenRequested(const QString &path);
 
     /* From any page, through PageWidget's signals. */
@@ -213,11 +215,17 @@ private:
     StatusBar *m_bar = nullptr;
     Dock *m_dock = nullptr;
 
-    /* The four root pages, in dock order. */
+    /*
+     * The three root pages, in dock order.
+     *
+     * There were four.  The fourth was a second CardGrid holding Power off and
+     * System -- two cards on a page with room for eight, reached by a tab of its
+     * own.  Both cards are on the Apps grid now and the tab is gone; buildPages()
+     * says why at more length.
+     */
     CardGrid *m_apps = nullptr;
     MediaPage *m_media = nullptr;
     SettingsPage *m_settings = nullptr;
-    CardGrid *m_power = nullptr;
 
     /* Pushed on top of a root page. */
     FilesPage *m_files = nullptr;

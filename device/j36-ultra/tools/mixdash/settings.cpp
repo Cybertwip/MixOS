@@ -151,6 +151,23 @@ void Settings::load()
     m_mediaShuffle = m_store->value(QStringLiteral("media/shuffle"), false).toBool();
 
     /*
+     * The card arrangement.  Trimmed and emptied of blanks on the way in, because
+     * a comma-separated INI value hand-edited on a PC comes back with spaces
+     * around the commas and an empty field where a trailing comma was, and the
+     * grid matches these against AppEntry::key by exact comparison.  Nothing else
+     * is validated: a key naming a card that is not installed is skipped by the
+     * grid, which is the same code path an uninstall takes.
+     */
+    m_cardOrder.clear();
+    const QStringList savedCards = m_store->value(QStringLiteral("dashboard/cards"))
+                                       .toStringList();
+    for (const QString &key : savedCards) {
+        const QString clean = key.trimmed();
+        if (!clean.isEmpty() && !m_cardOrder.contains(clean))
+            m_cardOrder.append(clean);
+    }
+
+    /*
      * Brightness gets the same treatment as the pointer speeds, and for a harder
      * reason: this is the only value in the file that can make the machine look
      * dead.  A hand-edited display/brightness=0 would come back after a reboot as
@@ -241,6 +258,20 @@ void Settings::setMediaShuffle(bool on)
     m_mediaShuffle = on;
     if (m_store) {
         m_store->setValue(QStringLiteral("media/shuffle"), m_mediaShuffle);
+        m_store->sync();
+    }
+}
+
+void Settings::setCardOrder(const QStringList &keys)
+{
+    if (m_cardOrder == keys)
+        return;
+    m_cardOrder = keys;
+    if (m_store) {
+        m_store->setValue(QStringLiteral("dashboard/cards"), m_cardOrder);
+        /* Written the moment the card is put down, like every other setting here
+         * and for the same reason: the way this device stops is that somebody
+         * holds the power button. */
         m_store->sync();
     }
 }
