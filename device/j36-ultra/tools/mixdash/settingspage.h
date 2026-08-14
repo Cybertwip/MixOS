@@ -29,6 +29,14 @@
  * amixer is in alsa-utils, which this image already stages for the Media page,
  * and if it is missing the row says so instead of the slider silently doing
  * nothing.
+ *
+ * AND IT IS DRIVEN THROUGH volume.h, not from here.  The plumbing used to be four
+ * private methods on this class, which was right while the slider below was the
+ * only way to change the volume.  It is not: VOL+ and VOL- on the side of the
+ * case work from the Media player and from a full-screen game, and two copies of
+ * "which control is the playback control" would be two probes of amixer and a
+ * slider showing the level from before the last press.  What is left here is
+ * m_volume and m_muted, which are the state of a row and nothing more.
  */
 #ifndef MIXDASH_SETTINGSPAGE_H
 #define MIXDASH_SETTINGSPAGE_H
@@ -77,18 +85,12 @@ private slots:
 private:
     void rebuild();
 
-    /* The first ALSA playback control that exists, cached.  Empty means either no
-     * amixer or no card, which the rows distinguish between. */
-    QString mixer();
-    void readMixer();
-    void writeVolume(int percent);
-    void writeMute(bool muted);
-
     ListPane *m_list = nullptr;
 
-    QString m_mixer;
-    bool m_mixerProbed = false;
-    bool m_haveAmixer = false;
+    /* What the mixer said the last time this page was entered, which is all these
+     * two are: the state of the slider and of the toggle.  The mixer itself lives
+     * in volume.h, because the hardware volume keys drive it from pages that are
+     * not this one. */
     int m_volume = -1;          /* per cent, -1 for "no control" */
     bool m_muted = false;
     QString m_note;

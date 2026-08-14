@@ -1015,6 +1015,22 @@ const char *const kPhrases[][Lang::Count] = {
       "A muda o idioma em todo o lado de uma vez.",
       "A cambia el idioma en todas partes de una vez." },
 
+    /* ── volume.cpp -- the bar the hardware volume keys put on the glass ──── */
+    /*
+     * One string, and it is the only one on that overlay: everything else the bar
+     * draws is a number and a speaker.  The newlines are load-bearing -- the bar
+     * is fifty pixels wide and Qt wraps at spaces and newlines and at nothing
+     * else, so each of these has to be three or four short words with a break
+     * chosen by hand.  paintEvent picks the font size that fits the longest of
+     * them, which is why "Soundkarte" is broken across two lines here.
+     */
+    { "no\nsound\ncard",
+      "aucune\ncarte\nson",
+      "nessuna\nscheda\naudio",
+      "keine\nSound-\nkarte",
+      "sem\nplaca\nde som",
+      "sin\ntarjeta\nde sonido" },
+
     /* ── wifi.cpp -- Wi-Fi ───────────────────────────────────────────────── */
     { "Nothing found yet.\nPress A on Scan again.",
       "Rien trouvé pour l'instant.\nAppuyez sur A sur Rechercher à nouveau.",

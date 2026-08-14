@@ -7,12 +7,9 @@
 
 #include <QDir>
 #include <QFile>
-#include <QFileInfo>
 #include <QGuiApplication>
 #include <QMouseEvent>
 #include <QPainter>
-#include <QProcess>
-#include <QRegularExpression>
 #include <QResizeEvent>
 #include <QScreen>
 #include <QStringList>
@@ -21,6 +18,7 @@
 #include "joypad.h"
 #include "stringsdb.h"
 #include "theme.h"
+#include "volume.h"
 
 namespace {
 
@@ -132,44 +130,6 @@ bool writeSysfs(const QString &path, int value)
     return ok;
 }
 
-QString firstExecutable(const QStringList &paths)
-{
-    for (const QString &p : paths)
-        if (QFileInfo(p).isExecutable())
-            return p;
-    return QString();
-}
-
-QString amixerPath()
-{
-    static const QString p = firstExecutable(QStringList()
-                                             << "/usr/bin/amixer" << "/bin/amixer");
-    return p;
-}
-
-/*
- * Bounded, and short.  amixer talks to the kernel and returns; if it has not
- * returned in two seconds the card is wedged and waiting longer only moves the
- * freeze from the mixer to the dashboard.
- */
-QString runShort(const QString &program, const QStringList &args, int timeoutMs = 2000)
-{
-    if (program.isEmpty())
-        return QString();
-
-    QProcess p;
-    p.setProcessChannelMode(QProcess::MergedChannels);
-    p.start(program, args);
-    if (!p.waitForStarted(1000))
-        return QString();
-    if (!p.waitForFinished(timeoutMs)) {
-        p.kill();
-        p.waitForFinished(400);
-        return QString();
-    }
-    return QString::fromLocal8Bit(p.readAll());
-}
-
 } /* namespace */
 
 /* ── the hub ─────────────────────────────────────────────────────────────── */
@@ -194,102 +154,14 @@ void SettingsPage::resizeEvent(QResizeEvent *event)
 
 void SettingsPage::onEnter()
 {
-    readMixer();
+    /*
+     * Read on the way in, every time, and never cached at this level.  The
+     * hardware volume keys work from anywhere and have almost certainly moved the
+     * level since this page was last looked at -- a slider showing what the mixer
+     * said the last time somebody opened Settings would be a slider that lies.
+     */
+    Volume::read(&m_volume, &m_muted);
     rebuild();
-}
-
-/* ── sound ───────────────────────────────────────────────────────────────── */
-
-/*
- * Which control to drive.  A board in bring-up has whatever the codec driver
- * happened to register, and the names are not standard: this one may expose
- * "Master", the next only "PCM", an HDMI-only card only "IEC958".  Preferring in
- * order and falling back to "the first one that has a volume" is what every
- * mixer applet does, and is the only thing that works without knowing the card.
- */
-QString SettingsPage::mixer()
-{
-    if (m_mixerProbed)
-        return m_mixer;
-    m_mixerProbed = true;
-
-    m_haveAmixer = !amixerPath().isEmpty();
-    if (!m_haveAmixer)
-        return m_mixer;
-
-    const QString out = runShort(amixerPath(), QStringList() << "scontrols");
-    QStringList names;
-    const QStringList lines = out.split('\n', Qt::SkipEmptyParts);
-    for (const QString &line : lines) {
-        const int a = line.indexOf('\'');
-        const int b = line.lastIndexOf('\'');
-        if (a >= 0 && b > a)
-            names << line.mid(a + 1, b - a - 1);
-    }
-
-    QStringList preferred;
-    preferred << "Master" << "PCM" << "Speaker" << "Headphone" << "Digital"
-              << "DAC" << "Playback";
-    for (const QString &want : preferred) {
-        if (names.contains(want)) {
-            m_mixer = want;
-            return m_mixer;
-        }
-    }
-    if (!names.isEmpty())
-        m_mixer = names.first();
-    return m_mixer;
-}
-
-/*
- * -M is the mapped (perceptual) scale.  Raw ALSA volume is a dB register value
- * pretending to be a percentage: at "50%" a raw control is usually already near
- * silent.  Mapped means the middle of the slider sounds like the middle.
- */
-void SettingsPage::readMixer()
-{
-    m_volume = -1;
-    m_muted = false;
-
-    const QString ctl = mixer();
-    if (ctl.isEmpty())
-        return;
-
-    const QString out = runShort(amixerPath(),
-                                 QStringList() << "-M" << "get" << ctl);
-    if (out.isEmpty())
-        return;
-
-    QRegularExpression vol("\\[(\\d{1,3})%\\]");
-    const QRegularExpressionMatch m = vol.match(out);
-    if (m.hasMatch())
-        m_volume = m.captured(1).toInt();
-
-    /* [off] appears once per channel; one is enough to call it muted. */
-    if (out.contains("[off]"))
-        m_muted = true;
-}
-
-void SettingsPage::writeVolume(int percent)
-{
-    const QString ctl = mixer();
-    if (ctl.isEmpty())
-        return;
-    m_volume = qBound(0, percent, 100);
-    runShort(amixerPath(), QStringList() << "-M" << "-q" << "set" << ctl
-                                         << QString("%1%").arg(m_volume));
-}
-
-void SettingsPage::writeMute(bool muted)
-{
-    const QString ctl = mixer();
-    if (ctl.isEmpty())
-        return;
-    m_muted = muted;
-    /* Not every control has a switch.  amixer says so on stderr and changes
-     * nothing, which is the right failure -- the slider still works. */
-    runShort(amixerPath(), QStringList() << "-q" << "set" << ctl
-                                         << (muted ? "mute" : "unmute"));
 }
 
 /* ── rows ────────────────────────────────────────────────────────────────── */
@@ -335,12 +207,12 @@ void SettingsPage::rebuild()
     h.text = tr("Sound");
     rows << h;
 
-    const QString ctl = mixer();
+    const QString ctl = Volume::control();
     if (ctl.isEmpty()) {
         r = ListRow();
         r.kind = ListRow::Item;
         r.text = tr("Volume");
-        r.detail = m_haveAmixer
+        r.detail = Volume::haveAmixer()
                        ? tr("No playback control -- is a card registered?")
                        : tr("amixer is missing.  Install alsa-utils.");
         r.enabled = false;
@@ -353,7 +225,9 @@ void SettingsPage::rebuild()
         r.detail = ctl;
         r.minimum = 0;
         r.maximum = 100;
-        r.stepSize = 5;
+        /* The same step the hardware keys take, so the slider and the rocker
+         * cannot land on levels the other one can never reach. */
+        r.stepSize = Volume::Step;
         r.value = m_volume < 0 ? 60 : m_volume;
         r.valueText = QString("%1 %").arg(r.value);
         r.accent = Theme::teal();
@@ -431,14 +305,15 @@ void SettingsPage::onValueChanged(int index, int value)
         return;
 
     if (rows[index].id == RowVolume) {
-        writeVolume(value);
+        m_volume = Volume::setPercent(value);
         ListRow r = rows[index];
         r.valueText = QString("%1 %").arg(m_volume);
         m_list->updateRow(index, r);
         /* Unmute on a deliberate raise: a slider that does nothing because
          * something else is muted is the oldest bug in audio. */
         if (m_muted && value > 0) {
-            writeMute(false);
+            Volume::setMuted(false);
+            m_muted = false;
             for (int i = 0; i < rows.size(); ++i) {
                 if (rows[i].id == RowMute) {
                     ListRow t = rows[i];
@@ -454,7 +329,8 @@ void SettingsPage::onValueChanged(int index, int value)
     }
 
     if (rows[index].id == RowMute) {
-        writeMute(value != 0);
+        m_muted = (value != 0);
+        Volume::setMuted(m_muted);
         m_note = m_muted ? tr("Muted") : tr("Unmuted");
         update();
     }

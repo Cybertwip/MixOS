@@ -847,8 +847,11 @@ bool SharingPage::handleNav(int action)
      * brightness is meant to be cheap.  Here the switches start a daemon, write
      * /etc and put this device's files on the network, and a d-pad nudge is not
      * an amount of intent that should do any of that.  A is the only way to flip
-     * them.  Left and right fall through to the shell, which walks to the next
-     * root page -- see Dashboard::onNav.
+     * them.
+     *
+     * They fall through to the shell, which does nothing with them here: it turns
+     * a refused left or right into a change of root page only from a root page,
+     * and this one is pushed.  B is the way out.  See Dashboard::onNav.
      */
     default:
         return false;

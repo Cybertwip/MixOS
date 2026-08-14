@@ -15,6 +15,11 @@
  *
  *   - the stack.  Back falls through a page that does not consume it, and the
  *     shell pops.  That is the whole navigation model.
+ *   - the tabs.  Left and right fall through the same way, and from a root page
+ *     the shell reads that as "there was nothing that way on this page" and moves
+ *     to the next one -- the D-pad's version of the shoulder buttons, so a board
+ *     being driven with one thumb is not stuck on the tab it started on.
+ *   - the volume.  Two keys on the side of the case that no page ever sees.
  *   - launching.  A child process needs the pad suspended, the panel warned
  *     about and a toast afterwards; a page cannot do that to itself.
  *   - the keyboard overlay.  It is one widget shared by every page that asks for
@@ -51,6 +56,7 @@ class QTimer;
 class SettingsPage;
 class SharingPage;
 class TerminalPage;
+class VolumeOverlay;
 class WifiPage;
 
 /*
@@ -135,7 +141,9 @@ signals:
     void firstPainted();
 
 public slots:
-    void onNav(int action);
+    /* `repeat' is Joypad's: false for a press, true for an autorepeat of one still
+     * being held.  Only the edge-of-page gesture reads it -- see onNav. */
+    void onNav(int action, bool repeat);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -183,6 +191,9 @@ private:
     PageWidget *current() const;
     void showPage(PageWidget *page);
     void setRoot(int page);
+    /* setRoot() one tab along, wrapping.  Both shoulders and, from a root page,
+     * both edges of the D-pad come through here. */
+    void stepRoot(int delta);
     void push(PageWidget *page);
     void pop();
     /* Status bar, dock, page geometry and the pointer, from whatever is current. */

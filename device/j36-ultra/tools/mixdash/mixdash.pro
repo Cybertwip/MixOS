@@ -46,6 +46,7 @@ SOURCES += \
     stringsdb.cpp \
     pointer.cpp \
     keyboard.cpp \
+    volume.cpp \
     settingspage.cpp \
     wifi.cpp \
     sharing.cpp \
@@ -64,6 +65,7 @@ HEADERS += \
     stringsdb.h \
     pointer.h \
     keyboard.h \
+    volume.h \
     settingspage.h \
     wifi.h \
     sharing.h \

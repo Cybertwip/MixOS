@@ -73,7 +73,8 @@ public:
          * asked for it with wantsKeys(), which is the Terminal and the Media
          * player, and the volume keys have to work everywhere -- including on
          * the Apps grid, where no page wants keys at all.  Being actions also
-         * gets them the repeat below for free, so holding VOL+ ramps.
+         * puts them within reach of the autorepeat, which they are named into by
+         * repeats() in joypad.cpp so that holding VOL+ ramps.
          */
         NavVolumeUp,
         NavVolumeDown
@@ -121,7 +122,18 @@ public:
     void rescan();
 
 signals:
-    void nav(int action);
+    /*
+     * `repeat' is false for the press itself and true for every one of the
+     * autorepeats that follow it while the key or the stick is held.
+     *
+     * Almost nothing cares -- walking a list is the same whether the press was
+     * held or made twice, which is the whole reason autorepeat exists.  What cares
+     * is anything a repeat should NOT be able to do over and over: the shell turns
+     * a left or a right the page refused into a change of root page, and at eleven
+     * repeats a second a leaned stick would spin through the tabs.  Those are
+     * gestures, and a gesture is a press.
+     */
+    void nav(int action, bool repeat);
 
     /* Pixels, already scaled and accelerated.  Fractional because at low speeds a
      * 15 ms tick moves less than a pixel and truncating each tick would stop the

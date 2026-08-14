@@ -194,12 +194,16 @@ public:
     void setEntries(const QVector<AppEntry> &entries);
     const QVector<AppEntry> &entries() const { return m_entries; }
     int index() const { return m_index; }
-    /* Absolute, unlike moveBy(), which walks the grid and wraps.  For putting the
-     * selection back after setEntries() has reset it. */
+    /* Absolute, unlike moveBy(), which walks the grid a card at a time.  For
+     * putting the selection back after setEntries() has reset it. */
     void setIndex(int index);
     QString currentTitle() const;
 
-    void moveBy(int dx, int dy);
+    /* False when the selection did not move -- the edge of the grid in that
+     * direction, or a grid with nothing in it.  handleNav hands that answer
+     * straight back to the shell, which turns a refused left or right into a
+     * change of root page. */
+    bool moveBy(int dx, int dy);
     void activate();
 
     void setPageTitle(const QString &t) { m_pageTitle = t; }

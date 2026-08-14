@@ -7,6 +7,7 @@
 
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QFontMetrics>
 #include <QPainter>
 #include <QPainterPath>
 #include <QProcess>
@@ -305,7 +306,10 @@ VolumeOverlay::VolumeOverlay(QWidget *parent)
 
 void VolumeOverlay::placeIn(const QRect &panel)
 {
-    const int w = 46;
+    /* Fifty-four and not the forty the track needs: the width is set by the
+     * no-card message, which is three words and has to be legible in six
+     * languages.  See paintEvent. */
+    const int w = 54;
     const int h = qMin(240, qMax(140, panel.height() / 2));
     /* Right-hand edge, vertically centred.  Right because the left of this panel
      * is where every page puts its list, and centred because the status bar owns
@@ -362,10 +366,36 @@ void VolumeOverlay::paintEvent(QPaintEvent *)
          * board "there is no sound card" and "the volume is down" are two
          * genuinely different problems with two different fixes.
          */
-        p.setFont(Theme::font(11, true));
+        const QRectF area = box.adjusted(3, 0, -3, 0);
+        const QString msg = tr("no\nsound\ncard");
+
+        /*
+         * The size is chosen against the longest word instead of fixed, because
+         * this bar is fifty pixels wide and the string is three words in six
+         * languages -- "nessuna", "tarjeta", "Soundkarte".  Qt wraps at spaces and
+         * newlines and at nothing else, so a word wider than the box is not
+         * wrapped, it is cut in half, and half a word is worse than a small one.
+         */
+        static const QRegularExpression ws(QStringLiteral("\\s+"));
+        const QStringList words = msg.split(ws, Qt::SkipEmptyParts);
+        int px = 12;
+        while (px > 8) {
+            const QFontMetrics fm(Theme::font(px, true));
+            bool fits = true;
+            for (const QString &w : words) {
+                if (fm.horizontalAdvance(w) > area.width()) {
+                    fits = false;
+                    break;
+                }
+            }
+            if (fits)
+                break;
+            --px;
+        }
+
+        p.setFont(Theme::font(px, true));
         p.setPen(Theme::ink2());
-        p.drawText(box.adjusted(4, 0, -4, 0),
-                   Qt::AlignCenter | Qt::TextWordWrap, tr("no\nsound\ncard"));
+        p.drawText(area, Qt::AlignCenter | Qt::TextWordWrap, msg);
         return;
     }
 

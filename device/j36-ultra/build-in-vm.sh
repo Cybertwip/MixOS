@@ -3297,6 +3297,62 @@ UNITID
     ln -sf ../mixdash.service \
            /newroot/run/systemd/system/multi-user.target.wants/mixdash.service
 
+    # ── the dock: mirror /dev/fb0 onto a USB-HDMI adapter ────────────────────────
+    #
+    # Only written when the binary is on the card, so deleting one file from
+    # /opt/mixos/bin takes the whole feature out of the boot with nothing left behind
+    # to fail -- the same removal contract every payload in this build has.
+    #
+    # WHY IT RUNS FROM BOOT AND NOT FROM A RULE.  It watches for the adapter itself:
+    # a readdir of /dev/dri every two seconds, and it mirrors while a "udl" node is
+    # there.  A udev rule would be less code here and more places to be wrong -- the
+    # rootfs is shared with an R36S, udev is not running yet in the initramfs, and a
+    # rule that fires once cannot notice the TV being switched on behind a hub that
+    # was already plugged in.  Two seconds of readdir is not measurable on this SoC.
+    #
+    # It is ordered after the dashboard only so that the first thing it mirrors is a
+    # dashboard rather than a console; it does not require it, and mirrors whatever is
+    # in /dev/fb0.  Restart=always because the one thing it must not do is give up:
+    # the whole point is to be ready whenever the dock arrives, which may be hours in.
+    #
+    # THE COMMENTS BELOW ARE INSIDE AN UNQUOTED HEREDOC, like UNITDASH above.  No
+    # backticks, no bare apostrophes, no trailing backslash -- $mixos_root is the one
+    # expansion wanted here and everything else that looks like shell would be shell.
+    if [ -x "/newroot$mixos_root/bin/j36-mixmirror" ]; then
+        cat > /newroot/run/systemd/system/j36-mixmirror.service <<UNITMIRROR
+# Written by the J36 Ultra initramfs, into a tmpfs.
+[Unit]
+Description=Mirror the panel onto a USB-HDMI adapter when one is plugged in
+Documentation=file:///opt/mixos/README.txt
+After=mixdash.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+# Nice, because this loses every argument against the dashboard: a diff of the panel
+# is worth exactly nothing if it costs the thing being mirrored its frame rate.
+Nice=5
+ExecStart=$mixos_root/bin/j36-mixmirror
+Restart=always
+RestartSec=5
+# The journal only.  Its steady state is silence, but a dock that is being plugged and
+# unplugged says a line each way, and console output would put those on top of the
+# dashboard.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNITMIRROR
+        ln -sf ../j36-mixmirror.service \
+               /newroot/run/systemd/system/multi-user.target.wants/j36-mixmirror.service
+        say "dash: USB-HDMI mirror armed -- plug a DisplayLink dock in at any time"
+    else
+        say "dash: no bin/j36-mixmirror on this card, so a USB-HDMI dock will"
+        say "      enumerate but will not show the dashboard"
+    fi
+
     # ── the probe, and WHY IT NO LONGER RUNS ON AN ORDINARY BOOT ─────────────────
     #
     # This unit was the whole of "mixsplash shows the eglprobe colours and then a
@@ -5404,6 +5460,50 @@ build_eglprobe() {
     return 0
 }
 
+# ── The USB-HDMI mirror ───────────────────────────────────────────────────────
+#
+# WHAT IT IS FOR.  Plug a DisplayLink dongle or a USB-C hub with HDMI on it into this
+# board and udl binds, a /dev/dri/cardN appears with the monitor's modes on it, and
+# the screen stays black.  Nothing is broken: CONFIG_DRM_FBDEV_EMULATION is =n on
+# purpose -- see the DRM prune far above, it is a global bool and turning it on would
+# have mtk_drm register a second /dev/fb and take the panel -- so udl has a card node
+# and no framebuffer, while mixdash is Qt on linuxfb and knows only /dev/fb0.  The two
+# cannot see each other.  j36-mixmirror copies between them: it diffs /dev/fb0 in
+# tiles, blits the changed ones into a dumb buffer on the udl node, and pushes them
+# with DRM_IOCTL_MODE_DIRTYFB, which is the ioctl udl actually transfers on.
+#
+# The file's own header has the rest, including why this is a mirror and not a second
+# display server, and what stops it ever modesetting the panel by mistake.
+#
+# STATIC, and for a reason beyond neatness: this way it can also be run from the
+# initramfs shell, where there is no ld.so and no /lib, which is the shell somebody
+# ends up in when the dock is the thing that is not working.
+#
+# Non-fatal, like eglprobe, fbdoom and mfgpower.  A board with no dongle plugged into
+# it must not lose its kernel artifacts because a 700-line accessory failed to build.
+MIXMIRROR_SRC="$ROOT/device/j36-ultra/tools/j36-mixmirror.c"
+MIXMIRROR_BIN=""
+
+build_mixmirror() {
+    local out="$WORK/j36-mixmirror" header
+
+    [[ -f "$MIXMIRROR_SRC" ]] || { log "mirror: $MIXMIRROR_SRC is missing"; return 1; }
+    arm-linux-gnueabihf-gcc -O2 -std=gnu11 -Wall -Wextra -static \
+        -o "$out" "$MIXMIRROR_SRC" || return 1
+
+    header="$(readelf -hd "$out" 2>/dev/null)" || return 1
+    grep -q 'Class:.*ELF32' <<<"$header" || { log "mirror: not a 32-bit ELF"; return 1; }
+    grep -q 'Machine:.*ARM' <<<"$header" || { log "mirror: not an ARM ELF"; return 1; }
+    if grep -q 'NEEDED' <<<"$header"; then
+        log "mirror: the binary wants shared libraries and -static was asked for"
+        return 1
+    fi
+
+    MIXMIRROR_BIN="$out"
+    log "mirror: j36-mixmirror is $(stat -c %s "$out") bytes, static ARM"
+    return 0
+}
+
 # ── The armhf chroot ──────────────────────────────────────────────────────────
 #
 # One emulated Debian armhf trixie tree, built once and kept, in which the dashboard
@@ -5940,6 +6040,20 @@ if [[ "${J36_GL:-1}" == 1 ]]; then
     fi
 else
     log "gl: J36_GL=0, skipping the GL front end"
+fi
+
+# The mirror is built outside the J36_GL block on purpose.  It touches no GL at all --
+# it is memcpy, one modeset and one dirty ioctl -- so a build with the Mesa front end
+# switched off should still come out able to drive a dock.
+set +e
+build_mixmirror
+mirror_rc=$?
+set -e
+if (( mirror_rc != 0 )); then
+    MIXMIRROR_BIN=""
+    log "mirror: j36-mixmirror was not built, see the error above -- a USB-HDMI adapter"
+    log "    will still enumerate and still get a /dev/dri node, it just will not show"
+    log "    the dashboard.  Nothing else in the image depends on it."
 fi
 
 # The dashboard, and it is on by default: it is what takes over the panel now.
@@ -6698,12 +6812,39 @@ j36.usb and HDMI
     whatever the driver.
 
     What you get when it works is a DRM card node with a connected output, listed by
-    run_usb at boot.  PAINTING it is a further step: DRM_FBDEV_EMULATION is off on
-    purpose -- it is a global bool, and turning it on for udl's sake would also make
-    mtk_drm create a second /dev/fb, which is exactly what keeping /dev/fb0 as
-    simplefb's is meant to prevent.  So the dashboard, which draws into /dev/fb0
-    with the CPU, does not appear on the dock by itself.  A compositor or a Qt
-    EGLFS-KMS front end pointed at that card node is what would put it there.
+    run_usb at boot.  PAINTING it is a further step, and it is the reason
+    j36-mixmirror exists: DRM_FBDEV_EMULATION is off on purpose -- it is a global
+    bool, and turning it on for udl's sake would also make mtk_drm create a second
+    /dev/fb, which is exactly what keeping /dev/fb0 as simplefb's is meant to
+    prevent.  So udl has a card node and no framebuffer, while the dashboard is Qt on
+    linuxfb and knows only /dev/fb0, and neither one can see the other.
+
+    opt/mixos/bin/j36-mixmirror closes that gap by copying between them.  It polls
+    /dev/dri every two seconds; when a node whose DRM driver NAME is "udl" appears it
+    picks the connected connector, chooses the mode that fits the most whole copies of
+    640x480, creates a dumb buffer, modesets, and from then on diffs /dev/fb0 in 64x64
+    tiles and pushes only the tiles that changed through DRM_IOCTL_MODE_DIRTYFB --
+    which is the ioctl udl transfers on, so a dumb buffer written and never marked
+    dirty shows nothing at all.  A still dashboard therefore costs no USB traffic.
+
+    It MIRRORS.  The handheld keeps its own screen, the dock shows the same picture
+    scaled by a whole number and centred, and unplugging is a process that goes back
+    to polling rather than a display server losing its output.  There is no extended
+    desktop and no input routing.
+
+    The driver-name test is the safety interlock and not a convenience: minor numbers
+    here are assigned in probe order across up to three DRM drivers (lima, mediatek,
+    udl), so cardN moves between boots, and a modeset aimed at mtk_drm would take the
+    panel with no way back.  Any node that is not named "udl" is closed again without
+    a second ioctl being sent to it.
+
+      j36-mixmirror -s     say what it found and what it would do, and exit
+      j36-mixmirror -v     the same reasoning, while running
+      j36-mixmirror -1     no scaling, 1:1 centred, for a mode that reads oddly
+
+    It is started by j36-mixmirror.service, which /init writes into /run only when the
+    binary is on the card.  Delete opt/mixos/bin/j36-mixmirror and the feature is gone
+    with nothing left behind to fail.
 
 j36.power=1
     The MT6592 PMIC: the battery gauge, the charger and a poweroff that actually
@@ -7777,7 +7918,7 @@ LICENCE
 # dashboard is.  With J36_MIXDASH=0 and no Doom, opt/mixos/j36 is still the modules,
 # mfgpower and the probe, and a build that silently shipped no tarball for them would
 # leave a card that boots to a dashboard-less console with no GPU either.
-if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" ]]; then
+if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" || -n "$MIXMIRROR_BIN" ]]; then
     mkdir -p "$SDROOT/opt/mixos/bin"
 
     if [[ -n "$MIXDASH_BIN" && -n "$QT_PAYLOAD" ]]; then
@@ -7806,6 +7947,16 @@ if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" ]]; then
             cp "$DOOM_WAD" "$SDROOT/opt/mixos/share/doom/$(basename "$DOOM_WAD")"
         fi
         log "dash: staged doom into opt/mixos/bin/"
+    fi
+
+    # The mirror goes beside them and is staged on its own merits -- unlike the
+    # dashboard it has no payload it needs next to it, being static, so a build that
+    # produced no Qt still ships a working dock.  /init writes its unit only when this
+    # file is here, so removing it from the card takes the feature off cleanly.
+    if [[ -n "$MIXMIRROR_BIN" ]]; then
+        cp "$MIXMIRROR_BIN" "$SDROOT/opt/mixos/bin/j36-mixmirror"
+        chmod 0755 "$SDROOT/opt/mixos/bin/j36-mixmirror"
+        log "dash: staged j36-mixmirror into opt/mixos/bin/"
     fi
 fi
 

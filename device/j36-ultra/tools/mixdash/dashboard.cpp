@@ -726,6 +726,19 @@ void Dashboard::setRoot(int page)
     showPage(m_roots[m_page]);
 }
 
+/*
+ * One tab left or right, wrapping at both ends.  The wrap is the point: four tabs
+ * in a ring means the far one is two presses away in the other direction rather
+ * than three in this one, and there is no end of the dock to get stuck against.
+ */
+void Dashboard::stepRoot(int delta)
+{
+    const int n = m_roots.size();
+    if (n <= 0)
+        return;
+    setRoot(((m_page + delta) % n + n) % n);
+}
+
 void Dashboard::push(PageWidget *page)
 {
     if (!page || current() == page)
@@ -778,6 +791,8 @@ void Dashboard::applyChrome()
         m_keyboard->raise();
     if (m_toast->isVisible())
         m_toast->raise();
+    if (m_volumeBar->isVisible())
+        m_volumeBar->raise();
     m_pointer->raise();
 
     syncInputMode();
@@ -1197,8 +1212,28 @@ void Dashboard::onOpenRequested(const QString &path)
 
 /* ── input ───────────────────────────────────────────────────────────────── */
 
-void Dashboard::onNav(int action)
+void Dashboard::onNav(int action, bool repeat)
 {
+    /*
+     * The volume keys come before EVERYTHING, the keyboard included.  They are two
+     * physical keys on the side of the case, and on every handheld ever made they
+     * do the same thing no matter what is on the screen: while a film is playing,
+     * while a name is being typed, inside a full-screen game.  A page that could
+     * swallow them would be a page you have to leave to turn the sound down, which
+     * is exactly the thing the keys exist to avoid.
+     *
+     * Two hardware keys, one line each, and no page ever hears about them.
+     */
+    if (action == Joypad::NavVolumeUp || action == Joypad::NavVolumeDown) {
+        bool muted = false;
+        const int level = Volume::nudge(action == Joypad::NavVolumeUp ? 1 : -1, &muted);
+        m_volumeBar->flash(level, muted);
+        /* flash() raised the bar over everything, the cursor included.  The arrow
+         * goes back on top the same way the toast puts it back. */
+        m_pointer->raise();
+        return;
+    }
+
     /* The keyboard is an overlay, so it gets first refusal: Back closes it rather
      * than popping the page being typed into. */
     if (m_keyboard->isVisible()) {
@@ -1224,11 +1259,46 @@ void Dashboard::onNav(int action)
     /* Whatever the page did not want. */
     switch (action) {
     case Joypad::NavPrevPage:
-        setRoot(m_page == 0 ? m_roots.size() - 1 : m_page - 1);
+        stepRoot(-1);
         return;
     case Joypad::NavNextPage:
-        setRoot(m_page == m_roots.size() - 1 ? 0 : m_page + 1);
+        stepRoot(1);
         return;
+
+    /*
+     * THE EDGES OF A ROOT PAGE ARE THE SHOULDER BUTTONS.
+     *
+     * Left and right only reach this far when the page on the glass had nothing
+     * to do with them: the last card in a row of the grid, a settings row with no
+     * value to nudge, a file list that does not use them.  At that point the
+     * board's only remaining way to change tab was L1/R1, and a stick or a D-pad
+     * on its own could not leave the page it started on -- which is what "locked
+     * to one screen" meant.  So the edge does what the shoulder does, and the
+     * shoulders keep working from anywhere in the page for the hand that is
+     * already on them.
+     *
+     * ONLY FROM A ROOT PAGE, and the empty stack is the test.  A pushed page is
+     * something you are inside -- a Wi-Fi scan, a terminal, a folder several
+     * levels down -- and setRoot() drops the stack, so sliding sideways out of one
+     * would throw it away for a press aimed at moving a cursor.  B leaves those,
+     * and B is on the pad.
+     *
+     * AND ONLY ON A PRESS, WHICH IS WHAT `repeat' IS FOR.  Held directions repeat
+     * every ninety milliseconds, so walking a stick along a row and leaving it
+     * leaned would page through all four tabs and start again inside half a
+     * second.  A repeat still moves the selection -- that is what makes a long
+     * list bearable -- but it stops dead at the edge, and the next press, made
+     * deliberately, is the one that changes tab.
+     */
+    case Joypad::NavLeft:
+        if (m_stack.isEmpty() && !repeat)
+            stepRoot(-1);
+        return;
+    case Joypad::NavRight:
+        if (m_stack.isEmpty() && !repeat)
+            stepRoot(1);
+        return;
+
     case Joypad::NavMenu:
         /* Menu is the settings button when the page in front has no use for it. */
         setRoot(m_current == m_settings ? 0 : 2);
@@ -1301,10 +1371,18 @@ bool Dashboard::eventFilter(QObject *watched, QEvent *event)
         case Qt::Key_PageDown:  action = Joypad::NavNextPage; break;
         case Qt::Key_M:         action = Joypad::NavMenu; break;
         case Qt::Key_Q:         action = Joypad::NavQuit; break;
+        /* The two keys on the side of the case, for a workstation that has them.
+         * Most desktops grab these before Qt sees them, which costs nothing: the
+         * bar is still reachable there through the Settings slider. */
+        case Qt::Key_VolumeUp:   action = Joypad::NavVolumeUp; break;
+        case Qt::Key_VolumeDown: action = Joypad::NavVolumeDown; break;
         default: break;
         }
         if (action != Joypad::NavNone) {
-            onNav(action);
+            /* X11 and Wayland both synthesise a held key as a stream of presses
+             * with this flag set, which is the same thing Joypad's own repeat
+             * means -- so the edge-of-page gesture behaves the same on both. */
+            onNav(action, key->isAutoRepeat());
             return true;
         }
     }

@@ -646,8 +646,14 @@ bool CardGrid::handleNav(int action)
     switch (action) {
     case Joypad::NavUp:    moveBy(0, -1); return true;
     case Joypad::NavDown:  moveBy(0, 1); return true;
-    case Joypad::NavLeft:  moveBy(-1, 0); return true;
-    case Joypad::NavRight: moveBy(1, 0); return true;
+    /*
+     * Left and right are consumed only if they MOVED something.  At the far edge
+     * of the grid there is no card that way, and the shell reads the false as
+     * "then change root page" -- so the same push of the stick that walks along a
+     * row walks off the end of it onto the next tab.  See Dashboard::onNav.
+     */
+    case Joypad::NavLeft:  return moveBy(-1, 0);
+    case Joypad::NavRight: return moveBy(1, 0);
     case Joypad::NavOk:    activate(); return true;
 
     /*
@@ -661,10 +667,14 @@ bool CardGrid::handleNav(int action)
      * does well, and the thing nothing else could do -- change which of the four
      * root pages is on the glass -- needed you to walk to the end of a grid first.
      *
-     * So they fall through, every time, to Dashboard::onNav, whose setRoot(-1)
-     * and setRoot(+1) move the page left and right and wrap at both ends.  Both
+     * So they fall through, every time, to Dashboard::onNav, whose stepRoot(-1)
+     * and stepRoot(+1) move the page left and right and wrap at both ends.  Both
      * shoulders on a side do the same thing on purpose: L1 and L2 are one gesture
      * to a thumb, and so are R1 and R2.
+     *
+     * The D-pad reaches the same two calls now, but only by walking to the edge
+     * of the grid first -- which is why the shoulders are still worth having:
+     * from the middle of a full page they are one press instead of three.
      *
      * Returning false rather than deleting the case labels would have been the
      * same behaviour; there are no case labels at all so that the next person
@@ -796,10 +806,10 @@ void CardGrid::mouseReleaseEvent(QMouseEvent *event)
     event->accept();
 }
 
-void CardGrid::moveBy(int dx, int dy)
+bool CardGrid::moveBy(int dx, int dy)
 {
     if (m_entries.isEmpty())
-        return;
+        return false;
 
     const int cols = qMin<int>(Theme::GridCols, m_entries.size());
     const int rows = qMax(1, (m_entries.size() + cols - 1) / cols);
@@ -807,8 +817,16 @@ void CardGrid::moveBy(int dx, int dy)
     int r = m_index / cols;
 
     if (dx) {
-        /* Horizontal wraps -- it is a row of things and the ends should meet. */
-        c = (c + dx + cols) % cols;
+        /*
+         * HORIZONTAL CLAMPS, AND IT USED TO WRAP.  The old note here said it was a
+         * row of things and the ends should meet, which is true of a row on its
+         * own and false of a row on a page: the far edge of the grid is now where
+         * the shell changes root page, so a wrap would put the one gesture that
+         * leaves this page permanently out of reach of the D-pad.  Wrapping is
+         * also what made the ends NOT meet in the honest sense -- three cards
+         * right from the third card landed back on the third card.
+         */
+        c = qBound(0, c + dx, cols - 1);
     }
     if (dy) {
         /* Vertical does not: on two rows, wrapping makes up and down feel like
@@ -822,9 +840,10 @@ void CardGrid::moveBy(int dx, int dy)
         candidate = m_entries.size() - 1;
     }
     if (candidate == m_index)
-        return;
+        return false;
 
     selectTo(candidate);
+    return true;
 }
 
 void CardGrid::activate()
@@ -2122,10 +2141,11 @@ bool InfoPage::handleNav(int action)
         scrollBy(1);
         return true;
     /*
-     * Left and right page rather than doing nothing.  Neither means anything
-     * else here -- the dashboard drops them when a page declines them -- and
-     * this sheet is several screens long on a machine whose only scroll wheel
-     * is a thumbstick nudged one row at a time.
+     * Left and right page rather than doing nothing.  Nothing else wants them
+     * here -- this page is pushed, and the shell only turns a refused left or
+     * right into a change of tab from a root page -- and this sheet is several
+     * screens long on a machine whose only scroll wheel is a thumbstick nudged
+     * one row at a time.
      */
     case Joypad::NavLeft:
         scrollBy(-pageStep());

@@ -420,11 +420,13 @@ void Joypad::poll()
 
     driveStick((int)ms);
 
-    /* Key repeat, for the four directions only. */
+    /* Key repeat, for the actions repeats() names -- the four directions and the
+     * two volume keys.  The true is what tells the shell this one was not a
+     * press, so it can refuse to act on it. */
     if (m_held != NavNone) {
         const qint64 now = m_heldSince.elapsed();
         if (now >= m_nextRepeat) {
-            emit nav(m_held);
+            emit nav(m_held, true);
             m_nextRepeat = now + kRepeatNextMs;
         }
     }
@@ -560,7 +562,7 @@ void Joypad::feed(int action, bool pressed)
         return;
     }
 
-    emit nav(action);
+    emit nav(action, false);
 
     if (repeats(action)) {
         m_held = action;
