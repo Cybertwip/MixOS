@@ -161,6 +161,34 @@ fi
 # the panel, mid-splash.  The patch asks for the supply only when there is a
 # node that could have named one.
 #
+# linux/0005-arm-mediatek-mt6592-smp.patch is the other seven cores.  Mainline
+# platsmp.c knows three MediaTek release protocols and MT6592 is none of them:
+# the three SoCs there each hold three secondary keys, which would light four
+# cores of eight even if the base address matched, and it does not.  The
+# constants the patch adds are transcribed from MediaTek's own MT6592 platform
+# sources -- mediatek/platform/mt6592/kernel/core/mt-smp.c in the 3.4.67 ALPS
+# trees -- and not extrapolated from the neighbouring SoCs.  The release
+# protocol is SRAMROM at 0x10202000: the jump address goes to +0x34, then cores
+# 1..3 are woken by writing 0x534c4131, 0x4c415332, 0x41534c33 to +0x38 and
+# cores 4..7 by writing 0x534c4134, 0x4c415335, 0x41534c36, 0x534c4137 to +0x3c.
+#
+# Seven keys is only half of it, because MT6592 is two Cortex-A7 clusters and
+# not one eight-core cluster -- an A7 MPCore tops out at four.  Cores 0..3 are
+# MP0 and are already powered when the LK hands over; cores 4..7 are MP1 and are
+# cold.  So the patch also does the MP1 power-up the vendor's mtcmos code does
+# before it writes those last four keys: the cluster rail and its L2 retention
+# release, then each of the four core rails with its L1 retention release, then
+# the debug block, all through SPM at 0x10006000 behind the 0xb16 project-code
+# write that unlocks it.  Coherency is the last step on each side -- clear
+# ACINACTM in MCUSYS MP0/MP1_AXI_CONFIG at 0x10200000 and raise the matching
+# CCI-400 snoop and DVM bits at 0x10390000, SI4 for MP0 and SI3 for MP1.
+#
+# Every vendor spin-until-ready loop became a bounded poll that logs and gives
+# up, so a wrong bit costs four cores and a KERN_ERR line rather than a hang at
+# an unlit screen; maxcpus=4 on the command line skips the MP1 half outright.
+# The device tree side is the enable-method in generate_dts.py; neither half
+# does anything without the other, so they move together.
+#
 # Applied idempotently rather than from a stamp file, because this checkout
 # persists across runs and a stamp can outlive the tree it describes -- a
 # J36_UPDATE_KERNEL reset above throws the patch away and would leave the stamp
@@ -172,10 +200,10 @@ fi
 # holding the previous version, which the new one neither reverse-applies to nor
 # applies over, and the build would stop dead on a checkout the developer has no
 # reason to suspect.  So the files the patch touches are checked back out and it
-# is tried once more.  That is safe here only because these four patches touch
-# disjoint files -- mtk-sd.c, two DRM files, mediatek.c, phy-generic.c -- so
-# restoring one patch's files cannot undo another's; keep it that way, or this
-# has to become a full reset-and-reapply of all of them.
+# is tried once more.  That is safe here only because these five patches touch
+# disjoint files -- mtk-sd.c, two DRM files, mediatek.c, phy-generic.c,
+# platsmp.c -- so restoring one patch's files cannot undo another's; keep it that
+# way, or this has to become a full reset-and-reapply of all of them.
 apply_kernel_patch() {
     local patch="$ROOT/device/j36-ultra/linux/$1" what="$2"
     [[ -f "$patch" ]] || die "missing kernel patch: $patch"
@@ -203,6 +231,7 @@ apply_kernel_patch 0001-mtk-sd-mt6592.patch "mtk-sd MT6592"
 apply_kernel_patch 0002-drm-mediatek-mt6592.patch "mtk_drm MT6592 display"
 apply_kernel_patch 0003-musb-mediatek-mt6592.patch "musb MT6592 USB host"
 apply_kernel_patch 0004-usb-phy-generic-no-node-no-vbus.patch "usb_phy_generic VBUS"
+apply_kernel_patch 0005-arm-mediatek-mt6592-smp.patch "MT6592 SMP"
 
 mkdir -p "$KERNEL_OUT"
 if [[ ! -f "$KERNEL_OUT/.config" ]]; then

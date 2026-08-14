@@ -1,0 +1,388 @@
+ARM: mediatek: bring up the other seven MT6592 cores
+
+The J36 Ultra is eight Cortex-A7s and boots one of them.  There is no
+enable-method for MT6592 anywhere in the tree, so arch/arm never gets an
+smp_ops, and the kernel reports that only by omission:
+
+  smp: Bringing up secondary CPUs ...
+  smp: Brought up 1 node, 1 CPU
+
+with no error in between to say what did not happen.
+
+None of the three entries already in platsmp.c can be borrowed.  Each
+carries three secondary keys, which would light four cores of eight even
+if the layout matched, and it does not.
+
+MediaTek's own mt6592 platform sources -- mediatek/platform/mt6592 in the
+3.4.67 ALPS trees -- give the whole protocol.  From mt-smp.c:
+
+  SLAVE_JUMP_REG   SRAMROM_BASE + 0x34
+  SLAVE1..3        SRAMROM_BASE + 0x38
+                   0x534c4131, 0x4c415332, 0x41534c33
+  SLAVE4..7        SRAMROM_BASE + 0x3c
+                   0x534c4134, 0x4c415335, 0x41534c36, 0x534c4137
+
+SRAMROM_BASE is 0xf0202000 in mt_reg_base.h, the kernel virtual alias of
+physical 0x10202000 -- the SRAMROM the mt7623 entry here already uses,
+which is the corroboration that the physical form is right.  So mt6592
+shares its base and jump register with mt7623 and differs only in the key
+layout: three keys at 0x38 for CPUs 1-3, four at 0x3c for CPUs 4-7.
+
+That split is the two clusters.  A Cortex-A7 cluster holds at most four
+cores, so eight is MP0 (CPUs 0-3) and MP1 (CPUs 4-7), and MP1 comes out of
+reset powered down.  A key written to a core whose rails are off releases
+nothing, so the vendor kernel powers the whole of MP1 up from
+smp_init_cpus(), through spm_mtcmos_init_cpusys1_1st_bring_up(), before
+releasing any secondary: the cluster domain with its L2, then the four
+core domains, then the debug block, each a PWR_ON/PWR_ON_S handshake
+against SPM_PWR_STATUS and its shadow followed by an L1 or L2 retention
+release and an isolation drop.  mt6592_smp_prepare_cpus() below is that
+sequence against the same registers, with one change: the vendor's
+unbounded polls are bounded here, so a wrong bit costs four CPUs and a
+message on the console rather than a boot that never finishes.
+
+Coherency comes with it.  Each cluster reaches the CCI-400 at 0x10390000
+through a slave interface -- S4 for MP0, S3 for MP1 -- and each has an
+ACINACTM bit in MCUSYS_CFGREG at 0x10200000 telling the interconnect it is
+not taking part.  The vendor kernel clears MP0's and enables S4 before the
+first secondary, and does MP1's as the second cluster arrives; both are
+done here in the same order.  Without them the clusters do not snoop each
+other.
+
+mediatek,mt6592-smp gets its own ops rather than reusing mt6589's, since
+nothing in a boot record can ask for the cluster-1 bring-up.
+
+maxcpus=4 on the kernel command line skips the cluster-1 half entirely:
+arch/arm clamps max_cpus to num_possible_cpus() before calling us, so the
+test in mt6592_smp_prepare_cpus() is exactly "was more than one cluster
+asked for".  That is the escape hatch if MP1 misbehaves on a board.
+
+Signed-off-by: MixOS J36 Ultra bring-up
+---
+diff --git a/arch/arm/mach-mediatek/platsmp.c b/arch/arm/mach-mediatek/platsmp.c
+index 16a4ee6c9..6932619db 100644
+--- a/arch/arm/mach-mediatek/platsmp.c
++++ b/arch/arm/mach-mediatek/platsmp.c
+@@ -6,6 +6,8 @@
+  * Author: Shunli Wang <shunli.wang@mediatek.com>
+  *         Yingjoe Chen <yingjoe.chen@mediatek.com>
+  */
++#include <linux/bits.h>
++#include <linux/delay.h>
+ #include <linux/io.h>
+ #include <linux/memblock.h>
+ #include <linux/of.h>
+@@ -41,6 +43,37 @@ static const struct mtk_smp_boot_info mtk_mt7623_boot = {
+ 	{ 0x38, 0x3c, 0x40 },
+ };
+ 
++/*
++ * MT6592 is eight Cortex-A7s, and a Cortex-A7 cluster holds at most four of
++ * them, so this part is two clusters: MP0 is CPUs 0-3 and MP1 is CPUs 4-7.
++ * That shows in the release keys below, which are not the three-key pattern of
++ * the SoCs above: CPUs 1-3 are released through one register and CPUs 4-7
++ * through the next one, and there are seven distinct keys rather than three.
++ *
++ * These come from MediaTek's own mt6592 platform sources -- the mt-smp.c that
++ * ships in the 3.4.67 ALPS trees, whose SLAVE1..SLAVE7 defines are
++ *
++ *   SLAVE_JUMP_REG   SRAMROM_BASE + 0x34
++ *   SLAVE1..3        SRAMROM_BASE + 0x38, keys 0x534c4131 0x4c415332 0x41534c33
++ *   SLAVE4..7        SRAMROM_BASE + 0x3c, keys 0x534c4134 0x4c415335 0x41534c36
++ *                                              0x534c4137
++ *
++ * with SRAMROM_BASE 0xf0202000, the kernel virtual alias of physical
++ * 0x10202000 -- the same SRAMROM the mt7623 entry above already uses, which is
++ * the corroboration that the physical form is right.
++ *
++ * The base and the jump register are therefore shared with mt7623 and only the
++ * key layout differs, but the two SoCs cannot share an entry: mt7623 spreads
++ * its three keys over 0x38/0x3c/0x40 while mt6592 puts three at 0x38 and four
++ * at 0x3c.
++ */
++static const struct mtk_smp_boot_info mtk_mt6592_boot = {
++	0x10202000, 0x34,
++	{ 0x534c4131, 0x4c415332, 0x41534c33,
++	  0x534c4134, 0x4c415335, 0x41534c36, 0x534c4137 },
++	{ 0x38, 0x38, 0x38, 0x3c, 0x3c, 0x3c, 0x3c },
++};
++
+ static const struct of_device_id mtk_tz_smp_boot_infos[] __initconst = {
+ 	{ .compatible   = "mediatek,mt8135", .data = &mtk_mt8135_tz_boot },
+ 	{ .compatible   = "mediatek,mt8127", .data = &mtk_mt8135_tz_boot },
+@@ -50,6 +83,7 @@ static const struct of_device_id mtk_tz_smp_boot_infos[] __initconst = {
+ 
+ static const struct of_device_id mtk_smp_boot_infos[] __initconst = {
+ 	{ .compatible   = "mediatek,mt6589", .data = &mtk_mt6589_boot },
++	{ .compatible   = "mediatek,mt6592", .data = &mtk_mt6592_boot },
+ 	{ .compatible   = "mediatek,mt7623", .data = &mtk_mt7623_boot },
+ 	{ .compatible   = "mediatek,mt7629", .data = &mtk_mt7623_boot },
+ 	{},
+@@ -141,3 +175,267 @@ static const struct smp_operations mt6589_smp_ops __initconst = {
+ 	.smp_boot_secondary = mtk_boot_secondary,
+ };
+ CPU_METHOD_OF_DECLARE(mt6589_smp, "mediatek,mt6589-smp", &mt6589_smp_ops);
++
++/*
++ * Writing the key is all mt6589 and mt7623 need, and on MT6592 it is enough
++ * for CPUs 1-3 only.  CPUs 4-7 sit in a second cluster that comes out of reset
++ * powered down: MP1 has its own SPM power domains -- one per core, one for the
++ * cluster with its L2, one for its debug block -- and a key written to a core
++ * whose rails are off releases nothing.  MediaTek's own kernel powers all of
++ * them up from smp_init_cpus(), through spm_mtcmos_init_cpusys1_1st_bring_up(),
++ * before any secondary is released, and that is what the code below is: the
++ * same sequence, against the same registers, with the vendor's unbounded
++ * do-while polls replaced by bounded ones so that a wrong bit costs four CPUs
++ * and a message rather than a boot.
++ *
++ * Coherency comes with it.  Each cluster reaches the CCI-400 through a slave
++ * interface -- S4 for MP0, S3 for MP1 -- and each has an ACINACTM bit in
++ * MCUSYS_CFGREG that tells the interconnect it is not participating.  The
++ * vendor kernel clears MP0's and enables S4 before the first secondary, and
++ * does MP1's as the second cluster comes up; both are done here in the same
++ * order.  Without them the two clusters do not snoop each other.
++ *
++ * maxcpus=4 on the command line skips the whole cluster-1 half: arch/arm
++ * clamps max_cpus to num_possible_cpus() before calling us, so the test below
++ * is exactly "was more than one cluster asked for".
++ */
++#define MT6592_MCUCFG_BASE		0x10200000
++#define MT6592_MCUCFG_SIZE		0x1000
++#define MT6592_MP0_AXI_CONFIG		0x0018
++#define MT6592_MP1_AXI_CONFIG		0x0118
++#define MT6592_ACINACTM			BIT(4)
++
++#define MT6592_CCI400_BASE		0x10390000
++#define MT6592_CCI400_SIZE		0x6000
++#define MT6592_CCI400_STATUS		0x000c
++#define MT6592_CCI400_CHANGE_PENDING	BIT(0)
++#define MT6592_CCI400_SI3_SNOOP_CTRL	0x4000
++#define MT6592_CCI400_SI4_SNOOP_CTRL	0x5000
++#define MT6592_CCI400_SNOOP_REQ		BIT(0)
++#define MT6592_CCI400_DVM_MSG_REQ	BIT(1)
++
++#define MT6592_SPM_BASE			0x10006000
++#define MT6592_SPM_SIZE			0x1000
++#define MT6592_SPM_POWERON_CONFIG_SET	0x0000
++#define MT6592_SPM_PROJECT_CODE		0xb16
++#define MT6592_SPM_REGWR_EN		BIT(0)
++#define MT6592_SPM_MP1_FC_PWR_CON(n)	(0x02a0 + (n) * 4)
++#define MT6592_SPM_MP1_CPU_PWR_CON	0x02b0
++#define MT6592_SPM_MP1_DBG_PWR_CON	0x02b4
++#define MT6592_SPM_MP1_FC_L1_PDN(n)	(0x02c0 + (n) * 4)
++#define MT6592_SPM_MP1_L2_DAT_SLEEP_B	0x02d4
++#define MT6592_SPM_PWR_STATUS		0x060c
++#define MT6592_SPM_PWR_STATUS_S		0x0610
++
++/* every *_PWR_CON register carries the same control bits */
++#define MT6592_SRAM_ISOINT_B		BIT(6)
++#define MT6592_SRAM_CKISO		BIT(5)
++#define MT6592_PWR_CLK_DIS		BIT(4)
++#define MT6592_PWR_ON_S			BIT(3)
++#define MT6592_PWR_ON			BIT(2)
++#define MT6592_PWR_ISO			BIT(1)
++#define MT6592_PWR_RST_B		BIT(0)
++
++#define MT6592_L1_PDN_ACK		BIT(8)
++#define MT6592_L1_PDN			BIT(0)
++#define MT6592_L2_SRAM_SLEEP_B_ACK	BIT(8)
++#define MT6592_L2_SRAM_SLEEP_B		BIT(0)
++
++#define MT6592_PWR_MP1_DBG		BIT(20)
++#define MT6592_PWR_MP1_CPU		BIT(15)
++/* and the four core bits count downwards from FC0 at 19, not upwards */
++#define MT6592_PWR_MP1_FC(n)		BIT(19 - (n))
++
++#define MT6592_PWR_TIMEOUT_US		10000
++
++static void __init mt6592_rmw(void __iomem *base, u32 reg, u32 set, u32 clr)
++{
++	u32 val = readl_relaxed(base + reg);
++
++	writel_relaxed((val | set) & ~clr, base + reg);
++}
++
++static int __init mt6592_poll(void __iomem *base, u32 reg, u32 mask, u32 want,
++			      const char *what)
++{
++	int us;
++
++	for (us = 0; us < MT6592_PWR_TIMEOUT_US; us++) {
++		if ((readl_relaxed(base + reg) & mask) == want)
++			return 0;
++		udelay(1);
++	}
++
++	pr_err("mt6592-smp: timed out waiting for %s\n", what);
++	return -ETIMEDOUT;
++}
++
++/*
++ * Power status is reported twice, in a register and in its shadow, and the
++ * vendor code waits for both.  Same here.
++ */
++static int __init mt6592_poll_pwr(void __iomem *spm, u32 bit, const char *what)
++{
++	int us;
++
++	for (us = 0; us < MT6592_PWR_TIMEOUT_US; us++) {
++		if ((readl_relaxed(spm + MT6592_SPM_PWR_STATUS) & bit) &&
++		    (readl_relaxed(spm + MT6592_SPM_PWR_STATUS_S) & bit))
++			return 0;
++		udelay(1);
++	}
++
++	pr_err("mt6592-smp: %s did not power up\n", what);
++	return -ETIMEDOUT;
++}
++
++static int __init mt6592_rails_on(void __iomem *spm, u32 pwr_con, u32 status,
++				  const char *what)
++{
++	int ret;
++
++	mt6592_rmw(spm, pwr_con, MT6592_PWR_ON, 0);
++	udelay(1);
++	mt6592_rmw(spm, pwr_con, MT6592_PWR_ON_S, 0);
++
++	ret = mt6592_poll_pwr(spm, status, what);
++	if (ret)
++		return ret;
++
++	mt6592_rmw(spm, pwr_con, 0, MT6592_PWR_CLK_DIS);
++	return 0;
++}
++
++/* the tail every domain shares: SRAM out of retention, then isolation off */
++static void __init mt6592_iso_off(void __iomem *spm, u32 pwr_con)
++{
++	mt6592_rmw(spm, pwr_con, MT6592_SRAM_ISOINT_B, 0);
++	mt6592_rmw(spm, pwr_con, 0, MT6592_SRAM_CKISO);
++	mt6592_rmw(spm, pwr_con, 0, MT6592_PWR_ISO);
++	mt6592_rmw(spm, pwr_con, MT6592_PWR_RST_B, 0);
++}
++
++static int __init mt6592_cluster1_on(void __iomem *spm)
++{
++	int ret;
++
++	/*
++	 * The vendor bring-up resets cpusys1 once before powering it, and does
++	 * so whether or not the domain is already on.  Kept, because the LK may
++	 * have left MP1 in a state its own bring-up would have cleared.
++	 */
++	mt6592_rmw(spm, MT6592_SPM_MP1_CPU_PWR_CON, 0, MT6592_PWR_RST_B);
++	mt6592_rmw(spm, MT6592_SPM_MP1_CPU_PWR_CON, MT6592_PWR_RST_B, 0);
++
++	if ((readl_relaxed(spm + MT6592_SPM_PWR_STATUS) & MT6592_PWR_MP1_CPU) &&
++	    (readl_relaxed(spm + MT6592_SPM_PWR_STATUS_S) & MT6592_PWR_MP1_CPU))
++		return 0;
++
++	ret = mt6592_rails_on(spm, MT6592_SPM_MP1_CPU_PWR_CON,
++			      MT6592_PWR_MP1_CPU, "cluster 1");
++	if (ret)
++		return ret;
++
++	mt6592_rmw(spm, MT6592_SPM_MP1_L2_DAT_SLEEP_B,
++		   MT6592_L2_SRAM_SLEEP_B, 0);
++	ret = mt6592_poll(spm, MT6592_SPM_MP1_L2_DAT_SLEEP_B,
++			  MT6592_L2_SRAM_SLEEP_B_ACK,
++			  MT6592_L2_SRAM_SLEEP_B_ACK, "the cluster 1 L2");
++	if (ret)
++		return ret;
++
++	mt6592_iso_off(spm, MT6592_SPM_MP1_CPU_PWR_CON);
++	return 0;
++}
++
++static int __init mt6592_cluster1_core_on(void __iomem *spm, unsigned int n)
++{
++	u32 pwr_con = MT6592_SPM_MP1_FC_PWR_CON(n);
++	u32 l1_pdn = MT6592_SPM_MP1_FC_L1_PDN(n);
++	int ret;
++
++	ret = mt6592_rails_on(spm, pwr_con, MT6592_PWR_MP1_FC(n), "a CPU4-7 core");
++	if (ret)
++		return ret;
++
++	mt6592_rmw(spm, l1_pdn, 0, MT6592_L1_PDN);
++	ret = mt6592_poll(spm, l1_pdn, MT6592_L1_PDN_ACK, 0, "a CPU4-7 L1");
++	if (ret)
++		return ret;
++
++	mt6592_iso_off(spm, pwr_con);
++	return 0;
++}
++
++static int __init mt6592_snoop_on(void __iomem *mcucfg, u32 axi_config,
++				  void __iomem *cci, u32 snoop_ctrl)
++{
++	mt6592_rmw(mcucfg, axi_config, 0, MT6592_ACINACTM);
++	mt6592_rmw(cci, snoop_ctrl,
++		   MT6592_CCI400_SNOOP_REQ | MT6592_CCI400_DVM_MSG_REQ, 0);
++
++	return mt6592_poll(cci, MT6592_CCI400_STATUS,
++			   MT6592_CCI400_CHANGE_PENDING, 0, "the CCI-400");
++}
++
++static void __init mt6592_smp_prepare_cpus(unsigned int max_cpus)
++{
++	void __iomem *mcucfg, *cci, *spm;
++	unsigned int n;
++
++	__mtk_smp_prepare_cpus(max_cpus, 0);
++	if (!mtk_smp_base)
++		return;
++
++	mcucfg = ioremap(MT6592_MCUCFG_BASE, MT6592_MCUCFG_SIZE);
++	cci = ioremap(MT6592_CCI400_BASE, MT6592_CCI400_SIZE);
++	spm = ioremap(MT6592_SPM_BASE, MT6592_SPM_SIZE);
++	if (!mcucfg || !cci || !spm) {
++		pr_err("mt6592-smp: no MCUSYS/CCI/SPM mapping, one cluster only\n");
++		goto out;
++	}
++
++	if (mt6592_snoop_on(mcucfg, MT6592_MP0_AXI_CONFIG, cci,
++			    MT6592_CCI400_SI4_SNOOP_CTRL))
++		goto out;
++
++	if (max_cpus <= 4)
++		goto out;
++
++	/* SPM ignores register writes until this is set */
++	writel_relaxed((MT6592_SPM_PROJECT_CODE << 16) | MT6592_SPM_REGWR_EN,
++		       spm + MT6592_SPM_POWERON_CONFIG_SET);
++
++	if (mt6592_cluster1_on(spm))
++		goto out;
++
++	for (n = 0; n < 4; n++)
++		if (mt6592_cluster1_core_on(spm, n))
++			goto out;
++
++	if (mt6592_rails_on(spm, MT6592_SPM_MP1_DBG_PWR_CON,
++			    MT6592_PWR_MP1_DBG, "the cluster 1 debug block"))
++		goto out;
++	mt6592_iso_off(spm, MT6592_SPM_MP1_DBG_PWR_CON);
++
++	mt6592_snoop_on(mcucfg, MT6592_MP1_AXI_CONFIG, cci,
++			MT6592_CCI400_SI3_SNOOP_CTRL);
++out:
++	if (spm)
++		iounmap(spm);
++	if (cci)
++		iounmap(cci);
++	if (mcucfg)
++		iounmap(mcucfg);
++}
++
++/*
++ * A name of its own, and not mt6589-smp with a different boot record, because
++ * the cluster-1 bring-up above has to run and nothing in the boot record can
++ * ask for it.
++ */
++static const struct smp_operations mt6592_smp_ops __initconst = {
++	.smp_prepare_cpus = mt6592_smp_prepare_cpus,
++	.smp_boot_secondary = mtk_boot_secondary,
++};
++CPU_METHOD_OF_DECLARE(mt6592_smp, "mediatek,mt6592-smp", &mt6592_smp_ops);

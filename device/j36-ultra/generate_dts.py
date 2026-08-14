@@ -380,21 +380,40 @@ def generate(sources: dict[str, str]) -> str:
 \t}};
 
 \t/*
-\t * Eight Cortex-A7s, and at the moment only the first one runs. There is no
-\t * enable-method here, so arch/arm never gets an smp_ops to release the other
-\t * seven with, and the kernel says so only by omission:
+\t * Eight Cortex-A7s, and until this enable-method existed only the first one
+\t * ran: without it arch/arm never gets an smp_ops to release the other seven
+\t * with, and the kernel says so only by omission --
 \t *
 \t *   smp: Bringing up secondary CPUs ...
 \t *   smp: Brought up 1 node, 1 CPU
 \t *
-\t * with no error in between. Mainline has no MT6592 entry -- platsmp.c knows
-\t * mt6589, mt7623, mt7629 and the trustzone mt81xx, and each of those carries
-\t * only three secondary keys anyway, so even borrowing one would light four
-\t * cores of eight. Fixing it needs MT6592's own boot base, jump register and
-\t * seven release keys, and those are a read out of the stock kernel, not a
-\t * guess: a wrong jump register sends seven cores into whatever happens to be
-\t * at that address, on a board that then has to be reflashed. Left alone
-\t * deliberately until that read has been done.
+\t * with no error in between. Mainline has no MT6592 entry of its own; platsmp.c
+\t * knows mt6589, mt7623, mt7629 and the trustzone mt81xx, and each of those
+\t * carries only three secondary keys anyway, so even borrowing one would light
+\t * four cores of eight. linux/0005-arm-mediatek-mt6592-smp.patch adds the entry
+\t * and this property selects it.
+\t *
+\t * The numbers behind it are transcribed from MediaTek's own MT6592 platform
+\t * sources -- mediatek/platform/mt6592/kernel/core/mt-smp.c in the 3.4.67 ALPS
+\t * trees -- rather than guessed, which mattered: a wrong jump register sends
+\t * seven cores into whatever happens to be at that address, on a board that
+\t * then has to be reflashed. The release protocol is SRAMROM at 0x10202000,
+\t * jump address at +0x34, and seven distinct keys rather than one repeated --
+\t * cores 1..3 at +0x38 and cores 4..7 at +0x3c.
+\t *
+\t * The reg values are why the second four are not 4..7. MT6592 is two
+\t * Cortex-A7 clusters, MP0 and MP1, because an A7 MPCore tops out at four
+\t * cores; the vendor sources say the same thing everywhere they touch cores
+\t * 4..7, and so do the separate L2s, the separate SPM power domains and the
+\t * CCI-400 wiring. So cores 4..7 are cluster 1 cores 0..3, MPIDR 0x100..0x103,
+\t * and reg has to say that or arch/arm will look for them at the wrong
+\t * affinity. Only MP0 is powered when the LK hands over -- the kernel patch
+\t * powers MP1 up through SPM before it writes those last four keys, and turns
+\t * on cache coherency for each cluster as it comes up.
+\t *
+\t * The kernel half and this property are useless apart, so they were written
+\t * together and should be changed together. If MP1 misbehaves, maxcpus=4 on
+\t * the kernel command line keeps the cluster powered down and boots on MP0.
 \t *
 \t * clock-frequency is what arch/arm/kernel/topology.c wants and what it
 \t * complained about eight times a boot, at KERN_ERR and therefore on the panel
@@ -419,14 +438,15 @@ def generate(sources: dict[str, str]) -> str:
 \tcpus {{
 \t\t#address-cells = <1>;
 \t\t#size-cells = <0>;
+\t\tenable-method = \"mediatek,mt6592-smp\";
 \t\tcpu@0 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <0>; clock-frequency = <840000000>; }};
 \t\tcpu@1 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <1>; clock-frequency = <840000000>; }};
 \t\tcpu@2 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <2>; clock-frequency = <840000000>; }};
 \t\tcpu@3 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <3>; clock-frequency = <840000000>; }};
-\t\tcpu@4 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <4>; clock-frequency = <840000000>; }};
-\t\tcpu@5 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <5>; clock-frequency = <840000000>; }};
-\t\tcpu@6 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <6>; clock-frequency = <840000000>; }};
-\t\tcpu@7 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <7>; clock-frequency = <840000000>; }};
+\t\tcpu@100 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <0x100>; clock-frequency = <840000000>; }};
+\t\tcpu@101 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <0x101>; clock-frequency = <840000000>; }};
+\t\tcpu@102 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <0x102>; clock-frequency = <840000000>; }};
+\t\tcpu@103 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <0x103>; clock-frequency = <840000000>; }};
 \t}};
 
 \tsoc {{
