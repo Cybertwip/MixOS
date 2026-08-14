@@ -2406,10 +2406,20 @@ run_usb() {
     # payload that draws real current off the system rail.  The PHY driver logs
     # the pad it drove; this says which of the two arrangements the card asked
     # for, in the words the operator would have to change.
+    #
+    # And it is an either/or, which the first of these two lines now says out
+    # loud.  There is one connector and the PMIC senses the charger on the same
+    # pin the port sources into, so a board driving DRVVBUS looks to the charger
+    # exactly like a board being charged.  The PMIC resolves that by reading the
+    # pad and refusing to charge into what it can prove is our own boost -- which
+    # is right, and which means j36.usb=1 is also the setting that reports
+    # No cable forever.  Whichever half is wanted is a card edit, not a bug.
     if [ "$usb_vbus" = 1 ]; then
         say "usb: the port is sourcing 5 V off VBAT -- fit a cell, or say j36.usb=novbus"
+        say "usb: while it sources, the charger cannot see a cable -- j36.usb=novbus to charge"
     else
         say "usb: VBUS held off by j36.usb=novbus -- the hub must have its own power"
+        say "usb: the pad is driven low, so the PMIC can see a real charger on this port"
     fi
     return 0
 }

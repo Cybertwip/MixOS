@@ -302,9 +302,13 @@ module_param(vbus, bool, 0444);
 MODULE_PARM_DESC(vbus,
 		 "drive the DRVVBUS pad named by j36,drvvbus-pad, so the port "
 		 "sources 5 V and a bus-powered device enumerates (default on). "
-		 "vbus=0 leaves the pad exactly as the LK left it -- use it with "
-		 "a self-powered hub, and use it if no cell is fitted, because "
-		 "the 5 V is a boost off VBAT and VBAT here is the system node.");
+		 "vbus=0 drives the pad LOW -- it does not merely decline to raise "
+		 "it, because this connector is also the charge port and the PMIC "
+		 "reads this pad to decide whether the 5 V on CHRIN is a charger or "
+		 "its own boost. Use vbus=0 with a self-powered hub, use it if no "
+		 "cell is fitted (the 5 V is a boost off VBAT and VBAT here is the "
+		 "system node), and use it when what you want back is CHARGING: the "
+		 "port cannot source and sink at the same time.");
 
 static bool musb_probe_layout;
 module_param(musb_probe_layout, bool, 0444);
@@ -327,7 +331,11 @@ struct j36_usb_phy {
 	struct phy *generic;
 
 	int vbus_pin;			/* -1 when the device tree names none */
-	bool vbus_on;
+	/* Tri-state, -1 until this driver has written the pad, and that third
+	 * value is load-bearing: the level the LK left is not knowable from the
+	 * SET/RST alias, so "never written" has to be distinct from "written low"
+	 * or the first drive-low gets optimised away as a no-op. */
+	int vbus_on;
 
 	struct delayed_work scan_work;
 	u32 pending_baseline[J36_GICD_ISPENDR_WORDS];
@@ -408,9 +416,23 @@ static void j36_gpio_mode_set(struct j36_usb_phy *p, unsigned int pin, u32 mode)
  */
 static void j36_usb_phy_vbus(struct j36_usb_phy *p, bool on)
 {
-	if (p->vbus_pin < 0 || !p->gpio || !vbus)
+	if (p->vbus_pin < 0 || !p->gpio)
 		return;
-	if (p->vbus_on == on)
+	/*
+	 * vbus=0 forbids SOURCING 5 V. It does not mean "do not touch the pad",
+	 * and that distinction is the whole of this hunk. The early return used to
+	 * cover both directions, so j36.usb=novbus left the pad exactly as the LK
+	 * handed it over -- and if the LK handed it over high, the port went on
+	 * sourcing 5 V that nothing in Linux had asked for, while
+	 * j36_mt6592_pmic's DRVVBUS interlock read that same pad, concluded the
+	 * 5 V on CHRIN was this board's own boost, and held the charger off for
+	 * the rest of the boot. "No cable" on a device with a cable in it, out of
+	 * the parameter whose name says the opposite. Off is driven now, not
+	 * assumed.
+	 */
+	if (on && !vbus)
+		return;
+	if (p->vbus_on == (int)on)
 		return;
 
 	j36_gpio_bank_bit(p, J36_GPIO_DOUT, p->vbus_pin, on);
@@ -756,8 +778,14 @@ static int j36_usb_phy_power_on(struct phy *phy)
 	 * first, and raising it while the PHY still sat in the recover()
 	 * sequence's device-mode tail would let a hub start its own attach
 	 * against a port that was still a B-device.
+	 *
+	 * The argument is the parameter and not `true', so that vbus=0 drives the
+	 * pad LOW here rather than walking past it. This port cannot source and
+	 * charge at the same time -- one connector, one CHRIN pin -- so "does not
+	 * source 5 V" has to be a fact the PMIC can read off the pad, not an
+	 * absence of writes. See j36_usb_phy_vbus().
 	 */
-	j36_usb_phy_vbus(p, true);
+	j36_usb_phy_vbus(p, vbus);
 
 	/*
 	 * Both of these are here rather than in phy_init because VBUS has just
@@ -931,6 +959,7 @@ static int j36_usb_phy_probe(struct platform_device *pdev)
 	 * j36_mt6592_input already uses on this board.
 	 */
 	p->vbus_pin = -1;
+	p->vbus_on = -1;		/* not written yet; see the struct */
 	p->gpio = j36_iomap_phandle(dev, "j36,gpio-controller");
 	if (IS_ERR(p->gpio)) {
 		dev_info(dev, "no j36,gpio-controller phandle: VBUS is not driven\n");
