@@ -36,34 +36,111 @@
  * runs. Trim is high-speed eye margin; a mouse, a keyboard and a DisplayLink
  * surface at 640x480 are not where that shows up first.
  *
- * ROLE. The tail of the stock recover sequence -- clear 0x6c bit 4, set 0x6c
- * 0x2e, set 0x6d 0x3e -- is not a wake-up, it is MTK's force-DEVICE-mode
- * override, which is why the stock LK ends up a gadget. Host mode is its exact
- * mirror (set 0x6d 0x3c, set 0x6c bit 4, clear 0x6c 0x2c), taken from MVII's
- * musb_phy_force_host() -- which had never run on this board, because MVII's
- * host driver is compiled out behind MVII_MT6592_ENABLE_USB_HOST for the
- * clock-gate reason above.
- *
- * It no longer rests on MVII alone. The stock Android kernel's own host switch,
- * at 0xc052eaa4, is these three writes and nothing else:
+ * ROLE, AND THE BUG THAT WAS IN THIS FILE. The tail of the stock recover
+ * sequence -- clear 0x6c bit 4, set 0x6c 0x2e, set 0x6d 0x3e -- is not a
+ * wake-up, it is MTK's force-DEVICE-mode override, which is why the stock LK
+ * ends up a gadget. That much was right. What was NOT right is what this file
+ * used to call the mirror of it, transcribed from the stock Android kernel at
+ * 0xc052eaa4 (on its 0xf1210000 mapping of SIFSLV, so +0x86c is this file's
+ * 0x6c) and from MVII's musb_phy_force_host():
  *
  *   c052eaa4:  strb r2, [r3, #0x86d]   // 0x6d |= 0x3c
  *   c052eacc:  strb r2, [r3, #0x86c]   // 0x6c |= 0x10
  *   c052eaf4:  strb r2, [r3, #0x86c]   // 0x6c &= 0xd3, i.e. clear 0x2c
  *
- * on the stock kernel's 0xf1210000 mapping of the SIFSLV window, so +0x86c and
- * +0x86d are this file's 0x6c and 0x6d. Byte for byte j36_phy_force_host().
- * The exit-host path at 0xc052eb8c is its inverse (0x6d &= 0xc3, 0x6c &= 0xc3).
- * One thing the stock does first that this does not: it clears DEVCTL.SESSION
- * in the MUSB core before touching the PHY. That belongs to musb_core, which
- * sets the session bit itself when it starts the host, and is not the PHY's to
- * take away.
+ * Those three writes are real and they are quoted correctly. They are not host
+ * mode. They are the VBUS/session half of a power-DOWN, and the board said so
+ * for as long as they ran: every MUSB dump in every log read
  *
- * .set_mode picks between the two sequences, so the role does not depend on how
- * the OTG ID pin happens to float. The kernel is configured USB_MUSB_HOST and
- * the device tree says dr_mode = "host", so in practice only the host branch
- * runs -- but the device branch is what phy_power_off leaves behind, which is
- * also the low-power state.
+ *   DEVCTL 80 [PERIPHERAL BDEV] VBUS below SessionEnd
+ *
+ * at power-on, three seconds later and nine seconds later alike -- B-device,
+ * HOSTMODE clear, no session -- while this driver reported it had forced host
+ * mode and was sourcing 5 V. Nothing enumerated: no stick, no SSD, no mouse, no
+ * hub. The readout in this file predicted its own bug in so many words ("HM
+ * clear on a node that asked for host means the role override did not take")
+ * and the prediction sat in the log unread.
+ *
+ * WHY IT IS KNOWABLE NOW. 0x6c and 0x6d used to be bare offsets here because
+ * naming a bit nobody has documented is worse than the number. They are not
+ * undocumented: this whole block is the U2PHYDTM0/DTM1 pair that mainline's
+ * phy-mtk-tphy.c drives on every later MediaTek part, and EIGHT of the fields
+ * this file already writes match that map exactly, which is not a coincidence
+ * eight times over:
+ *
+ *   this file                     byte.bit -> reg.bit   phy-mtk-tphy.c
+ *   J36_PHY_R1A_GPIO_CTL  0x80    0x1a.7 -> 0x18 b23    PA6_RG_U2_BC11_SW_EN
+ *   J36_PHY_R1A_BIT4      0x10    0x1a.4 -> 0x18 b20    PA6_RG_U2_OTG_VBUSCMP_EN
+ *   J36_PHY_R68_FORCE     0xf4    0x68   -> 0x68 b2,4-7 RG_TERMSEL, RG_XCVRSEL,
+ *                                                       RG_DPPULLDOWN, RG_DMPULLDOWN
+ *   J36_PHY_R69_FORCE     0x3c    0x69   -> 0x68 b10-13 P2C_RG_DATAIN
+ *   J36_PHY_R6A_FORCE     0xbe    0x6a   -> 0x68 b17-21,23  the five FORCE_* plus
+ *                                                       FORCE_DATAIN
+ *   J36_PHY_R6A_BIT2      0x04    0x6a.2 -> 0x68 b18    P2C_FORCE_SUSPENDM
+ *   J36_PHY_R6B_FORCE_UART_EN     0x6b.2 -> 0x68 b26    P2C_FORCE_UART_EN
+ *   J36_PHY_R6E_UART_EN   0x01    0x6e.0 -> 0x6c b16    P2C_RG_UART_EN
+ *
+ * So 0x6c is U2PHYDTM1[7:0] -- RG_IDDIG b1, RG_AVALID b2, RG_BVALID b3,
+ * RG_SESSEND b4, RG_VBUSVALID b5 -- and 0x6d is U2PHYDTM1[15:8], the five
+ * force_* enables for exactly those, force_iddig lowest. Decode the three
+ * writes above with that map and they say: force everything except IDDIG,
+ * assert SESSEND, deassert VBUSVALID and AVALID and BVALID. Which is
+ * u2_phy_instance_power_off() in mainline, verbatim, and which leaves RG_IDDIG
+ * at whatever it was -- and what it was is 1, forced, because recover() ran
+ * first and recover() ends in the force-device tail. A port pinned to
+ * B-device with the session forced ended is a port that cannot start one.
+ *
+ * Host mode is the other three lines of the same mainline routine:
+ * force_iddig with RG_IDDIG LOW (A-device), AVALID and VBUSVALID asserted,
+ * SESSEND deasserted. That is what j36_phy_force_host() does now. The stock
+ * decompile presumably has it too, a few hundred bytes from the sequence that
+ * was picked up instead.
+ *
+ * The stock host switch also clears DEVCTL.SESSION in the MUSB core before it
+ * touches the PHY at all. This file used to skip that and say why -- the bit
+ * belongs to musb_core, which sets it itself from musb_start(). It does, once,
+ * when the hub driver powers the root port at boot, and never again; that was
+ * enough while the role was fixed at boot and is not enough now. See
+ * j36_musb_session().
+ *
+ * ── WHICH ROLE, THOUGH ────────────────────────────────────────────────────────
+ *
+ * There is one connector. It is the charge port and it is the host port, and
+ * the PMIC senses the charger on the same net this port sources into, so the
+ * two are mutually exclusive in hardware and no device-tree constant can pick
+ * between them -- dr_mode is fixed at build time and says nothing about what is
+ * on the cable right now. Pinning it to host, which is what this driver did, is
+ * also what made j36_mt6592_pmic's DRVVBUS interlock hold the charger off for
+ * the entire uptime: a board that always sources 5 V always looks to itself
+ * like a board sourcing 5 V, so CHRDET is never believable and the dashboard
+ * says No cable with a charger plugged into it.
+ *
+ * So the role FOLLOWS THE PORT. With DRVVBUS low, DEVCTL's VBUS field is a live
+ * comparator on the pin (recover() enables it: that is what R1A bit 4 is), and
+ * the force_* overrides are the only thing that hides it -- release them for
+ * the 800 us the stock sequences settle for and the reading is real:
+ *
+ *   above AValid   somebody outside this board is driving the bus. A charger,
+ *                  or a PC. Be a device, leave DRVVBUS low, let the PMIC see
+ *                  its own CHRDET and charge.
+ *   below AValid   nothing is feeding the port. Be a host and source 5 V, and a
+ *                  bus-powered stick, SSD, mouse or hub comes up.
+ *
+ * Re-asked every role_poll_ms, because plugging a charger into a running
+ * console is the normal case. The measurement needs our own boost off, so the
+ * poll drops DRVVBUS for J36_VBUS_FALL_MS before reading -- and skips the whole
+ * thing whenever DEVCTL reports FSDEV or LSDEV, which is the core's own
+ * pre-enumeration attach flag. Nothing that is plugged in ever sees the gap.
+ *
+ * vbus= pins it, both ways and for the cases where the measurement is not
+ * wanted: vbus=1 is the old always-host-always-source behaviour, vbus=0 forbids
+ * sourcing without forbidding host (which is the self-powered-hub case, and the
+ * no-cell case), and the default vbus=-1 is the measurement above.
+ *
+ * .set_mode still picks between the two sequences for anything that asks, but
+ * in auto it answers a host request without acting on it: mediatek.c calls it
+ * once, straight after power_on, with the device tree's dr_mode, and honouring
+ * that would undo the measurement that had just been taken three lines earlier.
  *
  * VBUS. It is a GPIO on this board, not a PMIC boost register, and the stock
  * Android kernel says so in four instructions. mt_usb_set_vbus() -- found at
@@ -145,6 +222,7 @@
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/phy/phy.h>
@@ -231,26 +309,66 @@
 #define J36_PHY_R6A_BIT2		0x04
 #define J36_PHY_R6B			0x6b
 #define J36_PHY_R6B_FORCE_UART_EN	0x04
-/* 0x6c and 0x6d are the two low bytes of U2PHYDTM1, and they carry the role
- * override. Bit 4 of 0x6c is the one that differs between the two sequences --
- * device clears it, host sets it -- and it is left named after its position
- * rather than after a field, because neither the stock decompile nor MVII names
- * it and guessing IDDIG from the surrounding bits is exactly the kind of
- * invention this bring-up does not make. What is known is that the two stock
- * routines both end with bit 4 CLEARED and the LK enumerates as a gadget, so
- * cleared is the device role and set is the other one. */
-#define J36_PHY_R6C			0x6c	/* U2PHYDTM1, byte 0 */
-#define J36_PHY_R6C_BIT4		0x10
-#define J36_PHY_R6C_DEV_SET		0x2e
-#define J36_PHY_R6C_HOST_CLR		0x2c
-#define J36_PHY_R6D			0x6d	/* U2PHYDTM1, byte 1 -- the force_* enables */
-#define J36_PHY_R6D_DEV_SET		0x3e
-#define J36_PHY_R6D_HOST_SET		0x3c
+/* 0x6c and 0x6d are the two low bytes of U2PHYDTM1 and they carry the role, the
+ * session state and the force_* enables that decide whether any of it is the
+ * PHY's own comparators or a value written from here. These used to be bare
+ * offsets with a note saying that guessing IDDIG from the surrounding bits was
+ * not a guess worth making; the eight-field correspondence in the file header is
+ * what turned it from a guess into a read, and the bug it found is described
+ * there too. Bit for bit these are phy-mtk-tphy.c's P2C_RG_* and P2C_FORCE_*. */
+#define J36_PHY_R6C			0x6c	/* U2PHYDTM1[7:0] */
+#define J36_PHY_R6C_IDDIG		0x02	/* 1 = B-device, 0 = A-device */
+#define J36_PHY_R6C_AVALID		0x04
+#define J36_PHY_R6C_BVALID		0x08
+#define J36_PHY_R6C_SESSEND		0x10
+#define J36_PHY_R6C_VBUSVALID		0x20
+#define J36_PHY_R6D			0x6d	/* U2PHYDTM1[15:8] -- the force_* enables */
+#define J36_PHY_R6D_FORCE_IDDIG		0x02
+#define J36_PHY_R6D_FORCE_AVALID	0x04
+#define J36_PHY_R6D_FORCE_BVALID	0x08
+#define J36_PHY_R6D_FORCE_SESSEND	0x10
+#define J36_PHY_R6D_FORCE_VBUSVALID	0x20
+#define J36_PHY_R6D_FORCE_ALL		(J36_PHY_R6D_FORCE_IDDIG | \
+					 J36_PHY_R6D_FORCE_AVALID | \
+					 J36_PHY_R6D_FORCE_BVALID | \
+					 J36_PHY_R6D_FORCE_SESSEND | \
+					 J36_PHY_R6D_FORCE_VBUSVALID)
+
+/* Device: ID high so the core is a B-device, the session valid and VBUS present,
+ * which is the state a gadget plugged into a host is in. 0x6c ends at 0x2e and
+ * 0x6d at 0x3e, which is the stock recover() tail unchanged -- this is the one
+ * of the two sequences that was already right. */
+#define J36_PHY_R6C_DEV_SET		(J36_PHY_R6C_IDDIG | J36_PHY_R6C_AVALID | \
+					 J36_PHY_R6C_BVALID | J36_PHY_R6C_VBUSVALID)
+#define J36_PHY_R6C_DEV_CLR		J36_PHY_R6C_SESSEND
+
+/* Host: ID low so the core is an A-device, A-session valid, VBUS present, and
+ * the session explicitly not ended. B-valid belongs to the other role and is
+ * cleared rather than left, so neither sequence depends on what the other one
+ * wrote last. */
+#define J36_PHY_R6C_HOST_SET		(J36_PHY_R6C_AVALID | J36_PHY_R6C_VBUSVALID)
+#define J36_PHY_R6C_HOST_CLR		(J36_PHY_R6C_IDDIG | J36_PHY_R6C_BVALID | \
+					 J36_PHY_R6C_SESSEND)
+
 #define J36_PHY_R6E			0x6e
 #define J36_PHY_R6E_UART_EN		0x01
 
 /* The stock routines' own settle time, in microseconds. */
 #define J36_PHY_SETTLE_US		800
+
+/* How long the port is given to fall after DRVVBUS is dropped, before DEVCTL's
+ * VBUS field is read to find out whether anything ELSE is holding it up. It is
+ * an unloaded net with the load switch open, so this is discharging the
+ * connector's own capacitance and nothing else; 60 ms is far more than that
+ * needs and still short enough that a device plugged during the gap only loses
+ * one attach attempt, which musb retries. It is only ever spent with nothing
+ * attached -- see j36_port_attached(). */
+#define J36_VBUS_FALL_MS		60
+
+/* DEVCTL's VBUS field is four thresholds; this is the lowest one that means
+ * somebody is actually driving the bus rather than leakage holding it off the
+ * floor. */
+#define J36_MUSB_VBUS_AVALID		2
 
 /* MT6592 GPIO controller, from mt6592_led.c, which drives three pads on this
  * board with it today. Every register is a 16-pin bank at a 0x10 stride and
@@ -297,18 +415,49 @@ MODULE_PARM_DESC(scan_delay_ms,
 		 "delay before the first GICD_ISPENDR sample (the second is at "
 		 "three times this, to catch a connect that happens late)");
 
-static bool vbus = true;
-module_param(vbus, bool, 0444);
+static int vbus = -1;
+module_param(vbus, int, 0644);
 MODULE_PARM_DESC(vbus,
-		 "drive the DRVVBUS pad named by j36,drvvbus-pad, so the port "
-		 "sources 5 V and a bus-powered device enumerates (default on). "
-		 "vbus=0 drives the pad LOW -- it does not merely decline to raise "
-		 "it, because this connector is also the charge port and the PMIC "
-		 "reads this pad to decide whether the 5 V on CHRIN is a charger or "
-		 "its own boost. Use vbus=0 with a self-powered hub, use it if no "
-		 "cell is fitted (the 5 V is a boost off VBAT and VBAT here is the "
-		 "system node), and use it when what you want back is CHARGING: the "
-		 "port cannot source and sink at the same time.");
+		 "who drives the 5 V on the one connector this board has. "
+		 "-1 (default) measures it: with the DRVVBUS pad named by "
+		 "j36,drvvbus-pad held low, DEVCTL's VBUS field says whether "
+		 "anything outside is feeding the port, and the role follows -- "
+		 "fed means a charger or a PC, so be a device and let the PMIC "
+		 "charge; unfed means be a host and source 5 V so a stick, an SSD, "
+		 "a mouse or a bus-powered hub comes up. "
+		 "vbus=1 pins the old behaviour: host always, sourcing always, and "
+		 "the charger held off for the whole uptime because the PMIC reads "
+		 "this same pad and cannot tell our own boost from a charger. "
+		 "vbus=0 forbids SOURCING without pinning the role -- the port is "
+		 "still measured, it just never drives the pad -- and it drives "
+		 "the pad LOW rather than leaving it as found. Two cases want it: "
+		 "a self-powered hub, which brings its own 5 V, and a board with "
+		 "no cell fitted, where the boost comes off VBAT and VBAT here is "
+		 "the system node. "
+		 "Writable at runtime; the next role poll picks it up.");
+
+static unsigned int role_poll_ms = 3000;
+module_param(role_poll_ms, uint, 0644);
+MODULE_PARM_DESC(role_poll_ms,
+		 "how often to re-ask which way the port is being driven, in ms "
+		 "(default 3000, 0 stops the poll and freezes whatever the "
+		 "power-on measurement decided). Plugging a charger into a running "
+		 "console is the normal case and there is no interrupt for it on "
+		 "this board, so it is a poll. It costs one DRVVBUS drop of "
+		 "J36_VBUS_FALL_MS and one 800 us settle, and it is skipped "
+		 "entirely whenever anything is attached to the port.");
+
+static bool musb_session = true;
+module_param(musb_session, bool, 0644);
+MODULE_PARM_DESC(musb_session,
+		 "end and restart the MUSB session across a role change, by "
+		 "clearing and setting DEVCTL.SESSION (default on). musb_core "
+		 "sets that bit once, from musb_start(), when the hub driver "
+		 "powers the root port at boot -- so a port that becomes a "
+		 "charger port and then a host port again has nobody to restart "
+		 "it. The stock host switch clears the same bit for the same "
+		 "reason. musb_session=0 backs it out; host mode then works "
+		 "until the first role change and not after it.");
 
 static bool musb_probe_layout;
 module_param(musb_probe_layout, bool, 0444);
@@ -340,6 +489,17 @@ struct j36_usb_phy {
 	struct delayed_work scan_work;
 	u32 pending_baseline[J36_GICD_ISPENDR_WORDS];
 	unsigned int scans_left;
+
+	/* Tri-state again, and again load-bearing: -1 until a role has been
+	 * decided, so the first decision logs and applies even when it agrees
+	 * with what the sequences happen to have left behind. */
+	int role_host;
+	struct delayed_work role_work;
+	/* The role poll runs off a workqueue and .set_mode / .power_on /
+	 * .power_off run off musb's probe and remove. The generic PHY framework
+	 * serialises its own ops against each other and knows nothing about the
+	 * poll, so the poll is what this exists for. */
+	struct mutex lock;
 };
 
 /* ── register helpers ────────────────────────────────────────────────────────
@@ -430,7 +590,7 @@ static void j36_usb_phy_vbus(struct j36_usb_phy *p, bool on)
 	 * the parameter whose name says the opposite. Off is driven now, not
 	 * assumed.
 	 */
-	if (on && !vbus)
+	if (on && vbus == 0)
 		return;
 	if (p->vbus_on == (int)on)
 		return;
@@ -462,24 +622,58 @@ static void j36_phy_uart_off_and_trim(struct j36_usb_phy *p)
 		   J36_PHY_R06_TRIM_DEFAULT);
 }
 
-/* Device-mode tail, and also the low-power resting state. This is the tail both
- * stock routines end on, so it is what the PHY sits in after recover(). */
+/*
+ * Both roles, and both in the same order for the same reason: write the RG_*
+ * values FIRST and enable the force_* overrides after, so the override never
+ * goes live onto a value left behind by the other role. The stock recover()
+ * tail does exactly this, and the host sequence that used to be here did the
+ * opposite -- enabled four overrides, then wrote the values -- which is one of
+ * the smaller things wrong with it. See the file header for the larger one.
+ *
+ * The settle is the 800 us the stock routines take after their own role writes,
+ * and it is on both paths now: .set_mode reaches force_device() with nothing
+ * else between it and the caller, so the delay recover() takes before its own
+ * tail does not cover that path.
+ */
+
+/* Device: B-device, session valid, VBUS present. The low-power resting state and
+ * the tail both stock routines end on, so it is also what the PHY sits in after
+ * recover(). 0x6c ends at 0x2e and 0x6d at 0x3e, byte for byte as transcribed. */
 static void j36_phy_force_device(struct j36_usb_phy *p)
 {
-	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_BIT4);
+	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_DEV_CLR);
 	j36_phy_set(p, J36_PHY_R6C, J36_PHY_R6C_DEV_SET);
-	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_DEV_SET);
+	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_ALL);
+	usleep_range(J36_PHY_SETTLE_US, J36_PHY_SETTLE_US * 2);
 }
 
-/* Host-mode override, from MVII's musb_phy_force_host(): the mirror of the
- * above, and the only difference that decides whether a hub enumerates. The
- * settle delay is the same 800 us the stock routines take after their own
- * role writes. */
+/* Host: A-device, A-session valid, VBUS present, session not ended -- the one
+ * that decides whether anything ever enumerates. force_iddig is in FORCE_ALL
+ * and it has to be: without it the core reads the ID pin, which on a board with
+ * no OTG cable floats to B, which is what DEVCTL reported for as long as the
+ * transcribed sequence ran. */
 static void j36_phy_force_host(struct j36_usb_phy *p)
 {
-	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_HOST_SET);
-	j36_phy_set(p, J36_PHY_R6C, J36_PHY_R6C_BIT4);
 	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_HOST_CLR);
+	j36_phy_set(p, J36_PHY_R6C, J36_PHY_R6C_HOST_SET);
+	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_ALL);
+	usleep_range(J36_PHY_SETTLE_US, J36_PHY_SETTLE_US * 2);
+}
+
+/*
+ * Neither role: drop the five force_* enables so U2PHYDTM1's RG_* bits stop
+ * being what this driver last wrote and go back to being what the PHY's own
+ * comparators see. That is the only way DEVCTL's VBUS field means anything --
+ * with the overrides on it reports the role sequence back at you, which is
+ * exactly why "VBUS below SessionEnd" appeared in every log while the DRVVBUS
+ * pad was high.
+ *
+ * Leaves the RG_* values in 0x6c alone: they are ignored while unforced, and
+ * the next role sequence overwrites the ones it cares about anyway.
+ */
+static void j36_phy_release_force(struct j36_usb_phy *p)
+{
+	j36_phy_clr(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_ALL);
 	usleep_range(J36_PHY_SETTLE_US, J36_PHY_SETTLE_US * 2);
 }
 
@@ -650,6 +844,228 @@ static void j36_musb_probe_busctl(struct j36_usb_phy *p)
 			 legacy, mtk);
 }
 
+/* ── which way the port is being driven, and therefore which role ────────────
+ *
+ * One connector, one CHRIN net, one DRVVBUS pad. The port cannot source and
+ * sink at the same time and no device-tree constant knows which is wanted right
+ * now, so this measures it. See the header for the whole argument.
+ */
+
+/*
+ * The core's own pre-enumeration attach flag: FSDEV or LSDEV is set as soon as
+ * the PHY sees a device's pull-up on D+ or D-, before any enumeration has got
+ * anywhere. This is the guard on the whole measurement -- while it is true the
+ * poll does nothing at all, so a working device never sees VBUS drop out from
+ * under it, and neither does one that is halfway through coming up.
+ */
+static bool j36_port_attached(struct j36_usb_phy *p)
+{
+	u8 devctl;
+
+	if (!p->musb)
+		return false;
+
+	devctl = readb(p->musb + J36_MUSB_DEVCTL);
+	return !!(devctl & (J36_MUSB_DEVCTL_FSDEV | J36_MUSB_DEVCTL_LSDEV));
+}
+
+/*
+ * Is something OUTSIDE this board holding the port at 5 V?
+ *
+ * Only meaningful with DRVVBUS low and the force_* overrides released, and both
+ * are the caller's job -- j36_usb_phy_decide_role() is the only caller and does
+ * both immediately above.
+ */
+static int j36_port_externally_powered(struct j36_usb_phy *p)
+{
+	u8 devctl;
+	unsigned int level;
+
+	if (!p->musb)
+		return -1;
+
+	devctl = readb(p->musb + J36_MUSB_DEVCTL);
+	level = (devctl & J36_MUSB_DEVCTL_VBUS) >> J36_MUSB_DEVCTL_VBUS_SHIFT;
+
+	dev_dbg(p->dev, "port unfed by us reads DEVCTL %02x: VBUS %s\n",
+		devctl, j36_musb_vbus_str(devctl));
+
+	return level >= J36_MUSB_VBUS_AVALID;
+}
+
+/*
+ * DEVCTL.SESSION, and the one place this driver reaches into another driver's
+ * register block to write something.
+ *
+ * The header used to say this bit was not the PHY's to touch, because musb_core
+ * sets it itself when it starts the host. That is true, and it is true exactly
+ * once: musb_start() runs when the hub driver powers the root port, at boot, and
+ * nothing calls it again. It worked as long as the role never changed after
+ * boot -- which is precisely the assumption this file has just stopped making.
+ *
+ * A poll that takes the role away to charge, and then hands it back when the
+ * charger comes out, leaves musb with a host that has no session and no reason
+ * to think it needs one; nothing enumerates and nothing says why. So the driver
+ * that changes the role is the driver that has to end and restart the session,
+ * which is what the stock host switch does too -- it clears SESSION before it
+ * touches the PHY at all.
+ *
+ * A read-modify-write on DEVCTL is what musb_core does with this bit as well.
+ * The bits it reads back and writes again -- HOSTMODE, BDEVICE, FSDEV, LSDEV
+ * and the VBUS field -- are all read-only, so returning them is not a write.
+ * musb_session=0 backs the whole thing out at runtime if it ever turns out to
+ * race with musb_core's own writes; the port then behaves as it did before,
+ * which is to say host mode works until the first role change.
+ */
+static void j36_musb_session(struct j36_usb_phy *p, bool on)
+{
+	u8 devctl;
+
+	if (!p->musb || !musb_session)
+		return;
+
+	devctl = readb(p->musb + J36_MUSB_DEVCTL);
+	if (!!(devctl & J36_MUSB_DEVCTL_SESSION) == on)
+		return;
+
+	if (on)
+		devctl |= J36_MUSB_DEVCTL_SESSION;
+	else
+		devctl &= (u8)~J36_MUSB_DEVCTL_SESSION;
+	writeb(devctl, p->musb + J36_MUSB_DEVCTL);
+
+	dev_dbg(p->dev, "DEVCTL.SESSION %s\n", on ? "set" : "cleared");
+}
+
+/*
+ * True while the role is the measurement's to decide.
+ *
+ * vbus=0 is in here and not excluded from it, which is worth a line: forbidding
+ * the port to SOURCE 5 V is not the same question as which role it should be,
+ * and the two cases vbus=0 exists for both want the measurement. A self-powered
+ * hub does not drive the upstream cable -- the spec forbids it -- so the port
+ * reads as unfed and hosts it, which is exactly what vbus=0 was for. And a
+ * charger on a cell-less board reads as fed and gets charged into, which is what
+ * anyone typing vbus=0 wanted even more.
+ *
+ * Only vbus=1 pins, and only a device tree with no j36,musb-controller leaves
+ * nothing to measure with -- in which case host is the right default, because
+ * that is the role that needs a driver's help and device is what the PHY falls
+ * back to on its own anyway.
+ */
+static bool j36_role_is_auto(struct j36_usb_phy *p)
+{
+	return vbus <= 0 && p->musb;
+}
+
+/*
+ * Decide, and apply. Call with p->lock held.
+ *
+ * The measurement costs a DRVVBUS drop, so it is only paid when there is a
+ * decision to make and nothing plugged in to disturb. Everything else here is
+ * bookkeeping: re-raising the pad the measurement had to lower, and logging
+ * only on a change, because at role_poll_ms this would otherwise be twenty
+ * lines a minute for the life of the board.
+ */
+static void j36_usb_phy_decide_role(struct j36_usb_phy *p)
+{
+	bool released = false;
+	const char *why;
+	bool changed;
+	bool host;
+	int fed;
+
+	if (!j36_role_is_auto(p)) {
+		host = true;
+		why = vbus > 0
+			? "vbus=1 pins it"
+			: "there is no j36,musb-controller to measure the port with";
+		goto apply;
+	}
+
+	if (p->role_host == 1 && j36_port_attached(p))
+		return;			/* busy; ask again next poll */
+
+	if (p->vbus_on != 0) {
+		/* -1 counts: the LK may have left the pad high and this driver
+		 * cannot read back which, so the first measurement pays the
+		 * fall time too rather than guessing it does not have to. */
+		j36_usb_phy_vbus(p, false);
+		msleep(J36_VBUS_FALL_MS);
+	}
+
+	j36_phy_release_force(p);
+	released = true;
+	fed = j36_port_externally_powered(p);
+	if (fed < 0) {
+		host = true;
+		why = "the port cannot be read";
+	} else {
+		host = !fed;
+		why = fed ? "something outside is driving the bus"
+			  : "nothing is feeding the port";
+	}
+
+apply:
+	/*
+	 * `released' is why this is not simply "return early if the answer has
+	 * not changed". The measurement above turns the force_* overrides OFF to
+	 * take its reading, so a poll that measures and then agrees with itself
+	 * still has to put the role back -- otherwise the second poll after boot
+	 * quietly leaves the PHY reading the ID pin, which floats to B on a board
+	 * with no OTG cable, and the port goes back to being the B-device this
+	 * whole change is about. Both sequences are idempotent, so re-applying
+	 * costs three writes and one settle and no transient.
+	 */
+	if (p->role_host == (int)host && !released) {
+		j36_usb_phy_vbus(p, host);
+		return;
+	}
+	changed = p->role_host != (int)host;
+	p->role_host = host;
+
+	if (host) {
+		j36_phy_force_host(p);
+		j36_musb_session(p, true);
+		j36_usb_phy_vbus(p, true);
+	} else {
+		/* VBUS first. A B-device that went on driving 5 V would be
+		 * fighting whatever just plugged in, and on this board the
+		 * thing it would be fighting with is the system rail. */
+		j36_usb_phy_vbus(p, false);
+		j36_musb_session(p, false);
+		j36_phy_force_device(p);
+	}
+
+	if (!changed)
+		return;
+	if (host)
+		dev_info(p->dev,
+			 "port is a HOST: %s, so it sources 5 V and a stick, an SSD, a mouse or a hub can come up\n",
+			 why);
+	else
+		dev_info(p->dev,
+			 "port is a DEVICE: %s, so DRVVBUS stays low and the PMIC can see its own CHRDET and charge\n",
+			 why);
+}
+
+static void j36_usb_phy_role_work(struct work_struct *work)
+{
+	struct j36_usb_phy *p = container_of(to_delayed_work(work),
+					     struct j36_usb_phy, role_work);
+
+	mutex_lock(&p->lock);
+	j36_usb_phy_decide_role(p);
+	mutex_unlock(&p->lock);
+
+	/* Re-read the parameter every pass rather than caching it: both of these
+	 * are 0644 so the dashboard, or a shell, can change the port's mind
+	 * without a reload. role_poll_ms=0 parks the poll for good. */
+	if (role_poll_ms)
+		schedule_delayed_work(&p->role_work,
+				      msecs_to_jiffies(role_poll_ms));
+}
+
 /* ── the interrupt measurement, and the delayed sample that carries it ──────── */
 
 static void j36_usb_phy_sample_pending(struct j36_usb_phy *p, u32 *out)
@@ -765,39 +1181,34 @@ static int j36_usb_phy_power_on(struct phy *phy)
 	struct j36_usb_phy *p = phy_get_drvdata(phy);
 
 	/*
-	 * Host is the default here rather than a neutral state, because this
-	 * kernel is built USB_MUSB_HOST and the node says dr_mode = "host": there
-	 * is no path through musb that would ever ask for anything else, and
-	 * leaving the PHY in the recover() sequence's device-mode tail would mean
-	 * the port sat as a B-device until set_mode arrived.
+	 * The role, and the 5 V that goes with whichever it turns out to be.
+	 * This used to be two unconditional lines -- force host, raise the pad --
+	 * on the grounds that the kernel is built USB_MUSB_HOST and the node says
+	 * dr_mode = "host", so nothing would ever ask for anything else. Both
+	 * halves of that were true and the conclusion was still wrong: dr_mode is
+	 * a build-time constant and the cable is not, and on a board where the
+	 * charge port IS the host port, pinning host is also pinning "never
+	 * charge". decide_role() measures instead. vbus=1 restores the old two
+	 * lines exactly.
 	 */
-	j36_phy_force_host(p);
+	mutex_lock(&p->lock);
+	j36_usb_phy_decide_role(p);
+	mutex_unlock(&p->lock);
 
 	/*
-	 * After the role, not before. VBUS is what a downstream device sees
-	 * first, and raising it while the PHY still sat in the recover()
-	 * sequence's device-mode tail would let a hub start its own attach
-	 * against a port that was still a B-device.
-	 *
-	 * The argument is the parameter and not `true', so that vbus=0 drives the
-	 * pad LOW here rather than walking past it. This port cannot source and
-	 * charge at the same time -- one connector, one CHRIN pin -- so "does not
-	 * source 5 V" has to be a fact the PMIC can read off the pad, not an
-	 * absence of writes. See j36_usb_phy_vbus().
-	 */
-	j36_usb_phy_vbus(p, vbus);
-
-	/*
-	 * Both of these are here rather than in phy_init because VBUS has just
-	 * been raised and DEVCTL's VBUS field is the reading worth having, and
-	 * because power_on is still ahead of musb_start() -- which is what makes
-	 * the busctl write safe. Dump first, probe second, so the dump shows the
+	 * Both of these are here rather than in phy_init because the role has
+	 * just been decided and DEVCTL is the reading worth having, and because
+	 * power_on is still ahead of musb_start() -- which is what makes the
+	 * busctl write safe. Dump first, probe second, so the dump shows the
 	 * function address as musb left it rather than as the probe restored it.
 	 */
 	j36_musb_dump(p, "at power-on");
 	j36_musb_probe_busctl(p);
 
 	j36_usb_phy_scan_arm(p);
+	if (role_poll_ms)
+		schedule_delayed_work(&p->role_work,
+				      msecs_to_jiffies(role_poll_ms));
 	return 0;
 }
 
@@ -805,9 +1216,16 @@ static int j36_usb_phy_power_off(struct phy *phy)
 {
 	struct j36_usb_phy *p = phy_get_drvdata(phy);
 
+	/* Both syncs before the lock, not under it: the role work takes the same
+	 * lock, so cancelling it from inside would wait on itself. */
 	cancel_delayed_work_sync(&p->scan_work);
+	cancel_delayed_work_sync(&p->role_work);
+
+	mutex_lock(&p->lock);
 	j36_usb_phy_vbus(p, false);
 	j36_phy_savecurrent(p);
+	p->role_host = -1;
+	mutex_unlock(&p->lock);
 	return 0;
 }
 
@@ -829,35 +1247,67 @@ static int j36_usb_phy_exit(struct phy *phy)
 static int j36_usb_phy_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct j36_usb_phy *p = phy_get_drvdata(phy);
+	int ret = 0;
+
+	mutex_lock(&p->lock);
 
 	switch (mode) {
 	case PHY_MODE_USB_HOST:
+		/*
+		 * Advisory while the role is the measurement's. mediatek.c calls
+		 * this exactly once, from mtk_musb_init(), immediately after
+		 * phy_power_on() and with the device tree's dr_mode -- so acting
+		 * on it would undo the measurement taken three lines earlier and
+		 * pin host after all, which is the bug this file just stopped
+		 * having. The poll owns the role; this is told, not obeyed.
+		 */
+		if (j36_role_is_auto(p)) {
+			dev_dbg(p->dev,
+				"set_mode(host) noted; the role follows the port\n");
+			break;
+		}
+		p->role_host = 1;
 		j36_phy_force_host(p);
 		j36_usb_phy_vbus(p, true);
 		break;
 	case PHY_MODE_USB_DEVICE:
 		/*
+		 * Honoured in either mode: a gadget driver asking for this knows
+		 * something the port cannot be asked. The poll will re-decide,
+		 * and will agree, because a host that is feeding us is exactly
+		 * what the measurement reads as "be a device".
+		 *
 		 * Drop the 5 V first. A B-device that still drove VBUS would be
 		 * fighting whatever host just plugged in, and on this board the
 		 * thing it would be fighting with is the system rail.
 		 */
+		p->role_host = 0;
 		j36_usb_phy_vbus(p, false);
 		j36_phy_force_device(p);
 		break;
 	case PHY_MODE_USB_OTG:
 		/*
-		 * There is no ID-pin path here: both sequences are overrides
-		 * that pin the role, and the stock LK has no third one that
-		 * releases them. Answering EINVAL is better than silently
-		 * leaving whichever role was set last, which is what a
-		 * pass-through would do.
+		 * Releasing the overrides is a thing this file can do now --
+		 * j36_phy_release_force() is what the measurement is built on --
+		 * but it is not OTG. What it hands the role to is the ID pin,
+		 * and no schematic or stock routine here says that pin is
+		 * connected to anything; the stock LK has no sequence that
+		 * releases the overrides and leaves them released, which is what
+		 * a board with a wired ID pin would have. So this still answers
+		 * EINVAL rather than pretending, and the honest substitute is
+		 * the default vbus=-1, which decides the same question off the
+		 * one signal this board does have.
 		 */
-		dev_warn(p->dev, "OTG mode has no override sequence on this PHY\n");
-		return -EINVAL;
+		dev_warn(p->dev, "OTG mode has no override sequence on this PHY; vbus=-1 follows the port instead\n");
+		ret = -EINVAL;
+		break;
 	default:
-		return -EINVAL;
+		ret = -EINVAL;
+		break;
 	}
-	return 0;
+
+	mutex_unlock(&p->lock);
+	return ret;
 }
 
 static const struct phy_ops j36_usb_phy_ops = {
@@ -899,11 +1349,12 @@ static void __iomem *j36_iomap_phandle(struct device *dev, const char *property)
 	return base;
 }
 
-static void j36_usb_phy_cancel_scan(void *data)
+static void j36_usb_phy_cancel_work(void *data)
 {
 	struct j36_usb_phy *p = data;
 
 	cancel_delayed_work_sync(&p->scan_work);
+	cancel_delayed_work_sync(&p->role_work);
 }
 
 static int j36_usb_phy_probe(struct platform_device *pdev)
@@ -917,6 +1368,8 @@ static int j36_usb_phy_probe(struct platform_device *pdev)
 	if (!p)
 		return -ENOMEM;
 	p->dev = dev;
+	p->role_host = -1;		/* not decided yet; see the struct */
+	mutex_init(&p->lock);
 
 	p->phy = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(p->phy))
@@ -981,7 +1434,8 @@ static int j36_usb_phy_probe(struct platform_device *pdev)
 	}
 
 	INIT_DELAYED_WORK(&p->scan_work, j36_usb_phy_scan);
-	ret = devm_add_action_or_reset(dev, j36_usb_phy_cancel_scan, p);
+	INIT_DELAYED_WORK(&p->role_work, j36_usb_phy_role_work);
+	ret = devm_add_action_or_reset(dev, j36_usb_phy_cancel_work, p);
 	if (ret)
 		return ret;
 
@@ -1001,11 +1455,16 @@ static int j36_usb_phy_probe(struct platform_device *pdev)
 	 * musb_hdrc leaves this window untouched.
 	 */
 	if (p->vbus_pin < 0)
-		dev_info(dev, "MT6592 U2 PHY ready (host mode on power-on; VBUS is not driven, so the hub must be self-powered)\n");
-	else if (!vbus)
-		dev_info(dev, "MT6592 U2 PHY ready (host mode on power-on; VBUS held off by vbus=0, so the hub must be self-powered)\n");
+		dev_info(dev, "MT6592 U2 PHY ready (no DRVVBUS pad, so the port never sources 5 V and a hub must be self-powered)\n");
+	else if (vbus > 0)
+		dev_info(dev, "MT6592 U2 PHY ready (vbus=1 pins host mode; DRVVBUS pad %d will source 5 V off VBAT -- fit a cell, and the charger is held off for as long as it does)\n",
+			 p->vbus_pin);
+	else if (!p->musb)
+		dev_info(dev, "MT6592 U2 PHY ready (host mode on power-on; no j36,musb-controller to measure the port with, so the role cannot follow it)\n");
+	else if (vbus == 0)
+		dev_info(dev, "MT6592 U2 PHY ready (the role follows the port, but vbus=0 holds the 5 V off: a hub must be self-powered, and a charger is charged from)\n");
 	else
-		dev_info(dev, "MT6592 U2 PHY ready (host mode on power-on; DRVVBUS pad %d will source 5 V off VBAT -- fit a cell)\n",
+		dev_info(dev, "MT6592 U2 PHY ready (the role follows the port: sourcing 5 V off DRVVBUS pad %d when nothing feeds it -- fit a cell -- and standing down to charge when something does)\n",
 			 p->vbus_pin);
 	return 0;
 }
