@@ -93,6 +93,20 @@ public:
     void setMediaRoot(const QString &path);
 
     /*
+     * How the music player walks the queue: 0 plays the directory through and
+     * stops, 1 goes back round, 2 repeats the one track.  An int and not an enum
+     * for the same reason the language is a code -- this file gets read on a PC,
+     * and Settings has no business knowing MediaPage's enum either way.  Anything
+     * outside 0..2 is clamped on load, so a hand-edited file cannot wedge the
+     * player in a state it has no row for.
+     */
+    int mediaRepeat() const { return m_mediaRepeat; }
+    void setMediaRepeat(int mode);
+
+    bool mediaShuffle() const { return m_mediaShuffle; }
+    void setMediaShuffle(bool on);
+
+    /*
      * Screen brightness as a percentage, or -1 for "nobody has moved it here".
      *
      * It is remembered because nothing else remembers it.  The backlight driver
@@ -137,6 +151,8 @@ private:
     QString m_mediaRoot;
     QString m_language;
     int m_brightness = -1;
+    int m_mediaRepeat = 0;
+    bool m_mediaShuffle = false;
     bool m_writable = false;
 };
 

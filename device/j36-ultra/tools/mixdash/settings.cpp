@@ -147,6 +147,9 @@ void Settings::load()
     if (!m_mediaRoot.isEmpty() && !QFileInfo(m_mediaRoot).isDir())
         m_mediaRoot.clear();
 
+    m_mediaRepeat = clampInt(m_store->value(QStringLiteral("media/repeat"), 0).toInt(), 0, 2);
+    m_mediaShuffle = m_store->value(QStringLiteral("media/shuffle"), false).toBool();
+
     /*
      * Brightness gets the same treatment as the pointer speeds, and for a harder
      * reason: this is the only value in the file that can make the machine look
@@ -215,6 +218,29 @@ void Settings::setMediaRoot(const QString &path)
     m_mediaRoot = path;
     if (m_store) {
         m_store->setValue(QStringLiteral("media/root"), path);
+        m_store->sync();
+    }
+}
+
+void Settings::setMediaRepeat(int mode)
+{
+    const int value = clampInt(mode, 0, 2);
+    if (m_mediaRepeat == value)
+        return;
+    m_mediaRepeat = value;
+    if (m_store) {
+        m_store->setValue(QStringLiteral("media/repeat"), m_mediaRepeat);
+        m_store->sync();
+    }
+}
+
+void Settings::setMediaShuffle(bool on)
+{
+    if (m_mediaShuffle == on)
+        return;
+    m_mediaShuffle = on;
+    if (m_store) {
+        m_store->setValue(QStringLiteral("media/shuffle"), m_mediaShuffle);
         m_store->sync();
     }
 }
