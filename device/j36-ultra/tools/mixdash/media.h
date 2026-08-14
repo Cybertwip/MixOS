@@ -185,7 +185,13 @@ private:
         RowStop       = -6,
         RowRepeat     = -7,
         RowShuffle    = -8,
-        RowReveal     = -9
+        RowReveal     = -9,
+        /* Headers and the read-only output line.  They are unselectable, so they
+         * can never reach onActivated() -- but their id defaults to 0, which reads
+         * as "entry 0" there, and one future edit that made such a row selectable
+         * would silently open the first file in the directory.  Named, so it
+         * cannot. */
+        RowInert      = -10
     };
 
     struct Entry {

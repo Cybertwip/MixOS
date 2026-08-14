@@ -2,14 +2,19 @@
 /*
  * Copyright (c) 2025-2026 the MixOS project and contributors
  * See device/j36-ultra/LICENSE for the licence text and what it covers.
+ *
+ * media.cpp -- the browser, the queue, the transport and the two ffmpeg chains.
+ * media.h says why any of this is shaped the way it is; this file is the how.
  */
 #include "media.h"
 
 #include <QDir>
 #include <QFileInfo>
+#include <QFontMetrics>
 #include <QImageReader>
 #include <QPainter>
 #include <QProcess>
+#include <QRandomGenerator>
 #include <QResizeEvent>
 #include <QTimer>
 
@@ -18,12 +23,18 @@
 #include "joypad.h"
 #include "settings.h"
 #include "theme.h"
+#include "volume.h"
 
 namespace {
 
 const char *kAudioExt = "mp3 flac ogg oga opus wav m4a aac wma aiff mid";
 const char *kVideoExt = "mp4 mkv avi webm mov m4v mpg mpeg wmv flv ts 3gp ogv";
 const char *kImageExt = "jpg jpeg png bmp gif webp pbm pgm ppm xbm xpm tif tiff";
+
+/* The one sample rate the whole page uses.  See media.h: 48 kHz is the family the
+ * MT6592's audio PLL runs natively, and every divider not taken is a thing that
+ * cannot be subtly wrong. */
+const int kRate = 48000;
 
 bool extIn(const char *list, const QString &suffix)
 {
@@ -40,6 +51,52 @@ QString firstExisting(const QStringList &paths)
         if (QFileInfo(p).isExecutable())
             return p;
     return QString();
+}
+
+/*
+ * Kill a child and forget it, in the one order that works.
+ *
+ * disconnect() FIRST, because everything that calls this is either tearing the
+ * chain down deliberately or replacing it, and in both cases the finished signal
+ * that terminate() is about to cause would be read as "the track ended" by
+ * onMusicFinished() -- which would then advance the queue into the next track,
+ * from inside the code that was stopping it.  That was the old page's "the music
+ * does not stop" in its purest form.
+ *
+ * SIGCONT SECOND, because a process stopped by the pause button ignores SIGTERM
+ * until something lets it run again, and a paused player that is then closed would
+ * otherwise sit in the process table holding the sound card open for ever.
+ */
+void endProcess(QProcess *&p)
+{
+    if (!p)
+        return;
+    QProcess *const doomed = p;
+    p = nullptr;
+
+    doomed->disconnect();
+    if (doomed->state() != QProcess::NotRunning) {
+        if (doomed->processId() > 0)
+            ::kill((pid_t)doomed->processId(), SIGCONT);
+        doomed->terminate();
+        if (!doomed->waitForFinished(400))
+            doomed->kill();
+    }
+    doomed->deleteLater();
+}
+
+/* aplay says "aplay: main:834: audio open error: No such file or directory".  The
+ * file and line are ours to drop -- the sentence after them is the whole message,
+ * and the screen this lands on is 640 px wide. */
+QString tidyChildError(const QString &raw)
+{
+    QString line = raw.trimmed().section('\n', 0, 0).trimmed();
+    if (line.startsWith(QStringLiteral("aplay: "))) {
+        const int colon = line.indexOf(QStringLiteral(": "), 7);
+        if (colon > 0)
+            line = QStringLiteral("aplay: ") + line.mid(colon + 2).trimmed();
+    }
+    return line;
 }
 
 /*
@@ -92,40 +149,69 @@ MediaPage::MediaPage(QWidget *parent)
     m_list->setRowHeight(30);
     m_list->setPlaceholder(tr("Nothing playable here.\nB goes up a directory."));
     connect(m_list, &ListPane::activated, this, &MediaPage::onActivated);
+    connect(m_list, &ListPane::valueChanged, this, &MediaPage::onValueChanged);
 
     m_ui = new QTimer(this);
     m_ui->setInterval(500);
     connect(m_ui, &QTimer::timeout, this, &MediaPage::tick);
+
+    m_seekTimer = new QTimer(this);
+    m_seekTimer->setSingleShot(true);
+    m_seekTimer->setInterval(350);
+    connect(m_seekTimer, &QTimer::timeout, this, &MediaPage::commitSeek);
+
+    /* Both remembered, because a handheld that forgets it was shuffling is a
+     * handheld you set up again every boot. */
+    m_repeat = Settings::instance().mediaRepeat();
+    m_shuffle = Settings::instance().mediaShuffle();
 
     m_dir = mediaStartDir();
 }
 
 MediaPage::~MediaPage()
 {
-    stopPlayback();
+    /* Not stopMusic()/stopVideo(): those rebuild rows and touch the list pane,
+     * which is a child being destroyed underneath us.  The processes are all this
+     * destructor owes anybody. */
+    endProcess(m_decoder);
+    endProcess(m_videoAudio);
+    endProcess(m_videoAplay);
+    endProcess(m_music);
+    endProcess(m_aplay);
 }
 
 QString MediaPage::title() const
 {
-    if (m_mode != ModeBrowse && !m_playing.name.isEmpty())
-        return m_playing.name;
+    if (m_view == ViewPlayer) {
+        const Entry *t = queuedTrack();
+        if (t)
+            return m_trackTitle.isEmpty() ? t->name : m_trackTitle;
+    }
+    if (m_view == ViewImage || m_view == ViewVideo)
+        return m_showing.name;
     return tr("Media");
 }
 
 bool MediaPage::wantsFullscreen() const
 {
-    /* Only while a picture or a video is on the glass.  The browser and the music
-     * player both want the status bar -- one to say where you are, the other to
-     * keep the clock and the battery in sight while a record plays. */
-    return m_mode == ModeImage || m_mode == ModeVideo;
+    /* Only while a picture or a film is on the glass.  The browser and the player
+     * both want the status bar -- one to say where you are, the other to keep the
+     * clock and the battery in sight while a record plays. */
+    return m_view == ViewImage || m_view == ViewVideo;
+}
+
+void MediaPage::layOutList()
+{
+    const QRect card(Theme::Margin, Theme::Margin,
+                     width() - 2 * Theme::Margin, height() - 2 * Theme::Margin);
+    const int foot = m_note.isEmpty() ? 10 : 30;
+    m_list->setGeometry(card.x() + 6, card.y() + 40, card.width() - 12,
+                        qMax(24, card.height() - 40 - foot));
 }
 
 void MediaPage::resizeEvent(QResizeEvent *event)
 {
-    const QRect card(Theme::Margin, Theme::Margin,
-                     width() - 2 * Theme::Margin, height() - 2 * Theme::Margin);
-    m_list->setGeometry(card.x() + 6, card.y() + 36 + 4, card.width() - 12,
-                        card.height() - 36 - 10);
+    layOutList();
     QWidget::resizeEvent(event);
 }
 
@@ -133,6 +219,16 @@ void MediaPage::onEnter()
 {
     if (m_dir.isEmpty() || !QFileInfo(m_dir).isDir())
         m_dir = mediaStartDir();
+
+    /* A picture or a film that was up when the page was left is gone -- both were
+     * stopped by onLeave().  Music is not, so the view it left in is still the
+     * view it should come back to. */
+    if (m_view == ViewPlayer && !musicLive())
+        m_view = ViewBrowse;
+    if (m_view == ViewImage || m_view == ViewVideo)
+        m_view = ViewBrowse;
+    m_list->setVisible(true);
+
     populate(m_dir);
     m_ui->start();
 }
@@ -142,24 +238,58 @@ void MediaPage::onLeave()
     m_ui->stop();
     /*
      * Video and pictures stop; MUSIC KEEPS PLAYING.  That asymmetry is the whole
-     * reason the music player does not take the screen: a handheld that stops the
-     * album the moment you go and look at something else is a handheld nobody
-     * listens to music on.
+     * reason the player does not take the screen: a handheld that stops the album
+     * the moment you go and look at something else is a handheld nobody listens to
+     * music on.  A film you cannot see is just a fan spinning, so it goes.
      */
-    if (m_mode == ModeVideo || m_mode == ModeImage) {
-        stopPlayback();
-        setMode(ModeBrowse);
+    if (m_view == ViewVideo || m_view == ViewImage) {
+        stopVideo();
+        m_frame = QImage();
+        setView(ViewBrowse);
     }
 }
 
-void MediaPage::setMode(int mode)
+void MediaPage::setView(int view)
 {
-    if (m_mode == mode)
+    if (m_view == view)
         return;
-    m_mode = mode;
+
+    /* Leaving the browser: remember WHICH ENTRY was selected, not which row.  The
+     * now-playing row appears and disappears above the entries, so a row index
+     * saved here would come back one off whenever the music state changed while
+     * the player view was up. */
+    if (m_view == ViewBrowse) {
+        const ListRow *r = m_list->currentRow();
+        m_browseAt = (r && r->id >= 0) ? r->id : 0;
+    }
+
+    m_view = view;
     /* The list is a real child widget; behind a full-screen picture it would paint
      * over the picture rather than under it. */
-    m_list->setVisible(mode == ModeBrowse);
+    m_list->setVisible(view == ViewBrowse || view == ViewPlayer);
+
+    rebuild();
+
+    if (view == ViewBrowse) {
+        const QVector<ListRow> &rows = m_list->rows();
+        for (int i = 0; i < rows.size(); ++i) {
+            if (rows[i].id != m_browseAt)
+                continue;
+            m_list->setCurrent(i);
+            break;
+        }
+    } else if (view == ViewPlayer) {
+        /* Land on Pause, which is what the button under your thumb should do the
+         * moment the player opens. */
+        const QVector<ListRow> &rows = m_list->rows();
+        for (int i = 0; i < rows.size(); ++i) {
+            if (rows[i].id != RowPause)
+                continue;
+            m_list->setCurrent(i);
+            break;
+        }
+    }
+
     emit titleChanged();
     update();
 }
@@ -246,6 +376,11 @@ void MediaPage::populate(QString dir)
         m_entries.append(e);
     }
 
+    /* The browser IS the navigation, so where it got to is what gets remembered --
+     * and it is remembered per directory entered, not once when the page closes,
+     * because the way this device stops is that somebody holds the power button. */
+    Settings::instance().setMediaRoot(m_dir);
+
     rebuild();
     emit titleChanged();
 }
@@ -257,6 +392,7 @@ bool MediaPage::openPath(const QString &path)
         return false;
 
     if (info.isDir()) {
+        setView(ViewBrowse);
         populate(info.absoluteFilePath());
         m_list->setCurrent(0);
         return true;
@@ -267,23 +403,71 @@ bool MediaPage::openPath(const QString &path)
         return false;
 
     /* Browse to the containing directory first: opening a file with no list
-     * behind it means Back from the picture lands on an empty page, and the
-     * next/previous image walk has nothing to walk. */
+     * behind it means Back from the picture lands on an empty page, the queue has
+     * nothing to walk, and the next/previous image walk has nothing either. */
+    setView(ViewBrowse);
     populate(info.absolutePath());
     const QString want = info.absoluteFilePath();
     for (int i = 0; i < m_entries.size(); ++i) {
         if (m_entries[i].path != want)
             continue;
-        m_list->setCurrent(i);
+        const QVector<ListRow> &rows = m_list->rows();
+        for (int r = 0; r < rows.size(); ++r) {
+            if (rows[r].id != i)
+                continue;
+            m_list->setCurrent(r);
+            break;
+        }
         open(m_entries[i]);
         return true;
     }
     return false;
 }
 
+/* ── the rows ────────────────────────────────────────────────────────────── */
+
 void MediaPage::rebuild()
 {
     QVector<ListRow> rows;
+    if (m_view == ViewPlayer)
+        buildPlayerRows(rows);
+    else
+        buildBrowseRows(rows);
+
+    const int keep = m_list->current();
+    m_list->setRows(rows);
+    if (keep >= 0 && keep < rows.size())
+        m_list->setCurrent(keep);
+    layOutList();
+    update();
+}
+
+void MediaPage::buildBrowseRows(QVector<ListRow> &rows) const
+{
+    /*
+     * The now-playing row is PINNED AT THE TOP and it is a row like any other, not
+     * a strip painted over the foot of the sheet the way the old page did it.  A
+     * strip is furniture: you cannot select it, so the only way into the transport
+     * was a button chord nobody was told about.  A row you can land on and press
+     * is the whole discovery mechanism.
+     */
+    const Entry *track = queuedTrack();
+    if (musicLive() && track) {
+        ListRow r;
+        r.kind = ListRow::Item;
+        r.id = RowNowPlaying;
+        r.glyph = GlyphMusic;
+        r.accent = m_paused ? Theme::orange() : Theme::green();
+        r.text = m_trackTitle.isEmpty() ? track->name : m_trackTitle;
+
+        QString clock = humanTime((int)position());
+        if (m_duration > 0.0)
+            clock += " / " + humanTime((int)m_duration);
+        r.detail = clock + "   " + tr("open the player");
+        r.badge = m_paused ? tr("paused") : tr("playing");
+        r.badgeColour = r.accent;
+        rows.append(r);
+    }
 
     for (int i = 0; i < m_entries.size(); ++i) {
         const Entry &e = m_entries[i];
@@ -326,29 +510,278 @@ void MediaPage::rebuild()
             break;
         }
 
-        if (m_mode == ModeAudio && e.path == m_playing.path) {
+        /* The track that is playing is marked HERE too, so the directory listing
+         * and the player never disagree about what is on. */
+        if (track && e.kind == KindAudio && e.path == track->path && musicLive()) {
             r.badge = m_paused ? tr("paused") : tr("playing");
             r.badgeColour = m_paused ? Theme::orange() : Theme::green();
         }
         rows.append(r);
     }
-
-    const int keep = m_list->current();
-    m_list->setRows(rows);
-    if (keep >= 0 && keep < rows.size())
-        m_list->setCurrent(keep);
-    update();
 }
+
+void MediaPage::buildPlayerRows(QVector<ListRow> &rows) const
+{
+    const Entry *track = queuedTrack();
+    if (!track)
+        return;
+
+    {
+        ListRow head;
+        head.kind = ListRow::Header;
+        head.id = RowInert;
+        head.text = m_trackTitle.isEmpty() ? track->name : m_trackTitle;
+        rows.append(head);
+    }
+
+    {
+        ListRow r;
+        r.id = RowSeek;
+        r.text = tr("Position");
+        r.accent = Theme::blue();
+        if (m_duration > 0.0) {
+            r.kind = ListRow::Slider;
+            r.minimum = 0;
+            r.maximum = qMax(1, (int)m_duration);
+            r.value = qBound(0, (int)position(), r.maximum);
+            r.stepSize = 10;
+            r.valueText = humanTime(r.value) + " / " + humanTime(r.maximum);
+        } else {
+            /* No duration means no slider that could mean anything.  A disabled row
+             * still shows the clock and still cannot be landed on, which is exactly
+             * right for a control with nothing behind it. */
+            r.kind = ListRow::Item;
+            r.enabled = false;
+            r.detail = humanTime((int)position());
+        }
+        rows.append(r);
+    }
+
+    {
+        ListRow r;
+        r.kind = ListRow::Action;
+        r.id = RowPause;
+        r.glyph = GlyphPower;
+        r.accent = m_paused ? Theme::green() : Theme::orange();
+        r.text = m_paused ? tr("Resume") : tr("Pause");
+        rows.append(r);
+    }
+
+    {
+        ListRow r;
+        r.kind = ListRow::Action;
+        r.id = RowNext;
+        r.glyph = GlyphMusic;
+        r.accent = Theme::purple();
+        r.text = tr("Next track");
+        /* What Next will actually play, which on a shuffled queue is the only way
+         * to know before pressing it. */
+        if (m_orderAt >= 0 && m_orderAt + 1 < m_order.size())
+            r.detail = m_queue[m_order[m_orderAt + 1]].name;
+        else if (m_repeat != RepeatOff && !m_order.isEmpty())
+            r.detail = m_queue[m_order[0]].name;
+        else
+            r.detail = tr("last in this folder");
+        rows.append(r);
+    }
+
+    {
+        ListRow r;
+        r.kind = ListRow::Action;
+        r.id = RowPrev;
+        r.glyph = GlyphBack;
+        r.accent = Theme::purple();
+        r.text = tr("Previous track");
+        if (m_orderAt > 0)
+            r.detail = m_queue[m_order[m_orderAt - 1]].name;
+        else
+            r.detail = tr("first in this folder");
+        rows.append(r);
+    }
+
+    {
+        ListRow r;
+        r.kind = ListRow::Action;
+        r.id = RowStop;
+        r.glyph = GlyphPower;
+        r.accent = Theme::pink();
+        r.text = tr("Stop");
+        r.detail = tr("end playback and go back to the folder");
+        rows.append(r);
+    }
+
+    {
+        ListRow head;
+        head.kind = ListRow::Header;
+        head.id = RowInert;
+        head.text = tr("Queue");
+        rows.append(head);
+    }
+
+    {
+        ListRow r;
+        r.kind = ListRow::Item;
+        r.id = RowRepeat;
+        r.glyph = GlyphSettings;
+        r.accent = Theme::teal();
+        r.text = tr("Repeat");
+        switch (m_repeat) {
+        case RepeatAll:
+            r.badge = tr("folder");
+            r.badgeColour = Theme::teal();
+            r.detail = tr("play the folder round and round");
+            break;
+        case RepeatOne:
+            r.badge = tr("one");
+            r.badgeColour = Theme::teal();
+            r.detail = tr("play this track again when it ends");
+            break;
+        default:
+            r.badge = tr("off");
+            r.badgeColour = Theme::separator();
+            r.detail = tr("stop at the end of the folder");
+            break;
+        }
+        rows.append(r);
+    }
+
+    {
+        ListRow r;
+        r.kind = ListRow::Toggle;
+        r.id = RowShuffle;
+        r.glyph = GlyphChip;
+        r.accent = Theme::orange();
+        r.text = tr("Shuffle");
+        r.on = m_shuffle;
+        r.detail = tr("%1 tracks in this folder").arg(m_queue.size());
+        rows.append(r);
+    }
+
+    {
+        ListRow r;
+        r.kind = ListRow::Action;
+        r.id = RowReveal;
+        r.glyph = GlyphFiles;
+        r.accent = Theme::blue();
+        r.text = tr("Show in folder");
+        r.detail = QFileInfo(track->path).absolutePath();
+        rows.append(r);
+    }
+
+    {
+        /*
+         * The output device, disabled, at the foot.  Not decoration: "there is no
+         * sound" and "there is no sound FROM plughw:0,0 at 48 kHz" are different
+         * bug reports, and only one of them can be acted on.
+         */
+        ListRow head;
+        head.kind = ListRow::Header;
+        head.id = RowInert;
+        head.text = tr("Output");
+        rows.append(head);
+
+        ListRow d;
+        d.kind = ListRow::Item;
+        d.id = RowInert;
+        d.enabled = false;
+        d.glyph = GlyphInfo;
+        d.accent = Theme::ink3();
+        d.text = m_device.isEmpty() ? tr("no sound card on this device") : m_device;
+        d.detail = QString("s16le  %1 Hz  %2").arg(kRate).arg(tr("stereo"));
+        rows.append(d);
+    }
+}
+
+/* ── activation ──────────────────────────────────────────────────────────── */
 
 void MediaPage::onActivated(int index)
 {
     const QVector<ListRow> &rows = m_list->rows();
     if (index < 0 || index >= rows.size())
         return;
-    const int entry = rows[index].id;
-    if (entry < 0 || entry >= m_entries.size())
+    const int id = rows[index].id;
+
+    /* Non-negative is an index into m_entries; everything the player owns is
+     * negative and named.  One switch, no mapping table. */
+    if (id >= 0) {
+        if (id < m_entries.size())
+            open(m_entries[id]);
         return;
-    open(m_entries[entry]);
+    }
+
+    switch (id) {
+    case RowNowPlaying:
+        setView(ViewPlayer);
+        return;
+    case RowPause:
+        togglePause();
+        return;
+    case RowNext:
+        advance(1, false);
+        return;
+    case RowPrev:
+        /*
+         * Within the first three seconds Previous means "the one before"; after
+         * that it means "start this one again", which is what every player has
+         * done since the CD transport and is what a thumb reaches for when it
+         * missed the start of a song.
+         */
+        if (position() > 3.0)
+            playQueued(0.0);
+        else
+            advance(-1, false);
+        return;
+    case RowStop:
+        stopMusic();
+        return;
+    case RowRepeat: {
+        m_repeat = (m_repeat + 1) % 3;
+        Settings::instance().setMediaRepeat(m_repeat);
+        rebuild();
+        return;
+    }
+    case RowReveal: {
+        const Entry *track = queuedTrack();
+        if (!track)
+            return;
+        const QString file = track->path;
+        setView(ViewBrowse);
+        populate(QFileInfo(file).absolutePath());
+        const QVector<ListRow> &browse = m_list->rows();
+        for (int i = 0; i < browse.size(); ++i) {
+            if (browse[i].id < 0 || browse[i].key != file)
+                continue;
+            m_list->setCurrent(i);
+            break;
+        }
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+void MediaPage::onValueChanged(int index, int value)
+{
+    const QVector<ListRow> &rows = m_list->rows();
+    if (index < 0 || index >= rows.size())
+        return;
+
+    switch (rows[index].id) {
+    case RowSeek:
+        seekTo(value);
+        return;
+    case RowShuffle:
+        m_shuffle = (value != 0);
+        Settings::instance().setMediaShuffle(m_shuffle);
+        /* Re-derive the order around whatever is playing, so turning shuffle on
+         * mid-album does not restart the track you are listening to. */
+        reshuffle();
+        rebuild();
+        return;
+    default:
+        return;
+    }
 }
 
 void MediaPage::open(Entry entry)
@@ -366,7 +799,14 @@ void MediaPage::open(Entry entry)
         openVideo(entry);
         return;
     case KindAudio:
-        openAudio(entry);
+        /*
+         * Starting a track builds the queue out of the directory it came from and
+         * STAYS IN THE BROWSER.  Taking the screen here would be the old page's
+         * mistake in a new place: you started one song and lost the folder.  The
+         * now-playing row at the top is the way into the transport.
+         */
+        queueDirectory(m_dir, entry.path);
+        playQueued(0.0);
         return;
     default:
         emit toastRequested(tr("Nothing here plays %1").arg(entry.name.section('.', -1)), 2500);
@@ -412,11 +852,17 @@ void MediaPage::openImage(const Entry &entry)
         return;
     }
 
-    stopPlayback();
+    /*
+     * A PICTURE DOES NOT STOP THE MUSIC.  The old page called stopPlayback() here,
+     * which killed the album to show a photograph -- the single least defensible
+     * thing the old card did.  Only a film stops music, because only a film needs
+     * the sound card.
+     */
+    stopVideo();
     m_frame = image;
-    m_playing = entry;
+    m_showing = entry;
     m_note.clear();
-    setMode(ModeImage);
+    setView(ViewImage);
     update();
 }
 
@@ -426,7 +872,7 @@ void MediaPage::stepImage(int delta)
      * is not one. */
     int at = -1;
     for (int i = 0; i < m_entries.size(); ++i)
-        if (m_entries[i].path == m_playing.path)
+        if (m_entries[i].path == m_showing.path)
             at = i;
     if (at < 0)
         return;
@@ -439,7 +885,7 @@ void MediaPage::stepImage(int delta)
     }
 }
 
-/* ── ffmpeg ──────────────────────────────────────────────────────────────── */
+/* ── ffmpeg, aplay and the card ──────────────────────────────────────────── */
 
 QString MediaPage::ffmpegPath() const
 {
@@ -449,26 +895,85 @@ QString MediaPage::ffmpegPath() const
     return path;
 }
 
-bool MediaPage::hasSoundCard() const
+QString MediaPage::aplayPath() const
+{
+    static const QString path = firstExisting(QStringList()
+                                              << "/usr/bin/aplay" << "/bin/aplay");
+    return path;
+}
+
+QString MediaPage::alsaDevice() const
 {
     /*
-     * A PLAYBACK PCM, not merely /dev/snd.  This is what decides whether the
-     * single-process path below is allowed to name an alsa output at all: with
-     * no card, `-f alsa default' does not degrade to silence, it makes ffmpeg
-     * exit -- and that one process is also carrying the video, so an absent card
-     * would take the picture down with it.  The fallback has to be picked before
-     * the pipeline is built, which means asking here rather than finding out.
+     * THE LOWEST-NUMBERED PLAYBACK PCM, BY NAME, AND NOT `default'.
      *
-     * Not cached: the card is a module the boot word may or may not have loaded,
-     * and it can also go away.  Two readdirs on a tmpfs are not worth a stale
-     * answer.
+     * `default' on this image is a trap: finishing_touches.sh links
+     * /etc/asound.conf to /home/virtua/.asoundrc, and that file is the RG351MP's
+     * -- plug over dmix over hw:0,0, with an RK3326-era 44100/1024/4096 geometry
+     * hard-coded into it.  dmix exists so several processes can share one card.
+     * This handheld has exactly one audio consumer, which is this page, so the
+     * layer bought nothing and stood between the player and the only DAC on the
+     * machine.  `plughw:C,D' is resolved inside alsa-lib's own definitions, so
+     * nothing in /etc/asound.conf can redirect it, and it still does the rate,
+     * format and channel conversion `default' would have done.
+     *
+     * Read from /dev/snd rather than assumed to be card 0: a USB headset or an
+     * HDMI adapter that enumerated first would make card 0 something else, and the
+     * answer is wanted before the pipeline is built, not found out afterwards.
+     *
+     * Not cached.  The card is a module the boot word may or may not have loaded,
+     * and it can go away with the adapter it came in on.  One readdir on a devtmpfs
+     * per track is not worth a stale answer.
      */
     const QDir snd(QStringLiteral("/dev/snd"));
     if (!snd.exists())
-        return false;
+        return QString();
+
     /* pcmC0D0p -- the trailing p is playback; capture-only devices end in c. */
-    return !snd.entryList(QStringList() << QStringLiteral("pcmC*D*p"),
-                          QDir::System | QDir::NoDotAndDotDot).isEmpty();
+    const QStringList nodes = snd.entryList(QStringList() << QStringLiteral("pcmC*D*p"),
+                                            QDir::System | QDir::NoDotAndDotDot,
+                                            QDir::Name);
+    int bestCard = -1;
+    int bestDev = -1;
+    for (const QString &node : nodes) {
+        const int cAt = node.indexOf('C');
+        const int dAt = node.indexOf('D');
+        if (cAt < 0 || dAt <= cAt || dAt + 2 > node.size())
+            continue;
+        bool okCard = false;
+        bool okDev = false;
+        const int card = node.mid(cAt + 1, dAt - cAt - 1).toInt(&okCard);
+        const int dev = node.mid(dAt + 1, node.size() - dAt - 2).toInt(&okDev);
+        if (!okCard || !okDev)
+            continue;
+        if (bestCard < 0 || card < bestCard || (card == bestCard && dev < bestDev)) {
+            bestCard = card;
+            bestDev = dev;
+        }
+    }
+
+    if (bestCard < 0)
+        return QString();
+    return QString("plughw:%1,%2").arg(bestCard).arg(bestDev);
+}
+
+QString MediaPage::mixerComplaint() const
+{
+    /*
+     * A MUTED CARD IS THE OTHER WAY TO HAVE NO SOUND, and it is not the player's
+     * to fix silently: unmuting behind the user's back is how a device ends up
+     * blaring in a quiet room.  Say it, on the row under the track, and leave the
+     * two volume keys to do the fixing.
+     */
+    int percent = -1;
+    bool muted = false;
+    if (!Volume::read(&percent, &muted))
+        return QString();
+    if (muted)
+        return tr("the output is muted -- press VOL+");
+    if (percent == 0)
+        return tr("the volume is at zero -- press VOL+");
+    return QString();
 }
 
 bool MediaPage::ffmpegHasAlsa() const
@@ -486,7 +991,7 @@ bool MediaPage::ffmpegHasAlsa() const
      * off an SD card with a cold page cache.  A first play after boot could
      * overrun that easily -- and the old code then cached the timeout as a
      * definite `no alsa muxer', for the lifetime of the process, on an ffmpeg
-     * that has the muxer.  That is the message the board was showing.
+     * that has the muxer.
      *
      * So: a long window, and an inconclusive probe is not an answer.  A timeout
      * leaves the cache unset and the next attempt asks again, by which point the
@@ -513,7 +1018,8 @@ bool MediaPage::ffmpegHasAlsa() const
 
     const QString out = QString::fromLocal8Bit(p.readAllStandardOutput())
                         + QString::fromLocal8Bit(p.readAllStandardError());
-    for (const QString &line : out.split('\n')) {
+    const QStringList lines = out.split('\n');
+    for (const QString &line : lines) {
         /* " DE alsa            ALSA audio output" -- the E is what matters. */
         const QString t = line.trimmed();
         if (!t.contains(QStringLiteral(" alsa")) && !t.startsWith(QStringLiteral("DE alsa"))
@@ -573,25 +1079,96 @@ double MediaPage::probeDuration(const QString &path) const
            + parts.at(2).toDouble();
 }
 
+QString MediaPage::probeTitle(const QString &path) const
+{
+    /*
+     * The tags, so the player shows "Blue Monday" and not "03 - bm (1).mp3".
+     *
+     * WITH the key printed and parsed by name, not with nokey=1: ffprobe emits
+     * only the tags that exist, in the order the container stores them, so two
+     * bare lines cannot be told apart -- a file with an artist and no title would
+     * put the artist where the title goes.
+     */
+    const QString ffprobe = firstExisting(QStringList()
+                                          << "/usr/bin/ffprobe" << "/bin/ffprobe");
+    if (ffprobe.isEmpty())
+        return QString();
+
+    QProcess p;
+    p.start(ffprobe, QStringList()
+                         << "-v" << "error"
+                         << "-show_entries" << "format_tags=title,artist"
+                         << "-of" << "default=noprint_wrappers=1"
+                         << path);
+    if (!p.waitForStarted(1500) || !p.waitForFinished(4000)) {
+        p.kill();
+        p.waitForFinished(500);
+        return QString();
+    }
+
+    QString title;
+    QString artist;
+    const QStringList lines = QString::fromUtf8(p.readAllStandardOutput()).split('\n');
+    for (const QString &line : lines) {
+        const QString t = line.trimmed();
+        if (t.startsWith(QStringLiteral("TAG:title=")))
+            title = t.mid(10).trimmed();
+        else if (t.startsWith(QStringLiteral("TAG:artist=")))
+            artist = t.mid(11).trimmed();
+    }
+
+    if (title.isEmpty())
+        return QString();
+    if (artist.isEmpty())
+        return title;
+    return artist + QStringLiteral(" - ") + title;
+}
+
+QStringList MediaPage::audioDecodeArgs(const QString &path, double startAt) const
+{
+    QStringList args;
+    args << "-nostdin" << "-hide_banner" << "-loglevel" << "error";
+    /*
+     * -ss BEFORE -i is the fast form: it jumps by the container index rather than
+     * decoding and throwing away everything up to the point, which on this CPU is
+     * the difference between instant and half a minute.
+     */
+    if (startAt > 0.0)
+        args << "-ss" << QString::number(startAt, 'f', 2);
+    args << "-i" << path
+         << "-vn"                       /* cover art is a video stream, and it is not wanted */
+         << "-map" << "0:a:0"
+         << "-f" << "s16le"
+         << "-ar" << QString::number(kRate) << "-ac" << "2" << "-";
+    return args;
+}
+
 /* ── video ───────────────────────────────────────────────────────────────── */
 
 void MediaPage::openVideo(const Entry &entry, double startAt)
 {
+    /* By value before anything is torn down: commitSeek() passes m_showing, and
+     * the assignment below would otherwise be reading a member it is writing. */
+    const Entry item = entry;
+
     if (ffmpegPath().isEmpty()) {
         emit toastRequested(tr("ffmpeg is not installed.\nInstall it from Packages."), 4000);
         return;
     }
 
-    stopPlayback();
+    /* A film takes the sound card, so the record has to come off first.  This is
+     * the one direction the asymmetry in onLeave() runs the other way. */
+    stopMusic();
+    stopVideo();
 
-    m_playing = entry;
+    m_showing = item;
     m_buffer.clear();
     m_framesShown = 0;
     m_framesDropped = 0;
     m_paused = false;
     m_note.clear();
-    if (m_duration <= 0.0 || startAt <= 0.0)
-        m_duration = probeDuration(entry.path);
+    if (m_videoDuration <= 0.0 || startAt <= 0.0)
+        m_videoDuration = probeDuration(item.path);
 
     /* Even dimensions: several of the scalers and every yuv420 path want them, and
      * an odd width is a whole class of "ffmpeg exited 1" that is not worth having. */
@@ -608,14 +1185,9 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
 
     QStringList args;
     args << "-nostdin" << "-hide_banner" << "-loglevel" << "error" << "-re";
-    /*
-     * -ss BEFORE -i is the fast form: it jumps by the container index rather than
-     * decoding and throwing away everything up to the point, which on this CPU is
-     * the difference between instant and half a minute.
-     */
     if (startAt > 0.0)
         args << "-ss" << QString::number(startAt, 'f', 2);
-    args << "-i" << entry.path
+    args << "-i" << item.path
          << "-map" << "0:v:0"
          << "-vf" << filter
          << "-f" << "rawvideo" << "-pix_fmt" << "bgra";
@@ -626,13 +1198,13 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
      * will fix it; no muxer is an ffmpeg matter and the card is fine.  Reporting
      * either as the other is what sends someone rebuilding the wrong half.
      */
-    const bool card = hasSoundCard();
-    const bool alsa = card && ffmpegHasAlsa();
+    m_device = alsaDevice();
+    const bool alsa = !m_device.isEmpty() && ffmpegHasAlsa();
     if (alsa) {
         /* pipe:1 has to be named before the second output, and the audio map is
          * optional -- the trailing ? is what keeps a silent clip from failing. */
         args << "pipe:1"
-             << "-map" << "0:a:0?" << "-f" << "alsa" << "default";
+             << "-map" << "0:a:0?" << "-f" << "alsa" << m_device;
     } else {
         args << "-an" << "pipe:1";
     }
@@ -644,7 +1216,7 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
             this, &MediaPage::onDecoderFinished);
     m_decoder->start(ffmpegPath(), args);
 
-    if (!card) {
+    if (m_device.isEmpty()) {
         /*
          * Nothing to play into, so neither chain is started -- a second ffmpeg
          * feeding an aplay that cannot open a device is two processes failing in
@@ -659,29 +1231,30 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
          * drift is bounded by the sound card's buffer rather than unbounded, and
          * this only happens on an ffmpeg without the alsa muxer.
          */
-        const QString aplay = firstExisting(QStringList()
-                                            << "/usr/bin/aplay" << "/bin/aplay");
+        const QString aplay = aplayPath();
         if (!aplay.isEmpty()) {
-            QStringList sideArgs;
-            sideArgs << "-nostdin" << "-hide_banner" << "-loglevel" << "error";
-            if (startAt > 0.0)
-                sideArgs << "-ss" << QString::number(startAt, 'f', 2);
-            sideArgs << "-i" << entry.path
-                     << "-vn" << "-f" << "s16le"
-                     << "-ar" << "44100" << "-ac" << "2" << "-";
-
-            m_audioSide = new QProcess(this);
-            m_aplay = new QProcess(this);
-            m_audioSide->setStandardOutputProcess(m_aplay);
-            m_audioSide->start(ffmpegPath(), sideArgs);
-            m_aplay->start(aplay, QStringList() << "-q" << "-f" << "cd" << "-");
+            m_videoAudio = new QProcess(this);
+            m_videoAplay = new QProcess(this);
+            m_videoAudio->setStandardOutputProcess(m_videoAplay);
+            connect(m_videoAplay, &QProcess::readyReadStandardError,
+                    this, &MediaPage::onAplayStderr);
+            m_videoAudio->start(ffmpegPath(), audioDecodeArgs(item.path, startAt));
+            m_videoAplay->start(aplay, QStringList()
+                                           << "-q" << "-D" << m_device
+                                           << "-t" << "raw" << "-f" << "S16_LE"
+                                           << "-r" << QString::number(kRate) << "-c" << "2"
+                                           << "-");
             m_note = tr("audio on a separate clock -- no alsa muxer in ffmpeg");
+        } else {
+            m_note = tr("aplay is not installed (alsa-utils)");
         }
+    } else {
+        m_note = mixerComplaint();
     }
 
     m_clock.restart();
     m_pausedAt = (qint64)(startAt * 1000.0);
-    setMode(ModeVideo);
+    setView(ViewVideo);
     update();
 }
 
@@ -721,14 +1294,14 @@ void MediaPage::readFrames()
 
 void MediaPage::onDecoderFinished()
 {
-    if (!m_decoder)
+    if (!m_decoder || sender() != m_decoder)
         return;
 
     const QString err = QString::fromLocal8Bit(m_decoder->readAllStandardError()).trimmed();
     const int code = m_decoder->exitCode();
 
     if (code != 0 && !err.isEmpty())
-        m_note = err.section('\n', 0, 1);
+        m_note = tidyChildError(err);
     else if (code != 0)
         m_note = tr("ffmpeg exited %1").arg(code);
     else
@@ -740,98 +1313,244 @@ void MediaPage::onDecoderFinished()
     update();
 }
 
-/* ── music ───────────────────────────────────────────────────────────────── */
+/* ── the queue ───────────────────────────────────────────────────────────── */
 
-void MediaPage::openAudio(const Entry &entry, double startAt)
+void MediaPage::queueDirectory(const QString &dir, const QString &startWith)
 {
+    /* Both taken by value at the top: populate() is not called from here, but
+     * startWith is an m_entries path in every current caller and a future one
+     * that repopulates first would find it dangling. */
+    const QString want = startWith;
+
+    m_queue.clear();
+    m_order.clear();
+    m_orderAt = -1;
+
+    QDir d(dir);
+    if (!d.exists())
+        return;
+
+    const QFileInfoList infos = d.entryInfoList(QDir::Files | QDir::NoDotAndDotDot,
+                                                QDir::Name | QDir::IgnoreCase);
+    for (const QFileInfo &info : infos) {
+        if (info.fileName().startsWith('.'))
+            continue;
+        if (kindFor(info) != KindAudio)
+            continue;
+        Entry e;
+        e.path = info.absoluteFilePath();
+        e.name = info.fileName();
+        e.kind = KindAudio;
+        e.size = info.size();
+        m_queue.append(e);
+    }
+    if (m_queue.isEmpty())
+        return;
+
+    reshuffle();   /* builds the order, identity or permuted */
+
+    for (int i = 0; i < m_order.size(); ++i) {
+        if (m_queue[m_order[i]].path != want)
+            continue;
+        m_orderAt = i;
+        break;
+    }
+    if (m_orderAt < 0)
+        m_orderAt = 0;
+}
+
+void MediaPage::reshuffle()
+{
+    /* Which track is playing, as an index into m_queue -- read BEFORE the order is
+     * rebuilt, because m_orderAt means nothing across the rebuild. */
+    const int playing = queuedIndex();
+
+    m_order.clear();
+    m_order.reserve(m_queue.size());
+    for (int i = 0; i < m_queue.size(); ++i)
+        m_order.append(i);
+
+    if (m_shuffle) {
+        /* Fisher-Yates, with Qt's generator rather than <random>: it is seeded
+         * already, it is the one this program uses everywhere else, and a
+         * shuffle is not worth an extra header. */
+        for (int i = m_order.size() - 1; i > 0; --i) {
+            const int j = (int)QRandomGenerator::global()->bounded(i + 1);
+            const int t = m_order[i];
+            m_order[i] = m_order[j];
+            m_order[j] = t;
+        }
+    }
+
+    /* Land back on the same track wherever the permutation put it.  Turning
+     * shuffle on mid-album must not restart what you are listening to. */
+    m_orderAt = -1;
+    if (playing < 0)
+        return;
+    for (int i = 0; i < m_order.size(); ++i) {
+        if (m_order[i] != playing)
+            continue;
+        m_orderAt = i;
+        break;
+    }
+}
+
+int MediaPage::queuedIndex() const
+{
+    if (m_orderAt < 0 || m_orderAt >= m_order.size())
+        return -1;
+    const int i = m_order[m_orderAt];
+    return (i >= 0 && i < m_queue.size()) ? i : -1;
+}
+
+const MediaPage::Entry *MediaPage::queuedTrack() const
+{
+    const int i = queuedIndex();
+    return i < 0 ? nullptr : &m_queue[i];
+}
+
+void MediaPage::playQueued(double startAt)
+{
+    const Entry *at = queuedTrack();
+    if (!at)
+        return;
+    /* By value: everything below can touch m_queue, and a pointer into a QVector
+     * that reallocates is the same use-after-free the header warns about. */
+    const Entry track = *at;
+
     const QString ff = ffmpegPath();
-    const QString aplay = firstExisting(QStringList() << "/usr/bin/aplay" << "/bin/aplay");
-    if (ff.isEmpty() || aplay.isEmpty()) {
+    const QString ap = aplayPath();
+    if (ff.isEmpty() || ap.isEmpty()) {
         emit toastRequested(ff.isEmpty() ? tr("ffmpeg is not installed")
                                          : tr("aplay is not installed (alsa-utils)"), 4000);
         return;
     }
 
-    stopPlayback();
+    m_device = alsaDevice();
+    if (m_device.isEmpty()) {
+        m_note = tr("no sound card on this device");
+        emit toastRequested(m_note, 4000);
+        rebuild();
+        return;
+    }
 
-    m_playing = entry;
+    /* Replace the chain without touching the queue position -- this is a restart,
+     * not a stop, and stopMusic() would clear the very index we are playing. */
+    m_stopping = true;
+    endProcess(m_music);
+    endProcess(m_aplay);
+    m_stopping = false;
+
     m_paused = false;
-    m_note.clear();
-    if (m_duration <= 0.0 || startAt <= 0.0)
-        m_duration = probeDuration(entry.path);
+    m_note = mixerComplaint();
+    if (startAt <= 0.0 || m_duration <= 0.0) {
+        m_duration = probeDuration(track.path);
+        m_trackTitle = probeTitle(track.path);
+    }
 
-    /*
-     * Raw s16le at 44.1 kHz into `aplay -f cd' rather than a WAV stream: a WAV
-     * header written to a pipe has to lie about its length, and while aplay copes
-     * with that, the raw form has no header to be wrong.
-     */
     m_music = new QProcess(this);
     m_aplay = new QProcess(this);
+    /*
+     * Raw s16le into `aplay -t raw' rather than a WAV stream: a WAV header written
+     * to a pipe has to lie about its length, and while aplay copes with that, the
+     * raw form has no header to be wrong.  Every field aplay needs is on its own
+     * command line instead.
+     */
     m_music->setStandardOutputProcess(m_aplay);
     connect(m_music, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
-            this, [this](int code, QProcess::ExitStatus) {
-                if (code != 0) {
-                    const QString err = m_music
-                        ? QString::fromLocal8Bit(m_music->readAllStandardError()).trimmed()
-                        : QString();
-                    m_note = err.isEmpty() ? tr("ffmpeg exited %1").arg(code)
-                                           : err.section('\n', 0, 0);
-                } else {
-                    m_note = tr("end of track");
-                }
-                rebuild();
-            });
+            this, &MediaPage::onMusicFinished);
+    /*
+     * APLAY'S STDERR IS READ.  It was not, which is why a card that would not open
+     * produced silence and no message anywhere: aplay died, ffmpeg took EPIPE, and
+     * the only trace of the reason was in a pipe nobody was holding.
+     */
+    connect(m_aplay, &QProcess::readyReadStandardError, this, &MediaPage::onAplayStderr);
 
-    QStringList args;
-    args << "-nostdin" << "-hide_banner" << "-loglevel" << "error";
-    if (startAt > 0.0)
-        args << "-ss" << QString::number(startAt, 'f', 2);
-    args << "-i" << entry.path
-         << "-vn" << "-f" << "s16le"
-         << "-ar" << "44100" << "-ac" << "2" << "-";
-
-    m_music->start(ff, args);
-    m_aplay->start(aplay, QStringList() << "-q" << "-f" << "cd" << "-");
+    m_music->start(ff, audioDecodeArgs(track.path, startAt));
+    m_aplay->start(ap, QStringList()
+                           << "-q" << "-D" << m_device
+                           << "-t" << "raw" << "-f" << "S16_LE"
+                           << "-r" << QString::number(kRate) << "-c" << "2"
+                           << "-");
 
     m_clock.restart();
     m_pausedAt = (qint64)(startAt * 1000.0);
-    setMode(ModeAudio);
+
     rebuild();
+    emit titleChanged();
 }
 
-/* ── transport ───────────────────────────────────────────────────────────── */
-
-void MediaPage::stopPlayback()
+void MediaPage::advance(int delta, bool automatic)
 {
-    /* SIGCONT first: a stopped process ignores SIGTERM until it runs again, and a
-     * paused player that is then closed would otherwise stay in the process table
-     * holding the sound card. */
-    QProcess *const all[] = { m_decoder, m_audioSide, m_aplay, m_music };
-    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); ++i) {
-        QProcess *p = all[i];
-        if (!p || p->state() == QProcess::NotRunning)
-            continue;
-        if (p->processId() > 0)
-            ::kill((pid_t)p->processId(), SIGCONT);
-        p->terminate();
-    }
-    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); ++i) {
-        QProcess *p = all[i];
-        if (!p)
-            continue;
-        if (p->state() != QProcess::NotRunning && !p->waitForFinished(400))
-            p->kill();
-        p->deleteLater();
+    if (m_order.isEmpty()) {
+        stopMusic();
+        return;
     }
 
-    m_decoder = nullptr;
-    m_audioSide = nullptr;
-    m_aplay = nullptr;
-    m_music = nullptr;
-    m_buffer.clear();
-    m_frame = QImage();
-    m_paused = false;
+    /* Repeat-one acts on a track that ENDED BY ITSELF and on nothing else --
+     * pressing Next on a repeat-one track has to move, or the button is a lie. */
+    if (automatic && m_repeat == RepeatOne) {
+        playQueued(0.0);
+        return;
+    }
+
+    int next = m_orderAt + delta;
+    if (next < 0 || next >= m_order.size()) {
+        if (automatic && m_repeat == RepeatOff) {
+            stopMusic();
+            m_note = tr("end of folder");
+            rebuild();
+            return;
+        }
+        /* Off either end, wrap.  A deliberate press at the last track wraps even
+         * with repeat off: the alternative is a button that does nothing and says
+         * nothing, and the queue is one directory, not a lifetime of listening. */
+        next = (next < 0) ? m_order.size() - 1 : 0;
+    }
+
+    m_orderAt = next;
+    playQueued(0.0);
 }
+
+void MediaPage::stopMusic()
+{
+    m_stopping = true;
+    endProcess(m_music);
+    endProcess(m_aplay);
+    m_stopping = false;
+
+    /* The queue is kept, the POSITION is not: nothing is playing, so nothing is
+     * "now playing", and every row and badge that asks queuedTrack() goes quiet in
+     * one place.  This is the stop the old page did not have. */
+    m_orderAt = -1;
+    m_paused = false;
+    m_pausedAt = 0;
+    m_duration = 0.0;
+    m_trackTitle.clear();
+    m_seekTimer->stop();
+    m_seekTarget = -1.0;
+
+    if (m_view == ViewPlayer)
+        setView(ViewBrowse);
+    else
+        rebuild();
+    emit titleChanged();
+}
+
+void MediaPage::stopVideo()
+{
+    endProcess(m_decoder);
+    endProcess(m_videoAudio);
+    endProcess(m_videoAplay);
+    m_buffer.clear();
+    m_framesShown = 0;
+    m_framesDropped = 0;
+    m_videoDuration = 0.0;
+    m_seekTimer->stop();
+    m_seekTarget = -1.0;
+}
+
+/* ── the transport ───────────────────────────────────────────────────────── */
 
 void MediaPage::togglePause()
 {
@@ -842,7 +1561,7 @@ void MediaPage::togglePause()
      * a shell, and it resumes with the buffers intact.
      */
     const int sig = m_paused ? SIGCONT : SIGSTOP;
-    QProcess *const all[] = { m_decoder, m_audioSide, m_aplay, m_music };
+    QProcess *const all[] = { m_decoder, m_videoAudio, m_videoAplay, m_aplay, m_music };
     bool any = false;
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); ++i) {
         QProcess *p = all[i];
@@ -854,101 +1573,259 @@ void MediaPage::togglePause()
     if (!any)
         return;
 
-    if (m_paused) {
+    if (m_paused)
         m_clock.restart();
-    } else {
+    else
         m_pausedAt += m_clock.elapsed();
-    }
     m_paused = !m_paused;
+
     rebuild();
     update();
 }
 
-void MediaPage::seek(int seconds)
+double MediaPage::position() const
 {
-    if (m_mode != ModeVideo && m_mode != ModeAudio)
+    return (m_pausedAt + (m_paused ? 0 : m_clock.elapsed())) / 1000.0;
+}
+
+void MediaPage::seekTo(double seconds)
+{
+    if (!musicLive() && !videoLive())
         return;
 
-    /* A pipe cannot seek, so seeking is opening the file again somewhere else --
-     * which is exactly what the openers already do, given a start time. */
-    const double now = (m_pausedAt + (m_paused ? 0 : m_clock.elapsed())) / 1000.0;
-    double target = now + seconds;
-    if (m_duration > 0.0)
-        target = qBound(0.0, target, qMax(0.0, m_duration - 1.0));
+    const double total = videoLive() ? m_videoDuration : m_duration;
+    double target = seconds;
+    if (total > 0.0)
+        target = qBound(0.0, target, qMax(0.0, total - 1.0));
     else
         target = qMax(0.0, target);
 
-    const Entry entry = m_playing;
-    const int mode = m_mode;
+    /*
+     * The clock moves NOW and the process restarts in a third of a second.  Both
+     * halves matter: without the first the slider snaps back under the thumb that
+     * is dragging it, and without the second a held D-pad spawns one ffmpeg per
+     * key repeat on a CPU that takes a visible fraction of a second to load
+     * libavcodec, throwing all but the last away before it decodes a frame.
+     */
+    m_seekTarget = target;
+    m_pausedAt = (qint64)(target * 1000.0);
+    m_clock.restart();
+    m_seekTimer->start();
 
-    if (mode == ModeVideo)
-        openVideo(entry, target);
-    else
-        openAudio(entry, target);
+    if (m_view == ViewVideo)
+        update();
+}
 
-    m_note = tr("seek to %1").arg(humanTime((int)target));
+void MediaPage::seekBy(int seconds)
+{
+    /* From where the slider says we are, which during a pending seek is the target
+     * and not the process's real position -- so two quick presses of Right move
+     * twenty seconds rather than ten. */
+    const double from = (m_seekTarget >= 0.0 && m_seekTimer->isActive()) ? m_seekTarget
+                                                                        : position();
+    seekTo(from + seconds);
+}
+
+void MediaPage::commitSeek()
+{
+    if (m_seekTarget < 0.0)
+        return;
+    const double target = m_seekTarget;
+    m_seekTarget = -1.0;
+
+    /* A pipe cannot seek, so seeking is opening the file again somewhere else --
+     * which is exactly what the openers already do, given a start time. */
+    if (videoLive()) {
+        const Entry film = m_showing;
+        openVideo(film, target);
+    } else if (musicLive()) {
+        playQueued(target);
+    }
+}
+
+void MediaPage::onMusicFinished(int code)
+{
+    if (m_stopping || sender() != m_music)
+        return;
+
+    /* Everything both children said, read BEFORE either is reaped. */
+    QString err = QString::fromLocal8Bit(m_music->readAllStandardError()).trimmed();
+    if (m_aplay) {
+        const QString ap = QString::fromLocal8Bit(m_aplay->readAllStandardError()).trimmed();
+        if (!ap.isEmpty())
+            err = ap;   /* aplay's complaint is the interesting one; ffmpeg only got EPIPE */
+    }
+    /* A child killed by a signal reports exitCode 0 -- SIGPIPE from an aplay that
+     * died first is the case that matters, and reading it as a clean end of track
+     * would advance the queue through every file in the folder at pipe speed. */
+    const bool crashed = (m_music->exitStatus() != QProcess::NormalExit);
+
+    endProcess(m_music);
+    endProcess(m_aplay);
+
+    if (code != 0 || crashed) {
+        m_note = err.isEmpty() ? tr("ffmpeg exited %1").arg(code) : tidyChildError(err);
+        /*
+         * A FAILURE STOPS THE QUEUE.  Advancing would run the same broken pipeline
+         * over every track in the directory, one process pair per file, and the
+         * message on the glass would be replaced by the next identical one before
+         * anybody read it.
+         */
+        m_orderAt = -1;
+        m_paused = false;
+        if (m_view == ViewPlayer)
+            setView(ViewBrowse);
+        else
+            rebuild();
+        emit titleChanged();
+        return;
+    }
+
+    advance(1, true);
+}
+
+void MediaPage::onAplayStderr()
+{
+    QProcess *const p = qobject_cast<QProcess *>(sender());
+    if (!p)
+        return;
+    const QString text = QString::fromLocal8Bit(p->readAllStandardError()).trimmed();
+    if (text.isEmpty())
+        return;
+    /* Straight onto the glass.  This is the message that did not exist. */
+    m_note = tidyChildError(text);
+    layOutList();
     update();
 }
 
 void MediaPage::tick()
 {
-    if (m_mode == ModeAudio || m_mode == ModeVideo)
+    if (m_view == ViewVideo) {
         update();
+        return;
+    }
+
+    if (m_view == ViewPlayer) {
+        /*
+         * The seek row IN PLACE rather than a whole rebuild: setRows() resets the
+         * scroll, and doing that twice a second under a thumb that is holding the
+         * list still is the sort of thing that makes a UI feel broken without
+         * anybody being able to say why.
+         */
+        const QVector<ListRow> &rows = m_list->rows();
+        for (int i = 0; i < rows.size(); ++i) {
+            if (rows[i].id != RowSeek)
+                continue;
+            ListRow r = rows[i];
+            if (r.kind == ListRow::Slider) {
+                r.value = qBound(r.minimum, (int)position(), r.maximum);
+                r.valueText = humanTime(r.value) + " / " + humanTime(r.maximum);
+            } else {
+                r.detail = humanTime((int)position());
+            }
+            m_list->updateRow(i, r);
+            break;
+        }
+        layOutList();
+        return;
+    }
+
+    if (m_view == ViewBrowse && musicLive()) {
+        const QVector<ListRow> &rows = m_list->rows();
+        if (!rows.isEmpty() && rows[0].id == RowNowPlaying) {
+            const Entry *track = queuedTrack();
+            if (track) {
+                ListRow r = rows[0];
+                QString clock = humanTime((int)position());
+                if (m_duration > 0.0)
+                    clock += " / " + humanTime((int)m_duration);
+                r.detail = clock + "   " + tr("open the player");
+                m_list->updateRow(0, r);
+            }
+        }
+    }
+    layOutList();
 }
 
 /* ── input ───────────────────────────────────────────────────────────────── */
 
 bool MediaPage::handleNav(int action)
 {
-    if (m_mode == ModeImage) {
+    if (m_view == ViewImage) {
         switch (action) {
         case Joypad::NavLeft:  stepImage(-1); return true;
         case Joypad::NavRight: stepImage(1); return true;
         case Joypad::NavBack:
         case Joypad::NavOk:
             m_frame = QImage();
-            setMode(ModeBrowse);
+            setView(ViewBrowse);
             return true;
         default:
             return true;   /* Nothing else does anything while a picture is up. */
         }
     }
 
-    if (m_mode == ModeVideo) {
+    if (m_view == ViewVideo) {
         switch (action) {
-        case Joypad::NavOk:    togglePause(); return true;
-        case Joypad::NavLeft:  seek(-10); return true;
-        case Joypad::NavRight: seek(10); return true;
+        case Joypad::NavOk:
+        case Joypad::NavMenu:
+            togglePause();
+            return true;
+        case Joypad::NavLeft:  seekBy(-10); return true;
+        case Joypad::NavRight: seekBy(10); return true;
+        case Joypad::NavUp:    seekBy(60); return true;
+        case Joypad::NavDown:  seekBy(-60); return true;
         case Joypad::NavBack:
-            stopPlayback();
-            setMode(ModeBrowse);
+            stopVideo();
+            m_frame = QImage();
+            m_note.clear();
+            setView(ViewBrowse);
             return true;
         default:
             return true;
         }
     }
 
-    /* Browsing -- and possibly with music playing, which keeps its own keys on the
-     * shoulders so up and down still walk the list. */
+    if (m_view == ViewPlayer) {
+        switch (action) {
+        case Joypad::NavUp:    m_list->step(-1); return true;
+        case Joypad::NavDown:  m_list->step(1); return true;
+        case Joypad::NavOk:    m_list->press(); return true;
+        case Joypad::NavLeft:
+        case Joypad::NavRight: {
+            /*
+             * The row first -- the seek slider and the shuffle switch both want
+             * Left/Right, and adjust() says whether it took them.  Anywhere else
+             * on the list they seek anyway, so the transport is never more than
+             * one press away wherever the selection happens to be.
+             */
+            const int delta = (action == Joypad::NavLeft) ? -1 : 1;
+            if (!m_list->adjust(delta))
+                seekBy(delta * 10);
+            return true;
+        }
+        case Joypad::NavMenu:
+            togglePause();
+            return true;
+        case Joypad::NavBack:
+            setView(ViewBrowse);
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    /* Browsing.  LEFT AND RIGHT ARE NOT TAKEN HERE: they are how the shell moves
+     * between root pages, and the old card stole them for a transport whose
+     * process had usually already exited.  The transport lives in the player view,
+     * one press away on the row at the top. */
     switch (action) {
     case Joypad::NavUp:    m_list->step(-1); return true;
     case Joypad::NavDown:  m_list->step(1); return true;
     case Joypad::NavOk:    m_list->press(); return true;
-    case Joypad::NavLeft:
-        if (m_mode == ModeAudio) {
-            seek(-10);
-            return true;
-        }
-        return false;
-    case Joypad::NavRight:
-        if (m_mode == ModeAudio) {
-            seek(10);
-            return true;
-        }
-        return false;
     case Joypad::NavMenu:
-        if (m_mode == ModeAudio) {
-            togglePause();
+        if (musicLive() && queuedTrack()) {
+            setView(ViewPlayer);
             return true;
         }
         return false;
@@ -975,7 +1852,7 @@ void MediaPage::paintEvent(QPaintEvent *)
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
 
-    if (m_mode == ModeImage || m_mode == ModeVideo) {
+    if (m_view == ViewImage || m_view == ViewVideo) {
         p.fillRect(rect(), QColor(8, 9, 14));
 
         if (!m_frame.isNull()) {
@@ -987,7 +1864,7 @@ void MediaPage::paintEvent(QPaintEvent *)
             /* No smooth transform: bilinear on a full 640x480 frame costs more than
              * the decode does on this CPU, and ffmpeg already scaled the video. */
             p.drawImage(at, m_frame);
-        } else if (m_mode == ModeVideo) {
+        } else if (m_view == ViewVideo) {
             p.setPen(Theme::ink2());
             p.setFont(Theme::font(14));
             p.drawText(rect(), Qt::AlignCenter, tr("decoding..."));
@@ -996,20 +1873,18 @@ void MediaPage::paintEvent(QPaintEvent *)
         /* A strip along the foot with the name, the clock and any complaint. */
         const int barH = 34;
         const QRect bar(0, height() - barH, width(), barH);
-        QColor wash(8, 9, 14, 205);
-        p.fillRect(bar, wash);
+        p.fillRect(bar, QColor(8, 9, 14, 205));
 
         p.setFont(Theme::font(12));
         p.setPen(Theme::ink());
         p.drawText(bar.adjusted(10, 0, -10, 0), Qt::AlignLeft | Qt::AlignVCenter,
-                   m_playing.name);
+                   m_showing.name);
 
         QString right;
-        if (m_mode == ModeVideo) {
-            const int pos = (int)((m_pausedAt + (m_paused ? 0 : m_clock.elapsed())) / 1000);
-            right = humanTime(pos);
-            if (m_duration > 0.0)
-                right += " / " + humanTime((int)m_duration);
+        if (m_view == ViewVideo) {
+            right = humanTime((int)position());
+            if (m_videoDuration > 0.0)
+                right += " / " + humanTime((int)m_videoDuration);
             if (m_paused)
                 right = tr("paused") + "  " + right;
             if (m_framesDropped > 0)
@@ -1021,7 +1896,7 @@ void MediaPage::paintEvent(QPaintEvent *)
                 if (m_entries[i].kind != KindImage)
                     continue;
                 ++of;
-                if (m_entries[i].path == m_playing.path)
+                if (m_entries[i].path == m_showing.path)
                     at = of;
             }
             right = QString("%1 / %2   %3x%4").arg(at).arg(of)
@@ -1041,38 +1916,42 @@ void MediaPage::paintEvent(QPaintEvent *)
         return;
     }
 
-    /* Browsing. */
+    /* The browser and the player both live in the sheet. */
     const QRectF card(Theme::Margin, Theme::Margin,
                       width() - 2.0 * Theme::Margin, height() - 2.0 * Theme::Margin);
 
-    QString right = m_dir;
-    const QString home = QDir::homePath();
-    if (right.startsWith(home))
-        right = "~" + right.mid(home.size());
-    if (right.size() > 34)
-        right = "..." + right.right(31);
+    QString heading = tr("Media");
+    QString right;
 
-    paintSheet(p, card, tr("Media"), right);
+    if (m_view == ViewPlayer) {
+        heading = tr("Now playing");
+        if (!m_order.isEmpty() && m_orderAt >= 0)
+            right = QString("%1 / %2").arg(m_orderAt + 1).arg(m_order.size());
+        if (m_shuffle)
+            right += "   " + tr("shuffled");
+    } else {
+        right = m_dir;
+        const QString home = QDir::homePath();
+        if (right.startsWith(home))
+            right = "~" + right.mid(home.size());
+        if (right.size() > 34)
+            right = "..." + right.right(31);
+    }
 
-    if (m_mode == ModeAudio) {
-        /* The now-playing line, drawn over the foot of the sheet so a record that
-         * is playing is visible while the list is being walked. */
-        const int barH = 26;
-        const QRectF bar(card.x() + 6, card.bottom() - barH - 6, card.width() - 12, barH);
-        p.setBrush(QColor(28, 30, 42, 235));
-        p.setPen(QPen(Theme::separator(), 1.0));
-        p.drawRoundedRect(bar, 8, 8);
+    paintSheet(p, card, heading, right);
 
-        const int pos = (int)((m_pausedAt + (m_paused ? 0 : m_clock.elapsed())) / 1000);
-        p.setFont(Theme::font(11));
-        p.setPen(m_paused ? Theme::orange() : Theme::green());
-        p.drawText(bar.adjusted(10, 0, -10, 0), Qt::AlignLeft | Qt::AlignVCenter,
-                   (m_paused ? tr("paused") : tr("playing")) + "  " + m_playing.name);
-
-        QString clock = humanTime(pos);
-        if (m_duration > 0.0)
-            clock += " / " + humanTime((int)m_duration);
-        p.setPen(Theme::ink3());
-        p.drawText(bar.adjusted(10, 0, -10, 0), Qt::AlignRight | Qt::AlignVCenter, clock);
+    /*
+     * THE NOTE IS PAINTED IN EVERY VIEW NOW.  It used to be computed by the music
+     * chain and painted only over a picture or a film, so an aplay that could not
+     * open the card wrote its reason into a member that the browse view never
+     * looked at.  That is the whole of "no audio and no message".
+     */
+    if (!m_note.isEmpty()) {
+        const QRectF strip(card.x() + 12, card.bottom() - 26, card.width() - 24, 20);
+        const QFont small = Theme::font(11);
+        p.setFont(small);
+        p.setPen(Theme::orange());
+        p.drawText(strip, Qt::AlignLeft | Qt::AlignVCenter,
+                   QFontMetrics(small).elidedText(m_note, Qt::ElideRight, (int)strip.width()));
     }
 }
