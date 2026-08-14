@@ -1,115 +1,66 @@
-usb: musb: mediatek: support the MT6592 controller
+usb: musb: mediatek: program the toggle registers after phy_init()
 
-MT6592 has one Mentor MUSBMHDRC dual-role core at 0x11200000 and no
-EHCI, OHCI or XHCI anywhere on the SoC, so this glue is the only way the
-board gets USB at all.  Almost all of it already fits.  Verified against
-the stock MT6592 Android kernel (3.10.72) that ships on this hardware,
-register by register:
+mtk_musb_init() programs MUSB_TXTOGEN and MUSB_RXTOGEN before calling
+phy_init().  That is safe only where something other than the PHY driver
+has already ungated the controller.  On MT6592 the USB MAC and the U2
+PHY are both behind the PERI clock gate at 0x10003010 and the PHY
+driver's .init is what clears it, which makes those two writes an APB
+access to a gated peripheral -- on MediaTek that does not fault, it
+stalls the bus until the watchdog resets the board.
 
-  - the interrupt is GIC INTID 96.  mt_usb_init() sets musb->nIrq with a
-    plain "mov r3, #96; str r3, [r4, #0x290]", and the device tree cell
-    <0 64 8> that names it cross-checks against the same image's UART0
-    at INTID 115 and Mali_GP at INTID 234, both of which this board's
-    device tree already had right.
-  - the L1 interrupt aggregator is there and is at the offsets this file
-    already uses: mt_usb_init() writes 0xf to mregs + 0xa4, and the stock
-    ISR loads mregs + 0xa0 and mregs + 0xa4 and ANDs them, which is
-    mtk_musb_interrupt() exactly.
-  - MUSB_HSDMA_INTR at mregs + 0x200 takes 0xff0000ff, which is
-    DMA_INTR_STATUS_MSK | DMA_INTR_UNMASK_SET_MSK.
-  - the FIFO RAM is 8 KB, so MTK_MUSB_RAM_BITS = 11 is already right,
-    and the part has endpoints 1..8, so MTK_MUSB_MAX_EP_NUM = 8 is too.
-    mtk_musb_mode_cfg[] fits in 7808 of those 8192 bytes and is left
-    alone; it declines to use the 8th endpoint, which is a limit and not
-    a bug.
+It has been surviving because the stock LK leaves the USB gate open on
+its way out.  That is observable rather than assumed -- the J36 PHY
+driver prints the gate register on both sides of its own write, and on
+this board it reads
 
-Two things do not fit, and they are the whole patch.
+  PERI PDN0_STA 00000000 -> 00000000 (ungated mask 07ffffff); USB2.0 on
 
-1. The register layout.
+i.e. already clear before anything in Linux touched it.  But an open
+gate at hand-over is an accident of one bootloader and not a contract,
+and the toggle registers are only consulted during transfers, so moving
+the writes below phy_init()/phy_power_on() is later than necessary on
+every other SoC and too early on none.
 
-   MediaTek added the TXTOG/RXTOG toggle block at 0x80..0x87 in the
-   MT2701/MT7623 generation, and relocated the multipoint BUSCTL block
-   to 0x480 to make room for it.  MT6592 predates both: its musb driver
-   in the stock kernel touches no address in 0x80..0x87 and no address
-   of the form 0x480 + 8 * epnum, while agreeing with this file on
-   everything listed above.  So on MT6592 the toggle registers do not
-   exist and BUSCTL is still at the stock MUSB base of 0x80.
+WHAT THIS PATCH USED TO ALSO DO, AND WHY THE BOARD DELETED IT.
 
-   Left uncorrected this is silent and total.  musb_core writes every
-   device's function address through io.busctl_offset, so with the base
-   at 0x480 each SET_ADDRESS is followed by traffic still aimed at
-   address 0, and nothing on the port enumerates -- no mass storage, no
-   HID, no hub -- with no error logged anywhere, because every write
-   lands in a hole and every read returns whatever the hole returns.
+It carried a second and much larger change: a per-compatible variant
+that gave MT6592 its own musb_platform_ops with .busctl_offset,
+.get_toggle and .set_toggle left out, so that musb_core fell back to
+musb_default_busctl_offset() and put the multipoint BUSCTL block at the
+stock MUSB base of 0x80 instead of the 0x480 mediatek.c uses.  The
+reasoning was that MediaTek added the TXTOG/RXTOG block at 0x80..0x87 in
+the MT2701/MT7623 generation and relocated BUSCTL to 0x480 to make room
+for it, that MT6592 predates both, and that the stock 3.10.72 kernel's
+musb driver touches neither range.
 
-   The fix is to stop overriding what musb_core already does correctly.
-   A variant selected on the "mediatek,mt6592-musb" compatible omits
-   .busctl_offset, .get_toggle and .set_toggle, and musb_core falls back
-   to musb_default_busctl_offset() -- 0x80 + 8 * epnum + offset -- and
-   to the default software toggle handlers, which is how every MUSB
-   without MediaTek's toggle block has always been driven.
+The stock kernel not touching a register is not the same as the register
+not being there, and that is where the inference was wrong.  The J36 PHY
+driver was given a layout probe that settles it by writing to the
+hardware -- a pattern to ep0's TXFUNCADDR at both candidate bases, read
+back, restored -- and on this board it reports
 
-2. The order of the first controller access.
+  MUSB multipoint block is at 0x480 (0x080 read back 00): the MT2701
+  layout, so linux/0003-musb-mediatek-mt6592.patch has it wrong and
+  should be dropped
 
-   mtk_musb_init() programmed MUSB_TXTOGEN and MUSB_RXTOGEN before
-   calling phy_init().  That is safe only where something other than the
-   PHY driver has already ungated the controller.  On MT6592 the USB MAC
-   and the U2 PHY are both behind the PERI clock gate at 0x10003010 and
-   the PHY driver's .init is what clears it, which makes those two
-   writes an APB access to a gated peripheral -- on MediaTek that does
-   not fault, it stalls the bus until the watchdog resets the board.  It
-   has been surviving only because the stock LK leaves the USB gate open
-   on its way out, which is an accident and not a contract.
+Both halves of that agree.  0x480 held the pattern, which only the
+MT2701 layout can do.  0x080 read back zero, which is what MUSB_RXTOG
+does when MUSB_RXTOGEN is still zero out of reset -- so the toggle block
+is there too, exactly as the relocation implies.  MT6592's MUSB is the
+MT2701 layout and mediatek.c had it right unmodified, so the variant,
+the second ops table and the of_match entry for "mediatek,mt6592-musb"
+are gone.  The device tree names that compatible first and
+"mediatek,mtk-musb" second, and the second is what binds now.
 
-   The toggle registers are only consulted during transfers, so moving
-   the writes below phy_init()/phy_power_on() is later than necessary on
-   every other SoC and too early on none.
+That leaves the toggle writes unconditional again, which they should be:
+this part has the registers.
 
 Signed-off-by: MixOS J36 Ultra bring-up
 ---
 diff --git a/drivers/usb/musb/mediatek.c b/drivers/usb/musb/mediatek.c
 --- a/drivers/usb/musb/mediatek.c
 +++ b/drivers/usb/musb/mediatek.c
-@@ -38,6 +38,30 @@
- #define DMA_INTR_UNMASK_SET_MSK	GENMASK(31, 24)
- 
- #define MTK_MUSB_CLKS_NUM	3
-+
-+/*
-+ * MT6592's MUSB is two generations older than the MT2701/MT7623 part this glue
-+ * was written against, and it differs in exactly two places, both of them
-+ * register layout.  It has no TXTOG/RXTOG toggle block at 0x80..0x87, and
-+ * because it does not, its multipoint BUSCTL block is still at the stock MUSB
-+ * base of 0x80 rather than relocated to 0x480 to make room for one.
-+ *
-+ * Both were read off the stock MT6592 Android kernel (3.10.72), which touches
-+ * neither 0x80..0x87 nor any 0x480 + 8 * epnum address anywhere in its musb
-+ * driver, while agreeing with this file byte for byte on everything else:
-+ * USB_L1INTM = 0xf at mregs + 0xa4, MUSB_HSDMA_INTR = 0xff0000ff at
-+ * mregs + 0x200, an ISR that ANDs L1INTS with L1INTM, an 8 KB FIFO RAM and
-+ * endpoints 1..8.
-+ *
-+ * Getting the busctl base wrong is silent and total.  musb_core would write
-+ * every device's function address to registers that do not decode, so each
-+ * SET_ADDRESS is followed by traffic to address 0 -- and nothing on the port
-+ * ever enumerates.  No disk, no mouse, no hub, and no error either.
-+ */
-+struct mtk_musb_variant {
-+	const struct musb_platform_ops *ops;
-+	bool has_toggle_regs;
-+};
- 
- struct mtk_glue {
- 	struct device *dev;
-@@ -50,6 +74,7 @@
- 	struct clk_bulk_data clks[MTK_MUSB_CLKS_NUM];
- 	enum usb_role role;
- 	struct usb_role_switch *role_sw;
-+	const struct mtk_musb_variant *variant;
- };
- 
- static int mtk_musb_clks_get(struct mtk_glue *glue)
-@@ -264,10 +289,6 @@
+@@ -264,10 +264,6 @@
  	musb->is_host = false;
  	musb->isr = mtk_musb_interrupt;
  
@@ -120,7 +71,7 @@ diff --git a/drivers/usb/musb/mediatek.c b/drivers/usb/musb/mediatek.c
  	if (musb->port_mode == MUSB_OTG) {
  		ret = mtk_otg_switch_init(glue);
  		if (ret)
-@@ -284,6 +305,20 @@
+@@ -284,6 +280,18 @@
  
  	phy_set_mode(glue->phy, glue->phy_mode);
  
@@ -133,80 +84,9 @@ diff --git a/drivers/usb/musb/mediatek.c b/drivers/usb/musb/mediatek.c
 +	 * toggle registers are only read during transfers, so programming them
 +	 * here instead is later than needed on every SoC and too early on none.
 +	 */
-+	if (glue->variant->has_toggle_regs) {
-+		musb_writew(musb->mregs, MUSB_TXTOGEN, MTK_TOGGLE_EN);
-+		musb_writew(musb->mregs, MUSB_RXTOGEN, MTK_TOGGLE_EN);
-+	}
++	musb_writew(musb->mregs, MUSB_TXTOGEN, MTK_TOGGLE_EN);
++	musb_writew(musb->mregs, MUSB_RXTOGEN, MTK_TOGGLE_EN);
 +
  #if defined(CONFIG_USB_INVENTRA_DMA)
  	musb_writel(musb->mregs, MUSB_HSDMA_INTR,
  		    DMA_INTR_STATUS_MSK | DMA_INTR_UNMASK_SET_MSK);
-@@ -359,9 +394,41 @@
- 	.clearb = mtk_musb_clearb,
- 	.clearw = mtk_musb_clearw,
- 	.busctl_offset = mtk_musb_busctl_offset,
-+	.set_mode = mtk_musb_set_mode,
-+};
-+
-+/*
-+ * MT6592.  Leaving .get_toggle, .set_toggle and .busctl_offset out is not a
-+ * loss of function: musb_core substitutes musb_default_get_toggle(),
-+ * musb_default_set_toggle() and musb_default_busctl_offset(), and the last of
-+ * those is 0x80 + 8 * epnum + offset, which is where this part's multipoint
-+ * block actually is.  The default toggle handlers keep the data toggle in
-+ * software off the endpoint's CSR, which is how every MUSB without MediaTek's
-+ * toggle block has always worked.
-+ */
-+static const struct musb_platform_ops mt6592_musb_ops = {
-+	.quirks = MUSB_DMA_INVENTRA,
-+	.init = mtk_musb_init,
-+	.exit = mtk_musb_exit,
-+#ifdef CONFIG_USB_INVENTRA_DMA
-+	.dma_init = musbhs_dma_controller_create_noirq,
-+	.dma_exit = musbhs_dma_controller_destroy,
-+#endif
-+	.clearb = mtk_musb_clearb,
-+	.clearw = mtk_musb_clearw,
- 	.set_mode = mtk_musb_set_mode,
- };
- 
-+static const struct mtk_musb_variant mtk_musb_default_variant = {
-+	.ops = &mtk_musb_ops,
-+	.has_toggle_regs = true,
-+};
-+
-+static const struct mtk_musb_variant mt6592_musb_variant = {
-+	.ops = &mt6592_musb_ops,
-+	.has_toggle_regs = false,
-+};
-+
- #define MTK_MUSB_MAX_EP_NUM	8
- #define MTK_MUSB_RAM_BITS	11
- 
-@@ -411,6 +478,9 @@
- 		return -ENOMEM;
- 
- 	glue->dev = dev;
-+	glue->variant = of_device_is_compatible(np, "mediatek,mt6592-musb") ?
-+			&mt6592_musb_variant : &mtk_musb_default_variant;
-+
- 	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
- 	if (!pdata)
- 		return -ENOMEM;
-@@ -425,7 +495,7 @@
- 		return ret;
- 
- 	pdata->config = &mtk_musb_hdrc_config;
--	pdata->platform_ops = &mtk_musb_ops;
-+	pdata->platform_ops = glue->variant->ops;
- 	pdata->mode = usb_get_dr_mode(dev);
- 
- 	if (IS_ENABLED(CONFIG_USB_MUSB_HOST))
-@@ -515,6 +585,7 @@
- 
- #ifdef CONFIG_OF
- static const struct of_device_id mtk_musb_match[] = {
-+	{.compatible = "mediatek,mt6592-musb",},
- 	{.compatible = "mediatek,mtk-musb",},
- 	{},
- };

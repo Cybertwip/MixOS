@@ -1,6 +1,55 @@
 #!/bin/bash
+# Bring the backlight up if the board came out of the bootloader dark.
+#
+# THE PATH USED TO BE ONE BOARD'S PATH.  It read
+# /sys/devices/platform/backlight/backlight/backlight/brightness -- the RG351MP's,
+# with the "backlight" that is the platform device, the one that is the class
+# directory and the one that is the device name all spelled out.  The J36 Ultra's
+# panel is driven by j36-mt6592-backlight at 1400a000.pwm and has no such path, so
+# on every J36 boot this printed
+#
+#     cat: /sys/devices/platform/backlight/backlight/backlight/brightness: No such file
+#     checkbrightonboot: line 3: [: -lt: unary operator expected
+#
+# to the console -- the second because `cat' failing left `[' with an empty first
+# word.  Both lines land on the panel during the splash, which is the other reason
+# this is worth fixing rather than ignoring: they are two of the seams in a boot
+# that is meant to show nothing but the splash.
+#
+# /sys/class/backlight is the interface both boards have and neither invented, so
+# there is no device branch here and no path to update when a third board arrives.
+# A board with no backlight class at all -- which is most of them, since a panel
+# whose brightness is fixed in hardware registers nothing -- leaves the loop
+# without ever entering it and exits 0, silently, which is the correct amount to
+# say about a knob that does not exist.
+shopt -s nullglob
 
-if [ $(cat /sys/devices/platform/backlight/backlight/backlight/brightness) -lt 2 ]; then
-   echo 45 > /sys/devices/platform/backlight/backlight/backlight/brightness
-fi
+for bl in /sys/class/backlight/*; do
+    [ -r "$bl/brightness" ] && [ -w "$bl/brightness" ] || continue
 
+    cur=$(cat "$bl/brightness" 2>/dev/null)
+    max=$(cat "$bl/max_brightness" 2>/dev/null)
+
+    # Both have to be numbers before they are compared.  This is the guard whose
+    # absence produced the "unary operator expected" above: an unreadable sysfs
+    # file gives an empty string, and `[ "" -lt 2 ]' is a syntax error rather than
+    # a false.
+    case "$cur$max" in ''|*[!0-9]*) continue ;; esac
+    [ "$max" -gt 0 ] || continue
+
+    # Only a panel that is effectively off.  Anything the bootloader or the
+    # dashboard has already set is left exactly as it is -- the J36's LK hands
+    # over at 1023 of 1023 and mixdash restores the user's own level a second
+    # later, and neither wants a number from here.
+    [ "$cur" -lt 2 ] || continue
+
+    # A fifth of full, rather than the literal 45 this used to write.  45 was a
+    # fifth of the RG351MP's 255 and is a barely visible 4% of the J36's 1023;
+    # the point is a panel you can see well enough to read the splash on, which
+    # is a proportion of the range and not a number.
+    want=$(( max / 5 ))
+    [ "$want" -gt 0 ] || want=1
+    echo "$want" > "$bl/brightness" 2>/dev/null
+done
+
+exit 0

@@ -1,9 +1,31 @@
 #!/bin/bash
-sudo chmod 777 /sys/class/gpio/export
+# Drive the A10 Mini's power LED off GPIO 77.
+#
+# GUARDED, BECAUSE THIS IS THE ONLY BOARD THAT HAS THAT GPIO.  The J36 Ultra has
+# no /sys/class/gpio at all -- the legacy sysfs GPIO interface is deprecated and
+# its kernel config is off -- so every line below failed there, five times per
+# boot, onto the console and therefore onto the panel mid-splash:
+#
+#     chmod: cannot access '/sys/class/gpio/export': No such file or directory
+#     fix_power_led: line 3: /sys/class/gpio/export: No such file or directory
+#     chmod: cannot access '/sys/class/gpio/gpio77/direction': ...
+#
+# The exit below is not a workaround for the J36; it is the condition that was
+# always implied.  Note also that the write at the end only ever happened on an
+# A10MINI, so on an RG351MP this whole script was already three chmods and an
+# export for a value nobody set.
+[ -w /sys/class/gpio/export ] || exit 0
+
+chmod 777 /sys/class/gpio/export
 echo 77 > /sys/class/gpio/export
-sudo chmod 777 /sys/class/gpio/gpio77/direction
-sudo echo out > /sys/class/gpio/gpio77/direction
-sudo chmod 777 /sys/class/gpio/gpio77/value
-if [[ "$(cat /home/virtua/.config/.DEVICE)" = "A10MINI" ]]; then
+
+[ -e /sys/class/gpio/gpio77/direction ] || exit 0
+chmod 777 /sys/class/gpio/gpio77/direction
+echo out > /sys/class/gpio/gpio77/direction
+chmod 777 /sys/class/gpio/gpio77/value
+
+if [[ "$(cat /home/virtua/.config/.DEVICE 2>/dev/null)" = "A10MINI" ]]; then
   echo 1 > /sys/class/gpio/gpio77/value
 fi
+
+exit 0

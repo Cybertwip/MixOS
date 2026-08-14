@@ -306,14 +306,16 @@ MODULE_PARM_DESC(vbus,
 		 "a self-powered hub, and use it if no cell is fitted, because "
 		 "the 5 V is a boost off VBAT and VBAT here is the system node.");
 
-static bool musb_probe_layout = true;
+static bool musb_probe_layout;
 module_param(musb_probe_layout, bool, 0444);
 MODULE_PARM_DESC(musb_probe_layout,
 		 "at power-on, write a pattern to TXFUNCADDR at both candidate "
 		 "multipoint bases (0x080 and 0x480) and report which one holds "
-		 "it, then restore. This is what says whether the busctl base in "
-		 "linux/0003-musb-mediatek-mt6592.patch is right. Runs before "
-		 "musb_core starts, so no transfer can be in flight.");
+		 "it, then restore. Off by default because it has already been "
+		 "run and answered: 0x480, the MT2701 layout mediatek.c assumes "
+		 "unmodified. Turn it back on to re-ask on a board revision that "
+		 "does not enumerate. Runs before musb_core starts, so no "
+		 "transfer can be in flight.");
 
 struct j36_usb_phy {
 	struct device *dev;
@@ -563,6 +565,12 @@ static void j36_musb_dump(struct j36_usb_phy *p, const char *when)
 /*
  * Which base the multipoint block decodes at, answered by writing to it.
  *
+ * IT HAS BEEN ANSWERED: 0x480, with 0x080 reading back 00. That is the MT2701
+ * layout, so drivers/usb/musb/mediatek.c had it right unmodified and the half of
+ * linux/0003-musb-mediatek-mt6592.patch that moved BUSCTL back to 0x080 is gone.
+ * This is off by default now (musb_probe_layout) and kept for the next board
+ * revision that does not enumerate, where it is the first question to re-ask.
+ *
  * TXFUNCADDR for ep0 is the first register of that block, and it is plain
  * read/write storage in both layouts -- musb_core rewrites it before every
  * transfer to whatever address the device being talked to has. So a pattern
@@ -585,12 +593,12 @@ static void j36_musb_dump(struct j36_usb_phy *p, const char *when)
  * transfer could be live and where clobbering a function address mid-transaction
  * would be a real fault rather than a measurement.
  *
- * Writing to whichever base turns out to be the hole is safe, and this board has
- * already demonstrated it: the unpatched mediatek.c writes 0x480 on every single
- * transfer, and what the board does in response is fail to enumerate, not hang.
- * An undecoded offset inside a peripheral window that IS decoded and IS ungated
- * drops the write. The hang case is the gated one, and the PERI gate was opened
- * in .init long before this runs.
+ * Writing to whichever base turns out to be the hole is safe: an undecoded
+ * offset inside a peripheral window that IS decoded and IS ungated drops the
+ * write. The hang case is the gated one, and the PERI gate was opened in .init
+ * long before this runs. On this board neither base is a hole anyway -- 0x080 is
+ * MUSB_RXTOG, which took the write and discarded it because MUSB_RXTOGEN was
+ * still clear, and that is exactly the 00 readback reported above.
  */
 static void j36_musb_probe_busctl(struct j36_usb_phy *p)
 {
@@ -607,12 +615,12 @@ static void j36_musb_probe_busctl(struct j36_usb_phy *p)
 	writeb(0, p->musb + J36_MUSB_BUSCTL_MTK);
 
 	if (mtk == J36_MUSB_BUSCTL_MTK_VAL)
-		dev_warn(p->dev,
-			 "MUSB multipoint block is at 0x480 (0x080 read back %02x): the MT2701 layout, so linux/0003-musb-mediatek-mt6592.patch has it wrong and should be dropped\n",
+		dev_info(p->dev,
+			 "MUSB multipoint block is at 0x480 (0x080 read back %02x): the MT2701 layout, which is what mediatek.c drives unmodified\n",
 			 legacy);
 	else if (legacy == J36_MUSB_BUSCTL_LEGACY_VAL)
-		dev_info(p->dev,
-			 "MUSB multipoint block is at 0x080 (0x480 read back %02x): the legacy layout, which is what linux/0003-musb-mediatek-mt6592.patch assumes\n",
+		dev_warn(p->dev,
+			 "MUSB multipoint block is at 0x080 (0x480 read back %02x): the legacy layout, so mediatek.c is writing every function address into a hole and nothing will enumerate\n",
 			 mtk);
 	else
 		dev_warn(p->dev,

@@ -155,9 +155,101 @@ void writeBuild(void)
     Trace::writeAll(2, "\n");
 }
 
+/*
+ * TELLING THE SPLASH TO GO, WHICH IS NOW THIS PROGRAM'S JOB AND NOT THE UNIT FILE'S.
+ *
+ * mixdash.service used to send "quit" from an ExecStartPre, a second before this
+ * binary was even exec'd, and the unit said in so many words that a frozen splash was
+ * the right thing to look at while Qt did its dynamic linking.  It is not, and the
+ * board showed why twice over:
+ *
+ *   - mixsplash re-takes KD_GRAPHICS once a second for as long as it runs, and that
+ *     is the ONLY thing holding the console off this panel -- systemd, agetty and
+ *     vconsole-setup each reset the VT to KD_TEXT during that same stretch of the
+ *     boot.  Kill the splash before the dashboard paints and the next reset wins, so
+ *     fbcon starts drawing into the gap: the journal, the login banner and this
+ *     program's own StandardOutput=journal+console startup trace, for the second or
+ *     so it takes to reach a frame.  That is the "quick console text info just before
+ *     the dashboard".
+ *   - What is left on the glass in the meantime is one still frame, held from before
+ *     the last progress message was drawn.  That is the "MixSplash freezes during the
+ *     dashboard load".
+ *
+ * Both are the same mistake -- handing over at the wrong end of the gap -- and the fix
+ * is to hand over at the far end instead.  The splash keeps animating, keeps holding
+ * the console, and is dismissed from the first paintEvent, when there is finally
+ * something else on the panel to look at.
+ *
+ * THE FLAG BEFORE THE QUIT, because mixos-splash-tick is still feeding the splash a
+ * seconds count and stops only when it finds the flag.  Reversed, its next line would
+ * land after the last thing the dashboard said.
+ *
+ * QUIT OR ABORT, and the caller has to say which, because the two words differ in
+ * what mixsplash leaves the console in and both answers are wanted here.  /init told
+ * it `handover' before switch_root, and `quit' honours that: it exits without
+ * touching the mode, which is exactly right coming out of the first paint, where
+ * this program has just taken KD_GRAPHICS for itself and a KD_TEXT from a dying
+ * splash would blank the frame it is standing on.  `abort' means "give the text
+ * console back whatever you were told earlier", which is what every path out of
+ * textMode() wants: the mode is restored by mixsplash on its own way out, so the
+ * KDSETMODE below is a second opinion rather than the only one, and it cannot lose
+ * the race with the once-a-second re-take.
+ *
+ * SAFE FROM A SIGNAL HANDLER, which is not incidental: textMode() below calls this,
+ * and textMode() runs from onFatal and onStall.  open, write and close are all
+ * async-signal-safe, the guard is a sig_atomic_t, and there is no allocation and no
+ * Qt anywhere in it.  O_NONBLOCK so that a channel that happens to be a FIFO with
+ * nothing reading it fails the open instead of blocking a dying process forever; on
+ * the regular file /init actually creates it means nothing and costs nothing.
+ */
+volatile sig_atomic_t g_splashDismissed = 0;
+
+void dismissSplash(int giveBackTheConsole)
+{
+    static const char channel[] = "/dev/.mixsplash";
+    static const char doneFlag[] = "/dev/.mixsplash-done";
+    static const char handOver[] = "progress:100\nquit\n";
+    static const char giveBack[] = "progress:100\nabort\n";
+    const char *message = giveBackTheConsole ? giveBack : handOver;
+    size_t length = giveBackTheConsole ? sizeof(giveBack) - 1 : sizeof(handOver) - 1;
+    int fd;
+
+    if (g_splashDismissed)
+        return;
+    g_splashDismissed = 1;
+
+    fd = ::open(doneFlag, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    if (fd >= 0)
+        ::close(fd);
+
+    fd = ::open(channel, O_WRONLY | O_APPEND | O_NONBLOCK | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t written = ::write(fd, message, length);
+        (void)written;
+        ::close(fd);
+    }
+}
+
+/*
+ * THE SPLASH GOES FIRST, and that ordering is the whole of why this function is not
+ * two lines any more.  Every caller is on the way out and wants the console back so
+ * that what it prints next is readable -- but mixsplash re-takes KD_GRAPHICS once a
+ * second, so a KDSETMODE with the splash still alive is undone inside a second and
+ * the crash report is written to a console nothing is drawing.
+ *
+ * And it is unconditional now, where it used to be `if (g_ownGraphics)'.  That guard
+ * was for the case where Qt's plugin set the mode rather than this file, on the
+ * grounds that undoing it was Qt's business -- true while the program is running, and
+ * irrelevant here, because every path into this function ends in _exit, abort or a
+ * re-raised fatal signal and Qt is never going to get the chance.  It also missed the
+ * case that matters most: a dashboard that dies BEFORE its first paint never owned
+ * the mode at all, the splash did, and leaving the panel in KD_GRAPHICS with the
+ * splash gone is a black screen with the reason for it invisible behind it.
+ */
 void textMode(void)
 {
-    if (g_ttyFd >= 0 && g_ownGraphics) {
+    dismissSplash(1);
+    if (g_ttyFd >= 0) {
         ::ioctl(g_ttyFd, KDSETMODE, KD_TEXT);
         g_ownGraphics = 0;
     }
@@ -603,9 +695,27 @@ int main(int argc, char **argv)
          * one moment sooner.  Failing before this point leaves every line above on
          * the glass.
          */
-        QObject::connect(&dash, &Dashboard::firstPainted, &app, []() {
+        QObject::connect(&dash, &Dashboard::firstPainted, &dash, [&dash]() {
             Trace::phase("first paint -- the console is now KD_GRAPHICS");
+            /*
+             * The mode before the splash, so there is never an instant with neither
+             * of them holding it: dismissSplash() is what stops mixsplash re-taking
+             * KD_GRAPHICS every second, and between that stopping and this ioctl
+             * landing the console would be free for the next thing that resets it.
+             */
             takeGraphicsMode();
+            dismissSplash(0);
+            /*
+             * AND THEN PAINT IT ALL AGAIN, once, a quarter of a second later.  The
+             * splash draws at 25 fps and reads its channel between frames, so it can
+             * put one more frame onto the panel after this one -- and Qt would not
+             * notice, because linuxfb only flushes what a widget has marked dirty and
+             * nothing here is dirty any more.  The result would be a splash frame
+             * sitting on top of the dashboard until something happened to be
+             * redrawn.  One unconditional full repaint after mixsplash has certainly
+             * gone costs a frame nobody sees in the normal case and closes that.
+             */
+            QTimer::singleShot(250, &dash, [&dash]() { dash.update(); });
             /* Startup is over; a deadline from here would kill a working dashboard. */
             ::alarm(0);
             ::signal(SIGALRM, SIG_DFL);

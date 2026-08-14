@@ -273,6 +273,19 @@ sudo chmod 777 MixOSBuild/opt/system/"Change LED to Red.sh"
 sudo cp device/rg351mp/*.service MixOSBuild/etc/systemd/system/
 sudo chroot MixOSBuild/ bash -c "systemctl enable 351mp batt_led"
 
+# Unit files are data, not programs, and systemd says so on every boot that finds
+# one with the executable bit set:
+#
+#   Configuration file /etc/systemd/system/wifi_importer.service is marked
+#   executable.  Please remove executable permission bits.  Proceeding anyway.
+#
+# It proceeds, so this is cosmetic -- but it is cosmetic on the console during
+# early boot, which on this board is the panel with the splash on it.  The bit
+# came in on scripts/wifi_importer.service and `cp' preserved it; that file is
+# 0644 in the tree now, and this normalises the whole directory so the next unit
+# added with a stray +x does not put the line back.
+sudo chmod 0644 MixOSBuild/etc/systemd/system/*.service
+
 # Make all scripts in /usr/local/bin executable, world style
 sudo chmod 777 MixOSBuild/usr/local/bin/*
 

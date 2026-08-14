@@ -118,7 +118,7 @@ elif [[ "${J36_UPDATE_KERNEL:-0}" == 1 ]]; then
     git -C "$KERNEL_SRC" reset --hard FETCH_HEAD
 fi
 
-# ── The three changes this build makes to the kernel itself ───────────────────
+# ── The four changes this build makes to the kernel itself ────────────────────
 #
 # mtk-sd carries no compatible for MT6592 and refuses to probe without pinctrl;
 # linux/0001-mtk-sd-mt6592.patch fixes both, and its header records why neither
@@ -131,41 +131,78 @@ fi
 # and against the stock 3.4 kernel to prove the rest of the mt2701 driver data
 # exact.  Everything else that port needs is device tree, not code.
 #
-# linux/0003-musb-mediatek-mt6592.patch is USB, and it exists because MT6592's
-# MUSB predates the MT2701/MT7623 part drivers/usb/musb/mediatek.c was written
-# for by two generations.  MediaTek added the TXTOG/RXTOG toggle block at
-# 0x80..0x87 in that later part and moved the multipoint BUSCTL block to 0x480
-# to make room for it; MT6592 has neither, so BUSCTL is still at the stock MUSB
-# base of 0x80.  Driving it at 0x480 fails silently and completely -- every
-# device's function address is written into a hole, so each SET_ADDRESS is
-# followed by traffic still aimed at address 0 and nothing enumerates, with no
-# error logged.  The patch also moves the two toggle-register writes below
-# phy_init(), because on this SoC the PHY driver's .init is what ungates the
-# controller and a MUSB access before it stalls the APB until the watchdog
-# fires.  Its header records what was read out of the stock 3.10.72 kernel to
-# establish all of that, including the confirmation that INTID 96 is the right
-# interrupt and that 8 KB of FIFO RAM and endpoints 1..8 already match.
+# linux/0003-musb-mediatek-mt6592.patch is USB, and it is now one hunk: it moves
+# the two TXTOGEN/RXTOGEN writes in mtk_musb_init() from above phy_init() to
+# below phy_set_mode().  On this SoC the PHY driver's .init is what ungates the
+# controller, so a MUSB register access issued before it is an APB access to a
+# gated peripheral, which on MediaTek stalls the bus until the watchdog fires.
+# That has never actually fired here -- the LK hands over with the gate already
+# open, which the PHY driver prints on every boot -- but an open gate at
+# hand-over is one bootloader's habit and not a contract.
+#
+# It used to be much larger, and the board deleted the rest.  It also gave
+# MT6592 its own musb_platform_ops without .busctl_offset, on the reasoning that
+# MediaTek added the TXTOG/RXTOG block at 0x80..0x87 in the MT2701/MT7623
+# generation and moved the multipoint BUSCTL block to 0x480 to make room, so a
+# part two generations older should still have BUSCTL at the stock 0x80.  The
+# J36 PHY driver settles that by writing to the hardware rather than reasoning
+# about it -- a pattern into ep0's TXFUNCADDR at both candidate bases, read
+# back, restored -- and this board answers 0x480, with 0x080 reading back 00
+# exactly as a gated MUSB_RXTOG would.  It is the MT2701 layout after all, so
+# mediatek.c was right unmodified and the variant, the second ops table and the
+# "mediatek,mt6592-musb" of_match entry are gone.  The device tree still names
+# that compatible first and "mediatek,mtk-musb" second; the second is what binds.
+#
+# linux/0004-usb-phy-generic-no-node-no-vbus.patch is one line of USB cosmetics
+# with one board-specific reason to care.  mediatek.c registers a nop xceiv from
+# code for every MUSB glue, so that device has no of_node and its "vbus" supply
+# can never resolve; the regulator core then refuses to give its dummy to an
+# exclusive request and warns about it at KERN_WARNING, which on this board is
+# the panel, mid-splash.  The patch asks for the supply only when there is a
+# node that could have named one.
 #
 # Applied idempotently rather than from a stamp file, because this checkout
 # persists across runs and a stamp can outlive the tree it describes -- a
 # J36_UPDATE_KERNEL reset above throws the patch away and would leave the stamp
 # claiming otherwise.  `apply --reverse --check' succeeds only when the change is
 # already present, so the tree is asked instead of a bookkeeping file.
+#
+# The same persistence is why there is a revert-and-retry below.  A patch that is
+# EDITED during bring-up -- 0003 has now been rewritten twice -- leaves a tree
+# holding the previous version, which the new one neither reverse-applies to nor
+# applies over, and the build would stop dead on a checkout the developer has no
+# reason to suspect.  So the files the patch touches are checked back out and it
+# is tried once more.  That is safe here only because these four patches touch
+# disjoint files -- mtk-sd.c, two DRM files, mediatek.c, phy-generic.c -- so
+# restoring one patch's files cannot undo another's; keep it that way, or this
+# has to become a full reset-and-reapply of all of them.
 apply_kernel_patch() {
     local patch="$ROOT/device/j36-ultra/linux/$1" what="$2"
     [[ -f "$patch" ]] || die "missing kernel patch: $patch"
+
     if git -C "$KERNEL_SRC" apply --reverse --check "$patch" 2>/dev/null; then
         log "The $what patch is already applied"
-    elif git -C "$KERNEL_SRC" apply --check "$patch" 2>/dev/null; then
-        log "Applying the $what patch"
-        git -C "$KERNEL_SRC" apply "$patch"
-    else
-        die "$1 neither applies to nor is applied in $KERNEL_SRC; refresh it against $KERNEL_BRANCH"
+        return
     fi
+
+    if ! git -C "$KERNEL_SRC" apply --check "$patch" 2>/dev/null; then
+        local files=()
+        mapfile -t files < <(sed -n 's|^+++ b/||p' "$patch")
+        [[ ${#files[@]} -gt 0 ]] || die "$1 has no +++ b/ lines: it is not a patch"
+        log "Restoring ${files[*]} to make room for a revised $what patch"
+        git -C "$KERNEL_SRC" checkout -- "${files[@]}" 2>/dev/null \
+            || die "cannot restore ${files[*]} in $KERNEL_SRC"
+        git -C "$KERNEL_SRC" apply --check "$patch" 2>/dev/null \
+            || die "$1 neither applies to nor is applied in $KERNEL_SRC; refresh it against $KERNEL_BRANCH"
+    fi
+
+    log "Applying the $what patch"
+    git -C "$KERNEL_SRC" apply "$patch"
 }
 apply_kernel_patch 0001-mtk-sd-mt6592.patch "mtk-sd MT6592"
 apply_kernel_patch 0002-drm-mediatek-mt6592.patch "mtk_drm MT6592 display"
 apply_kernel_patch 0003-musb-mediatek-mt6592.patch "musb MT6592 USB host"
+apply_kernel_patch 0004-usb-phy-generic-no-node-no-vbus.patch "usb_phy_generic VBUS"
 
 mkdir -p "$KERNEL_OUT"
 if [[ ! -f "$KERNEL_OUT/.config" ]]; then
@@ -196,6 +233,28 @@ done
 config_v SERIAL_8250_NR_UARTS 4
 config_v SERIAL_8250_RUNTIME_UARTS 4
 config_s LOCALVERSION "-j36"
+
+# ── The black screen between the LK's logo and the MixOS splash ───────────────
+#
+# simplefb hands this kernel the framebuffer the LK was already drawing into,
+# logo and all, and fbcon then binds to it and clears it to a text console:
+#
+#   [3.338545] simple-framebuffer 82700000.framebuffer: framebuffer at 0x82700000
+#   [3.339220] Console: switching to colour frame buffer device 80x30
+#
+# /init does not start mixsplash until 4.2 s, so that is the better part of a
+# second of black panel in the middle of a boot that is meant to show a picture
+# and then another picture. Deferred takeover leaves the firmware's pixels alone
+# until something is actually printed to the console, which with loglevel=4 is
+# nothing at all on a boot that goes right -- so the LK logo stays up until
+# mixsplash paints over it, and the seam closes.
+#
+# It stays honest on a boot that goes wrong: the first KERN_ERR takes the console
+# over exactly as before, clears the logo and starts drawing, so a failure still
+# reaches the panel. That is also why loglevel is not lowered past 4 to help this
+# along -- the point is to print nothing when there is nothing to say, not to
+# stop being able to say it.
+config_y FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER
 
 # multi_v7_defconfig enables dozens of unrelated boards. Prune user-selectable
 # ARCH/MACH/SOC targets so the zImage plus initramfs fits the fixed 9 MiB slot.
@@ -764,6 +823,7 @@ for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 EXT2_FS_XATTR EXT2_FS_POSIX_ACL BTRFS_FS_POSIX_ACL \
                 DRM DEVMEM SOUND POWER_SUPPLY BACKLIGHT_CLASS_DEVICE \
                 USB_SUPPORT USB_PHY GENERIC_PHY HID_SUPPORT \
+                FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER \
                 USB_MUSB_HOST MUSB_PIO_ONLY USB_ANNOUNCE_NEW_DEVICES; do
     grep -q "^CONFIG_${required}=y$" "$CONFIG" || \
         die "required kernel option CONFIG_${required}=y was not selected"
@@ -2940,31 +3000,59 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=$mixos_root/bin
-# ── the last word to the splash ──────────────────────────────────────────────
+# ── the last word to the splash, which is no longer a goodbye ────────────────
 #
 # The splash has been running since the initramfs and is still on the panel: it
 # survived switch_root, /dev came with it, so /dev/.mixsplash is the same file it
-# has had open all along.  This finishes the bar, gives it a second to ease up to
-# the end, and then tells it to stop -- because from the next line on there are
-# two processes writing to /dev/fb0 and only one of them should be.
+# has had open all along.  This names the stage and fills the bar, and that is now
+# all it does -- it does not stop the splash and it does not set the done flag the
+# ticker watches for.
 #
-# It stops BEFORE mixdash rather than after its first paint, and the second is
-# not a gap: mixsplash exits with the console still in KD_GRAPHICS (that is what
-# the "handover" message bought), so what stays on the glass is its own last
-# frame, held there until Qt has finished its dynamic linking and painted over
-# it.  A frozen splash is the correct thing to look at during that; a text
-# console suddenly reappearing is not.
+# IT USED TO SEND "quit" HERE, a whole second before mixdash was even exec'd, and
+# the comment that stood in this space defended it: mixsplash exits leaving the
+# console in KD_GRAPHICS, so its last frame stays on the glass while Qt links
+# itself, and a held picture beats a text console reappearing.  Both halves of
+# that were wrong on this board.  The held picture is precisely what "MixSplash
+# freezes during the dashboard load" is a report of -- it is a still frame for as
+# long as the dynamic linker takes.  And the console reappears regardless, because
+# KD_GRAPHICS is a mode and not a lock: systemd, agetty and vconsole-setup each
+# reset the VT during that same stretch of the boot, and the one process that was
+# taking it back every second was the splash this line had just killed.  What
+# fbcon drew into the gap included this unit's own journal+console output, which
+# is the "quick console text info" that shows up just before the dashboard.
+#
+# So the splash now runs until mixdash has a frame on the panel, and mixdash puts
+# it down itself: dismissSplash() in main.cpp, called from the first paintEvent --
+# and from every failure path as well, so a dashboard that never paints still
+# hands the console back in time to say why.
 #
 # Appending to a file, never a pipe, so this cannot block even if nothing is
 # reading; and "-" in front so that a boot with no splash at all does not fail
 # its ExecStartPre.  Re-running on every restart attempt is harmless by design.
-#
-# The touch comes first and is the whole stop protocol for the ticker that has
-# been feeding the splash since sysinit -- see mixos-splash-tick.  If it came
-# last, the ticker's next line would land on top of "Starting the dashboard" and
-# the last thing on the panel before Qt paints would be a stale seconds count.
-ExecStartPre=-/bin/sh -c ': > /dev/.mixsplash-done; { echo "stage:Starting the dashboard"; echo "progress:100"; } >> /dev/.mixsplash; sleep 1; echo quit >> /dev/.mixsplash'
+ExecStartPre=-/bin/sh -c '{ echo "stage:Starting the dashboard"; echo "progress:100"; } >> /dev/.mixsplash'
 ExecStart=$mixos_root/bin/mixdash
+# ── the backstop for the dashboard that never gets as far as its own code ────
+#
+# dismissSplash() covers every way mixdash can fail once it is running, because it
+# hangs off textMode() and every fatal path goes through that.  What it cannot
+# cover is the dashboard that never runs at all: a missing binary, a missing
+# library, an exec that fails before main.  With the splash no longer stopped
+# ahead of ExecStart, that boot would sit under a splash still animating and still
+# re-taking the console every second, with systemd's explanation on a VT that
+# nothing is drawing -- a picture of a working boot on a board that has none.
+#
+# So the unit dismisses it too, on the way out.  It runs on the failure that would
+# otherwise be silent, and on the ordinary stop, and on the restart in between;
+# every one of those wants the console back.  On the normal path it is a duplicate
+# of what mixdash already did minutes ago, appended to a regular file with nothing
+# reading it, which costs six bytes and does nothing else.
+#
+# `abort' and not `quit': /init said `handover' before switch_root, and `quit' honours
+# it by exiting without touching the console mode.  That is right when the dashboard is
+# painting and wrong here, where the whole point is to get the text console back so the
+# reason there is no dashboard can be read off the panel.  `abort' is the word that
+# means exactly that.
+ExecStopPost=-/bin/sh -c ': > /dev/.mixsplash-done; echo abort >> /dev/.mixsplash'
 Restart=on-failure
 RestartSec=2
 # 3 is the dashboard's own startup watchdog and 4 is an exception caught at the top of

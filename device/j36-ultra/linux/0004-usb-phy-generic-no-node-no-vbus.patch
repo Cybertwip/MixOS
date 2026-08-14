@@ -1,0 +1,70 @@
+usb: phy: generic: do not demand a VBUS regulator for a node-less device
+
+usb_phy_gen_create_phy() asks for the "vbus" supply with an exclusive
+get.  When the device came from the device tree that is right: the
+phandle either resolves or it genuinely is not there.  When the device
+was built in code it can never resolve, because there is no node to hold
+a vbus-supply property -- and usb_phy_generic_register() builds exactly
+such a device.  drivers/usb/musb/mediatek.c calls it for every MUSB
+glue, MT6592's included.
+
+The regulator core answers an unresolvable lookup by offering its dummy
+regulator, then declines to hand a dummy to an exclusive request and
+says so:
+
+  usb_phy_generic usb_phy_generic.2.auto: dummy supplies not allowed for
+  exclusive requests (id=vbus)
+
+The three lines below the get already read that -ENODEV as "none fitted,
+carry on", so the message announces a condition the caller has handled.
+It is emitted at KERN_WARNING, which on the J36 Ultra means it is printed
+to the console -- and the console on this board is the panel, mid-splash,
+where the whole point is that nothing is printed at all.
+
+Gate the get on dev->of_node, which is the same test this function
+already uses a few lines up for the clock and reset properties.  Devices
+that do come from a node keep their vbus-supply and every error path that
+went with it.
+
+Signed-off-by: MixOS J36 Ultra bring-up
+---
+diff --git a/drivers/usb/phy/phy-generic.c b/drivers/usb/phy/phy-generic.c
+--- a/drivers/usb/phy/phy-generic.c
++++ b/drivers/usb/phy/phy-generic.c
+@@ -256,12 +256,30 @@
+ 		return dev_err_probe(dev, PTR_ERR(nop->vcc),
+ 				     "could not get vcc regulator\n");
+ 
+-	nop->vbus_draw = devm_regulator_get_exclusive(dev, "vbus");
+-	if (PTR_ERR(nop->vbus_draw) == -ENODEV)
+-		nop->vbus_draw = NULL;
+-	if (IS_ERR(nop->vbus_draw))
+-		return dev_err_probe(dev, PTR_ERR(nop->vbus_draw),
+-				     "could not get vbus regulator\n");
++	/*
++	 * Only ask for a VBUS regulator when there is a node that could have
++	 * named one.  usb_phy_generic_register() builds this device in code --
++	 * drivers/usb/musb/mediatek.c does it for every MUSB glue, MT6592's
++	 * included -- so it has no of_node, no vbus-supply phandle and nothing
++	 * for the regulator core to resolve.  The core offers its dummy, will
++	 * not give a dummy to an exclusive request, and warns:
++	 *
++	 *   usb_phy_generic usb_phy_generic.2.auto: dummy supplies not allowed
++	 *   for exclusive requests (id=vbus)
++	 *
++	 * The code below already reads that -ENODEV as "none fitted, carry on",
++	 * so the warning announces a handled condition -- at KERN_WARNING, which
++	 * on this board puts it on the panel in the middle of the boot splash.
++	 * A device that does come from a node is unaffected.
++	 */
++	if (dev->of_node) {
++		nop->vbus_draw = devm_regulator_get_exclusive(dev, "vbus");
++		if (PTR_ERR(nop->vbus_draw) == -ENODEV)
++			nop->vbus_draw = NULL;
++		if (IS_ERR(nop->vbus_draw))
++			return dev_err_probe(dev, PTR_ERR(nop->vbus_draw),
++					     "could not get vbus regulator\n");
++	}
+ 
+ 	nop->dev		= dev;
+ 	nop->phy.dev		= nop->dev;

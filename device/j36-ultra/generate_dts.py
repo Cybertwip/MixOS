@@ -379,17 +379,54 @@ def generate(sources: dict[str, str]) -> str:
 \t\t}};
 \t}};
 
+\t/*
+\t * Eight Cortex-A7s, and at the moment only the first one runs. There is no
+\t * enable-method here, so arch/arm never gets an smp_ops to release the other
+\t * seven with, and the kernel says so only by omission:
+\t *
+\t *   smp: Bringing up secondary CPUs ...
+\t *   smp: Brought up 1 node, 1 CPU
+\t *
+\t * with no error in between. Mainline has no MT6592 entry -- platsmp.c knows
+\t * mt6589, mt7623, mt7629 and the trustzone mt81xx, and each of those carries
+\t * only three secondary keys anyway, so even borrowing one would light four
+\t * cores of eight. Fixing it needs MT6592's own boot base, jump register and
+\t * seven release keys, and those are a read out of the stock kernel, not a
+\t * guess: a wrong jump register sends seven cores into whatever happens to be
+\t * at that address, on a board that then has to be reflashed. Left alone
+\t * deliberately until that read has been done.
+\t *
+\t * clock-frequency is what arch/arm/kernel/topology.c wants and what it
+\t * complained about eight times a boot, at KERN_ERR and therefore on the panel
+\t * during the splash:
+\t *
+\t *   /cpus/cpu@0 missing clock-frequency property
+\t *
+\t * 840 MHz is the kernel's own measurement, not a datasheet number. This build
+\t * has no arch timer to calibrate against, so it times the delay loop instead
+\t * and reports lpj=8396800 at HZ=100; the A7 delay loop is a subs and a
+\t * predicted-taken bhi, which that core dual-issues at one iteration per
+\t * cycle, giving 839.68 MHz -- 0.04 percent off a round 840. The alternative
+\t * reading, two cycles per iteration, would put the part at 1.679 GHz against
+\t * an advertised 1.7, which the calibration is far too accurate to be.
+\t *
+\t * Nothing here depends on that being exactly right. topology.c uses the value
+\t * only to rank cores against each other, and eight identical numbers rank the
+\t * same at any value; the number is written down to be honest about what the
+\t * board is doing, not because the scheduler needs it. If the LK turns out to
+\t * hand over at a different OPP, correct it here and nothing else changes.
+\t */
 \tcpus {{
 \t\t#address-cells = <1>;
 \t\t#size-cells = <0>;
-\t\tcpu@0 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <0>; }};
-\t\tcpu@1 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <1>; }};
-\t\tcpu@2 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <2>; }};
-\t\tcpu@3 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <3>; }};
-\t\tcpu@4 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <4>; }};
-\t\tcpu@5 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <5>; }};
-\t\tcpu@6 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <6>; }};
-\t\tcpu@7 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <7>; }};
+\t\tcpu@0 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <0>; clock-frequency = <840000000>; }};
+\t\tcpu@1 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <1>; clock-frequency = <840000000>; }};
+\t\tcpu@2 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <2>; clock-frequency = <840000000>; }};
+\t\tcpu@3 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <3>; clock-frequency = <840000000>; }};
+\t\tcpu@4 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <4>; clock-frequency = <840000000>; }};
+\t\tcpu@5 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <5>; clock-frequency = <840000000>; }};
+\t\tcpu@6 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <6>; clock-frequency = <840000000>; }};
+\t\tcpu@7 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <7>; clock-frequency = <840000000>; }};
 \t}};
 
 \tsoc {{
@@ -1205,16 +1242,27 @@ def generate(sources: dict[str, str]) -> str:
 \t * musb->ctrl_base, 0xf1200000 being the stock kernel's static mapping of
 \t * 0x11200000.
 \t *
-\t * BOTH compatibles are load-bearing, and the first one especially so.
-\t * mediatek,mtk-musb is what makes drivers/usb/musb/mediatek.c bind at all;
-\t * mediatek,mt6592-musb is what makes it bind CORRECTLY, because
-\t * linux/0003-musb-mediatek-mt6592.patch keys the register layout off it.
-\t * MT6592's MUSB predates the MT2701/MT7623 part that glue was written for:
-\t * it has no TXTOG/RXTOG block at 0x80..0x87, so its multipoint BUSCTL block
-\t * is still at the stock MUSB base of 0x80 rather than moved to 0x480. Drop
-\t * the mt6592 string and every device's function address is written into a
-\t * hole -- nothing enumerates, and nothing says why. The patch header records
-\t * how that was read out of the stock 3.10.72 kernel.
+\t * mediatek,mtk-musb is the compatible that binds, and it is the second one
+\t * on purpose. mediatek,mt6592-musb used to be matched by
+\t * linux/0003-musb-mediatek-mt6592.patch, which keyed a different register
+\t * layout off it: MT6592's MUSB predates the MT2701/MT7623 part that glue was
+\t * written for, so the argument went, it has no TXTOG/RXTOG block at
+\t * 0x80..0x87 and its multipoint BUSCTL block should still be at the stock
+\t * MUSB base of 0x80 rather than moved to 0x480.
+\t *
+\t * The board says otherwise. j36_mt6592_usb_phy's layout probe writes a
+\t * pattern to TXFUNCADDR at both bases and reads it back, and on this part
+\t * 0x480 holds it while 0x080 returns 00 -- the signature of MUSB_RXTOG with
+\t * MUSB_RXTOGEN still clear. It IS the MT2701 layout, mediatek.c drives it
+\t * right unmodified, and that half of the patch has been dropped along with
+\t * the of_match entry for mediatek,mt6592-musb. Nothing matches the first
+\t * string now.
+\t *
+\t * It stays anyway. A compatible list is meant to read most-specific first,
+\t * this node genuinely is an MT6592 MUSB, and leaving the name here is what
+\t * gives a future quirk somewhere to attach without a device tree change --
+\t * which on this board means a reflash. An unmatched leading compatible costs
+\t * nothing: of_match_device walks the list until something hits.
 \t *
 \t * dr_mode = \"host\" is what makes this a port and not a socket. The core is
 \t * dual-role, and 5 V is a boost off VBAT driven by a plain GPIO rather than
