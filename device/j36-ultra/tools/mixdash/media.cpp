@@ -1442,6 +1442,7 @@ void MediaPage::playQueued(double startAt)
     m_stopping = false;
 
     m_paused = false;
+    m_childSaid.clear();
     m_note = mixerComplaint();
     if (startAt <= 0.0 || m_duration <= 0.0) {
         m_duration = probeDuration(track.path);
@@ -1457,7 +1458,15 @@ void MediaPage::playQueued(double startAt)
      * command line instead.
      */
     m_music->setStandardOutputProcess(m_aplay);
+    /*
+     * BOTH ends of the chain report, into the same slot.  ffmpeg's exit is the
+     * interesting one when it fails; aplay's is the interesting one when it does
+     * not, because aplay is still a third of a second of pipe behind ffmpeg when
+     * ffmpeg says it is done.  onMusicFinished() sorts out which is which.
+     */
     connect(m_music, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
+            this, &MediaPage::onMusicFinished);
+    connect(m_aplay, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
             this, &MediaPage::onMusicFinished);
     /*
      * APLAY'S STDERR IS READ.  It was not, which is why a card that would not open
@@ -1545,9 +1554,15 @@ void MediaPage::stopVideo()
     m_buffer.clear();
     m_framesShown = 0;
     m_framesDropped = 0;
-    m_videoDuration = 0.0;
     m_seekTimer->stop();
     m_seekTarget = -1.0;
+    /*
+     * m_videoDuration is deliberately KEPT.  Seeking is stopVideo() followed by
+     * openVideo() with a start time, and openVideo only re-probes when it is
+     * opening from the beginning -- so clearing it here would put an ffprobe of the
+     * whole container in front of every ten-second nudge of the D-pad.  A stale
+     * value cannot leak into the next film: that one opens at 0 and re-probes.
+     */
 }
 
 /* ── the transport ───────────────────────────────────────────────────────── */
@@ -1645,26 +1660,58 @@ void MediaPage::commitSeek()
 
 void MediaPage::onMusicFinished(int code)
 {
-    if (m_stopping || sender() != m_music)
+    if (m_stopping)
+        return;
+    QProcess *const who = qobject_cast<QProcess *>(sender());
+    if (!who || (who != m_music && who != m_aplay))
         return;
 
+    /*
+     * FFMPEG FINISHING CLEANLY IS NOT THE END OF THE TRACK.  It exits as soon as the
+     * last sample is in the pipe, and at that moment aplay is still holding a
+     * pipe-full -- 64 KiB, which at 48 kHz stereo s16 is a third of a second -- plus
+     * whatever is left in the ALSA ring.  Tearing the pair down here, which is what
+     * a single handler on ffmpeg's finished() would do, cuts the last half second
+     * off every song in the album and then does it again on the next one.
+     *
+     * So the clean case answers on APLAY's finished() instead: ffmpeg's exit closes
+     * the write end, aplay reads EOF, drains, and exits by itself.  ffmpeg is only
+     * disconnected here, not reaped, because it has nothing left to say.
+     */
+    if (who == m_music && code == 0 && m_music->exitStatus() == QProcess::NormalExit) {
+        /* Only the connections from this process to this page.  disconnect() with
+         * no arguments would be aimed at the same place but is a blunter tool than
+         * the situation needs. */
+        disconnect(m_music, nullptr, this, nullptr);
+        return;
+    }
+
     /* Everything both children said, read BEFORE either is reaped. */
-    QString err = QString::fromLocal8Bit(m_music->readAllStandardError()).trimmed();
-    if (m_aplay) {
+    QString err = QString::fromLocal8Bit(who->readAllStandardError()).trimmed();
+    if (m_aplay && who != m_aplay) {
         const QString ap = QString::fromLocal8Bit(m_aplay->readAllStandardError()).trimmed();
         if (!ap.isEmpty())
             err = ap;   /* aplay's complaint is the interesting one; ffmpeg only got EPIPE */
     }
+    const QString whoName = (who == m_aplay) ? QStringLiteral("aplay")
+                                             : QStringLiteral("ffmpeg");
     /* A child killed by a signal reports exitCode 0 -- SIGPIPE from an aplay that
      * died first is the case that matters, and reading it as a clean end of track
      * would advance the queue through every file in the folder at pipe speed. */
-    const bool crashed = (m_music->exitStatus() != QProcess::NormalExit);
+    const bool crashed = (who->exitStatus() != QProcess::NormalExit);
 
     endProcess(m_music);
     endProcess(m_aplay);
 
     if (code != 0 || crashed) {
-        m_note = err.isEmpty() ? tr("ffmpeg exited %1").arg(code) : tidyChildError(err);
+        /* What it said now, else what it said earlier and onAplayStderr kept, else
+         * the bare fact that it is gone. */
+        if (!err.isEmpty())
+            m_note = tidyChildError(err);
+        else if (!m_childSaid.isEmpty())
+            m_note = m_childSaid;
+        else
+            m_note = tr("%1 exited %2").arg(whoName).arg(code);
         /*
          * A FAILURE STOPS THE QUEUE.  Advancing would run the same broken pipeline
          * over every track in the directory, one process pair per file, and the
@@ -1692,8 +1739,10 @@ void MediaPage::onAplayStderr()
     const QString text = QString::fromLocal8Bit(p->readAllStandardError()).trimmed();
     if (text.isEmpty())
         return;
-    /* Straight onto the glass.  This is the message that did not exist. */
-    m_note = tidyChildError(text);
+    /* Straight onto the glass.  This is the message that did not exist.  The copy
+     * is for onMusicFinished, which arrives after this buffer has been drained. */
+    m_childSaid = tidyChildError(text);
+    m_note = m_childSaid;
     layOutList();
     update();
 }

@@ -338,6 +338,20 @@ private:
     bool m_paused = false;
 
     QString m_note;
+
+    /*
+     * The last thing a child of the music chain wrote to stderr, kept apart from
+     * m_note.
+     *
+     * readyReadStandardError DRAINS the buffer, so by the time finished() arrives
+     * the reason the child died is already gone -- and the failure handler would
+     * then paint a bare "aplay exited 1" over the sentence that said why.  This is
+     * where onAplayStderr puts a copy so the handler has something to fall back on.
+     * Cleared at the top of every playQueued(), because a complaint from the
+     * previous track is not evidence about this one.
+     */
+    QString m_childSaid;
+
     QTimer *m_ui = nullptr;
 
     /* Where the slider says we are, waiting for commitSeek() to make it true.

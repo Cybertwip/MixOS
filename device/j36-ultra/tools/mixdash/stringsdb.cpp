@@ -1883,6 +1883,14 @@ const char *const kPhrases[][Lang::Count] = {
       "ffmpeg endete mit %1",
       "o ffmpeg terminou com %1",
       "ffmpeg ha salido con %1" },
+    /* %1 is a program name -- ffmpeg or aplay -- so it stays untranslated and the
+     * sentence has to read correctly with either one in front of it. */
+    { "%1 exited %2",
+      "%1 s'est terminé avec %2",
+      "%1 è uscito con %2",
+      "%1 endete mit %2",
+      "o %1 terminou com %2",
+      "%1 ha salido con %2" },
     { "end of file",
       "fin du fichier",
       "fine del file",
