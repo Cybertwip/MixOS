@@ -27,17 +27,48 @@
 # Set J36_RESUME_R36=0 to skip it and build the J36 layer against whatever base
 # is already in the VM.
 
+# ── Why this re-execs itself, and why from a copy ─────────────────────────────
+#
 # `sh ./build-j36-ultra.sh' is the natural thing to type and it is not what this
 # script is.  It uses arrays, [[ ]] and set -E, and it sources a helper that does
 # too; macOS /bin/sh is bash 3.2 in POSIX mode and will not run all of it.  Rather
 # than document that, re-exec under bash and let either invocation work.
-if [ -z "${BASH_VERSION:-}" ]; then
-    exec bash "$0" "$@"
+#
+# THE COPY IS THE OTHER HALF, and it is not neatness.  bash does not read a script
+# into memory: it reads a block, runs what it parsed, seeks back to the byte it
+# stopped on and reads the next block.  Edit the file while it is running -- a
+# checkout, a rebase, a sweep over the licence headers -- and every byte after the
+# edit moves while that saved offset does not.  The next read starts mid-line and
+# bash reports a syntax error against a line number that has nothing wrong on it,
+# and it reports it AFTER the two-hour VM build this script was driving has already
+# finished, so the diagnosis costs a whole run and the file parses clean afterwards.
+#
+# A run therefore executes a snapshot taken at startup.  The checkout can be edited
+# underneath it -- by an editor, by git, by anything -- and this run will not notice,
+# because the bytes it is reading are its own.  $ROOT still has to be the checkout
+# and not the snapshot's directory, so it is resolved before the exec and handed
+# over; everything below reads the checkout as it always did.
+if [ -z "${BASH_VERSION:-}" ] || [ -z "${J36_SNAPSHOT:-}" ]; then
+    J36_ROOT_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)" || exit 1
+    J36_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/build-j36-ultra.XXXXXX")" || exit 1
+    cat -- "$0" > "$J36_SNAPSHOT" || { rm -f -- "$J36_SNAPSHOT"; exit 1; }
+    export J36_ROOT_DIR J36_SNAPSHOT
+    exec bash "$J36_SNAPSHOT" "$@"
 fi
 
 set -Eeuo pipefail
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# Removed on the way out, not at startup: an unlinked file that is still open keeps
+# running fine, but leaving it on disk for the length of the build is what makes a
+# crashed run inspectable.  A killed run leaves it in TMPDIR, where it belongs.
+# The `case' is what stops this deleting somebody's file: it fires only for a name
+# mktemp made from the template above, and a pattern that does not match exits 0.
+trap 'case "${J36_SNAPSHOT:-}" in */build-j36-ultra.??????) rm -f -- "$J36_SNAPSHOT" ;; esac' EXIT
+
+# The checkout the snapshot was taken from -- see the exec above.  ${BASH_SOURCE[0]}
+# is a file in TMPDIR now, so it is only the fallback, for the case where somebody
+# runs this with J36_SNAPSHOT already set and skips the copy deliberately.
+ROOT="${J36_ROOT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)}"
 DARKOS_LOG_TAG="build-j36-ultra"
 # shellcheck source=device/common/multipass.sh
 . "$ROOT/device/common/multipass.sh"

@@ -2638,9 +2638,590 @@ out:
     return frames > 0 ? 0 : 1;
 }
 
+/* ── -o: render on lima, present through the framebuffer the LK lit ────────────
+ *
+ * WHY THIS MODE EXISTS.  Every other GL mode here presents through KMS, and on
+ * this board KMS presentation is the part that does not work -- not lima, not
+ * Mesa, not the shader compiler.  -c will happily report a renderer string, link
+ * a program, rasterise thirty-six triangles and put every one of them into a
+ * buffer the panel never fetches, because the panel is not on mtk_drm's CRTC: it
+ * is on simple-framebuffer over the memory the LK left at 0x82700000, and it has
+ * been since before Linux started.  Modesetting mtk_drm is what takes it away,
+ * and -c and -p both do that, irrecoverably, for the reason written above them.
+ *
+ * So this mode presents the other way.  It renders with lima into an offscreen
+ * FBO and copies the result into /dev/fb0 -- the same mapping mixdash draws
+ * through, the same one -f paints bars into.  There is no DRM master here, no
+ * connector, no CRTC, no ADDFB2 and no modeset of any kind.  The render node is
+ * opened for gbm and for nothing else.  Nothing this mode does has to be given
+ * back, which is what makes it the one GL mode that is safe to run at boot, and
+ * safe to run twice.
+ *
+ * THAT IS ALSO THE ARCHITECTURE THE LK USES.  The MVII bare-metal driver --
+ * mt6592_gpu_offload.c in the PowerEngine tree -- runs this same GPU with its
+ * MMUs off and points the PP's writeback unit straight at a destination address
+ * in DRAM.  It never touches the DDP, the DSI or the display mutex, and it never
+ * modesets, because on a Mali-450 there is nothing to modeset: Utgard has no
+ * display controller at all.  The GPU renders, something else scans out.  This
+ * mode is that arrangement expressed through Mesa instead of through registers,
+ * with lima's MMU and lima's page tables doing what the LK does by identity
+ * mapping, and glReadPixels standing in for the writeback unit's destination
+ * pointer.
+ *
+ * WHAT THE ANSWER MEANS.  This mode and -c differ in exactly one thing, which is
+ * where the finished frame goes, so between them they split the fault cleanly:
+ *
+ *   -o draws, -c does not      lima, Mesa, the compiler and the rasteriser are
+ *                              all sound.  What is broken is presentation --
+ *                              mtk_drm's modeset, or the DSI re-initialised out
+ *                              from under a panel that adopts LK state and has
+ *                              no init table to put it back.  Nothing in the GL
+ *                              stack needs fixing and nothing in it should be
+ *                              changed to chase this.
+ *   neither draws              the fault is in the GL stack after all, and the
+ *                              messages this mode prints on the way -- which
+ *                              driver bound, which renderer string, which
+ *                              renderbuffer format the FBO accepted, whether the
+ *                              shaders compiled -- are the finding.
+ *   -o draws but slowly        expected, and the number is printed.  The copy is
+ *                              a CPU read of 1.2 MB per frame out of GPU memory
+ *                              and a 1.2 MB write into the framebuffer.  It is
+ *                              the price of not owning the scanout, and it is
+ *                              paid per frame, not per triangle.
+ *
+ * The per-phase timings are printed for that last row: gl is the draw, read is
+ * glReadPixels, blit is the convert-and-store.  If read dominates, the fix is a
+ * dma-buf over the LK's carveout so lima can render into the scanout memory
+ * directly and the copy disappears; if gl dominates, the GPU is the limit and
+ * there is nothing to win there.
+ */
+
+#define GL_FRAMEBUFFER             0x8D40
+#define GL_RENDERBUFFER            0x8D41
+#define GL_COLOR_ATTACHMENT0       0x8CE0
+#define GL_DEPTH_ATTACHMENT        0x8D00
+#define GL_FRAMEBUFFER_COMPLETE    0x8CD5
+#define GL_RGBA8_OES               0x8058
+#define GL_RGB565                  0x8D62
+#define GL_RGB5_A1                 0x8057
+#define GL_RGBA4                   0x8056
+#define GL_DEPTH_COMPONENT16       0x81A5
+#define GL_RGBA                    0x1908
+#define GL_UNSIGNED_BYTE           0x1401
+#define GL_PACK_ALIGNMENT          0x0D05
+
+static void (*p_glGenFramebuffers)(int, unsigned int *);
+static void (*p_glBindFramebuffer)(unsigned int, unsigned int);
+static void (*p_glDeleteFramebuffers)(int, const unsigned int *);
+static void (*p_glGenRenderbuffers)(int, unsigned int *);
+static void (*p_glBindRenderbuffer)(unsigned int, unsigned int);
+static void (*p_glDeleteRenderbuffers)(int, const unsigned int *);
+static void (*p_glRenderbufferStorage)(unsigned int, unsigned int, int, int);
+static void (*p_glFramebufferRenderbuffer)(unsigned int, unsigned int,
+                                           unsigned int, unsigned int);
+static unsigned int (*p_glCheckFramebufferStatus)(unsigned int);
+static void (*p_glReadPixels)(int, int, int, int, unsigned int, unsigned int,
+                              void *);
+static void (*p_glPixelStorei)(unsigned int, int);
+
+#define GLSYM(name)                                                             \
+    do {                                                                        \
+        *(void **)(&p_##name) = glsym(#name);                                   \
+        if (!p_##name) {                                                        \
+            printf("offload: this GLES2 has no %s\n", #name);                   \
+            return 0;                                                           \
+        }                                                                       \
+    } while (0)
+
+static int load_gles_fbo(void)
+{
+    GLSYM(glGenFramebuffers);
+    GLSYM(glBindFramebuffer);
+    GLSYM(glDeleteFramebuffers);
+    GLSYM(glGenRenderbuffers);
+    GLSYM(glBindRenderbuffer);
+    GLSYM(glDeleteRenderbuffers);
+    GLSYM(glRenderbufferStorage);
+    GLSYM(glFramebufferRenderbuffer);
+    GLSYM(glCheckFramebufferStatus);
+    GLSYM(glReadPixels);
+    GLSYM(glPixelStorei);
+    return 1;
+}
+#undef GLSYM
+
+static const char *fbo_status(unsigned int s)
+{
+    switch (s) {
+    case GL_FRAMEBUFFER_COMPLETE: return "complete";
+    case 0x8CD6: return "incomplete attachment";
+    case 0x8CD7: return "no attachment";
+    case 0x8CD9: return "attachments differ in size";
+    case 0x8CDD: return "unsupported combination of formats";
+    case 0:      return "glCheckFramebufferStatus failed outright";
+    default:     return "?";
+    }
+}
+
+/* The framebuffer this mode presents into: everything -f learns about /dev/fb0,
+ * kept, because the copy needs the stride and the channel layout on every frame
+ * and re-reading them per frame would be two ioctls a frame for numbers that
+ * cannot change while the mapping is open. */
+struct fbtarget {
+    int            fd;
+    unsigned char *base;
+    size_t         len;
+    uint32_t       w, h, stride, bpp;
+    struct fb_var_screeninfo var;
+    int            xrgb8888;   /* the one layout with a byte-swap fast path */
+};
+
+static int fb_target_open(struct fbtarget *t)
+{
+    struct fb_fix_screeninfo fix;
+
+    memset(t, 0, sizeof(*t));
+    t->fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+    if (t->fd < 0) {
+        printf("offload: /dev/fb0: %m -- with no framebuffer there is nowhere to "
+               "put a rendered frame, and this mode has nothing to do\n");
+        return 0;
+    }
+
+    memset(&fix, 0, sizeof(fix));
+    if (ioctl(t->fd, FBIOGET_VSCREENINFO, &t->var) < 0 ||
+        ioctl(t->fd, FBIOGET_FSCREENINFO, &fix) < 0) {
+        printf("offload: FBIOGET_?SCREENINFO: %m\n");
+        close(t->fd);
+        return 0;
+    }
+
+    t->bpp    = t->var.bits_per_pixel;
+    t->stride = fix.line_length;
+    t->w      = t->var.xres;
+    t->h      = t->var.yres;
+
+    if (t->bpp != 32 && t->bpp != 16) {
+        printf("offload: %ubpp is not a depth this mode writes\n", t->bpp);
+        close(t->fd);
+        return 0;
+    }
+    if (!t->w || !t->h || t->stride < t->w * (t->bpp / 8u)) {
+        printf("offload: %ux%u at stride %u cannot be right\n",
+               t->w, t->h, t->stride);
+        close(t->fd);
+        return 0;
+    }
+
+    t->len = (size_t)t->stride * t->h;
+    if (fix.smem_len && t->len > fix.smem_len)
+        t->len = fix.smem_len;
+    t->base = mmap(NULL, t->len, PROT_READ | PROT_WRITE, MAP_SHARED, t->fd, 0);
+    if (t->base == MAP_FAILED) {
+        printf("offload: mmap %u bytes: %m\n", (unsigned)t->len);
+        close(t->fd);
+        return 0;
+    }
+
+    /* x8r8g8b8, which is what the DT gives simplefb on this board.  Anything else
+     * still works, through the general path below, one channel at a time. */
+    t->xrgb8888 = (t->bpp == 32 &&
+                   t->var.red.offset   == 16 && t->var.red.length   == 8 &&
+                   t->var.green.offset ==  8 && t->var.green.length == 8 &&
+                   t->var.blue.offset  ==  0 && t->var.blue.length  == 8);
+
+    /* Both of the states that are black on purpose, undone before drawing into a
+     * panel that would otherwise stay dark and be blamed on the GPU. */
+    if (ioctl(t->fd, FBIOBLANK, FB_BLANK_UNBLANK) == 0)
+        ;
+    tty_report(1);
+
+    printf("offload: /dev/fb0 \"%s\" %ux%u %ubpp stride %u at 0x%08lx, "
+           "r%u+%u g%u+%u b%u+%u%s\n",
+           fix.id, t->w, t->h, t->bpp, t->stride, fix.smem_start,
+           t->var.red.offset, t->var.red.length,
+           t->var.green.offset, t->var.green.length,
+           t->var.blue.offset, t->var.blue.length,
+           t->xrgb8888 ? ", byte-swap fast path" : "");
+    return 1;
+}
+
+static void fb_target_close(struct fbtarget *t)
+{
+    if (t->base && t->base != MAP_FAILED)
+        munmap(t->base, t->len);
+    if (t->fd >= 0)
+        close(t->fd);
+    t->base = NULL;
+    t->fd = -1;
+}
+
+/*
+ * RGBA8 out of glReadPixels into whatever the framebuffer's bitfields say, one
+ * row at a time and bottom-up: GL's origin is the lower-left corner and the
+ * framebuffer's row 0 is the top, so a copy that does not flip renders a cube
+ * standing on its head -- which looks like a projection-matrix bug and is not
+ * one.
+ */
+static void fb_store(const struct fbtarget *t, const unsigned char *rgba)
+{
+    const uint32_t rl = t->var.red.length,   ro = t->var.red.offset;
+    const uint32_t gl = t->var.green.length, go = t->var.green.offset;
+    const uint32_t bl = t->var.blue.length,  bo = t->var.blue.offset;
+    const uint32_t al = t->var.transp.length, ao = t->var.transp.offset;
+    const uint32_t alpha = al ? (((1u << al) - 1u) << ao) : 0u;
+    uint32_t x, y;
+
+    for (y = 0; y < t->h; y++) {
+        const unsigned char *src = rgba + (size_t)(t->h - 1u - y) * t->w * 4u;
+        unsigned char *dst = t->base + (size_t)y * t->stride;
+
+        if (t->xrgb8888) {
+            /* [R,G,B,A] in memory reads back as A<<24|B<<16|G<<8|R on this
+             * little-endian machine, and the target wants R<<16|G<<8|B, so the
+             * whole conversion is one red/blue exchange. */
+            const uint32_t *s = (const uint32_t *)(const void *)src;
+            uint32_t *d = (uint32_t *)(void *)dst;
+            for (x = 0; x < t->w; x++) {
+                const uint32_t p = s[x];
+                d[x] = ((p & 0x000000ffu) << 16) | (p & 0x0000ff00u) |
+                       ((p & 0x00ff0000u) >> 16);
+            }
+            continue;
+        }
+
+        for (x = 0; x < t->w; x++) {
+            const uint32_t px =
+                ((uint32_t)(src[x * 4u + 0u] >> (8u - rl)) << ro) |
+                ((uint32_t)(src[x * 4u + 1u] >> (8u - gl)) << go) |
+                ((uint32_t)(src[x * 4u + 2u] >> (8u - bl)) << bo) | alpha;
+            if (t->bpp == 32)
+                ((uint32_t *)(void *)dst)[x] = px;
+            else
+                ((uint16_t *)(void *)dst)[x] = (uint16_t)px;
+        }
+    }
+}
+
+static int offload(const char *path, int seconds)
+{
+    /* No EGL_SURFACE_TYPE and no window: the context is made current against
+     * EGL_NO_SURFACE, which EGL_KHR_surfaceless_context allows and which every
+     * Mesa build has for ES2.  Asking for a window surface here is what would
+     * drag gbm's scanout requirements -- and therefore a display device -- back
+     * into a path whose entire point is not needing one. */
+    EGLint attr[] = {
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_NONE
+    };
+    EGLint cattr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    static const struct { unsigned int fmt; const char *name; } COLOUR[] = {
+        { GL_RGBA8_OES, "RGBA8" }, { GL_RGB5_A1, "RGB5_A1" },
+        { GL_RGBA4, "RGBA4" }, { GL_RGB565, "RGB565" }
+    };
+    struct fbtarget fb;
+    EGLDisplay dpy = NULL;
+    EGLConfig pick[64], cfg;
+    EGLContext ctx = NULL;
+    struct gbm_device *gbm = NULL;
+    unsigned char *rgba = NULL;
+    const unsigned char *s;
+    unsigned int fbo = 0, colour = 0, depth = 0, prog = 0, vs, fs, st = 0;
+    unsigned int chosen = 0;
+    const char *chosen_name = "none";
+    EGLint count = 0, e;
+    int a_pos, a_col, u_mvp, fd = -1, rc = 1, k, have_depth = 0;
+    long frames = 0;
+    double t0, t, mark, gl_s = 0.0, read_s = 0.0, blit_s = 0.0, split;
+    float proj[16];
+
+    printf("== %s, rotating cube into /dev/fb0 for %ds, no modeset\n",
+           path, seconds);
+
+    if (!fb_target_open(&fb))
+        return 1;
+
+    /* O_RDWR because gbm wants it; nothing here ever issues a modesetting ioctl,
+     * and a render node could not honour one if it did. */
+    fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        printf("offload: %s: %m -- lima is not loaded, or j36.lima=0, or "
+               "mfgpower refused to power the MFG domain.  Nothing renders "
+               "without a render node.\n", path);
+        goto out_fb;
+    }
+
+    gbm = p_gbm_create_device(fd);
+    if (!gbm) {
+        printf("offload: gbm_create_device(%s) failed -- this Mesa will not make "
+               "a gbm device out of a render node, so the display is asked for "
+               "surfacelessly instead\n", path);
+    }
+
+    if (gbm) {
+        if (p_eglGetPlatformDisplayEXT)
+            dpy = p_eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR, gbm, NULL);
+        if (!dpy && p_eglGetPlatformDisplay)
+            dpy = p_eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm, NULL);
+        if (!dpy)
+            dpy = p_eglGetDisplay(gbm);
+    }
+    /* The fallback picks a driver rather than being handed one, so it is second:
+     * on a board with llvmpipe in the rootfs, surfaceless can succeed on software
+     * and the answer would then say nothing about lima. */
+    if (!dpy) {
+        if (p_eglGetPlatformDisplayEXT)
+            dpy = p_eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, NULL, NULL);
+        if (!dpy && p_eglGetPlatformDisplay)
+            dpy = p_eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, NULL, NULL);
+        if (dpy)
+            printf("offload: on the surfaceless platform, so the driver below is "
+                   "whatever Mesa picked and not necessarily lima -- check the "
+                   "renderer string\n");
+    }
+    if (!dpy || !p_eglInitialize(dpy, NULL, NULL)) {
+        printf("offload: no EGL display on %s\n", path);
+        goto out_gbm;
+    }
+
+    eglclear();
+    if (!p_eglBindAPI(EGL_OPENGL_ES_API)) {
+        printf("offload: eglBindAPI(ES): 0x%04x\n", p_eglGetError());
+        goto out_dpy;
+    }
+    if (!p_eglChooseConfig(dpy, attr, pick, 64, &count) || count == 0) {
+        printf("offload: no ES2-renderable config at all on this display\n");
+        goto out_dpy;
+    }
+    cfg = pick[0];
+
+    /* NULL is EGL_NO_SURFACE, spelled the way the rest of this file spells it. */
+    ctx = p_eglCreateContext(dpy, cfg, NULL, cattr);
+    if (!ctx || !p_eglMakeCurrent(dpy, NULL, NULL, ctx)) {
+        e = p_eglGetError();
+        printf("offload: no current surfaceless ES2 context: 0x%04x %s -- an EGL "
+               "without EGL_KHR_surfaceless_context cannot do this\n",
+               e, eglerr(e));
+        goto out_ctx;
+    }
+
+    if (!load_gles() || !load_gles_fbo())
+        goto out_current;
+
+    s = p_glGetString(GL_RENDERER);
+    printf("offload: renderer \"%s\"\n", s ? (const char *)s : "NULL");
+    s = p_glGetString(GL_VERSION);
+    printf("offload: version \"%s\"\n", s ? (const char *)s : "NULL");
+
+    /* The FBO, at the panel's size so the copy is a straight row-for-row store
+     * with no scaling anywhere in it. */
+    p_glGenFramebuffers(1, &fbo);
+    p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    p_glGenRenderbuffers(1, &colour);
+    p_glBindRenderbuffer(GL_RENDERBUFFER, colour);
+    for (k = 0; k < (int)(sizeof(COLOUR) / sizeof(COLOUR[0])); k++) {
+        p_glRenderbufferStorage(GL_RENDERBUFFER, COLOUR[k].fmt,
+                                (int)fb.w, (int)fb.h);
+        if (p_glGetError() == GL_NO_ERROR) {
+            chosen = COLOUR[k].fmt;
+            chosen_name = COLOUR[k].name;
+            break;
+        }
+    }
+    if (!chosen) {
+        printf("offload: this driver would not give a %ux%u colour renderbuffer "
+               "in any ES2 format\n", fb.w, fb.h);
+        goto out_current;
+    }
+    p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                GL_RENDERBUFFER, colour);
+
+    /* Depth is a nicety -- the cube is convex, so culling alone draws it right --
+     * so a driver that refuses one loses the depth test and nothing else. */
+    p_glGenRenderbuffers(1, &depth);
+    p_glBindRenderbuffer(GL_RENDERBUFFER, depth);
+    p_glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16,
+                            (int)fb.w, (int)fb.h);
+    if (p_glGetError() == GL_NO_ERROR) {
+        p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                    GL_RENDERBUFFER, depth);
+        have_depth = 1;
+    }
+
+    st = p_glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (st != GL_FRAMEBUFFER_COMPLETE && have_depth) {
+        /* Colour and depth that are individually legal and jointly refused is a
+         * real Utgard case, so drop depth and ask again before giving up. */
+        p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                    GL_RENDERBUFFER, 0);
+        have_depth = 0;
+        st = p_glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    }
+    if (st != GL_FRAMEBUFFER_COMPLETE) {
+        printf("offload: the FBO is %s (0x%04x), so there is nothing to render "
+               "into\n", fbo_status(st), st);
+        goto out_current;
+    }
+    printf("offload: %ux%u FBO, colour %s, depth %s\n",
+           fb.w, fb.h, chosen_name, have_depth ? "16-bit" : "none");
+
+    vs = compile_shader(GL_VERTEX_SHADER, CUBE_VS, "vertex");
+    fs = vs ? compile_shader(GL_FRAGMENT_SHADER, CUBE_FS, "fragment") : 0;
+    if (!vs || !fs)
+        goto out_current;
+
+    prog = p_glCreateProgram();
+    if (prog) {
+        int ok = 0, len = 0;
+        char log[512];
+        p_glAttachShader(prog, vs);
+        p_glAttachShader(prog, fs);
+        p_glLinkProgram(prog);
+        p_glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            log[0] = '\0';
+            p_glGetProgramInfoLog(prog, (int)sizeof(log), &len, log);
+            log[sizeof(log) - 1] = '\0';
+            printf("offload: the program did not link: %s\n",
+                   log[0] ? log : "(the driver returned no log)");
+            prog = 0;
+        }
+    }
+    if (!prog) {
+        printf("offload: no program, so there is nothing to draw with\n");
+        goto out_current;
+    }
+
+    a_pos = p_glGetAttribLocation(prog, "a_pos");
+    a_col = p_glGetAttribLocation(prog, "a_col");
+    u_mvp = p_glGetUniformLocation(prog, "u_mvp");
+    if (a_pos < 0 || a_col < 0 || u_mvp < 0) {
+        printf("offload: the linked program has no a_pos/a_col/u_mvp (%d/%d/%d)\n",
+               a_pos, a_col, u_mvp);
+        goto out_current;
+    }
+
+    rgba = malloc((size_t)fb.w * fb.h * 4u);
+    if (!rgba) {
+        printf("offload: no memory for a %ux%u readback\n", fb.w, fb.h);
+        goto out_current;
+    }
+
+    build_cube();
+    m_perspective(proj, 45.0f, (float)fb.w / (float)fb.h, 0.1f, 20.0f);
+
+    p_glViewport(0, 0, (int)fb.w, (int)fb.h);
+    if (have_depth) {
+        p_glEnable(GL_DEPTH_TEST);
+        p_glDepthFunc(GL_LESS);
+    }
+    p_glEnable(GL_CULL_FACE);
+    p_glUseProgram(prog);
+    p_glVertexAttribPointer((unsigned int)a_pos, 3, GL_FLOAT, 0,
+                            6 * (int)sizeof(float), cube_verts);
+    p_glVertexAttribPointer((unsigned int)a_col, 3, GL_FLOAT, 0,
+                            6 * (int)sizeof(float), cube_verts + 3);
+    p_glEnableVertexAttribArray((unsigned int)a_pos);
+    p_glEnableVertexAttribArray((unsigned int)a_col);
+    /* Rows are t->w * 4 bytes and therefore already 4-aligned, but saying so
+     * costs nothing and stops a driver padding the readback behind our back. */
+    p_glPixelStorei(GL_PACK_ALIGNMENT, 4);
+
+    quit_open();
+    t0 = mark = now_s();
+    for (;;) {
+        float mv[16], rx[16], ry[16], tr[16], tmp[16], mvp[16];
+        double a, b, c;
+
+        t = now_s();
+        if (t - t0 >= (double)seconds || quit_pressed())
+            break;
+
+        m_rot_x(rx, (float)(t - t0) * 0.9f);
+        m_rot_y(ry, (float)(t - t0) * 1.3f);
+        m_translate(tr, 0.0f, 0.0f, -6.0f);
+        m_mul(tmp, ry, rx);
+        m_mul(mv, tr, tmp);
+        m_mul(mvp, proj, mv);
+
+        p_glClearColor(0.04f, 0.05f, 0.09f, 1.0f);
+        p_glClear(GL_COLOR_BUFFER_BIT | (have_depth ? GL_DEPTH_BUFFER_BIT : 0u));
+        p_glUniformMatrix4fv(u_mvp, 1, 0, mvp);
+        p_glDrawArrays(GL_TRIANGLES, 0, 36);
+        if (p_glFinish)
+            p_glFinish();
+        a = now_s();
+
+        /* glReadPixels is the one format pair ES2 guarantees for any FBO, which
+         * is why the renderbuffer's own format above is allowed to be whatever
+         * the driver would give. */
+        p_glReadPixels(0, 0, (int)fb.w, (int)fb.h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        b = now_s();
+
+        fb_store(&fb, rgba);
+        c = now_s();
+
+        gl_s   += a - t;
+        read_s += b - a;
+        blit_s += c - b;
+        frames++;
+
+        if (c - mark >= 5.0) {
+            printf("offload: %ld frames, %.1f fps\n", frames,
+                   (double)frames / (c - t0));
+            mark = c;
+        }
+    }
+    quit_close();
+
+    t = now_s();
+    split = (double)(frames ? frames : 1);
+    printf("offload: %ld frames in %.1fs, %.1f fps -- gl %.1f ms, read %.1f ms, "
+           "blit %.1f ms per frame\n", frames, t - t0,
+           t > t0 ? (double)frames / (t - t0) : 0.0,
+           gl_s * 1000.0 / split, read_s * 1000.0 / split, blit_s * 1000.0 / split);
+    if (frames == 0) {
+        printf("offload: nothing was drawn, so the messages above are the "
+               "finding\n");
+    } else {
+        printf("offload: if the panel showed a turning cube then lima compiles, "
+               "links and rasterises correctly on this board, and a black screen "
+               "under -c or under any SDL/KMSDRM client is a presentation fault, "
+               "not a GL one -- look at mtk_drm's modeset and at the DSI, not at "
+               "Mesa\n");
+        rc = 0;
+    }
+
+out_current:
+    free(rgba);
+    if (fbo) {
+        p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        p_glDeleteFramebuffers(1, &fbo);
+    }
+    if (colour)
+        p_glDeleteRenderbuffers(1, &colour);
+    if (depth)
+        p_glDeleteRenderbuffers(1, &depth);
+    p_eglMakeCurrent(dpy, NULL, NULL, NULL);
+out_ctx:
+    if (ctx)
+        p_eglDestroyContext(dpy, ctx);
+out_dpy:
+    p_eglTerminate(dpy);
+out_gbm:
+    if (gbm)
+        p_gbm_device_destroy(gbm);
+    if (fd >= 0)
+        close(fd);
+out_fb:
+    fb_target_close(&fb);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
-    int wins = 0, painted = -1, cubed = -1, listed = -1, i;
+    int wins = 0, painted = -1, cubed = -1, listed = -1, offloaded = -1, i;
     const char *node;
     int fb_secs = 3;
 
@@ -2689,6 +3270,17 @@ int main(int argc, char **argv)
                     secs = atoi(argv[++i]);
                 node = display_node();
                 cubed = node ? cube(node, secs > 0 ? secs : CUBE_SECONDS) : 1;
+            } else if (!strcmp(argv[i], "-o")) {
+                /* The render node by name, and not display_node(): this mode
+                 * wants lima and must not be handed a card that would drag a
+                 * display device -- and a modeset -- back into the path. */
+                int secs = CUBE_SECONDS;
+                const char *dev = "/dev/dri/renderD128";
+                if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+                    secs = atoi(argv[++i]);
+                else if (i + 1 < argc && !strncmp(argv[i + 1], "/dev/", 5))
+                    dev = argv[++i];
+                offloaded = offload(dev, secs > 0 ? secs : CUBE_SECONDS);
             } else {
                 wins += probe(argv[i], strstr(argv[i], "/card") != NULL);
             }
@@ -2702,8 +3294,8 @@ int main(int argc, char **argv)
         wins += probe("/dev/dri/renderD128", 0);
     }
 
-    if (painted >= 0 || cubed >= 0 || listed >= 0)
-        return (painted > 0 || cubed > 0 || listed > 0) ? 1 : 0;
+    if (painted >= 0 || cubed >= 0 || listed >= 0 || offloaded >= 0)
+        return (painted > 0 || cubed > 0 || listed > 0 || offloaded > 0) ? 1 : 0;
 
     printf("eglprobe: %s\n", wins ? "a context came up, see which API above"
                                   : "no API created a context on any node");
