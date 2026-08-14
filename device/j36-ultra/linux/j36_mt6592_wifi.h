@@ -316,6 +316,12 @@
 #define J36_HIF_INIT_ACK_TIMEOUT_US	1000000
 #define J36_HIF_READY_TIMEOUT_US	6000000
 
+/* Two seconds, and not a guess: the ROM handles the probe request asynchronously
+ * on wifi_task, and the probe's own SPI helper spins up to 32000 iterations per
+ * transfer, so the flag can be several hundred milliseconds behind the command. */
+#define J36_ADIE_PROBE_POLL_INTERVAL_MS	20
+#define J36_ADIE_PROBE_POLL_LIMIT	100
+
 /* ── addresses inside the connectivity ROM's own data ────────────────────────
  *
  * Reached through INIT_CMD_ACCESS_REG, which is the ROM answering a read or a

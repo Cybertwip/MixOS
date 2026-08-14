@@ -207,8 +207,8 @@ MODULE_PARM_DESC(chgreboot,
  * which puts 19181 counts at 4214 mV -- a cell at its CV setpoint.  Channel 4
  * takes the x1 arm and a 330k/39k board divider instead.
  */
-#define J36_ADC_FULL_SCALE_MV		7200
-#define J36_ADC_VCHR_FULL_SCALE_MV	3600
+#define J36_ADC_FULL_SCALE_MV		3600
+#define J36_ADC_VCHR_FULL_SCALE_MV	1800
 #define J36_VCHR_DIVIDER_NUM		369
 #define J36_VCHR_DIVIDER_DEN		39
 #define J36_R_SENSE_MOHM		68

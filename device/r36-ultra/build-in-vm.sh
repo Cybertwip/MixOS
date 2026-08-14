@@ -371,6 +371,13 @@ restore_rootfs_snapshot() {
     # A finished image is about to be verified and returned; copying ten gigabytes to
     # then exit immediately would be pure waste.  `marked finalization' and not merely
     # the image's existence: image_setup.sh creates $DISK long before it is finished.
+    #
+    # The gate above now catches that case and exits before this is ever called, so this
+    # is a guard and not the mechanism.  It stays because it is the honest statement of
+    # when a restore is pointless, and because it is what makes the two orderings agree:
+    # if the gate discarded the image for failing to verify it also cleared
+    # finalization.done, so this test is false and the snapshot comes back -- which is
+    # the whole reason the restore has to run after the gate rather than before it.
     if marked finalization && [[ -s "$DISK" ]]; then return 1; fi
 
     if marked userspace && [[ -s "$ROOTFS_STRIPPED_SNAPSHOT" ]]; then
@@ -801,6 +808,53 @@ discard_foreign_layout
 clear_foreign_rootfs_mount
 clear_legacy_multiarch_root
 
+# ── THE FINISHED-IMAGE GATE COMES FIRST, AND THE ORDER IS THE WHOLE POINT ────
+#
+# If a finished image already exists, verify and stop immediately -- but only if it can
+# actually boot.  The 08042026 GUI image finalized cleanly with an unformatted BOOT
+# partition, and accepting that here is what turned a build bug into a released artifact.
+#
+# `marked finalization' is what makes "finished" mean finished: image_setup.sh creates
+# $DISK at full size long before anything is written into it, so the file's existence on
+# its own would let a half-built image be handed over as a completed build.  That
+# distinction used to be free, because the archive only existed after create_image.sh ran
+# at the very end -- and the archive is what has gone.
+#
+# WHY IT IS UP HERE.  It used to sit below the three stale-checkpoint blocks, and the
+# rootfs one would reliably shoot it before it fired.  clean_mounts.sh deletes the build
+# filesystem at the end of a SUCCESSFUL run, so the next run opens with a state directory
+# that says finished and no $FILESYSTEM -- which is exactly the trigger for "the build
+# filesystem is gone; clearing the rootfs checkpoints that described it", and that clear
+# takes finalization.done with it.  By the time the gate below was reached there was no
+# finalization mark left to match, so a completed base build re-partitioned and
+# re-debootstrapped Debian from scratch every single time, for an image already sitting
+# in the build directory.  Nothing was wrong with the checkpoints, the snapshots or the
+# image; the run was simply asked whether it was finished after it had been told to
+# forget.  Ask first.
+#
+# Nothing below needs to have run for this decision: it reads $DISK and finalization,
+# both of which discard_foreign_layout above has already had its say about.  And if the
+# image fails to verify, the stamps this clears are precisely the ones that make the
+# blocks below do the right thing on the way past -- the snapshot restore included.
+if marked finalization && [[ -s "$DISK" ]]; then
+    if ! python3 device/r36-ultra/verify_boot.py "$DISK" \
+            --require Image --require uInitrd --require boot.ini; then
+        log "The finished image has no bootable BOOT partition; discarding it and rebuilding"
+        rm -f "$DISK"
+        rm -f "$STATE_DIR"/complete.done "$STATE_DIR"/finalization.done \
+            "$STATE_DIR"/image.done
+    else
+        log "Existing finished image found and its BOOT partition is bootable: $DISK"
+        mark complete
+        # Reached only because discard_foreign_layout let this image stand, so it is this
+        # layout's image by elimination.  Recording that is what lets the next run tell
+        # the two apart once the image itself has been deleted.
+        layout_signature > "$STATE_DIR/layout"
+        printf '%s\n' "$DISK" > "$STATE_DIR/latest-image"
+        exit 0
+    fi
+fi
+
 # Before any checkpoint is inferred: a missing build root may be recoverable.
 restore_rootfs_snapshot || true
 
@@ -866,34 +920,6 @@ fi
 if marked kernel && ! boot_stash_ready; then
     log "The kernel checkpoint has no boot payload left to install; the kernel will be rebuilt"
     rm -f "$STATE_DIR/kernel.done"
-fi
-
-# If a finished image already exists, verify and stop immediately -- but only if it can
-# actually boot.  The 08042026 GUI image finalized cleanly with an unformatted BOOT
-# partition, and accepting that here is what turned a build bug into a released artifact.
-#
-# `marked finalization' is what makes "finished" mean finished: image_setup.sh creates
-# $DISK at full size long before anything is written into it, so the file's existence on
-# its own would let a half-built image be handed over as a completed build.  That
-# distinction used to be free, because the archive only existed after create_image.sh ran
-# at the very end -- and the archive is what has gone.
-if marked finalization && [[ -s "$DISK" ]]; then
-    if ! python3 device/r36-ultra/verify_boot.py "$DISK" \
-            --require Image --require uInitrd --require boot.ini; then
-        log "The finished image has no bootable BOOT partition; discarding it and rebuilding"
-        rm -f "$DISK"
-        rm -f "$STATE_DIR"/complete.done "$STATE_DIR"/finalization.done \
-            "$STATE_DIR"/image.done
-    else
-        log "Existing finished image found and its BOOT partition is bootable: $DISK"
-        mark complete
-        # Reached only because discard_foreign_layout let this image stand, so it is this
-        # layout's image by elimination.  Recording that is what lets the next run tell
-        # the two apart once the image itself has been deleted.
-        layout_signature > "$STATE_DIR/layout"
-        printf '%s\n' "$DISK" > "$STATE_DIR/latest-image"
-        exit 0
-    fi
 fi
 
 run_stage prepare prepare.sh

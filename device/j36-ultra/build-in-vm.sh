@@ -263,6 +263,13 @@ config_v SERIAL_8250_NR_UARTS 4
 config_v SERIAL_8250_RUNTIME_UARTS 4
 config_s LOCALVERSION "-j36"
 
+# CRC32 is `default y' and would very probably be on anyway.  It is asked for
+# explicitly because j36_mt6592_wifi's firmware download puts a CRC-32 in every
+# 2 KiB chunk header and the boot ROM checks it, so crc32_le() has to resolve at
+# insmod time -- and an unresolved symbol there is a module that never loads,
+# reported as a Wi-Fi failure with nothing about a CRC in it.
+config_y CRC32
+
 # ── The black screen between the LK's logo and the MixOS splash ───────────────
 #
 # simplefb hands this kernel the framebuffer the LK was already drawing into,
@@ -1596,9 +1603,16 @@ for arg in $(cat /proc/cmdline); do
         # in this payload that can switch the board off.  The amp hangs off VBAT,
         # which on this PMIC is the system node: with no cell fitted VBAT is held
         # up only by the charger's current source, and the amp at output pulls it
-        # under the undervoltage lockout.  So a card configured for audio still
-        # boots silent, and this word is the deliberate second step -- on a board
-        # with a cell in it.
+        # under the undervoltage lockout.
+        #
+        # It is in the shipped bootargs, because j36.audio=1 on its own gives a
+        # card that accepts audio and sends it nowhere, which is not audio.  What
+        # makes that the right default rather than a gamble is that the word is no
+        # longer the only way to reach the amp: it seeds a "Speaker Amp" mixer
+        # control, so a board that cannot hold the rail says
+        # `amixer -c0 set "Speaker Amp" off' and keeps its card, and one that can
+        # is not asking anybody to edit bootargs on a vfat partition first.  Drop
+        # back to j36.audio=1 to boot with it off.
         j36.audio=speaker)
             want_audio=1
             audio_speaker=1
@@ -2294,8 +2308,11 @@ run_audio() {
     else
         say "audio: no /dev/snd; the card did not register"
     fi
-    if [ "$audio_speaker" != 1 ]; then
-        say "audio: the speaker amp is off -- add j36.audio=speaker with a cell fitted"
+    if [ "$audio_speaker" = 1 ]; then
+        say "audio: speaker amp armed; it powers up when the DL1 cursor first moves"
+        say "audio: if the board cuts out in playback: amixer -c0 set \"Speaker Amp\" off"
+    else
+        say "audio: speaker amp off -- amixer -c0 set \"Speaker Amp\" on to try it"
     fi
     return 0
 }
@@ -2520,7 +2537,7 @@ run_wifi() {
         echo "$payload/wifi/firmware" > /sys/module/firmware_class/parameters/path
         say "wifi: firmware search path is $payload/wifi/firmware"
     else
-        say "wifi: no writable firmware_class path -- the ROM patches will not be found"
+        say "wifi: no writable firmware_class path -- the ROM patches and the WLAN firmware will not be found"
     fi
 
     # Same skip as run_usb, for the same reason and a different overlap: the
@@ -6233,14 +6250,14 @@ initrd=initrd.img
 # Only the four files the LK reads are on BOOT; the rest is in sd-root.tar.gz,
 # unpacked as /opt/mixos on the ext2 OS partition.
 #
-# j36.audio=speaker powers the class-D amp off VBAT, the system node, so a
-# battery-less board pulls itself under its own lockout.  j36.usb=1 sources 5 V
-# off that same rail: say j36.usb=novbus with no cell, or a self-powered hub.
+# j36.audio=speaker powers the class-D amp off VBAT, the system node: if the board
+# cuts out in playback, `amixer -c0 set "Speaker Amp" off' -- no reboot needed.
+# j36.usb=1 sources 5 V off that same rail: j36.usb=novbus with no cell.
 # j36.gl=debug adds Mesa's EGL trace; a diagnostic, not a default.
 # j36.splash=0 with loglevel=7 boots to text, which is the pair
 # ./build-j36-ultra.sh --no-splash writes here.
 # Each boot writes mixos-log.txt at the top of this partition; j36.log=0 stops it.
-bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=1 j36.usb=1 j36.power=1 j36.wifi=1 j36.splash=1
+bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=speaker j36.usb=1 j36.power=1 j36.wifi=1 j36.splash=1
 CONF
 
 # ── --no-splash, applied to the line rather than written into it ──────────────
@@ -6761,7 +6778,7 @@ j36.power=nocharge
 
 j36.wifi=1
     The connectivity MCU.  One module, j36/wifi/j36_mt6592_wifi.ko, loaded after
-    the power payload, and it does the first two of the four things that stand
+    the power payload, and it does the first three of the four things that stand
     between a cold MT6592 and a network interface.
 
     WHAT IT DOES.  It powers the CONSYS block -- the MT6323's VCN28/VCN33 rails
@@ -6769,17 +6786,34 @@ j36.wifi=1
     the EMI mapping register that tells the MCU which megabyte of DRAM is its own
     -- and then talks to it.  The link is BTIF at 0x1100c000, a 4-wire UART with
     no pins, running MediaTek's STP framing with WMT commands inside it, and what
-    goes down it is the pair of ROM patches in j36/wifi/firmware/.  A patched MCU
-    answers with its chip ID, and that is where this build stops.
+    goes down it is the pair of ROM patches in j36/wifi/firmware/.
 
-    WHAT IT DOES NOT DO, said plainly: there is no wlan0 after this word.  The
-    WLAN firmware proper (WIFI_RAM_CODE_SOC) goes down the AHB HIF at 0x180f0000,
-    and neither that stage nor the cfg80211 netdev on top of it is in this build.
-    The driver says so itself in the last line it prints.  Reading the boot log is
-    the whole test: "connectivity MCU up: chip 0x..." means both stages passed,
-    and "Wi-Fi bring-up stopped at [stage]" names the one that did not -- the
-    stage names are the driver's own, and consys-power, btif-link, rom-patch and
-    wmt-handshake are the ones worth grepping for.
+    Then the third stage, over the WLAN AHB HIF at 0x180f0000: MediaTek's own
+    WIFI_RAM_CODE_SOC, 257 KiB in 2 KiB chunks, each with a CRC-32 the boot ROM
+    checks, then the MT6625L A-die probe, then WIFI_START, then WLAN_READY.  At
+    that point the firmware is executing on the connectivity core.
+
+    WHAT IT DOES NOT DO, said plainly: there is still no wlan0 after this word.
+    WLAN_READY means the firmware is running, not that anything can be sent
+    through it -- scanning, association, key management and the data path are the
+    fourth stage, they are a great deal more code than the first three, and they
+    are not in this build.  The driver says so itself in the last line it prints.
+
+    Reading the boot log is the whole test.  "WLAN firmware running: chip 0x...,
+    WLAN_READY" means all three stages passed.  "connectivity MCU up: ... but the
+    WLAN firmware did not start" means the MCU is fine and stage 3 is not, which
+    is a different problem from the MCU never answering, and "Wi-Fi bring-up
+    stopped at [stage]" names it -- the stage names are the driver's own, and
+    consys-power, btif-link, rom-patch, wmt-handshake, wlan-firmware-missing and
+    firmware-ready-timeout are the ones worth grepping for.
+
+    Two lines below that are worth reading even on success.  "A-die probe ran"
+    means the RF front end was configured by the ROM; "timed out" or "ROM went
+    silent" means the driver forced the probe's completion flag to get the
+    firmware up, and a receiver left at reset values hears no beacons.  And
+    "connectivity PC N changes in M samples" is what separates a firmware that is
+    running from a core that stopped: zero changes is a stopped core, and the
+    last PC is the address it stopped at.
 
     WHY IT IMPLIES j36.power.  The PMIC wrapper is one hardware state machine with
     one result register and no arbitration between users, so exactly one driver
@@ -6797,11 +6831,18 @@ j36.wifi=1
     firmware_class path at the payload directory instead.  The consequence worth
     knowing: delete j36/wifi/ and the driver and its blobs leave together.
 
-    The two files are MediaTek's, off this device's stock system image, and their
-    names lie about their order -- ROMv1_patch_1_1_hdr.bin is patch 1 and
-    ROMv1_patch_1_0_hdr.bin is patch 2.  The driver reads the sequence out of byte
-    24 of each header and sorts on that, because sending them in filename order
-    makes the MCU stop answering rather than complain.
+    The three files are MediaTek's, off this device's stock system image.  Two are
+    the ROM patches, and their names lie about their order -- ROMv1_patch_1_1_hdr.bin
+    is patch 1 and ROMv1_patch_1_0_hdr.bin is patch 2.  The driver reads the
+    sequence out of byte 24 of each header and sorts on that, because sending them
+    in filename order makes the MCU stop answering rather than complain.
+
+    The third is WIFI_RAM_CODE_SOC, the WLAN firmware, and it has no extension at
+    all -- that is the name the device's own /system/etc/firmware uses and so it is
+    the name the driver asks the loader for.  Worth saying out loud because a *.bin
+    staging glob cannot see it, which is exactly how it went missing from the card
+    for a while: ROM patches present, the image they patch absent, and a radio that
+    stopped one stage earlier than the log suggested.
 
 j36.gl=1
     Stage j36/gl/ -- Debian's armhf Mesa -- into a tmpfs, so that a program looking
@@ -7588,7 +7629,8 @@ GNU General Public License, version 2 only:
                             j36_mt6592_usb_phy
     j36/power/*.ko          MixOS's j36_mt6592_pmic and j36_mt6592_backlight
     j36/wifi/*.ko           MixOS's j36_mt6592_wifi -- the CONSYS connectivity
-                            MCU's power, BTIF link and ROM patch download
+                            MCU's power, BTIF link, ROM patch download and the
+                            WLAN firmware download over the AHB HIF
     j36_mt6592_input.ko     MixOS's keypad and GPIO key adapter
 
     The seven MixOS modules are GPL-2.0-only deliberately and are not Ms-PL: they
@@ -7597,9 +7639,10 @@ GNU General Public License, version 2 only:
 
 Their own terms:
 
-    j36/wifi/firmware/      MediaTek's connectivity ROM patches, redistributed
-                            unmodified as this device shipped them; MediaTek's
-                            terms, not MixOS's, and not GPL
+    j36/wifi/firmware/      MediaTek's connectivity ROM patches and WLAN
+                            firmware, redistributed unmodified as this device
+                            shipped them; MediaTek's terms, not MixOS's, and not
+                            GPL
     j36/gl/*.so*            Mesa, from Debian (MIT and others)
     qt/lib, qt/plugins      Qt 5.15 and its runtime closure, from Debian: LGPL-3
                             with Qt's own exceptions, and GPL/LGPL/MIT/others for

@@ -449,6 +449,28 @@ QString MediaPage::ffmpegPath() const
     return path;
 }
 
+bool MediaPage::hasSoundCard() const
+{
+    /*
+     * A PLAYBACK PCM, not merely /dev/snd.  This is what decides whether the
+     * single-process path below is allowed to name an alsa output at all: with
+     * no card, `-f alsa default' does not degrade to silence, it makes ffmpeg
+     * exit -- and that one process is also carrying the video, so an absent card
+     * would take the picture down with it.  The fallback has to be picked before
+     * the pipeline is built, which means asking here rather than finding out.
+     *
+     * Not cached: the card is a module the boot word may or may not have loaded,
+     * and it can also go away.  Two readdirs on a tmpfs are not worth a stale
+     * answer.
+     */
+    const QDir snd(QStringLiteral("/dev/snd"));
+    if (!snd.exists())
+        return false;
+    /* pcmC0D0p -- the trailing p is playback; capture-only devices end in c. */
+    return !snd.entryList(QStringList() << QStringLiteral("pcmC*D*p"),
+                          QDir::System | QDir::NoDotAndDotDot).isEmpty();
+}
+
 bool MediaPage::ffmpegHasAlsa() const
 {
     /*
@@ -456,24 +478,38 @@ bool MediaPage::ffmpegHasAlsa() const
      * outdev, but this is exactly the sort of thing that a stripped rebuild drops,
      * and the failure without the check is silent video with no sound and no
      * message.
+     *
+     * THE TIMEOUTS ARE NOT ARBITRARY AND THEY WERE TOO SHORT.  They were 1.5 s to
+     * start and 3 s to finish, which is generous on a desktop and not nearly
+     * enough here: ffmpeg drags in libavdevice, libavfilter, libavformat and
+     * something like two hundred shared objects, and this is an A7 reading them
+     * off an SD card with a cold page cache.  A first play after boot could
+     * overrun that easily -- and the old code then cached the timeout as a
+     * definite `no alsa muxer', for the lifetime of the process, on an ffmpeg
+     * that has the muxer.  That is the message the board was showing.
+     *
+     * So: a long window, and an inconclusive probe is not an answer.  A timeout
+     * leaves the cache unset and the next attempt asks again, by which point the
+     * binary and its libraries are in page cache and it returns immediately.
      */
     static int cached = -1;
     if (cached >= 0)
         return cached != 0;
-    cached = 0;
 
     if (ffmpegPath().isEmpty())
         return false;
 
     QProcess p;
     p.start(ffmpegPath(), QStringList() << "-hide_banner" << "-devices");
-    if (!p.waitForStarted(1500))
+    if (!p.waitForStarted(8000))
         return false;
-    if (!p.waitForFinished(3000)) {
+    if (!p.waitForFinished(15000)) {
         p.kill();
         p.waitForFinished(500);
         return false;
     }
+
+    cached = 0;
 
     const QString out = QString::fromLocal8Bit(p.readAllStandardOutput())
                         + QString::fromLocal8Bit(p.readAllStandardError());
@@ -584,7 +620,14 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
          << "-vf" << filter
          << "-f" << "rawvideo" << "-pix_fmt" << "bgra";
 
-    const bool alsa = ffmpegHasAlsa();
+    /*
+     * The card is asked about FIRST and separately, because the two failures want
+     * different words.  No card is a boot-word or a driver matter and no ffmpeg
+     * will fix it; no muxer is an ffmpeg matter and the card is fine.  Reporting
+     * either as the other is what sends someone rebuilding the wrong half.
+     */
+    const bool card = hasSoundCard();
+    const bool alsa = card && ffmpegHasAlsa();
     if (alsa) {
         /* pipe:1 has to be named before the second output, and the audio map is
          * optional -- the trailing ? is what keeps a silent clip from failing. */
@@ -601,7 +644,15 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
             this, &MediaPage::onDecoderFinished);
     m_decoder->start(ffmpegPath(), args);
 
-    if (!alsa) {
+    if (!card) {
+        /*
+         * Nothing to play into, so neither chain is started -- a second ffmpeg
+         * feeding an aplay that cannot open a device is two processes failing in
+         * the background while the screen says nothing.  The note is the whole of
+         * the response.
+         */
+        m_note = tr("no sound card on this device");
+    } else if (!alsa) {
         /*
          * Audio in its own chain, which drifts from the video because the two
          * decodes have no shared clock.  aplay's blocking writes pace it, so the

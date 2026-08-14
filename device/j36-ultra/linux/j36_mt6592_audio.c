@@ -27,21 +27,28 @@
  *     the measurement this driver exists to take, which is why it ungates the
  *     clocks, logs CLK_CFG_AUD before and after, and says in one line per stream
  *     whether the DMA cursor moved.
- *   - The CLASS-D SPEAKER IS A KNOWN POWER HAZARD and stays off unless it is
- *     asked for by name. VBAT on this PMIC family is the system node: with no
- *     cell fitted it is held up only by the charger's current source, and MVII
- *     recorded the amp at full output pulling it under the undervoltage lockout
- *     -- the board switches off a few seconds into playback. So `speaker=1' is
- *     opt-in, it opens at a conservative level, and the amp is only ever powered
- *     after the DL1 cursor has been seen moving, so it is never fed by an
- *     unclocked DAC (which would drive the coil with DC and take the rail down
- *     for a different reason).
+ *   - The CLASS-D SPEAKER IS A KNOWN POWER HAZARD. VBAT on this PMIC family is
+ *     the system node: with no cell fitted it is held up only by the charger's
+ *     current source, and MVII recorded the amp AT FULL OUTPUT pulling it under
+ *     the undervoltage lockout -- the board switches off a few seconds into
+ *     playback. Three things bound that, all still in force: it opens at
+ *     `spk_level' (8 of 11) rather than wide, it ramps a step at a time, and it
+ *     is only ever powered after the DL1 cursor has been seen moving, so it is
+ *     never fed by an unclocked DAC (which would drive the coil with DC and take
+ *     the rail down for a different reason).
  *
- * The consequence, stated plainly: with the default parameters this card is
- * silent by construction. What it gives is /dev/snd, a PCM that accepts and
- * paces audio, and one dmesg line that says whether the hardware consumed it.
- * Sound comes from the boot word, once the log says the DMA is alive and a cell
- * is fitted.
+ * WHAT CHANGED, and it is the difference between a measurement and a product:
+ * the amp used to be reachable only through `speaker=1', which is a 0444 module
+ * parameter -- on a running board that is not a setting, it is a fact about the
+ * bootargs on the vfat partition. So a board with a cell in it had no way to say
+ * so, and the card sat there accepting audio and sending it nowhere. That is
+ * "the video plays and there is no sound", and it was this driver's doing.
+ *
+ * The parameter now seeds a "Speaker Amp Switch" mixer control and stops there.
+ * Every safety property above survives, because they are properties of the
+ * power-up sequence rather than of who asked for it; what is gone is the part
+ * where the answer could not be revisited without a reboot. alsa-restore saves
+ * the control with the rest of the mixer, so answering it once is enough.
  *
  * No interrupt. The AFE's IRQ block is not in the reference material at all, and
  * a period wakeup does not need it: the DL1 cursor is a register, so it is polled
@@ -172,9 +179,11 @@ MODULE_PARM_DESC(codec, "program the MT6323 ABB downlink over PWRAP (default on)
 static bool speaker;
 module_param(speaker, bool, 0444);
 MODULE_PARM_DESC(speaker,
-		 "power the class-D speaker amp once the DL1 DMA is proven live. "
-		 "OFF by default: with no cell fitted the amp pulls VBAT, which is "
-		 "the system node, under the PMIC's undervoltage lockout");
+		 "initial state of the \"Speaker Amp\" control: power the class-D "
+		 "amp once the DL1 DMA is proven live. With no cell fitted the amp "
+		 "pulls VBAT, which is the system node, under the PMIC's "
+		 "undervoltage lockout -- so this only seeds the control, and the "
+		 "control can be turned back off without a reboot");
 
 static int spk_level = J36_SPK_LEVEL_SAFE;
 module_param(spk_level, int, 0444);
@@ -209,6 +218,11 @@ struct j36_afe {
 	bool			soft_paced;
 
 	bool			amp_on;
+	/* Whether the amp is ALLOWED to be powered, as opposed to whether it is.
+	 * Seeded from the `speaker' parameter and then owned by the "Speaker Amp
+	 * Switch" control, because a 0444 module parameter is not a decision a
+	 * running system can revisit -- see the control below. */
+	bool			amp_allowed;
 	bool			mute;
 	unsigned int		level;		/* J36_SPK_LEVEL_MIN..MAX */
 };
@@ -633,8 +647,11 @@ static void j36_afe_poll(struct work_struct *work)
 			 * above worked and the DAC is being fed; if it never
 			 * appears, everything below the memif is still dark. */
 			dev_info(afe->dev, "AFE DL1 DMA is live (cursor moving)\n");
-			if (speaker)
+			if (afe->amp_allowed)
 				j36_speaker_on(afe);
+			else
+				dev_info(afe->dev,
+					 "speaker amp is not allowed; `amixer -c0 set \"Speaker Amp\" on' or boot with j36.audio=speaker\n");
 		}
 	} else if (!afe->cursor_live && !afe->soft_paced &&
 		   time_after(jiffies, afe->start_jiffies +
@@ -864,7 +881,55 @@ static int j36_switch_put(struct snd_kcontrol *kcontrol,
 	afe->mute = mute;
 	if (mute)
 		j36_speaker_off(afe);
-	else if (speaker && afe->cursor_live)
+	else if (afe->amp_allowed && afe->cursor_live)
+		j36_speaker_on(afe);
+	return 1;
+}
+
+/*
+ * THE AMP AS A CONTROL RATHER THAN A BOOT WORD.
+ *
+ * `speaker' is 0444, so on a running board it is not a setting -- it is a fact
+ * about how the module happened to be insmod'ed, and the only way to change it
+ * is a reboot with a different bootargs line on the vfat partition. That made
+ * the hazard the thing that could not be re-examined: a board with a cell in it
+ * had no way to say so, and the card sat there accepting audio and sending it
+ * nowhere, which is exactly what "video plays and there is no sound" was.
+ *
+ * So the parameter now seeds this control and stops there. Everything that made
+ * the amp safe is untouched and still applies to both paths: it is only ever
+ * powered once the DL1 cursor has been seen moving, it opens at `spk_level' and
+ * not at the vendor maximum, it ramps a step at a time, and mute takes it back
+ * down. What changes is that "allowed" is now a question the system can answer
+ * later -- and alsa-restore saves it with the rest of the mixer, so answering it
+ * once survives the next boot without touching bootargs at all.
+ *
+ * Switching it on mid-stream powers the amp there and then, which is the useful
+ * behaviour when someone is looking for the level at which this board's rail
+ * holds up: play something, turn it on, and step the volume.
+ */
+static int j36_amp_get(struct snd_kcontrol *kcontrol,
+		       struct snd_ctl_elem_value *ucontrol)
+{
+	struct j36_afe *afe = snd_kcontrol_chip(kcontrol);
+
+	ucontrol->value.integer.value[0] = afe->amp_allowed;
+	return 0;
+}
+
+static int j36_amp_put(struct snd_kcontrol *kcontrol,
+		       struct snd_ctl_elem_value *ucontrol)
+{
+	struct j36_afe *afe = snd_kcontrol_chip(kcontrol);
+	bool allowed = ucontrol->value.integer.value[0];
+
+	if (allowed == afe->amp_allowed)
+		return 0;
+
+	afe->amp_allowed = allowed;
+	if (!allowed)
+		j36_speaker_off(afe);
+	else if (!afe->mute && afe->cursor_live)
 		j36_speaker_on(afe);
 	return 1;
 }
@@ -885,6 +950,18 @@ static const struct snd_kcontrol_new j36_afe_controls[] = {
 		.info	= snd_ctl_boolean_mono_info,
 		.get	= j36_switch_get,
 		.put	= j36_switch_put,
+	},
+	{
+		.iface	= SNDRV_CTL_ELEM_IFACE_MIXER,
+		/* "Speaker Amp Switch" and not "Speaker Playback Switch": the
+		 * latter is a name alsamixer and every desktop volume applet
+		 * will pick up and toggle as an ordinary output mute, and this
+		 * is a power decision about a rail, not a mute. */
+		.name	= "Speaker Amp Switch",
+		.access	= SNDRV_CTL_ELEM_ACCESS_READWRITE,
+		.info	= snd_ctl_boolean_mono_info,
+		.get	= j36_amp_get,
+		.put	= j36_amp_put,
 	},
 };
 
@@ -945,6 +1022,7 @@ static int j36_afe_probe(struct platform_device *pdev)
 	afe->rate = 48000;
 	afe->frame_bytes = 4;
 	afe->level = clamp(spk_level, J36_SPK_LEVEL_MIN, J36_SPK_LEVEL_MAX);
+	afe->amp_allowed = speaker;
 	mutex_init(&afe->pmic_lock);
 	INIT_DELAYED_WORK(&afe->poll_work, j36_afe_poll);
 

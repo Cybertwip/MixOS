@@ -577,6 +577,12 @@ static int j36_hif_rom_access_reg(struct j36_wifi *w, bool write, u32 address,
 	const u8 sequence = j36_hif_next_sequence(w);
 	u8 *packet = w->hif_tx;
 
+	/* Ownership can be taken back by the chip between commands, and this is
+	 * called in a poll loop; the bind is a single register read when it is
+	 * already held. */
+	if (j36_wifi_hif_bind(w))
+		return -EIO;
+
 	memset(packet, 0, J36_INIT_ACCESS_REG_PACKET_SIZE);
 	j36_put_le16(packet + 0, J36_INIT_ACCESS_REG_PACKET_SIZE);
 	packet[4] = J36_INIT_CMD_ACCESS_REG;
@@ -692,9 +698,13 @@ static int j36_hif_run_adie_probe(struct j36_wifi *w)
 	 * commands whose reply shape is known, and the thing worth waiting for is
 	 * not an acknowledgement of the command anyway -- it is the flag, which
 	 * the probe writes several calls deeper.
+	 *
+	 * Two seconds at 20 ms, which is the reference's window and not a guess:
+	 * wifi_task handles the message asynchronously and the probe's SPI helper
+	 * spins up to 32000 iterations per transfer.
 	 */
-	for (i = 0; i < 200; i++) {
-		usleep_range(1000, 2000);
+	for (i = 0; i < J36_ADIE_PROBE_POLL_LIMIT; i++) {
+		msleep(J36_ADIE_PROBE_POLL_INTERVAL_MS);
 		flag = j36_hif_read_adie_flag(w);
 		if (flag > 0) {
 			w->hif_stats.adie_probe_state = J36_ADIE_PROBE_RAN;
@@ -709,7 +719,7 @@ static int j36_hif_run_adie_probe(struct j36_wifi *w)
 	}
 
 	w->hif_stats.adie_probe_state = J36_ADIE_PROBE_TIMEOUT;
-	w->hif_stats.adie_probe_polls = 200;
+	w->hif_stats.adie_probe_polls = J36_ADIE_PROBE_POLL_LIMIT;
 	return 0;
 }
 

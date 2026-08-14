@@ -134,6 +134,7 @@ private:
     /* Probed once: does this ffmpeg have the alsa output muxer compiled in.  If it
      * does, one process plays both streams; if not, audio needs its own chain. */
     bool ffmpegHasAlsa() const;
+    bool hasSoundCard() const;
     QString ffmpegPath() const;
     double probeDuration(const QString &path) const;
 
