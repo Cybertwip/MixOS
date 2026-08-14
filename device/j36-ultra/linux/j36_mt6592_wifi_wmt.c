@@ -44,6 +44,7 @@
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/minmax.h>
+#include <linux/moduleparam.h>
 #include <linux/sched.h>
 #include <linux/string.h>
 
@@ -56,6 +57,69 @@
  * retransmission window at all.
  */
 #define J36_WMT_IDLE_POLL_US		2000
+
+/*
+ * A gap this long on every FIFO fill of a single byte would still put a
+ * full-size patch fragment inside the two-second command timeout with room to
+ * spare, which is the only thing the cap is here to guarantee.  Nothing sensible
+ * needs to be near it.
+ */
+#define J36_WMT_PACE_MAX_GAP_US		1000
+
+static int stp_tx_burst = -1;
+module_param(stp_tx_burst, int, 0444);
+MODULE_PARM_DESC(stp_tx_burst,
+		 "bytes per BTIF transmit FIFO fill, 0 for as many as fit (default -1: walk the pacing ladder)");
+
+static int stp_tx_gap_us = -1;
+module_param(stp_tx_gap_us, int, 0444);
+MODULE_PARM_DESC(stp_tx_gap_us,
+		 "microseconds to wait after each BTIF transmit FIFO fill (default -1: walk the pacing ladder)");
+
+struct j36_wmt_pace {
+	u32 burst;
+	u32 gap_us;
+};
+
+/*
+ * The rungs, slowest last.  Rung 0 is the link with nothing done to it, so a
+ * board that never needed any of this pays exactly nothing and the log looks the
+ * way it always did.
+ *
+ * The spacing is deliberately coarse.  This is not a search for the fastest pace
+ * that works -- it is a search for ANY pace that works, on a link where the
+ * failure costs two seconds a try.  Four rungs below the unpaced one cover a
+ * factor of sixty in transmit rate between them, and the slowest of them puts a
+ * 1011-byte frame on the wire in about 100 ms, which the receiving end has all
+ * of J36_WMT_COMMAND_TIMEOUT_US to deal with.
+ */
+static const struct j36_wmt_pace j36_wmt_paces[] = {
+	{  0,   0 },	/* fill the FIFO, never wait: today's link */
+	{ 16,  40 },	/* ~4 ms for a full fragment */
+	{  8,  60 },	/* ~9 ms */
+	{  4,  80 },	/* ~22 ms */
+	{  1, 100 },	/* ~103 ms, one byte at a time */
+};
+
+static bool j36_wmt_pace_is_pinned(void)
+{
+	return stp_tx_burst >= 0 || stp_tx_gap_us >= 0;
+}
+
+/*
+ * A pinned parameter wins over the rung, so the ladder can be walked once to
+ * find the answer and then nailed down in boot.conf without touching the code.
+ */
+static void j36_wmt_set_pace(struct j36_wifi *w, u32 burst, u32 gap_us)
+{
+	if (stp_tx_burst >= 0)
+		burst = stp_tx_burst;
+	if (stp_tx_gap_us >= 0)
+		gap_us = stp_tx_gap_us;
+
+	w->tx_burst = min_t(u32, burst, J36_BTIF_TX_FIFO_SIZE);
+	w->tx_gap_us = min_t(u32, gap_us, J36_WMT_PACE_MAX_GAP_US);
+}
 
 static ktime_t j36_deadline(u32 microseconds)
 {
@@ -100,14 +164,14 @@ void j36_wifi_wmt_trace(struct j36_wifi *w, const char *phase)
 	const struct j36_stp_stats *s = &w->stats;
 
 	dev_info(w->dev,
-		 "%s: frag %u/%u sz %u tx %u rx %u lsr 0x%02x | hdr %u len %u crc %u big %u/%u fw %u ooo %u retx %u ack %u short %u refill %u | evt %u op 0x%02x txus %u/%u | seq %u,%u,%u\n",
+		 "%s: frag %u/%u sz %u tx %u rx %u lsr 0x%02x | hdr %u len %u crc %u big %u/%u fw %u ooo %u retx %u ack %u short %u refill %u | evt %u op 0x%02x txus %u/%u pace %u/%uus | seq %u,%u,%u\n",
 		 phase, s->fragment_index, s->fragment_count, s->fragment_size,
 		 s->tx_bytes, s->rx_bytes, s->last_btif_lsr,
 		 s->header_errors, s->length_errors, s->crc_errors,
 		 s->oversize_events, s->last_oversize_size, s->fw_messages,
 		 s->out_of_order, s->retransmits, s->acks, s->short_events,
 		 s->tx_refills, s->last_event_size, s->last_event_opcode,
-		 s->last_tx_us, s->max_tx_us,
+		 s->last_tx_us, s->max_tx_us, w->tx_burst, w->tx_gap_us,
 		 w->tx_sequence, w->expected_rx_sequence, w->last_ack);
 }
 
@@ -230,10 +294,22 @@ static int j36_btif_write_all(struct j36_wifi *w, const u8 *data, u32 size)
 			cpu_relax();
 			continue;
 		}
+		if (w->tx_burst && room > w->tx_burst)
+			room = w->tx_burst;
 		if (room > size - written)
 			room = size - written;
 		for (i = 0; i < room; i++)
 			writeb(data[written++], w->btif + J36_BTIF_THR);
+		/*
+		 * Pacing, and it is a busy wait on purpose: this is mid-frame,
+		 * where the rule at the top of the file applies.  The gap is in
+		 * microseconds and the frame it is spread over is bounded by the
+		 * caller's deadline, so the cost is bounded too -- the slowest
+		 * rung of the ladder puts a 1011-byte fragment at about 100 ms,
+		 * well inside the two-second command timeout.
+		 */
+		if (w->tx_gap_us && written < size)
+			udelay(w->tx_gap_us);
 	}
 
 	w->stats.tx_bytes += written;
@@ -1249,6 +1325,8 @@ int j36_wifi_wmt_load_patch(struct j36_wifi *w, const void *data, size_t size)
 	const u8 *image = data;
 	const u8 *body;
 	u32 body_size, bytes_before;
+	u32 rungs, step, rung = w->pace_rung;
+	int ret = -EIO;
 	u8 metadata, patch_count, sequence;
 
 	if (!image || size <= J36_WMT_PATCH_HEADER_SIZE ||
@@ -1358,41 +1436,97 @@ int j36_wifi_wmt_load_patch(struct j36_wifi *w, const void *data, size_t size)
 	body_size = size - J36_WMT_PATCH_HEADER_SIZE;
 	bytes_before = w->stats.patch_bytes;
 
-	/* One retry at the same fragment size, not a search over sizes.
+	/*
+	 * The retry ladder, and it walks transmit PACING rather than fragment
+	 * size, because the byte accounting says size is not the axis.
 	 *
-	 * A halving ladder used to live here -- 1000, then 500, 250 and on down --
-	 * put in to find out whether frame length was what the link choked on.  It
-	 * answered, and the answer was no: 136-byte fragments stalled the same way
-	 * the full-size ones did, and 125 after them.  What the ladder costs is
-	 * not free either: every rung replays the body from fragment zero, and a
-	 * pass that stalls spends two seconds on the fragment it stalls at, so the
-	 * full ladder is minutes of a machine doing nothing else.
+	 * What the fragment window in the log actually showed, on the pass that
+	 * put 1011-byte frames out: tx grew by 11161 bytes, which is exactly
+	 * eleven 1011-byte frames plus the ten 4-byte resync prefixes between
+	 * them, and rx grew by nothing at all.  Not a CRC error, not a header
+	 * error, not an out-of-order sequence, not even a bare four-byte STP ACK.
+	 * The chip's STP layer acknowledges a data packet before it ever reaches
+	 * WMT, so a silent frame is one the far end never finished ASSEMBLING --
+	 * this fails below WMT, and there is nothing in the payload to blame.
+	 * The same chip answers the two address commands again moments later, so
+	 * it is not wedged either; it is the frame that goes missing.
 	 *
-	 * A single retry keeps the part that was worth having: a link that lost
-	 * one frame gets a second pass, with both address commands re-issued first
-	 * to put the peer back at the start of the sequence. */
-	if (j36_wmt_download_patch_body(w, body, body_size,
-					J36_WMT_PATCH_FRAGMENT_SIZE)) {
-		j36_wifi_wmt_trace(w, "patch fragment retry");
-		w->stats.patch_bytes = bytes_before;
+	 * A halving ladder over fragment size used to live here -- 1000, 500, 250
+	 * and on down -- and it reported that 136-byte fragments stalled exactly
+	 * as the full-size ones did, and 125 after them.  That was a real result
+	 * and it is why this is not a size ladder any more, but it was measuring
+	 * the wrong thing to begin with: fragment ZERO is what stalls, fragment
+	 * zero is the same frame at every rung except for its length, and the
+	 * answer event is the same five bytes whatever was sent.  Halving the
+	 * size halves the transmit BURST as a side effect, which is why the small
+	 * rungs got closer, and 26-byte command frames -- eight of them, all
+	 * answered -- get through every time.  The threshold sits between 26 and
+	 * 136 bytes, which is where a 32- or 64-byte receive FIFO would put it.
+	 *
+	 * So the thing being varied here is how fast the bytes leave, not how
+	 * many of them there are.  The asymmetry that makes this possible is
+	 * spelled out at the top of the header: btif_init()'s hardware handshake
+	 * stops the FAR end while OUR receive FIFO fills, and nothing anywhere
+	 * stops US while theirs does.  The connectivity MCU running its unpatched
+	 * bootstrap -- the code we are in the middle of replacing -- is the
+	 * slowest reader this link will ever have.
+	 *
+	 * Each rung replays the body from fragment zero with both address
+	 * commands re-issued first, so the peer restarts the sequence with us,
+	 * and a rung that is going to fail fails on its first fragment for the
+	 * two seconds of J36_WMT_COMMAND_TIMEOUT_US.  Five rungs is ten seconds
+	 * of worst case, once, on a boot that would otherwise have no Wi-Fi.
+	 */
+	rungs = ARRAY_SIZE(j36_wmt_paces);
+	if (j36_wmt_pace_is_pinned())
+		rungs = 2;	/* the pinned pace, and one retry at it */
 
-		if (j36_wmt_exchange(w, patch_address, sizeof(patch_address), 8,
-				     J36_WMT_COMMAND_TIMEOUT_US) ||
-		    j36_wmt_exchange(w, part_address, sizeof(part_address), 8,
-				     J36_WMT_COMMAND_TIMEOUT_US)) {
-			j36_wifi_wmt_trace(w, "patch re-address failed");
-			j36_wifi_fail(w, "wmt-patch-readdress-failed",
-				      "patch-address setup failed after a stalled pass");
-			return -EIO;
+	for (step = 0; step < rungs; step++) {
+		rung = min(w->pace_rung + step, rungs - 1);
+
+		if (step) {
+			j36_wifi_wmt_trace(w, "patch fragment retry");
+			w->stats.patch_bytes = bytes_before;
+
+			if (j36_wmt_exchange(w, patch_address,
+					     sizeof(patch_address), 8,
+					     J36_WMT_COMMAND_TIMEOUT_US) ||
+			    j36_wmt_exchange(w, part_address,
+					     sizeof(part_address), 8,
+					     J36_WMT_COMMAND_TIMEOUT_US)) {
+				j36_wifi_wmt_trace(w, "patch re-address failed");
+				j36_wifi_fail(w, "wmt-patch-readdress-failed",
+					      "patch-address setup failed after a stalled pass");
+				return -EIO;
+			}
 		}
-		if (j36_wmt_download_patch_body(w, body, body_size,
-						J36_WMT_PATCH_FRAGMENT_SIZE)) {
-			j36_wifi_wmt_trace(w, "patch fragment stalled");
-			j36_wifi_fail(w, "wmt-patch-fragment-failed",
-				      "ROM patch fragment download failed");
-			return -EIO;
-		}
+
+		j36_wmt_set_pace(w, j36_wmt_paces[rung].burst,
+				 j36_wmt_paces[rung].gap_us);
+		ret = j36_wmt_download_patch_body(w, body, body_size,
+						  J36_WMT_PATCH_FRAGMENT_SIZE);
+		if (!ret)
+			break;
 	}
+
+	if (ret) {
+		j36_wifi_wmt_trace(w, "patch fragment stalled");
+		j36_wifi_fail(w, "wmt-patch-fragment-failed",
+			      "ROM patch fragment download failed");
+		return -EIO;
+	}
+
+	/*
+	 * Worth a line of its own rather than leaving it to the trace, because
+	 * this is the answer the ladder exists to produce: whichever rung carried
+	 * the patch is the pace to pin with stp_tx_burst= and stp_tx_gap_us= and
+	 * be done with the search.  The second image starts from this rung.
+	 */
+	if (rung != w->pace_rung || w->tx_burst || w->tx_gap_us)
+		dev_info(w->dev,
+			 "WMT patch went down at %u bytes per FIFO fill, %u us apart\n",
+			 w->tx_burst, w->tx_gap_us);
+	w->pace_rung = rung;
 
 	if (j36_wmt_exchange(w, reset, sizeof(reset), 5, J36_WMT_COMMAND_TIMEOUT_US)) {
 		j36_wifi_wmt_trace(w, "patch reset failed");

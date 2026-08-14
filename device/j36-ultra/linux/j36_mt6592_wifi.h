@@ -671,6 +671,25 @@ struct j36_wifi {
 	u8 last_rx_sequence;
 	u32 last_ack;
 
+	/*
+	 * BTIF transmit pacing: how many bytes go into the transmit FIFO per fill,
+	 * and how long to wait afterwards before looking at it again.  A burst of
+	 * zero means "as much as the FIFO will take", which is the unpaced link.
+	 *
+	 * These exist because the far end has no way to stop us.  btif_init()
+	 * enables the hardware handshake, and that handshake protects OUR receive
+	 * FIFO -- it stops the connectivity MCU while ours is full.  Nothing in
+	 * the other direction stops us while THEIRS is full, and the MCU running
+	 * the unpatched bootstrap is the slowest reader on this link.  See the
+	 * pacing ladder in j36_mt6592_wifi_wmt.c for what the device said about it.
+	 */
+	u32 tx_burst;
+	u32 tx_gap_us;
+
+	/* Which rung of that ladder last carried a patch down.  The second image
+	 * starts where the first one succeeded rather than back at the top. */
+	u32 pace_rung;
+
 	struct j36_stp_stats stats;
 	struct j36_hif_stats hif_stats;
 

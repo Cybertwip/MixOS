@@ -2831,9 +2831,12 @@ static int fb_target_open(struct fbtarget *t)
                    t->var.blue.offset  ==  0 && t->var.blue.length  == 8);
 
     /* Both of the states that are black on purpose, undone before drawing into a
-     * panel that would otherwise stay dark and be blamed on the GPU. */
-    if (ioctl(t->fd, FBIOBLANK, FB_BLANK_UNBLANK) == 0)
-        ;
+     * panel that would otherwise stay dark and be blamed on the GPU.  The unblank
+     * is advisory and its result is deliberately dropped: a panel that was never
+     * blanked answers ENOTTY or EINVAL and needs nothing done about it, and a
+     * panel that refuses to unblank is a finding for the frame below, not a
+     * reason to give up the target here. */
+    (void)ioctl(t->fd, FBIOBLANK, FB_BLANK_UNBLANK);
     tty_report(1);
 
     printf("offload: /dev/fb0 \"%s\" %ux%u %ubpp stride %u at 0x%08lx, "
