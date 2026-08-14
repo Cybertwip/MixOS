@@ -6146,15 +6146,22 @@ if (( ${#WIFI_MODULE_ORDER[@]} > 0 )); then
     log "wifi: staged ${#WIFI_MODULE_ORDER[@]} modules into $PAYREL/wifi/"
 
     # The names under mediatek/mt6592/ are what request_firmware() asks for, so
-    # the tree is copied whole rather than the two files flattened.  A missing
+    # the tree is copied whole rather than the files flattened.  A missing
     # blob is a warning and not a build failure: the modules still stage, the
     # bring-up still runs, and it reports rom-patch-missing at the exact stage it
     # needed them -- which is a better answer than a build that refused.
+    #
+    # EVERY FILE, NOT *.bin.  This used to glob for .bin and there were only ever
+    # two files, both ending in it, so nothing showed.  The WLAN firmware itself is
+    # named WIFI_RAM_CODE_SOC with no extension at all -- that is the name the
+    # driver asks the firmware loader for, because it is the name in the device's
+    # own /system/etc/firmware -- and a glob that cannot see it stages a card whose
+    # radio has its ROM patches and not the image they patch.
     WIFI_FW_SRC="$ROOT/device/j36-ultra/firmware"
     if [[ -d "$WIFI_FW_SRC/mediatek/mt6592" ]]; then
-        mkdir -p "$PAYDIR/wifi/firmware/mediatek/mt6592"
-        cp "$WIFI_FW_SRC/mediatek/mt6592/"*.bin \
-           "$PAYDIR/wifi/firmware/mediatek/mt6592/"
+        mkdir -p "$PAYDIR/wifi/firmware/mediatek"
+        cp -a "$WIFI_FW_SRC/mediatek/mt6592" \
+              "$PAYDIR/wifi/firmware/mediatek/"
         log "wifi: staged $(ls -1 "$PAYDIR/wifi/firmware/mediatek/mt6592" | wc -l) firmware blobs into $PAYREL/wifi/firmware/"
     else
         log "wifi: $WIFI_FW_SRC/mediatek/mt6592 is missing -- the ROM patches are not on the card and the radio will stop at rom-patch-missing"
