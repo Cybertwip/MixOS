@@ -699,21 +699,27 @@ Two things about the port itself, neither of them software:
 
 The original MixOS work here — `build-in-vm.sh`, `generate_dts.py`,
 `create_boot_image.py`, `fetch_freedoom.py`, `sync-mvii-board.sh`,
-`tools/j36-eglprobe.c`, `tools/mfgpower.c`, `tools/mixsplash.c`, `tools/mixdash/`
-and this documentation — is under the **Microsoft Public License (Ms-PL)**. The full text
-and the exact per-file scope are in [LICENSE](LICENSE).
+`tools/j36-eglprobe.c`, `tools/j36-mixmirror.c`, `tools/mfgpower.c`,
+`tools/mixsplash.c`, `tools/mixdash/` and this documentation — is dual-licensed:
+take it under the **Mozilla Public License 2.0** or under the **GNU General Public
+License version 2 or later**, at your option. The reasoning, the exact per-file
+scope and both full texts are in [LICENSE](LICENSE), [LICENSE.MPL-2.0](LICENSE.MPL-2.0)
+and [LICENSE.GPL-2](LICENSE.GPL-2). In short: MPL-2.0 keeps this file-level
+copyleft while letting a vendor ship proprietary code beside it, and the GPL half
+is what lets any of it move into the kernel it exists to drive.
 
-Two things in this directory are **not** Ms-PL, and the distinction is not
-cosmetic:
+Two things in this directory are **not** part of that dual grant, and the
+distinction is not cosmetic:
 
 - Everything under `linux/` — the seven MixOS modules (`j36_mt6592_input.c`,
   `j36_mt6592_audio.c`, `j36_jd9365_panel.c`, `j36_mt6592_usb_phy.c`,
   `j36_mt6592_pmic.c`, `j36_mt6592_backlight.c` and the three-file
   `j36_mt6592_wifi` build) and the three `linux/*.patch` files — is
   **`GPL-2.0-only`**. They derive from and link against GPL-2.0-only kernel
-  internals, and Ms-PL is not GPL-compatible — its section 3(D) adds a condition
-  GPLv2 section 6 forbids adding — so relicensing them is not this project's to
-  do, and it is not attempted.
+  internals, which is narrower than either half of the dual grant, so relicensing
+  them is not this project's to do and it is not attempted. Code may move *into*
+  them from the dual-licensed list — that is what the GPL half is for — and it may
+  not move back out.
 - `mvii-board/` is five verbatim MediaTek/MVII board headers and driver sources,
   redistributed unmodified with a SHA-256 each in `mvii-board/PROVENANCE.txt`.
   They are inputs the DTS generator parses, not MixOS work.
@@ -724,15 +730,17 @@ cosmetic:
 A finished card is an aggregate: the Linux kernel, Mesa, Qt, SDL, busybox, the
 Freedoom IWAD and the Debian rootfs each arrive under their own terms.
 `build-in-vm.sh` writes the same statement onto the card as `sd-boot/LICENSE.txt`,
-mapped payload file by payload file, because handing somebody a card is a
-distribution and Ms-PL section 3(C) says the notices travel with it.
+mapped payload file by payload file and with both licence texts appended, because
+handing somebody a card is a distribution and both halves of the grant say the
+notices and the source offer travel with it.
 
 **MixOS supports the MediaTek line of processors**, and this directory is that
-support. MixOS is a *divergent* fork of dArkOS, itself a Debian-based continuation
-of ArkOS by christianhaitian: it adds a second SoC vendor and a 32-bit ARM kernel
-to a build system that assumed one vendor and arm64, and it changes shared files to
-do it. Neither dArkOS nor ArkOS endorses this port, is affiliated with it, or
-should receive its bug reports.
+support. It adds a second SoC vendor and a 32-bit ARM kernel to a build pipeline
+that assumed one vendor and arm64, and it changes shared files to do it. That
+pipeline is the part that descends from dArkOS, itself a Debian-based continuation
+of ArkOS by christianhaitian, and it keeps their MIT licence; nothing MixOS runs
+comes from either any more. Neither dArkOS nor ArkOS endorses this port, is
+affiliated with it, or should receive its bug reports.
 
 Thanks, in the order the debt is owed: to the **Debian** project, whose operating
 system this device actually runs — the rootfs is Debian, built with Debian's tools,
@@ -742,5 +750,5 @@ to **MediaTek**, whose register documentation and vendor driver sources the devi
 tree generator reads directly rather than guessing from; to **Mesa**, whose lima
 and kmsro drivers are the only reason a Utgard part from 2013 can run a GLES 2.0
 UI at all; and to the **Linux kernel**, **Qt**, **SDL**, **busybox** and
-**doomgeneric** projects. MixOS is not affiliated with or endorsed by any of
-them, nor by Microsoft — Ms-PL is simply the licence chosen for the MixOS work.
+**doomgeneric** projects. MixOS is not affiliated with or endorsed by any of them,
+and neither half of the dual grant conveys a right in anybody's trademark.
