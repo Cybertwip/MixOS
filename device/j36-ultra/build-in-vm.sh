@@ -3889,6 +3889,200 @@ AUTOMOUNT
     return 0
 }
 
+# ── `default', so that sound is a property of the machine ─────────────────────
+#
+# WHAT WAS WRONG.  Everything on this image that plays a sound and does not name a
+# device names `default', and `default' on this card was the RG351MP's:
+#
+#     pcm.!default { type plug  slave.pcm "dmixer" }
+#     pcm.dmixer   { type dmix  ipc_key 1024
+#                    slave { pcm "hw:0,0" period_size 1024 buffer_size 4096
+#                            rate 44100 } }
+#
+# finishing_touches.sh links /etc/asound.conf to /home/virtua/.asoundrc, and that
+# is the file.  Three things are wrong with it here and only the first is fatal:
+# the RK3326-era geometry is hard-coded, the rate is hard-coded, and dmix puts a
+# shared-memory software mixer between every player and a DAC that has exactly one
+# consumer.  The dashboard sidestepped all of it by naming `plughw:C,D' itself --
+# which is why films had sound and nothing else on the machine did.  Sidestepping
+# is not the same as fixing: aplay, mpv, SDL, an emulator, anything installed from
+# the Packages page, all of them ask for `default'.
+#
+# WHAT THIS DOES.  Writes the two-stanza file this board actually wants into the
+# tmpfs and BIND-MOUNTS it over the one on the card.  A bind mount is not a write:
+# the bytes on p3 are untouched, the same card in an R36S gets its own file back,
+# and there is nothing to undo.  That matters more than usual here -- .asoundrc
+# lives on the home partition, which is shared with the other launcher, and the
+# invariant this whole initramfs is built on is that nothing on the shared rootfs
+# is written.
+#
+# WHY IT CANNOT BE A DROP-IN INSTEAD.  alsa-lib's hook list loads, in order,
+# /usr/share/alsa/alsa.conf.d/, /etc/alsa/conf.d/, /etc/asound.conf and finally
+# ~/.asoundrc.  Later wins, and pcm.!default is an override in both files -- so a
+# conf.d file, which is the polite way to do this, loses to the very file it is
+# trying to correct.  The only place that beats ~/.asoundrc is ~/.asoundrc.
+#
+# WHY BOTH PATHS ARE TRIED.  /etc/asound.conf is a symlink to ~/.asoundrc on this
+# image, so one bind normally covers both; readlink -f collapses them and the loop
+# skips the duplicate.  A card where somebody replaced the symlink with a real file
+# gets both bound, which is the only way to be right about a rootfs this old.
+#
+# GATED ON A CARD HAVING REGISTERED, and deliberately so.  Without j36.audio there
+# is no /dev/snd, and pointing `default' at a card that does not exist would turn a
+# silent machine into a machine where every player fails to open a device.  No
+# card, no change, and the original file stands.
+#
+# NO dmix, AND THAT IS A DECISION.  It buys one thing -- several processes sharing
+# the DAC -- and this AFE has no playback interrupt: the driver polls the DL1
+# cursor from a work item and calls snd_pcm_period_elapsed() from there.  A
+# software mixer on top of that is latency and CPU on eight A7s for a case that
+# does not arise on a handheld running one thing at a time.  The cost is that the
+# second opener gets EBUSY while the first is playing.  Anyone who wants the trade
+# the other way replaces the slave in the file below with a dmix block; the
+# boot.conf notes carry the stanza.
+setup_asound() {
+    if [ -z "$rootdev" ]; then
+        say "asound: no rootfs was found, so there is no default to correct"
+        return 1
+    fi
+    if [ ! -d /dev/snd ]; then
+        say "asound: no card registered, so \`default' is left as the rootfs has it"
+        return 1
+    fi
+    if ! ensure_run_tmpfs; then
+        say "asound: no tmpfs on the rootfs /run, so nothing can be staged"
+        return 1
+    fi
+    mkdir -p /newroot/run/j36/bin /newroot/run/systemd/system
+
+    # hw:CARD=j36 and not hw:0.  The id is set by the driver itself -- the third
+    # argument to snd_devm_card_new in j36_mt6592_audio.c is the literal "j36" --
+    # so it is a promise rather than a guess, and it survives a USB headset or an
+    # HDMI adapter enumerating first and taking card 0.
+    #
+    # plug over hw, which is what `default' has always meant: rate, format and
+    # channel conversion in alsa-lib for anything that does not match the AFE's one
+    # PCM -- s16, stereo, 8 to 48 kHz.  A mono 22 kHz wav plays; the card is never
+    # asked for something it does not do.
+    cat > /newroot/run/j36/asound.conf <<'ASOUNDRC'
+# The J36 Ultra's default sound device.
+#
+# Written by the MixOS initramfs into a tmpfs and bind-mounted over the file this
+# card shipped with, which was the RG351MP's and named an RK3326 dmix.  The bytes
+# on the card are untouched: boot another launcher and you get its file back.
+#
+# hw:CARD=j36 is the MT6592 AFE's DL1 playback path.  The id comes from the driver
+# and does not move when something else enumerates as card 0.
+pcm.!default {
+	type plug
+	slave.pcm "hw:CARD=j36,DEV=0"
+}
+
+# So that amixer and alsamixer with no -c land on the same card.  "Speaker Amp",
+# "Master Playback Volume" and "Master Playback Switch" are the controls here.
+ctl.!default {
+	type hw
+	card j36
+}
+ASOUNDRC
+
+    cat > /newroot/run/j36/bin/j36-asound <<'ASOUNDSH'
+#!/bin/sh
+# j36-asound -- put this board's default PCM in front of the card's own.
+#
+# Written by the J36 Ultra initramfs into /run and started once by
+# j36-asound.service, after local-fs.target: the home partition carries the file
+# being covered, so binding before it is mounted would be covering the wrong one
+# and the mount would hide the work.
+#
+# Nothing here is a write.  Every path is bind-mounted over, so the card keeps
+# whatever it had and a reboot into anything else sees it.
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+src=/run/j36/asound.conf
+[ -f "$src" ] || { echo "j36-asound: $src is missing"; exit 0; }
+
+done_targets=""
+bound=0
+for p in /etc/asound.conf /home/virtua/.asoundrc /root/.asoundrc; do
+	# -f after the resolve, so a dangling symlink is skipped rather than being
+	# a mount target that does not exist.
+	t=$(readlink -f "$p" 2>/dev/null) || continue
+	[ -n "$t" ] && [ -f "$t" ] || continue
+	case " $done_targets " in *" $t "*) continue ;; esac
+	done_targets="$done_targets $t"
+	if mount --bind "$src" "$t"; then
+		echo "j36-asound: default now plays through hw:CARD=j36 (over $t)"
+		bound=$((bound + 1))
+	else
+		echo "j36-asound: could not bind over $t"
+	fi
+done
+
+if [ "$bound" = 0 ]; then
+	# Not a failure.  A rootfs with no asound.conf and no .asoundrc has no
+	# wrong default to correct -- alsa-lib's own is already plug over the one
+	# card -- so there is nothing to do and nothing to report as broken.
+	echo "j36-asound: nothing to cover; alsa-lib's own default stands"
+fi
+exit 0
+ASOUNDSH
+    chmod 0755 /newroot/run/j36/bin/j36-asound
+
+    # THE THREE ORDERING LINES ARE ONE DECISION EACH.
+    #
+    # After=local-fs.target, because the file being covered is on the home
+    # partition.  Bind before that partition is mounted and two things go wrong at
+    # once: readlink -f resolves /etc/asound.conf into the empty /home/virtua on the
+    # rootfs and finds nothing to cover, and then the real mount arrives and brings
+    # the RG351MP's file back uncovered.  RequiresMountsFor names the path outright,
+    # so this also holds on a card where /home/virtua is not in fstab.
+    #
+    # Before=sysinit.target, which is as early as a unit that needs a mounted
+    # filesystem can be.  `default' has to be right before the first process that
+    # asks for it, and alsa-lib resolves the name once per open and keeps the
+    # handle -- so a player that starts a second too early plays out of the old file
+    # for its whole run.
+    #
+    # DefaultDependencies=no is what makes that legal rather than a cycle: the
+    # default set puts After=sysinit.target on every service, and a unit both after
+    # and before the same target is a loop systemd breaks by dropping one of them at
+    # random.  j36-splash.service above does the same thing for the same reason.
+    #
+    # RemainAfterExit because the mounts outlive the process that made them, and no
+    # ExecStop: they are meant to last as long as the boot does, and unmounting them
+    # at shutdown would only uncover a file nothing is going to read again.  The
+    # leading `-' on ExecStart is the belt: this runs before sysinit.target, and a
+    # unit that can fail there is a unit that can hold up a boot over a sound file.
+    cat > /newroot/run/systemd/system/j36-asound.service <<'UNITASOUND'
+# Written by the J36 Ultra initramfs, into a tmpfs.  See setup_asound in /init.
+[Unit]
+Description=Point ALSA's default PCM at the J36 Ultra's card
+DefaultDependencies=no
+RequiresMountsFor=/home/virtua
+After=local-fs.target
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+ConditionPathExists=/run/j36/asound.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/bin/sh /run/j36/bin/j36-asound
+
+[Install]
+WantedBy=sysinit.target
+UNITASOUND
+
+    mkdir -p /newroot/run/systemd/system/sysinit.target.wants
+    ln -sf ../j36-asound.service \
+           /newroot/run/systemd/system/sysinit.target.wants/j36-asound.service
+
+    say "asound: default is plug over hw:CARD=j36 for the whole system"
+    return 0
+}
+
 # ── the log somebody can actually read ────────────────────────────────────────
 #
 # WHY THIS EXISTS.  "Send me the log" has had no answer on this board.  The panel
@@ -4380,6 +4574,12 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_gl" = 1 ] || \
     if [ "$want_audio" = 1 ]; then
         stage "Starting audio"; detail "MT6592 AFE, MT6323 codec"
         progress 62; run_audio
+        # Straight after the card, and not down with setup_dash.  run_audio has
+        # just told us whether /dev/snd exists, which is the only thing worth
+        # gating this on, and `default' is a property of the machine rather than
+        # of the dashboard: a card with j36.dash=0 still has aplay, mpv, SDL and
+        # every emulator on it asking alsa-lib for a device by that name.
+        setup_asound
     fi
     if [ "$want_usb" = 1 ]; then
         stage "Starting USB"; detail "MUSB host, hub, HID"

@@ -152,7 +152,10 @@ private slots:
     void readFrames();
     void onDecoderFinished();
     void onMusicFinished(int code);
-    void onAplayStderr();
+    /* Whatever the playing chain wrote to stderr, straight onto the glass.  It is
+     * ffmpeg's when ffmpeg opens the card itself and aplay's when it does not, and
+     * both want the same treatment -- hence one slot rather than two. */
+    void onChildStderr();
     void tick();
     /*
      * The seek the slider has been showing for the last third of a second.
@@ -283,15 +286,27 @@ private:
     QString ffmpegPath() const;
     QString aplayPath() const;
     double probeDuration(const QString &path) const;
+    /* Does this container carry an audio stream.  The film's sound is its own
+     * ffmpeg, and starting one on a silent clip is an error message rather than
+     * silence.  True when there is no ffprobe to ask. */
+    bool probeHasAudio(const QString &path) const;
     /* Title and artist out of the container's tags, for the one track that is
      * playing.  Empty when there are no tags or no ffprobe. */
     QString probeTitle(const QString &path) const;
     /* The mixer, asked once per track: a muted card is the other way to have no
      * sound, and it is not the player's to fix silently. */
     QString mixerComplaint() const;
-    /* ffmpeg's decode arguments for one audio stream, shared by the music chain
-     * and by the video page's fallback chain. */
-    QStringList audioDecodeArgs(const QString &path, double startAt) const;
+    /*
+     * ffmpeg's decode arguments for one audio stream, shared by the music chain and
+     * by the video page's fallback chain.
+     *
+     * alsaSink names the card to write into -- `plughw:C,D' -- and makes this one
+     * process that plays the track by itself.  Empty asks for raw s16le on stdout
+     * instead, which is the aplay chain, and that form only survives for an ffmpeg
+     * built without the alsa outdev.
+     */
+    QStringList audioDecodeArgs(const QString &path, double startAt,
+                                const QString &alsaSink) const;
 
     ListPane *m_list = nullptr;
     QString m_dir;
@@ -304,8 +319,10 @@ private:
     /* ── video and pictures ───────────────────────────────────────────────── */
     Entry m_showing;                   /* the picture or the film */
     QProcess *m_decoder = nullptr;
-    QProcess *m_videoAudio = nullptr;  /* second ffmpeg, only without the alsa muxer */
-    QProcess *m_videoAplay = nullptr;
+    /* The film's sound, always in its own process: a decoder blocked on the frame
+     * pipe must not be what stops the card being fed.  See openVideo(). */
+    QProcess *m_videoAudio = nullptr;
+    QProcess *m_videoAplay = nullptr;  /* only on an ffmpeg without the alsa outdev */
     QByteArray m_buffer;
     QImage m_frame;
     int m_frameW = 0;
@@ -313,6 +330,10 @@ private:
     int m_framesShown = 0;
     int m_framesDropped = 0;
     double m_videoDuration = 0.0;
+    /* Probed with the duration and kept for the same lifetime, so a seek does not
+     * pay for it again.  Nothing false about a stale value: a new film opens at 0
+     * and re-probes both. */
+    bool m_videoHasAudio = false;
 
     /* ── music ────────────────────────────────────────────────────────────── */
     QVector<Entry> m_queue;
@@ -321,6 +342,9 @@ private:
     QVector<int> m_order;
     int m_orderAt = -1;
     QProcess *m_music = nullptr;
+    /* Null whenever ffmpeg writes the card itself, which is the normal case.  Every
+     * place that touches it has to cope with that -- including onMusicFinished(),
+     * where a null m_aplay is what makes ffmpeg's own exit the end of the track. */
     QProcess *m_aplay = nullptr;
     QString m_trackTitle;              /* from the tags, or empty */
     QString m_device;                  /* what alsaDevice() said when it started */
@@ -346,7 +370,7 @@ private:
      * readyReadStandardError DRAINS the buffer, so by the time finished() arrives
      * the reason the child died is already gone -- and the failure handler would
      * then paint a bare "aplay exited 1" over the sentence that said why.  This is
-     * where onAplayStderr puts a copy so the handler has something to fall back on.
+     * where onChildStderr puts a copy so the handler has something to fall back on.
      * Cleared at the top of every playQueued(), because a complaint from the
      * previous track is not evidence about this one.
      */

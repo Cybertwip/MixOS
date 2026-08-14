@@ -1223,10 +1223,40 @@ def generate(sources: dict[str, str]) -> str:
 \t *                   No existing compatible pairs a 12-bit divider with
 \t *                   this generation's pad-tune register, hence the patch.
 \t *
-\t * 25 MHz to start with: default speed, no high-speed timing to get wrong
-\t * while the pad tuning is unproven. The LK runs the same card at 13 MHz.
-\t * Raise to 50 MHz with cap-sd-highspeed once a filesystem has survived
-\t * real traffic here.
+\t * 50 MHz high speed, and that is the promotion the line above used to
+\t * promise. It said \"raise to 50 MHz with cap-sd-highspeed once a
+\t * filesystem has survived real traffic here\", and it has: this card
+\t * carries the rootfs, the home partition, the Qt payload, Mesa and every
+\t * ROM on the machine, and it has booted, written its own log and served
+\t * video off p3 for weeks without a single mtk-sd error.
+\t *
+\t * What 25 MHz was costing is not subtle. Default Speed is 25 MHz on a
+\t * 4-bit bus -- 12.5 MB/s of signalling, call it 10 to 11 MB/s after
+\t * overhead -- and everything slow on this board is the same shape:
+\t * eglprobe takes an age on its first run and is instant on its second
+\t * (that is 30-odd MB of Mesa being read once and then served out of page
+\t * cache), video stutters where the decoder waits on the card, and the
+\t * dashboard's first paint waits on 40 MB of Qt. Doubling the clock does
+\t * not fix a decode that is CPU-bound, but it halves every one of those
+\t * first reads.
+\t *
+\t * The card is an SDXC, so High Speed is a certainty rather than a hope --
+\t * it is mandatory above SDHC -- and the driver asks for it in CMD6 and
+\t * falls back on its own if the card refuses. 200 MHz over the 12-bit
+\t * divider gives exactly 4, so 50 MHz is an exact rate and not a rounded
+\t * one; the previous 25 MHz was a divide by 8 from the same source.
+\t *
+\t * UHS is deliberately not asked for. SDR50 and above need the bus at
+\t * 1.8 V, this board's vmmc is a fixed 3.3 V rail with no signal-voltage
+\t * switch behind it, and no-1-8-v above says so. 50 MHz is the ceiling
+\t * here and there is nothing left on the table.
+\t *
+\t * IF THIS BOARD EVER COMES BACK WITH mtk-sd CRC or TIMEOUT ERRORS, the
+\t * revert is two lines: delete cap-sd-highspeed and put max-frequency back
+\t * to 25000000. The kernel names the mode it settled on at probe --
+\t * \"new high speed SDXC card\" against the plain \"new SDXC card\" this
+\t * board printed before this change -- so one line of the boot log says
+\t * which of the two is in force.
 \t *
 \t * non-removable is a statement about this kernel, not about the slot: card
 \t * detect is a GPIO, MT6592 has no pinctrl/GPIO driver in mainline, and
@@ -1240,8 +1270,9 @@ def generate(sources: dict[str, str]) -> str:
 \t\tclocks = <&msdc1_src_clk>, <&msdc1_h_clk>;
 \t\tclock-names = \"source\", \"hclk\";
 \t\tvmmc-supply = <&msdc1_vmmc>;
-\t\tmax-frequency = <25000000>;
+\t\tmax-frequency = <50000000>;
 \t\tbus-width = <4>;
+\t\tcap-sd-highspeed;
 \t\tno-1-8-v;
 \t\tno-mmc;
 \t\tno-sdio;

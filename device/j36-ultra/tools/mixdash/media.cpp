@@ -1079,6 +1079,44 @@ double MediaPage::probeDuration(const QString &path) const
            + parts.at(2).toDouble();
 }
 
+bool MediaPage::probeHasAudio(const QString &path) const
+{
+    /*
+     * Asked because the film's sound is a SEPARATE ffmpeg now, and a process that
+     * is started on a silent clip does not sit there quietly: it exits at once with
+     * "Stream map '0:a:0' matches no streams", which this page would then paint
+     * under the picture as though something had broken.  The old single-process
+     * form got this for free from the `?' on its map, and the `?' cannot be used
+     * here -- an output with no streams in it is its own error.
+     *
+     * TRUE WHEN THERE IS NO FFPROBE, which is the useful way to be wrong: nearly
+     * every film has sound, so assuming it plays the ones that do and costs a note
+     * on the ones that do not.  Assuming the other way would silence everything on
+     * an image that happens to ship ffmpeg without ffprobe.
+     *
+     * Probed alongside the duration and kept for the same lifetime, so seeking --
+     * which is openVideo() again with a start time -- does not pay for it twice.
+     */
+    const QString ffprobe = firstExisting(QStringList()
+                                          << "/usr/bin/ffprobe" << "/bin/ffprobe");
+    if (ffprobe.isEmpty())
+        return true;
+
+    QProcess p;
+    p.start(ffprobe, QStringList()
+                         << "-v" << "error"
+                         << "-select_streams" << "a:0"
+                         << "-show_entries" << "stream=index"
+                         << "-of" << "default=noprint_wrappers=1:nokey=1"
+                         << path);
+    if (!p.waitForStarted(1500) || !p.waitForFinished(4000)) {
+        p.kill();
+        p.waitForFinished(500);
+        return true;
+    }
+    return !QString::fromLatin1(p.readAllStandardOutput()).trimmed().isEmpty();
+}
+
 QString MediaPage::probeTitle(const QString &path) const
 {
     /*
@@ -1124,7 +1162,8 @@ QString MediaPage::probeTitle(const QString &path) const
     return artist + QStringLiteral(" - ") + title;
 }
 
-QStringList MediaPage::audioDecodeArgs(const QString &path, double startAt) const
+QStringList MediaPage::audioDecodeArgs(const QString &path, double startAt,
+                                       const QString &alsaSink) const
 {
     QStringList args;
     args << "-nostdin" << "-hide_banner" << "-loglevel" << "error";
@@ -1138,8 +1177,21 @@ QStringList MediaPage::audioDecodeArgs(const QString &path, double startAt) cons
     args << "-i" << path
          << "-vn"                       /* cover art is a video stream, and it is not wanted */
          << "-map" << "0:a:0"
-         << "-f" << "s16le"
-         << "-ar" << QString::number(kRate) << "-ac" << "2" << "-";
+         << "-ar" << QString::number(kRate) << "-ac" << "2";
+
+    /*
+     * THE RATE AND THE CHANNEL COUNT ARE FORCED IN BOTH FORMS, and that matters
+     * more in the alsa one.  plughw would convert a 44.1 kHz file to whatever the
+     * AFE is running at, but it would do it inside alsa-lib on the very thread
+     * that is feeding the card -- and that thread has a deadline, because this
+     * AFE has no playback interrupt and the driver polls the DL1 cursor from a
+     * work item.  ffmpeg's resampler runs before the write instead, where being
+     * late costs a buffer rather than a gap.
+     */
+    if (alsaSink.isEmpty())
+        args << "-f" << "s16le" << "-";
+    else
+        args << "-f" << "alsa" << alsaSink;
     return args;
 }
 
@@ -1167,8 +1219,10 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
     m_framesDropped = 0;
     m_paused = false;
     m_note.clear();
-    if (m_videoDuration <= 0.0 || startAt <= 0.0)
+    if (m_videoDuration <= 0.0 || startAt <= 0.0) {
         m_videoDuration = probeDuration(item.path);
+        m_videoHasAudio = probeHasAudio(item.path);
+    }
 
     /* Even dimensions: several of the scalers and every yuv420 path want them, and
      * an odd width is a whole class of "ffmpeg exited 1" that is not worth having. */
@@ -1190,7 +1244,8 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
     args << "-i" << item.path
          << "-map" << "0:v:0"
          << "-vf" << filter
-         << "-f" << "rawvideo" << "-pix_fmt" << "bgra";
+         << "-f" << "rawvideo" << "-pix_fmt" << "bgra"
+         << "-an" << "pipe:1";
 
     /*
      * The card is asked about FIRST and separately, because the two failures want
@@ -1200,14 +1255,6 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
      */
     m_device = alsaDevice();
     const bool alsa = !m_device.isEmpty() && ffmpegHasAlsa();
-    if (alsa) {
-        /* pipe:1 has to be named before the second output, and the audio map is
-         * optional -- the trailing ? is what keeps a silent clip from failing. */
-        args << "pipe:1"
-             << "-map" << "0:a:0?" << "-f" << "alsa" << m_device;
-    } else {
-        args << "-an" << "pipe:1";
-    }
 
     m_decoder = new QProcess(this);
     m_decoder->setReadChannel(QProcess::StandardOutput);
@@ -1216,20 +1263,52 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
             this, &MediaPage::onDecoderFinished);
     m_decoder->start(ffmpegPath(), args);
 
+    /*
+     * ── THE SOUND IS ITS OWN PROCESS, AND THAT IS THE FIX FOR CHOPPY FILMS ──
+     *
+     * It used to be the same ffmpeg: one command with two outputs, rawvideo on
+     * pipe:1 and the sound on `-f alsa'.  That reads well and it starves the DAC.
+     *
+     * A frame here is 640x480x4 -- 1.2 MB -- and a pipe holds 64 KiB, so ffmpeg is
+     * blocked in write(2) for almost the whole of every frame, waiting for this
+     * process to come round the event loop and drain it.  A muxer is one thread:
+     * while it is blocked on the pipe it is not calling snd_pcm_writei either.  The
+     * card's ring is 64 KiB, which at 48 kHz stereo is 341 ms, so any single stall
+     * longer than that -- one full-screen repaint that runs long, one directory
+     * listing, one page of the card read cold -- is a hole in the sound.  That is
+     * exactly what "the audio is extremely choppy" sounds like, and it gets worse
+     * the more the picture costs, which is backwards.
+     *
+     * Two processes cannot do that to each other.  The decoder blocks on the pipe
+     * as before and nothing else is behind it; the sound has its own demux, its own
+     * decode -- cheap, `-vn' and one stream -- and blocks only on the card.
+     *
+     * WHAT IT COSTS is a shared clock: the picture is paced by ffmpeg's `-re' off
+     * the wall clock and the sound by the AFE's own 48 kHz, so they drift by
+     * whatever those two disagree by.  That is parts per million on this SoC, it
+     * starts from the same timestamp because both are given the same `startAt', and
+     * every seek restarts both.  A few milliseconds an hour against a hole in the
+     * sound every few seconds is not a close call.
+     */
     if (m_device.isEmpty()) {
         /*
-         * Nothing to play into, so neither chain is started -- a second ffmpeg
-         * feeding an aplay that cannot open a device is two processes failing in
-         * the background while the screen says nothing.  The note is the whole of
-         * the response.
+         * Nothing to play into, so no sound chain is started at all -- an ffmpeg
+         * that cannot open a device is a process failing in the background while
+         * the screen says nothing.  The note is the whole of the response.
          */
         m_note = tr("no sound card on this device");
-    } else if (!alsa) {
+    } else if (!m_videoHasAudio) {
+        m_note = mixerComplaint();      /* a silent clip, and that is not a fault */
+    } else if (alsa) {
+        m_videoAudio = new QProcess(this);
+        connect(m_videoAudio, &QProcess::readyReadStandardError,
+                this, &MediaPage::onChildStderr);
+        m_videoAudio->start(ffmpegPath(), audioDecodeArgs(item.path, startAt, m_device));
+        m_note = mixerComplaint();
+    } else {
         /*
-         * Audio in its own chain, which drifts from the video because the two
-         * decodes have no shared clock.  aplay's blocking writes pace it, so the
-         * drift is bounded by the sound card's buffer rather than unbounded, and
-         * this only happens on an ffmpeg without the alsa muxer.
+         * No alsa outdev in this ffmpeg, so the sound goes down a pipe into aplay
+         * instead.  Same shape, one more process, and the same drift.
          */
         const QString aplay = aplayPath();
         if (!aplay.isEmpty()) {
@@ -1237,19 +1316,17 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
             m_videoAplay = new QProcess(this);
             m_videoAudio->setStandardOutputProcess(m_videoAplay);
             connect(m_videoAplay, &QProcess::readyReadStandardError,
-                    this, &MediaPage::onAplayStderr);
-            m_videoAudio->start(ffmpegPath(), audioDecodeArgs(item.path, startAt));
+                    this, &MediaPage::onChildStderr);
+            m_videoAudio->start(ffmpegPath(), audioDecodeArgs(item.path, startAt, QString()));
             m_videoAplay->start(aplay, QStringList()
                                            << "-q" << "-D" << m_device
                                            << "-t" << "raw" << "-f" << "S16_LE"
                                            << "-r" << QString::number(kRate) << "-c" << "2"
                                            << "-");
-            m_note = tr("audio on a separate clock -- no alsa muxer in ffmpeg");
+            m_note = tr("audio through aplay -- no alsa muxer in ffmpeg");
         } else {
             m_note = tr("aplay is not installed (alsa-utils)");
         }
-    } else {
-        m_note = mixerComplaint();
     }
 
     m_clock.restart();
@@ -1419,10 +1496,8 @@ void MediaPage::playQueued(double startAt)
     const Entry track = *at;
 
     const QString ff = ffmpegPath();
-    const QString ap = aplayPath();
-    if (ff.isEmpty() || ap.isEmpty()) {
-        emit toastRequested(ff.isEmpty() ? tr("ffmpeg is not installed")
-                                         : tr("aplay is not installed (alsa-utils)"), 4000);
+    if (ff.isEmpty()) {
+        emit toastRequested(tr("ffmpeg is not installed"), 4000);
         return;
     }
 
@@ -1431,6 +1506,35 @@ void MediaPage::playQueued(double startAt)
         m_note = tr("no sound card on this device");
         emit toastRequested(m_note, 4000);
         rebuild();
+        return;
+    }
+
+    /*
+     * ONE PROCESS, AND APLAY IS THE FALLBACK RATHER THAN THE PATH.
+     *
+     * A film has always played its sound by handing ffmpeg the card and letting it
+     * write with `-f alsa'.  A song went through a pipe into aplay instead, for no
+     * reason beyond the order the two were written -- and that difference is what
+     * the board reported: films had sound and music did not, because aplay on this
+     * rootfs dies before it opens anything with
+     *
+     *     aplay: symbol lookup error: undefined symbol: snd_pcm_subformat_value
+     *
+     * which is an alsa-utils newer than the libasound.so.2 it resolves against.
+     * Nothing in this page can fix that pairing.  What it can do is stop depending
+     * on it, and there was never anything to gain: aplay's only job here was to
+     * hold a 64 KiB pipe and call snd_pcm_writei, which is exactly what ffmpeg's
+     * alsa outdev does one buffer earlier and in the process that already has the
+     * samples.  One process, one fewer buffer between the decoder and the DAC, and
+     * one fewer binary that has to be installed and has to work.
+     *
+     * The old chain stays for an ffmpeg built without the alsa outdev, because
+     * that is a real build and the answer for it is still a pipe into aplay.
+     */
+    const bool direct = ffmpegHasAlsa();
+    const QString ap = direct ? QString() : aplayPath();
+    if (!direct && ap.isEmpty()) {
+        emit toastRequested(tr("aplay is not installed (alsa-utils)"), 4000);
         return;
     }
 
@@ -1450,37 +1554,43 @@ void MediaPage::playQueued(double startAt)
     }
 
     m_music = new QProcess(this);
-    m_aplay = new QProcess(this);
-    /*
-     * Raw s16le into `aplay -t raw' rather than a WAV stream: a WAV header written
-     * to a pipe has to lie about its length, and while aplay copes with that, the
-     * raw form has no header to be wrong.  Every field aplay needs is on its own
-     * command line instead.
-     */
-    m_music->setStandardOutputProcess(m_aplay);
-    /*
-     * BOTH ends of the chain report, into the same slot.  ffmpeg's exit is the
-     * interesting one when it fails; aplay's is the interesting one when it does
-     * not, because aplay is still a third of a second of pipe behind ffmpeg when
-     * ffmpeg says it is done.  onMusicFinished() sorts out which is which.
-     */
     connect(m_music, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
             this, &MediaPage::onMusicFinished);
-    connect(m_aplay, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
-            this, &MediaPage::onMusicFinished);
     /*
-     * APLAY'S STDERR IS READ.  It was not, which is why a card that would not open
-     * produced silence and no message anywhere: aplay died, ffmpeg took EPIPE, and
-     * the only trace of the reason was in a pipe nobody was holding.
+     * THE STDERR OF WHATEVER OPENS THE CARD IS READ.  It was not, which is why a
+     * card that would not open produced silence and no message anywhere: the
+     * process died, its partner took EPIPE, and the only trace of the reason was
+     * in a pipe nobody was holding.
      */
-    connect(m_aplay, &QProcess::readyReadStandardError, this, &MediaPage::onAplayStderr);
+    connect(m_music, &QProcess::readyReadStandardError, this, &MediaPage::onChildStderr);
 
-    m_music->start(ff, audioDecodeArgs(track.path, startAt));
-    m_aplay->start(ap, QStringList()
-                           << "-q" << "-D" << m_device
-                           << "-t" << "raw" << "-f" << "S16_LE"
-                           << "-r" << QString::number(kRate) << "-c" << "2"
-                           << "-");
+    if (!direct) {
+        m_aplay = new QProcess(this);
+        /*
+         * Raw s16le into `aplay -t raw' rather than a WAV stream: a WAV header
+         * written to a pipe has to lie about its length, and while aplay copes with
+         * that, the raw form has no header to be wrong.  Every field aplay needs is
+         * on its own command line instead.
+         */
+        m_music->setStandardOutputProcess(m_aplay);
+        /*
+         * BOTH ends of the chain report, into the same slot.  ffmpeg's exit is the
+         * interesting one when it fails; aplay's is the interesting one when it does
+         * not, because aplay is still a third of a second of pipe behind ffmpeg when
+         * ffmpeg says it is done.  onMusicFinished() sorts out which is which.
+         */
+        connect(m_aplay, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
+                this, &MediaPage::onMusicFinished);
+        connect(m_aplay, &QProcess::readyReadStandardError, this, &MediaPage::onChildStderr);
+    }
+
+    m_music->start(ff, audioDecodeArgs(track.path, startAt, direct ? m_device : QString()));
+    if (m_aplay)
+        m_aplay->start(ap, QStringList()
+                               << "-q" << "-D" << m_device
+                               << "-t" << "raw" << "-f" << "S16_LE"
+                               << "-r" << QString::number(kRate) << "-c" << "2"
+                               << "-");
 
     m_clock.restart();
     m_pausedAt = (qint64)(startAt * 1000.0);
@@ -1677,8 +1787,16 @@ void MediaPage::onMusicFinished(int code)
      * So the clean case answers on APLAY's finished() instead: ffmpeg's exit closes
      * the write end, aplay reads EOF, drains, and exits by itself.  ffmpeg is only
      * disconnected here, not reaped, because it has nothing left to say.
+     *
+     * WITH NO APLAY THERE IS NOTHING TO WAIT FOR, and the test is on m_aplay rather
+     * than on which branch playQueued() took, because that pointer IS the answer.
+     * When ffmpeg writes the card itself the draining happens inside it -- the alsa
+     * outdev's writes are blocking, so the last period is in the ring before it
+     * returns -- and its clean exit is the end of the track.  Waiting here for a
+     * second process that was never started would leave the album stopped on its
+     * first song with the transport still showing it as playing.
      */
-    if (who == m_music && code == 0 && m_music->exitStatus() == QProcess::NormalExit) {
+    if (m_aplay && who == m_music && code == 0 && m_music->exitStatus() == QProcess::NormalExit) {
         /* Only the connections from this process to this page.  disconnect() with
          * no arguments would be aimed at the same place but is a blunter tool than
          * the situation needs. */
@@ -1704,7 +1822,7 @@ void MediaPage::onMusicFinished(int code)
     endProcess(m_aplay);
 
     if (code != 0 || crashed) {
-        /* What it said now, else what it said earlier and onAplayStderr kept, else
+        /* What it said now, else what it said earlier and onChildStderr kept, else
          * the bare fact that it is gone. */
         if (!err.isEmpty())
             m_note = tidyChildError(err);
@@ -1731,7 +1849,7 @@ void MediaPage::onMusicFinished(int code)
     advance(1, true);
 }
 
-void MediaPage::onAplayStderr()
+void MediaPage::onChildStderr()
 {
     QProcess *const p = qobject_cast<QProcess *>(sender());
     if (!p)
