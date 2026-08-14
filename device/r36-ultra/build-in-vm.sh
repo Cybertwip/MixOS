@@ -187,13 +187,21 @@ ROM_PART_START=$(( STORAGE_PART_END + 1 ))
 ROM_PART_END=$(( ROM_PART_START + (ROM_PART_SIZE * 1024 * 1024 / 512) - 1 ))
 DISK_START_PADDING=$(( (SYSTEM_PART_START + 2048 - 1) / 2048 ))
 DISK_SIZE=$(( DISK_START_PADDING + SYSTEM_SIZE + STORAGE_SIZE + ROM_PART_SIZE + 1 ))
-# THE ONE ARTIFACT THIS BUILD SHIPS, and the only one: MixOS_<arch>_<debian>_<commit>.img,
+# THE ONE ARTIFACT THIS BUILD SHIPS, and the only one: MixOS_<arch>_<debian>_base.img,
 # uncompressed.  There is no .7z beside it any more -- see the finalization stage for why
-# that went, and darkos_image_name() in device/common/multipass.sh for where this name
-# comes from and why the host computes it rather than this script.  The fallback is for
-# running this file by hand on a Linux box with no wrapper; .git is absent in the build VM,
-# so there the wrapper's value is the only one there is.
-DISK="${DARKOS_IMAGE_NAME:-MixOS_${USERSPACE_ARCH}_${DEBIAN_CODE_NAME}_$(git -C "$ROOT" rev-parse --short=7 HEAD 2>/dev/null || echo nogit).img}"
+# that went, and darkos_base_image_name() in device/common/multipass.sh for where this
+# name comes from and why the host computes it rather than this script.  The fallback is
+# for running this file by hand on a Linux box with no wrapper.
+#
+# NO COMMIT IN IT, AND THAT IS THE POINT.  It used to be ..._<commit>.img, and because
+# every stage below decides what it can skip by asking whether its output is still on
+# disk, a commit was enough to make this script look for a file no run had ever written.
+# The image checkpoint went, finalization went with it, and the final stage ran again in
+# full -- restore, package churn, a fresh 8 GB image -- for bytes identical to the ones
+# already sitting beside it under last commit's name.  Nothing in this image is a
+# function of a commit in this repository; it is Debian, a kernel and a bootloader.  The
+# commit belongs on what build-j36-ultra.sh copies out of this, and that is where it is.
+DISK="${DARKOS_IMAGE_NAME:-MixOS_${USERSPACE_ARCH}_${DEBIAN_CODE_NAME}_base.img}"
 export ROOT_FILESYSTEM_FORMAT ROOT_FILESYSTEM_FORMAT_PARAMETERS
 export DATA_LABEL DATA_FILESYSTEM_FORMAT DATA_FILESYSTEM_FORMAT_PARAMETERS
 export DATA_MOUNT_OPTIONS DATA_MOUNT_POINT
@@ -746,6 +754,46 @@ discard_foreign_layout() {
     log "The rebuilt image will be $DISK; the old one is still there to flash meanwhile"
     return 0
 }
+# ── ADOPTING THE IMAGE THE PREVIOUS NAMING SCHEME LEFT ───────────────────────
+#
+# $DISK used to end in the commit id and now ends in `base', so the first run after that
+# change finds a state directory that says finished and an image file it has never heard
+# of.  Rebuilding is the wrong answer twice over: the file is right there, and it is the
+# same bytes this build would spend two hours producing.
+#
+# `latest-image' is what makes the adoption safe rather than a guess.  It is written by
+# the last line of a run that completed, so it names an image that finished; the mtime
+# glob that find_base_image() falls back to would just pick up whatever is newest,
+# including the half-written one an interrupted run left behind.  A rename and nothing
+# else -- the checkpoints beside it already describe these bytes.
+#
+# It runs before discard_foreign_layout on purpose: that function judges $DISK, and with
+# no $DISK to judge it would let a pre-ext2 image stand unexamined under its old name.
+# Renamed first, it gets the same look every other image gets.
+#
+# AND IT IS NOT A PRISTINE BASE, which the operator has to be told rather than left to
+# discover.  The image being adopted is one a J36 run has already injected into, and
+# inject_into_image() adds: p1 is `cp -r' and p2 is `tar -xzpf', so both overwrite what
+# the new payload names and neither removes what only the old one did.  Every output
+# copied from this base therefore inherits that residue -- harmless for a file the
+# current payload also writes, a ghost for one it dropped.  Deleting $DISK is the cure,
+# and it costs a base rebuild, so it is the operator's call and not this script's.
+adopt_previous_image_name() {
+    local previous
+    [[ ! -s "$DISK" ]] || return 0
+    [[ -f "$STATE_DIR/latest-image" ]] || return 0
+    read -r previous < "$STATE_DIR/latest-image"
+    [[ -n "$previous" && "$previous" != "$DISK" && -s "$previous" ]] || return 0
+    log "Adopting $previous as $DISK: same image, and the name is all that changed"
+    mv -f "$previous" "$DISK"
+    printf '%s\n' "$DISK" > "$STATE_DIR/latest-image"
+    log "NOTE this base already carries a J36 payload from the run that made it, and"
+    log "NOTE injection adds rather than replaces, so files an older payload wrote and"
+    log "NOTE the current one does not will survive into every image copied from it."
+    log "NOTE Delete $DISK to force a pristine base on the next run; it costs a rebuild."
+}
+adopt_previous_image_name
+
 discard_foreign_layout
 
 # A GUI-only and a full-app build use different filesystem/image names.  Make

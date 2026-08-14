@@ -79,6 +79,12 @@ STATE_KEY="${DEBIAN_RELEASE}-userspace-${USERSPACE_ARCH}-profile-gui-v4"
 # Computed here and passed in, because .git/ does not ride into the build VM.  Named
 # after the commit rather than the date -- see darkos_image_name.
 IMAGE_NAME="$(darkos_image_name "$SCRIPT_DIR" "$USERSPACE_ARCH" "$DEBIAN_RELEASE")"
+# What THIS script builds and hands over, which is not the same file.  The base carries no
+# commit -- see darkos_base_image_name for the six minutes and the hour that cost -- and
+# $IMAGE_NAME above is now the name of what build-j36-ultra.sh copies out of it.  A run of
+# this script on its own therefore delivers the base, and the commit that produced it is
+# still readable from /etc/j36-build inside the image.
+BASE_IMAGE_NAME="$(darkos_base_image_name "$USERSPACE_ARCH" "$DEBIAN_RELEASE")"
 # An internal handshake, not an operator knob: build-j36-ultra.sh sets it because it is
 # about to inject two payloads into this image and re-copy it, and an 8.3 GB transfer of
 # the pre-injection bytes is one nobody ever wanted.  If the J36 layer then fails, the
@@ -103,7 +109,14 @@ recreating the partition image, Debian rootfs, U-Boot, or kernel.
 Artifacts are copied to:
   ${ARTIFACT_DIR}
 
-It produces one uncompressed image, named after the commit it was built from:
+It produces one uncompressed image, the reusable base for this Debian release and
+architecture:
+  ${BASE_IMAGE_NAME}
+
+The base carries no commit because nothing in it varies with one, and naming it
+after a commit made every commit rebuild it.  build-j36-ultra.sh copies it and
+folds the board layer into the copy; that copy is the flashable article and it is
+the one named after the commit:
   ${IMAGE_NAME}
 
 Common overrides:
@@ -133,7 +146,7 @@ run_make() {
     cd "$SCRIPT_DIR"
     darkos_log "Building or resuming RG351MP (Debian ${DEBIAN_RELEASE}, userspace=${USERSPACE_ARCH}, jobs=${BUILD_JOBS}, cache=${CACHE})"
     env DEBIAN_CODE_NAME="$DEBIAN_RELEASE" \
-        DARKOS_IMAGE_NAME="$IMAGE_NAME" \
+        DARKOS_IMAGE_NAME="$BASE_IMAGE_NAME" \
         USERSPACE_ARCH="$USERSPACE_ARCH" \
         BUILD_JOBS="$BUILD_JOBS" \
         ENABLE_CACHE="$CACHE" \
@@ -204,7 +217,7 @@ darkos_log "Completed partition, Debian bootstrap, U-Boot and kernel stages are 
 
 multipass exec "$VM_NAME" -- env \
     DEBIAN_CODE_NAME="$DEBIAN_RELEASE" \
-    DARKOS_IMAGE_NAME="$IMAGE_NAME" \
+    DARKOS_IMAGE_NAME="$BASE_IMAGE_NAME" \
     USERSPACE_ARCH="$USERSPACE_ARCH" \
     BUILD_JOBS="$BUILD_JOBS" \
     ENABLE_CACHE="$CACHE" \
@@ -249,7 +262,7 @@ sync "$ARTIFACT_DIR"
 darkos_log "Build completed and verified."
 darkos_log "Artifacts: ${ARTIFACT_DIR}"
 if [[ "$DEFER_IMAGE_COPY" == 0 ]]; then
-    darkos_log "Flash this: ${ARTIFACT_DIR}/${IMAGE_NAME}"
-    darkos_report_stale_images "$ARTIFACT_DIR" "$IMAGE_NAME"
+    darkos_log "Flash this: ${ARTIFACT_DIR}/${BASE_IMAGE_NAME}"
+    darkos_report_stale_images "$ARTIFACT_DIR" "$BASE_IMAGE_NAME"
 fi
 darkos_warn "This is the RG351MP/RK3326 base image. It does not yet contain the R36 Ultra-specific DTB layer."

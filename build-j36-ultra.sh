@@ -245,8 +245,19 @@ else
     fi
 fi
 
+# The name of what this run delivers, computed here for the same reason the base build's
+# is: .git does not ride into the VM, so `git rev-parse' in there has nothing to read.
+#
+# The base image the layer goes into carries no commit -- see darkos_base_image_name --
+# because nothing in it varies with one.  This does: it is the base plus this checkout's
+# kernel, device tree, drivers and dashboard, so it is named after the checkout.  The
+# defaults match build-r36-ultra.sh's, which is what decides the base's own name.
+J36_IMAGE_NAME="$(darkos_image_name "$ROOT" \
+    "${USERSPACE_ARCH:-armhf}" "${DEBIAN_CODE_NAME:-trixie}")"
+
 darkos_log "Building the J36 Ultra layer"
 multipass exec "$VM_NAME" -- env \
+    J36_IMAGE_NAME="$J36_IMAGE_NAME" \
     J36_WORK_DIR="$VM_WORK_DIR" \
     J36_EXPORT_DIR="$VM_EXPORT_DIR" \
     J36_MIX_ONLY="$MIX_ONLY" \

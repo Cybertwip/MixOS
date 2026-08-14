@@ -60,6 +60,31 @@ darkos_image_name() {
     printf 'MixOS_%s_%s_%s.img\n' "$arch" "$codename" "$commit"
 }
 
+# darkos_base_image_name ARCH CODENAME
+#
+# The name of the image the BASE build works on and keeps: MixOS_<arch>_<debian>_base.img.
+# One per arch and Debian release, and it never carries a commit.
+#
+# ── WHY THE BASE MUST NOT BE NAMED AFTER A COMMIT ────────────────────────────
+#
+# The base build checkpoints its stages in a state directory and decides what it can
+# skip by asking whether its outputs are still on disk.  With the image named after the
+# commit, a commit was enough to make it look for a file no run had ever written -- so
+# every commit invalidated the image checkpoint, and with it finalization, and the whole
+# final stage ran again: a six-minute restore of the cached root, an hour or more of
+# package churn, and a fresh 8 GB image, to produce bytes byte-identical to the ones
+# beside it under a different name.  Four such images were found in one build VM.
+#
+# The base is a function of the Debian release and the architecture, and of nothing this
+# repository commits, so that is what its name says.  It is built once and then reused,
+# and the commit belongs on the thing that actually varies with the commit: the flashable
+# image the J36 layer produces FROM the base, which darkos_image_name above still names.
+# That one is a copy, so the base is never patched, never iterated on, and never has to
+# be trusted to be pristine -- it is.
+darkos_base_image_name() {
+    printf 'MixOS_%s_%s_base.img\n' "$1" "$2"
+}
+
 # darkos_artifact_dir ROOT
 #
 # The host directory the finished images land in: MixOS-Artifacts, a sibling of the

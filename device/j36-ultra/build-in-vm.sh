@@ -3047,11 +3047,20 @@ ExecStart=$mixos_root/bin/mixdash
 # of what mixdash already did minutes ago, appended to a regular file with nothing
 # reading it, which costs six bytes and does nothing else.
 #
-# `abort' and not `quit': /init said `handover' before switch_root, and `quit' honours
-# it by exiting without touching the console mode.  That is right when the dashboard is
+# The word is abort and not quit -- and NO BACKTICKS AROUND EITHER OF THEM, because
+# this heredoc is the unquoted one and a backtick in it is a command substitution that
+# ends up inside /init.  The quoting habit the rest of this file uses for words like
+# this was applied here once and the apostrophes caught inside the substitution parsed
+# as "Unterminated quoted string"; bash -n on this script sees none of it, because out
+# there the whole of /init is inside a single-quoted heredoc.  What caught it is the
+# dash -n at the bottom of this file, and that is the only reason it cost a build
+# rather than a card.
+#
+# As for the choice itself: /init says handover before switch_root, and quit honours it
+# by exiting without touching the console mode.  That is right when the dashboard is
 # painting and wrong here, where the whole point is to get the text console back so the
-# reason there is no dashboard can be read off the panel.  `abort' is the word that
-# means exactly that.
+# reason there is no dashboard can be read off the panel.  abort is the word that means
+# exactly that.
 ExecStopPost=-/bin/sh -c ': > /dev/.mixsplash-done; echo abort >> /dev/.mixsplash'
 Restart=on-failure
 RestartSec=2
@@ -3232,15 +3241,38 @@ UNITID
     ln -sf ../mixdash.service \
            /newroot/run/systemd/system/multi-user.target.wants/mixdash.service
 
-    # The probe, before the dashboard.  -f is the one mode that touches nothing it
-    # cannot give back: it counts the pixels already in /dev/fb0, undoes a backlight
-    # at zero and a console left in KD_GRAPHICS, and paints colour bars with the CPU.
-    # Run here it is a handover signal that costs a second -- bars and then a
-    # dashboard means both halves work, bars that stay mean mixdash never started,
-    # and no bars at all mean nothing userspace draws will be seen and the dashboard
-    # is not the thing to debug.  It is NOT -p or -c: those two modeset, and on a
-    # kernel with no fbdev emulation the CRTC is disabled when the client exits, so
-    # either one would hide the dashboard for the rest of the boot.
+    # ── the probe, and WHY IT NO LONGER RUNS ON AN ORDINARY BOOT ─────────────────
+    #
+    # This unit was the whole of "mixsplash shows the eglprobe colours and then a
+    # console text screen flashes before the dashboard", and it produced both halves
+    # of that from the two lines in `eglprobe -f' that were written to be helpful.
+    #
+    # The colours are literal: fb_report(repair=1, paint_it=1) fills /dev/fb0 with
+    # eight bars, a white border and a diagonal, then sleeps.  There is no compositor
+    # on this board and no DRM in that path -- the bars land directly on top of the
+    # splash's own pixels, in the same buffer, a second before the dashboard.
+    #
+    # The text screen is tty_report(repair=1), and it is subtler.  The splash holds
+    # /dev/tty0 in KD_GRAPHICS, which is exactly the state that function is written to
+    # diagnose: it reads the mode, decides that "something put it there and did not put
+    # it back", and sets KD_TEXT.  fbcon then repaints the entire console over the
+    # splash.  It lasts about a second because console_regrab() in mixsplash.c re-takes
+    # KD_GRAPHICS once a second and paints the next frame over it -- which is precisely
+    # a flash, and precisely where the user sees one.  Neither of those is a bug in
+    # eglprobe.  A probe whose job is to undo a console left in graphics mode cannot
+    # tell a splash that is using the mode from a dead client that abandoned it, so the
+    # answer is not to make it cleverer: it is not to run it while a splash is up.
+    #
+    # So it runs under j36.gl=debug and not otherwise.  That is the flag whose whole
+    # meaning is "I am debugging the display and I want to see what it says", and the
+    # boot it costs its seamlessness on is a boot the operator asked to look inside.
+    # The binary is staged either way, so `/run/j36/eglprobe -f' from a shell answers
+    # the same question after the fact without a rebuild.
+    #
+    # It is NOT -p or -c even then: those two modeset, and on a kernel with no fbdev
+    # emulation the CRTC is disabled when the client exits, so either one would hide
+    # the dashboard for the rest of the boot.
+    #
     # A UNIT OF ITS OWN, AND NOT ExecStartPre, AND THIS IS THE FIX FOR A HANG.
     # ExecStartPre runs on every start ATTEMPT, restarts included.  mixdash.service is
     # Restart=on-failure with StartLimitBurst=3, so a dashboard that fails to start ran
@@ -3255,7 +3287,7 @@ UNITID
     # After= it, so a mixdash restart finds it already active and does not re-run it:
     # one EGL init per boot instead of three, and attempts two and three put their own
     # stderr on a panel nothing has repainted.
-    if [ "$probe_ready" = 1 ]; then
+    if [ "$probe_ready" = 1 ] && [ "$gl_debug" = 1 ]; then
         cat >> /newroot/run/systemd/system/mixdash.service <<'UNITPROBEDEP'
 
 [Unit]
@@ -3263,9 +3295,11 @@ Wants=mixdash-probe.service
 After=mixdash-probe.service
 UNITPROBEDEP
         cat > /newroot/run/systemd/system/mixdash-probe.service <<'UNITPROBE'
-# Written by the J36 Ultra initramfs.  Once per boot, before the dashboard.
+# Written by the J36 Ultra initramfs, and ONLY under j36.gl=debug.  Once per boot,
+# before the dashboard.  It paints over the splash and hands the console back to
+# fbcon on purpose; that is the point of asking for it.
 [Unit]
-Description=MixOS panel probe (J36 Ultra)
+Description=MixOS panel probe (J36 Ultra, j36.gl=debug only)
 Before=mixdash.service
 
 [Service]
@@ -3276,26 +3310,26 @@ StandardError=journal+console
 # - because a probe is not a precondition: whatever it says, the dashboard still
 # gets its attempt.
 ExecStart=-/bin/sh -c '/run/j36/eglprobe -f 1 2>&1 | tee /run/j36/eglprobe.log'
-UNITPROBE
-        # And under j36.gl=debug the two library questions as well.  The replay stays
-        # on mixdash.service, where it belongs: the dashboard covers the panel with its
-        # own drawing, so the only time the probe's verdict can be read is after the
-        # shell has exited.
-        if [ "$gl_debug" = 1 ]; then
-            cat >> /newroot/run/systemd/system/mixdash-probe.service <<'UNITDBG'
+# And the two library questions as well.  The replay stays on mixdash.service, where
+# it belongs: the dashboard covers the panel with its own drawing, so the only time
+# the probe's verdict can be read is after the shell has exited.
 ExecStart=-/bin/sh -c '/run/j36/eglprobe 2>&1 | tee -a /run/j36/eglprobe.log'
 ExecStart=-/bin/sh -c 'LIBGL_ALWAYS_SOFTWARE=1 /run/j36/eglprobe -s 2>&1 | tee -a /run/j36/eglprobe.log'
 Environment="EGL_LOG_LEVEL=debug"
 Environment="LIBGL_DEBUG=verbose"
-UNITDBG
-            cat >> /newroot/run/systemd/system/mixdash.service <<'UNITDBGREPLAY'
+UNITPROBE
+        cat >> /newroot/run/systemd/system/mixdash.service <<'UNITDBGREPLAY'
 
 [Service]
 ExecStopPost=-/bin/sh -c 'echo "--- eglprobe, repeated now that the shell has exited ---"; cat /run/j36/eglprobe.log'
 UNITDBGREPLAY
-        fi
-        say "dash: mixdash-probe.service runs the probe once per boot, not once per"
-        say "      start attempt -- three restarts used to mean three EGL inits"
+        say "dash: j36.gl=debug, so mixdash-probe.service runs the probe once per boot"
+        say "      -- it paints bars over the splash and gives fbcon the console back"
+    elif [ "$probe_ready" = 1 ]; then
+        say "dash: eglprobe is staged but NOT run at boot: -f paints colour bars into"
+        say "      /dev/fb0 and puts tty0 back into KD_TEXT, which is the flash the"
+        say "      splash used to show.  Add j36.gl=debug for it, or run"
+        say "      /run/j36/eglprobe -f from a shell afterwards"
     fi
 
     say "dash: mixdash.service is the shell"
@@ -8038,6 +8072,14 @@ r36_state_dir() {
 # partitioning with today's payload in it -- the most confusing possible result.  A
 # rebuild is the answer, and saying so is more useful than quietly patching the wrong
 # image.  The old ones are named in the log so it is clear why they were passed over.
+#
+# AND ONLY A `_base' IMAGE IN THE FALLBACK.  The mtime glob used to take the newest
+# MixOS_*.img, which since the base/output split is very often one of THIS pipeline's own
+# outputs -- an image that has already been injected into once.  Patching that lays this
+# run's payload over the last one's with nothing to say which file came from where, which
+# is the iteration the split exists to prevent.  So the fallback asks for the base by
+# name, and finding none is reported as having none rather than papered over with an
+# image that would appear to work.
 find_base_image() {
     local state name
     state="$(r36_state_dir)"
@@ -8048,19 +8090,22 @@ find_base_image() {
             return 0
         fi
     fi
-    ls -1t "$ROOT"/MixOS_*_*_*.img 2>/dev/null | head -n 1 || true
+    ls -1t "$ROOT"/MixOS_*_*_base.img 2>/dev/null | head -n 1 || true
 }
 
-# What the injected image is a function of: the image it was injected into, and the two
+# What the injected image is a function of: the BASE it was copied from, and the two
 # payloads.  Recorded after a successful injection so a re-run that changes neither can
-# skip the injection -- which is the whole cost of this section.  The image's own size and
-# mtime are enough for the first half because injection is the only thing that writes to
-# it here, and the recorded value is read back after that write; a base rebuild moves
-# both, and so does a new commit, because the image is named after the commit.
+# skip the injection -- which, with the copy, is the whole cost of this section.
+#
+# THE BASE AND NOT THE OUTPUT, since the split.  The output's size and mtime move every
+# time this section runs, so signing the output would sign the answer with the question in
+# it and never match twice.  The base is written only by build-r36-ultra.sh, which is
+# exactly the event that should invalidate this.  The output's existence is checked
+# separately, at the call site, because a stamp cannot speak for a file that was deleted.
 image_export_signature() {
     local img="$1"
     {
-        stat -c 'image %s %Y' "$img"
+        stat -c 'base %s %Y' "$img"
         if [[ -f "$ARTIFACTS/sd-root.tar.gz" ]]; then
             stat -c 'sd-root %s %Y' "$ARTIFACTS/sd-root.tar.gz"
         else
@@ -8299,6 +8344,73 @@ print(p[0]["start"], p[0]["size"], p[1]["start"], p[1]["size"])
 # the operator a manual copy rather than the whole build.  It is loud, though.
 BASE_IMAGE="$(find_base_image)"
 
+# ── THE COPY, AND WHY THE BASE IS NEVER THE THING THAT GETS PATCHED ──────────
+#
+# This section used to inject straight into the base and hand the base over, which made
+# the base and the deliverable the same file.  Two things followed from that, and both
+# were paid on every single run.
+#
+# The base could not be trusted, so it could not be kept.  An image that has been
+# patched once is not a base any more; patching it again layers this run's payload on
+# top of the last one's and there is nothing that says which files came from where.  The
+# way the pipeline avoided that was to have build-r36-ultra.sh produce a NEW image every
+# commit -- which it did by naming the image after the commit, which invalidated its own
+# image checkpoint, which re-ran the entire final stage: a six-minute restore of the
+# cached root, an hour of package churn, a fresh 8 GB write.  An hour of work whose only
+# product was a clean file to patch.
+#
+# A copy is that clean file, and it costs about three minutes.  The base is built once
+# per Debian release and never written to again; every run copies it, patches the copy,
+# and hands the copy over under this checkout's commit.  Nothing is iterative: this run's
+# output is a function of the base and this run's payload, and of no run before it.
+#
+# --sparse=always because both files are mostly holes -- 8.3 GB apparent, a fraction of
+# that allocated -- and a copy that filled them in would be the slowest step in the
+# build.  Written to .part and renamed, so an interrupted copy cannot be mistaken for an
+# image by the next run, or by an operator with a card in the slot.
+OUTPUT_IMAGE=""
+if [[ -n "$BASE_IMAGE" && "$MIX_ONLY" != 1 ]]; then
+    OUTPUT_IMAGE="$ROOT/${J36_IMAGE_NAME:-MixOS_j36_output.img}"
+    # The one case where they are allowed to be the same file: an operator who pointed
+    # J36_IMAGE_NAME at the base, or a base build that was told to use this name.  Copying
+    # a file onto itself would truncate it, so the copy is skipped and the injection goes
+    # in place -- the old behaviour, for the one configuration that asks for it.
+    if [[ "$OUTPUT_IMAGE" == "$BASE_IMAGE" ]]; then
+        log "image: the output name IS the base name, so this run patches the base itself"
+    fi
+fi
+
+copy_base_to_output() {
+    [[ "$OUTPUT_IMAGE" != "$BASE_IMAGE" ]] || return 0
+    log "image: copying $(basename "$BASE_IMAGE") to $(basename "$OUTPUT_IMAGE")"
+    rm -f "$OUTPUT_IMAGE.part"
+    if ! cp --reflink=auto --sparse=always "$BASE_IMAGE" "$OUTPUT_IMAGE.part"; then
+        rm -f "$OUTPUT_IMAGE.part"
+        log "image: the copy failed, so there is nothing to inject into"
+        return 1
+    fi
+    mv -f "$OUTPUT_IMAGE.part" "$OUTPUT_IMAGE"
+    return 0
+}
+
+# Every commit made one of these, and four were found in a build VM at 4.3 GB each.  They
+# are not intermediates that something might still want: each is a complete flashable
+# image from a commit that has been superseded, and the one this run is about to write
+# replaces all of them.  The base is not in the glob's shape and cannot be caught by it;
+# a `.part' from an interrupted copy is, and is exactly as dead.
+prune_previous_outputs() {
+    local old
+    for old in "$ROOT"/MixOS_*_*_*.img "$ROOT"/MixOS_*_*_*.img.part; do
+        [[ -f "$old" ]] || continue
+        [[ "$old" != "$OUTPUT_IMAGE" && "$old" != "$BASE_IMAGE" ]] || continue
+        case "$(basename "$old")" in
+            *_base.img|*-old-layout.img) continue ;;
+        esac
+        log "image: removing $(basename "$old"), superseded by this run"
+        rm -f "$old"
+    done
+}
+
 if [[ "$MIX_ONLY" == 1 ]]; then
     log "image: --mix-only, so the base image is left alone.  boot/ and root/ below are"
     log "image: what this run produced; copy boot/ onto the card's BOOT partition and the"
@@ -8313,12 +8425,14 @@ elif [[ -z "$BASE_IMAGE" ]]; then
         log "image: NOTE $(basename "$stale") is here but predates the ext2 layout and the"
         log "image: rename, so it is not a base for today's payload."
     done
-elif [[ -f "$IMAGE_STAMP" ]] && \
+elif [[ -f "$IMAGE_STAMP" && -s "$OUTPUT_IMAGE" ]] && \
      [[ "$(cat "$IMAGE_STAMP")" == "$(image_export_signature "$BASE_IMAGE")" ]]; then
-    log "image: $(basename "$BASE_IMAGE") already carries this exact payload -- nothing"
-    log "image: to inject."
-elif inject_into_image "$BASE_IMAGE"; then
+    log "image: $(basename "$OUTPUT_IMAGE") was built from this base with this exact"
+    log "image: payload -- nothing to copy and nothing to inject."
+    prune_previous_outputs
+elif copy_base_to_output && inject_into_image "$OUTPUT_IMAGE"; then
     image_export_signature "$BASE_IMAGE" > "$IMAGE_STAMP"
+    prune_previous_outputs
 else
     log "image: SOME OR ALL of the payload did not reach the image -- read the lines"
     log "image: above.  sd-boot/ and sd-root.tar.gz are still in the artifacts and can"
@@ -8334,10 +8448,18 @@ fi
     if [[ "$MIX_ONLY" == 1 ]]; then
         printf 'image=mix-only\n'
         printf 'payload=exported\n'
-    elif [[ -n "$BASE_IMAGE" ]] && [[ -f "$IMAGE_STAMP" ]]; then
-        printf 'image=%s\n' "$(basename "$BASE_IMAGE")"
+    elif [[ -s "$OUTPUT_IMAGE" ]] && [[ -f "$IMAGE_STAMP" ]]; then
+        printf 'image=%s\n' "$(basename "$OUTPUT_IMAGE")"
         printf 'payload=in-image\n'
+    elif [[ -s "$OUTPUT_IMAGE" ]]; then
+        # A copy that was made and then not fully injected into.  It is named rather than
+        # hidden, because it is still a bootable base and the operator may want it -- but
+        # `stale' is what stops the wrapper from handing it over as this run's article.
+        printf 'image=%s\n' "$(basename "$OUTPUT_IMAGE")"
+        printf 'payload=stale\n'
     elif [[ -n "$BASE_IMAGE" ]]; then
+        # The copy itself failed, so what is here is the untouched base.  Naming it says
+        # there is something to flash and that it carries none of this run's work.
         printf 'image=%s\n' "$(basename "$BASE_IMAGE")"
         printf 'payload=stale\n'
     else
