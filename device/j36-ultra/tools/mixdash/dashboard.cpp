@@ -955,6 +955,61 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
         toast(tr("%1 exited").arg(title));
 }
 
+/*
+ * WHY POWER OFF DOES NOT GO THROUGH launch().
+ *
+ * launch() is built for a child that comes back: it toasts "Starting", blocks the
+ * event loop on QProcess::execute, and toasts an exit code afterwards.  poweroff
+ * does come back, and immediately, because all it does is ask PID 1 -- and then
+ * the dashboard carries on painting for the twenty or thirty seconds systemd
+ * needs to stop the units, write the shutdown log onto BOOT and unmount the card.
+ * What is on the glass for that whole window is a live menu that answers nothing,
+ * followed by a picture that stops moving.  That is indistinguishable from a hang,
+ * and it is most of the reason a power-off on this board has ever been reported
+ * as one.
+ *
+ * So: a curtain that says what is happening, painted and flushed BEFORE the
+ * request goes out; the pad and the pointer put away for good, because there is
+ * nothing left to press; and the process started detached, because nothing here
+ * wants its exit code and there is no event loop to come back to.
+ *
+ * The second line of the curtain is not padding.  There is no power-path FET on
+ * this PMIC, so VBAT is VSYS: with a charger in, VBUS holds the system rail up
+ * and the RTC cannot pull it down.  The driver restarts the board instead of
+ * halting it warm -- see j36_mt6592_pmic.c -- so a power-off attempted on the
+ * charger looks like a reboot, and the one thing the user needs to know is that
+ * unplugging fixes it.
+ */
+void Dashboard::powerOff()
+{
+    const QString exe = firstExisting(QStringList() << "/sbin/poweroff"
+                                                    << "/usr/sbin/poweroff");
+    if (exe.isEmpty()) {
+        toast(tr("poweroff is not on this card"));
+        return;
+    }
+
+    m_toastTimer->stop();
+    m_toast->hide();
+
+    QLabel *curtain = new QLabel(this);
+    curtain->setAlignment(Qt::AlignCenter);
+    curtain->setWordWrap(true);
+    curtain->setStyleSheet(
+        "QLabel { background: #0A0B10; color: #E8EAF2; font-size: 17px; }");
+    curtain->setText(tr("Powering off\n\nIf the board comes back up, unplug the charger and try again."));
+    curtain->setGeometry(rect());
+    curtain->show();
+    curtain->raise();
+    /* Painted here, not on the next trip round the loop: there is no next trip. */
+    curtain->repaint();
+    QCoreApplication::processEvents();
+
+    m_pad->setSuspended(true);
+    m_pointer->sleep();
+    QProcess::startDetached(exe, QStringList());
+}
+
 /* ── activating a card ───────────────────────────────────────────────────── */
 
 /*
@@ -1045,8 +1100,7 @@ void Dashboard::activate(const AppEntry &entry)
             return;
         }
         m_armed = InternalNone;
-        launch(tr("Power off"), firstExisting(QStringList() << "/sbin/poweroff" << "/usr/sbin/poweroff"),
-               QStringList());
+        powerOff();
         break;
     default:
         break;

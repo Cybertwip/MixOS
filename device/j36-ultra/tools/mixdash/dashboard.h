@@ -190,6 +190,9 @@ private:
 
     void activate(const AppEntry &entry);
     void launch(const QString &title, const QString &exe, const QStringList &args);
+    /* Not launch(): a shutdown is the one child that must not be waited for, and
+     * the one that needs the panel to say so first.  See dashboard.cpp. */
+    void powerOff();
     void toast(const QString &text, int ms = 2400);
     static QString firstExisting(const QStringList &candidates);
     static QString firstWad();

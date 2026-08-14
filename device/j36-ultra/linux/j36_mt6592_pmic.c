@@ -151,6 +151,11 @@ static bool poweroff = true;
 module_param(poweroff, bool, 0444);
 MODULE_PARM_DESC(poweroff, "register the RTC BBPU power-off handler");
 
+static bool chgreboot = true;
+module_param(chgreboot, bool, 0444);
+MODULE_PARM_DESC(chgreboot,
+		 "restart rather than hang when power-off is asked for with a charger attached");
+
 /* ── PWRAP (the PMIC wrapper), WACS2 ─────────────────────────────────────────
  *
  * The same transport j36_mt6592_input uses for the volume keys' AUXADC channel,
@@ -2379,23 +2384,19 @@ static int j36_rtc_unlock_locked(struct j36_pmic *p)
 }
 
 /*
- * The whole sequence under one lock, using the lock-free transport internals: a
- * power-off is one atomic group of PMIC transactions, and nothing in it sleeps,
- * so it is safe from a context that may not.
+ * One attempt, whole, under one lock: a power-off is one atomic group of PMIC
+ * transactions, and nothing in it sleeps, so it is safe from a context that may
+ * not.  The unlock is INSIDE the attempt and not hoisted out of the loop above
+ * it -- an unlock that retired but did not take leaves every following BBPU write
+ * discarded in silence, and a retry that does not re-open the write interface is
+ * a retry that cannot fix anything.
  *
- * A successful power-off does not return -- the rail is gone before the delay
- * finishes -- so reaching the bottom of this function IS the failure report.
+ * A successful attempt does not return.
  */
-static int j36_pmic_power_off(struct sys_off_data *data)
+static int j36_rtc_bbpu_power_down(struct j36_pmic *p)
 {
-	struct j36_pmic *p = data->cb_data;
 	unsigned long flags;
 	int ret;
-
-	if (!j36_pwrap_up(p)) {
-		dev_emerg(p->dev, "pwrap is down; cannot reach the RTC\n");
-		return NOTIFY_DONE;
-	}
 
 	spin_lock_irqsave(&p->lock, flags);
 	ret = j36_rtc_unlock_locked(p);
@@ -2406,14 +2407,94 @@ static int j36_pmic_power_off(struct sys_off_data *data)
 	if (!ret)
 		ret = j36_rtc_trigger_locked(p);
 	spin_unlock_irqrestore(&p->lock, flags);
+	return ret;
+}
 
-	if (ret) {
-		dev_emerg(p->dev, "RTC power-off sequence failed (%d)\n", ret);
+/*
+ * Ask eight times over eight hundred milliseconds rather than once over five
+ * hundred.  Stock's mt_power_off() is a `while (1)' around this same write and it
+ * is a loop for a reason: the RTC retires the word on a 32 kHz domain, and the
+ * rail does not fall the instant it does.  One shot was strictly weaker than the
+ * thing it was ported from.
+ */
+#define J36_BBPU_TRIES			8
+#define J36_BBPU_SETTLE_MS		100
+
+/*
+ * WHY THIS FUNCTION HAS A TAIL AT ALL, AND WHY THE TAIL REBOOTS.
+ *
+ * There is no power-path FET on this PMIC family -- the fact at the top of this
+ * file, arriving one more time in the place it hurts most.  VBAT is VSYS, and
+ * with a cable in, VBUS is what holds VSYS up.  Pulling PWRBB low through the RTC
+ * cannot take a board down while something else is powering it: the write retires,
+ * the PMIC re-powers, and the kernel comes back from mdelay() on a board that is
+ * still on.  do_kernel_power_off() then returns to machine_power_off(), which
+ * halts the CPU with the rail up -- and because mixdash owns the panel and fbcon
+ * was handed over at boot, the last frame it drew stays on the glass.  A warm
+ * brick showing a menu.  That is the "shutdown just freezes the device" report,
+ * and none of it is a driver bug: it is what the hardware does.
+ *
+ * Stock answers it in one line -- `if (upmu_is_chr_det()) arch_reset(0, "charger")'
+ * -- and reboots into a loader that shows a charging animation.  This board's
+ * loader has no such mode, so a restart lands back in MixOS.  That is still the
+ * better of the two: a device that comes back up when you ask it to shut down
+ * plugged in is annoying and legible, and you can act on it.  A frozen warm panel
+ * is neither.  chgreboot=0 on the insmod line restores the halt.
+ *
+ * The charger is read BEFORE the first write and reported whatever the answer is,
+ * because with no console and no panel that line is the only evidence a later
+ * reader will have about which of these two stories they are looking at.
+ */
+static int j36_pmic_power_off(struct sys_off_data *data)
+{
+	struct j36_pmic *p = data->cb_data;
+	unsigned int i;
+	int online, ret;
+
+	if (!j36_pwrap_up(p)) {
+		dev_emerg(p->dev, "pwrap is down; cannot reach the RTC\n");
 		return NOTIFY_DONE;
 	}
 
-	mdelay(500);
-	dev_emerg(p->dev, "RTC BBPU write retired but the board is still up\n");
+	online = j36_charger_online(p);
+	dev_emerg(p->dev, "power off: charger %s\n",
+		  online < 0 ? "unreadable" : online ? "ATTACHED" : "absent");
+
+	for (i = 0; i < J36_BBPU_TRIES; ++i) {
+		ret = j36_rtc_bbpu_power_down(p);
+		if (ret) {
+			dev_emerg(p->dev,
+				  "RTC power-off sequence failed (%d) on attempt %u\n",
+				  ret, i + 1);
+			break;
+		}
+		mdelay(J36_BBPU_SETTLE_MS);
+	}
+
+	if (online > 0 && chgreboot) {
+		dev_emerg(p->dev,
+			  "a charger is attached and this PMIC cannot latch off with VBUS present -- restarting instead.  Unplug the cable and power off again to shut down.\n");
+		/*
+		 * emergency_restart() and not machine_restart(): this is a loadable
+		 * module, and on ARM machine_restart() has no EXPORT_SYMBOL, so a
+		 * call to it is an unresolved symbol at insmod time -- the whole
+		 * driver would fail to load and the board would lose its battery
+		 * gauge over a line that only runs on the charger.  The exported
+		 * wrapper reaches the same place: emergency_restart() dumps the
+		 * ring buffer, which puts the dev_emerg lines above in front of
+		 * whatever is reading, and then calls machine_emergency_restart(),
+		 * which on this architecture IS machine_restart() -- and that walks
+		 * the restart-handler chain down to mtk_wdt's SWRST.
+		 */
+		emergency_restart();
+	}
+
+	if (online > 0)
+		dev_emerg(p->dev,
+			  "power off did not latch, and a charger is attached -- unplug the cable and try again\n");
+	else
+		dev_emerg(p->dev,
+			  "BBPU writes retired but the board is still up\n");
 	return NOTIFY_DONE;
 }
 

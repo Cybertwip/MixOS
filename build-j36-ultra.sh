@@ -72,6 +72,11 @@ VM_ARTIFACT_MOUNT="/mnt/j36-artifacts"
 VM_BASE_ARTIFACT_MOUNT="/mnt/mixos-artifacts"
 VM_BUILD_DIR="/home/ubuntu/dArkOS"
 VM_WORK_DIR="/home/ubuntu/j36-ultra-work"
+# The same path build-r36-ultra.sh hands its in-VM half as DARKOS_R36_STATE_DIR.
+# Only the image prune at the bottom reads it, and only to find out which images the
+# base build's checkpoints still expect to be there.  Spelt out rather than exported
+# from that script because the two wrappers share nothing but the VM.
+VM_R36_STATE_DIR="/home/ubuntu/darkos-r36-state"
 
 usage() {
     cat <<USAGE
@@ -383,6 +388,74 @@ sync "$DEST"
         darkos_warn "and that the workstation has room for another $VM_IMAGE_SIZE bytes."
         darkos_die "the image was built but did not reach $BASE_ARTIFACT_DIR"
     fi
+
+    # ── and only now, the ones this run superseded ────────────────────────────
+    #
+    # ONE OUTPUT IMAGE IN THE VM, AND IT IS THE ONE ON THE WORKSTATION.  Every run
+    # copies the base to a name carrying the commit it was built from, and nothing
+    # ever removed the last one: five had piled up in /home/ubuntu/dArkOS before this
+    # block existed -- 23 GB of a disk that also has to hold a chroot, a kernel tree
+    # and the base image.  A VM that runs out of room does not fail here; it fails in
+    # the middle of a debootstrap or a dd, hours in, with an error about the thing it
+    # happened to be writing.
+    #
+    # AFTER the hand-over AND after the size check, never before.  The only moment it
+    # is safe to delete this run's predecessors is when this run's article has been
+    # verified to exist on the workstation at the right size.  Pruning first would turn
+    # one failed copy into no image anywhere.
+    #
+    # FOUR THINGS ARE KEPT and each for a reason the next run depends on:
+    #   - $FLASH_IMAGE, obviously: it is what was just built.
+    #   - *_base.img, because find_base_image() in device/j36-ultra/build-in-vm.sh
+    #     falls back to the newest of those when the state directory cannot name one,
+    #     and the checkpointed base build treats its own output as a finished stage.
+    #   - MixOS_R36_*_File_System.img, which is not an output at all: it is the base
+    #     build's rootfs intermediate ($FILESYSTEM in device/r36-ultra/build-in-vm.sh)
+    #     and its checkpoint says it exists.
+    #   - whatever a latest-image marker names.  Those live one directory down, in
+    #     "$STATE_ROOT/<codename>-userspace-<arch>-profile-<profile>-v4", so the loop
+    #     reads every one it finds rather than guessing the profile this run used.
+    # Removing any of them turns the next run into a full rebuild, which is precisely
+    # what the resume exists to avoid.
+    multipass exec "$VM_NAME" -- bash -lc '
+set -Eeuo pipefail
+BUILD_DIR=$1
+KEEP=$2
+STATE_ROOT=$3
+cd "$BUILD_DIR"
+
+# Every checkpoint directory under the state root gets a say, not just this run.
+# A delimited string and not an array: this is a here-string handed to a remote
+# shell, and one that needs no bash-4 feature is one fewer thing to be wrong about
+# an Ubuntu image nobody pinned.
+ADOPTED="|"
+for marker in "$STATE_ROOT"/latest-image "$STATE_ROOT"/*/latest-image; do
+    [[ -f "$marker" ]] || continue
+    name=""
+    read -r name < "$marker" || true
+    [[ -n "$name" ]] && ADOPTED="$ADOPTED$name|"
+done
+
+freed=0
+for img in MixOS_*.img; do
+    [[ -f "$img" ]] || continue
+    [[ "$img" == "$KEEP" ]] && continue
+    [[ "$ADOPTED" == *"|$img|"* ]] && continue
+    case "$img" in
+        *_base.img|MixOS_R36_*_File_System.img) continue ;;
+    esac
+    size="$(stat -c %s "$img")"
+    printf "  prune: %s (%s bytes), superseded by %s\n" "$img" "$size" "$KEEP"
+    rm -f "$img"
+    freed=$(( freed + size ))
+done
+if (( freed > 0 )); then
+    printf "  prune: %s GB reclaimed in the VM\n" "$(( freed / 1024 / 1024 / 1024 ))"
+else
+    printf "  prune: nothing to remove; %s is the only output image here\n" "$KEEP"
+fi
+df -h --output=avail "$BUILD_DIR" | tail -1 | xargs printf "  prune: %s free in the VM now\n"
+' j36-image-prune "$VM_BUILD_DIR" "$FLASH_IMAGE" "$VM_R36_STATE_DIR"
 elif [[ -n "$FLASH_IMAGE" && "$FLASH_IMAGE" != none ]]; then
     darkos_warn "$FLASH_IMAGE was NOT handed over: the payload did not reach it."
     darkos_warn "Read the 'image:' lines in the build log; do not expect /opt/mixos on a card flashed from it."

@@ -205,6 +205,21 @@ const char *const kPhrases[][Lang::Count] = {
       "Zum Ausschalten den Reiter Energie benutzen",
       "Use o separador Energia para desligar",
       "Usa la pestaña Energía para apagar" },
+    { "poweroff is not on this card",
+      "poweroff n'est pas sur cette carte",
+      "poweroff non è su questa scheda",
+      "poweroff ist nicht auf dieser Karte",
+      "poweroff não está neste cartão",
+      "poweroff no está en esta tarjeta" },
+    /* The shutdown curtain.  Two lines, and the blank one between them is part of
+     * the string: the second line is the only place the charger rule is ever told
+     * to somebody looking at the panel. */
+    { "Powering off\n\nIf the board comes back up, unplug the charger and try again.",
+      "Extinction\n\nSi la console redémarre, débranchez le chargeur et réessayez.",
+      "Spegnimento\n\nSe la console si riaccende, scollega il caricatore e riprova.",
+      "Wird ausgeschaltet\n\nWenn das Gerät wieder startet, das Ladegerät abziehen und erneut versuchen.",
+      "A desligar\n\nSe a consola voltar a ligar, desligue o carregador e tente de novo.",
+      "Apagando\n\nSi la consola vuelve a encenderse, desconecta el cargador e inténtalo de nuevo." },
 
     /* ── widgets.cpp -- the System information page ──────────────────────── */
     { "removable",

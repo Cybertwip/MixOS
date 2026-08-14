@@ -6719,6 +6719,11 @@ j36.power=1
     holds the power button.  Pass poweroff=0 to the module to keep the old
     behaviour.
 
+    It only cuts the rail ON BATTERY.  VBAT is VSYS here, so a charger holds the
+    system rail up no matter what the RTC is told; the driver asks eight times,
+    reports the charger state, and then restarts rather than leave the board warm
+    with mixdash last frame stuck on the glass.  chgreboot=0 keeps the halt.
+
     The charger is armed once per plug event, at the limit BC1.2 negotiated, and
     the constant voltage is only ever raised -- never lowered below the node,
     because lowering it on a board where VBAT is VSYS is a way to brown out the
@@ -7493,15 +7498,26 @@ Any single allocation of 8 MiB or more is printed the same way even when it succ
 for one and the request before the fatal one is usually the same code path getting
 away with it.
 
-Rebooting
----------
+Rebooting and powering off
+--------------------------
 
 `reboot' works from here on: the device tree describes the TOPRGU watchdog at
 0x10007000, and mtk_wdt registers the restart handler that machine_restart()
 calls.  Without that node userspace shuts down cleanly and then prints "Reboot
 failed -- System halted", which is a halt, not a crash -- the card is safe to
-pull at that point.  `poweroff' still ends the same way, because nothing drives
-the PMIC yet; hold the power button instead.
+pull at that point.
+
+`poweroff' goes through the PMIC module, which pulls PWRBB low through the RTC
+BBPU latch.  UNPLUG THE CHARGER FIRST.  There is no power-path FET on this PMIC
+family, so VBAT is VSYS: with a cable in, VBUS holds the system rail up and no
+amount of writing to the RTC can take the board down.  The driver asks eight
+times, then -- because the alternative is halting the CPU with the rail up and
+mixdash last frame frozen on a panel nobody can take back -- restarts the board
+instead, and says why in the log.  So a power-off attempted on the charger looks
+like a reboot.  That is the hardware, not the driver; stock Android answers the
+same case the same way and lands in a loader that draws a charging animation,
+which this board does not have.  chgreboot=0 on the module line restores the
+halt.  On battery, `poweroff' cuts the rail.
 
 Licence
 -------
