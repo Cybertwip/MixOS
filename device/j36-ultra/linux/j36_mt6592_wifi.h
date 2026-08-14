@@ -697,6 +697,11 @@ int j36_wifi_wmt_probe_link(struct j36_wifi *w);
 int j36_wifi_wmt_load_patch(struct j36_wifi *w, const void *data, size_t size);
 void j36_wifi_wmt_trace(struct j36_wifi *w, const char *phase);
 
+/* j36_mt6592_wifi_hif.c */
+int j36_wifi_hif_bind(struct j36_wifi *w);
+int j36_wifi_hif_load_firmware(struct j36_wifi *w, const void *data, size_t size);
+void j36_wifi_hif_trace(struct j36_wifi *w);
+
 /* Shared by all three: record why we stopped, once, in one place. */
 void j36_wifi_fail(struct j36_wifi *w, const char *blocked, const char *fmt, ...)
 	__printf(3, 4);
