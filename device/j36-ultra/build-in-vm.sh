@@ -4026,6 +4026,82 @@ if [ "$bound" = 0 ]; then
 	# card -- so there is nothing to do and nothing to report as broken.
 	echo "j36-asound: nothing to cover; alsa-lib's own default stands"
 fi
+
+# ── the second job: the libasound that aplay cannot link against ──────────────
+#
+#	aplay: symbol lookup error: undefined symbol: snd_pcm_subformat_value
+#
+# snd_pcm_subformat_value arrived in alsa-lib 1.2.10.  aplay is from the
+# alsa-utils apt installed and expects it; the copy of libasound.so.2 that the
+# loader actually hands it predates it.  Both are soname 2 so ld.so is content,
+# and the program dies at the first call instead.
+#
+# That is a rootfs the R36S image shipped with, not something this build made,
+# and it is not confined to aplay: every alsa-lib caller on the machine resolves
+# through the same shadowing copy.  So it is fixed the same way `default' is --
+# by covering the wrong file rather than replacing it, which keeps the card
+# bootable by anything else.
+#
+# THE TEST IS THE SYMBOL AND NOTHING ELSE.  Not a version string, not a file
+# date, not a size: the exported name lives in .dynstr as plain bytes, so a
+# library that has it can satisfy aplay and one that does not cannot, which is
+# exactly the question being asked.  grep -q rather than -a, because -q alone
+# gives the right exit status on a binary and busybox grep has no -a.
+#
+# THE ORDER OF THE DIRECTORIES IS THE POLICY.  The multiarch directories come
+# first because that is where apt keeps the copy it updates; /usr/local and /opt
+# come after because that is where a handheld image drops the build it froze
+# years ago.  The first complete library found wins and is bound over every
+# incomplete one, so the frozen copy stops being what the loader picks.
+good=""
+for d in /usr/lib/arm-linux-gnueabihf /lib/arm-linux-gnueabihf \
+         /usr/lib /lib /usr/local/lib/arm-linux-gnueabihf /usr/local/lib \
+         /opt/lib /opt/system/lib; do
+	[ -d "$d" ] || continue
+	for f in "$d"/libasound.so.2 "$d"/libasound.so.2.*; do
+		[ -f "$f" ] || continue
+		grep -q snd_pcm_subformat_value "$f" 2>/dev/null || continue
+		good=$(readlink -f "$f" 2>/dev/null)
+		[ -n "$good" ] && break
+		good=""
+	done
+	[ -n "$good" ] && break
+done
+
+if [ -z "$good" ]; then
+	# Nothing on the card exports it.  Say so plainly and stop: there is no
+	# file here to put in front, and a build that wants aplay working from
+	# this state has to ship a newer alsa-lib, which is not a decision an
+	# initramfs gets to make at boot.
+	echo "j36-asound: no libasound.so.2 here exports snd_pcm_subformat_value"
+	exit 0
+fi
+
+seen_libs=" $good "
+covered=0
+for d in /usr/lib/arm-linux-gnueabihf /lib/arm-linux-gnueabihf \
+         /usr/lib /lib /usr/local/lib/arm-linux-gnueabihf /usr/local/lib \
+         /opt/lib /opt/system/lib; do
+	[ -d "$d" ] || continue
+	for f in "$d"/libasound.so.2 "$d"/libasound.so.2.*; do
+		[ -f "$f" ] || continue
+		t=$(readlink -f "$f" 2>/dev/null) || continue
+		[ -n "$t" ] || continue
+		case " $seen_libs " in *" $t "*) continue ;; esac
+		seen_libs="$seen_libs $t"
+		grep -q snd_pcm_subformat_value "$t" 2>/dev/null && continue
+		if mount --bind "$good" "$t"; then
+			echo "j36-asound: $t was too old for aplay; $good is in front of it now"
+			covered=$((covered + 1))
+		else
+			echo "j36-asound: could not bind $good over $t"
+		fi
+	done
+done
+
+if [ "$covered" = 0 ]; then
+	echo "j36-asound: libasound is $good, and it has what aplay asks for"
+fi
 exit 0
 ASOUNDSH
     chmod 0755 /newroot/run/j36/bin/j36-asound
@@ -4058,7 +4134,7 @@ ASOUNDSH
     cat > /newroot/run/systemd/system/j36-asound.service <<'UNITASOUND'
 # Written by the J36 Ultra initramfs, into a tmpfs.  See setup_asound in /init.
 [Unit]
-Description=Point ALSA's default PCM at the J36 Ultra's card
+Description=Point ALSA at the J36 Ultra's card, and at a libasound aplay can use
 DefaultDependencies=no
 RequiresMountsFor=/home/virtua
 After=local-fs.target
@@ -7013,6 +7089,25 @@ j36.audio=speaker
     /run/j36/asound.conf and restart j36-asound.service instead -- or change
     setup_asound in the initramfs and rebuild.  Editing p3 changes it for the R36S
     too; the /run file does not.
+
+    THE SAME UNIT ALSO FIXES aplay, and for the same reason it fixes `default': the
+    file the machine reaches for is the wrong one.
+
+      aplay: symbol lookup error: undefined symbol: snd_pcm_subformat_value
+
+    That symbol arrived in alsa-lib 1.2.10.  aplay is from the alsa-utils apt put on
+    the card and wants it; the libasound.so.2 the loader hands it is older and does
+    not have it.  Both are soname 2, so nothing complains until the call.  It is not
+    an aplay problem -- every alsa-lib caller on the machine goes through the same
+    copy -- so j36-asound looks through the library directories, in apt's order
+    first and the frozen /usr/local and /opt copies after, finds one that exports
+    the symbol, and bind-mounts it over the ones that do not.  Again a cover and not
+    a write.  It prints which file it put in front of which, or
+
+      j36-asound: no libasound.so.2 here exports snd_pcm_subformat_value
+
+    if every copy on the card is old, which is a rootfs to fix rather than something
+    a boot can paper over.
 
     THE DASHBOARD STILL NAMES THE CARD, and that is independent of all of the above.
     MediaPage::alsaDevice() reads /dev/snd, takes the lowest-numbered pcmC*D*p, and

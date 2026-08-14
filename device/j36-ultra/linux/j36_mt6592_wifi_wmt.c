@@ -82,9 +82,7 @@ struct j36_wmt_pace {
 };
 
 /*
- * The rungs, slowest last.  Rung 0 is the link with nothing done to it, so a
- * board that never needed any of this pays exactly nothing and the log looks the
- * way it always did.
+ * The rungs, slowest last.  Rung 0 is the link with nothing done to it.
  *
  * The spacing is deliberately coarse.  This is not a search for the fastest pace
  * that works -- it is a search for ANY pace that works, on a link where the
@@ -94,12 +92,19 @@ struct j36_wmt_pace {
  * of J36_WMT_COMMAND_TIMEOUT_US to deal with.
  */
 static const struct j36_wmt_pace j36_wmt_paces[] = {
-	{  0,   0 },	/* fill the FIFO, never wait: today's link */
+	{  0,   0 },	/* fill the FIFO, never wait: the link as it shipped */
 	{ 16,  40 },	/* ~4 ms for a full fragment */
 	{  8,  60 },	/* ~9 ms */
 	{  4,  80 },	/* ~22 ms */
 	{  1, 100 },	/* ~103 ms, one byte at a time */
 };
+
+/*
+ * Where the search opens when nothing is pinned.  Not rung 0: the argument for
+ * skipping it is with the ladder in j36_wifi_wmt_load_patch(), and the way back
+ * to it is stp_tx_burst=0 stp_tx_gap_us=0.
+ */
+#define J36_WMT_PACE_FIRST_RUNG		1
 
 static bool j36_wmt_pace_is_pinned(void)
 {
@@ -433,6 +438,73 @@ static int j36_stp_discard_bytes(struct j36_wifi *w, u32 count, ktime_t deadline
 			return -ETIMEDOUT;
 	}
 	return 0;
+}
+
+/*
+ * ── PUTTING THE TRANSPORT BACK BEFORE ASKING THE PEER ANYTHING ELSE ──
+ *
+ * What the boot log showed the retry ladder doing, and why this exists:
+ *
+ *	patch address ready:  ... tx 262   rx 190 ... seq 0,0,7
+ *	WMT opcode 0x01 got no usable answer            <- the first fragment
+ *	patch fragment retry: ... tx 11423 rx 190 ... retx 10
+ *	WMT opcode 0x08 got no usable answer            <- the RE-ADDRESS
+ *	patch re-address failed: ... tx 11749 rx 190 ... retx 20
+ *	Wi-Fi bring-up stopped at [wmt-patch-readdress-failed]
+ *
+ * rx is frozen at 190 across all of it.  Not one byte came back after the
+ * address commands -- and the 26-byte address command is a frame this link had
+ * just carried twice, answered both times.  So the pass that stalls does not
+ * merely lose its own fragment: it leaves the link unable to carry the small
+ * frame that the retry opens with, and the retry dies on that instead of ever
+ * reaching the next rung.  Rungs 1 to 4 of the pacing ladder have never once
+ * been tried on this board; every boot spends four seconds proving rung 0 fails
+ * and then stops.
+ *
+ * Whatever ate the fragment, the peer's STP parser is now sitting mid-packet
+ * waiting for bytes that are never coming, and our own FIFOs may still hold the
+ * tail of it.  Stock's answer to exactly this is the four-byte resync prefix
+ * (stp_do_tx_timeout(), stp_core.c:408-428), which is what j36_stp_send_resync()
+ * sends -- but stock sends it on a link whose FIFOs it has not just stalled, so
+ * the order here does a little more:
+ *
+ *	clear the FIFOs   -- drop the truncated frame still queued on our side
+ *	drain the receive -- our receive FIFO filling is what deasserts the
+ *	                     hardware handshake and stops the peer mid-word, so
+ *	                     emptying it is what lets the peer speak again
+ *	resync            -- four continuous 0x7f, which is the only pattern the
+ *	                     peer parser breaks a partial packet on
+ *
+ * The three sequence counters are deliberately NOT touched.  A resync realigns
+ * framing, not numbering, and stock does not reset them here either; a peer that
+ * kept counting through the stall would be desynchronised by us helpfully
+ * starting over.  If it turns out the peer does restart, that shows up as `ooo'
+ * climbing in the trace, and this is where the reset would go.
+ */
+static void j36_wmt_recover_link(struct j36_wifi *w)
+{
+	u32 drained = 0;
+	u8 byte;
+
+	j36_btif_clear_fifos(w);
+
+	/*
+	 * Bounded twice over: a byte only counts if it turns up inside the idle
+	 * poll window, and the cap stops a peer that has decided to shout.  Four
+	 * kilobytes is four full fragments, far more than anything that could
+	 * legitimately still be in flight.
+	 */
+	while (drained < 4096 &&
+	       !j36_btif_read_byte(w, &byte, j36_deadline(J36_WMT_IDLE_POLL_US)))
+		drained++;
+
+	j36_stp_send_resync(w);
+	usleep_range(1000, 2000);
+
+	if (drained)
+		dev_info(w->dev,
+			 "WMT link recovery drained %u stale byte%s before the resync\n",
+			 drained, drained == 1 ? "" : "s");
 }
 
 static int j36_stp_receive_wmt(struct j36_wifi *w, u8 *payload, u32 capacity,
@@ -1326,6 +1398,7 @@ int j36_wifi_wmt_load_patch(struct j36_wifi *w, const void *data, size_t size)
 	const u8 *body;
 	u32 body_size, bytes_before;
 	u32 rungs, step, rung = w->pace_rung;
+	bool readdressed = true;
 	int ret = -EIO;
 	u8 metadata, patch_count, sequence;
 
@@ -1471,15 +1544,47 @@ int j36_wifi_wmt_load_patch(struct j36_wifi *w, const void *data, size_t size)
 	 * bootstrap -- the code we are in the middle of replacing -- is the
 	 * slowest reader this link will ever have.
 	 *
-	 * Each rung replays the body from fragment zero with both address
-	 * commands re-issued first, so the peer restarts the sequence with us,
-	 * and a rung that is going to fail fails on its first fragment for the
-	 * two seconds of J36_WMT_COMMAND_TIMEOUT_US.  Five rungs is ten seconds
-	 * of worst case, once, on a boot that would otherwise have no Wi-Fi.
+	 * Each rung replays the body from fragment zero with the transport put
+	 * back first and both address commands re-issued after it, so the peer
+	 * restarts the sequence with us, and a rung that is going to fail fails on
+	 * its first fragment for the two seconds of J36_WMT_COMMAND_TIMEOUT_US.
+	 * Five rungs is ten seconds of worst case, once, on a boot that would
+	 * otherwise have no Wi-Fi.
+	 *
+	 * ── WHY THE LADDER DOES NOT START AT RUNG 0, AND HOW TO PUT IT BACK ──
+	 *
+	 * Because on this board rung 0 does not merely fail, it costs the boot
+	 * every other rung.  The trace above j36_wmt_recover_link() is the whole
+	 * argument: the unpaced pass stalls, and the 26-byte address command that
+	 * opens the retry -- a frame this same link answered twice a moment
+	 * earlier -- then goes unanswered too.  Spending the one attempt made on a
+	 * healthy link to re-confirm the rung already known to break it is the
+	 * worst possible use of it, so the search now opens at the first paced
+	 * rung and rung 0 is reached only by asking for it:
+	 *
+	 *	j36_mt6592_wifi.stp_tx_burst=0 j36_mt6592_wifi.stp_tx_gap_us=0
+	 *
+	 * which pins the unpaced link exactly as before.  A board that genuinely
+	 * needed nothing pays one rung of 16-bytes-per-fill at 40 us, about four
+	 * milliseconds on a full fragment, once per patch image.  That is not a
+	 * cost worth protecting against.
+	 *
+	 * ── AND WHY A FAILED RE-ADDRESS NO LONGER ENDS THE BRING-UP ──
+	 *
+	 * It used to return -EIO on the spot, which is why rungs 1 to 4 have never
+	 * run.  But a re-address that goes unanswered is a statement about the
+	 * LINK, not about the ladder: it says this rung's stall took the transport
+	 * with it.  The next rung is precisely the thing worth trying after that,
+	 * not the thing to skip.  So the failure is recorded, the step is
+	 * abandoned, and the loop moves on; the readdress error is only reported
+	 * as the cause if no rung ever got its address commands through, which is
+	 * the case where the peer really is gone.
 	 */
 	rungs = ARRAY_SIZE(j36_wmt_paces);
 	if (j36_wmt_pace_is_pinned())
 		rungs = 2;	/* the pinned pace, and one retry at it */
+	else if (!w->pace_rung)
+		w->pace_rung = J36_WMT_PACE_FIRST_RUNG;
 
 	for (step = 0; step < rungs; step++) {
 		rung = min(w->pace_rung + step, rungs - 1);
@@ -1487,6 +1592,7 @@ int j36_wifi_wmt_load_patch(struct j36_wifi *w, const void *data, size_t size)
 		if (step) {
 			j36_wifi_wmt_trace(w, "patch fragment retry");
 			w->stats.patch_bytes = bytes_before;
+			j36_wmt_recover_link(w);
 
 			if (j36_wmt_exchange(w, patch_address,
 					     sizeof(patch_address), 8,
@@ -1495,10 +1601,11 @@ int j36_wifi_wmt_load_patch(struct j36_wifi *w, const void *data, size_t size)
 					     sizeof(part_address), 8,
 					     J36_WMT_COMMAND_TIMEOUT_US)) {
 				j36_wifi_wmt_trace(w, "patch re-address failed");
-				j36_wifi_fail(w, "wmt-patch-readdress-failed",
-					      "patch-address setup failed after a stalled pass");
-				return -EIO;
+				readdressed = false;
+				ret = -EIO;
+				continue;
 			}
+			readdressed = true;
 		}
 
 		j36_wmt_set_pace(w, j36_wmt_paces[rung].burst,
@@ -1509,6 +1616,11 @@ int j36_wifi_wmt_load_patch(struct j36_wifi *w, const void *data, size_t size)
 			break;
 	}
 
+	if (ret && !readdressed) {
+		j36_wifi_fail(w, "wmt-patch-readdress-failed",
+			      "patch-address setup failed after every stalled pass");
+		return -EIO;
+	}
 	if (ret) {
 		j36_wifi_wmt_trace(w, "patch fragment stalled");
 		j36_wifi_fail(w, "wmt-patch-fragment-failed",
