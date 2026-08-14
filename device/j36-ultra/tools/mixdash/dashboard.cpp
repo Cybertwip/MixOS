@@ -12,10 +12,12 @@
 #include "packages.h"
 #include "pointer.h"
 #include "settingspage.h"
+#include "sharing.h"
 #include "stringsdb.h"
 #include "terminal.h"
 #include "theme.h"
 #include "trace.h"
+#include "volume.h"
 #include "wifi.h"
 
 #include <QCoreApplication>
@@ -304,6 +306,8 @@ Dashboard::Dashboard(QWidget *parent)
     m_terminal = new TerminalPage(this);
     Trace::step("WifiPage");
     m_wifi = new WifiPage(this);
+    Trace::step("SharingPage");
+    m_sharing = new SharingPage(this);
     Trace::step("PackagesPage");
     m_packages = new PackagesPage(this);
     Trace::step("MousePage");
@@ -352,6 +356,17 @@ Dashboard::Dashboard(QWidget *parent)
         m_armedExe.clear();
     });
 
+    /*
+     * Built here, after the toast and before the keyboard, because the shell's
+     * overlays are stacked in construction order and this one belongs between
+     * them: over the toast, which is transient text the volume keys do not
+     * interrupt, and under the keyboard, which is the only overlay a press can be
+     * aimed at.  No mixer is touched -- the first probe happens on the first
+     * press, so a board with no sound card costs nothing at startup.
+     */
+    Trace::step("Volume overlay");
+    m_volumeBar = new VolumeOverlay(this);
+
     Trace::step("Keyboard overlay");
     m_keyboard = new Keyboard(this);
     connect(m_keyboard, &Keyboard::finished, this, &Dashboard::onKeyboardFinished);
@@ -374,7 +389,7 @@ Dashboard::Dashboard(QWidget *parent)
     Trace::step("page tables");
     m_roots << m_apps << m_media << m_settings << m_power;
     m_all << m_apps << m_media << m_settings << m_power
-          << m_files << m_terminal << m_wifi << m_packages
+          << m_files << m_terminal << m_wifi << m_sharing << m_packages
           << m_diagnostics << m_mouse << m_display << m_language << m_info;
     for (PageWidget *page : m_all) {
         adopt(page);
@@ -557,6 +572,20 @@ void Dashboard::buildPages()
     wifi.glyph = GlyphWifi;
     wifi.internal = InternalWifi;
     apps.append(wifi);
+
+    /*
+     * Next to Wi-Fi rather than in Settings, and that is not an aesthetic choice:
+     * settings.h says the hub holds settings and not applications, and this page
+     * starts a daemon, writes /etc and generates a credential.  It is also the
+     * card whose usefulness depends entirely on the one above it, so they sit
+     * together.
+     */
+    AppEntry sharing;
+    sharing.title = tr("Sharing");
+    sharing.accent = Theme::pink();
+    sharing.glyph = GlyphFiles;
+    sharing.internal = InternalSharing;
+    apps.append(sharing);
 
     /*
      * What the "3D cube" card became.  The cube is still in there and still turns;
@@ -782,6 +811,11 @@ void Dashboard::resizeEvent(QResizeEvent *event)
      * what is being typed into stays visible above it. */
     const int kb = qMin(300, height());
     m_keyboard->setGeometry(0, height() - kb, width(), kb);
+
+    /* The volume bar is given the WHOLE panel and not `normal', because it has to
+     * be placeable over a page that took the status bar and the dock away -- the
+     * Media player at full screen is the main thing anybody presses VOL+ during. */
+    m_volumeBar->placeIn(rect());
 
     applyChrome();
     QWidget::resizeEvent(event);
@@ -1082,6 +1116,9 @@ void Dashboard::activate(const AppEntry &entry)
         break;
     case InternalWifi:
         push(m_wifi);
+        break;
+    case InternalSharing:
+        push(m_sharing);
         break;
     case InternalPackages:
         push(m_packages);

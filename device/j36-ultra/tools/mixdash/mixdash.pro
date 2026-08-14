@@ -48,6 +48,7 @@ SOURCES += \
     keyboard.cpp \
     settingspage.cpp \
     wifi.cpp \
+    sharing.cpp \
     terminal.cpp \
     media.cpp \
     diagnostics.cpp \
@@ -65,6 +66,7 @@ HEADERS += \
     keyboard.h \
     settingspage.h \
     wifi.h \
+    sharing.h \
     terminal.h \
     media.h \
     diagnostics.h \

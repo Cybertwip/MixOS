@@ -49,6 +49,7 @@ class QLabel;
 class QListView;
 class QTimer;
 class SettingsPage;
+class SharingPage;
 class TerminalPage;
 class WifiPage;
 
@@ -116,6 +117,7 @@ public:
         InternalFiles,
         InternalTerminal,
         InternalWifi,
+        InternalSharing,
         InternalPackages,
         InternalDiagnostics,
         InternalInfo,
@@ -210,6 +212,7 @@ private:
     FilesPage *m_files = nullptr;
     TerminalPage *m_terminal = nullptr;
     WifiPage *m_wifi = nullptr;
+    SharingPage *m_sharing = nullptr;
     PackagesPage *m_packages = nullptr;
     DiagnosticsPage *m_diagnostics = nullptr;
     MousePage *m_mouse = nullptr;
@@ -232,6 +235,10 @@ private:
 
     QLabel *m_toast = nullptr;
     QTimer *m_toastTimer = nullptr;
+    /* The vertical bar VOL+ and VOL- put on the glass for three seconds.  An
+     * overlay, like the toast and the keyboard, and for the same reason: it has
+     * to appear over a page that has taken the whole panel. */
+    VolumeOverlay *m_volumeBar = nullptr;
     Joypad *m_pad = nullptr;
 
     int m_page = 0;

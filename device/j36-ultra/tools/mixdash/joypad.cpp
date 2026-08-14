@@ -58,6 +58,13 @@ const Map kMap[] = {
     { BTN_START,     Joypad::NavMenu },
     { BTN_MODE,      Joypad::NavQuit },
 
+    /* The two volume keys the keypad matrix carries -- generate_dts.py puts
+     * MT6592_J36_KEY_VOL_UP_MATRIX and _DOWN_ on KEY_VOLUMEUP and KEY_VOLUMEDOWN.
+     * The shell answers these itself, before any page sees them: see
+     * Dashboard::onNav. */
+    { KEY_VOLUMEUP,   Joypad::NavVolumeUp },
+    { KEY_VOLUMEDOWN, Joypad::NavVolumeDown },
+
     /* The device tree's special-home key, which has no BTN_ name. */
     { 88,            Joypad::NavMenu },
 
@@ -104,10 +111,22 @@ int lookup(int code)
     return Joypad::NavNone;
 }
 
-bool isDirection(int action)
+/*
+ * Which actions autorepeat while held.  It was called isDirection() and it was
+ * the four D-pad directions, which is what "hold it and it keeps going" meant
+ * when the only thing worth holding was a selection.
+ *
+ * The two volume keys belong here for the same reason and are NOT directions:
+ * they are the only other action on this case whose whole purpose is to be held
+ * down.  Everything else in the map is a decision -- A, B, the shoulders, Menu --
+ * and an action that repeats is an action that can happen twice from one press,
+ * which for Power off is not a thing to risk.
+ */
+bool repeats(int action)
 {
     return action == Joypad::NavUp || action == Joypad::NavDown
-        || action == Joypad::NavLeft || action == Joypad::NavRight;
+        || action == Joypad::NavLeft || action == Joypad::NavRight
+        || action == Joypad::NavVolumeUp || action == Joypad::NavVolumeDown;
 }
 
 /* EVIOCGBIT hands back a bitmap in longs.  Two lines of arithmetic rather than a
@@ -536,14 +555,14 @@ void Joypad::driveStick(int ms)
 void Joypad::feed(int action, bool pressed)
 {
     if (!pressed) {
-        if (isDirection(action) && m_held == action)
+        if (repeats(action) && m_held == action)
             m_held = NavNone;
         return;
     }
 
     emit nav(action);
 
-    if (isDirection(action)) {
+    if (repeats(action)) {
         m_held = action;
         m_nextRepeat = m_heldSince.elapsed() + kRepeatFirstMs;
     }

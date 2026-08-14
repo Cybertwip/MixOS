@@ -66,7 +66,17 @@ public:
         NavPrevPage,
         NavNextPage,
         NavMenu,
-        NavQuit
+        NavQuit,
+        /*
+         * The two hardware keys on the side of the case.  They are Nav actions
+         * and not raw key() codes on purpose: key() only reaches a page that
+         * asked for it with wantsKeys(), which is the Terminal and the Media
+         * player, and the volume keys have to work everywhere -- including on
+         * the Apps grid, where no page wants keys at all.  Being actions also
+         * gets them the repeat below for free, so holding VOL+ ramps.
+         */
+        NavVolumeUp,
+        NavVolumeDown
     };
 
     /* Bit flags on key().  Tracked here because only this file sees the press
