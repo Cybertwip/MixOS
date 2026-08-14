@@ -8,4 +8,5 @@ obj-m += j36_mt6592_backlight.o
 obj-m += j36_mt6592_wifi.o
 j36_mt6592_wifi-y := j36_mt6592_wifi_main.o \
 		     j36_mt6592_wifi_consys.o \
-		     j36_mt6592_wifi_wmt.o
+		     j36_mt6592_wifi_wmt.o \
+		     j36_mt6592_wifi_hif.o

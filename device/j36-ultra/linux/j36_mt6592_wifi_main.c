@@ -3,24 +3,29 @@
  * J36 Ultra MT6592 CONSYS Wi-Fi: the platform driver.
  *
  * Maps the windows, waits for the PMIC, and runs the bring-up: power the
- * connectivity subsystem, open the BTIF link, put both ROM patches down it.
+ * connectivity subsystem, open the BTIF link, put both ROM patches down it, then
+ * push MediaTek's WLAN firmware down the AHB HIF and start it.
  *
- * A mirror of PowerEngine/OS/MVII's mt6592_wifi.c, which is where the same three
- * steps are sequenced for the bootstrap.  What is different here is the waiting:
- * MVII owns the machine and can assume the PMIC is up and the patch images are in
- * hand, and a Linux driver can assume neither, so the PMIC dependency is a probe
- * deferral and the images come from request_firmware().
+ * A mirror of PowerEngine/OS/MVII's mt6592_wifi.c, which is where the same steps
+ * are sequenced for the bootstrap.  What is different here is the waiting: MVII
+ * owns the machine and can assume the PMIC is up and the images are in hand, and
+ * a Linux driver can assume neither, so the PMIC dependency is a probe deferral
+ * and the images come from request_firmware().
  *
  *
  * ── WHAT THIS BUILD DOES AND DOES NOT GET YOU ──
  *
- * It gets the connectivity MCU powered, clocked, talking, and running a patched
- * image with its radio configured.  It does NOT get a network interface: the WLAN
- * firmware (WIFI_RAM_CODE_SOC) goes down the AHB HIF, and neither the HIF nor the
- * cfg80211 side is in this build.  There is deliberately no netdev registered and
- * no wiphy, because a driver that offers an interface it cannot carry traffic on
- * is worse than one that says plainly where it stopped -- so the last line this
- * driver logs is which stage it reached, every time, success or not.
+ * It gets the connectivity MCU powered, clocked, talking, running a patched image
+ * with its radio configured, and then WIFI_RAM_CODE_SOC downloaded and executing
+ * -- WLAN_READY asserted.
+ *
+ * It does NOT get a network interface.  WLAN_READY means the firmware is running,
+ * not that anything can be sent through it: scanning, association, key management
+ * and the data path are a further layer on top of that transport and are not in
+ * this build.  There is deliberately no netdev registered and no wiphy, because a
+ * driver that offers an interface it cannot carry traffic on is worse than one
+ * that says plainly where it stopped -- so the last line this driver logs is which
+ * stage it reached, every time, success or not.
  */
 
 #include <linux/device.h>
@@ -48,18 +53,21 @@
  * order off the filenames puts them down backwards, and the peer rejects an
  * out-of-order patch by going quiet rather than by saying so.
  *
- * WIFI_RAM_CODE_SOC is the third blob in that directory and is not requested
- * here: it is the WLAN firmware, it goes down the AHB HIF, and asking for it in a
- * build with no HIF would only produce a missing-firmware warning for something
- * this driver would not know what to do with.
+ * WIFI_RAM_CODE_SOC is the third blob in that directory and is the WLAN firmware
+ * itself, which goes down the AHB HIF once the MCU is patched.  It has no
+ * extension, which is worth saying out loud because it is not an oversight and a
+ * *.bin staging glob silently omitted it from the image for a while.
  */
 static const char * const j36_wifi_patch_names[] = {
 	"mediatek/mt6592/ROMv1_patch_1_1_hdr.bin",
 	"mediatek/mt6592/ROMv1_patch_1_0_hdr.bin",
 };
 
+#define J36_WIFI_RAM_CODE_NAME	"mediatek/mt6592/WIFI_RAM_CODE_SOC"
+
 MODULE_FIRMWARE("mediatek/mt6592/ROMv1_patch_1_1_hdr.bin");
 MODULE_FIRMWARE("mediatek/mt6592/ROMv1_patch_1_0_hdr.bin");
+MODULE_FIRMWARE(J36_WIFI_RAM_CODE_NAME);
 
 struct j36_wifi_patch {
 	const struct firmware *fw;
@@ -69,14 +77,15 @@ struct j36_wifi_patch {
 /*
  * The bring-up state, plus the images, plus nothing else.
  *
- * struct j36_wifi is the part the other two translation units share; the patch
- * set is main.c's alone, and how many there are is a property of this file's
+ * struct j36_wifi is the part the other translation units share; the image set is
+ * main.c's alone, and how many patches there are is a property of this file's
  * table rather than of the hardware.  Keeping it out here means the header does
  * not have to name a count that only this file can know.
  */
 struct j36_wifi_device {
 	struct j36_wifi w;
 	struct j36_wifi_patch patch[ARRAY_SIZE(j36_wifi_patch_names)];
+	const struct firmware *wlan_fw;
 	bool patches_ready;
 };
 
@@ -103,7 +112,7 @@ void j36_wifi_fail(struct j36_wifi *w, const char *blocked, const char *fmt, ...
 	w->blocked = blocked;
 }
 
-/* ── the ROM patch images ────────────────────────────────────────────────────*/
+/* ── the firmware images ─────────────────────────────────────────────────────*/
 
 /*
  * READ AT PROBE, NOT AT BRING-UP, and the reason is where this driver is loaded
@@ -122,10 +131,19 @@ void j36_wifi_fail(struct j36_wifi *w, const char *blocked, const char *fmt, ...
  * is a materially different diagnosis from "the MCU never answered" -- which is
  * the whole reason the bring-up is staged.
  */
-static void j36_wifi_request_patches(struct j36_wifi_device *jd)
+static void j36_wifi_request_images(struct j36_wifi_device *jd)
 {
 	struct j36_wifi *w = &jd->w;
 	unsigned int i, j;
+
+	/*
+	 * The WLAN image first, and before any early return below, because the two
+	 * failures are independent and the switch_root deadline applies to both.  A
+	 * missing ROM patch must not be able to skip the read of an image that is
+	 * there, or the log would blame the patch for a stage that never ran.
+	 */
+	if (firmware_request_nowarn(&jd->wlan_fw, J36_WIFI_RAM_CODE_NAME, w->dev))
+		jd->wlan_fw = NULL;
 
 	for (i = 0; i < ARRAY_SIZE(jd->patch); i++) {
 		/* _nowarn: a missing patch is reported below in terms of what it
@@ -163,7 +181,7 @@ static void j36_wifi_request_patches(struct j36_wifi_device *jd)
 	jd->patches_ready = true;
 }
 
-static void j36_wifi_release_patches(void *data)
+static void j36_wifi_release_images(void *data)
 {
 	struct j36_wifi_device *jd = data;
 	unsigned int i;
@@ -172,6 +190,8 @@ static void j36_wifi_release_patches(void *data)
 		release_firmware(jd->patch[i].fw);
 		jd->patch[i].fw = NULL;
 	}
+	release_firmware(jd->wlan_fw);
+	jd->wlan_fw = NULL;
 	jd->patches_ready = false;
 }
 
@@ -209,21 +229,42 @@ static void j36_wifi_bring_up(struct work_struct *work)
 					    jd->patch[i].fw->size))
 			goto out;
 
+	/*
+	 * Stage 3.  Not fatal to the stages already reported: a patched MCU with no
+	 * WLAN firmware is a real, useful, and precisely diagnosable state, and the
+	 * trace below prints either way.
+	 */
+	if (!jd->wlan_fw) {
+		j36_wifi_fail(w, "wlan-firmware-missing",
+			      "%s is not in the firmware search path",
+			      J36_WIFI_RAM_CODE_NAME);
+		goto out;
+	}
+	j36_wifi_hif_load_firmware(w, jd->wlan_fw->data, jd->wlan_fw->size);
+
 out:
 	/*
 	 * The one line that is always printed, whatever happened.  Even the
 	 * success case names what is missing -- because a log that stops at "ok"
 	 * invites the reading that there is a network interface somewhere.
 	 */
-	if (w->ready)
+	if (w->firmware_alive)
 		dev_info(w->dev,
-			 "connectivity MCU up: chip 0x%08x, %u ROM patches, RF %s -- WLAN firmware and cfg80211 are not in this build\n",
+			 "WLAN firmware running: chip 0x%08x, %u ROM patches, RF %s, %u bytes downloaded, WLAN_READY -- there is no netdev, cfg80211 is not in this build\n",
 			 w->chip_id, w->patch_count,
-			 w->calibrated ? "calibrated" : "uncalibrated");
+			 w->calibrated ? "calibrated" : "uncalibrated",
+			 w->hif_stats.downloaded_bytes);
+	else if (w->ready)
+		dev_warn(w->dev,
+			 "connectivity MCU up: chip 0x%08x, %u ROM patches, RF %s -- but the WLAN firmware did not start, stopped at [%s]\n",
+			 w->chip_id, w->patch_count,
+			 w->calibrated ? "calibrated" : "uncalibrated",
+			 w->blocked ? w->blocked : "unknown");
 	else
 		dev_warn(w->dev, "Wi-Fi bring-up stopped at [%s]\n",
 			 w->blocked ? w->blocked : "unknown");
 	j36_wifi_wmt_trace(w, "bring-up");
+	j36_wifi_hif_trace(w);
 
 	mutex_unlock(&w->lock);
 }
@@ -346,9 +387,7 @@ static int j36_wifi_probe(struct platform_device *pdev)
 	mutex_init(&w->lock);
 
 	/* Ours: the BTIF link, the connectivity MCU's config block, and the WLAN
-	 * AHB HIF.  The HIF window is mapped but untouched in this build -- it is
-	 * where stage 3 starts, and having it in the device tree now means stage 3
-	 * is a driver change alone. */
+	 * AHB HIF the firmware download runs over. */
 	w->btif = devm_platform_ioremap_resource_byname(pdev, "btif");
 	if (IS_ERR(w->btif))
 		return dev_err_probe(dev, PTR_ERR(w->btif), "map BTIF\n");
@@ -387,10 +426,10 @@ static int j36_wifi_probe(struct platform_device *pdev)
 	/* Registered BEFORE the work item's own action, so it runs AFTER it on the
 	 * way out: devm unwinds in reverse, and the images must outlive the last
 	 * fragment that reads them. */
-	ret = devm_add_action_or_reset(dev, j36_wifi_release_patches, jd);
+	ret = devm_add_action_or_reset(dev, j36_wifi_release_images, jd);
 	if (ret)
 		return ret;
-	j36_wifi_request_patches(jd);
+	j36_wifi_request_images(jd);
 
 	INIT_WORK(&w->bring_up, j36_wifi_bring_up);
 	ret = devm_add_action_or_reset(dev, j36_wifi_cancel_bring_up, w);
@@ -431,6 +470,6 @@ static struct platform_driver j36_wifi_driver = {
 };
 module_platform_driver(j36_wifi_driver);
 
-MODULE_DESCRIPTION("J36 Ultra MT6592 CONSYS Wi-Fi bring-up (power, BTIF/STP/WMT, ROM patches)");
+MODULE_DESCRIPTION("J36 Ultra MT6592 CONSYS Wi-Fi bring-up (power, BTIF/STP/WMT, ROM patches, WLAN firmware)");
 MODULE_AUTHOR("MixOS / PowerEngine integration");
 MODULE_LICENSE("GPL");

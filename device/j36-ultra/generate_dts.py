@@ -626,8 +626,8 @@ def generate(sources: dict[str, str]) -> str:
 \t\t *
 \t\t *   btif     0x1100c000  the die-to-die UART the WMT link runs over
 \t\t *   conn-mcu 0x18070000  the connectivity MCU config block, chip id at +8
-\t\t *   hif      0x180f0000  the WLAN AHB HIF -- mapped, and untouched until
-\t\t *                        the firmware stage exists to use it
+\t\t *   hif      0x180f0000  the WLAN AHB HIF the firmware download and the
+\t\t *                        WIFI_START handshake run over
 \t\t *
 \t\t * memory-region is the EMI aperture the subsystem DMAs through, above.
 \t\t *
