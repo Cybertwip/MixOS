@@ -110,6 +110,48 @@ BUILD_ONLY_PACKAGES=(
   rapidjson-dev
   zlib1g-dev
 )
+# ── WHAT THE LISTS BELOW PUT BACK MUST NOT BE TAKEN OUT HERE ────────────────
+#
+# Four of the names above -- ccache, cmake, libsdl2-dev and premake4 -- are also in
+# needed_packages.txt, and that is not a mistake in either list: they are build tools
+# the shipped image is meant to carry.  Removing them anyway and reinstalling them a
+# hundred lines further down cost 329 packages and 152 MB of dpkg work on EVERY
+# build, and it is the reason the stripped-root snapshot never became a fixed point:
+# a run restored from it did the identical 329 again.
+#
+# It is not four packages' worth of work, it is 329, because removal cascades the
+# wrong way.  Take out libsdl2-dev and apt must also take out everything that depends
+# on it, then `apt autoremove' takes out everything that was only there for those --
+# libgl1, mesa-libgallium, ffmpeg, libavcodec61, vlc-plugin-base, the whole runtime
+# graph.  Then needed_packages.txt asks for them back.  The log of a restored build
+# says it in three lines: Removing 78, Removing 251, Installing 329.
+#
+# So the four are subtracted from the removal set by name.  Their dependencies need
+# no subtracting, which is the point of the change just below.
+RUNTIME_KEPT=()
+while read -r KEPT_PACKAGE; do
+  RUNTIME_KEPT+=( "$KEPT_PACKAGE" )
+done < <(
+  read_package_list needed_packages.txt
+  if [[ "$BUILD_BLUEALSA" == "y" ]]; then
+    read_package_list bluetooth_needed_packages.txt
+  fi
+  if [[ -z "$SELECTED_USERSPACE_ARCH" && "${BUILD_ARMHF}" == "y" ]]; then
+    read_package_list needed_packages32.txt
+  fi
+)
+BUILD_ONLY_CANDIDATES=()
+for CANDIDATE in "${BUILD_ONLY_PACKAGES[@]}"; do
+  KEEP_IT=0
+  for KEPT_PACKAGE in "${RUNTIME_KEPT[@]}"; do
+    if [[ "$CANDIDATE" == "$KEPT_PACKAGE" ]]; then KEEP_IT=1; break; fi
+  done
+  (( KEEP_IT )) || BUILD_ONLY_CANDIDATES+=( "$CANDIDATE" )
+done
+if (( ${#BUILD_ONLY_CANDIDATES[@]} != ${#BUILD_ONLY_PACKAGES[@]} )); then
+  echo -e "Keeping $(( ${#BUILD_ONLY_PACKAGES[@]} - ${#BUILD_ONLY_CANDIDATES[@]} )) build-time package(s) that the runtime lists ask for"
+fi
+
 # A name dpkg has never heard of makes it exit non-zero and complain on stderr
 # while still reporting the others on stdout, hence the redirect -- the same
 # reason install_package has one.
@@ -117,14 +159,35 @@ REMOVABLE_PACKAGES=()
 while read -r INSTALLED_PACKAGE; do
   REMOVABLE_PACKAGES+=( "$INSTALLED_PACKAGE" )
 done < <(sudo chroot MixOSBuild/ dpkg-query -W \
-    -f '${Package}:${Architecture} ${db:Status-Status}\n' "${BUILD_ONLY_PACKAGES[@]}" 2>/dev/null |
+    -f '${Package}:${Architecture} ${db:Status-Status}\n' "${BUILD_ONLY_CANDIDATES[@]}" 2>/dev/null |
     awk '$NF == "installed" { print $1 }')
 
+# ── apt-mark auto, AND THEN autoremove: THE REMOVAL IS APT'S DECISION ────────
+#
+# This was `apt remove', which is an order rather than an opinion: it takes the named
+# package out and drags out everything that depends on it, whether or not the image
+# still needs it.  What is actually wanted here is "these were only ever here to
+# compile with" -- which is what the auto flag means, and `apt autoremove' on the very
+# next line is the thing that reads it.
+#
+# The difference is exactly the churn.  A build-time package that nothing shipped
+# needs is auto, unreferenced, and removed -- the same package `apt remove' took.  One
+# that a runtime package depends on is auto but still referenced, so it stays, and
+# the reinstall below has nothing to do.  install_package already reports that in one
+# line ("All N requested package(s) are already installed"), and that line is what a
+# cached cleanup is supposed to look like.
+#
+# Idempotent by construction: a root restored from the stripped snapshot has these
+# names either already removed -- so dpkg-query does not report them and they are not
+# passed at all -- or already auto, where apt-mark is a no-op that writes the flag it
+# already holds.  apt-mark reads /var/lib/dpkg and the extended-states file, neither
+# of which cleanup deletes, so it needs no package lists and works on a restored root
+# where `apt remove' could not even resolve a name.
 if (( ${#REMOVABLE_PACKAGES[@]} )); then
-  echo -e "Removing ${#REMOVABLE_PACKAGES[@]} of ${#BUILD_ONLY_PACKAGES[@]} build-time packages"
-  call_chroot "apt remove -y ${REMOVABLE_PACKAGES[*]}"
+  echo -e "Marking ${#REMOVABLE_PACKAGES[@]} of ${#BUILD_ONLY_CANDIDATES[@]} build-time packages as automatically installed"
+  call_chroot "apt-mark auto ${REMOVABLE_PACKAGES[*]}"
 else
-  echo -e "None of the ${#BUILD_ONLY_PACKAGES[@]} build-time packages is installed; nothing to remove"
+  echo -e "None of the ${#BUILD_ONLY_CANDIDATES[@]} build-time packages is installed; nothing to unmark"
 fi
 
 call_chroot "apt -y autoremove"
