@@ -345,9 +345,9 @@ Dashboard::Dashboard(QWidget *parent)
     m_toastTimer->setSingleShot(true);
     connect(m_toastTimer, &QTimer::timeout, this, [this]() {
         m_toast->hide();
-        /* An armed Restart or Power off expires with its own prompt.  Anything else
-         * would leave a button that shuts the board down on the next press, minutes
-         * later, with no warning on screen. */
+        /* An armed Power off expires with its own prompt.  Anything else would leave
+         * a button that shuts the board down on the next press, minutes later, with
+         * no warning on screen. */
         m_armed = InternalNone;
         m_armedExe.clear();
     });
@@ -575,12 +575,14 @@ void Dashboard::buildPages()
 
     QVector<AppEntry> powers;
 
-    AppEntry restart;
-    restart.title = tr("Restart");
-    restart.accent = Theme::orange();
-    restart.glyph = GlyphPower;
-    restart.internal = InternalReboot;
-    powers.append(restart);
+    /*
+     * There was a Restart card here, first on the page, and it is gone because the
+     * board has a power button that reboots it and a card cannot do that better.
+     * Everything else on this tab is something the hardware has no way to ask for --
+     * a clean poweroff, the system report -- and Restart was the one entry that was
+     * only ever a second way to press a button, sitting in the position the
+     * D-pad lands on when the tab opens.
+     */
 
     AppEntry off;
     off.title = tr("Power off");
@@ -1036,16 +1038,6 @@ void Dashboard::activate(const AppEntry &entry)
         m_info->refresh();
         push(m_info);
         break;
-    case InternalReboot:
-        if (m_armed != InternalReboot) {
-            m_armed = InternalReboot;
-            toast(tr("Press A again to restart"));
-            return;
-        }
-        m_armed = InternalNone;
-        launch(tr("Restart"), firstExisting(QStringList() << "/sbin/reboot" << "/usr/sbin/reboot"),
-               QStringList());
-        break;
     case InternalPoweroff:
         if (m_armed != InternalPoweroff) {
             m_armed = InternalPoweroff;
@@ -1127,9 +1119,10 @@ void Dashboard::onNav(int action)
         /* Deliberately not qApp->quit(): mixdash.service is Restart=on-failure, so
          * a clean exit is a clean stop and systemd does not bring the dashboard
          * back.  Quitting here would be a one-way door whose only way back is a
-         * power cycle -- which is what the old Console card was.  Power off and
-         * Restart are on the Power tab and do the thing properly. */
-        toast(tr("Use the Power tab to restart or power off"));
+         * power cycle -- which is what the old Console card was.  Power off is on
+         * the Power tab and does the thing properly; restarting is the board's own
+         * power button, which is why there is no card for it. */
+        toast(tr("Use the Power tab to power off"));
         return;
     }
 

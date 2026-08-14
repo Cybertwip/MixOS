@@ -106,6 +106,10 @@ public:
      * the cards are gone and so are the arms that served them.  InternalConsole
      * went the same way for a worse reason -- it hung the dashboard.  The note
      * where the card used to be built, in buildPages(), says why.
+     *
+     * InternalReboot is gone too, and that one for no reason worse than the board
+     * having a power button that already does it.  A card that duplicates hardware
+     * is a card you can hit by accident.
      */
     enum Internal {
         InternalNone = 0,
@@ -115,7 +119,6 @@ public:
         InternalPackages,
         InternalDiagnostics,
         InternalInfo,
-        InternalReboot,
         InternalPoweroff
     };
 

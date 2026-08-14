@@ -255,7 +255,22 @@ fi
 J36_IMAGE_NAME="$(darkos_image_name "$ROOT" \
     "${USERSPACE_ARCH:-armhf}" "${DEBIAN_CODE_NAME:-trixie}")"
 
+# THE MANIFEST IS CLEARED BEFORE THE BUILD, NOT AFTER.  flashable-image.txt lives in the
+# work directory, which survives between runs, and build-in-vm.sh writes it at the END of
+# its image stage.  So a run that dies before that stage leaves the PREVIOUS run's manifest
+# in place, still saying payload=in-image about an image built from another commit -- and
+# the hand-over below trusts that file.  Clearing it first makes its absence mean exactly
+# one thing: this build did not get as far as an image.
+multipass exec "$VM_NAME" -- \
+    rm -f "$VM_WORK_DIR/artifacts/flashable-image.txt"
+
 darkos_log "Building the J36 Ultra layer"
+# The status is caught rather than left to `set -e'.  An abort here stops the script on
+# this line, which says nothing about the thing the operator asks first -- was anything
+# handed over? -- and leaves that to be inferred from a "Flash this:" line that never
+# appears, hundreds of lines below wherever the log actually ends.  Catching it puts the
+# answer at the bottom of the run, in the same place a successful run reports its image.
+BUILD_RC=0
 multipass exec "$VM_NAME" -- env \
     J36_IMAGE_NAME="$J36_IMAGE_NAME" \
     J36_WORK_DIR="$VM_WORK_DIR" \
@@ -277,7 +292,15 @@ multipass exec "$VM_NAME" -- env \
     J36_MIXDASH="${J36_MIXDASH:-1}" \
     J36_SPLASH="$SPLASH" \
     J36_PAYLOAD_ON="${J36_PAYLOAD_ON:-root}" \
-    bash "$VM_BUILD_DIR/device/j36-ultra/build-in-vm.sh"
+    bash "$VM_BUILD_DIR/device/j36-ultra/build-in-vm.sh" || BUILD_RC=$?
+
+if [[ "$BUILD_RC" != 0 ]]; then
+    darkos_warn "The J36 Ultra layer FAILED (exit $BUILD_RC).  NOTHING WAS HANDED OVER."
+    darkos_warn "$BASE_ARTIFACT_DIR has not been written to by this run.  If an image is"
+    darkos_warn "sitting there it is from an earlier build and carries none of this checkout."
+    darkos_warn "The failure itself is above; the build stops at the first command that fails."
+    exit "$BUILD_RC"
+fi
 
 # ── Handing over the image that actually carries the payload ──────────────────
 #
@@ -333,6 +356,33 @@ bash device/r36-ultra/copy_artifacts.sh "$DEST" "$IMAGE"
 printf "%s\n" "$IMAGE" > "$DEST/latest-image.txt"
 sync "$DEST"
 ' j36-image-copy "$VM_BUILD_DIR" "$VM_BASE_ARTIFACT_MOUNT" "$FLASH_IMAGE"
+
+    # AND THEN CHECKED FROM THIS SIDE OF THE MOUNT.  Everything above runs in the VM and
+    # reports success there, against /mnt/mixos-artifacts -- but what gets flashed is a
+    # path on the workstation, and the two are the same directory only for as long as an
+    # sshfs mount says so.  A copy that succeeded in the VM and left nothing here is not a
+    # hypothetical: it is the failure that sent this build round again with an empty
+    # MixOS-Artifacts and a log full of green.  Comparing sizes across the boundary costs
+    # two stat calls and turns that into an error at the moment it happens.
+    #
+    # stat is spelt twice because this half runs on the workstation: BSD stat on macOS,
+    # GNU stat on a Linux one.  The VM is always Ubuntu, so its side is GNU only.
+    VM_IMAGE_SIZE="$(multipass exec "$VM_NAME" -- stat -c %s "$VM_BUILD_DIR/$FLASH_IMAGE")"
+    HOST_IMAGE_SIZE=0
+    if [[ -f "$BASE_ARTIFACT_DIR/$FLASH_IMAGE" ]]; then
+        HOST_IMAGE_SIZE="$(stat -f %z "$BASE_ARTIFACT_DIR/$FLASH_IMAGE" 2>/dev/null \
+            || stat -c %s "$BASE_ARTIFACT_DIR/$FLASH_IMAGE")"
+    fi
+    if [[ "$HOST_IMAGE_SIZE" != "$VM_IMAGE_SIZE" ]]; then
+        darkos_warn "The copy reported success in the VM but $BASE_ARTIFACT_DIR/$FLASH_IMAGE"
+        darkos_warn "is $HOST_IMAGE_SIZE bytes and the image in the VM is $VM_IMAGE_SIZE."
+        darkos_warn "The image itself is fine and is still at $VM_BUILD_DIR/$FLASH_IMAGE in"
+        darkos_warn "the VM; what failed is the hand-over across the Multipass mount."
+        darkos_warn "Check that $BASE_ARTIFACT_DIR is mounted at $VM_BASE_ARTIFACT_MOUNT:"
+        darkos_warn "  multipass info $VM_NAME"
+        darkos_warn "and that the workstation has room for another $VM_IMAGE_SIZE bytes."
+        darkos_die "the image was built but did not reach $BASE_ARTIFACT_DIR"
+    fi
 elif [[ -n "$FLASH_IMAGE" && "$FLASH_IMAGE" != none ]]; then
     darkos_warn "$FLASH_IMAGE was NOT handed over: the payload did not reach it."
     darkos_warn "Read the 'image:' lines in the build log; do not expect /opt/mixos on a card flashed from it."
