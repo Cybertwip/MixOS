@@ -490,17 +490,16 @@ void DiagnosticsPage::probeSystem(QVector<Finding> &out)
     cpu.name = tr("CPU");
     QString model;
     int cores = 0;
-    QFile f("/proc/cpuinfo");
-    if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        while (!f.atEnd()) {
-            const QString line = QString::fromLocal8Bit(f.readLine());
-            if (line.startsWith("processor"))
-                ++cores;
-            else if (model.isEmpty() && line.startsWith("model name"))
-                model = line.section(':', 1).trimmed();
-            else if (model.isEmpty() && line.startsWith("Hardware"))
-                model = line.section(':', 1).trimmed();
-        }
+    /* SysInfo::readLines and not a readLine() loop, here and below: atEnd() is
+     * true from the start on anything in /proc.  See widgets.cpp. */
+    const QStringList cpuLines = SysInfo::readLines("/proc/cpuinfo");
+    for (const QString &line : cpuLines) {
+        if (line.startsWith("processor"))
+            ++cores;
+        else if (model.isEmpty() && line.startsWith("model name"))
+            model = line.section(':', 1).trimmed();
+        else if (model.isEmpty() && line.startsWith("Hardware"))
+            model = line.section(':', 1).trimmed();
     }
     const int khz = SysInfo::readTrimmed(
                         "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq").toInt();
@@ -516,15 +515,12 @@ void DiagnosticsPage::probeSystem(QVector<Finding> &out)
     mem.name = tr("Memory");
     long totalKb = 0;
     long availKb = 0;
-    QFile mf("/proc/meminfo");
-    if (mf.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        while (!mf.atEnd()) {
-            const QString line = QString::fromLocal8Bit(mf.readLine());
-            if (line.startsWith("MemTotal:"))
-                totalKb = line.section(':', 1).trimmed().split(' ').first().toLong();
-            else if (line.startsWith("MemAvailable:"))
-                availKb = line.section(':', 1).trimmed().split(' ').first().toLong();
-        }
+    const QStringList memLines = SysInfo::readLines("/proc/meminfo");
+    for (const QString &line : memLines) {
+        if (line.startsWith("MemTotal:"))
+            totalKb = line.section(':', 1).trimmed().split(' ').first().toLong();
+        else if (line.startsWith("MemAvailable:"))
+            availKb = line.section(':', 1).trimmed().split(' ').first().toLong();
     }
     mem.detail = tr("%1 MB total, %2 MB available")
                      .arg(totalKb / 1024).arg(availKb / 1024);

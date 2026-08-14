@@ -103,7 +103,9 @@ public:
      *
      * There is no InternalMedia, InternalSettings or InternalPower any more: those
      * three cards did nothing but setRoot() to a tab the dock already shows, so
-     * the cards are gone and so are the arms that served them.
+     * the cards are gone and so are the arms that served them.  InternalConsole
+     * went the same way for a worse reason -- it hung the dashboard.  The note
+     * where the card used to be built, in buildPages(), says why.
      */
     enum Internal {
         InternalNone = 0,
@@ -114,8 +116,7 @@ public:
         InternalDiagnostics,
         InternalInfo,
         InternalReboot,
-        InternalPoweroff,
-        InternalConsole
+        InternalPoweroff
     };
 
     explicit Dashboard(QWidget *parent = nullptr);
@@ -186,9 +187,6 @@ private:
 
     void activate(const AppEntry &entry);
     void launch(const QString &title, const QString &exe, const QStringList &args);
-    /* The Console card: a login shell on a VT of its own, with the dashboard
-     * still running behind it.  Blocks until the shell exits. */
-    void console();
     void toast(const QString &text, int ms = 2400);
     static QString firstExisting(const QStringList &candidates);
     static QString firstWad();

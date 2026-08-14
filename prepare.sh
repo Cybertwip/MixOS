@@ -31,11 +31,19 @@ if [[ "${ENABLE_CACHE}" == "y" ]]; then
       # If a package changes from what's in the cache, just redownload the whole package again
       # Do not error out with a 503 error [Server reports unexpected range] message
       sudo sed -i "/\# VfileUseRangeOps: /c\VfileUseRangeOps: 0" /etc/apt-cacher-ng/acng.conf
+      # Only on the run that installed it.  These two lines throw away the build
+      # machine's own package indexes and its downloaded .debs so that the next apt
+      # refetches them THROUGH the proxy that has just appeared -- which is a
+      # one-time seeding step and reads as one.  Outside this branch they ran on
+      # every single build, so a machine that had apt-cacher-ng installed months ago
+      # still deleted 16 MB of indexes and its whole /var/cache/apt before every
+      # build and downloaded them again.  That is not cache warming, that is a cache
+      # being emptied on a schedule.
+      sudo rm -rf /var/lib/apt/lists
+      sudo rm -rf /var/cache/apt/*
   fi
   # Ensure service is running
   sudo systemctl enable --now apt-cacher-ng
-  sudo rm -rf /var/lib/apt/lists
-  sudo rm -rf /var/cache/apt/*
   sudo systemctl restart apt-cacher-ng
 fi
 

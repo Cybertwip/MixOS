@@ -31,6 +31,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QRegion>
 #include <QResizeEvent>
 #include <QShowEvent>
 #include <QTimer>
@@ -54,6 +55,42 @@ QString readTrimmed(const QString &path)
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
         return QString();
     return QString::fromLocal8Bit(f.readAll()).trimmed();
+}
+
+/*
+ * EVERY LINE OF A FILE, AND WHY IT IS THIS AND NOT A readLine() LOOP.
+ *
+ * Seven places in this dashboard walked a /proc file like this:
+ *
+ *     while (!f.atEnd()) { const QString line = f.readLine(); ... }
+ *
+ * and every one of them read nothing whatsoever.  QFileDevice::atEnd() answers
+ * from the file's SIZE, and Qt says so in as many words: "For regular empty
+ * files on Unix (e.g. those in /proc), this function returns true, since the
+ * file system reports that the size of such a file is 0."  procfs generates its
+ * contents when they are read, so it reports every file as zero bytes:
+ *
+ *     stat -c %s /proc/meminfo   ->  0
+ *     wc -c    < /proc/meminfo   ->  1531
+ *
+ * atEnd() is therefore true before the first read and the loop body never runs
+ * once.  That is one bug rather than seven, and it is the whole reason the
+ * System page called the chip "unknown", counted no cores, showed no RAM row at
+ * all, listed no mounted volumes and no sound card, and why the status bar's
+ * Wi-Fi meter never had a signal to draw.
+ *
+ * readAll() reads until read(2) returns 0, which is the only thing these files
+ * answer to, so everything that wants lines comes through here.  Empty lines are
+ * dropped: /proc/cpuinfo separates processors with them and no caller here uses
+ * them as a delimiter.  Local 8-bit and not Latin-1 because one of the callers
+ * is /proc/self/mounts, where a mount point can be a UTF-8 volume label.
+ */
+QStringList readLines(const QString &path)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return QStringList();
+    return QString::fromLocal8Bit(f.readAll()).split('\n', Qt::SkipEmptyParts);
 }
 
 /*
@@ -122,6 +159,7 @@ QString wirelessInterface()
 
 namespace {
 
+using SysInfo::readLines;
 using SysInfo::readTrimmed;
 
 QString firstWords(const QString &s, int n)
@@ -138,11 +176,8 @@ QString firstWords(const QString &s, int n)
  */
 int wirelessQuality()
 {
-    QFile f("/proc/net/wireless");
-    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
-        return -1;
-    while (!f.atEnd()) {
-        const QString line = QString::fromLatin1(f.readLine());
+    const QStringList lines = readLines("/proc/net/wireless");
+    for (const QString &line : lines) {
         const int colon = line.indexOf(':');
         if (colon < 0)
             continue;
@@ -586,9 +621,7 @@ void CardGrid::setIndex(int index)
     const int clamped = qBound(0, index, m_entries.size() - 1);
     if (clamped == m_index)
         return;
-    m_index = clamped;
-    update();
-    emit indexChanged(m_index);
+    selectTo(clamped);
 }
 
 QString CardGrid::currentTitle() const
@@ -618,23 +651,26 @@ bool CardGrid::handleNav(int action)
     case Joypad::NavOk:    activate(); return true;
 
     /*
-     * THE SHOULDERS, WHICH ARE NOW SELECTION FIRST AND TABS SECOND.
+     * THE SHOULDERS ARE NOT HANDLED HERE, AND THAT IS THE POINT.
      *
-     * L1/L2 and R1/R2 arrive here as NavPrevPage and NavNextPage, and until now
-     * this page did not want them, so the shell's fallback ran and they jumped
-     * straight to the previous or next dock tab.  That is a tab strip and not a
-     * shortcut: a hand already on the shoulder had to move back to the D-pad to
-     * pick anything on the tab it had just landed on.
+     * L1/L2 and R1/R2 arrive as NavPrevPage and NavNextPage.  For one release
+     * this page consumed them to step the SELECTION card by card, on the theory
+     * that a hand already on the shoulder should not have to move back to the
+     * D-pad.  It is the wrong theory: the selection is what the D-pad is for, so
+     * the shoulders were a second, slower way to do the one thing the pad already
+     * does well, and the thing nothing else could do -- change which of the four
+     * root pages is on the glass -- needed you to walk to the end of a grid first.
      *
-     * So they step the selection, in reading order and without wrapping, and
-     * return false only at the two ends of the grid -- where falling through to
-     * the shell means the tab change still happens, one press later.  Held down,
-     * that walks the whole dashboard from either end without touching the pad,
-     * which is what "they're just shortcuts" asks for.  The D-pad is unchanged
-     * and still wraps within its row.
+     * So they fall through, every time, to Dashboard::onNav, whose setRoot(-1)
+     * and setRoot(+1) move the page left and right and wrap at both ends.  Both
+     * shoulders on a side do the same thing on purpose: L1 and L2 are one gesture
+     * to a thumb, and so are R1 and R2.
+     *
+     * Returning false rather than deleting the case labels would have been the
+     * same behaviour; there are no case labels at all so that the next person
+     * reading this switch does not see the shoulders listed and assume the grid
+     * has an opinion about them.
      */
-    case Joypad::NavPrevPage: return stepBy(-1);
-    case Joypad::NavNextPage: return stepBy(1);
 
     default: return false;
     }
@@ -667,6 +703,52 @@ QRectF CardGrid::cardRect(int i) const
     return QRectF(Theme::Margin + c * (cw + Theme::Gap), top + r * (ch + Theme::Gap), cw, ch);
 }
 
+/*
+ * Eight pixels of margin, and the number is derived rather than picked.  A card
+ * draws OUTSIDE cardRect() twice: Theme::softShadow strokes out to `spread' (6)
+ * px, one further at the bottom, and a selected card adds an outline at
+ * r.adjusted(-2.5, -2.5, 2.5, 2.5).  Eight covers the larger of those with a
+ * pixel over for antialiasing, and toAlignedRect() rounds outwards so a card on
+ * a half-pixel boundary does not leave a seam.
+ */
+QRect CardGrid::dirtyRect(int i) const
+{
+    return cardRect(i).adjusted(-8, -8, 8, 8).toAlignedRect();
+}
+
+/*
+ * WHY MOVING THE SELECTION MARKS TWO RECTANGLES AND NOT THE WHOLE PAGE.
+ *
+ * Hover moves the selection and the stick moves the cursor sixty times a second,
+ * so on a page being pointed at this runs constantly.  Every caller used to end
+ * in the argument-less update(), which marks the entire grid dirty, and
+ * paintEvent then redrew all nine cards -- nine soft shadows of six rounded
+ * strokes each, nine rounded-rect gradients, nine glyphs, nine elided titles --
+ * in order to change the outline on two of them.  Qt's raster engine does that
+ * in software on a Cortex-A7 with no 2D engine it can reach, on the same thread
+ * that is trying to move the cursor, which is exactly the "pointer gets stuck
+ * for a small instant when hovering any menu item" this replaces.
+ *
+ * Only two cards change: the one losing the selection and the one gaining it.
+ * Marking those two, and having paintEvent skip cards the marked region does not
+ * touch, leaves the rest of the page in the backing store where it already is.
+ *
+ * The pixels stay correct because Qt repaints a dirty region from the top level
+ * down: Dashboard::paintEvent redraws the desk under the marked rectangles
+ * before this page draws anything into them, so the cards are not composited on
+ * top of their own previous alpha.
+ */
+void CardGrid::selectTo(int next)
+{
+    const int prev = m_index;
+    m_index = next;
+    if (prev >= 0 && prev < m_entries.size())
+        update(dirtyRect(prev));
+    if (next >= 0 && next < m_entries.size())
+        update(dirtyRect(next));
+    emit indexChanged(m_index);
+}
+
 int CardGrid::cardAt(const QPoint &p) const
 {
     for (int i = 0; i < m_entries.size(); ++i)
@@ -682,11 +764,8 @@ void CardGrid::mouseMoveEvent(QMouseEvent *event)
      * the cursor move the selection is what keeps them from disagreeing about
      * what "the current card" is when the user switches hands mid-page. */
     const int i = cardAt(event->pos());
-    if (i >= 0 && i != m_index) {
-        m_index = i;
-        update();
-        emit indexChanged(m_index);
-    }
+    if (i >= 0 && i != m_index)
+        selectTo(i);
     event->accept();
 }
 
@@ -697,11 +776,8 @@ void CardGrid::mousePressEvent(QMouseEvent *event)
         return;
     }
     m_pressed = cardAt(event->pos());
-    if (m_pressed >= 0 && m_pressed != m_index) {
-        m_index = m_pressed;
-        update();
-        emit indexChanged(m_index);
-    }
+    if (m_pressed >= 0 && m_pressed != m_index)
+        selectTo(m_pressed);
     event->accept();
 }
 
@@ -748,27 +824,7 @@ void CardGrid::moveBy(int dx, int dy)
     if (candidate == m_index)
         return;
 
-    m_index = candidate;
-    update();
-    emit indexChanged(m_index);
-}
-
-bool CardGrid::stepBy(int dx)
-{
-    if (m_entries.isEmpty())
-        return false;
-
-    /* Flat, not row-and-column: a shortcut that steps off the end of one row and
-     * onto the start of the next is the order the cards are read in, and it is
-     * the order that makes "hold R1 to get to the last card" behave. */
-    const int next = m_index + dx;
-    if (next < 0 || next >= m_entries.size())
-        return false;
-
-    m_index = next;
-    update();
-    emit indexChanged(m_index);
-    return true;
+    selectTo(candidate);
 }
 
 void CardGrid::activate()
@@ -840,17 +896,33 @@ void CardGrid::paintCard(QPainter &p, const AppEntry &e, const QRectF &r, bool s
                titleMetrics.elidedText(e.title, Qt::ElideRight, (int)tw));
 }
 
-void CardGrid::paintEvent(QPaintEvent *)
+void CardGrid::paintEvent(QPaintEvent *event)
 {
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
 
+    /*
+     * The other half of selectTo()'s story.  Marking two rectangles saves nothing
+     * on its own: QPainter would still be asked to draw all nine cards and would
+     * still build every gradient and lay out every title before the clip rejected
+     * the pixels.  Testing here is what makes the saving real.
+     *
+     * region() and not rect(): rect() is the bounding box of the dirty region, so
+     * a selection moving from the first card to the last would report the whole
+     * page and this test would pass for everything.
+     *
+     * The neighbours of a changed card usually intersect it -- the gap is 12 px
+     * and dirtyRect() grows each side by 8 -- and repainting them is not waste but
+     * correctness: their shadows are drawn into that same overlap.
+     */
+    const QRegion dirty = event->region();
+
     for (int i = 0; i < m_entries.size(); ++i)
-        if (i != m_index)
+        if (i != m_index && dirty.intersects(dirtyRect(i)))
             paintCard(p, m_entries[i], cardRect(i), false);
 
     /* The selected card last, so its glow is not painted over by a neighbour. */
-    if (m_index >= 0 && m_index < m_entries.size())
+    if (m_index >= 0 && m_index < m_entries.size() && dirty.intersects(dirtyRect(m_index)))
         paintCard(p, m_entries[m_index], cardRect(m_index), true);
 }
 
@@ -1500,18 +1572,44 @@ struct CpuInfo {
     int cores;
 };
 
+/*
+ * How many CPUs a cpulist names.  sysfs writes these as "0-7", or "0-3,6,7" once
+ * something has been hotplugged out of the middle, and putting that string
+ * straight on the glass is how the System page came to say "0-7 present" -- which
+ * a reader takes as a seven, not as eight of them.  0 for anything unparseable,
+ * including the empty string a kernel without CONFIG_HOTPLUG_CPU gives.
+ */
+int cpuListCount(const QString &list)
+{
+    int n = 0;
+    const QStringList ranges = list.split(',', Qt::SkipEmptyParts);
+    for (const QString &range : ranges) {
+        const QStringList ends = range.split('-');
+        bool ok = false;
+        const int first = ends.value(0).toInt(&ok);
+        if (!ok)
+            continue;
+        int last = first;
+        if (ends.size() > 1) {
+            last = ends.value(1).toInt(&ok);
+            if (!ok)
+                continue;
+        }
+        if (last < first)
+            continue;
+        n += last - first + 1;
+    }
+    return n;
+}
+
 CpuInfo cpuInfo()
 {
     CpuInfo info;
     info.cores = 0;
 
-    QFile f("/proc/cpuinfo");
-    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
-        return info;
-
     QString name, impl, part, arch, rev;
-    while (!f.atEnd()) {
-        const QString line = QString::fromLatin1(f.readLine());
+    const QStringList lines = readLines("/proc/cpuinfo");
+    for (const QString &line : lines) {
         const int colon = line.indexOf(':');
         if (colon < 0)
             continue;
@@ -1618,13 +1716,9 @@ QStringList blockDisks()
 QStringList mountedVolumes()
 {
     QStringList out;
-    QFile f("/proc/self/mounts");
-    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
-        return out;
-
-    while (!f.atEnd()) {
-        const QStringList c =
-            QString::fromLatin1(f.readLine()).split(' ', Qt::SkipEmptyParts);
+    const QStringList lines = readLines("/proc/self/mounts");
+    for (const QString &line : lines) {
+        const QStringList c = line.split(' ', Qt::SkipEmptyParts);
         if (c.size() < 4 || !c.at(0).startsWith("/dev/"))
             continue;
 
@@ -1887,16 +1981,13 @@ QStringList thermalZones()
 QStringList soundCards()
 {
     QStringList out;
-    QFile f("/proc/asound/cards");
-    if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        while (!f.atEnd()) {
-            const QString line = QString::fromLatin1(f.readLine());
-            if (!line.contains('['))
-                continue;
-            const QString what = line.section(':', 1).trimmed();
-            if (!what.isEmpty())
-                out << line.trimmed().section(' ', 0, 0) + "  " + what;
-        }
+    const QStringList lines = readLines("/proc/asound/cards");
+    for (const QString &line : lines) {
+        if (!line.contains('['))
+            continue;
+        const QString what = line.section(':', 1).trimmed();
+        if (!what.isEmpty())
+            out << line.trimmed().section(' ', 0, 0) + "  " + what;
     }
     if (out.isEmpty() && QFileInfo::exists("/dev/snd/controlC0"))
         out << "controlC0, but /proc/asound says nothing";
@@ -2105,12 +2196,20 @@ void InfoPage::refresh()
     add(tr("Chip"), cpu.model.isEmpty() ? tr("unknown") : cpu.model);
     if (!cpu.hardware.isEmpty())
         add(tr("Platform"), cpu.hardware);
-    /* Present, not online: this SoC hotplugs cores out under thermal load, and a
-     * quad-core that says "1 core" is exactly the thing worth noticing. */
-    const QString present = readTrimmed("/sys/devices/system/cpu/present");
-    add(tr("Cores"), tr("%1 online%2").arg(cpu.cores)
-                         .arg(present.isEmpty() ? QString()
-                                                : ", " + tr("%1 present").arg(present)));
+    /*
+     * Both numbers, but only when they differ.  This SoC hotplugs cores out under
+     * thermal load and an octa-core reporting two is exactly the thing worth
+     * noticing, so the discrepancy is what gets spelled out; when every core the
+     * board has is running there is nothing to compare and a bare count reads
+     * better than "8 online of 8".
+     */
+    const int present = cpuListCount(readTrimmed("/sys/devices/system/cpu/present"));
+    if (cpu.cores <= 0 && present <= 0)
+        add(tr("Cores"), tr("unknown"));
+    else if (present > 0 && present != cpu.cores)
+        add(tr("Cores"), tr("%1 online of %2").arg(cpu.cores).arg(present));
+    else
+        add(tr("Cores"), QString::number(qMax(cpu.cores, present)));
 
     const QString freq = "/sys/devices/system/cpu/cpu0/cpufreq/";
     const QString cur = readTrimmed(freq + "scaling_cur_freq");
@@ -2135,35 +2234,36 @@ void InfoPage::refresh()
     /* ── Memory ──────────────────────────────────────────────────────────── */
     addHeader(tr("Memory"));
 
-    QFile mem("/proc/meminfo");
-    if (mem.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        long total = 0, avail = 0, swapTotal = 0, swapFree = 0;
-        while (!mem.atEnd()) {
-            const QString line = QString::fromLatin1(mem.readLine());
-            const QString value = line.section(':', 1).trimmed().section(' ', 0, 0);
-            if (line.startsWith("MemTotal:"))
-                total = value.toLong();
-            else if (line.startsWith("MemAvailable:"))
-                avail = value.toLong();
-            else if (line.startsWith("SwapTotal:"))
-                swapTotal = value.toLong();
-            else if (line.startsWith("SwapFree:"))
-                swapFree = value.toLong();
-        }
-        if (total > 0)
-            add(tr("RAM"), tr("%1 free of %2")
-                               .arg(humanBytes((qulonglong)avail * 1024),
-                                    humanBytes((qulonglong)total * 1024)));
-        add(tr("Swap"), swapTotal > 0 ? tr("%1 free of %2")
-                                            .arg(humanBytes((qulonglong)swapFree * 1024),
-                                                 humanBytes((qulonglong)swapTotal * 1024))
-                                      : tr("none"));
-    } else {
-        /* A section header with nothing under it reads as a page that broke
-         * halfway through drawing, so every section on this sheet says something
-         * even when the file behind it would not open. */
-        add(tr("RAM"), tr("no /proc/meminfo"));
+    long total = 0, avail = 0, swapTotal = 0, swapFree = 0;
+    const QStringList meminfo = readLines("/proc/meminfo");
+    for (const QString &line : meminfo) {
+        const QString value = line.section(':', 1).trimmed().section(' ', 0, 0);
+        if (line.startsWith("MemTotal:"))
+            total = value.toLong();
+        else if (line.startsWith("MemAvailable:"))
+            avail = value.toLong();
+        else if (line.startsWith("SwapTotal:"))
+            swapTotal = value.toLong();
+        else if (line.startsWith("SwapFree:"))
+            swapFree = value.toLong();
     }
+    /*
+     * The RAM row is drawn whatever happens.  It used to be `if (total > 0)', so
+     * a read that came back with nothing did not print a zero -- it printed no
+     * row at all, and a Memory section with only a Swap line under it reads as a
+     * page that gave up halfway rather than as a number that could not be had.
+     * That is what "no RAM size reported there" was looking at.
+     */
+    if (total > 0)
+        add(tr("RAM"), tr("%1 free of %2")
+                           .arg(humanBytes((qulonglong)avail * 1024),
+                                humanBytes((qulonglong)total * 1024)));
+    else
+        add(tr("RAM"), tr("no /proc/meminfo"));
+    add(tr("Swap"), swapTotal > 0 ? tr("%1 free of %2")
+                                        .arg(humanBytes((qulonglong)swapFree * 1024),
+                                             humanBytes((qulonglong)swapTotal * 1024))
+                                  : tr("none"));
 
     /* ── Display ─────────────────────────────────────────────────────────── */
     addHeader(tr("Display"));

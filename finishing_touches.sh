@@ -395,13 +395,12 @@ fi
 # round trip.  ${DATA_FILESYSTEM_FORMAT_PARAMETERS} carries the label.
 sudo mkfs.${DATA_FILESYSTEM_FORMAT} ${DATA_FILESYSTEM_FORMAT_PARAMETERS} ${LOOP_ROM}
 # The partition mounts at ${DATA_MOUNT_POINT} -- /home/virtua -- on the device, so its
-# root is a home directory and the rom library is one directory inside it.  Here it is
-# mounted at mnt/data and ${fat32_mountpoint} points one level in, at that library:
-# every line below writes through that variable and none of them has to change.
+# root is a home directory and nothing else.  Here it is mounted at mnt/data, and every
+# line below writes to that directly.
 #
-# The variable name is left alone on purpose: it is read a few dozen times below and
-# renaming it would be churn in exchange for nothing.  It is not fat32 any more, and it
-# is not the partition root either.
+# A second variable used to sit beside this one -- fat32_mountpoint, pointing one level
+# deeper at mnt/data/roms -- because the rom library was the only thing this file put on
+# the partition.  It went with the tree it named; see the block just below.
 data_mountpoint=mnt/data
 mkdir -p ${data_mountpoint}
 sudo mount -t ${DATA_FILESYSTEM_FORMAT} ${LOOP_ROM} ${data_mountpoint}

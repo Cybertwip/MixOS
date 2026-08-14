@@ -69,6 +69,13 @@ devenv32:
 
 clean:
 	[ -d "mnt/boot" ] && sudo umount mnt/boot && sudo rm -rf mnt/boot || true
+	[ -d "mnt/data" ] && sudo umount mnt/data && sudo rm -rf mnt/data || true
+# mnt/roms was what finishing_touches.sh called that mount point before p3 became a home
+# directory instead of a rom library.  It stays for one more release for the same reason
+# the Arkbuild line below does: a tree interrupted mid-build by an older checkout still
+# has it MOUNTED, and the wholesale `rm -rf mnt' further down would then be deleting
+# through a live mount rather than a directory.  Unmounting first is the entire point of
+# these two lines.
 	[ -d "mnt/roms" ] && sudo umount mnt/roms && sudo rm -rf mnt/roms || true
 	[ -d "main" ] && sudo rm -rf main || true
 	[ -d "initrd" ] && sudo rm -rf initrd || true

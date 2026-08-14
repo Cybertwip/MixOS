@@ -34,15 +34,12 @@
 #include <QTimer>
 #include <QVBoxLayout>
 
-#include <errno.h>
-#include <fcntl.h>
-#include <linux/kd.h>
-#include <linux/vt.h>
-#include <signal.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <sys/wait.h>
-#include <unistd.h>
+/*
+ * There is no <linux/vt.h>, <linux/kd.h>, <sys/ioctl.h>, <sys/wait.h>, <signal.h>,
+ * <fcntl.h>, <errno.h>, <string.h> or <unistd.h> here any more.  They were all for
+ * the Console card's fork-a-shell-onto-a-spare-VT, which is gone; launching is
+ * QProcess::execute and nothing else in this file speaks to the kernel directly.
+ */
 
 namespace {
 
@@ -592,12 +589,22 @@ void Dashboard::buildPages()
     off.internal = InternalPoweroff;
     powers.append(off);
 
-    AppEntry console;
-    console.title = tr("Console");
-    console.accent = Theme::teal();
-    console.glyph = GlyphTerminal;
-    console.internal = InternalConsole;
-    powers.append(console);
+    /*
+     * There was a Console card here, between Power off and System, and it is gone
+     * rather than fixed.  It forked a login shell onto a spare VT and blocked the
+     * event loop until that shell exited, and on this board opening it was a hang:
+     * the dashboard stops painting the moment the fork starts, and if the VT switch
+     * does not take -- which is what happens when the panel is a simplefb the
+     * kernel's console driver was never bound to -- then nothing is drawn on the
+     * glass by anyone, and the only input path left is the one that was suspended
+     * on purpose two lines earlier.  No frame, no pad, no way back.
+     *
+     * The recovery would have been VT_WAITACTIVE timeouts, a watchdog on the child
+     * and a fallback that undoes the mode switch, which is a console driver's worth
+     * of work to reach a prompt that the Terminal card on the Apps grid already
+     * gives -- in-process, on the panel that is known to draw, with the pad still
+     * live.  So: use Terminal.  See terminal.cpp.
+     */
 
     AppEntry info;
     info.title = tr("System");
@@ -946,166 +953,6 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
         toast(tr("%1 exited").arg(title));
 }
 
-/* ── dropping to a shell, and coming back ────────────────────────────────── */
-
-/*
- * WHY THIS FORKS A SHELL INSTEAD OF QUITTING.
- *
- * The Console card used to be qApp->quit(), which sounds like "leave the
- * dashboard and get a prompt" and is exactly that -- once.  mixdash.service is
- * Restart=on-failure, so a clean exit is a clean stop and systemd does NOT bring
- * the dashboard back; the card was a one-way door out of the shell whose only
- * way back was a power cycle.  That is the bug: "the Console menu does not
- * return to the dashboard back again."
- *
- * So the shell is a child, and the dashboard is still sitting behind it with the
- * pages it had.  ON A VT OF ITS OWN, and that part is not decoration:
- *
- *   - The dashboard's VT is in KD_GRAPHICS and there is a getty on tty1.  Giving
- *     the child the CURRENT VT means the shell and the getty share one keyboard
- *     and one screen, and both of them think they own it.
- *   - A VT from VT_OPENQRY has no session on it, so TIOCSCTTY in the child
- *     succeeds and the shell gets job control -- without which ^C kills nothing
- *     and every "vi" opened here would be unquittable.
- *   - Switching away leaves the dashboard's VT in KD_GRAPHICS, so on the way
- *     back fbcon still will not draw on it.  The framebuffer underneath has been
- *     scribbled on by the console, which is what the repaint at the end is for.
- *
- * The event loop is stopped for the whole session, exactly as launch() stops it:
- * Qt's linuxfb plugin writes straight into the mmapped framebuffer and does not
- * care which VT is on the glass, so a paint that arrived while the shell had the
- * screen would land on top of the shell.
- */
-void Dashboard::console()
-{
-    toast(tr("Opening a console"), 60000);
-    /* On the glass before anything blocks -- see launch(). */
-    m_toast->repaint();
-    QCoreApplication::processEvents();
-
-    /* Not O_CLOEXEC: this fd is deliberately closed by hand, and the child does
-     * not inherit anything from here anyway once it has execed. */
-    const int tty = ::open("/dev/tty0", O_RDWR);
-    if (tty < 0) {
-        toast(tr("No console on this card"), 5000);
-        return;
-    }
-
-    struct vt_stat vts;
-    ::memset(&vts, 0, sizeof(vts));
-    int spare = -1;
-    if (::ioctl(tty, VT_GETSTATE, &vts) != 0 || ::ioctl(tty, VT_OPENQRY, &spare) != 0
-        || spare <= 0) {
-        ::close(tty);
-        toast(tr("No free console"), 5000);
-        return;
-    }
-    const int mine = vts.v_active;
-
-    const QString node = QString("/dev/tty%1").arg(spare);
-    const QByteArray nodeBytes = node.toLocal8Bit();
-
-    /* The child gets the input devices to itself, and whatever it was pressed
-     * with is discarded before the dashboard listens again.  The joypad reads
-     * evdev directly and does not grab it, so the kernel keeps feeding the same
-     * keys to the VT -- suspending is what stops the dashboard acting on the
-     * shell's typing, not what lets the shell see it. */
-    m_pad->setSuspended(true);
-    m_pointer->sleep();
-
-    bool ok = true;
-    if (::ioctl(tty, VT_ACTIVATE, spare) != 0 || ::ioctl(tty, VT_WAITACTIVE, spare) != 0)
-        ok = false;
-
-    const pid_t pid = ok ? ::fork() : -1;
-    if (pid == 0) {
-        /*
-         * Everything below runs in the child and must not throw, allocate or
-         * touch Qt: this is between fork() and exec() in a process that has a
-         * Qt event loop's worth of state in it, and async-signal-safe is the
-         * only contract that holds here.
-         */
-        ::setsid();
-
-        const int fd = ::open(nodeBytes.constData(), O_RDWR);
-        if (fd < 0)
-            ::_exit(127);
-        ::ioctl(fd, TIOCSCTTY, 1);
-        /* The VT is fresh so it is already KD_TEXT, but a VT that a previous
-         * session left in graphics mode would otherwise show nothing at all. */
-        ::ioctl(fd, KDSETMODE, KD_TEXT);
-        ::dup2(fd, 0);
-        ::dup2(fd, 1);
-        ::dup2(fd, 2);
-        if (fd > 2)
-            ::close(fd);
-
-        /* Qt may have blocked signals for its own handlers, and a shell that
-         * starts with SIGINT blocked has no ^C for the rest of the session. */
-        sigset_t empty;
-        sigemptyset(&empty);
-        ::sigprocmask(SIG_SETMASK, &empty, nullptr);
-        ::signal(SIGINT, SIG_DFL);
-        ::signal(SIGQUIT, SIG_DFL);
-        ::signal(SIGTSTP, SIG_DFL);
-        ::signal(SIGTTIN, SIG_DFL);
-        ::signal(SIGTTOU, SIG_DFL);
-        ::signal(SIGCHLD, SIG_DFL);
-        ::signal(SIGPIPE, SIG_DFL);
-
-        /* \033c is a full reset: the VT may have been left by something else
-         * mid-escape-sequence, and a prompt in the middle of that is unreadable.
-         * Said in English rather than through tr(), because the translations
-         * live in the parent's memory and reading them here is a malloc. */
-        static const char banner[] =
-            "\033c"
-            "MixOS console.  Type exit to go back to the dashboard.\n\n";
-        ssize_t ignored = ::write(1, banner, sizeof(banner) - 1);
-        (void)ignored;
-
-        ::setenv("TERM", "linux", 1);
-        if (!::getenv("HOME"))
-            ::setenv("HOME", "/root", 1);
-        /* Login shells (argv[0] starting with '-') so /etc/profile runs and the
-         * PATH here is the PATH a user would get on tty1. */
-        ::execl("/bin/bash", "-bash", (char *)nullptr);
-        ::execl("/bin/sh", "-sh", (char *)nullptr);
-        ::_exit(127);
-    }
-
-    int status = 0;
-    if (pid > 0) {
-        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR)
-            ;
-    }
-
-    /* Back to the dashboard's VT before the spare is freed -- VT_DISALLOCATE
-     * refuses the VT that is on the glass. */
-    ::ioctl(tty, VT_ACTIVATE, mine);
-    ::ioctl(tty, VT_WAITACTIVE, mine);
-    ::ioctl(tty, VT_DISALLOCATE, spare);
-    /* Ours again, and said out loud rather than assumed: the switch away and
-     * back is the one moment in this program's life when something else could
-     * have put this VT into text mode. */
-    ::ioctl(tty, KDSETMODE, KD_GRAPHICS);
-    ::close(tty);
-
-    m_pad->setSuspended(false);
-
-    /* Every pixel is suspect -- fbcon drew a login banner over the framebuffer
-     * while we were away.  Same reasoning as launch(). */
-    update();
-    if (m_current)
-        m_current->update();
-
-    if (pid < 0)
-        toast(tr("Could not open a console"), 5000);
-    else if (WIFEXITED(status) && WEXITSTATUS(status) == 127)
-        toast(tr("No shell on this card"), 5000);
-    else
-        toast(tr("Back from the console"));
-}
-
 /* ── activating a card ───────────────────────────────────────────────────── */
 
 /*
@@ -1209,9 +1056,6 @@ void Dashboard::activate(const AppEntry &entry)
         launch(tr("Power off"), firstExisting(QStringList() << "/sbin/poweroff" << "/usr/sbin/poweroff"),
                QStringList());
         break;
-    case InternalConsole:
-        console();
-        break;
     default:
         break;
     }
@@ -1280,7 +1124,12 @@ void Dashboard::onNav(int action)
     }
 
     if (action == Joypad::NavQuit) {
-        toast(tr("Power, then Console, leaves the dashboard"));
+        /* Deliberately not qApp->quit(): mixdash.service is Restart=on-failure, so
+         * a clean exit is a clean stop and systemd does not bring the dashboard
+         * back.  Quitting here would be a one-way door whose only way back is a
+         * power cycle -- which is what the old Console card was.  Power off and
+         * Restart are on the Power tab and do the thing properly. */
+        toast(tr("Use the Power tab to restart or power off"));
         return;
     }
 

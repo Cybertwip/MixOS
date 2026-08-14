@@ -42,6 +42,47 @@ QString firstExisting(const QStringList &paths)
     return QString();
 }
 
+/*
+ * WHERE THE BROWSER STARTS WHEN NOBODY HAS SAID
+ *
+ * It used to start nowhere: Settings::mediaRoot() is empty until someone picks a
+ * directory, m_dir took that empty string, and populate() handed it to QDir("")
+ * -- which is not "no directory", it is the PROCESS's working directory.  That is
+ * WorkingDirectory=/opt/mixos/bin out of mixdash.service, so the media browser
+ * opened on the payload directory, next to doom-j36, and every row in it is a
+ * binary that rebuild() marks unselectable.  Worse, an empty m_dir has no
+ * QFileInfo::absolutePath(), so the `..' row's target was empty too and Back's
+ * "go up a directory" guard was false from the start: the page had no way out of
+ * a directory with nothing in it to open.  Hence "it does not navigate".
+ *
+ * /home/virtua first because that is the card's writable partition -- p3, mounted
+ * over the virtua user's home by the initramfs -- and it is where anything the
+ * user copied onto the card actually lands.  The rest are for a machine that
+ * booted without a card: the home directory of whoever we are, then the
+ * read-only card mount if the initramfs made one, then /media.  Root last so the
+ * page always has SOMEWHERE, even on a system missing all of the above.
+ */
+QString defaultMediaRoot()
+{
+    const QStringList candidates = QStringList()
+        << QStringLiteral("/home/virtua")
+        << QDir::homePath()
+        << QStringLiteral("/run/j36/card")
+        << QStringLiteral("/media");
+    for (const QString &c : candidates)
+        if (!c.isEmpty() && QFileInfo(c).isDir())
+            return c;
+    return QDir::rootPath();
+}
+
+/* The remembered root if it is still a directory, the default if not.  Checked
+ * again here and not just at load time because the card it named can be pulled. */
+QString mediaStartDir()
+{
+    const QString remembered = Settings::instance().mediaRoot();
+    return QFileInfo(remembered).isDir() ? remembered : defaultMediaRoot();
+}
+
 } /* namespace */
 
 MediaPage::MediaPage(QWidget *parent)
@@ -56,7 +97,7 @@ MediaPage::MediaPage(QWidget *parent)
     m_ui->setInterval(500);
     connect(m_ui, &QTimer::timeout, this, &MediaPage::tick);
 
-    m_dir = Settings::instance().mediaRoot();
+    m_dir = mediaStartDir();
 }
 
 MediaPage::~MediaPage()
@@ -91,7 +132,7 @@ void MediaPage::resizeEvent(QResizeEvent *event)
 void MediaPage::onEnter()
 {
     if (m_dir.isEmpty() || !QFileInfo(m_dir).isDir())
-        m_dir = Settings::instance().mediaRoot();
+        m_dir = mediaStartDir();
     populate(m_dir);
     m_ui->start();
 }
@@ -166,10 +207,15 @@ QString MediaPage::humanTime(int seconds)
  * destroying the string this function is still reading. */
 void MediaPage::populate(QString dir)
 {
-    m_dir = dir;
+    /* Absolute before anything stores it.  m_dir is what both ways up out of a
+     * directory are computed from -- the `..' row's target and NavBack's parent --
+     * and neither an empty nor a relative path has an absolutePath() to climb to,
+     * so a page that got one could be entered and never left.  See
+     * defaultMediaRoot() above for how it used to get one. */
+    QDir d(dir.isEmpty() ? defaultMediaRoot() : dir);
+    m_dir = d.absolutePath();
     m_entries.clear();
 
-    QDir d(dir);
     if (!d.exists()) {
         rebuild();
         emit titleChanged();
@@ -180,7 +226,7 @@ void MediaPage::populate(QString dir)
         Entry up;
         up.kind = KindUp;
         up.name = QStringLiteral("..");
-        up.path = QFileInfo(dir).absolutePath();
+        up.path = QFileInfo(m_dir).absolutePath();
         m_entries.append(up);
     }
 

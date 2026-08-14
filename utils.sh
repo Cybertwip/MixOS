@@ -293,11 +293,32 @@ function read_package_list() {
 updateapt="N"
 
 # The sources.list fix and one `apt update' for the whole build, not one per package.
+#
+# ── WHY THE PROXY IS RE-ARMED HERE AND NOT ONLY AT BOOTSTRAP ─────────────────
+#
+# bootstrap_rootfs.sh writes 99proxy into the tree it creates, and that was the only
+# copy.  cleanup_filesystem.sh then DELETES it at the end of the build, which is
+# right -- a shipped image must not carry an apt proxy pointing at a machine that is
+# not the handheld.  But the stripped-root snapshot is taken AFTER cleanup, so every
+# resumed build restores a rootfs with no proxy configured, and its `apt update' plus
+# the dozen-odd packages cleanup removed go straight out to deb.debian.org.  That is
+# the 16 MB of indexes and the package downloads on a build that was supposed to be
+# resuming from a cached root: apt-cacher-ng was running the whole time with the
+# packages already in it, and nothing was pointed at it.
+#
+# Writing it here, on the one function every install goes through, makes it true for
+# whichever root this run is working on and however that root got here.  It is one
+# file in a chroot, it is idempotent, and cleanup removes it again exactly as before.
 function apt_update_once() {
   local chroot_dir="$1"
   [[ "$updateapt" == "Y" ]] && return 0
   if ! grep -qs contrib "${chroot_dir}/etc/apt/sources.list"; then
     sudo sed -i '/main/s//main contrib non-free non-free-firmware/' "${chroot_dir}/etc/apt/sources.list"
+  fi
+  if [[ "${ENABLE_CACHE}" == "y" ]]; then
+    sudo mkdir -p "${chroot_dir}/etc/apt/apt.conf.d"
+    echo 'Acquire::http::proxy "http://127.0.0.1:3142";' |
+      sudo tee "${chroot_dir}/etc/apt/apt.conf.d/99proxy" > /dev/null
   fi
   sudo chroot ${chroot_dir}/ apt -y update
   updateapt="Y"

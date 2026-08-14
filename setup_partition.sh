@@ -31,11 +31,11 @@ elif [[ "$ROOT_FILESYSTEM_FORMAT" == *"ext"* ]]; then
   ROOT_FILESYSTEM_MOUNT_OPTIONS="defaults,noatime"
 fi
 # The third partition -- p3, historically EASYROMS -- is ext2 and labelled DATA now,
-# on the same reasoning as the rootfs and one more besides: it holds Linux content
-# (roms, themes, tools, bios) with ownership and execute bits that vfat cannot express,
-# which is why the old flow formatted it vfat here and had firstboot immediately
-# reformat it to exfat and untar /roms.tar back onto it.  ext2 from the start removes
-# that whole round trip, and this kernel and the R36S's both mount it as they are.
+# on the same reasoning as the rootfs and one more besides: it holds a Linux home
+# directory, whose dotfiles, ownership and execute bits vfat cannot express, which is
+# why the old flow formatted it vfat here and had firstboot immediately reformat it to
+# exfat and untar /roms.tar back onto it.  ext2 from the start removes that whole round
+# trip, and this kernel and the R36S's both mount it as they are.
 #
 # Kept as its own set of variables and not folded into ROOT_FILESYSTEM_*: the two
 # partitions are allowed to diverge, and a reader looking at p3 should not have to
@@ -59,10 +59,11 @@ DATA_MOUNT_OPTIONS="defaults,auto,noatime,nofail"
 # /home/virtua and not /roms.  The mount point IS the login user's home directory, so a
 # shell lands on this partition: it is where bash starts, where the file explorer opens,
 # and the one place on the card meant to be written.  /roms was EmulationStation's name
-# for it and MixOS does not run EmulationStation -- the legacy tree survives as roms/
-# inside this partition, with /roms a symlink to it for the RK3326 scripts that still
-# say so.  Under /home rather than a top-level /virtua because it is a home directory
-# and nothing else, and $HOME under /home is what every tool on the card assumes.
+# for it, MixOS does not run EmulationStation, and neither the roms/ tree nor the /roms
+# symlink that used to point into it is created any more -- see finishing_touches.sh for
+# what was in there and why none of it had a reader left.  Under /home rather than a
+# top-level /virtua because it is a home directory and nothing else, and $HOME under
+# /home is what every tool on the card assumes.
 #
 # The account is named `virtua', uid 1000, after the directory rather than the other way
 # round.  It used to be `ark' with /home/ark a symlink to here, which meant one directory

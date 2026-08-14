@@ -26,6 +26,7 @@
 
 #include <QColor>
 #include <QPair>
+#include <QRect>
 #include <QString>
 #include <QStringList>
 #include <QVector>
@@ -199,13 +200,6 @@ public:
     QString currentTitle() const;
 
     void moveBy(int dx, int dy);
-    /*
-     * One card left or right in reading order, WITHOUT the wrap moveBy() does,
-     * and false when there is nowhere to go.  That false is the whole point: it
-     * is what lets the shoulder buttons step through the grid and then carry on
-     * into the next tab instead of chasing their own tail round one row.
-     */
-    bool stepBy(int dx);
     void activate();
 
     void setPageTitle(const QString &t) { m_pageTitle = t; }
@@ -224,7 +218,14 @@ protected:
 
 private:
     QRectF cardRect(int i) const;
+    /* cardRect() plus the shadow and glow that are drawn outside it -- the unit
+     * of repaint for this page.  See the comment on selectTo() in widgets.cpp. */
+    QRect dirtyRect(int i) const;
     int cardAt(const QPoint &p) const;
+    /* Move the selection to `next', repaint only the two cards that changed, and
+     * emit indexChanged().  Every caller that moves the selection goes through
+     * here; nothing sets m_index by hand. */
+    void selectTo(int next);
     void paintCard(QPainter &p, const AppEntry &e, const QRectF &r, bool selected);
 
     QVector<AppEntry> m_entries;
@@ -445,6 +446,10 @@ private:
 /* Shared by more than one page, and by the status bar. */
 namespace SysInfo {
 QString readTrimmed(const QString &path);
+/* Every line of a file, with the empty ones dropped.  Use this and never
+ * `while (!f.atEnd()) f.readLine()' -- see the comment on the definition for
+ * what that does to a file in /proc. */
+QStringList readLines(const QString &path);
 int batteryCapacity(bool *charging);
 bool networkUp();
 /* The wireless interface, from /sys/class/net/<if>/wireless or /phy80211. */

@@ -124,9 +124,13 @@ BUILD_JOBS=4 USERSPACE_ARCH=armhf ./build-r36-ultra.sh
   OTA updater are gone.  All of them came from ArkOS, none of them could run on
   an image built from this tree (they draw with `msgbox`/`osk`/`gptokeyb`, which
   no live script installs), and the updater pulled its payload from upstream
-  dArkOS.  `/opt/system` itself remains, because `roms/tools` is bind-mounted
-  onto it and `importwifi.sh` reads credentials out of there.  Replacements
-  belong in mixdash once the board has a working network interface.
+  dArkOS.  `/opt/system` itself remains only because the two RG351MP LED
+  scripts are copied into it.  The `roms/tools` bind mount that used to back
+  `/opt/system/Tools` went with the roms tree, so `importwifi.sh` now looks
+  for a `wifikeyfile.txt` under a path nothing creates — which is inert
+  rather than broken, since that is what it did on any card without a key
+  file.  Replacements belong in mixdash once the board has a working network
+  interface.
 
 # Licence
 

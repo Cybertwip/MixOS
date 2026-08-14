@@ -4501,12 +4501,42 @@ build_fbdoom() {
         # doomgeneric_j36.c explains why 480 would leave garbage on screen.
         # -std=gnu17 pins the dialect: this is 1997 C, and gcc 14 promoted
         # implicit declarations and int/pointer mismatches to hard errors.
+        #
+        # THE TWO -Wno- FLAGS, AND WHY SILENCING BEATS PATCHING HERE.  This
+        # engine emits exactly five warnings and every one of them is upstream's,
+        # in a tree pinned to DOOM_COMMIT that this recipe deliberately does not
+        # fork -- the source list a few lines up is checked against upstream's
+        # own Makefile precisely so that this stays a checkout and not a patch
+        # queue.  Both flags are blanket over sixty-odd files, which is the cost.
+        #
+        # -Wno-format-truncation covers four of them: "map%i" and "map0%i" in
+        # p_setup.c, "CWILV%2.2d" and "WIA%d%.2d%.2d" in wi_stuff.c.  The target
+        # is char[9] because a WAD lump name is eight characters and a NUL.  gcc
+        # sees plain ints and has to reason about INT_MIN..INT_MAX; the actual
+        # values are a map number and two loop counters bounded by NUMEPISODES
+        # and NUMMAPS, so the longest name any of them can produce is eight
+        # characters.  There is nothing to fix even in the impossible case:
+        # these are snprintf, which truncates and terminates rather than
+        # overflowing, so the warning describes a wrong lump name -- a missing
+        # graphic -- and not a memory error.  The only way to convince gcc is to
+        # narrow the types in someone else's game engine.
+        #
+        # -Wno-unused-result covers the fifth, m_menu.c ignoring fread's result
+        # while reading the 24-byte description out of each save file.  That one
+        # is a real gap: a truncated save leaves the previous contents of a
+        # static buffer showing as the slot name in the load menu.  It is still
+        # a static buffer and still NUL-terminated, so it is a stale label and
+        # not a crash, and it takes a corrupt save to see it at all.
+        #
+        # If DOOM_COMMIT is ever bumped, drop both flags for one build and read
+        # what comes out before putting them back.
         log "fbdoom: compiling ${#srcs[@]} sources in one pass for ARMv7"
         ( cd "$dir" && arm-linux-gnueabihf-gcc \
             -O2 -std=gnu17 -fcommon -static \
             -DNORMALUNIX -DLINUX -DSNDSERV -D_DEFAULT_SOURCE \
             -DDOOMGENERIC_RESX=640 -DDOOMGENERIC_RESY=400 \
             -Wno-error=implicit-function-declaration \
+            -Wno-format-truncation -Wno-unused-result \
             -o doom-j36 "${srcs[@]}" doomgeneric_j36.c -lm ) || return 1
         printf '%s\n' "$want" >"$stamp"
     fi
