@@ -1388,16 +1388,26 @@ void Dashboard::onNav(int action, bool repeat)
             return;
     }
 
-    if (action == Joypad::NavQuit) {
-        /* Deliberately not qApp->quit(): mixdash.service is Restart=on-failure, so
-         * a clean exit is a clean stop and systemd does not bring the dashboard
-         * back.  Quitting here would be a one-way door whose only way back is a
-         * power cycle -- which is what the old Console card was.  The Power off card
-         * on the Apps grid does the thing properly; restarting is the board's own
-         * power button, which is why there is no card for it. */
-        toast(tr("Use the Power off card on the Apps grid"));
-        return;
-    }
+    /*
+     * FN (BTN_MODE, the MENU key on the matrix) used to be caught right here and
+     * answered with a toast telling the reader to go and use the Power off card.
+     * That is gone.  It was a dead end dressed up as help: the button did nothing,
+     * every press cost a toast, and the sentence was advice about a DIFFERENT
+     * control rather than an effect of the one that was pressed.  A button whose
+     * only behaviour is to describe another button is a button with no behaviour.
+     *
+     * FN is now the page's, like any other action -- the Terminal makes it the
+     * interrupt key, which is the thing a handheld with no Ctrl key cannot
+     * otherwise do -- and a page that has no use for it lets it fall through to
+     * the switch below, where it lands on `default' and nothing happens.  Nothing
+     * happening is the honest outcome and it is silent.
+     *
+     * Quitting is still not among the options, and NavQuit keeps its name only
+     * because it is what a bring-up keyboard's Q key has always sent.
+     * mixdash.service is Restart=on-failure, so a clean exit is a clean stop and
+     * systemd does not bring the dashboard back: qApp->quit() here would be a
+     * one-way door out of the shell whose only way back is a power cycle.
+     */
 
     PageWidget *page = current();
     if (page && page->handleNav(action))

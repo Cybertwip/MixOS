@@ -312,6 +312,7 @@ multipass exec "$VM_NAME" -- env \
     J36_WORK_DIR="$VM_WORK_DIR" \
     J36_EXPORT_DIR="$VM_EXPORT_DIR" \
     J36_MIX_ONLY="$MIX_ONLY" \
+    J36_JOBS="${J36_JOBS:-}" \
     J36_KERNEL_BRANCH="${J36_KERNEL_BRANCH:-linux-6.12.y}" \
     J36_KERNEL_URL="${J36_KERNEL_URL:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}" \
     J36_UPDATE_KERNEL="${J36_UPDATE_KERNEL:-0}" \

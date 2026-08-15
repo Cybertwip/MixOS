@@ -279,34 +279,13 @@ static int j36_wlan_frame(struct j36_wifi *w, const u8 *frame, u32 frame_len,
 
 /* ── the commands ────────────────────────────────────────────────────────────*/
 
-/*
- * The rate bitmaps.  MediaTek numbers the fourteen 802.11b/g rates in the order
- * they appear in a supported-rates element, which is neither ascending nor
- * grouped by modulation, so this is a table and not an expression.  The high bit
- * of a rate byte is the "basic" flag and is masked off before the lookup.
- */
-static u16 j36_rate_bit(u8 rate)
-{
-	switch (rate & 0x7f) {
-	case 2:		return BIT(0);	/* 1 Mb/s   */
-	case 4:		return BIT(1);	/* 2        */
-	case 11:	return BIT(2);	/* 5.5      */
-	case 22:	return BIT(3);	/* 11       */
-	case 44:	return BIT(4);	/* 22       */
-	case 66:	return BIT(5);	/* 33       */
-	case 12:	return BIT(6);	/* 6        */
-	case 18:	return BIT(7);	/* 9        */
-	case 24:	return BIT(8);	/* 12       */
-	case 36:	return BIT(9);	/* 18       */
-	case 48:	return BIT(10);	/* 24       */
-	case 72:	return BIT(11);	/* 36       */
-	case 96:	return BIT(12);	/* 48       */
-	case 108:	return BIT(13);	/* 54       */
-	default:	return 0;
-	}
-}
-
-/* The two fallbacks below are stock's own 802.11bg sets, used when a beacon
+/* The rate bitmaps reach this layer already converted: the beacon's raw rate
+ * bytes are the scan's units, not a command's, so j36_wlan_rate_bit() in
+ * j36_mt6592_wifi_net.c does that walk and fills bss->operational_rates.  A
+ * second copy of that table used to sit here and had gone dead; two tables of
+ * fourteen magic numbers each is a drift waiting to happen.
+ *
+ * The two fallbacks below are stock's own 802.11bg sets, used when a beacon
  * carried no rates element at all: every b and g rate operational, the four b
  * rates plus 6/12/24 basic. */
 #define J36_RATES_DEFAULT_OPERATIONAL	0x3fcf

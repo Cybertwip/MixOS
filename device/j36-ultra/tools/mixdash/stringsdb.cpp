@@ -210,14 +210,6 @@ const char *const kPhrases[][Lang::Count] = {
       "Hier öffnet nichts %1",
       "Nada aqui abre %1",
       "Nada aquí abre %1" },
-    /* "Power off" and "Apps" both name things on the glass, so each language has
-     * to spell them here exactly as its own rows for those two strings do. */
-    { "Use the Power off card on the Apps grid",
-      "Utilisez la carte Éteindre sur la grille Applis",
-      "Usa la scheda Spegni nella griglia App",
-      "Die Karte Ausschalten im Raster Apps benutzen",
-      "Use o cartão Desligar na grelha Apps",
-      "Usa la tarjeta Apagar en la cuadrícula Apps" },
     { "poweroff is not on this card",
       "poweroff n'est pas sur cette carte",
       "poweroff non è su questa scheda",

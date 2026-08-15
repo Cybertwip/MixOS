@@ -414,6 +414,11 @@ static void j36_wlan_parse_ies(struct j36_wlan_bss *bss, const u8 *ies,
  * being converted and not the command's: bit 7 of a rate byte is 802.11's own
  * "this rate is basic" flag, which is why a basic rate is also an operational
  * one and the two masks overlap.
+ *
+ * It is a table and not an expression on purpose.  MediaTek numbers the fourteen
+ * 802.11b/g rates in the order they appear in a supported-rates element, which is
+ * neither ascending nor grouped by modulation -- 22 Mb/s and 33 Mb/s sit between
+ * the b rates and the g ones -- so there is no arithmetic that produces it.
  */
 static u16 j36_wlan_rate_bit(u8 rate)
 {

@@ -1326,6 +1326,46 @@ bool TerminalPage::handleNav(int action)
          * keyboard attached and a command to type anyway. */
         emit textRequested(tr("Command"), QString(), false);
         return true;
+    case Joypad::NavQuit:
+        /*
+         * FN is the interrupt key.
+         *
+         * This handheld has no Ctrl, so until now a command that would not stop on
+         * its own -- a ping with no count, a tail -f, anything that reads until the
+         * end of a pipe that never ends -- could only be got rid of by leaving the
+         * page and coming back, which does not kill it, or by cutting the power.
+         * The keyboard overlay cannot help either: it enters a LINE, and an
+         * interrupt is not a line, it is a byte that has to arrive while the thing
+         * being interrupted is the one holding the terminal.
+         *
+         * The byte is asked of the pty rather than assumed to be 0x03, because the
+         * line discipline acts on whatever VINTR currently is and a shell profile
+         * is free to have moved it with stty.  Writing the character we believe in
+         * rather than the one it is watching for would type a control character at
+         * the prompt and look like the button did nothing.
+         *
+         * It goes down the pty as a character and is NOT a kill() of the child,
+         * which is deliberate: the line discipline turns it into SIGINT for the
+         * FOREGROUND process group, so it reaches the command that is running and
+         * not the shell that is waiting for it -- and with nothing running it does
+         * what Ctrl+C does at any prompt, which is abandon the half-typed line.
+         * Sending it a signal ourselves would need the foreground pgid and would
+         * take the shell down with it when there was no job.
+         *
+         * A full-screen program that has turned ISIG off (an editor, say) receives
+         * a literal ^C instead, which is also what a real Ctrl+C would do there.
+         */
+        if (m_dead)
+            return true;    /* nothing to interrupt; silence beats a stray ^C */
+        {
+            struct termios t;
+            char intr = 0x03;
+
+            if (m_fd >= 0 && tcgetattr(m_fd, &t) == 0 && t.c_cc[VINTR] != _POSIX_VDISABLE)
+                intr = (char)t.c_cc[VINTR];
+            send(QByteArray(1, intr));
+        }
+        return true;
     case Joypad::NavBack:
         return false;   /* Leaves the page.  The shell keeps running. */
     default:

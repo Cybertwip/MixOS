@@ -56,6 +56,25 @@ CACHE="$WORK/cache"
 log() { printf '\n[build-j36-ultra] %s\n' "$*"; }
 die() { printf '\n[build-j36-ultra] ERROR: %s\n' "$*" >&2; exit 1; }
 
+# ── how many compiles run at once ──────────────────────────────────────────────
+#
+# One number, decided here and used by every build below -- kernel, out-of-tree
+# modules, busybox and the emulated armhf dashboard -- so `-j' is something this
+# file settles once instead of something each make call rediscovers.  J36_JOBS
+# overrides it, which is what a machine that has to stay usable while this runs
+# wants:  J36_JOBS=4 ./build-j36-ultra.sh.  Unset, it is the VM's own core count,
+# which is DARKOS_VM_CPUS -- 8 -- unless the operator narrowed that too.
+#
+# It is expanded HERE, natively, and the literal number is what crosses into the
+# armhf chroot.  nproc does work under qemu-arm -- /proc is bound for it, see
+# ensure_armhf_chroot -- but a `$(nproc)' written inside a string that is going to
+# be re-expanded by a second shell is one escaping mistake away from collapsing to
+# a bare `-j', and a bare `-j' is make's "unlimited": it forks a compile for every
+# source file at once, which on an emulated toolchain is how a build machine runs
+# out of memory rather than how it goes faster.  A literal number cannot do that.
+JOBS="${J36_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || JOBS=4
+
 [[ "$(uname -s)" == Linux ]] || die "build-in-vm.sh must run on Linux"
 [[ -d "$DRIVERS" ]] || die "MVII J36 Drivers not found: $DRIVERS"
 
@@ -1152,7 +1171,7 @@ if [[ -d /usr/lib/ccache ]]; then export PATH="/usr/lib/ccache:$PATH"; fi
 # then reports every core symbol the adapter uses -- __platform_driver_register,
 # devm_kmalloc, memset, __aeabi_unwind_cpp_pr0 -- as "undefined!".
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
-    CROSS_COMPILE=arm-linux-gnueabihf- -j"$(nproc)" zImage modules
+    CROSS_COMPILE=arm-linux-gnueabihf- -j"$JOBS" zImage modules
 
 # Kbuild runs modpost in two passes and the first one writes vmlinux.symvers: the
 # vmlinux exports alone, which is exactly what an external module needs.  If the
@@ -1213,7 +1232,7 @@ log "Building the out-of-tree J36 modules: the input adapter, the panel, the AFE
 mkdir -p "$MODULE_SRC"
 rsync -a --delete "$ROOT/device/j36-ultra/linux/" "$MODULE_SRC/"
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
-    CROSS_COMPILE=arm-linux-gnueabihf- M="$MODULE_SRC" -j"$(nproc)" modules
+    CROSS_COMPILE=arm-linux-gnueabihf- M="$MODULE_SRC" -j"$JOBS" modules
 KERNEL_RELEASE="$(make -s -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
     CROSS_COMPILE=arm-linux-gnueabihf- kernelrelease)"
 MODULE="$MODULE_SRC/j36_mt6592_input.ko"
@@ -1421,7 +1440,7 @@ if [[ ! -x "$BUSYBOX_SRC/busybox" || "${J36_REBUILD_BUSYBOX:-0}" == 1 ]]; then
     # it, because a cached BusyBox skips this block entirely and the assertion has
     # to hold on every run.
 
-    make -C "$BUSYBOX_SRC" CROSS_COMPILE=arm-linux-gnueabihf- -j"$(nproc)"
+    make -C "$BUSYBOX_SRC" CROSS_COMPILE=arm-linux-gnueabihf- -j"$JOBS"
 fi
 BUSYBOX="$BUSYBOX_SRC/busybox"
 [[ -x "$BUSYBOX" ]] || die "static ARM BusyBox was not produced"
@@ -6581,6 +6600,21 @@ build_mixdash() {
     ensure_armhf_chroot || { armhf_chroot_teardown; return 1; }
     chroot_install_deps qt "${MIXDASH_BUILD_DEPS[@]}" || { armhf_chroot_teardown; return 1; }
 
+    # ccache, and on its OWN stamp rather than appended to MIXDASH_BUILD_DEPS: the qt
+    # stamp is already on disk in every existing chroot, so a package added to that
+    # list would never be installed in any of them -- see chroot_install_deps.
+    #
+    # This is the change that makes rebuilding the dashboard bearable.  The staging
+    # step below wipes $src and copies the sources in fresh, so every file has a new
+    # mtime and make rebuilds all twenty-one of them every single time, even when one
+    # line of one file changed -- and each of those compiles is an emulated armhf g++
+    # chewing through Qt's headers.  ccache keys on CONTENT, not on timestamps, so the
+    # twenty files that did not change become cache hits and only the one that did is
+    # actually compiled.  Non-fatal: no network, or an apt that will not resolve, costs
+    # a slow build and not a failed one.
+    chroot_install_deps ccache ccache || \
+        log "mixdash: no ccache in the chroot, so this build compiles everything"
+
     sudo rm -rf "$src"
     sudo mkdir -p "$src"
     for f in "$MIXDASH_SRC"/*.cpp "$MIXDASH_SRC"/*.h "$MIXDASH_SRC"/mixdash.pro; do
@@ -6606,7 +6640,13 @@ BUILDIDH
     # work from a plain shell with no environment set, which is how this will be run
     # the first time.  /run/j36/gl comes first so the Mesa payload wins for the GL
     # names; /opt/mixos/qt/lib is where everything Qt lives.
-    log "mixdash: building the dashboard for armhf (emulated)"
+    #
+    # CCACHE_DIR is under /home/build and the wipe above is of /home/build/mixdash,
+    # so the cache outlives the sources it was filled from and only a chroot rebuild
+    # empties it.  /usr/lib/ccache goes on PATH for the make and not for the qmake:
+    # qmake bakes the plain names `g++' and `cc' into the Makefile, and it is make's
+    # PATH that decides which g++ those resolve to.
+    log "mixdash: building the dashboard for armhf (emulated), -j$JOBS"
     armhf_chroot_run "cd /home/build/mixdash && \
         q=\$(command -v qmake || true); \
         [ -n \"\$q\" ] || q=\$(ls /usr/lib/*/qt5/bin/qmake 2>/dev/null | head -1); \
@@ -6615,7 +6655,11 @@ BUILDIDH
             QMAKE_LFLAGS+='-Wl,--disable-new-dtags' \
             QMAKE_LFLAGS+='-Wl,-rpath,/run/j36/gl' \
             QMAKE_LFLAGS+='-Wl,-rpath,/opt/mixos/qt/lib' && \
-        make -j\$(nproc) && strip mixdash" \
+        export CCACHE_DIR=/home/build/.ccache CCACHE_MAXSIZE=2G && \
+        if [ -d /usr/lib/ccache ]; then export PATH=/usr/lib/ccache:\$PATH; fi && \
+        make -j$JOBS && strip mixdash && \
+        { command -v ccache >/dev/null && ccache -s | \
+            sed -n 's/^\(cache hit rate\|Hits\|Misses\)/mixdash ccache: &/p'; true; }" \
         || { armhf_chroot_teardown; return 1; }
 
     [[ -f "$src/mixdash" ]] || { log "mixdash: make left no binary"; armhf_chroot_teardown; return 1; }

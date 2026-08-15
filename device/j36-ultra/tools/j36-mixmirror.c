@@ -554,9 +554,14 @@ static int udl_loaded(void)
  */
 static int count_children(const char *dir, const char *parent)
 {
-    char prefix[64];
     DIR *d;
     struct dirent *e;
+    /* Sized off dirent and not off what a bus path plausibly is.  `parent' is a
+     * d_name from the caller's own scan, so d_name's length is the bound the
+     * compiler checks this against; picking a number because "1-1.4" is five
+     * characters just moves that check to runtime, which is what -Wformat-
+     * truncation was saying.  +2 is the '.' and the NUL. */
+    char prefix[sizeof(e->d_name) + 2];
     size_t plen;
     int n = 0;
 
