@@ -3,7 +3,7 @@
  * Copyright (c) 2025-2026 the MixOS project and contributors
  * See device/j36-ultra/LICENSE for the licence text and what it covers.
  *
- * volumes.h -- what is plugged into the USB port, as a list the shell can draw.
+ * disks.h -- what is plugged into the USB port, as a list the shell can draw.
  *
  * THIS FILE MOUNTS NOTHING.  The image already has a mounter: udev's
  * 99-mixos-automount.rules fires on any sd* carrying a filesystem,
@@ -53,8 +53,8 @@
  * and the plain umount are the two rungs below it, for a system where systemd is
  * not the one that mounted this.
  */
-#ifndef MIXDASH_VOLUMES_H
-#define MIXDASH_VOLUMES_H
+#ifndef MIXDASH_DISKS_H
+#define MIXDASH_DISKS_H
 
 #include <QObject>
 #include <QString>
@@ -149,4 +149,4 @@ private:
     bool m_started = false;
 };
 
-#endif /* MIXDASH_VOLUMES_H */
+#endif /* MIXDASH_DISKS_H */

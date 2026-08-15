@@ -3,9 +3,9 @@
  * Copyright (c) 2025-2026 the MixOS project and contributors
  * See device/j36-ultra/LICENSE for the licence text and what it covers.
  *
- * volumes.cpp -- the reader described in volumes.h.
+ * disks.cpp -- the reader described in disks.h.
  */
-#include "volumes.h"
+#include "disks.h"
 
 #include <QDir>
 #include <QFile>
