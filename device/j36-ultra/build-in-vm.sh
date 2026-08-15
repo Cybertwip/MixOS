@@ -3671,6 +3671,77 @@ UNITDBGREPLAY
         say "      /run/j36/eglprobe -f from a shell afterwards"
     fi
 
+    # ── WARMING EGL, WHICH IS THE SAME BINARY WITH NO ARGUMENTS ─────────────────
+    #
+    # WHAT IS SLOW.  The first thing on this board to want graphics pays for the
+    # whole stack coming up: the loader maps libEGL, libgbm, libGLESv2 and the
+    # DRI driver behind them, every one of their DT_NEEDEDs comes off the card,
+    # lima's first open of the render node sets up its context, and Mesa builds
+    # the config table.  On a Cortex-A7 reading a microSD that is most of a
+    # second, and it is paid by whatever the operator just launched -- so it
+    # reads as "the emulator takes a moment to start" rather than as boot time.
+    #
+    # WHAT THIS DOES.  Runs it once, in the background, after the dashboard is
+    # already on the panel, where nobody is waiting.  Everything above is then
+    # in the page cache and in the kernel's lima state, and the app that follows
+    # finds it warm.  Nothing is left running: the probe exits, and what remains
+    # is cache.
+    #
+    # WHY THE PROBE AND NOT A PROGRAM WRITTEN FOR THIS.  Because with no
+    # arguments it is exactly this and nothing else.  main() with argc == 1 does
+    # a read-only fb_report -- two ioctls, no writes -- then load(), then probe()
+    # on the display node and on renderD128: eglInitialize, the config table,
+    # and one context per API.  It is the -f, -p, -c, -o and -z modes that paint
+    # or modeset, and none of them is passed here.  See the paragraph above for
+    # what happened the last time this binary ran at boot with -f.
+    #
+    # AND ITS OUTPUT GOES TO THE JOURNAL AND NOWHERE ELSE.  journal+console here
+    # would be forty lines of Mesa drawn over a dashboard that has just finished
+    # painting, which is the failure console.h in mixdash exists to prevent; the
+    # same argument holds for anything else this board starts behind it.
+    if [ "$probe_ready" = 1 ] && [ "$gl_ready" = 1 ] && [ "$gl_debug" != 1 ]; then
+        cat > /newroot/run/systemd/system/j36-glwarm.service <<UNITGLWARM
+# Written by the J36 Ultra initramfs, into a tmpfs.  Not on the card.
+[Unit]
+Description=Warm the EGL stack so the first graphics app does not pay for it
+# After, and not Requires: a dashboard that failed is a board somebody is about
+# to run something on by hand, and the warm-up is worth just as much there.
+After=mixdash.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment="LD_LIBRARY_PATH=/run/j36/gl:$mixos_root/qt/lib"
+# Mesa keeps its compiled shaders under XDG_CACHE_HOME and disables the cache
+# outright when it has nowhere to put them -- which, for a unit running as root
+# with no HOME, is what would happen.  A tmpfs is the right home for it on a
+# machine whose only disk is the card it boots from: the cache is worth having
+# within one boot, which is exactly what this unit is filling it for, and it is
+# not worth a single write to the card.  The ceiling is there because Mesa's
+# own default is measured in gigabytes and this board has neither the RAM nor
+# the shaders to need it.
+Environment="XDG_CACHE_HOME=/run/j36/glcache"
+Environment="MESA_SHADER_CACHE_MAX_SIZE=32M"
+ExecStartPre=-/bin/mkdir -p /run/j36/glcache
+# Leading dash: a probe that could not make a context is a board with no GL, and
+# that is a thing to read in the journal, not a failed unit to restart.
+ExecStart=-/run/j36/eglprobe
+StandardOutput=journal
+StandardError=journal
+# Behind the dashboard in both queues.  The whole point is that this costs
+# nobody anything; a warm-up that made the first frame late would be a loss.
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=120
+[Install]
+WantedBy=multi-user.target
+UNITGLWARM
+        mkdir -p /newroot/run/systemd/system/multi-user.target.wants
+        ln -sf ../j36-glwarm.service \
+               /newroot/run/systemd/system/multi-user.target.wants/j36-glwarm.service
+        say "dash: j36-glwarm.service brings EGL up once after the dashboard, so the"
+        say "      first app that wants graphics finds the stack already warm"
+    fi
+
     say "dash: mixdash.service is the shell"
     say "      $mixos_root/bin/mixdash, Qt on linuxfb over /dev/fb0"
     if [ "$gl_ready" != 1 ]; then
@@ -7711,6 +7782,14 @@ systemd.mask=firstboot.service
     that partition to exfat, though this kernel still has exfat and vfat built in
     for cards written before the change.
 
+    THE ONE THING IT DID THAT THIS BOARD STILL NEEDS -- growing the DATA
+    partition into the rest of the card -- is done instead by
+    j36-expand-data.service, which /init writes into the /run tmpfs on every
+    boot.  It runs before systemd mounts /home/virtua, extends p3 to the end of
+    the disk with sfdisk and then resize2fs's the ext2 inside it, and it does
+    none of that once there is nothing left to take.  It never mkfs's anything,
+    which is the whole reason it is not the script above.
+
 batt_led.service, no longer masked
     The RK3326 battery LED daemon, and the first unit the forwarded log caught:
 
@@ -8849,6 +8928,18 @@ over the top, which is also what keeps /run/j36 visible after systemd starts.
 
 Pull the card into an R36S and none of it exists.  Nothing was written to the
 filesystem, so there is nothing to undo.
+
+And it is brought up once, on purpose, by j36-glwarm.service -- the same
+eglprobe with no arguments, run after the dashboard has painted, output to the
+journal only.  The first program on this board to want graphics otherwise pays
+for the whole stack arriving off the card: the loader maps Mesa and everything
+under it, lima opens its render node for the first time, and the config table
+is built.  That is most of a second on this SoC, and it is charged to whatever
+the operator just launched.  Running it where nobody is waiting moves the cost
+off them; the probe exits and what it leaves behind is page cache, the lima
+state and a shader cache under /run/j36/glcache.  Under j36.gl=debug the unit
+is not written at all, because mixdash-probe.service has already done it twice
+before the dashboard.
 
 Which APIs come up, and which one does not
 ------------------------------------------
