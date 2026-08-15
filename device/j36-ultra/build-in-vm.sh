@@ -1789,10 +1789,10 @@ for arg in $(cat /proc/cmdline); do
             want_power=1
             power_charge=0
             ;;
-        # The connectivity subsystem: MT6323 rails, the CONSYS power domain, the
-        # BTIF link and the two ROM patches.  Behind its own word for the reason
-        # every payload here has one and for one more that is specific to it: the
-        # MTCMOS sequence brings up a power domain the AP shares a bus with, and
+        # The radio: MT6323 rails, the CONSYS power domain, the BTIF link, the
+        # two ROM patches, the WLAN firmware and wlan0.  Behind its own word for
+        # the reason every payload here has one, and for one more specific to it:
+        # the MTCMOS sequence brings up a domain the AP shares a bus with, and
         # a bus protection released in the wrong order on MediaTek does not fault
         # -- it stalls until the watchdog resets the board.  Dropping the word, or
         # deleting j36/wifi/, is the recovery, from any machine that reads SD
@@ -5020,7 +5020,7 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_gl" = 1 ] || \
     # step in the bar because it is the only one that waits on a peer -- see the
     # bound on the wait in run_wifi.
     if [ "$want_wifi" = 1 ]; then
-        stage "Starting Wi-Fi"; detail "CONSYS power, BTIF link, ROM patches"
+        stage "Starting Wi-Fi"; detail "CONSYS power, BTIF link, firmware, wlan0"
         progress 73; run_wifi
     fi
     if [ "$want_gl" = 1 ]; then
@@ -7153,8 +7153,8 @@ changes nothing else:
                            set (scsi_mod, sd_mod, usb-storage, ntfs3) -- plus load.order
   opt/mixos/j36/power/     the MT6592 PMIC: battery gauge, charger, poweroff --
                            and the panel backlight, which is the same subject
-  opt/mixos/j36/wifi/      the CONSYS connectivity MCU: rails, BTIF link and the
-                           two ROM patches, which ship in wifi/firmware/ with it
+  opt/mixos/j36/wifi/      the radio and wlan0: CONSYS rails, BTIF link, cfg80211
+                           and the blobs, which ship in wifi/firmware/ with it
   opt/mixos/j36/gl/        Mesa's GL front end, plus links
   opt/mixos/j36/eglprobe   -f reports and paints /dev/fb0 with no DRM at all and
                            runs on every boot; -o draws the GPU's cube into
@@ -7920,7 +7920,8 @@ j36.wifi=1
     stage 3, and "Wi-Fi bring-up stopped at [stage]" is stages 1 and 2 -- the
     stage names are the driver's own, and consys-power, btif-link, rom-patch,
     wmt-handshake, wlan-firmware-missing, firmware-ready-timeout,
-    wlan-basic-config and wlan-netdev-register are the ones worth grepping for.
+    wlan-basic-config-refused, hif-abnormal-interrupt and wlan-netdev-register
+    are the ones worth grepping for.
 
     Two lines below that are worth reading even on success.  "A-die probe ran"
     means the RF front end was configured by the ROM; "timed out" or "ROM went
@@ -8976,9 +8977,10 @@ GNU General Public License, version 2 only:
                             mass-storage set, ntfs3, and MixOS's
                             j36_mt6592_usb_phy
     j36/power/*.ko          MixOS's j36_mt6592_pmic and j36_mt6592_backlight
-    j36/wifi/*.ko           MixOS's j36_mt6592_wifi -- the CONSYS connectivity
-                            MCU's power, BTIF link, ROM patch download and the
-                            WLAN firmware download over the AHB HIF
+    j36/wifi/*.ko           cfg80211 and rfkill, plus MixOS's j36_mt6592_wifi --
+                            the CONSYS MCU's power, the BTIF link, the ROM patch
+                            and WLAN firmware downloads over the AHB HIF, and
+                            wlan0 on top of them
     j36_mt6592_input.ko     MixOS's keypad and GPIO key adapter
 
     The seven MixOS modules are GPL-2.0-ONLY deliberately, and are not part of
@@ -9231,12 +9233,13 @@ SD cards.
   j36/power            the MT6592 PMIC -- battery gauge, charger and a poweroff
                        that cuts the rail -- and the panel backlight.  j36.power=1;
                        j36.power=nocharge keeps the charger as the LK set it.
-  j36/wifi             the CONSYS connectivity MCU: its rails, the BTIF link, and
-                       wifi/firmware/ holding the two ROM patches that go down it.
-                       There is no network interface yet -- the WLAN firmware and
-                       cfg80211 stages are not in this build, and the boot log
-                       says which stage it reached.  j36.wifi=1 implies j36.power,
-                       because one driver owns the PMIC wrapper.
+  j36/wifi             the radio, and wlan0: the CONSYS MCU's rails, the BTIF
+                       link, wifi/firmware/ holding the two ROM patches and the
+                       WLAN firmware, and cfg80211 on top.  2.4 GHz WPA2-PSK,
+                       driven by the wpa_supplicant and NetworkManager already on
+                       the rootfs; the boot log says which stage it reached.
+                       j36.wifi=1 implies j36.power, because one driver owns the
+                       PMIC wrapper.
   j36/gl               Mesa's GL front end, staged in /run/j36/gl ahead of the
                        rootfs's RK3326 Mali blob.  links/ records the SONAME
                        aliases, kept from when this payload was on FAT.  j36.gl=1
