@@ -362,19 +362,41 @@ MODULE_PARM_DESC(chgreboot,
  *
  *   And the measured number: VBAT 1925 mV, on a console that was running the
  *   panel, the GPU and eight A7s while it printed it.  This PMIC's own UVLO
- *   would have switched the board off long before 1.9 V.  Doubled it is 3850
- *   mV, which is an ordinary resting cell, and the gauge's 0% follows straight
- *   from the halving -- 1925 mV is far below J36_V_0PERCENT_TRACKING_MV, so the
- *   curve was being asked about a voltage no cell on this board has ever been
- *   at.
+ *   would have switched the board off long before 1.9 V.
+ *
+ * AND THEN IT WAS 7200, WHICH IS ALSO HALF, AND THE BOARD SAID SO AGAIN.
+ *
+ * That is the correction this driver is being brought into line with, and the
+ * evidence for it is MVII's, on the same silicon:
+ * PMIC_AUXADC_VOLTAGE_FULL_RANGE_MV went 1800 -> 3600 in the loader's own tree
+ * ("Fix scale up"), i.e. its channel 6/7 full scale went 7200 -> 14400, and the
+ * charge park has read a sane pack ever since -- inside the 3000..4400 mV band
+ * lk_draw_detail_screen() paints VBAT against.  The 1925 mV above is the SAME
+ * NUMBER the loader was showing at 7200, which is what settles it: doubling
+ * 3600 to 7200 here fixed half of a factor of four and left the gauge reading a
+ * cell that does not exist -- 1925 mV is far under J36_V_0PERCENT_TRACKING_MV,
+ * so the curve was being asked about a voltage no pack on this board has ever
+ * been at, and answered 0%.  At 14400 the same counts are 3850 mV, an ordinary
+ * resting cell.
+ *
+ * SO THE ARM IN FRONT OF THE CONVERTER IS 8 AND NOT 4, whatever the cust data
+ * says, and the honest way to write that would be R_BAT_SENSE 8 with the 1800
+ * reference intact.  It is written the loader's way instead -- 3600 x 4 -- for
+ * one reason: these two files are kept diffable line for line, and the number a
+ * reader will find in MVII is 3600.  The physics is in this paragraph; the
+ * arithmetic is identical either way.
  *
  * The x1 arm below is untouched: channel 4 takes it, and the 330k/39k board
- * divider in front of that is what the two VCHR constants describe.
+ * divider in front of that is what the two VCHR constants describe.  It is
+ * untouched because VCHR has never been the channel that read wrong -- a 5 V
+ * cable measures 5 V through it -- which is itself the evidence that the x4/x8
+ * arm is what the correction belongs to and not the reference.
  *
- * If this ever needs backing out, it is one number -- put J36_ADC_R_BAT_SENSE
- * to 2 and the old behaviour returns, with the same arithmetic on show.
+ * If this ever needs backing out, it is one number -- put
+ * J36_ADC_VOLTAGE_FULL_RANGE_MV to 1800 and the old behaviour returns, with the
+ * same arithmetic on show.
  */
-#define J36_ADC_VOLTAGE_FULL_RANGE_MV	1800
+#define J36_ADC_VOLTAGE_FULL_RANGE_MV	3600
 #define J36_ADC_R_BAT_SENSE		4
 #define J36_ADC_FULL_SCALE_MV		(J36_ADC_VOLTAGE_FULL_RANGE_MV * \
 					 J36_ADC_R_BAT_SENSE)
@@ -1090,10 +1112,18 @@ static bool j36_pwrap_up(struct j36_pmic *p)
  *
  * All three widen to 64-bit where MVII uses 32.  That is the one arithmetic
  * departure in this port and it is not cosmetic: raw * 1800 * 369 overflows a u32
- * above ~6400 counts, and delta * 7200 * 1000 overflows an s32 above ~298 counts,
- * which is only ~950 mA -- exactly the current a DCP is allowed to deliver.  The
- * values MVII actually sees stay inside both bounds, so this changes no result;
- * it removes a cliff the port had no reason to keep.
+ * above ~6400 counts, and delta * 14400 * 1000 overflows an s32 above ~149 counts.
+ * The second bound used to be ~298 counts, and the full scale doubling above
+ * halved it -- so what was a cliff at ~950 mA, the most a DCP may deliver, is now
+ * a cliff at ~475 mA, which is an ORDINARY charge current on this board and not a
+ * corner at all.  MVII still computes it in 32 bits and still gets away with it
+ * because its own charge park is short; a driver that runs for days would not.
+ * The widening changes no result inside the bounds and removes the cliff.
+ *
+ * The scale also changes what a count is worth: at 14400 mV over 32768 counts a
+ * count is 0.44 mV, so 2.27 counts per millivolt, and one count across the 68
+ * mOhm shunt is ~6.5 mA.  Both are twice what they were, which is the resolution
+ * this converter always had and the old scale was quietly halving.
  */
 static int j36_sense_mv(int raw)
 {
