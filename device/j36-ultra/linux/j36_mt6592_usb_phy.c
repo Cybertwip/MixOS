@@ -1922,7 +1922,7 @@ static void j36_musb_host_kick(struct j36_usb_phy *p)
 	 * way round and settled there.
 	 */
 	dev_info(p->dev,
-		 "DEVCTL %02x: the core is a %s with %s and HM clear -- taking VBUS down inside the PHY, restarting the session against the dead bus and bringing VBUS back up %s, which is the rise MUSB latches host mode on (attempt %u of %u)\n",
+		 "DEVCTL %02x: the core is a %s with %s and is not armed as a host -- taking VBUS down inside the PHY, restarting the session against the dead bus and bringing VBUS back up %s, which is the rise MUSB latches host mode on (attempt %u of %u)\n",
 		 devctl,
 		 devctl & J36_MUSB_DEVCTL_BDEVICE ? "B-device" : "A-device",
 		 devctl & J36_MUSB_DEVCTL_SESSION ? "a session" : "no session",
