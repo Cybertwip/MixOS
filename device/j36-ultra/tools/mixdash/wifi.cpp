@@ -96,6 +96,55 @@ bool isLinkLocal(const QString &address)
     return address.startsWith(QLatin1String("169.254."));
 }
 
+/* NMDeviceStateReason, from NetworkManager.h, and only the ones this radio can
+ * actually produce.  Numeric for the same reason NMDeviceState is: nmcli prints
+ * the number in brackets in every language and the sentence in only one. */
+enum {
+    ReasonConfigFailed         = 4,
+    ReasonIpConfigUnavailable  = 5,
+    ReasonIpConfigExpired      = 6,
+    ReasonNoSecrets            = 7,
+    ReasonSupplicantDisconnect = 8,
+    ReasonSupplicantConfig     = 9,
+    ReasonSupplicantFailed     = 10,
+    ReasonSupplicantTimeout    = 11,
+    ReasonDhcpStartFailed      = 15,
+    ReasonDhcpError            = 16,
+    ReasonDhcpFailed           = 17,
+    ReasonFirmwareMissing      = 35,
+    ReasonRemoved              = 36,
+    ReasonSleeping             = 37,
+    ReasonConnectionRemoved    = 38,
+    ReasonUserRequested        = 39,
+    ReasonDependencyFailed     = 50,
+    ReasonSsidNotFound         = 53
+};
+
+/*
+ * nmcli's exit status, from its manual page.  It is coarser than the reason code
+ * and it is always there, which is why both are read: a `--wait' that runs out
+ * gives 3 and no reason at all, because nothing has failed yet.
+ */
+enum {
+    ExitOk         = 0,
+    ExitError      = 1,
+    ExitBadInput   = 2,
+    ExitTimeout    = 3,
+    ExitActivation = 4,
+    ExitNoManager  = 8,
+    ExitNoSuch     = 10
+};
+
+/* True while NetworkManager is in the middle of bringing a connection up: from
+ * `prepare' through `secondaries', which is everything between the button and an
+ * address.  Nothing that takes the antenna off the AP's channel may happen in
+ * here -- a thirteen-channel sweep during a four-way handshake or a DHCP exchange
+ * is how a working network becomes "Timeout expired". */
+bool isActivating(int state)
+{
+    return state >= StatePrepare && state <= StateSecondaries;
+}
+
 } /* namespace */
 
 WifiPage::WifiPage(QWidget *parent)
@@ -113,6 +162,38 @@ WifiPage::WifiPage(QWidget *parent)
     m_timer = new QTimer(this);
     m_timer->setInterval(2000);
     connect(m_timer, &QTimer::timeout, this, &WifiPage::poll);
+
+    /*
+     * The query pump.  One QProcess, reused, plus a timer that kills a child that
+     * has stopped answering -- QProcess enforces no deadline of its own once
+     * nobody is sitting in waitForFinished, and a wedged nmcli holding the pump
+     * would stop the page updating for ever.
+     */
+    m_query = new QProcess(this);
+    m_query->setProcessChannelMode(QProcess::SeparateChannels);
+    {
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("LC_ALL"), QStringLiteral("C"));
+        env.insert(QStringLiteral("LANG"), QStringLiteral("C"));
+        m_query->setProcessEnvironment(env);
+    }
+    connect(m_query, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
+            this, [this](int code, QProcess::ExitStatus status) {
+                queryFinished(code, status == QProcess::NormalExit);
+            });
+    /* A child that never started is not a child that answered "no": nmcli missing
+     * or unrunnable must not be read as "NetworkManager is down". */
+    connect(m_query, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart)
+            queryFinished(-1, false);
+    });
+
+    m_guard = new QTimer(this);
+    m_guard->setSingleShot(true);
+    connect(m_guard, &QTimer::timeout, this, [this]() {
+        if (m_query->state() != QProcess::NotRunning)
+            m_query->kill();
+    });
 
     m_scanAge.start();
 }
@@ -140,6 +221,7 @@ void WifiPage::onEnter()
 
     m_note.clear();
     m_profileAge = 0;
+    m_tick = 0;
 
     /*
      * No rfkill poke and no SIOCSIFFLAGS here, and their absence is the point.
@@ -151,22 +233,28 @@ void WifiPage::onEnter()
     refreshStatus();
     refreshProfiles();
     refreshScan();
-    rebuild();
 
     /* A rescan on entry, because the first thing anybody wants from this page is
-     * the list.  It is asynchronous -- NetworkManager updates its own list and a
-     * later poll reads it. */
-    if (m_managerUp && m_radioOn) {
-        nmcli(QStringList() << "device" << "wifi" << "rescan" << "ifname" << m_iface, 3000);
-        m_scanAge.restart();
-    }
+     * the list.  It is asynchronous twice over -- it goes on the queue behind the
+     * status queries, and NetworkManager then sweeps in its own time and a later
+     * poll reads what it found. */
+    enqueue(QueryRescan);
+    m_scanAge.restart();
 
+    pumpQueries();
+    rebuild();
+
+    m_timer->setInterval(2000);
     m_timer->start();
 }
 
 void WifiPage::onLeave()
 {
     m_timer->stop();
+    /* Drop what has not started.  The one in flight is left alone: killing it
+     * would leave a half-read pipe for nothing, and its handler only writes to
+     * fields this page owns. */
+    m_queue.clear();
 }
 
 /* ── talking to NetworkManager ───────────────────────────────────────────── */
@@ -182,14 +270,17 @@ QString WifiPage::nmcli(const QStringList &args, int timeoutMs, int *exitCode,
         return QString();
 
     /*
-     * BLOCKING, ON PURPOSE, AND BOUNDED -- for the queries.  Each one is a D-Bus
-     * round trip to a daemon on the same machine and comes back in milliseconds,
-     * and a bounded stall with an empty answer beats a state machine that has to
-     * remember what it was in the middle of.  The two operations that are NOT
-     * bounded like this -- `connection up' and `device connect', either of which
-     * can sit for the better part of a minute waiting on a four-way handshake and
-     * a DHCP exchange -- go through startAction() instead and run in the
-     * background while the poll timer reports on them.
+     * BLOCKING, BOUNDED, AND NO LONGER ON THE POLL PATH.  What is left here is the
+     * handful of verbs a person has just pressed a button to cause -- deleting a
+     * profile, reloading them -- where the next line of the caller genuinely needs
+     * the result and where a pause is the expected shape of a button.  Everything
+     * that runs on a timer goes through enqueue()/pumpQueries() instead, because
+     * Shell::waitForFinished does not pump the event loop and three of these per
+     * tick froze the panel for most of every two seconds; see the note in wifi.h.
+     *
+     * The long verbs -- `connection up' and `device connect', either of which can
+     * sit for the better part of a minute on a four-way handshake and a DHCP
+     * exchange -- have always gone through startAction() and still do.
      */
     QProcess p;
     p.setProcessChannelMode(QProcess::SeparateChannels);
@@ -223,6 +314,126 @@ QString WifiPage::nmcli(const QStringList &args, int timeoutMs, int *exitCode,
     return QString::fromUtf8(p.readAllStandardOutput());
 }
 
+/* ── the background query pump ───────────────────────────────────────────── */
+
+QStringList WifiPage::queryArgs(const Query &query) const
+{
+    switch (query.id) {
+    case QueryRadio:
+        return QStringList() << "-t" << "radio" << "wifi";
+    case QueryDevice:
+        return QStringList() << "-t" << "-f"
+                             << "GENERAL.STATE,GENERAL.CONNECTION,"
+                                "IP4.ADDRESS,IP4.GATEWAY"
+                             << "device" << "show" << m_iface;
+    case QueryProfiles:
+        return QStringList() << "-t" << "-f" << "NAME,UUID,TYPE"
+                             << "connection" << "show";
+    case QuerySsid:
+        return QStringList() << "-t" << "-f" << "802-11-wireless.ssid"
+                             << "connection" << "show" << "uuid" << query.arg;
+    case QueryScan: {
+        QStringList fields;
+        fields << "IN-USE" << "SSID";
+        if (m_ssidHex)
+            fields << "SSID-HEX";
+        fields << "BSSID" << "SIGNAL" << "FREQ" << "SECURITY";
+        return QStringList() << "-t" << "-f" << fields.join(QChar(','))
+                             << "device" << "wifi" << "list"
+                             << "ifname" << m_iface << "--rescan" << "no";
+    }
+    case QueryRescan:
+        return QStringList() << "device" << "wifi" << "rescan" << "ifname" << m_iface;
+    default:
+        return QStringList();
+    }
+}
+
+/*
+ * Add a query unless the same one is already waiting or running.  The
+ * de-duplication is what makes it safe to enqueue unconditionally from the poll:
+ * a tick that lands while the queue is still draining -- which is what happens on
+ * a loaded board, or when nmcli is being slow -- adds nothing rather than piling
+ * up a backlog that then runs all at once.
+ */
+void WifiPage::enqueue(int id, const QString &arg)
+{
+    if (nmcliPath().isEmpty() || m_iface.isEmpty())
+        return;
+    if (m_querying && m_inFlight.id == id && m_inFlight.arg == arg)
+        return;
+    for (int i = 0; i < m_queue.size(); ++i)
+        if (m_queue[i].id == id && m_queue[i].arg == arg)
+            return;
+
+    Query q;
+    q.id = id;
+    q.arg = arg;
+    /* A scan listing serialises every AP the daemon has seen, and a rescan can sit
+     * behind the radio finishing whatever it was doing.  The rest are one D-Bus
+     * property read. */
+    q.timeoutMs = (id == QueryScan) ? 8000 : (id == QueryRescan ? 6000 : 5000);
+    m_queue.append(q);
+}
+
+void WifiPage::pumpQueries()
+{
+    if (m_querying || m_queue.isEmpty())
+        return;
+    if (nmcliPath().isEmpty()) {
+        m_queue.clear();
+        return;
+    }
+
+    m_inFlight = m_queue.takeFirst();
+    const QStringList args = queryArgs(m_inFlight);
+    if (args.isEmpty()) {
+        pumpQueries();
+        return;
+    }
+
+    m_querying = true;
+    m_guard->start(m_inFlight.timeoutMs);
+    m_query->start(nmcliPath(), args);
+}
+
+/*
+ * `answered' is the whole reason the exit code is not enough.  A child we killed
+ * on the guard timer, or one that never started because nmcli is not there, has
+ * a non-zero code and has said nothing -- and reading that as "NetworkManager is
+ * down" would blank a working page every time the box was busy.  Silence leaves
+ * the last known state exactly where it was.
+ */
+void WifiPage::queryFinished(int exitCode, bool answered)
+{
+    if (!m_querying)
+        return;
+
+    m_guard->stop();
+    m_querying = false;
+
+    const QString out = QString::fromUtf8(m_query->readAllStandardOutput());
+    m_query->readAllStandardError();
+
+    const Query done = m_inFlight;
+    m_inFlight = Query();
+
+    if (answered) {
+        switch (done.id) {
+        case QueryRadio:    applyRadio(exitCode, out); break;
+        case QueryDevice:   applyDevice(exitCode, out); break;
+        case QueryProfiles: applyProfiles(exitCode, out); break;
+        case QuerySsid:     applySsid(done.arg, exitCode, out); break;
+        case QueryScan:     applyScan(exitCode, out); break;
+        case QueryRescan:   break;   /* nothing comes back but a scan request */
+        default:            break;
+        }
+        rebuild();
+    }
+
+    pumpQueries();
+}
+
 bool WifiPage::busy() const
 {
     return m_action && m_action->state() != QProcess::NotRunning;
@@ -253,21 +464,36 @@ void WifiPage::startAction(const QStringList &args, const QString &note)
                     m_action->readAllStandardOutput();
                     if (code == 0) {
                         m_note.clear();
+                        m_badKeySsid.clear();
                     } else {
                         /*
-                         * nmcli's own sentence, untranslated because it is the
-                         * only one that says which of a dozen things went wrong
-                         * -- "Secrets were required, but not provided", "No
-                         * suitable device found", "The Wi-Fi network could not be
-                         * found".  A generic phrase in the right language is
-                         * worth less here than the exact one in English.
+                         * WHAT WENT WRONG, IN WORDS, AND WHY THEY ARE NOT nmcli'S
+                         * WORDS ANY MORE.  This used to print nmcli's own
+                         * sentence, on the grounds that it was the only thing
+                         * specific enough to be useful.  That was true while there
+                         * was nothing to compare it against and stopped being true
+                         * the moment the number in front of it was read: "Error:
+                         * Connection activation failed: (7) Secrets were required,
+                         * but not provided." is an accurate description of an
+                         * internal event and it is not what a person needs to be
+                         * told.  "Wrong passphrase" is.  failureText() names the
+                         * cases this radio can actually produce and falls back to
+                         * nmcli's sentence for the rest, so nothing is lost.
                          */
-                        m_note = tr("that did not work");
-                        emit toastRequested(err.isEmpty() ? tr("NetworkManager refused")
-                                                          : err.section('\n', 0, 0),
-                                            5000);
+                        const int reason = reasonIn(err);
+                        if (reason == ReasonNoSecrets) {
+                            if (!m_pending.ssid.isEmpty())
+                                m_badKeySsid = m_pending.ssid;
+                            else if (!m_ssid.isEmpty())
+                                m_badKeySsid = m_ssid;
+                        }
+
+                        const QString said = failureText(code, err);
+                        m_note = said;
+                        emit toastRequested(said, 6000);
                     }
                     refreshStatus();
+                    pumpQueries();
                     rebuild();
                 });
     }
@@ -300,6 +526,113 @@ QStringList WifiPage::splitTerse(const QString &line)
     }
     out.append(cur);
     return out;
+}
+
+/* ── what went wrong ─────────────────────────────────────────────────────── */
+
+/*
+ * The number in "Error: Connection activation failed: (7) Secrets were required,
+ * but not provided."  It is an NMDeviceStateReason and it is the only part of that
+ * line that is the same in every language, which is the whole reason for reading
+ * it rather than the sentence.  -1 when there is no bracketed number at all --
+ * `--wait' running out prints no reason, because at that moment nothing has
+ * failed.
+ */
+int WifiPage::reasonIn(const QString &text)
+{
+    for (int i = 0; i + 1 < text.size(); ++i) {
+        if (text.at(i) != QChar('('))
+            continue;
+        int j = i + 1;
+        QString digits;
+        while (j < text.size() && text.at(j).isDigit())
+            digits += text.at(j++);
+        if (!digits.isEmpty() && j < text.size() && text.at(j) == QChar(')'))
+            return digits.toInt();
+    }
+    return -1;
+}
+
+QString WifiPage::failureText(int exitCode, const QString &err) const
+{
+    switch (reasonIn(err)) {
+    /*
+     * The one everybody meets.  NetworkManager asks for secrets when the AP
+     * rejects the key it was given, and because this page always writes the
+     * passphrase into the profile before it activates, "no secrets" here can only
+     * mean the passphrase in that profile did not work.
+     */
+    case ReasonNoSecrets:
+        return tr("Wrong passphrase");
+    case ReasonSupplicantConfig:
+        return tr("This radio cannot do that network's security");
+    case ReasonSupplicantDisconnect:
+    case ReasonSupplicantFailed:
+        return tr("The access point dropped the connection");
+    case ReasonSupplicantTimeout:
+        return tr("The access point stopped answering");
+    /* Associated, encrypted, and then nothing came back from the router.  This is
+     * the DHCP half of the exchange failing, and it is a different fault from a
+     * refused key even though both end with no network. */
+    case ReasonIpConfigUnavailable:
+    case ReasonIpConfigExpired:
+    case ReasonDhcpStartFailed:
+    case ReasonDhcpError:
+    case ReasonDhcpFailed:
+        return tr("The router never sent an address");
+    case ReasonSsidNotFound:
+        return tr("That network is not in range");
+    case ReasonConfigFailed:
+        return tr("NetworkManager could not apply those settings");
+    case ReasonFirmwareMissing:
+        return tr("The Wi-Fi firmware is missing");
+    case ReasonRemoved:
+        return tr("The wireless interface went away");
+    case ReasonSleeping:
+        return tr("The radio was put to sleep");
+    case ReasonConnectionRemoved:
+        return tr("That saved network was deleted");
+    case ReasonUserRequested:
+        return tr("Something else disconnected it");
+    case ReasonDependencyFailed:
+        return tr("Something it needed failed first");
+    default:
+        break;
+    }
+
+    switch (exitCode) {
+    /*
+     * `--wait' ran out.  This is NOT a failure and saying so is the difference
+     * between a page that helps and one that lies: NetworkManager is still trying
+     * when nmcli gives up on watching it, and the device state says how far it
+     * got.  Stuck at ip-config is the DHCP exchange, which on this board was for a
+     * long time the group key going in under the wrong address -- see
+     * j36_wlan_cfg_add_key() in the driver.
+     */
+    case ExitTimeout:
+        if (m_deviceState == StateIpConfig)
+            return tr("Joined, but the router never sent an address");
+        if (m_deviceState == StateNeedAuth)
+            return tr("Wrong passphrase");
+        if (isActivating(m_deviceState))
+            return tr("Still trying; it is taking longer than usual");
+        return tr("It did not finish in time");
+    case ExitNoManager:
+        return tr("NetworkManager is not running");
+    case ExitNoSuch:
+        return tr("That network is gone");
+    case ExitBadInput:
+        return tr("NetworkManager did not understand that");
+    case ExitActivation:
+    case ExitError:
+    default:
+        break;
+    }
+
+    /* Nothing recognised.  nmcli's own first line, which is at least exact, and
+     * failing that the only thing that is certainly true. */
+    const QString line = err.section('\n', 0, 0).trimmed();
+    return line.isEmpty() ? tr("NetworkManager refused") : line;
 }
 
 /* ── state ───────────────────────────────────────────────────────────────── */
