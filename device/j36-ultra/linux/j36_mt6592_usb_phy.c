@@ -70,7 +70,7 @@
  *
  *   this file                     byte.bit -> reg.bit   phy-mtk-tphy.c
  *   J36_PHY_R1A_GPIO_CTL  0x80    0x1a.7 -> 0x18 b23    PA6_RG_U2_BC11_SW_EN
- *   J36_PHY_R1A_BIT4      0x10    0x1a.4 -> 0x18 b20    PA6_RG_U2_OTG_VBUSCMP_EN
+ *   J36_PHY_R1A_VBUSCMP_EN 0x10   0x1a.4 -> 0x18 b20    PA6_RG_U2_OTG_VBUSCMP_EN
  *   J36_PHY_R68_FORCE     0xf4    0x68   -> 0x68 b2,4-7 RG_TERMSEL, RG_XCVRSEL,
  *                                                       RG_DPPULLDOWN, RG_DMPULLDOWN
  *   J36_PHY_R69_FORCE     0x3c    0x69   -> 0x68 b10-13 P2C_RG_DATAIN
@@ -86,17 +86,18 @@
  * RG_SESSEND b4, RG_VBUSVALID b5 -- and 0x6d is U2PHYDTM1[15:8], the five
  * force_* enables for exactly those, force_iddig lowest. Decode the three
  * writes above with that map and they say: force everything except IDDIG,
- * assert SESSEND, deassert VBUSVALID and AVALID and BVALID. Which is
- * u2_phy_instance_power_off() in mainline, verbatim, and which leaves RG_IDDIG
- * at whatever it was -- and what it was is 1, forced, because recover() ran
- * first and recover() ends in the force-device tail. A port pinned to
- * B-device with the session forced ended is a port that cannot start one.
+ * assert SESSEND, deassert VBUSVALID and AVALID and BVALID.
  *
- * Host mode is the other three lines of the same mainline routine:
- * force_iddig with RG_IDDIG LOW (A-device), AVALID and VBUSVALID asserted,
- * SESSEND deasserted. That is what j36_phy_force_host() does now. The stock
- * decompile presumably has it too, a few hundred bytes from the sequence that
- * was picked up instead.
+ * WHICH IS HALF OF A HOST SWITCH AND NOT A POWER-DOWN AT ALL, and the stock
+ * MT6592 Android kernel -- in the tree now, at Reference/MT6592LK -- says which
+ * half. It is the opening of musb_session_restart(): the deliberate
+ * take-VBUS-away step that the restart of the session is meant to be seen
+ * against. Copied on its own, with the session never restarted and RG_IDDIG
+ * left at the 1 that recover()'s force-device tail put there, it really is a
+ * port pinned to B-device with the session forced ended -- a port that cannot
+ * start one -- which is what every early log said. It was not the wrong
+ * sequence. It was the first three lines of the right one, and the rest of it
+ * is below.
  *
  * The stock host switch also clears DEVCTL.SESSION in the MUSB core before it
  * touches the PHY at all. This file used to skip that and say why -- the bit
@@ -127,53 +128,119 @@
  * j36_musb_stand_down() is the missing edge, and j36_musb_host_kick() is the poll
  * checking that it took.
  *
- * ── AND THE EDGE WAS NOT ENOUGH EITHER, BECAUSE THE CORE HAD NO CLOCK ─────────
+ * ── AND THE EDGE WAS NOT ENOUGH EITHER, AND THE CLOCK WAS NOT WHY ────────────
  *
- * The stand-down landed, and the port still enumerated nothing. What the third
- * log says, read as one picture rather than line by line:
+ * The stand-down landed and the port still enumerated nothing, and the theory
+ * that followed was that MUSB had no USB-side clock. Everything fitted it: HM
+ * never setting, BDEVICE not tracking a forced ID, HSMODE stuck at whatever the
+ * bootloader's high-speed gadget left in it, and above all
  *
- *   DEVCTL 19  A-device, SESSION set, VBUS above VBusValid -- and HM clear,
- *              held for three seconds. Not a settle-time problem.
- *   DEVCTL 99  after the bounce, three seconds later, still HM clear, and
- *              BDEVICE back ON despite RG_IDDIG being forced low the whole time.
- *   POWER  70 -> b0 -> f0   with HSMODE (read-only) set in every one of them,
- *              on a port with nothing plugged into it and no session that ever
- *              chirped. HSMODE is the bootloader's, from the high-speed gadget
- *              it ran, and it has never been cleared.
  *   41: 0 0 0 0 0 0 0 0  MT_SYSIRQ 64 Level musb-hdrc.3.auto
- *              -- the controller's interrupt has NEVER FIRED, on any of the
- *              eight CPUs, in the whole uptime.
  *
- * Every one of those is a register in MUSB's USB clock domain refusing to move,
- * while every register in its APB domain reads and writes perfectly: HWVERS,
- * EPINFO and RAMINFO come back correct, DEVCTL.SESSION takes a write and reads
- * it back, and the DRVVBUS pad -- a GPIO, on nobody's USB clock -- does exactly
- * what it is told. HM, BDEVICE, HSMODE and every interrupt source the core has
- * are on the other side of that line. Zero interrupts is the one that settles
- * it: CONNECT, RESET, SESSREQ, VBUS_ERROR and SOF are all generated from the
- * 60 MHz the PHY hands back, and a core that had it would have raised SOMETHING
- * in eleven seconds of being asked to be a host.
+ * an interrupt line that had never fired on any of eight CPUs in the whole
+ * uptime, when CONNECT, RESET, SESSREQ, VBUS_ERROR and SOF are all generated off
+ * the 60 MHz the PHY hands back. So j36_phy_clock_on() was written: mainline's
+ * u2_phy_instance_init() sets PA0_RG_USB20_INTR_EN in USBPHYACR0 under the
+ * comment "switch to USB function, and enable usb pll", the LK's savecurrent()
+ * clears it on its way out, and no routine in this file had ever written it.
  *
- * So the role was never the last problem. The PHY's own circuits are off, its
- * PLL is down, MUSB is being clocked on the bus side and nowhere else, and a
- * dual-role core in that state answers register reads and arbitrates nothing.
+ * IT WAS ALREADY SET. The next log says so in the line the write itself prints:
  *
- * WHAT TURNS THEM ON is one bit, and this file was missing it. Mainline's
- * u2_phy_instance_init() in phy-mtk-tphy.c is three writes under the comment
- * "switch to USB function, and enable usb pll": clear P2C_FORCE_UART_EN and
- * P2C_FORCE_SUSPENDM in U2PHYDTM0, clear P2C_RG_UART_EN in U2PHYDTM1, and set
- * PA0_RG_USB20_INTR_EN in USBPHYACR0. The transcribed recover() here has the
- * first two -- they are J36_PHY_R6B_FORCE_UART_EN, J36_PHY_R6A_FORCE and
- * J36_PHY_R6E_UART_EN, and they were quoted right -- and does not have the
- * third. USBPHYACR0 is byte 0x00 of this window and no routine in this file
- * has ever written it. The LK's savecurrent() clears that bit on its way out,
- * which is what a bootloader handing a port over is supposed to do, and the
- * kernel side of the handshake was never here to put it back.
+ *   PHY circuits enabled: USBPHYACR0 6e -> 6e (RG_USB20_INTR_EN was already set)
  *
- * j36_phy_clock_on() is that write, and it runs before any role sequence and
- * before musb_core sees the core at all.
+ * and every dump after it agrees -- USBPHYACR0 6e, SuspendM 1 from the link,
+ * L1INTM 0000000f once mediatek.c has unmasked the aggregator. The clock is
+ * there, the L1 aggregator is open, the interrupt is wired to the SPI the device
+ * tree names. Nothing has fired because nothing has HAPPENED: HM is still clear,
+ * so the root hub still has one port it never scans, so nothing on that port is
+ * ever reset or addressed and no event exists to raise. The write stays -- it is
+ * mainline's and it costs one byte -- but it was never the fault, and this file
+ * should stop saying it was.
  *
- * SUSPENDM is the other half and it is a knob rather than a decision. UTMI's
+ * ── WHAT THE FAULT IS: MT6592 HAS NO VBUS SENSING IP ─────────────────────────
+ *
+ * The stock MT6592 Android kernel settles it, in its own comment, in
+ * Reference/MT6592LK/.../usb20/usb20_host.c. musb_id_pin_work(), on the branch
+ * that becomes a host:
+ *
+ *	musb_platform_set_vbus(mtk_musb, 1);
+ *
+ *	// for no VBUS sensing IP
+ *	// wait VBUS ready
+ *	msleep(100);
+ *	// clear session
+ *	musb_writeb(mregs, MUSB_DEVCTL, devctl & ~MUSB_DEVCTL_SESSION);
+ *	// USB MAC OFF: VBUSVALID=0, AVALID=0, BVALID=0, SESSEND=1, IDDIG=X
+ *	USBPHY_SET8(0x6c, 0x10);
+ *	USBPHY_CLR8(0x6c, 0x2e);
+ *	USBPHY_SET8(0x6d, 0x3e);
+ *	// wait
+ *	msleep(5);
+ *	// restart session
+ *	musb_writeb(mregs, MUSB_DEVCTL, devctl | MUSB_DEVCTL_SESSION);
+ *	// USB MAC ON and Host Mode: VBUSVALID=1, AVALID=1, BVALID=1, SESSEND=0, IDDIG=0
+ *	USBPHY_CLR8(0x6c, 0x10);
+ *	USBPHY_SET8(0x6c, 0x2c);
+ *	USBPHY_SET8(0x6d, 0x3e);
+ *
+ *	musb_start(mtk_musb);
+ *
+ * Read the ORDER rather than the bytes. The valids are taken DOWN before the
+ * session is started and put back UP after it, so what the core sees while it is
+ * arbitrating is VBUS RISING. That is the whole trick, and the comment names the
+ * reason: this part has no VBUS sensing IP. DEVCTL's VBUS field is not a
+ * comparator on the pin unless the PHY is told to make it one -- it is whatever
+ * U2PHYDTM1 was last forced to -- and a level that was already high before the
+ * session began is not an event. MUSB latches HOSTMODE on the transition.
+ *
+ * Everything this file did was the other way round. force_host() asserted the
+ * valids and only THEN was SESSION set: at power-on, on every role change, and
+ * on all four host kicks. The core was handed a session that was already,
+ * statically, on a valid bus, found nothing to arbitrate, and stayed whatever it
+ * had been. Which is exactly what the log holds still at:
+ *
+ *   DEVCTL 19 at power-on   A-device, SESSION, VBUS above VBusValid, HM clear
+ *   DEVCTL 99 at every poll B-device, SESSION, VBUS above VBusValid, HM clear
+ *
+ * -- and 0x19 and 0x99 are not arbitrary numbers either. They are
+ * MUSB_QUIRK_A_DISCONNECT_19 and MUSB_QUIRK_B_DISCONNECT_99, the two values
+ * musb_core keeps named constants for, because they are what this core reads
+ * when a session is running and the far end was never seen.
+ *
+ * j36_musb_host_arm() is that sequence in that order, and every path that wants
+ * host mode goes through it now.
+ *
+ * TWO SMALLER THINGS THE STOCK SOURCE CORRECTS, both wrong here before:
+ *
+ *   B-VALID IS SET IN HOST MODE. 0x2c is AVALID | BVALID | VBUSVALID. This file
+ *   used to clear BVALID on the host path on the grounds that it belonged to the
+ *   other role; MediaTek asserts all three in both roles and moves only SESSEND
+ *   and IDDIG between them.
+ *
+ *   THE GAP IS 5 ms, not the hundred that was guessed at. The hundred belongs
+ *   BEFORE the whole thing, waiting for the rail -- and it is spent with the
+ *   session down, which is what J36_VBUS_RISE_MS was really fighting: musb's own
+ *   A-device VBUS timer cannot expire during a session that has not started.
+ *
+ * AND THERE IS A SECOND ARM, also stock, for when the first does not take.
+ * musb_session_restart() -- the same file's VBUS_ERROR recovery -- ends by
+ * RELEASING the four value forces instead of asserting them:
+ *
+ *	USBPHY_CLR8(0x6d, 0x3c);   // stop forcing avalid/bvalid/sessend/vbusvalid
+ *	USBPHY_CLR8(0x6c, 0x3c);
+ *	musb_writeb(mregs, MUSB_DEVCTL, devctl | MUSB_DEVCTL_SESSION);
+ *
+ * with force_iddig left on, so the role is still ours while the VBUS state comes
+ * from the PHY's own comparator on the actual pin -- which recover() enables, and
+ * which is what R1A bit 4 is. On this board DRVVBUS really is driven, so that
+ * comparator really should read valid. The host kick alternates the two: odd
+ * attempts force the valids, even attempts hand them back to the comparator. If
+ * a sensed attempt comes back "VBUS below SessionEnd" then the 5 V this driver
+ * believes it is sourcing is not reaching the PHY, and that is a different fault
+ * in a different place -- the load switch, the pad, or the pad's mode -- which is
+ * worth being able to tell apart from one boot log.
+ *
+ * SUSPENDM is a knob rather than a decision, and it stays one. UTMI's
  * SuspendM gates the PHY's clock output, and once the force bit is clear -- as
  * mainline leaves it, as recover() leaves it -- the link drives it, which means
  * MUSB does. MUSB holds it high while POWER.ENSUSPEND is 0, and POWER.ENSUSPEND
@@ -425,7 +492,14 @@
 #define J36_PHY_R06_TRIM_DEFAULT	0x68
 #define J36_PHY_R1A			0x1a
 #define J36_PHY_R1A_GPIO_CTL		0x80	/* rg_usb20_gpio_ctl */
-#define J36_PHY_R1A_BIT4		0x10
+/*
+ * RG_USB20_OTG_VBUSSCMP_EN -- the PHY's own comparator on the VBUS pin. The
+ * stock recover() sets it and savecurrent() clears it, and it is what makes the
+ * sensed arm in j36_musb_host_arm() mean anything: with the four value forces
+ * released, this comparator is the only thing driving AVALID, BVALID, SESSEND
+ * and VBUSVALID, and therefore the only thing DEVCTL's VBUS field reports.
+ */
+#define J36_PHY_R1A_VBUSCMP_EN		0x10
 #define J36_PHY_R1D			0x1d
 #define J36_PHY_R1D_BIT4		0x10
 #define J36_PHY_R22			0x22
@@ -467,6 +541,18 @@
 					 J36_PHY_R6D_FORCE_BVALID | \
 					 J36_PHY_R6D_FORCE_SESSEND | \
 					 J36_PHY_R6D_FORCE_VBUSVALID)
+/*
+ * FORCE_ALL without force_iddig, and the four RG_* values it covers: 0x3c in
+ * both bytes, which is what musb_session_restart() clears to hand the VBUS state
+ * back to the PHY's own comparator while keeping the role forced. See
+ * j36_phy_sense_vbus().
+ */
+#define J36_PHY_R6D_FORCE_VBUS		(J36_PHY_R6D_FORCE_AVALID | \
+					 J36_PHY_R6D_FORCE_BVALID | \
+					 J36_PHY_R6D_FORCE_SESSEND | \
+					 J36_PHY_R6D_FORCE_VBUSVALID)
+#define J36_PHY_R6C_VBUS_ALL		(J36_PHY_R6C_AVALID | J36_PHY_R6C_BVALID | \
+					 J36_PHY_R6C_SESSEND | J36_PHY_R6C_VBUSVALID)
 
 /* Device: ID high so the core is a B-device, the session valid and VBUS present,
  * which is the state a gadget plugged into a host is in. 0x6c ends at 0x2e and
@@ -476,13 +562,33 @@
 					 J36_PHY_R6C_BVALID | J36_PHY_R6C_VBUSVALID)
 #define J36_PHY_R6C_DEV_CLR		J36_PHY_R6C_SESSEND
 
-/* Host: ID low so the core is an A-device, A-session valid, VBUS present, and
- * the session explicitly not ended. B-valid belongs to the other role and is
- * cleared rather than left, so neither sequence depends on what the other one
- * wrote last. */
-#define J36_PHY_R6C_HOST_SET		(J36_PHY_R6C_AVALID | J36_PHY_R6C_VBUSVALID)
-#define J36_PHY_R6C_HOST_CLR		(J36_PHY_R6C_IDDIG | J36_PHY_R6C_BVALID | \
-					 J36_PHY_R6C_SESSEND)
+/*
+ * Host: ID low so the core is an A-device, all three valids asserted, session
+ * explicitly not ended. 0x6c ends at 0x2c, which is
+ *
+ *	USBPHY_CLR8(0x6c, 0x10);   // SESSEND = 0
+ *	USBPHY_SET8(0x6c, 0x2c);   // AVALID = BVALID = VBUSVALID = 1
+ *
+ * from the stock host switch, byte for byte. BVALID used to be in the CLR list
+ * here on the theory that it belonged to the other role; MediaTek asserts all
+ * three in both roles and moves only SESSEND and IDDIG between them.
+ */
+#define J36_PHY_R6C_HOST_SET		(J36_PHY_R6C_AVALID | J36_PHY_R6C_BVALID | \
+					 J36_PHY_R6C_VBUSVALID)		/* 0x2c */
+#define J36_PHY_R6C_HOST_CLR		(J36_PHY_R6C_IDDIG | J36_PHY_R6C_SESSEND)
+
+/*
+ * And the state the PHY is parked at IN BETWEEN, which is the step this file
+ * never had and the whole of the fix: MediaTek's "USB MAC OFF". Session ended,
+ * every valid deasserted, RG_IDDIG already low so the role the session is about
+ * to be arbitrated against is A. 0x6c gets 0x10 set and 0x2e cleared, exactly as
+ * the stock switch does it, and the session is started from here so that the
+ * valids RISE inside it. See j36_phy_park_idle() and the file header.
+ */
+#define J36_PHY_R6C_IDLE_SET		J36_PHY_R6C_SESSEND		/* 0x10 */
+#define J36_PHY_R6C_IDLE_CLR		(J36_PHY_R6C_IDDIG | J36_PHY_R6C_AVALID | \
+					 J36_PHY_R6C_BVALID | \
+					 J36_PHY_R6C_VBUSVALID)		/* 0x2e */
 
 #define J36_PHY_R6E			0x6e
 #define J36_PHY_R6E_UART_EN		0x01
@@ -510,26 +616,33 @@
 #define J36_VBUS_FALL_MS		60
 
 /*
- * And how long the rail is given to COME UP before DEVCTL.SESSION is set on it.
+ * And how long the RAIL is given to come up, before anything else in the arm
+ * happens at all.  This is MediaTek's own "wait VBUS ready" and it is their
+ * number: msleep(100), immediately after musb_platform_set_vbus(1) and before
+ * the session is touched.
  *
- * This one was missing and it is the whole of "VBUS_ERROR in a_idle".  musb, on
- * a session set as an A-device, starts otg_timer and expects the VBUS field to
- * reach AValid inside a hundred milliseconds; if it does not, it logs
+ * It used to be 50 and it used to sit in the wrong place -- between the role
+ * write and the session edge -- where it was fighting musb's A-device VBUS
+ * timer.  That timer gives the VBUS field about a hundred milliseconds to reach
+ * AValid after a session is granted, and missing it is
  *
  *     VBUS_ERROR in a_idle (80, <SessEnd), retry #0
  *
- * drops the session and retries.  The old order here set SESSION first and
- * raised the pad afterwards, and MVII's log shows the error arriving 71 ms after
- * the drop and 19 ms BEFORE the raise -- so the timer expired on a rail this
- * driver had not put back yet, once per role poll, for the whole uptime.  HM
- * never got set, the root port never scanned, and nothing enumerated.
- *
- * 50 ms is a load switch into a connector and whatever bulk is on the far side
- * of it.  The USB spec gives a hub 100 ms to bring a port up and this is the
- * same net with a smaller budget behind it, so the margin against musb's own
- * window is comfortable at both ends.
+ * which is what MVII's log was full of.  Spending the rise time BEFORE the
+ * session is started takes the whole race away: the timer cannot expire during a
+ * session that has not begun, and by the time one has, the load switch has been
+ * closed for a tenth of a second.
  */
-#define J36_VBUS_RISE_MS		50
+#define J36_VBUS_RISE_MS		100
+
+/*
+ * And the gap between "USB MAC OFF" and the session restart, which is the one
+ * delay in the arm that is load-bearing rather than generous: it is how long the
+ * core is given to observe a dead bus before it is asked to start a session on
+ * one.  Five milliseconds, because five is what the stock host switch sleeps
+ * there -- this file guessed a hundred before the source was in the tree.
+ */
+#define J36_PHY_MAC_OFF_MS		5
 
 /*
  * And how long DEVCTL.SESSION is held DOWN in between, which is the other half
@@ -560,18 +673,20 @@
  */
 #define J36_MUSB_SESSION_GAP_MS		20
 
-/* How many times the poll will re-drive ID and restart a session that came up
- * without HM before it gives up and says so once. Four is a retry rather than a
- * loop: each attempt costs about a third of a second of sleeps inside the poll
- * worker and they are spread over the first fifteen seconds of uptime, and if
- * the core will not take host mode after five the fault is not the edge.
+/* How many times the poll will re-arm a session that came up without HM before
+ * it gives up and says so once. Four is a retry rather than a loop: each attempt
+ * costs about a third of a second of sleeps inside the poll worker and they are
+ * spread over the first fifteen seconds of uptime, and if the core will not take
+ * host mode after four full stock arms the fault is not the edge.
  *
- * It was two while the kick only bounced SESSION, which changed nothing the core
- * could act on, so more attempts would only have repeated the same non-event.
- * They do something different now -- see j36_phy_rearm_host() -- and one of the
- * things they may have to outlast is MUSB's own A-device connect timeout, which
- * drops the session about a second after it is granted if no connect interrupt
- * arrives. Giving up while that race is still open is giving up too early. */
+ * Four is also the smallest count that runs BOTH arms twice, which matters now
+ * that the attempts alternate: odd ones force the valids and even ones hand them
+ * to the PHY's comparator, so a board that fails every attempt still produces one
+ * measured reading of the actual VBUS pin per pair. See j36_musb_host_kick() and
+ * j36_phy_sense_vbus(). One of the things the retries may also have to outlast is
+ * MUSB's own A-device connect timeout, which drops the session about a second
+ * after it is granted if no connect interrupt arrives; giving up while that race
+ * is still open is giving up too early. */
 #define J36_MUSB_HM_KICKS		4u
 
 /*
@@ -1022,23 +1137,15 @@ static void j36_phy_clock_off(struct j36_usb_phy *p)
 /*
  * ── IS THE ROLE ALREADY THE ONE BEING ASKED FOR? ─────────────────────────────
  *
- * MUSB latches A-or-B from the ID input at the instant DEVCTL.SESSION goes 0->1,
- * and the ID input is these two registers. Rewriting them with the values they
- * already hold is not free: the sequence is clr, set, enable, so with the force
- * bits already live the outputs move twice before they land, and a session edge
- * placed inside that window is latched against a role that is still settling.
+ * One caller now, j36_phy_force_device(), and it is the only one that wants this
+ * question asked. Device is the resting state -- it is the tail of both stock
+ * sequences, so the PHY is already in it after recover() -- and the role poll
+ * would otherwise rewrite it every three seconds for the life of the board.
  *
- * That is the difference between the boot that reads DEVCTL 19 and the one that
- * reads 99. The 19 came from a role written 50 ms before the edge; every 99 came
- * from a role written 800 us before it -- once by phy_set_mode(), which mediatek.c
- * calls immediately before musb_start(), and once per host kick. So the rewrite
- * is skipped when there is nothing to rewrite, and paid for with a real settle
- * when there is. With both, power_on came up DEVCTL 3d: session, HM, VBUS valid
- * and LSDEV -- host mode, with a low-speed mouse already powered on the wire.
- *
- * The skip is right for every caller except the one that needs the ID line to
- * MOVE rather than to read correctly, and that one does not come through here:
- * see j36_phy_rearm_host(), which is what the host kick calls and why.
+ * The host path deliberately does NOT skip. It used to, on the argument that
+ * rewriting live force bits moves the outputs twice; the outputs moving is the
+ * whole of what makes the core arbitrate, so there the argument was backwards.
+ * See j36_musb_host_arm().
  */
 static bool j36_phy_role_is(struct j36_usb_phy *p, u8 set, u8 clr)
 {
@@ -1065,16 +1172,51 @@ static void j36_phy_force_device(struct j36_usb_phy *p)
 	msleep(J36_PHY_ROLE_SETTLE_MS);
 }
 
-/* Host: A-device, A-session valid, VBUS present, session not ended -- the one
- * that decides whether anything ever enumerates. force_iddig is in FORCE_ALL
- * and it has to be: without it the core reads the ID pin, which on a board with
- * no OTG cable floats to B, which is what DEVCTL reported for as long as the
- * transcribed sequence ran. */
+/*
+ * ── USB MAC OFF: THE HALF OF THE HOST SWITCH THIS FILE NEVER HAD ─────────────
+ *
+ * Session ended, every valid deasserted, RG_IDDIG low so the role is already A,
+ * and all five forces live. Byte for byte the stock switch's
+ *
+ *	USBPHY_SET8(0x6c, 0x10);
+ *	USBPHY_CLR8(0x6c, 0x2e);
+ *	USBPHY_SET8(0x6d, 0x3e);
+ *
+ * and in that order: assert "the session ended" BEFORE taking the valids away,
+ * so the PHY never briefly reports a live bus with no session on it.
+ *
+ * On its own this is a port that cannot do anything, which is the point. It is
+ * only ever entered with SESSION down and left within five milliseconds, and
+ * what it buys is that whatever comes up next comes up as an EVENT. See
+ * j36_musb_host_arm().
+ */
+static void j36_phy_park_idle(struct j36_usb_phy *p)
+{
+	j36_phy_clock_on(p);
+	j36_phy_set(p, J36_PHY_R6C, J36_PHY_R6C_IDLE_SET);
+	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_IDLE_CLR);
+	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_ALL);
+	usleep_range(J36_PHY_SETTLE_US, J36_PHY_SETTLE_US * 2);
+}
+
+/*
+ * Host: A-device, all three valids asserted, session not ended -- the stock
+ * switch's "USB MAC ON and Host Mode", and the write that has to land AFTER
+ * DEVCTL.SESSION rather than before it.
+ *
+ * force_iddig is in FORCE_ALL and has to be: without it the core reads the ID
+ * pin, which on a board with no OTG cable floats to B.
+ *
+ * NOT idempotent, and that is deliberate. This used to skip itself when the PHY
+ * already read host-forced, on the argument that rewriting live force bits moves
+ * the outputs twice near a session edge. That argument was upside down: moving
+ * the outputs is the entire job. The caller parks the PHY at idle first, so
+ * every call from the arm has real work to do anyway, and the one caller that
+ * does not -- .set_mode -- is better off writing than skipping.
+ */
 static void j36_phy_force_host(struct j36_usb_phy *p)
 {
 	j36_phy_clock_on(p);
-	if (j36_phy_role_is(p, J36_PHY_R6C_HOST_SET, J36_PHY_R6C_HOST_CLR))
-		return;
 	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_HOST_CLR);
 	j36_phy_set(p, J36_PHY_R6C, J36_PHY_R6C_HOST_SET);
 	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_ALL);
@@ -1083,50 +1225,28 @@ static void j36_phy_force_host(struct j36_usb_phy *p)
 }
 
 /*
- * ── RE-DRIVE THE ID INPUT, RATHER THAN ASSERT IT ─────────────────────────────
+ * ── THE SAME STEP, BUT MEASURED INSTEAD OF ASSERTED ──────────────────────────
  *
- * force_host() above is idempotent by design and skips itself when the PHY is
- * already host-forced, which is right everywhere except here. The core does not
- * read ID; it SAMPLES it, and what it samples on is the ID line moving. Rewrite
- * U2PHYDTM1 with the values it already holds and not one bit changes, so there
- * is nothing for the core to sample and a session started afterwards is latched
- * against whatever the core last decided.
+ * musb_session_restart()'s tail: release the four VALUE forces so AVALID,
+ * BVALID, SESSEND and VBUSVALID come from the PHY's own comparator on the VBUS
+ * pin, keeping force_iddig so the role stays this driver's. The comparator is
+ * R1A bit 4, which recover() enables; it is re-asserted here because
+ * savecurrent() clears it and a port that has been powered off and on again
+ * would otherwise release the forces onto a comparator that is not running.
  *
- * Which is exactly the shape of the boot in front of me. power_on's sequence ran
- * with the PHY still device-forced from recover(), so force_host() drove IDDIG
- * 1 -> 0 for real, and the core came up as it should: DEVCTL 3d -- session, HM,
- * VBUS valid, LSDEV, a low-speed mouse already on the wire and powered. Then
- * musb_core's own bring-up ran, musb_generic_disable() wrote DEVCTL = 0, and
- * musb_start() set SESSION again from the hub thread a few milliseconds later.
- * By then the PHY had been host-forced for a quarter of a second and held
- * perfectly still, so there was no edge, the core arbitrated from a state
- * machine that had just been reset, and it came back a B-device: DEVCTL 99.
- * Every session bounce after that read 99 as well, because bouncing SESSION
- * asks the core to arbitrate again without giving it anything new to arbitrate
- * on.
- *
- * So this puts the PHY through device and back to host: IDDIG genuinely high,
- * settle, then genuinely low, which is the same 1 -> 0 the working power_on
- * sequence produced. It is the whole of the difference between the two, and it
- * is unconditional -- the skip in force_host() is what has to be bypassed.
- *
- * Safe to run with 5 V up and SESSION down, which is how the caller leaves it:
- * the core has no session to be a peripheral of, so the device half is fifty
- * milliseconds of a line held high and nothing acting on it.
+ * What this is for: the forced arm tells the core that VBUS rose whether it did
+ * or not, so a forced arm that fails proves only that the core would not take
+ * host mode. A sensed arm that fails, with "VBUS below SessionEnd" in the
+ * readout, says something quite different and much more useful -- that the 5 V
+ * this driver believes it is sourcing is not arriving at the PHY at all, which
+ * is a fault in the load switch or the pad and not in any of this.
  */
-static void j36_phy_rearm_host(struct j36_usb_phy *p)
+static void j36_phy_sense_vbus(struct j36_usb_phy *p)
 {
 	j36_phy_clock_on(p);
-
-	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_DEV_CLR);
-	j36_phy_set(p, J36_PHY_R6C, J36_PHY_R6C_DEV_SET);
-	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_ALL);
-	usleep_range(J36_PHY_SETTLE_US, J36_PHY_SETTLE_US * 2);
-	msleep(J36_PHY_ROLE_SETTLE_MS);
-
-	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_HOST_CLR);
-	j36_phy_set(p, J36_PHY_R6C, J36_PHY_R6C_HOST_SET);
-	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_ALL);
+	j36_phy_set(p, J36_PHY_R1A, J36_PHY_R1A_VBUSCMP_EN);
+	j36_phy_clr(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_VBUS);
+	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_VBUS_ALL);
 	usleep_range(J36_PHY_SETTLE_US, J36_PHY_SETTLE_US * 2);
 	msleep(J36_PHY_ROLE_SETTLE_MS);
 }
@@ -1161,7 +1281,7 @@ static void j36_phy_recover(struct j36_usb_phy *p)
 	j36_phy_wr(p, J36_PHY_R06,
 		   (j36_phy_rd(p, J36_PHY_R06) & J36_PHY_R06_TRIM_KEEP) |
 		   J36_PHY_R06_TRIM_DEFAULT);
-	j36_phy_set(p, J36_PHY_R1A, J36_PHY_R1A_BIT4);
+	j36_phy_set(p, J36_PHY_R1A, J36_PHY_R1A_VBUSCMP_EN);
 	usleep_range(J36_PHY_SETTLE_US, J36_PHY_SETTLE_US * 2);
 	j36_phy_force_device(p);
 }
@@ -1568,6 +1688,78 @@ static u8 j36_musb_settle(struct j36_usb_phy *p)
 }
 
 /*
+ * ── THE HOST ARM, IN MEDIATEK'S ORDER ────────────────────────────────────────
+ *
+ * Every path in this file that wants host mode goes through here, and the order
+ * of the six steps is the whole point -- see the file header for the stock
+ * musb_id_pin_work() it is transcribed from and the comment in it that explains
+ * why ("for no VBUS sensing IP").
+ *
+ * The short version: MT6592's MUSB has no comparator of its own on the VBUS pin.
+ * DEVCTL's VBUS field is whatever U2PHYDTM1 was last forced to, so a rail that
+ * was already high before the session started is not something the core can
+ * arbitrate on -- and HOSTMODE is latched on a transition, not on a level. So
+ * the valids are taken DOWN, the session is started against a dead bus, and the
+ * valids are brought back UP inside it. That rise is the event, and it is the
+ * one thing this driver never gave the core in three boots.
+ *
+ * `sensed' picks which of the two stock ways step 6 happens. false forces the
+ * valids high (musb_id_pin_work()); true releases the four value forces so the
+ * PHY's own comparator drives them from the actual pin
+ * (musb_session_restart()). Both keep force_iddig, so the role stays ours
+ * either way. See j36_phy_sense_vbus() for why the second is worth having.
+ *
+ * Returns DEVCTL after the settle, or 0 when there is no MUSB window mapped --
+ * in which case the PHY half still ran and only the readout is missing.
+ *
+ * Call with p->lock held.
+ */
+static u8 j36_musb_host_arm(struct j36_usb_phy *p, bool sensed)
+{
+	j36_phy_clock_on(p);
+
+	/*
+	 * 1. The rail first, and MediaTek's hundred milliseconds to come up on.
+	 *    Spent with the session still down, which is what keeps musb's
+	 *    A-device VBUS timer from ever seeing a rail that is not there yet.
+	 */
+	j36_usb_phy_vbus(p, true);
+	msleep(J36_VBUS_RISE_MS);
+
+	/*
+	 * 2. End whatever session is running -- the bootloader's at boot,
+	 *    musb_start()'s afterwards -- and take the peripheral pull-up down
+	 *    with it, so there is one question on the wire and not two.
+	 */
+	j36_musb_stand_down(p);
+
+	/* 3. USB MAC OFF. The step that was missing. */
+	j36_phy_park_idle(p);
+
+	/* 4. The stock five milliseconds of a visibly dead bus. */
+	msleep(J36_PHY_MAC_OFF_MS);
+
+	/*
+	 * 5. Start the session while the core still sees that dead bus, so what
+	 *    happens next is an edge it can act on.
+	 */
+	j36_musb_session(p, true);
+
+	/* 6. And bring VBUS up inside the session. */
+	if (sensed)
+		j36_phy_sense_vbus(p);
+	else
+		j36_phy_force_host(p);
+
+	/*
+	 * 7. HM is not set by the store that set SESSION; it is set by the core
+	 *    once it has sampled ID and the valids over its own clock. Give it
+	 *    the window before calling the result anything.
+	 */
+	return p->musb ? j36_musb_settle(p) : 0;
+}
+
+/*
  * ── DID IT TAKE? ─────────────────────────────────────────────────────────────
  *
  * HM is set by the core, not by anything here, and it is the only bit that says
@@ -1598,6 +1790,7 @@ static u8 j36_musb_settle(struct j36_usb_phy *p)
  */
 static void j36_musb_host_kick(struct j36_usb_phy *p)
 {
+	bool sensed;
 	u8 devctl;
 
 	if (!p->musb || !musb_session || p->hm_gave_up)
@@ -1619,6 +1812,15 @@ static void j36_musb_host_kick(struct j36_usb_phy *p)
 
 	p->hm_kicks++;
 	/*
+	 * Odd attempts force the valids, even attempts hand them to the PHY's own
+	 * comparator on the pin. Both are stock -- musb_id_pin_work() and
+	 * musb_session_restart() -- and alternating them means one boot answers
+	 * two different questions: whether the core will take host mode at all,
+	 * and whether the 5 V this driver thinks it is sourcing is really there.
+	 */
+	sensed = !(p->hm_kicks & 1u);
+
+	/*
 	 * A/B is read out rather than asserted. This line used to say "A-device"
 	 * whatever DEVCTL held, and it said it over a 99 -- BDEVICE set -- in three
 	 * consecutive boots, which hid the whole of the fault: the core had not
@@ -1626,33 +1828,37 @@ static void j36_musb_host_kick(struct j36_usb_phy *p)
 	 * way round and settled there.
 	 */
 	dev_info(p->dev,
-		 "DEVCTL %02x: the core is a %s with %s and HM clear -- re-driving ID and restarting the session so it arbitrates the role again (attempt %u of %u)\n",
+		 "DEVCTL %02x: the core is a %s with %s and HM clear -- taking VBUS down inside the PHY, restarting the session against the dead bus and bringing VBUS back up %s, which is the rise MUSB latches host mode on (attempt %u of %u)\n",
 		 devctl,
 		 devctl & J36_MUSB_DEVCTL_BDEVICE ? "B-device" : "A-device",
 		 devctl & J36_MUSB_DEVCTL_SESSION ? "a session" : "no session",
+		 sensed ? "from the PHY's own comparator on the pin"
+			: "forced",
 		 p->hm_kicks, J36_MUSB_HM_KICKS);
 
-	j36_musb_stand_down(p);
-	/*
-	 * The whole point of the kick, and the only thing it has that a bare
-	 * session bounce did not: an ID line that MOVES. See j36_phy_rearm_host().
-	 */
-	j36_phy_rearm_host(p);
-	/*
-	 * Same gap decide_role() leaves between the role and the edge. There it is
-	 * nominally VBUS rise time; here VBUS never dropped, so it is purely the
-	 * settle the core needs between sampling ID and being asked to act on it.
-	 */
-	msleep(J36_VBUS_RISE_MS);
-	j36_musb_session(p, true);
+	devctl = j36_musb_host_arm(p, sensed);
 
-	devctl = j36_musb_settle(p);
 	dev_info(p->dev,
-		 "after the restart DEVCTL reads %02x: the core is %s\n",
+		 "after the arm DEVCTL reads %02x [%s, VBUS %s]: the core is %s\n",
 		 devctl,
+		 devctl & J36_MUSB_DEVCTL_BDEVICE ? "B-device" : "A-device",
+		 j36_musb_vbus_str(devctl),
 		 devctl & J36_MUSB_DEVCTL_HM
-			? "the HOST"
+			? "the HOST -- the root port can scan now"
 			: "still not the host, after being given the full settle window");
+
+	/*
+	 * And the one reading the sensed arm exists for. With the value forces
+	 * released the VBUS field is a comparator on the actual pin, so a low one
+	 * here is not a role problem at all: DRVVBUS is high, this driver believes
+	 * it is sourcing 5 V, and the PHY cannot see it.
+	 */
+	if (sensed && !(devctl & J36_MUSB_DEVCTL_HM) &&
+	    ((devctl & J36_MUSB_DEVCTL_VBUS) >> J36_MUSB_DEVCTL_VBUS_SHIFT) <
+	    J36_MUSB_VBUS_AVALID)
+		dev_warn(p->dev,
+			 "and it was measured, not forced: with DRVVBUS pad %d driven high the PHY's own comparator still reads VBUS %s, so the 5 V is not reaching the port -- look at the load switch and the pad, not at the role\n",
+			 p->vbus_pin, j36_musb_vbus_str(devctl));
 }
 
 /*
@@ -1871,49 +2077,40 @@ apply:
 
 	if (host) {
 		/*
-		 * END WHATEVER SESSION IS RUNNING BEFORE STARTING THIS ONE.
+		 * THE WHOLE HOST BRING-UP IS ONE CALL NOW, and it is MediaTek's
+		 * own order rather than this file's: rail up, wait, end the
+		 * session, park the PHY at "no VBUS", start the session against
+		 * that, and only then bring the valids up. See
+		 * j36_musb_host_arm() and the file header.
 		 *
-		 * At boot the session running is the bootloader's, taken out as a
-		 * B-device, and MUSB fixes the role when a session begins. Setting
-		 * a bit that is already set is not a beginning -- see
-		 * J36_MUSB_SESSION_GAP_MS -- so without this the core stayed the
-		 * peripheral the LK made it, HM never came up, and the root hub
-		 * had a port it never scanned. On every later role change the same
-		 * call is what the stock host switch does, for the same reason.
+		 * What used to be here asserted the valids first and set SESSION
+		 * afterwards, so the core was handed a bus that had been
+		 * statically valid the whole time and had nothing to arbitrate
+		 * on. It answered with DEVCTL 19 at power-on and 99 at every
+		 * poll after, HM clear in both, for three consecutive boots.
 		 */
-		j36_musb_stand_down(p);
-		j36_phy_force_host(p);
-		/*
-		 * VBUS, THEN THE RAIL'S RISE TIME, THEN THE SESSION.  The other
-		 * order is what produced "VBUS_ERROR in a_idle" once per poll:
-		 * musb starts its A-device timer the moment SESSION goes in and
-		 * gives the VBUS field about a hundred milliseconds to reach
-		 * AValid, and this driver was raising the pad ninety
-		 * milliseconds later.  Raise first and the field is already
-		 * where the timer wants it, so the session comes up, HM is set
-		 * by the core, the root port scans, and a mouse or a hub
-		 * enumerates.
-		 */
-		j36_usb_phy_vbus(p, true);
-		msleep(J36_VBUS_RISE_MS);
-		j36_musb_session(p, true);
+		u8 devctl = j36_musb_host_arm(p, false);
+
 		/*
 		 * And say whether it took, here rather than only from the poll
-		 * three seconds later. This is the reading that matters -- a
-		 * session started as an A-device on a good rail either becomes
-		 * host or the core has no clock -- and the poll's version of it
-		 * used to be the first anyone saw.
+		 * three seconds later.
+		 *
+		 * NOT taking here is not yet a fault, and this line no longer
+		 * pretends otherwise: power_on runs inside musb_platform_init(),
+		 * and musb_generic_disable() writes DEVCTL = 0 a moment later
+		 * and musb_start() sets SESSION again from the hub thread with
+		 * the PHY holding perfectly still. So whatever is armed here is
+		 * torn down before anything can use it, and the arm that has to
+		 * win is the one j36_musb_host_kick() runs from the first role
+		 * poll, after all of that has happened.
 		 */
-		if (p->musb && musb_session) {
-			u8 devctl = j36_musb_settle(p);
-
+		if (p->musb && musb_session)
 			dev_info(p->dev,
-				 "session started as an A-device: DEVCTL %02x, the core is %s\n",
-				 devctl,
+				 "session started as an A-device: DEVCTL %02x [VBUS %s], the core is %s\n",
+				 devctl, j36_musb_vbus_str(devctl),
 				 devctl & J36_MUSB_DEVCTL_HM
 					? "the HOST -- the root port can scan now"
-					: "NOT the host");
-		}
+					: "NOT the host yet; musb_start() has not run, so the poll arms it again once it has");
 	} else {
 		/* VBUS first. A B-device that went on driving 5 V would be
 		 * fighting whatever just plugged in, and on this board the
@@ -2152,9 +2349,18 @@ static int j36_usb_phy_set_mode(struct phy *phy, enum phy_mode mode, int submode
 				"set_mode(host) noted; the role follows the port\n");
 			break;
 		}
+		/*
+		 * The full arm, not just the role write. mediatek.c calls this
+		 * from the tail of mtk_musb_init(), which is the last thing to
+		 * touch the PHY before musb_start() -- exactly where the stock
+		 * driver puts its own arm. It will be undone by
+		 * musb_generic_disable()'s DEVCTL = 0 like everything else at
+		 * this stage, and the poll's kick is what finally makes it
+		 * stick, but arming in the stock place costs a third of a second
+		 * of boot and is the one chance to get it before the hub thread.
+		 */
 		p->role_host = 1;
-		j36_phy_force_host(p);
-		j36_usb_phy_vbus(p, true);
+		j36_musb_host_arm(p, false);
 		break;
 	case PHY_MODE_USB_DEVICE:
 		/*
