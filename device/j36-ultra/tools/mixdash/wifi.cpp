@@ -1197,14 +1197,14 @@ void WifiPage::forgetProfilesFor(const QString &ssid)
     if (ssid.isEmpty())
         return;
 
-    refreshProfiles();
+    syncProfiles();
     for (int i = 0; i < m_profiles.size(); ++i) {
         if (m_profiles[i].ssid != ssid && m_profiles[i].name != ssid)
             continue;
         nmcli(QStringList() << "connection" << "delete" << "uuid" << m_profiles[i].uuid, 8000);
     }
     m_ssidCache.clear();
-    refreshProfiles();
+    syncProfiles();
 }
 
 void WifiPage::connectTo(const Ap &ap)
@@ -1218,9 +1218,18 @@ void WifiPage::connectTo(const Ap &ap)
         return;
     }
 
-    if (ap.saved && !ap.uuid.isEmpty()) {
+    /*
+     * A saved profile is used as saved -- EXCEPT for the one whose key
+     * NetworkManager has just told us it does not accept.  Without that exception
+     * the page is a dead end: a profile with a wrong passphrase is still a saved
+     * profile, so this branch would run `connection up' against the same wrong key
+     * every time the row was pressed and there would be no way left to type a
+     * different one.  Falling through asks again and rewrites the profile.
+     */
+    if (ap.saved && !ap.uuid.isEmpty() && ap.ssid != m_badKeySsid) {
         /* The key is already in the profile, which is where it belongs and where
          * autoconnect will find it after the next reboot.  Just switch. */
+        m_pending = ap;
         startAction(QStringList() << "--wait" << "45" << "connection" << "up"
                                   << "uuid" << ap.uuid << "ifname" << m_iface,
                     tr("joining %1").arg(ap.ssid));
@@ -1302,10 +1311,16 @@ void WifiPage::connectWithKey(const Ap &ap, const QString &passphrase)
     m_ssidCache.clear();
     refreshProfiles();
 
+    /* A fresh key: whatever was refused before is no longer what is on the card. */
+    if (m_badKeySsid == ap.ssid)
+        m_badKeySsid.clear();
+    m_pending = ap;
+
     startAction(QStringList() << "--wait" << "45" << "connection" << "up"
                               << "uuid" << uuid << "ifname" << m_iface,
                 tr("joining %1").arg(ap.ssid));
     m_scanAge.restart();
+    pumpQueries();
 }
 
 /* ── the list ────────────────────────────────────────────────────────────── */
@@ -1433,6 +1448,14 @@ void WifiPage::rebuild()
             detail += "  " + tr("saved");
         r.detail = detail;
 
+        /* The saved key on this one was refused, so pressing the row will ask for
+         * a new one rather than trying the old one again.  Say so on the row: a
+         * network that is "saved" and does not connect is otherwise inexplicable. */
+        if (!m_badKeySsid.isEmpty() && ap.ssid == m_badKeySsid) {
+            r.detail = tr("the saved passphrase was refused -- press to retype it");
+            r.accent = Theme::orange();
+        }
+
         if (ap.current) {
             if (m_deviceState == StateActivated && !m_address.isEmpty()) {
                 r.badge = m_address;
@@ -1546,10 +1569,11 @@ void WifiPage::onActivated(int index)
         return;
     }
     case RowRescan:
-        nmcli(QStringList() << "device" << "wifi" << "rescan" << "ifname" << m_iface, 3000);
+        enqueue(QueryRescan);
+        enqueue(QueryScan);
         m_scanAge.restart();
         m_note.clear();
-        refreshScan();
+        pumpQueries();
         rebuild();
         return;
     case RowDisconnect:
@@ -1567,9 +1591,12 @@ void WifiPage::onActivated(int index)
     case RowForget: {
         const QString ssid = m_ssid;
         forgetProfilesFor(ssid);
+        if (m_badKeySsid == ssid)
+            m_badKeySsid.clear();
         m_note = tr("forgot %1").arg(ssid);
         refreshStatus();
         refreshScan();
+        pumpQueries();
         rebuild();
         return;
     }
@@ -1604,9 +1631,11 @@ void WifiPage::onActivated(int index)
         m_note = tr("starting NetworkManager");
         update();
         QTimer::singleShot(3000, this, [this]() {
+            m_managerUp = true;   /* so the profile and scan queries are not skipped */
             refreshStatus();
             refreshProfiles();
             refreshScan();
+            pumpQueries();
             rebuild();
         });
         return;
