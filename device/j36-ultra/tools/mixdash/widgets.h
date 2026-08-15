@@ -26,6 +26,7 @@
 
 #include <QColor>
 #include <QPair>
+#include <QPixmap>
 #include <QRect>
 #include <QString>
 #include <QStringList>
@@ -51,7 +52,8 @@ enum Glyph {
     GlyphImage,
     GlyphChip,
     GlyphInfo,
-    GlyphGlobe
+    GlyphGlobe,
+    GlyphDrive
 };
 
 void paintGlyph(QPainter &p, const QRectF &box, int glyph, const QColor &ink);
@@ -186,6 +188,10 @@ struct AppEntry {
      * nothing gives it back, so the warning has to come before the launch -- once
      * the child has the panel, no toast of ours can be seen. */
     bool confirm = false;
+    /* This card is a mounted USB volume, so its long-press menu has Eject on it.
+     * A flag rather than a test on the key, because the grid is not the place that
+     * knows what a volume is -- see volumes.h and Dashboard::rebuildApps. */
+    bool ejectable = false;
 };
 
 /*
@@ -316,6 +322,9 @@ signals:
     /* The arrangement changed and should be written down.  The shell owns
      * Settings; this widget owns the order.  Carries the keys in slot order. */
     void orderChanged(const QStringList &keys);
+    /* Eject was chosen from a card's long-press menu.  The grid knows the gesture
+     * and nothing else: unmounting is the shell's, through volumes.h. */
+    void ejectRequested(int index);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -392,6 +401,52 @@ private:
     void paintCard(QPainter &p, const AppEntry &e, const QRectF &r, bool selected,
                    qreal lift);
 
+    /*
+     * THE CARD ART CACHE, and why a grid that only moves nine rectangles needed
+     * one.
+     *
+     * paintCard is not cheap: a soft shadow is six antialiased rounded strokes, the
+     * body is three gradient fills, the foot needs a clip path, the glyph is a
+     * handful of paths, and the title is measured, elided and shaped -- and none of
+     * that is cached by Qt between calls.  At rest it happens twice a selection
+     * move and nobody notices.  DURING A PLACEMENT IT HAPPENS TO EVERY CARD BETWEEN
+     * THE TWO SLOTS, thirty times a second, on a Cortex-A7 with no 2D engine: the
+     * cards are sliding, so every one of them is dirty on every frame.  That is the
+     * choppiness.
+     *
+     * A sliding card is the same picture at a different place, so the picture is
+     * drawn once into a pixmap and the frames blit it.  Only two cards are ever
+     * drawn live: the selected one, whose outline differs, and the carried one,
+     * which is also scaled by its lift.  Everything else is a blit.
+     *
+     * The pixmap is the card plus kArtPad on each side, because a card draws
+     * outside its own rectangle -- see dirtyRect(), which uses the same margin for
+     * the same reason.
+     *
+     * INVALIDATION IS THE PART THAT BITES.  The art depends on the entry and on the
+     * slot size, so setEntries() and resizeEvent() drop the lot; moveEntry()
+     * permutes the cache in step with m_entries rather than dropping it, which is
+     * the whole point -- the placement animation must not be the thing that rebuilds
+     * every card it is animating.
+     */
+    const QPixmap &cardArt(int i);
+    void invalidateArt();
+
+    /* ── the long-press menu ──────────────────────────────────────────────── */
+    enum MenuAction {
+        MenuOpen = 0,
+        MenuMove,
+        MenuEject
+    };
+
+    void openMenu(int index);
+    void closeMenu();
+    void runMenu();
+    QVector<int> menuActions() const;
+    QRectF menuRect() const;
+    QRectF menuRowRect(int row) const;
+    void paintMenu(QPainter &p);
+
     QVector<AppEntry> m_entries;
     QVector<Motion> m_motion;
     int m_index = 0;
@@ -423,6 +478,14 @@ private:
     /* A grid with more cards than fit scrolls rather than paging.  Zero, and
      * unreachable, until something is installed that makes it taller. */
     int m_scroll = 0;
+
+    /* Parallel to m_entries.  A null pixmap is "not drawn yet", which is how a
+     * cleared cache and a cache with a hole in it are the same thing. */
+    QVector<QPixmap> m_art;
+
+    /* -1 when no menu is open; otherwise the card it belongs to. */
+    int m_menu = -1;
+    int m_menuRow = 0;
 };
 
 /*

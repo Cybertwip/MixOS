@@ -32,6 +32,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QRegion>
+#include <QtMath>
 #include <QResizeEvent>
 #include <QShowEvent>
 #include <QTimer>
@@ -381,6 +382,19 @@ void paintGlyph(QPainter &p, const QRectF &box, int glyph, const QColor &ink)
                              ball.width() * 0.52, ball.height()));
         break;
     }
+    case GlyphDrive: {
+        /* A memory stick, seen from the side: the body, the metal shell at the top
+         * and the seam between the two.  Not a disk platter and not the three-prong
+         * USB trident -- the first is not what anybody plugs into this thing, and
+         * the second is the port rather than what is in it. */
+        const QRectF body(x + w * 0.28, y + h * 0.34, w * 0.44, h * 0.52);
+        p.drawRoundedRect(body, w * 0.08, w * 0.08);
+        const QRectF shell(x + w * 0.36, y + h * 0.14, w * 0.28, h * 0.20);
+        p.drawRoundedRect(shell, w * 0.05, w * 0.05);
+        p.drawLine(QPointF(body.left() + w * 0.06, y + h * 0.52),
+                   QPointF(body.right() - w * 0.06, y + h * 0.52));
+        break;
+    }
     default:
         break;
     }
@@ -665,6 +679,17 @@ const qreal kDropKick = 9.0;
  * which is how anybody ever finds out that a grid can be rearranged. */
 const int kHoldMs = 500;
 
+/* The margin the card art cache leaves around a card, and it is dirtyRect()'s
+ * twelve for dirtyRect()'s reasons: a card draws outside its own rectangle, and a
+ * cached picture that stops at the card's edge is a card with its shadow cut off. */
+const int kArtPad = 12;
+
+/* The long-press menu: one row this tall, this wide, on a panel with this much
+ * padding.  Sized for a thumb on a 640x480 panel rather than for a pointer. */
+const int kMenuRowH = 30;
+const int kMenuW = 168;
+const int kMenuPad = 6;
+
 } /* namespace */
 
 CardGrid::CardGrid(QWidget *parent)
@@ -763,7 +788,9 @@ void CardGrid::setEntries(const QVector<AppEntry> &entries)
     m_carryFrom = -1;
     m_okArmed = false;
     m_hold->stop();
+    m_menu = -1;
     m_scroll = qBound(0, m_scroll, maxScroll());
+    invalidateArt();
 
     update();
     emit indexChanged(m_index);
@@ -799,6 +826,8 @@ QString CardGrid::title() const
         return tr("Moving %1 -- A to place, B to cancel")
             .arg(m_entries[m_carry].title);
     }
+    if (m_menu >= 0 && m_menu < m_entries.size())
+        return m_entries[m_menu].title + tr(" -- A to choose, B to close");
 
     const QString t = currentTitle();
     if (m_pageTitle.isEmpty())
@@ -1135,15 +1164,68 @@ void CardGrid::moveEntry(int from, int to)
 
     const AppEntry card = m_entries[from];
     const Motion motion = m_motion.value(from);
+    const QPixmap art = m_art.value(from);
     m_entries.remove(from);
     if (from < m_motion.size())
         m_motion.remove(from);
+    if (from < m_art.size())
+        m_art.remove(from);
     m_entries.insert(to, card);
     m_motion.insert(qMin(to, m_motion.size()), motion);
+    /* The art moves WITH the card, which is the whole reason the cache is a vector
+     * parallel to m_entries rather than a map keyed by slot: a placement that
+     * dropped the cache would rebuild every card it is animating, thirty times a
+     * second, which is the cost this was written to remove. */
+    m_art.insert(qMin(to, m_art.size()), art);
 
-    /* Every card between the two ends has a new slot to head for. */
+    /*
+     * Every card between the two ends has a new slot to head for, and every one of
+     * them is showing a different card than it was a moment ago -- so the range has
+     * to be marked now rather than waiting for the first animation frame.  The
+     * RANGE, and not the page: a one-slot move dirties two cards, and repainting
+     * the other ten to show them is what the pointer feels as a stall.
+     */
+    const int lo = qMax(0, qMin(from, to) - 1);
+    const int hi = qMin(m_entries.size() - 1, qMax(from, to) + 1);
+    QRegion dirty;
+    for (int i = lo; i <= hi; ++i) {
+        dirty += dirtyRect(drawRect(i));
+        dirty += dirtyRect(slotRect(i));
+    }
     wake();
-    update();
+    update(dirty);
+}
+
+/* ── the card art cache ──────────────────────────────────────────────────── */
+
+const QPixmap &CardGrid::cardArt(int i)
+{
+    if (m_art.size() != m_entries.size())
+        m_art.resize(m_entries.size());
+
+    QPixmap &art = m_art[i];
+    const QRectF slot = slotRect(i);
+    const QSize want(qCeil(slot.width()) + 2 * kArtPad, qCeil(slot.height()) + 2 * kArtPad);
+    if (!art.isNull() && art.size() == want)
+        return art;
+
+    art = QPixmap(want);
+    /* Transparent, because the desk shows through the rounded corners and through
+     * every pixel of the shadow.  Filling it with the desk colour instead would be
+     * a card with a grey halo on the day somebody changes the wallpaper. */
+    art.fill(Qt::transparent);
+
+    QPainter q(&art);
+    q.setRenderHint(QPainter::Antialiasing, true);
+    paintCard(q, m_entries[i], QRectF(kArtPad, kArtPad, slot.width(), slot.height()),
+              false, 0.0);
+    return art;
+}
+
+void CardGrid::invalidateArt()
+{
+    m_art.clear();
+    m_art.resize(m_entries.size());
 }
 
 bool CardGrid::moveBy(int dx, int dy)
@@ -1285,11 +1367,46 @@ void CardGrid::onHoldExpired()
      */
     m_okArmed = false;
     if (m_carry < 0)
-        pickUp();
+        openMenu(m_index);
 }
 
 bool CardGrid::handleNav(int action)
 {
+    /*
+     * THE MENU EATS EVERYTHING WHILE IT IS OPEN, including the directions it does
+     * not use.  A menu that let Left through would move the selection under a panel
+     * that is still pointing at the card it was opened on, and the next A would
+     * then act on a card the user is no longer looking at.
+     */
+    if (m_menu >= 0) {
+        const int rows = menuActions().size();
+        switch (action) {
+        case Joypad::NavUp:
+            if (m_menuRow > 0) {
+                --m_menuRow;
+                update();
+            }
+            return true;
+        case Joypad::NavDown:
+            if (m_menuRow + 1 < rows) {
+                ++m_menuRow;
+                update();
+            }
+            return true;
+        case Joypad::NavOk:
+            /* Armed, not run: the release runs it.  Otherwise the A that opened
+             * this menu -- whose own release is still to come -- would be the A
+             * that picks the first row off it. */
+            m_okArmed = true;
+            return true;
+        case Joypad::NavBack:
+            closeMenu();
+            return true;
+        default:
+            return true;
+        }
+    }
+
     switch (action) {
     case Joypad::NavUp:    moveBy(0, -1); return true;
     case Joypad::NavDown:  moveBy(0, 1); return true;
@@ -1364,6 +1481,14 @@ void CardGrid::handleNavRelease(int action)
     if (!m_okArmed)
         return;   /* the hold already claimed this press */
     m_okArmed = false;
+
+    /* With a menu up, A picks a row off it rather than opening the card behind
+     * it.  The arming above is what keeps the release that ends the long press
+     * from being the release that chooses -- it cleared m_okArmed on the way. */
+    if (m_menu >= 0) {
+        runMenu();
+        return;
+    }
     activate();
 }
 
@@ -1380,6 +1505,7 @@ void CardGrid::onLeave()
 {
     m_hold->stop();
     m_okArmed = false;
+    closeMenu();
     if (m_carry >= 0)
         cancelCarry();
 }
@@ -1388,6 +1514,22 @@ void CardGrid::onLeave()
 
 void CardGrid::mouseMoveEvent(QMouseEvent *event)
 {
+    /* Hovering a menu row highlights it, the same as the D-pad walking onto it.
+     * Off the panel, nothing moves: the selection underneath must not follow the
+     * cursor while a menu is pointing at a particular card. */
+    if (m_menu >= 0) {
+        const QVector<int> actions = menuActions();
+        for (int i = 0; i < actions.size(); ++i) {
+            if (menuRowRect(i).contains(event->pos()) && i != m_menuRow) {
+                m_menuRow = i;
+                update(menuRect().toAlignedRect());
+                break;
+            }
+        }
+        event->accept();
+        return;
+    }
+
     if (m_carry >= 0 && m_carryByPointer) {
         /* The card follows the cursor, and the slot under the cursor is where it
          * would land -- so the grid reflows live, which is the feedback that says
@@ -1428,6 +1570,30 @@ void CardGrid::mousePressEvent(QMouseEvent *event)
     }
 
     m_pointerAt = event->pos();
+
+    /* A click on the menu chooses; a click anywhere else puts it away and does
+     * nothing else, which is what every menu on every desktop does and is the
+     * reason nobody has to be told. */
+    if (m_menu >= 0) {
+        const QVector<int> actions = menuActions();
+        int hit = -1;
+        for (int i = 0; i < actions.size(); ++i) {
+            if (menuRowRect(i).contains(event->pos())) {
+                hit = i;
+                break;
+            }
+        }
+        if (hit >= 0) {
+            m_menuRow = hit;
+            runMenu();
+        } else {
+            closeMenu();
+        }
+        m_pressed = -1;
+        event->accept();
+        return;
+    }
+
     if (m_carry >= 0) {
         /* A click while something is in the air places it, the same as A does. */
         drop();
@@ -1499,6 +1665,11 @@ void CardGrid::resizeEvent(QResizeEvent *event)
      * than sprung there: a resize on this board is a display being plugged in,
      * and nine cards flying across the panel is not what that should look like. */
     m_scroll = qBound(0, m_scroll, maxScroll());
+    /* The slots are a different size, so every cached picture is the wrong shape.
+     * cardArt() would notice by itself -- it compares sizes -- but dropping them
+     * here is what stops a display change from holding a screenful of pixmaps
+     * nothing will ever blit again. */
+    invalidateArt();
     for (int i = 0; i < m_motion.size() && i < m_entries.size(); ++i) {
         const QRectF home = slotRect(i);
         m_motion[i].x = home.x();
@@ -1614,8 +1785,20 @@ void CardGrid::paintEvent(QPaintEvent *event)
         if (i == m_index || i == m_carry)
             continue;
         const QRectF r = drawRect(i);
-        if (dirty.intersects(dirtyRect(r)))
+        if (!dirty.intersects(dirtyRect(r)))
+            continue;
+        /*
+         * From the cache, at whole pixels.  The rounding is deliberate: a blit to
+         * an integer offset is a memcpy with a blend, and a blit to a fractional
+         * one goes through the transform path with a mask.  Half a pixel of
+         * placement error on a card that is sliding past at a hundred pixels a
+         * second is not a thing anybody can see; the frame it saves is.
+         */
+        const QPixmap &art = cardArt(i);
+        if (art.isNull())
             paintCard(p, m_entries[i], r, false, 0.0);
+        else
+            p.drawPixmap(QPoint(qRound(r.x()) - kArtPad, qRound(r.y()) - kArtPad), art);
     }
 
     /* The selected card last, so its glow is not painted over by a neighbour --
@@ -1630,6 +1813,163 @@ void CardGrid::paintEvent(QPaintEvent *event)
         const QRectF r = drawRect(m_carry);
         if (dirty.intersects(dirtyRect(r)))
             paintCard(p, m_entries[m_carry], r, true, m_motion.value(m_carry).lift);
+    }
+
+    /* Above everything, including the card it belongs to. */
+    if (m_menu >= 0 && m_menu < m_entries.size())
+        paintMenu(p);
+}
+
+/* ── the long-press menu ─────────────────────────────────────────────────── */
+
+/*
+ * WHAT LONG PRESS USED TO DO, AND WHY IT NOW ASKS.
+ *
+ * Holding A picked the card up, full stop: one gesture, one outcome, nothing to
+ * learn.  That was right while rearranging was the only thing a card could be told
+ * to do.  It is not: a USB volume is a card now, and a volume has to be ejectable
+ * from somewhere -- and "somewhere" cannot be another press of A, which opens it,
+ * nor a button this handheld does not have.
+ *
+ * So the hold opens a menu and the menu has the placement gesture on it.  That
+ * costs the rearrangement one press, which is the honest trade: it also makes the
+ * gesture discoverable, which it never was -- a menu that says "Move" is a menu
+ * that teaches, and nothing about holding A on a card ever said it could be moved.
+ */
+QVector<int> CardGrid::menuActions() const
+{
+    QVector<int> out;
+    if (m_menu < 0 || m_menu >= m_entries.size())
+        return out;
+    out << MenuOpen << MenuMove;
+    if (m_entries[m_menu].ejectable)
+        out << MenuEject;
+    return out;
+}
+
+QRectF CardGrid::menuRect() const
+{
+    const QVector<int> actions = menuActions();
+    if (actions.isEmpty())
+        return QRectF();
+
+    const qreal h = actions.size() * kMenuRowH + 2 * kMenuPad;
+    const QRectF card = drawRect(m_menu);
+
+    /*
+     * Under the card if there is room and over it if there is not, and never off
+     * the side.  Anchored to the card rather than to the middle of the page because
+     * the menu has to be obviously ABOUT something -- a panel in the centre of the
+     * screen is a dialogue, and this is not one.
+     */
+    qreal y = card.bottom() + 8;
+    if (y + h > height() - 6)
+        y = card.top() - 8 - h;
+    y = qBound(qreal(6), y, qreal(qMax(6, height() - 6 - (int)h)));
+
+    qreal x = card.center().x() - kMenuW / 2.0;
+    x = qBound(qreal(6), x, qreal(qMax(6, width() - 6 - kMenuW)));
+
+    return QRectF(x, y, kMenuW, h);
+}
+
+QRectF CardGrid::menuRowRect(int row) const
+{
+    const QRectF r = menuRect();
+    if (r.isNull())
+        return QRectF();
+    return QRectF(r.x() + kMenuPad, r.y() + kMenuPad + row * kMenuRowH,
+                  r.width() - 2 * kMenuPad, kMenuRowH);
+}
+
+void CardGrid::openMenu(int index)
+{
+    if (index < 0 || index >= m_entries.size())
+        return;
+    m_menu = index;
+    m_menuRow = 0;
+    update();
+    emit titleChanged();
+}
+
+void CardGrid::closeMenu()
+{
+    if (m_menu < 0)
+        return;
+    m_menu = -1;
+    update();
+    emit titleChanged();
+}
+
+void CardGrid::runMenu()
+{
+    const QVector<int> actions = menuActions();
+    if (m_menuRow < 0 || m_menuRow >= actions.size()) {
+        closeMenu();
+        return;
+    }
+    const int action = actions[m_menuRow];
+    const int card = m_menu;
+
+    /* Closed BEFORE the action runs, and the index kept in a local: Eject shells
+     * out for as long as the volume takes to flush, and a menu still on the glass
+     * through all of it is a menu the user presses again. */
+    m_menu = -1;
+    update();
+    emit titleChanged();
+
+    switch (action) {
+    case MenuOpen:
+        if (card >= 0 && card < m_entries.size())
+            emit activated(card);
+        break;
+    case MenuMove:
+        if (card != m_index)
+            selectTo(card);
+        pickUp();
+        break;
+    case MenuEject:
+        emit ejectRequested(card);
+        break;
+    default:
+        break;
+    }
+}
+
+void CardGrid::paintMenu(QPainter &p)
+{
+    const QVector<int> actions = menuActions();
+    const QRectF r = menuRect();
+    if (actions.isEmpty() || r.isNull())
+        return;
+
+    Theme::softShadow(p, r, 10, 10, 70);
+    Theme::vgrad(p, r, Theme::window().lighter(112), Theme::window(), 10);
+    p.setBrush(Qt::NoBrush);
+    p.setPen(QPen(Theme::border(), 1.0));
+    p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 10, 10);
+
+    p.setFont(Theme::font(14));
+    for (int i = 0; i < actions.size(); ++i) {
+        const QRectF row = menuRowRect(i);
+        if (i == m_menuRow) {
+            QColor sel = Theme::blue();
+            sel.setAlpha(200);
+            p.setPen(Qt::NoPen);
+            p.setBrush(sel);
+            p.drawRoundedRect(row, 7, 7);
+            p.setBrush(Qt::NoBrush);
+        }
+
+        QString text;
+        switch (actions[i]) {
+        case MenuOpen:  text = tr("Open"); break;
+        case MenuMove:  text = tr("Move"); break;
+        case MenuEject: text = tr("Eject"); break;
+        default: break;
+        }
+        p.setPen(i == m_menuRow ? Theme::ink() : Theme::ink2());
+        p.drawText(row.adjusted(12, 0, -12, 0), Qt::AlignVCenter | Qt::AlignLeft, text);
     }
 }
 
