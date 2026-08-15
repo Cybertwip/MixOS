@@ -584,6 +584,39 @@ void Dashboard::buildPages()
     files.internal = InternalFiles;
     apps.append(files);
 
+    /*
+     * ONE CARD PER MOUNTED USB VOLUME, next to Files because that is what they are:
+     * the same browser, opened somewhere else and not allowed out of it.
+     *
+     * WHY A CARD AND NOT A NOTIFICATION.  A toast saying "BACKUP mounted" is gone in
+     * two seconds and leaves the user to find the disk through a file browser they
+     * have to open, walk to /media in, and remember the name of.  A card is where
+     * everything else on this device already is, it is reached by the gesture that
+     * reaches everything else, and it stays there for exactly as long as the disk
+     * does -- which is the honest lifetime for it.
+     *
+     * THEY ARE NOT PINNED TO THIS POSITION.  This is the position they are BORN in,
+     * once, and only for a volume the saved arrangement has never seen: setEntries
+     * lays the saved keys out first, so a stick that has been picked up and moved to
+     * the front of the grid comes back to the front of the grid the next time it is
+     * plugged in.  That is the whole reason Volume::key is derived from the mount
+     * point and not from the kernel name -- see volumes.h.
+     *
+     * The greyed-out case is a read-only mount: a dirty NTFS volume, or a disk with
+     * errors on it.  It still opens -- reading it is exactly what it is good for --
+     * so `available' stays true and the state is said in the menu instead.
+     */
+    for (const Volume &v : Volumes::instance().list()) {
+        AppEntry disk;
+        disk.key = v.key();
+        disk.title = v.name();
+        disk.accent = v.readOnly ? Theme::yellow() : Theme::teal();
+        disk.glyph = GlyphDrive;
+        disk.internal = InternalVolume;
+        disk.ejectable = true;
+        apps.append(disk);
+    }
+
     AppEntry packages;
     packages.key = QStringLiteral("packages");
     packages.title = tr("Packages");
@@ -1434,8 +1467,30 @@ void Dashboard::activate(const AppEntry &entry)
 
     switch (entry.internal) {
     case InternalFiles:
+        /* No path and no scope: the whole filesystem, opened wherever the browser
+         * was left.  openAt() says why it is remembered. */
+        m_files->openAt(QString(), QString());
         push(m_files);
         break;
+    case InternalVolume: {
+        /*
+         * The mount point is looked up NOW rather than carried on the card, because
+         * the card outlives the truth by up to a rescan: a stick pulled out is a
+         * card that is still on the grid until Volumes notices and the grid is
+         * rebuilt, and pressing it in that window must say so rather than open a
+         * browser on a directory that is not a filesystem any more.
+         */
+        const Volume *v = Volumes::instance().byKey(entry.key);
+        if (!v) {
+            toast(tr("%1 is no longer plugged in").arg(entry.title), 3000);
+            break;
+        }
+        m_files->openAt(v->mountPoint, v->mountPoint);
+        push(m_files);
+        if (v->readOnly)
+            toast(tr("%1 is mounted read-only").arg(v->name()), 3000);
+        break;
+    }
     case InternalTerminal:
         push(m_terminal);
         break;
