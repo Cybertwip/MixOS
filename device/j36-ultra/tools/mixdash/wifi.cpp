@@ -10,19 +10,13 @@
 #include <QFileInfo>
 #include <QPainter>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QResizeEvent>
+#include <QSet>
 #include <QTimer>
+#include <QUuid>
 
 #include <algorithm>
-
-#include <arpa/inet.h>
-#include <errno.h>
-#include <net/if.h>
-#include <netinet/in.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include "joypad.h"
 #include "settings.h"
@@ -31,7 +25,28 @@
 
 namespace {
 
-const char *kCtrlDir = "/run/wpa_supplicant";
+/* Where NetworkManager's keyfile plugin keeps profiles, and writes its own. */
+const char *kProfileDir = "/etc/NetworkManager/system-connections";
+
+/*
+ * NMDeviceState, from NetworkManager.h.  The numbers are used rather than the
+ * words beside them because nmcli translates the words and never the number, and
+ * this page has to read the same output on a device set to Portuguese.
+ */
+enum {
+    StateUnmanaged    = 10,
+    StateUnavailable  = 20,
+    StateDisconnected = 30,
+    StatePrepare      = 40,
+    StateConfig       = 50,
+    StateNeedAuth     = 60,
+    StateIpConfig     = 70,
+    StateIpCheck      = 80,
+    StateSecondaries  = 90,
+    StateActivated    = 100,
+    StateDeactivating = 110,
+    StateFailed       = 120
+};
 
 QString firstExecutable(const QStringList &candidates)
 {
@@ -41,33 +56,44 @@ QString firstExecutable(const QStringList &candidates)
     return QString();
 }
 
-QString wpaCli()
+QString nmcliPath()
 {
     static const QString path = firstExecutable(QStringList()
-                                                << "/usr/sbin/wpa_cli"
-                                                << "/sbin/wpa_cli"
-                                                << "/usr/bin/wpa_cli");
+                                                << "/usr/bin/nmcli"
+                                                << "/bin/nmcli"
+                                                << "/usr/local/bin/nmcli");
     return path;
 }
 
-QString wpaPassphrase()
+QString stateWord(int state)
 {
-    static const QString path = firstExecutable(QStringList()
-                                                << "/usr/bin/wpa_passphrase"
-                                                << "/usr/sbin/wpa_passphrase"
-                                                << "/sbin/wpa_passphrase");
-    return path;
+    switch (state) {
+    case StateUnmanaged:    return WifiPage::tr("not managed");
+    case StateUnavailable:  return WifiPage::tr("radio off");
+    case StateDisconnected: return WifiPage::tr("not connected");
+    case StatePrepare:
+    case StateConfig:       return WifiPage::tr("connecting");
+    case StateNeedAuth:     return WifiPage::tr("passphrase refused");
+    case StateIpConfig:     return WifiPage::tr("asking for an address");
+    case StateIpCheck:
+    case StateSecondaries:  return WifiPage::tr("checking");
+    case StateActivated:    return WifiPage::tr("connected");
+    case StateDeactivating: return WifiPage::tr("disconnecting");
+    case StateFailed:       return WifiPage::tr("failed");
+    default:                return QString();
+    }
 }
 
 /*
- * Hex, so the SSID never has to survive a round trip through quoting.
- * wpa_supplicant accepts an unquoted hex string for ssid and treats it as the
- * raw bytes, which is the only encoding that is right for an SSID containing a
- * space, a quote or a byte that is not UTF-8 at all -- and those exist.
+ * 169.254.0.0/16 is IPv4LL, and its presence on a wireless interface means one
+ * thing only: a DHCP client gave up waiting for the router and made an address up
+ * so that it would have something to report.  It is not a lease, there is no
+ * gateway behind it and nothing on the LAN can be reached through it -- which is
+ * exactly what "connected but no internet" looks like from the outside.
  */
-QString hexSsid(const QString &ssid)
+bool isLinkLocal(const QString &address)
 {
-    return QString::fromLatin1(ssid.toUtf8().toHex());
+    return address.startsWith(QLatin1String("169.254."));
 }
 
 } /* namespace */
@@ -112,17 +138,26 @@ void WifiPage::onEnter()
     if (m_iface.isEmpty())
         m_iface = SysInfo::wirelessInterface();
 
-    unblockRadio();
-    bringInterfaceUp();
+    m_note.clear();
+    m_profileAge = 0;
 
+    /*
+     * No rfkill poke and no SIOCSIFFLAGS here, and their absence is the point.
+     * NetworkManager keeps its own record of whether the radio should be on and
+     * re-applies it; a page that reached past it to /sys/class/rfkill would win
+     * for about a second.  `nmcli radio wifi on' is the same switch, asked of the
+     * thing that owns it.
+     */
     refreshStatus();
+    refreshProfiles();
+    refreshScan();
     rebuild();
 
-    /* A scan on entry, because the first thing anybody wants from this page is
-     * the list, and a two-second wait for it is shorter than a press. */
-    if (supplicantUp()) {
-        cli(QStringList() << "scan");
-        m_scanPending = true;
+    /* A rescan on entry, because the first thing anybody wants from this page is
+     * the list.  It is asynchronous -- NetworkManager updates its own list and a
+     * later poll reads it. */
+    if (m_managerUp && m_radioOn) {
+        nmcli(QStringList() << "device" << "wifi" << "rescan" << "ifname" << m_iface, 3000);
         m_scanAge.restart();
     }
 
@@ -134,108 +169,136 @@ void WifiPage::onLeave()
     m_timer->stop();
 }
 
-/* ── the control socket ──────────────────────────────────────────────────── */
+/* ── talking to NetworkManager ───────────────────────────────────────────── */
 
-QString WifiPage::cli(const QStringList &args, int timeoutMs) const
+QString WifiPage::nmcli(const QStringList &args, int timeoutMs, int *exitCode,
+                        QString *errorOut) const
 {
-    if (wpaCli().isEmpty() || m_iface.isEmpty())
+    if (exitCode)
+        *exitCode = -1;
+    if (errorOut)
+        errorOut->clear();
+    if (nmcliPath().isEmpty())
         return QString();
 
-    QStringList full;
-    full << "-p" << QString::fromLatin1(kCtrlDir) << "-i" << m_iface;
-    full += args;
-
     /*
-     * BLOCKING, ON PURPOSE, AND BOUNDED.  Every command here is a request over a
-     * unix datagram socket to a process on the same machine; the reply comes back
-     * in single-digit milliseconds or the supplicant is wedged, in which case a
-     * two-and-a-half-second stall and an empty string is a better answer than a
-     * state machine that has to remember what it was in the middle of.  The one
-     * genuinely slow operation -- the scan itself -- is NOT waited for: `scan'
-     * returns immediately and the results are read on a later poll.
+     * BLOCKING, ON PURPOSE, AND BOUNDED -- for the queries.  Each one is a D-Bus
+     * round trip to a daemon on the same machine and comes back in milliseconds,
+     * and a bounded stall with an empty answer beats a state machine that has to
+     * remember what it was in the middle of.  The two operations that are NOT
+     * bounded like this -- `connection up' and `device connect', either of which
+     * can sit for the better part of a minute waiting on a four-way handshake and
+     * a DHCP exchange -- go through startAction() instead and run in the
+     * background while the poll timer reports on them.
      */
     QProcess p;
-    p.setProcessChannelMode(QProcess::MergedChannels);
-    p.start(wpaCli(), full);
-    if (!Shell::waitForStarted(p, 1000))
+    p.setProcessChannelMode(QProcess::SeparateChannels);
+
+    /*
+     * LC_ALL=C, because several of the columns read below are English words that
+     * nmcli would otherwise translate -- `enabled', `disabled', the parenthesised
+     * half of `100 (connected)'.  A dashboard that speaks six languages must not
+     * ask its tools to speak any of them.
+     */
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.insert(QStringLiteral("LC_ALL"), QStringLiteral("C"));
+    env.insert(QStringLiteral("LANG"), QStringLiteral("C"));
+    p.setProcessEnvironment(env);
+
+    p.start(nmcliPath(), args);
+    if (!Shell::waitForStarted(p, 1500))
         return QString();
     if (!Shell::waitForFinished(p, timeoutMs)) {
         p.kill();
         Shell::waitForFinished(p, 500);
+        if (errorOut)
+            *errorOut = tr("nmcli did not answer");
         return QString();
     }
-    return QString::fromLocal8Bit(p.readAll());
+
+    if (exitCode)
+        *exitCode = p.exitCode();
+    if (errorOut)
+        *errorOut = QString::fromUtf8(p.readAllStandardError()).trimmed();
+    return QString::fromUtf8(p.readAllStandardOutput());
 }
 
-bool WifiPage::supplicantUp() const
+bool WifiPage::busy() const
 {
-    if (m_iface.isEmpty())
-        return false;
-    /* The socket file is the honest test.  `wpa_cli status' would also answer, at
-     * the cost of a process spawn every two seconds. */
-    return QFileInfo::exists(QString::fromLatin1(kCtrlDir) + "/" + m_iface);
+    return m_action && m_action->state() != QProcess::NotRunning;
 }
 
-void WifiPage::unblockRadio()
+void WifiPage::startAction(const QStringList &args, const QString &note)
 {
-    /*
-     * rfkill through sysfs rather than through the rfkill binary: it is three
-     * reads and a write, it cannot fail in a way that needs parsing, and it works
-     * on an image that never installed the tool.
-     */
-    const QString base = "/sys/class/rfkill";
-    const QStringList nodes = QDir(base).entryList(QStringList() << "rfkill*", QDir::Dirs);
-    for (const QString &n : nodes) {
-        if (SysInfo::readTrimmed(base + "/" + n + "/type") != "wlan")
-            continue;
-        if (SysInfo::readTrimmed(base + "/" + n + "/soft") == "0")
-            continue;
-        QFile f(base + "/" + n + "/soft");
-        if (f.open(QIODevice::WriteOnly))
-            f.write("0\n");
-    }
-}
-
-void WifiPage::bringInterfaceUp()
-{
-    if (m_iface.isEmpty())
+    if (nmcliPath().isEmpty())
         return;
-
-    const int s = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0)
+    if (busy()) {
+        emit toastRequested(tr("Still working on the last one"), 2500);
         return;
-
-    struct ifreq ifr;
-    ::memset(&ifr, 0, sizeof(ifr));
-    ::strncpy(ifr.ifr_name, m_iface.toLatin1().constData(), IFNAMSIZ - 1);
-    if (::ioctl(s, SIOCGIFFLAGS, &ifr) == 0 && !(ifr.ifr_flags & IFF_UP)) {
-        ifr.ifr_flags |= IFF_UP;
-        ::ioctl(s, SIOCSIFFLAGS, &ifr);
     }
-    ::close(s);
+
+    if (!m_action) {
+        m_action = new QProcess(this);
+        m_action->setProcessChannelMode(QProcess::SeparateChannels);
+
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("LC_ALL"), QStringLiteral("C"));
+        env.insert(QStringLiteral("LANG"), QStringLiteral("C"));
+        m_action->setProcessEnvironment(env);
+
+        connect(m_action, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
+                this, [this](int code, QProcess::ExitStatus) {
+                    const QString err =
+                        QString::fromUtf8(m_action->readAllStandardError()).trimmed();
+                    m_action->readAllStandardOutput();
+                    if (code == 0) {
+                        m_note.clear();
+                    } else {
+                        /*
+                         * nmcli's own sentence, untranslated because it is the
+                         * only one that says which of a dozen things went wrong
+                         * -- "Secrets were required, but not provided", "No
+                         * suitable device found", "The Wi-Fi network could not be
+                         * found".  A generic phrase in the right language is
+                         * worth less here than the exact one in English.
+                         */
+                        m_note = tr("that did not work");
+                        emit toastRequested(err.isEmpty() ? tr("NetworkManager refused")
+                                                          : err.section('\n', 0, 0),
+                                            5000);
+                    }
+                    refreshStatus();
+                    rebuild();
+                });
+    }
+
+    m_note = note;
+    update();
+    m_action->start(nmcliPath(), args);
 }
 
-QString WifiPage::ipv4() const
+/*
+ * nmcli -t escapes a literal `:' and a literal `\' inside a value with a
+ * backslash, so the fields cannot be recovered with QString::split(':') -- a
+ * BSSID would come apart into six pieces and an SSID with a colon in it would
+ * come apart into two.  Walk it instead.
+ */
+QStringList WifiPage::splitTerse(const QString &line)
 {
-    if (m_iface.isEmpty())
-        return QString();
-
-    const int s = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0)
-        return QString();
-
-    struct ifreq ifr;
-    ::memset(&ifr, 0, sizeof(ifr));
-    ifr.ifr_addr.sa_family = AF_INET;
-    ::strncpy(ifr.ifr_name, m_iface.toLatin1().constData(), IFNAMSIZ - 1);
-    QString out;
-    if (::ioctl(s, SIOCGIFADDR, &ifr) == 0) {
-        char buf[INET_ADDRSTRLEN] = { 0 };
-        struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
-        if (::inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)))
-            out = QString::fromLatin1(buf);
+    QStringList out;
+    QString cur;
+    for (int i = 0; i < line.size(); ++i) {
+        const QChar c = line.at(i);
+        if (c == QChar('\\') && i + 1 < line.size()) {
+            cur += line.at(++i);
+        } else if (c == QChar(':')) {
+            out.append(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
     }
-    ::close(s);
+    out.append(cur);
     return out;
 }
 
@@ -243,105 +306,211 @@ QString WifiPage::ipv4() const
 
 void WifiPage::refreshStatus()
 {
-    m_state.clear();
+    m_managerUp = false;
+    m_radioOn = true;
+    m_deviceState = -1;
     m_ssid.clear();
+    m_address.clear();
+    m_gateway.clear();
 
-    if (!supplicantUp())
+    if (nmcliPath().isEmpty() || m_iface.isEmpty())
         return;
 
-    const QString status = cli(QStringList() << "status");
-    const QStringList lines = status.split('\n', Qt::SkipEmptyParts);
-    for (const QString &line : lines) {
-        const int eq = line.indexOf('=');
-        if (eq <= 0)
+    /* One command that answers two questions: nmcli exits non-zero with "Error:
+     * NetworkManager is not running." when there is nothing to ask. */
+    int rc = -1;
+    const QString radio = nmcli(QStringList() << "-t" << "radio" << "wifi", 3000, &rc);
+    if (rc != 0)
+        return;
+    m_managerUp = true;
+    m_radioOn = (radio.trimmed() != QLatin1String("disabled"));
+
+    const QString show = nmcli(QStringList() << "-t" << "-f"
+                                             << "GENERAL.STATE,GENERAL.CONNECTION,"
+                                                "IP4.ADDRESS,IP4.GATEWAY"
+                                             << "device" << "show" << m_iface,
+                               4000, &rc);
+    if (rc != 0)
+        return;
+
+    for (const QString &line : show.split('\n', Qt::SkipEmptyParts)) {
+        const QStringList cols = splitTerse(line);
+        if (cols.size() < 2)
             continue;
-        const QString key = line.left(eq).trimmed();
-        const QString value = line.mid(eq + 1).trimmed();
-        if (key == "wpa_state")
-            m_state = value;
-        else if (key == "ssid")
+        const QString key = cols.at(0);
+        const QString value = cols.mid(1).join(QChar(':')).trimmed();
+        if (value == QLatin1String("--"))
+            continue;
+
+        if (key == QLatin1String("GENERAL.STATE")) {
+            /* "100 (connected)" in most versions, "100" in some.  Both work. */
+            m_deviceState = value.section(' ', 0, 0).toInt();
+        } else if (key == QLatin1String("GENERAL.CONNECTION")) {
             m_ssid = value;
+        } else if (key.startsWith(QLatin1String("IP4.ADDRESS"))) {
+            /* IP4.ADDRESS[1], and there can be several.  The first is the one
+             * that matters, and the prefix stays on it: "192.168.1.42/24" is a
+             * more useful thing to read on the glass than the address alone,
+             * because the mask is half of what people come to this page to
+             * check. */
+            if (m_address.isEmpty())
+                m_address = value;
+        } else if (key.startsWith(QLatin1String("IP4.GATEWAY"))) {
+            m_gateway = value;
+        }
+    }
+}
+
+void WifiPage::refreshProfiles()
+{
+    m_profiles.clear();
+    if (!m_managerUp)
+        return;
+
+    int rc = -1;
+    const QString out = nmcli(QStringList() << "-t" << "-f" << "NAME,UUID,TYPE"
+                                            << "connection" << "show",
+                              4000, &rc);
+    if (rc != 0)
+        return;
+
+    QSet<QString> live;
+    for (const QString &line : out.split('\n', Qt::SkipEmptyParts)) {
+        const QStringList cols = splitTerse(line);
+        if (cols.size() < 3)
+            continue;
+        /* Both spellings: nmcli prints the alias on new versions and the settings
+         * name on old ones, and an image can be upgraded under us. */
+        const QString type = cols.at(2).trimmed();
+        if (type != QLatin1String("wifi") && type != QLatin1String("802-11-wireless"))
+            continue;
+
+        Profile pr;
+        pr.name = cols.at(0);
+        pr.uuid = cols.at(1).trimmed();
+        if (pr.uuid.isEmpty())
+            continue;
+        pr.ssid = ssidOfProfile(pr.uuid);
+        if (pr.ssid.isEmpty())
+            pr.ssid = pr.name;
+        m_profiles.append(pr);
+        live.insert(pr.uuid);
     }
 
-    m_address = ipv4();
+    /* Forget the SSID of a profile that has been deleted, so a network that is
+     * removed and added again does not answer with the old name. */
+    for (QHash<QString, QString>::iterator it = m_ssidCache.begin(); it != m_ssidCache.end(); ) {
+        if (live.contains(it.key()))
+            ++it;
+        else
+            it = m_ssidCache.erase(it);
+    }
 }
 
-bool WifiPage::isOpenNetwork(const QString &flags)
+/*
+ * The profile's name is usually its SSID and is not required to be, so the SSID
+ * is asked for -- once per profile, and then remembered.  Without the cache this
+ * would be a process spawn per saved network every two seconds.
+ */
+QString WifiPage::ssidOfProfile(const QString &uuid)
 {
-    return !flags.contains("WPA") && !flags.contains("WEP") && !flags.contains("SAE");
+    QHash<QString, QString>::const_iterator hit = m_ssidCache.constFind(uuid);
+    if (hit != m_ssidCache.constEnd())
+        return hit.value();
+
+    int rc = -1;
+    const QString out = nmcli(QStringList() << "-t" << "-f" << "802-11-wireless.ssid"
+                                            << "connection" << "show" << "uuid" << uuid,
+                              3000, &rc);
+    QString ssid;
+    if (rc == 0) {
+        for (const QString &line : out.split('\n', Qt::SkipEmptyParts)) {
+            const QStringList cols = splitTerse(line);
+            if (cols.size() >= 2 && cols.at(0) == QLatin1String("802-11-wireless.ssid")) {
+                ssid = cols.mid(1).join(QChar(':')).trimmed();
+                break;
+            }
+        }
+    }
+    if (ssid == QLatin1String("--"))
+        ssid.clear();
+
+    m_ssidCache.insert(uuid, ssid);
+    return ssid;
 }
 
-QString WifiPage::security(const QString &flags)
+/* nmcli reports signal strength as a percentage already, which is the number
+ * every other status bar on every other device shows.  There is no dBm column in
+ * `device wifi list', and inventing one back out of the percentage would be
+ * precision this page does not have. */
+int WifiPage::quality(int percent)
 {
-    if (flags.contains("SAE"))
-        return QStringLiteral("WPA3");
-    if (flags.contains("WPA2"))
-        return QStringLiteral("WPA2");
-    if (flags.contains("WPA"))
-        return QStringLiteral("WPA");
-    if (flags.contains("WEP"))
-        return QStringLiteral("WEP");
-    return tr("open");
-}
-
-/* -30 dBm is as good as it gets in the room with the router; -90 is the floor
- * below which nothing associates.  Linear between them is not physics, but it is
- * the same approximation every other status bar makes. */
-int WifiPage::quality(int dbm)
-{
-    return qBound(0, (dbm + 90) * 100 / 60, 100);
+    return qBound(0, percent, 100);
 }
 
 void WifiPage::refreshScan()
 {
-    if (!supplicantUp())
+    if (!m_managerUp || m_iface.isEmpty())
         return;
 
-    /* Saved networks first, so a scanned AP can be marked as one we know. */
-    QVector<QPair<QString, int> > saved;   /* ssid, network id */
-    int currentId = -1;
-    const QStringList netLines = cli(QStringList() << "list_networks").split('\n');
-    for (const QString &line : netLines) {
-        const QStringList cols = line.split('\t');
-        if (cols.size() < 2)
-            continue;
-        bool ok = false;
-        const int id = cols.at(0).trimmed().toInt(&ok);
-        if (!ok)
-            continue;
-        saved.append(qMakePair(cols.at(1), id));
-        if (cols.size() >= 4 && cols.at(3).contains("CURRENT"))
-            currentId = id;
+    QStringList fields;
+    fields << "IN-USE" << "SSID";
+    if (m_ssidHex)
+        fields << "SSID-HEX";
+    fields << "BSSID" << "SIGNAL" << "FREQ" << "SECURITY";
+
+    /*
+     * `--rescan no' matters more than it looks.  Without it nmcli asks for a fresh
+     * scan on every listing, and on this radio a scan is a thirteen-channel sweep
+     * that takes the antenna off the AP for the duration -- which, done every two
+     * seconds by a page somebody left open, is enough to break a DHCP exchange in
+     * progress.  The list here is whatever NetworkManager last saw; the rescan is
+     * a separate, deliberate, occasional thing.
+     */
+    int rc = -1;
+    const QString out = nmcli(QStringList() << "-t" << "-f" << fields.join(QChar(','))
+                                            << "device" << "wifi" << "list"
+                                            << "ifname" << m_iface << "--rescan" << "no",
+                              6000, &rc);
+    if (rc != 0) {
+        if (m_ssidHex) {
+            /* An nmcli old enough not to know SSID-HEX rejects the whole field
+             * list rather than the one field, and the page would go blank.  Drop
+             * it, once, and never ask again. */
+            m_ssidHex = false;
+            refreshScan();
+        }
+        return;
     }
 
+    const int hex = m_ssidHex ? 1 : 0;
     QVector<Ap> found;
-    const QStringList lines = cli(QStringList() << "scan_results").split('\n');
-    for (const QString &line : lines) {
-        const QStringList cols = line.split('\t');
-        /* bssid, frequency, signal level, flags, ssid -- and a hidden network has
-         * an empty fifth column, which is why the size test is >= 5 and the ssid
-         * is then checked separately. */
-        if (cols.size() < 5)
-            continue;
-        if (cols.at(0) == "bssid")
+    for (const QString &line : out.split('\n', Qt::SkipEmptyParts)) {
+        const QStringList cols = splitTerse(line);
+        if (cols.size() < 6 + hex)
             continue;
 
         Ap ap;
-        ap.bssid = cols.at(0);
-        ap.frequency = cols.at(1).toInt();
-        ap.signalDbm = cols.at(2).toInt();
-        ap.flags = cols.at(3);
-        ap.ssid = cols.at(4);
+        ap.current = (cols.at(0).trimmed() == QLatin1String("*"));
+        ap.ssid = cols.at(1);
+        if (m_ssidHex)
+            ap.ssidHex = cols.at(2).trimmed();
+        ap.bssid = cols.at(2 + hex).trimmed();
+        ap.signal = cols.at(3 + hex).trimmed().toInt();
+        ap.frequency = cols.at(4 + hex).trimmed().section(' ', 0, 0).toInt();
+        ap.security = cols.at(5 + hex).trimmed();
+        if (ap.security == QLatin1String("--"))
+            ap.security.clear();
         if (ap.ssid.isEmpty())
             continue;   /* Hidden: nothing to show and nothing to press. */
 
         /* The same network on two bands, or two radios of one mesh, comes back as
-         * several rows with one name.  Keep the strongest. */
+         * several rows with one name.  Keep the one we are on, or the strongest. */
         bool merged = false;
         for (int i = 0; i < found.size(); ++i) {
             if (found[i].ssid != ap.ssid)
                 continue;
-            if (ap.signalDbm > found[i].signalDbm)
+            if (ap.current || (!found[i].current && ap.signal > found[i].signal))
                 found[i] = ap;
             merged = true;
             break;
@@ -351,12 +520,11 @@ void WifiPage::refreshScan()
     }
 
     for (int i = 0; i < found.size(); ++i) {
-        for (int j = 0; j < saved.size(); ++j) {
-            if (saved[j].first != found[i].ssid)
+        for (int j = 0; j < m_profiles.size(); ++j) {
+            if (m_profiles[j].ssid != found[i].ssid && m_profiles[j].name != found[i].ssid)
                 continue;
             found[i].saved = true;
-            found[i].networkId = saved[j].second;
-            found[i].current = (saved[j].second == currentId);
+            found[i].uuid = m_profiles[j].uuid;
             break;
         }
     }
@@ -366,7 +534,7 @@ void WifiPage::refreshScan()
             return a.current;
         if (a.saved != b.saved)
             return a.saved;
-        return a.signalDbm > b.signalDbm;
+        return a.signal > b.signal;
     });
 
     m_aps = found;
@@ -376,164 +544,250 @@ void WifiPage::poll()
 {
     refreshStatus();
 
-    if (m_scanPending && m_scanAge.elapsed() > 1800) {
-        refreshScan();
-        m_scanPending = false;
-    } else if (!m_scanPending && m_scanAge.elapsed() > 20000) {
-        /* A slow background rescan so the list does not go stale while the page
-         * is open, without hammering the radio while it is trying to associate. */
-        if (m_state != "SCANNING" && m_state != "ASSOCIATING")
-            cli(QStringList() << "scan");
-        m_scanPending = true;
-        m_scanAge.restart();
+    /* Profiles change when somebody presses a button on this page, and otherwise
+     * never.  Every tenth second is often enough to notice one arriving from
+     * somewhere else, and cheap enough not to matter. */
+    if (++m_profileAge >= 5) {
+        m_profileAge = 0;
+        refreshProfiles();
     }
 
-    /*
-     * The step every "the Wi-Fi does not work" report is really about.  The
-     * supplicant has associated and there is still no address, because nothing in
-     * this image runs a DHCP client for a wireless interface.  Give it a few
-     * seconds in case something else is doing it, then do it here.
-     */
-    if (m_state == "COMPLETED" && m_address.isEmpty()) {
-        if (++m_addressWait >= 3 && !m_dhcpTried) {
-            m_dhcpTried = true;
-            startDhcp();
-        }
-    } else {
-        m_addressWait = 0;
-        if (!m_address.isEmpty())
-            m_dhcpTried = false;
+    refreshScan();
+
+    /* NetworkManager scans on its own schedule while it is disconnected, and
+     * stops when it associates.  This is only for the page that is left open on
+     * the list: twenty seconds, and not while a verb is in flight. */
+    if (m_managerUp && m_radioOn && !busy() && m_scanAge.elapsed() > 20000) {
+        nmcli(QStringList() << "device" << "wifi" << "rescan" << "ifname" << m_iface, 3000);
+        m_scanAge.restart();
     }
 
     rebuild();
 }
 
-void WifiPage::startDhcp()
-{
-    if (m_dhcp && m_dhcp->state() != QProcess::NotRunning)
-        return;
-
-    /*
-     * Whichever client this card has.  dhclient is what Debian installs, udhcpc is
-     * what a busybox-slimmed image has, dhcpcd is what somebody may have added.
-     * The flags differ enough that a table of (binary, arguments) is clearer than
-     * a single command line with conditionals in it.
-     */
-    struct Client { const char *path; const char *args; };
-    static const Client kClients[] = {
-        { "/sbin/dhclient",     "-1 -v" },
-        { "/usr/sbin/dhclient", "-1 -v" },
-        { "/sbin/dhcpcd",       "-t 20" },
-        { "/usr/sbin/dhcpcd",   "-t 20" },
-        { "/sbin/udhcpc",       "-n -q -t 5 -i" },
-        { "/usr/bin/udhcpc",    "-n -q -t 5 -i" },
-        { "/bin/busybox",       "udhcpc -n -q -t 5 -i" }
-    };
-
-    QString exe;
-    QStringList args;
-    for (size_t i = 0; i < sizeof(kClients) / sizeof(kClients[0]); ++i) {
-        if (!QFileInfo(QString::fromLatin1(kClients[i].path)).isExecutable())
-            continue;
-        exe = QString::fromLatin1(kClients[i].path);
-        args = QString::fromLatin1(kClients[i].args).split(' ', Qt::SkipEmptyParts);
-        break;
-    }
-
-    if (exe.isEmpty()) {
-        m_note = tr("associated, but no DHCP client is installed");
-        emit toastRequested(tr("Joined, but nothing here can ask for an address.\n"
-                               "Install isc-dhcp-client from Packages."), 5000);
-        update();
-        return;
-    }
-
-    /* udhcpc wants the interface after -i; dhclient and dhcpcd take it last. */
-    args << m_iface;
-
-    if (!m_dhcp) {
-        m_dhcp = new QProcess(this);
-        connect(m_dhcp, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
-                this, [this](int, QProcess::ExitStatus) {
-                    m_address = ipv4();
-                    m_note = m_address.isEmpty() ? tr("DHCP finished with no address")
-                                                 : QString();
-                    rebuild();
-                });
-    }
-
-    m_note = tr("asking for an address");
-    update();
-    m_dhcp->start(exe, args);
-}
-
 /* ── joining ─────────────────────────────────────────────────────────────── */
 
-QString WifiPage::psk(const QString &ssid, const QString &passphrase) const
+/*
+ * GKeyFile's escaping, which is what NetworkManager's keyfile plugin reads these
+ * values back through.  A stray backslash makes it reject the whole value with
+ * "invalid escape sequence", and a passphrase that begins or ends with a space
+ * loses it to the parser's whitespace trimming -- so both are spelled out.
+ */
+QString WifiPage::keyfileEscape(const QString &value)
 {
-    /* A 64-character hex string is already the PSK; wpa_passphrase would refuse
-     * it for being longer than 63 characters. */
-    if (passphrase.size() == 64) {
-        bool hex = true;
-        for (int i = 0; i < 64 && hex; ++i)
-            hex = passphrase.at(i).isDigit()
-                || (passphrase.at(i).toLower() >= QChar('a') && passphrase.at(i).toLower() <= QChar('f'));
-        if (hex)
-            return passphrase.toLower();
+    QString out;
+    out.reserve(value.size() + 8);
+    for (int i = 0; i < value.size(); ++i) {
+        const QChar c = value.at(i);
+        if (c == QChar('\\'))
+            out += QStringLiteral("\\\\");
+        else if (c == QChar('\n'))
+            out += QStringLiteral("\\n");
+        else if (c == QChar('\t'))
+            out += QStringLiteral("\\t");
+        else if (c == QChar('\r'))
+            out += QStringLiteral("\\r");
+        else if (c == QChar(' ') && (i == 0 || i == value.size() - 1))
+            out += QStringLiteral("\\s");
+        else
+            out += c;
+    }
+    return out;
+}
+
+/*
+ * The SSID goes into the profile as a list of decimal bytes -- ssid=77;121;78;
+ * -- which looks like the awkward way round and is the safe one.  It is the form
+ * NetworkManager itself writes for any SSID that is not clean UTF-8, so its
+ * reader is required to accept it, and it removes every question about how a
+ * space, a semicolon or a byte that is not text at all survives the file.  The
+ * bytes come from nmcli's own SSID-HEX column when there is one, so they are the
+ * bytes off the air rather than a round trip through a QString.
+ */
+QString WifiPage::ssidBytes(const Ap &ap)
+{
+    QString clean;
+    for (int i = 0; i < ap.ssidHex.size(); ++i) {
+        const char l = ap.ssidHex.at(i).toLower().toLatin1();
+        if ((l >= '0' && l <= '9') || (l >= 'a' && l <= 'f'))
+            clean += ap.ssidHex.at(i);
     }
 
-    if (wpaPassphrase().isEmpty())
-        return QString();
+    QByteArray raw;
+    if (clean.size() >= 2 && (clean.size() % 2) == 0)
+        raw = QByteArray::fromHex(clean.toLatin1());
+    if (raw.isEmpty())
+        raw = ap.ssid.toUtf8();
+
+    QString out;
+    for (int i = 0; i < raw.size(); ++i)
+        out += QString::number(static_cast<unsigned char>(raw.at(i))) + QLatin1String(";");
+    return out;
+}
+
+bool WifiPage::writeProfile(const Ap &ap, const QString &passphrase,
+                            QString *uuidOut, QString *errorOut)
+{
+    const QString dirPath = QString::fromLatin1(kProfileDir);
+    QDir dir(dirPath);
+    if (!dir.exists() && !QDir().mkpath(dirPath)) {
+        *errorOut = tr("Cannot write to %1").arg(dirPath);
+        return false;
+    }
+
+    const QString uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+
+    /* The filename is cosmetic -- NetworkManager keys on the uuid inside -- so
+     * anything a path cannot hold becomes an underscore, and a name that is left
+     * with nothing at all falls back to the uuid. */
+    QString base;
+    for (int i = 0; i < ap.ssid.size(); ++i) {
+        const QChar c = ap.ssid.at(i);
+        base += (c.isLetterOrNumber() || c == QChar('-') || c == QChar('_'))
+                    ? c : QChar('_');
+    }
+    if (base.isEmpty())
+        base = uuid;
+
+    QString path = dirPath + "/" + base + ".nmconnection";
+    /* If something is already there it belongs to a different network -- the ones
+     * for this SSID were deleted a moment ago -- so do not touch it. */
+    if (QFile::exists(path))
+        path = dirPath + "/" + uuid + ".nmconnection";
+
+    QString body;
+    body += QLatin1String("[connection]\n");
+    body += "id=" + keyfileEscape(ap.ssid.isEmpty() ? uuid : ap.ssid) + "\n";
+    body += "uuid=" + uuid + "\n";
+    body += QLatin1String("type=wifi\n");
+    body += "interface-name=" + m_iface + "\n";
+    /*
+     * The two lines this whole page exists for.  autoconnect=true is what makes
+     * the network come back on its own after a reboot, and retries=0 means "keep
+     * trying" -- NetworkManager's default is four attempts and then never again
+     * until something asks, which on a handheld that gets carried out of range
+     * and back is the wrong answer every time.
+     */
+    body += QLatin1String("autoconnect=true\n");
+    body += QLatin1String("autoconnect-retries=0\n");
+
+    body += QLatin1String("\n[wifi]\n");
+    body += QLatin1String("mode=infrastructure\n");
+    body += "ssid=" + ssidBytes(ap) + "\n";
+
+    if (!passphrase.isEmpty()) {
+        body += QLatin1String("\n[wifi-security]\n");
+        body += QLatin1String("key-mgmt=wpa-psk\n");
+        /*
+         * This radio does CCMP and only CCMP -- see j36_wlan_crypto_supported()
+         * in the driver, which refuses anything else with -EOPNOTSUPP.  Saying so
+         * in the profile means a mixed-mode AP offering TKIP is ruled out by
+         * NetworkManager before the association rather than by the driver in the
+         * middle of it, and the failure that reaches the glass names the network
+         * instead of the kernel.
+         */
+        body += QLatin1String("pairwise=ccmp;\n");
+        body += QLatin1String("group=ccmp;\n");
+        body += "psk=" + keyfileEscape(passphrase) + "\n";
+    }
+
+    body += QLatin1String("\n[ipv4]\n");
+    body += QLatin1String("method=auto\n");
+    body += QLatin1String("\n[ipv6]\n");
+    body += QLatin1String("method=auto\n");
 
     /*
-     * The passphrase goes in on STDIN, not in argv.  Anything in argv is world
-     * readable in /proc/<pid>/cmdline for as long as the process lives, and on a
-     * device where the whole point is that other people's packages get installed
-     * later, a Wi-Fi key that is briefly public is a key that is public.
+     * Written to a dotfile and renamed into place.  NetworkManager watches this
+     * directory with inotify and would happily read a half-written profile;
+     * names beginning with a dot are on its ignore list, and rename(2) within one
+     * directory is atomic, so what it sees is the finished file or nothing.
      */
-    QProcess p;
-    p.start(wpaPassphrase(), QStringList() << ssid);
-    if (!Shell::waitForStarted(p, 1000))
-        return QString();
-    p.write(passphrase.toUtf8());
-    p.write("\n");
-    p.closeWriteChannel();
-    if (!Shell::waitForFinished(p, 3000)) {
-        p.kill();
-        Shell::waitForFinished(p, 500);
-        return QString();
+    const QString tmp = dirPath + "/.mixdash-profile.tmp";
+    QFile::remove(tmp);
+
+    QFile f(tmp);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        *errorOut = tr("Cannot write to %1").arg(dirPath);
+        return false;
+    }
+    /* Before the passphrase goes in, not after.  NetworkManager also refuses to
+     * load a profile that anyone but root can read, so this is both halves of the
+     * same rule. */
+    f.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
+    const QByteArray raw = body.toUtf8();
+    const bool written = (f.write(raw) == raw.size());
+    f.close();
+    if (!written) {
+        QFile::remove(tmp);
+        *errorOut = tr("Cannot write to %1").arg(dirPath);
+        return false;
     }
 
-    const QStringList lines = QString::fromLocal8Bit(p.readAllStandardOutput()).split('\n');
-    for (const QString &line : lines) {
-        const QString t = line.trimmed();
-        /* "#psk=..." is the comment wpa_passphrase writes with the plaintext in
-         * it; the real one has no hash. */
-        if (t.startsWith("psk=") && t.size() == 68)
-            return t.mid(4);
+    QFile::remove(path);
+    if (!QFile::rename(tmp, path)) {
+        QFile::remove(tmp);
+        *errorOut = tr("Cannot write to %1").arg(dirPath);
+        return false;
     }
-    return QString();
+
+    *uuidOut = uuid;
+    return true;
+}
+
+void WifiPage::forgetProfilesFor(const QString &ssid)
+{
+    if (ssid.isEmpty())
+        return;
+
+    refreshProfiles();
+    for (int i = 0; i < m_profiles.size(); ++i) {
+        if (m_profiles[i].ssid != ssid && m_profiles[i].name != ssid)
+            continue;
+        nmcli(QStringList() << "connection" << "delete" << "uuid" << m_profiles[i].uuid, 8000);
+    }
+    m_ssidCache.clear();
+    refreshProfiles();
 }
 
 void WifiPage::connectTo(const Ap &ap)
 {
-    if (!supplicantUp()) {
-        emit toastRequested(tr("wpa_supplicant is not running on %1").arg(m_iface), 3500);
+    if (!m_managerUp) {
+        emit toastRequested(tr("NetworkManager is not running"), 3500);
+        return;
+    }
+    if (busy()) {
+        emit toastRequested(tr("Still working on the last one"), 2500);
         return;
     }
 
-    if (ap.saved && ap.networkId >= 0) {
-        /* Already configured -- and the passphrase is in the supplicant's own
-         * config, which is where it belongs.  Just switch to it. */
-        cli(QStringList() << "select_network" << QString::number(ap.networkId));
-        m_note = tr("joining %1").arg(ap.ssid);
-        m_dhcpTried = false;
-        m_addressWait = 0;
-        update();
+    if (ap.saved && !ap.uuid.isEmpty()) {
+        /* The key is already in the profile, which is where it belongs and where
+         * autoconnect will find it after the next reboot.  Just switch. */
+        startAction(QStringList() << "--wait" << "45" << "connection" << "up"
+                                  << "uuid" << ap.uuid << "ifname" << m_iface,
+                    tr("joining %1").arg(ap.ssid));
         return;
     }
 
-    if (isOpenNetwork(ap.flags)) {
+    /*
+     * What this radio cannot do, said before the passphrase keyboard rather than
+     * after four failed handshakes.  WPA2-PSK with CCMP is the whole list.
+     */
+    if (ap.security.contains(QLatin1String("802.1X"))) {
+        emit toastRequested(tr("This network needs a company login, which this device cannot do"), 5000);
+        return;
+    }
+    if (ap.security.contains(QLatin1String("WEP"))) {
+        emit toastRequested(tr("WEP is not supported by this radio"), 4000);
+        return;
+    }
+    if (ap.security.contains(QLatin1String("WPA3"))
+        && !ap.security.contains(QLatin1String("WPA2"))) {
+        emit toastRequested(tr("This radio does WPA2 only, and this network is WPA3"), 5000);
+        return;
+    }
+
+    if (ap.security.isEmpty()) {
         connectWithKey(ap, QString());
         return;
     }
@@ -560,57 +814,40 @@ void WifiPage::textEntered(const QString &text, bool accepted)
 
 void WifiPage::connectWithKey(const Ap &ap, const QString &passphrase)
 {
-    const QString idText = cli(QStringList() << "add_network").trimmed();
-    bool ok = false;
-    /* add_network answers with the id on its own line, sometimes after the
-     * "Selected interface" banner wpa_cli prints. */
-    int id = -1;
-    for (const QString &line : idText.split('\n')) {
-        const int v = line.trimmed().toInt(&ok);
-        if (ok) {
-            id = v;
-            break;
-        }
-    }
-    if (id < 0) {
-        emit toastRequested(tr("wpa_supplicant would not add a network"), 3000);
+    if (!m_managerUp) {
+        emit toastRequested(tr("NetworkManager is not running"), 3500);
         return;
     }
 
-    cli(QStringList() << "set_network" << QString::number(id) << "ssid" << hexSsid(ap.ssid));
+    /*
+     * The passphrase never becomes an argument.  `nmcli device wifi connect X
+     * password Y' is one line and it puts the key in /proc/<pid>/cmdline, where
+     * every user on the box can read it for as long as the process lives -- and
+     * on a device whose whole point is that other people's packages get installed
+     * later, a key that is briefly public is a key that is public.  So the
+     * profile is written here, 0600, and only its uuid is ever passed to nmcli.
+     */
+    forgetProfilesFor(ap.ssid);
 
-    if (passphrase.isEmpty()) {
-        cli(QStringList() << "set_network" << QString::number(id) << "key_mgmt" << "NONE");
-    } else {
-        const QString hex = psk(ap.ssid, passphrase);
-        if (hex.isEmpty()) {
-            /* No wpa_passphrase on the card.  Fall back to the quoted form, which
-             * is correct for every passphrase that does not contain a quote. */
-            cli(QStringList() << "set_network" << QString::number(id) << "psk"
-                              << ("\"" + passphrase + "\""));
-        } else {
-            cli(QStringList() << "set_network" << QString::number(id) << "psk" << hex);
-        }
-        if (ap.flags.contains("SAE")) {
-            /* WPA3 personal.  Offering both key managements lets the supplicant
-             * pick, which is what a transition-mode AP needs. */
-            cli(QStringList() << "set_network" << QString::number(id) << "key_mgmt"
-                              << "WPA-PSK SAE");
-            cli(QStringList() << "set_network" << QString::number(id) << "ieee80211w" << "1");
-        }
+    QString uuid;
+    QString err;
+    if (!writeProfile(ap, passphrase, &uuid, &err)) {
+        m_note = tr("could not save the network");
+        emit toastRequested(err.isEmpty() ? tr("Could not write the profile") : err, 5000);
+        update();
+        return;
     }
 
-    cli(QStringList() << "enable_network" << QString::number(id));
-    cli(QStringList() << "select_network" << QString::number(id));
-    /* Written to wpa_supplicant.conf so the network is still there after a
-     * reboot.  Fails harmlessly if update_config=1 is not set in the file. */
-    cli(QStringList() << "save_config");
+    /* inotify would find it on its own in a moment; asking makes the activation
+     * below deterministic instead of a race with a directory watcher. */
+    nmcli(QStringList() << "connection" << "reload", 8000);
+    m_ssidCache.clear();
+    refreshProfiles();
 
-    m_note = tr("joining %1").arg(ap.ssid);
-    m_dhcpTried = false;
-    m_addressWait = 0;
+    startAction(QStringList() << "--wait" << "45" << "connection" << "up"
+                              << "uuid" << uuid << "ifname" << m_iface,
+                tr("joining %1").arg(ap.ssid));
     m_scanAge.restart();
-    update();
 }
 
 /* ── the list ────────────────────────────────────────────────────────────── */
@@ -637,20 +874,78 @@ void WifiPage::rebuild()
         return;
     }
 
-    if (!supplicantUp()) {
+    if (nmcliPath().isEmpty()) {
         ListRow r;
         r.kind = ListRow::Header;
-        r.text = "wpa_supplicant";
+        r.text = QStringLiteral("NetworkManager");
+        rows.append(r);
+
+        ListRow explain;
+        explain.text = tr("No nmcli on this card");
+        explain.detail = tr("NetworkManager owns the radio here. Install network-manager from Packages.");
+        explain.enabled = false;
+        explain.glyph = GlyphWifi;
+        rows.append(explain);
+
+        m_list->setRows(rows);
+        update();
+        return;
+    }
+
+    if (!m_managerUp) {
+        ListRow r;
+        r.kind = ListRow::Header;
+        r.text = QStringLiteral("NetworkManager");
         rows.append(r);
 
         ListRow start;
         start.kind = ListRow::Action;
-        start.text = tr("Start wpa_supplicant on %1").arg(m_iface);
-        start.detail = tr("No control socket in /run/wpa_supplicant");
+        start.text = tr("Start NetworkManager");
+        start.detail = tr("Nothing is answering on the system bus");
         start.glyph = GlyphWifi;
         start.accent = Theme::orange();
-        start.id = RowStartSupplicant;
+        start.id = RowStartManager;
         rows.append(start);
+
+        m_list->setRows(rows);
+        update();
+        return;
+    }
+
+    if (m_deviceState == StateUnmanaged) {
+        ListRow r;
+        r.kind = ListRow::Header;
+        r.text = m_iface;
+        rows.append(r);
+
+        ListRow manage;
+        manage.kind = ListRow::Action;
+        manage.text = tr("Let NetworkManager manage %1").arg(m_iface);
+        manage.detail = tr("Nothing will hold an address on it until something does");
+        manage.glyph = GlyphWifi;
+        manage.accent = Theme::orange();
+        manage.id = RowManage;
+        rows.append(manage);
+
+        m_list->setRows(rows);
+        update();
+        return;
+    }
+
+    if (!m_radioOn) {
+        ListRow r;
+        r.kind = ListRow::Header;
+        r.text = tr("Networks");
+        rows.append(r);
+
+        ListRow on;
+        on.kind = ListRow::Action;
+        on.text = tr("Turn the radio on");
+        on.detail = tr("Wi-Fi is switched off");
+        on.glyph = GlyphWifi;
+        on.accent = Theme::orange();
+        on.id = RowEnableRadio;
+        rows.append(on);
 
         m_list->setRows(rows);
         update();
@@ -672,22 +967,42 @@ void WifiPage::rebuild()
         r.key = ap.ssid;
         r.accent = ap.current ? Theme::green() : Theme::ink2();
 
-        const int q = quality(ap.signalDbm);
-        QString detail = tr("%1%  %2 dBm  %3")
-                             .arg(q).arg(ap.signalDbm).arg(security(ap.flags));
+        QString detail = QString::number(quality(ap.signal)) + "%";
+        detail += "  " + (ap.security.isEmpty() ? tr("open") : ap.security);
         if (ap.frequency >= 5000)
             detail += "  5 GHz";
         if (ap.saved)
             detail += "  " + tr("saved");
         r.detail = detail;
 
-        if (ap.current && m_state == "COMPLETED") {
-            r.badge = m_address.isEmpty() ? tr("no address") : m_address;
-            r.badgeColour = m_address.isEmpty() ? Theme::orange() : Theme::green();
-        } else if (ap.current) {
-            r.badge = m_state.toLower();
-            r.badgeColour = Theme::blue();
+        if (ap.current) {
+            if (m_deviceState == StateActivated && !m_address.isEmpty()) {
+                r.badge = m_address;
+                r.badgeColour = isLinkLocal(m_address) ? Theme::orange() : Theme::green();
+            } else if (m_deviceState == StateActivated) {
+                r.badge = tr("no address");
+                r.badgeColour = Theme::orange();
+            } else {
+                r.badge = stateWord(m_deviceState);
+                r.badgeColour = Theme::blue();
+            }
         }
+        rows.append(r);
+    }
+
+    /*
+     * The 169.254 line, spelled out where it happens.  An address in that range
+     * is the one visible symptom of a DHCP exchange that never completed, and
+     * without this row the page reads as a successful connection that mysteriously
+     * has no internet behind it.
+     */
+    if (isLinkLocal(m_address)) {
+        ListRow r;
+        r.text = tr("The router never answered");
+        r.detail = tr("%1 is the address a device gives itself when DHCP fails").arg(m_address);
+        r.enabled = false;
+        r.glyph = GlyphInfo;
+        r.accent = Theme::orange();
         rows.append(r);
     }
 
@@ -698,7 +1013,7 @@ void WifiPage::rebuild()
 
     ListRow rescan;
     rescan.kind = ListRow::Action;
-    rescan.text = m_scanPending ? tr("Scanning...") : tr("Scan again");
+    rescan.text = tr("Scan again");
     rescan.glyph = GlyphWifi;
     rescan.accent = Theme::blue();
     rescan.id = RowRescan;
@@ -717,7 +1032,7 @@ void WifiPage::rebuild()
         ListRow forget;
         forget.kind = ListRow::Action;
         forget.text = tr("Forget %1").arg(m_ssid);
-        forget.detail = tr("Remove it from wpa_supplicant.conf");
+        forget.detail = tr("Remove it from the saved networks");
         forget.glyph = GlyphBack;
         forget.accent = Theme::red();
         forget.id = RowForget;
@@ -726,8 +1041,10 @@ void WifiPage::rebuild()
         ListRow reconnect;
         reconnect.kind = ListRow::Action;
         reconnect.text = tr("Reconnect to a saved network");
+        reconnect.detail = m_profiles.isEmpty() ? tr("Nothing is saved yet") : QString();
         reconnect.glyph = GlyphWifi;
         reconnect.accent = Theme::teal();
+        reconnect.enabled = !m_profiles.isEmpty();
         reconnect.id = RowReconnect;
         rows.append(reconnect);
     }
@@ -771,42 +1088,52 @@ void WifiPage::onActivated(int index)
         return;
     }
     case RowRescan:
-        cli(QStringList() << "scan");
-        m_scanPending = true;
+        nmcli(QStringList() << "device" << "wifi" << "rescan" << "ifname" << m_iface, 3000);
         m_scanAge.restart();
         m_note.clear();
+        refreshScan();
         rebuild();
         return;
     case RowDisconnect:
-        cli(QStringList() << "disconnect");
-        m_note = tr("disconnected");
-        rebuild();
+        /*
+         * `device disconnect' and not `connection down', because the two differ
+         * in exactly the way a button labelled Disconnect should: this one also
+         * tells NetworkManager to stop auto-connecting on that device until
+         * something asks it to, which is what somebody who just pressed it means.
+         * It is a runtime flag and does not survive a reboot, so the saved
+         * network still comes back on its own tomorrow.
+         */
+        startAction(QStringList() << "--wait" << "20" << "device" << "disconnect" << m_iface,
+                    tr("disconnecting"));
         return;
     case RowForget: {
-        const QStringList netLines = cli(QStringList() << "list_networks").split('\n');
-        for (const QString &line : netLines) {
-            const QStringList cols = line.split('\t');
-            if (cols.size() < 4 || !cols.at(3).contains("CURRENT"))
-                continue;
-            cli(QStringList() << "remove_network" << cols.at(0).trimmed());
-            cli(QStringList() << "save_config");
-            m_note = tr("forgot %1").arg(m_ssid);
-            break;
-        }
+        const QString ssid = m_ssid;
+        forgetProfilesFor(ssid);
+        m_note = tr("forgot %1").arg(ssid);
+        refreshStatus();
+        refreshScan();
         rebuild();
         return;
     }
     case RowReconnect:
-        cli(QStringList() << "reconnect");
-        m_note = tr("reconnecting");
-        rebuild();
+        /* No profile named: NetworkManager picks the best one it has for this
+         * device, which is the whole point of having saved them. */
+        startAction(QStringList() << "--wait" << "45" << "device" << "connect" << m_iface,
+                    tr("reconnecting"));
         return;
-    case RowStartSupplicant: {
+    case RowEnableRadio:
+        startAction(QStringList() << "radio" << "wifi" << "on",
+                    tr("turning the radio on"));
+        return;
+    case RowManage:
+        startAction(QStringList() << "device" << "set" << m_iface << "managed" << "yes",
+                    tr("handing %1 to NetworkManager").arg(m_iface));
+        return;
+    case RowStartManager: {
         /*
-         * Only reached when the service is not running.  systemd owns it in this
-         * image, so ask systemd; falling back to starting the daemon by hand would
-         * leave two supplicants fighting over the interface the moment the unit
-         * came up on its own.
+         * Only reached when the daemon is not running.  systemd owns it in this
+         * image, so ask systemd; starting it by hand would leave two of them
+         * fighting over the interface the moment the unit came up on its own.
          */
         const QString systemctl = firstExecutable(QStringList()
                                                   << "/bin/systemctl" << "/usr/bin/systemctl");
@@ -815,15 +1142,13 @@ void WifiPage::onActivated(int index)
             return;
         }
         QProcess::startDetached(systemctl,
-                                QStringList() << "start" << ("wpa_supplicant@" + m_iface + ".service"));
-        m_note = tr("starting wpa_supplicant@%1").arg(m_iface);
+                                QStringList() << "start" << "NetworkManager.service");
+        m_note = tr("starting NetworkManager");
         update();
-        QTimer::singleShot(2500, this, [this]() {
-            if (supplicantUp()) {
-                cli(QStringList() << "scan");
-                m_scanPending = true;
-                m_scanAge.restart();
-            }
+        QTimer::singleShot(3000, this, [this]() {
+            refreshStatus();
+            refreshProfiles();
+            refreshScan();
             rebuild();
         });
         return;
@@ -840,9 +1165,9 @@ bool WifiPage::handleNav(int action)
     case Joypad::NavDown:  m_list->step(1); return true;
     case Joypad::NavOk:    m_list->press(); return true;
     case Joypad::NavMenu:
-        cli(QStringList() << "scan");
-        m_scanPending = true;
+        nmcli(QStringList() << "device" << "wifi" << "rescan" << "ifname" << m_iface, 3000);
         m_scanAge.restart();
+        refreshScan();
         rebuild();
         return true;
     default:
@@ -859,8 +1184,9 @@ void WifiPage::paintEvent(QPaintEvent *)
                       width() - 2.0 * Theme::Margin, height() - 2.0 * Theme::Margin);
 
     QString right = m_iface.isEmpty() ? tr("no interface") : m_iface;
-    if (!m_state.isEmpty())
-        right += "  " + m_state.toLower();
+    const QString word = stateWord(m_deviceState);
+    if (!word.isEmpty())
+        right += "  " + word;
     const QRectF body = paintSheet(p, card, QStringLiteral("Wi-Fi"), right);
 
     /* One line under the title bar: what the page is doing, or what the address
@@ -868,15 +1194,22 @@ void WifiPage::paintEvent(QPaintEvent *)
      * rather than in a toast that has already gone. */
     QString line = m_note;
     if (line.isEmpty()) {
-        if (!m_ssid.isEmpty() && !m_address.isEmpty())
+        if (!m_ssid.isEmpty() && !m_address.isEmpty()) {
             line = m_ssid + " -- " + m_address;
-        else if (!m_ssid.isEmpty())
+            if (!m_gateway.isEmpty() && !isLinkLocal(m_address))
+                line += "  " + tr("via %1").arg(m_gateway);
+        } else if (!m_ssid.isEmpty()) {
             line = m_ssid;
-        else
+        } else {
             line = tr("Not connected");
+        }
     }
+
     p.setFont(Theme::font(12));
-    p.setPen(m_address.isEmpty() ? Theme::ink2() : Theme::green());
+    if (m_address.isEmpty())
+        p.setPen(Theme::ink2());
+    else
+        p.setPen(isLinkLocal(m_address) ? Theme::orange() : Theme::green());
     p.drawText(QRectF(body.x() + 12, body.y() + 2, body.width() - 24, 18),
                Qt::AlignLeft | Qt::AlignVCenter, line);
 }

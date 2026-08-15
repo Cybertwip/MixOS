@@ -29,7 +29,7 @@
  *   "Wi-Fi"                                              (dashboard.cpp)
  *   "USB"                                                (widgets.cpp)
  *   "MixOS on J36 Ultra"                                 (settingspage.cpp)
- *   "%1%  %2 dBm  %3"                                    (wifi.cpp)
+ *   "NetworkManager"                                     (wifi.cpp)
  *   "%1  %2 bpp  stride %3  %4"                          (diagnostics.cpp)
  *   "%1 (%2, %3 Mb/s)"                                   (diagnostics.cpp)
  *   "CPU"                                                (diagnostics.cpp)
