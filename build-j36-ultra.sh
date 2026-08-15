@@ -188,32 +188,16 @@ fi
 
 [[ "$(uname -s)" == "Darwin" ]] || darkos_die "run this wrapper on macOS"
 [[ "$RESUME_R36" == "0" || "$RESUME_R36" == "1" ]] || darkos_die "J36_RESUME_R36 must be 0 or 1."
-[[ -d "$BOARD_SRC" ]] || darkos_die "vendored MVII board sources are missing: $BOARD_SRC
-run ./device/j36-ultra/sync-mvii-board.sh to restore them from a PowerEngine checkout"
+[[ -d "$BOARD_SRC" ]] || darkos_die "MVII board sources are missing: $BOARD_SRC
+they are committed; restore them from git"
 
-# A warning, not a failure.  This build is self-contained by design, so a
-# PowerEngine tree that happens to be newer than the vendored copies must not stop
-# it -- but silently building last week's keymap is worse than being told.
-#
-# Written as a pipe into a subshell rather than `done < <(...)': macOS /bin/sh is
-# bash 3.2 in POSIX mode, which rejects process substitution outright, and it
-# rejects it at PARSE time -- so `sh ./build-j36-ultra.sh' died on this block
-# before the script had run a single line.
-if [[ -d "$DRIVERS_HOST" && -f "$BOARD_SRC/PROVENANCE.txt" ]]; then
-    drifted="$(
-        grep -E '^[0-9a-f]{64}  ' "$BOARD_SRC/PROVENANCE.txt" |
-        while read -r want file; do
-            [ -n "${file:-}" ] || continue
-            [ -f "$DRIVERS_HOST/$file" ] || continue
-            have="$(shasum -a 256 "$DRIVERS_HOST/$file" | awk '{print $1}')"
-            [ "$have" = "$want" ] || printf '%s ' "$file"
-        done
-    )"
-    if [[ -n "$drifted" ]]; then
-        darkos_warn "MVII drivers have moved since mvii-board/ was vendored: $drifted"
-        darkos_warn "run ./device/j36-ultra/sync-mvii-board.sh to pick the changes up"
-    fi
-fi
+# There used to be a drift check here: it hashed the board sources against a
+# PowerEngine tree sitting beside this checkout and warned when the two had parted
+# ways.  PowerEngine is a separate project on its own schedule, and the check made
+# every J36 build's output depend on whatever happened to be in a sibling directory
+# -- including, once that project deleted a file this port still parses, a warning
+# about drift that no longer meant anything.  mvii-board/ is the source of truth
+# and is edited here; there is nothing left to compare it to.
 
 # THE DTB IS NOT BUILT HERE.  It used to be, and the reason given was a good one --
 # its generator asserts on the JD9365 record table and the keypad pad mux, and those
