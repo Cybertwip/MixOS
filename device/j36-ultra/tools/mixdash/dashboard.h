@@ -57,6 +57,7 @@ class Pointer;
 class QFileSystemModel;
 class QLabel;
 class QListView;
+class QProcess;
 class QTimer;
 class SettingsPage;
 class SharingPage;
@@ -258,6 +259,9 @@ private:
 
     void activate(const AppEntry &entry);
     void launch(const QString &title, const QString &exe, const QStringList &args);
+    /* Everything launch() has to undo, in one place, so that the two ways a child
+     * can end -- it exited, it never started -- cannot drift apart. */
+    void childDone(const QString &message);
     /* Not launch(): a shutdown is the one child that must not be waited for, and
      * the one that needs the panel to say so first.  See dashboard.cpp. */
     void powerOff();
@@ -315,6 +319,15 @@ private:
     /* The exe of a confirm-first card that has been pressed once.  Keyed on the path
      * rather than on a bool so two such cards cannot arm each other. */
     QString m_armedExe;
+
+    /*
+     * The launched child, while there is one.  Null the rest of the time, and that
+     * null is also the "may I start another" test -- there is one framebuffer and
+     * one set of input devices, so two children would be two programs drawing over
+     * each other with the pad going to neither.
+     */
+    QPointer<QProcess> m_child;
+    QString m_childTitle;
 };
 
 #endif /* MIXDASH_DASHBOARD_H */

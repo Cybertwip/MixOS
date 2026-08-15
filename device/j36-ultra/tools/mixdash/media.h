@@ -118,6 +118,7 @@
 class GlVideo;
 class ListPane;
 class QFileInfo;
+class QMouseEvent;
 class QPainter;
 class QProcess;
 class QTimer;
@@ -173,11 +174,38 @@ public:
 protected:
     void paintEvent(QPaintEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
+    /*
+     * The transport is painted, not built out of widgets, so the buttons have to
+     * be hit-tested by hand -- see the note above transportRect() in media.cpp for
+     * why there is no other way to have a control over a film.
+     */
+    void mousePressEvent(QMouseEvent *event) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
+    void mouseReleaseEvent(QMouseEvent *event) override;
 
 private slots:
     void onActivated(int index);
     void onValueChanged(int index, int value);
     void readFrames();
+    /*
+     * ── WHERE THE PICTURE IS KEPT LEVEL WITH THE SOUND ──
+     *
+     * The two chains are separate processes and always will be -- one muxer
+     * blocked on a 64 KiB frame pipe is one muxer not feeding the DAC, which is
+     * the whole reason they were split -- so there is no shared clock to hand.
+     * What there is, is a clock they both already follow: ALSA plays 48000
+     * samples every second of wall time, so the wall clock IS the audio clock to
+     * within one period, and the picture only has to be held against it.
+     *
+     * That is what this does.  The decoder is asked for constant-rate frames, so
+     * the Nth frame out of the pipe is due at startAt + N/fps and no timestamp has
+     * to be carried down a raw pipe.  A frame that is not due yet waits; a frame
+     * that is late is skipped so the next one can be on time.  ffmpeg's own `-re'
+     * used to do the pacing, and that is exactly what could not recover: -re never
+     * emits faster than real time, so a second lost to anything else was a second
+     * behind the sound for the rest of the film.
+     */
+    void pump();
     /*
      * Put the newest frame back on the panel through the GPU.  Called from
      * readFrames() for every frame, and queued from paintEvent() whenever Qt has
@@ -195,12 +223,20 @@ private slots:
      */
     void restartWithoutGl();
     void onDecoderFinished();
+    /* ffprobe answered, or died trying.  Either way whatever was waiting on it is
+     * started here -- a probe that failed is not a reason not to play, it is a
+     * reason to play without a length on the bar. */
+    void onProbeFinished();
     void onMusicFinished(int code);
     /* Whatever the playing chain wrote to stderr, straight onto the glass.  It is
      * ffmpeg's when ffmpeg opens the card itself and aplay's when it does not, and
      * both want the same treatment -- hence one slot rather than two. */
     void onChildStderr();
     void tick();
+    /* The two and a half seconds since the last thing anybody did are up: take the
+     * transport off the film.  Never fires while a film is paused or stopped -- see
+     * nudgeTransport(). */
+    void hideTransport();
     /*
      * The seek the slider has been showing for the last third of a second.
      *
@@ -268,9 +304,19 @@ private:
     /* Cursor onto the row showing this path; false if this listing has none. */
     bool selectPath(const QString &path);
     void openImage(const Entry &entry);
-    /* startAt is why this takes a time: a pipe cannot seek, so seeking is running
-     * ffmpeg again from somewhere else, and that is the same code path as opening. */
+    /*
+     * startAt is why this takes a time: a pipe cannot seek, so seeking is running
+     * ffmpeg again from somewhere else, and that is the same code path as opening.
+     *
+     * IT IS IN TWO HALVES BECAUSE THE FIRST ONE WAITS.  A film that has not been
+     * probed yet cannot be opened -- the rate the picture has to be paced at and
+     * whether there is any sound to pace it against both come out of ffprobe -- so
+     * openVideo() puts the spinner up, asks, and returns.  openVideoNow() is what
+     * onProbeFinished() calls, and it is also what a seek calls directly, because
+     * a seek is the same container and the answer is already in hand.
+     */
     void openVideo(const Entry &entry, double startAt = 0.0);
+    void openVideoNow(const Entry &entry, double startAt);
     void stepImage(int delta);
     void setView(int view);
     /*
@@ -297,8 +343,11 @@ private:
     int queuedIndex() const;
     const Entry *queuedTrack() const;
     /* Start what m_orderAt points at.  The only place that spawns the music
-     * chain, so the only place that has to get the pipeline right. */
+     * chain, so the only place that has to get the pipeline right.  Split for the
+     * same reason openVideo() is: the tags and the length come from a probe that
+     * is no longer allowed to stop the program while it runs. */
     void playQueued(double startAt = 0.0);
+    void playQueuedNow(double startAt);
     /* +1 and -1, honouring repeat and shuffle.  `automatic' is true when a track
      * ended by itself, which is the only case RepeatOne acts on -- pressing Next
      * on a repeat-one track has to move, or the button is a lie. */
@@ -324,6 +373,47 @@ private:
     void paintChrome(QPainter &p) const;
     QString chromeRight() const;
     QRect chromeRect() const;
+
+    /* ── the transport, for a film ────────────────────────────────────────── */
+    /*
+     * A film gets the panel below instead of the one-line strip above.  The ids
+     * are what the hit test returns and what pressControl() acts on, and they are
+     * NOT indices into anything -- the layout is rebuilt from the widget's width
+     * every time it is asked for, so nothing may cache a position.
+     */
+    enum Control {
+        CtlNone = 0,
+        CtlBar,        /* the timebar, which is a control and not a readout */
+        CtlBack,       /* -10 s */
+        CtlPlay,
+        CtlForward,    /* +10 s */
+        CtlLoop,
+        CtlZoom,       /* letterboxed <-> filling the panel */
+        CtlClose
+    };
+    struct Button {
+        int id = CtlNone;
+        QRect where;
+    };
+
+    /* The whole panel, the groove the knob runs in, and the row of buttons.  All
+     * three in widget coordinates, all three derived from nothing but the widget's
+     * size, so the software path and the GPU path cannot disagree about where a
+     * button is. */
+    QRect transportRect() const;
+    QRect barRect() const;
+    QVector<Button> buttons() const;
+    void paintTransport(QPainter &p) const;
+    /* Which control is under a widget-coordinate point, CtlNone for none. */
+    int controlAt(const QPoint &at) const;
+    void pressControl(int id);
+    /* Put the transport up and start the two and a half seconds again.  Called
+     * from every press, every mouse move and every change of state, which is the
+     * whole of the show-and-hide policy. */
+    void nudgeTransport();
+    /* True while the transport should be on the glass: it was nudged recently, or
+     * there is a reason it must not go away at all. */
+    bool transportUp() const;
     /* Re-render the strip and hand it to the GPU, but only when its text has
      * changed since last time.  `into' is the page's rectangle on the
      * framebuffer, because the strip's position is given in those coordinates. */
@@ -350,6 +440,19 @@ private:
     bool musicLive() const { return m_music != nullptr; }
     bool videoLive() const { return m_decoder != nullptr; }
 
+    /* One frame out of the pipe.  yuv420p is twelve bits a pixel and bgra is
+     * thirty-two: that ratio is most of what the GPU path buys before a single
+     * instruction runs on the GPU, and it is the unit everything about the pipe is
+     * measured in -- the read buffer, the frame number, the drop. */
+    int frameBytes() const
+    {
+        return m_gl ? (m_frameW * m_frameH * 3) / 2 : m_frameW * m_frameH * 4;
+    }
+    /* Everything the decoder has, into m_buffer, with a backstop that throws away
+     * whatever is more than a second stale.  See the note in media.cpp: the pipe
+     * must never be what stops ffmpeg. */
+    void fill();
+
     /* ── ffmpeg, aplay and the card ───────────────────────────────────────── */
 
     /* `plughw:C,D' for the lowest-numbered playback PCM, or empty when there is
@@ -360,14 +463,22 @@ private:
     bool ffmpegHasAlsa() const;
     QString ffmpegPath() const;
     QString aplayPath() const;
-    double probeDuration(const QString &path) const;
-    /* Does this container carry an audio stream.  The film's sound is its own
-     * ffmpeg, and starting one on a silent clip is an error message rather than
-     * silence.  True when there is no ffprobe to ask. */
-    bool probeHasAudio(const QString &path) const;
-    /* Title and artist out of the container's tags, for the one track that is
-     * playing.  Empty when there are no tags or no ffprobe. */
-    QString probeTitle(const QString &path) const;
+    QString ffprobePath() const;
+
+    /*
+     * Ask ffprobe about `path' and come back through onProbeFinished() with
+     * `purpose' -- WaitVideo or WaitMusic -- to be resumed.  Returns immediately.
+     * A path that has already been probed does not go out again; the caller is
+     * resumed on the next trip round the event loop instead, so that "cached" and
+     * "not cached" are the same code path at the call site and neither of them
+     * re-enters the caller underneath itself.
+     */
+    void probeThen(const QString &path, int purpose, const Entry &entry, double startAt);
+    /* Whatever this page is willing to show as the name of what is playing: the
+     * container's title tag, else the artist and title, else the file name without
+     * its extension.  Never empty for a file that exists, which is the point --
+     * "decoding..." and a blank label were the two things it used to be. */
+    QString displayTitle(const Entry &entry, const QString &tagged) const;
     /* The mixer, asked once per track: a muted card is the other way to have no
      * sound, and it is not the player's to fix silently. */
     QString mixerComplaint() const;
@@ -443,6 +554,83 @@ private:
      * pay for it again.  Nothing false about a stale value: a new film opens at 0
      * and re-probes both. */
     bool m_videoHasAudio = false;
+    /*
+     * The rate the decoder is being asked to emit at, which is what turns "the Nth
+     * frame out of the pipe" into "the moment that frame is due".  Zero until the
+     * probe answers; see pump().
+     */
+    double m_videoFps = 0.0;
+    /* Frames taken out of the pipe since this decoder started, shown and dropped
+     * alike -- the frame NUMBER, which is the only timestamp a raw pipe carries. */
+    int m_framesDecoded = 0;
+    /* The `-ss' this decoder run was started with, so frame numbers can be turned
+     * into positions in the film rather than in the run. */
+    double m_videoStart = 0.0;
+    /* Fires when the frame already sitting in the buffer becomes due.  Single
+     * shot and re-armed by pump(): a frame arriving early has to be held, and
+     * readyRead will not fire again to remind us. */
+    QTimer *m_pace = nullptr;
+
+    /* ── one ffprobe, asynchronous, cached per path ───────────────────────── */
+    /*
+     * THIS USED TO BE THREE BLOCKING FORKS AND IT WAS THE FREEZE.
+     *
+     * probeDuration(), probeHasAudio() and probeTitle() each started an ffprobe and
+     * sat in Shell::waitForFinished until it answered -- up to four seconds apiece,
+     * with the event loop stopped, before a single frame was asked for.  On a cold
+     * page cache that is most of a minute for a folder of music, and there is no
+     * spinner that can turn while nothing in the program is running.
+     *
+     * So it is one ffprobe now: streams and format tags in a single invocation,
+     * started and forgotten about, and whatever wanted to play carries on from
+     * onProbeFinished().  The answer is kept against the path it describes, which
+     * is what stops a ten-second nudge of the D-pad -- openVideo() again, with a
+     * start time -- from asking about the same container over and over.
+     */
+    QProcess *m_probe = nullptr;
+    QString m_probedPath;
+    double m_probeDuration = 0.0;
+    double m_probeFps = 0.0;
+    bool m_probeAudio = false;
+    QString m_probeTitle;
+
+    /* What the answer is for.  A probe with nothing waiting on it is a probe whose
+     * film was abandoned while it ran, and its result is filed and dropped. */
+    enum { WaitNothing = 0, WaitVideo, WaitMusic };
+    int m_waiting = WaitNothing;
+    Entry m_waitEntry;
+    double m_waitStart = 0.0;
+
+    /* Something is being opened and there is nothing to show yet.  What the spinner
+     * is drawn from, and what keeps "end of file" from being painted over a film
+     * that has not started. */
+    bool m_loading = false;
+    /* busyRequested(), but only when the answer has actually changed.  m_loading is
+     * written from half a dozen places and the shell's spinner has a timer behind
+     * it; saying "still loading" thirty times would restart nothing but would emit
+     * thirty signals for no reason. */
+    void setLoading(bool on, const QString &what = QString());
+    QString m_loadingWhat;
+
+    /* ── transport state ──────────────────────────────────────────────────── */
+    /* Started by nudgeTransport(), and its expiry is the ONLY thing that takes the
+     * panel off the film -- there is no other timer and no other rule. */
+    QTimer *m_transportTimer = nullptr;
+    bool m_transportShown = true;
+    /* What the pointer is over, so a button can light under it.  CtlNone the whole
+     * time there is no mouse on the board, which is the usual case. */
+    int m_hover = CtlNone;
+    /* The knob is being dragged.  While this is true the bar shows m_seekTarget
+     * and the film is left alone; the seek commits on release, through the same
+     * debounce the D-pad uses. */
+    bool m_scrubbing = false;
+    /* Play it again at the end.  Video only: music has m_repeat, which is a
+     * three-way over a queue and means something different. */
+    bool m_loopVideo = false;
+    /* Fill the panel, cropping what does not fit, instead of letterboxing.  It is
+     * ffmpeg that scales, so this is a decoder argument and changing it restarts
+     * the film where it stood -- exactly what a seek already does. */
+    bool m_fill = false;
 
     /* ── music ────────────────────────────────────────────────────────────── */
     QVector<Entry> m_queue;

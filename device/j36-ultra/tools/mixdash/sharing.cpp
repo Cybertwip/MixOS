@@ -97,6 +97,34 @@ QString smbpasswdPath()
     return found;
 }
 
+/* samba's own configuration checker, out of samba-common-bin -- which the samba
+ * package depends on, so it is on the card wherever smbd is.  It is what
+ * /usr/share/samba/is-configured runs to decide whether smbd should run at all,
+ * which is exactly why this page runs it too: asking the same question the same
+ * way is the only way to get the same answer. */
+QString testparmPath()
+{
+    static const QStringList paths = QStringList()
+        << QStringLiteral("/usr/bin/testparm") << QStringLiteral("/usr/sbin/testparm");
+    static const QString found = firstExecutable(paths);
+    return found;
+}
+
+/*
+ * How long the page keeps watching a start that has not finished.
+ *
+ * Ninety seconds because that is systemd's own DefaultTimeoutStartSec, and neither
+ * unit overrides it: declaring failure any earlier would be this page calling a
+ * start dead while the init system is still waiting for it, which is the mistake
+ * the old fifteen-second sample made in miniature.
+ */
+const int kStartGraceMs = 90000;
+
+/* Idle, and while a start is being watched.  Four seconds is enough for an address
+ * appearing or a stick being plugged in; a start wants to be seen landing. */
+const int kPollIdleMs = 4000;
+const int kPollWatchMs = 1500;
+
 } /* namespace */
 
 /* ── the shell-outs ──────────────────────────────────────────────────────── */
@@ -140,10 +168,44 @@ QString SharingPage::systemctl(const QStringList &args, int timeoutMs, int *rc)
     return QString::fromUtf8(p.readAll()).trimmed();
 }
 
+QString SharingPage::activeState(const QString &unit)
+{
+    return systemctl(QStringList() << QStringLiteral("is-active") << unit, 2500);
+}
+
 bool SharingPage::unitActive(const QString &unit)
 {
-    return systemctl(QStringList() << QStringLiteral("is-active") << unit, 2500)
-               == QLatin1String("active");
+    return activeState(unit) == QLatin1String("active");
+}
+
+/*
+ * `activating' IS NOT `inactive', AND CONFLATING THEM WAS THE BUG.  unitActive()
+ * answers the question the switch on the glass asks -- is the share up -- and for
+ * that, everything that is not "active" is "no".  This answers the other question,
+ * the one the old code never asked: is there still something happening.  A
+ * Type=notify unit sits in `activating' from the moment its ExecCondition forks
+ * until smbd sends READY=1, and on this board that stretch is measured in tens of
+ * seconds, not the fifteen the start was given.
+ */
+bool SharingPage::stateIsTransient(const QString &state)
+{
+    /* Empty is one of them, and deliberately.  Empty means the query did not
+     * answer -- a systemctl that timed out or did not run -- and "I could not
+     * find out" is not grounds for declaring a start dead.  The grace still
+     * bounds it, so a systemd that never answers ends the wait; it just does not
+     * end it on the first missed tick. */
+    return state.isEmpty()
+        || state == QLatin1String("activating")
+        || state == QLatin1String("deactivating")
+        || state == QLatin1String("reloading");
+}
+
+QString SharingPage::unitProperty(const QString &unit, const QString &prop)
+{
+    return systemctl(QStringList() << QStringLiteral("show")
+                                   << (QStringLiteral("--property=") + prop)
+                                   << QStringLiteral("--value") << unit,
+                     4000);
 }
 
 bool SharingPage::unitEnabled(const QString &unit)
@@ -161,10 +223,134 @@ bool SharingPage::unitEnabled(const QString &unit)
  * and a symlink pointing at the wrong one is a unit that silently does not exist. */
 QString SharingPage::unitPath(const QString &unit)
 {
-    return systemctl(QStringList() << QStringLiteral("show")
-                                   << QStringLiteral("--property=FragmentPath")
-                                   << QStringLiteral("--value") << unit,
-                     4000);
+    return unitProperty(unit, QStringLiteral("FragmentPath"));
+}
+
+/*
+ * ── SAYING WHY, WHICH THIS PAGE COULD NOT DO ─────────────────────────────────
+ *
+ * `systemctl start' is a poor witness to its own failure here.  It prints a line
+ * when a unit FAILS, which is the case this board hardly ever hits; it prints
+ * nothing at all when a unit is SKIPPED, which is the case this board hits every
+ * time smb.conf is not readable, because both samba units carry
+ *
+ *     ExecCondition=/usr/share/samba/is-configured smb
+ *
+ * and a non-zero ExecCondition means skip, not fail -- exit status 0, no output,
+ * unit inactive.  And it prints nothing when it was killed for taking too long,
+ * because the killing was ours.
+ *
+ * So the reason is asked for afterwards, from the unit itself.  Result= is
+ * systemd's own word for what happened and it survives the job: `exec-condition'
+ * for the skip, `timeout' for a Type=notify daemon that never said READY, and
+ * `exit-code' with ExecMainStatus= for one that died.  Where the answer points at
+ * the configuration, samba is asked what it thinks of the file, because "samba
+ * skipped itself" is only half a sentence without it.
+ *
+ * This function never returns an empty string.  That is the contract that matters:
+ * the report this whole rewrite came from was a switch that moved back with
+ * nothing written anywhere.
+ */
+QString SharingPage::startFailureReason(const QString &unit)
+{
+    const QString result = unitProperty(unit, QStringLiteral("Result"));
+    const QString state = activeState(unit);
+
+    if (result == QLatin1String("exec-condition")) {
+        const QFileInfo cfg((QString::fromLatin1(kConfig)));
+        if (!cfg.exists())
+            return tr("samba skipped itself: there is no %1")
+                       .arg(QString::fromLatin1(kConfig));
+        if (cfg.size() == 0)
+            return tr("samba skipped itself: %1 is empty -- the card may be full")
+                       .arg(QString::fromLatin1(kConfig));
+        const QString why = configComplaint();
+        if (!why.isEmpty())
+            return tr("samba will not read %1: %2")
+                       .arg(QString::fromLatin1(kConfig), why);
+        return tr("samba skipped itself over %1")
+                   .arg(QString::fromLatin1(kConfig));
+    }
+
+    if (result == QLatin1String("timeout"))
+        return tr("%1 did not finish starting").arg(unit);
+
+    if (result == QLatin1String("exit-code")) {
+        const QString why = configComplaint();
+        if (!why.isEmpty())
+            return why;
+        const QString status = unitProperty(unit, QStringLiteral("ExecMainStatus"));
+        return tr("%1 exited %2")
+                   .arg(unit, status.isEmpty() ? QStringLiteral("?") : status);
+    }
+
+    if (result == QLatin1String("signal") || result == QLatin1String("core-dump"))
+        return tr("%1 was killed as it started").arg(unit);
+
+    if (result == QLatin1String("resources"))
+        return tr("there was not enough memory to start %1").arg(unit);
+
+    /* Result= says success and the unit is not running, which is the shape a start
+     * that was never issued leaves behind -- no systemctl on the card, or a systemd
+     * that did not answer.  Say what state it IS in rather than inventing a cause. */
+    const QString why = configComplaint();
+    if (!why.isEmpty())
+        return why;
+    if (!state.isEmpty())
+        return tr("%1 is %2 and did not start").arg(unit, state);
+    return tr("systemd did not answer about %1").arg(unit);
+}
+
+QString SharingPage::configComplaint()
+{
+    if (testparmPath().isEmpty())
+        return QString();
+
+    QProcess p;
+    p.setProcessChannelMode(QProcess::MergedChannels);
+    /* -s is "do not wait for a keypress before dumping", which is the difference
+     * between a check and a hang on a page with no terminal behind it. */
+    p.start(testparmPath(),
+            QStringList() << QStringLiteral("-s") << QString::fromLatin1(kConfig));
+    if (!Shell::waitForStarted(p, 2000))
+        return QString();
+    if (!Shell::waitForFinished(p, 20000)) {
+        p.kill();
+        Shell::waitForFinished(p, 500);
+        return QString();
+    }
+
+    const QString out = QString::fromUtf8(p.readAll());
+    /* testparm's complaints and its dump come out of the same pipe, so the dump is
+     * walked for the words it puts on a bad file.  The lines that matter look like
+     * "Error loading services." and "... failed", and the first of them is the one
+     * worth putting on a 640x480 panel. */
+    const QStringList lines = out.split(QLatin1Char('\n'));
+    for (const QString &raw : lines) {
+        /* The dump and the diagnostics share this pipe, and they are told apart by
+         * where they start: testparm indents every parameter it echoes back with a
+         * tab and writes its own complaints hard against the left margin.  Without
+         * that test a share whose path had the word "error" in it would be reported
+         * as the reason smbd did not start. */
+        if (raw.startsWith(QLatin1Char('\t')) || raw.startsWith(QLatin1Char(' ')))
+            continue;
+        const QString line = raw.trimmed();
+        if (line.isEmpty())
+            continue;
+        if (line.contains(QLatin1String("Error"), Qt::CaseInsensitive)
+            || line.contains(QLatin1String("failed"), Qt::CaseInsensitive)
+            || line.startsWith(QLatin1String("Unknown parameter")))
+            return line;
+    }
+    /* Nothing recognisable, but it still refused: its last word is better than
+     * this page's guess. */
+    if (p.exitCode() != 0) {
+        for (int i = lines.size() - 1; i >= 0; --i)
+            if (!lines.at(i).trimmed().isEmpty())
+                return lines.at(i).trimmed();
+        return tr("testparm exited %1").arg(p.exitCode());
+    }
+    return QString();
 }
 
 /*
@@ -400,6 +586,18 @@ QString SharingPage::applyPassword(const QString &password)
     f.write(password.toUtf8());
     f.write("\n");
     f.close();
+    /*
+     * CHECKED AFTER THE CLOSE, not after the writes.  A QFile write of thirteen
+     * bytes lands in the buffer and the buffer is not handed to the kernel until
+     * the close, so a full card fails HERE and nowhere earlier.  The old code
+     * returned success unconditionally at this point, and the account samba had
+     * just been given would then be one this page could never show again -- the
+     * share works and the only copy of its password is gone.
+     */
+    if (f.error() != QFile::NoError || f.size() <= 0) {
+        return tr("the password reached samba but could not be saved to %1 -- "
+                  "is the card full?").arg(QString::fromLatin1(kSecret));
+    }
     /* Owner only.  It is the credential to a writable export of somebody's home
      * directory and this image has a Terminal page on it. */
     f.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
@@ -506,8 +704,37 @@ QString SharingPage::writeConfig()
       << "   browseable = yes\n"
       << "   create mask = 0644\n"
       << "   directory mask = 0755\n";
+
+    /*
+     * ── THE WRITE IS LOOKED AT NOW, AND IT WAS NOT ───────────────────────────
+     *
+     * This function used to end `s.flush(); f.close(); return QString();' -- three
+     * statements, no question asked, success reported whatever had happened to the
+     * bytes.  QTextStream buffers, so every one of those `<<' above succeeds even
+     * on a card with nothing left on it; the failure arrives at the flush and at
+     * the close, which is precisely where nobody was looking.
+     *
+     * What came out the other side was a TRUNCATED /etc/samba/smb.conf and a page
+     * saying the configuration had been written.  And a truncated smb.conf is the
+     * worst of the three states this file can be in: samba's is-configured returns
+     * non-zero over it, so systemd SKIPS smbd rather than failing it, so
+     * `systemctl start smbd' exits 0 and prints nothing and the switch goes back to
+     * off with no reason recorded anywhere on the device.
+     *
+     * The half-written file is deliberately LEFT WHERE IT IS rather than rolled
+     * back.  What it would be rolled back to is Debian's file plus
+     * finishing_touches.sh's `guest ok = yes' share of the whole DATA partition,
+     * and a card that cannot write its own configuration is not a card to hand a
+     * guest-writable export to.  A skipped smbd shares nothing, which is the right
+     * way for this to fail.
+     */
     s.flush();
+    const bool streamOk = (s.status() == QTextStream::Ok);
     f.close();
+    if (!streamOk || f.error() != QFile::NoError || f.size() <= 0) {
+        return tr("could not finish writing %1 -- is the card full?")
+                   .arg(QString::fromLatin1(kConfig));
+    }
     return QString();
 }
 
@@ -520,7 +747,20 @@ bool SharingPage::configIsOurs()
      * the file to look for it anywhere would find it in a comment somebody
      * pasted, and this question deserves a stricter answer than that. */
     const QByteArray head = f.readLine(256).trimmed();
-    return head == QByteArray(kMarker);
+    if (head != QByteArray(kMarker))
+        return false;
+
+    /*
+     * AND THE FILE HAS TO REACH ITS END, which the marker alone does not prove.
+     * A write that ran out of card gets the first line down and stops somewhere in
+     * the middle, and a file like that answered "yes, ours" for ever after --
+     * ensureConfigured() would then skip the rewrite that is the one thing which
+     * could have repaired it, on every visit, permanently.  Both share headers are
+     * looked for because they are the last things written; the rest of the file is
+     * small enough that reading it to find them costs nothing.
+     */
+    const QByteArray rest = f.readAll();
+    return rest.contains("\n[Home]\n") && rest.contains("\n[Disks]\n");
 }
 
 /*
@@ -557,6 +797,10 @@ void SharingPage::start()
         m_note = tr("samba is not installed on this card");
         return;
     }
+    if (systemctlPath().isEmpty()) {
+        m_note = tr("there is no systemctl on this card, so nothing can start smbd");
+        return;
+    }
 
     /* Config first: smbd reads it at startup, so writing it afterwards would
      * serve the guest-readable shares for the life of this boot. */
@@ -566,12 +810,27 @@ void SharingPage::start()
         return;
     }
 
+    int rc = -1;
     const QString out = systemctl(QStringList() << QStringLiteral("start")
                                                 << QString::fromLatin1(kSmbd),
-                                  15000);
-    /* Best effort, and its failure is not the share's: see the note on kNmbd. */
-    systemctl(QStringList() << QStringLiteral("start") << QString::fromLatin1(kNmbd),
-              8000);
+                                  15000, &rc);
+
+    /*
+     * nmbd second, and --no-block, and BOTH of those matter.
+     *
+     * --no-block because its result is explicitly not consulted -- see the note on
+     * kNmbd -- so the eight seconds this used to wait were eight seconds of a dead
+     * panel bought for nothing.  systemd runs the job either way.
+     *
+     * Second because smbd.service carries `After=nmb.service', and After= binds two
+     * units that are in the same job transaction.  Queue nmbd first and smbd is
+     * made to wait for it, which is nmbd's whole startup added to the one wait on
+     * this page that anybody is watching.  Queued after, there is nothing for the
+     * ordering to apply to.
+     */
+    systemctl(QStringList() << QStringLiteral("--no-block")
+                            << QStringLiteral("start") << QString::fromLatin1(kNmbd),
+              4000);
 
     m_active = unitActive(QString::fromLatin1(kSmbd));
     if (m_active) {
@@ -580,20 +839,95 @@ void SharingPage::start()
                      ? tr("sharing is on, but this device has no network address yet")
                      : tr("sharing is on at %1").arg(ips.first());
         m_reveal = true;
-    } else {
-        m_note = out.isEmpty() ? tr("smbd would not start") : out.section('\n', 0, 0);
+        return;
     }
+
+    /*
+     * NOT RUNNING YET IS NOT THE SAME AS REFUSED, and telling the two apart is the
+     * whole point of this rewrite.
+     *
+     * rc is -1 when systemctl never finished -- which here means the fifteen-second
+     * budget ran out and the client was killed.  Killing the client does not cancel
+     * anything: the job belongs to PID 1 and smbd carries on coming up behind it.
+     * On this board that is the ordinary case for a first start, not an unusual
+     * one, because the unit runs testparm three times off a cold SD card before
+     * smbd is even exec'd.  So the page starts watching instead of lying.
+     *
+     * The same is true when systemctl DID return and the unit is still activating:
+     * a Type=notify unit can be perfectly healthy and not yet ready.
+     */
+    if (rc < 0 || stateIsTransient(activeState(QString::fromLatin1(kSmbd)))) {
+        beginWatch();
+        return;
+    }
+
+    /* It really did stop trying.  systemd's own line if it left one -- it does for
+     * a failure and does not for a skip -- and otherwise the reason dug out of the
+     * unit, which is never empty. */
+    m_note = out.isEmpty() ? startFailureReason(QString::fromLatin1(kSmbd))
+                           : out.section('\n', 0, 0);
 }
 
 void SharingPage::stop()
 {
+    /* Any watch in flight is over: whatever the start was going to do, this is the
+     * newer instruction, and a watch that outlived it would report "sharing is on"
+     * a second after the user switched it off. */
+    m_starting = false;
+    m_startGraceMs = 0;
+    m_timer->setInterval(kPollIdleMs);
+
     systemctl(QStringList() << QStringLiteral("stop") << QString::fromLatin1(kSmbd),
               10000);
-    systemctl(QStringList() << QStringLiteral("stop") << QString::fromLatin1(kNmbd),
-              8000);
+    systemctl(QStringList() << QStringLiteral("--no-block")
+                            << QStringLiteral("stop") << QString::fromLatin1(kNmbd),
+              4000);
     m_active = unitActive(QString::fromLatin1(kSmbd));
     m_reveal = false;
     m_note = m_active ? tr("smbd is still running") : tr("sharing is off");
+}
+
+/*
+ * ── WATCHING A START THAT HAS NOT LANDED ─────────────────────────────────────
+ *
+ * The alternative was to keep blocking until systemd answered, and systemd's own
+ * patience for a Type=notify unit is ninety seconds.  Ninety seconds inside
+ * Shell::waitForFinished is ninety seconds of a panel that does not repaint, does
+ * not read the pad and cannot be backed out of -- which is not a fix, it is the
+ * same bug wearing a longer coat.
+ *
+ * So the wait moves into the poll timer this page already had.  The page keeps
+ * running, the note says what is actually happening, and the tick that finds the
+ * unit settled writes the real answer.  The cost is one `is-active' fork every
+ * second and a half for as long as it takes, which is a fork this page was already
+ * doing every four seconds anyway.
+ */
+void SharingPage::beginWatch()
+{
+    m_starting = true;
+    m_startGraceMs = kStartGraceMs;
+    m_timer->setInterval(kPollWatchMs);
+    m_note = tr("smbd is still starting -- this takes a moment on the first try");
+}
+
+void SharingPage::endWatch(bool ok)
+{
+    m_starting = false;
+    m_startGraceMs = 0;
+    m_timer->setInterval(kPollIdleMs);
+
+    if (ok) {
+        const QStringList ips = addresses();
+        m_note = ips.isEmpty()
+                     ? tr("sharing is on, but this device has no network address yet")
+                     : tr("sharing is on at %1").arg(ips.first());
+        /* Shown on the way up and only on the way up.  It is the one moment the
+         * password is certain to be wanted, and onEnter() masks it again. */
+        m_reveal = true;
+        emit toastRequested(tr("Sharing is on"), 2500);
+        return;
+    }
+    m_note = startFailureReason(QString::fromLatin1(kSmbd));
 }
 
 /* ── the page ────────────────────────────────────────────────────────────── */
@@ -632,6 +966,12 @@ void SharingPage::onEnter()
      * somebody else, and a password that stays on screen from the last visit is
      * one that gets shoulder-surfed by accident. */
     m_reveal = false;
+    /* Not resumed across a visit.  The unit carries on starting whether this page
+     * is on the glass or not, so coming back and reading is-active tells the truth
+     * without any state having to survive the trip. */
+    m_starting = false;
+    m_startGraceMs = 0;
+    m_timer->setInterval(kPollIdleMs);
     poll();
     m_timer->start();
 }
@@ -639,12 +979,29 @@ void SharingPage::onEnter()
 void SharingPage::onLeave()
 {
     m_timer->stop();
+    m_starting = false;
+    m_startGraceMs = 0;
 }
 
 void SharingPage::poll()
 {
-    m_active = unitActive(QString::fromLatin1(kSmbd));
+    const QString state = activeState(QString::fromLatin1(kSmbd));
+    m_active = (state == QLatin1String("active"));
     m_enabled = unitEnabled(QString::fromLatin1(kSmbd));
+
+    if (m_starting) {
+        if (m_active) {
+            endWatch(true);
+        } else if (!stateIsTransient(state)) {
+            /* It has stopped moving and it is not up.  Waiting out the rest of the
+             * grace would only make the page slower to say so. */
+            endWatch(false);
+        } else {
+            m_startGraceMs -= m_timer->interval();
+            if (m_startGraceMs <= 0)
+                endWatch(false);
+        }
+    }
 
     /* Rebuilt every tick rather than only when one of those two changed: the
      * address and the volume list live in row details, and neither of them is
@@ -709,9 +1066,24 @@ void SharingPage::rebuild()
     r = ListRow();
     r.kind = ListRow::Toggle;
     r.text = tr("Share over the network");
-    r.detail = m_active ? tr("smbd is running")
-                        : tr("Off.  Nothing on this device is reachable from the network.");
-    r.on = m_active;
+    /*
+     * THE SWITCH FOLLOWS THE INSTRUCTION AND THE LINE UNDER IT FOLLOWS THE DAEMON,
+     * which is the only honest way to draw a thing that takes half a minute to
+     * happen.  Every report this page has ever drawn was some version of "the knob
+     * pulls back to off", and half of the reason was this line: the switch was
+     * wired straight to is-active, so between the press and smbd saying READY it
+     * sat in the off position as though the press had been refused.  It had not
+     * been.  On is now "a start is in flight or has landed", and the detail says
+     * which of the two, so nothing here claims the share is reachable before it is.
+     */
+    r.detail = m_active   ? tr("smbd is running")
+             : m_starting ? tr("Starting -- smbd has not answered yet")
+                          : tr("Off.  Nothing on this device is reachable from the network.");
+    r.on = m_active || m_starting;
+    if (m_starting && !m_active) {
+        r.badge = tr("starting");
+        r.badgeColour = Theme::yellow();
+    }
     r.accent = Theme::green();
     r.id = IdShare;
     rows << r;
@@ -856,7 +1228,10 @@ void SharingPage::onActivated(int index)
 
     switch (rows[index].id) {
     case IdShare:
-        if (m_active)
+        /* m_starting counts as on, because that is the position the switch is
+         * drawn in -- pressing a switch that looks on has to turn it off, and a
+         * stop is also the right way to call off a start still in flight. */
+        if (m_active || m_starting)
             stop();
         else
             start();
@@ -979,6 +1354,7 @@ void SharingPage::paintEvent(QPaintEvent *)
      * "on" with it. */
     const QString right = !sambaInstalled() ? tr("no samba")
                           : m_active        ? tr("sharing on")
+                          : m_starting      ? tr("sharing starting")
                                             : tr("sharing off");
     const QRectF body = paintSheet(p, card, tr("Sharing"), right);
 
@@ -994,7 +1370,7 @@ void SharingPage::paintEvent(QPaintEvent *)
             line = tr("Switch it on to reach this device's files from a PC");
     }
     p.setFont(Theme::font(12));
-    p.setPen(m_active ? Theme::green() : Theme::ink2());
+    p.setPen(m_active ? Theme::green() : m_starting ? Theme::yellow() : Theme::ink2());
     p.drawText(QRectF(body.x() + 12, body.y() + 2, body.width() - 24, 18),
                Qt::AlignLeft | Qt::AlignVCenter, line);
 }

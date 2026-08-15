@@ -224,6 +224,14 @@ MediaPage::MediaPage(QWidget *parent)
     m_seekTimer->setInterval(350);
     connect(m_seekTimer, &QTimer::timeout, this, &MediaPage::commitSeek);
 
+    /* Single shot, armed by pump() for whatever a decoded-but-not-yet-due frame
+     * has left to wait.  Not a periodic 40 ms tick: the interval is the film's,
+     * not this program's, and a fixed one would beat against it. */
+    m_pace = new QTimer(this);
+    m_pace->setSingleShot(true);
+    m_pace->setTimerType(Qt::PreciseTimer);
+    connect(m_pace, &QTimer::timeout, this, &MediaPage::pump);
+
     /* Both remembered, because a handheld that forgets it was shuffling is a
      * handheld you set up again every boot. */
     m_repeat = Settings::instance().mediaRepeat();
@@ -1177,132 +1185,168 @@ bool MediaPage::ffmpegHasAlsa() const
     return cached != 0;
 }
 
-double MediaPage::probeDuration(const QString &path) const
+QString MediaPage::ffprobePath() const
 {
-    const QString ffprobe = firstExisting(QStringList()
-                                          << "/usr/bin/ffprobe" << "/bin/ffprobe");
-    if (!ffprobe.isEmpty()) {
-        QProcess p;
-        p.start(ffprobe, QStringList()
-                             << "-v" << "error"
-                             << "-show_entries" << "format=duration"
-                             << "-of" << "default=noprint_wrappers=1:nokey=1"
-                             << path);
-        if (Shell::waitForStarted(p, 1500) && Shell::waitForFinished(p, 4000)) {
-            bool ok = false;
-            const double d = QString::fromLatin1(p.readAllStandardOutput()).trimmed().toDouble(&ok);
-            if (ok && d > 0.0)
-                return d;
-        } else {
-            p.kill();
-            Shell::waitForFinished(p, 500);
-        }
-    }
-
-    /* No ffprobe: ask ffmpeg to open the file and say what it found.  It exits 1
-     * for having no output, which is expected and not an error here. */
-    if (ffmpegPath().isEmpty())
-        return 0.0;
-    QProcess p;
-    p.start(ffmpegPath(), QStringList() << "-hide_banner" << "-i" << path);
-    if (!Shell::waitForStarted(p, 1500) || !Shell::waitForFinished(p, 4000)) {
-        p.kill();
-        Shell::waitForFinished(p, 500);
-        return 0.0;
-    }
-    const QString err = QString::fromLocal8Bit(p.readAllStandardError());
-    const int at = err.indexOf(QStringLiteral("Duration:"));
-    if (at < 0)
-        return 0.0;
-    const QString stamp = err.mid(at + 9, 11).trimmed();   /* HH:MM:SS.ss */
-    const QStringList parts = stamp.split(':');
-    if (parts.size() != 3)
-        return 0.0;
-    return parts.at(0).toDouble() * 3600.0 + parts.at(1).toDouble() * 60.0
-           + parts.at(2).toDouble();
+    return firstExisting(QStringList() << "/usr/bin/ffprobe" << "/bin/ffprobe");
 }
 
-bool MediaPage::probeHasAudio(const QString &path) const
+/*
+ * ── ONE PROBE, ASYNCHRONOUS, AND WHOEVER ASKED IS RESUMED FROM ITS EXIT ──────
+ *
+ * Everything this page needs to know about a file before it can play it comes out
+ * of one ffprobe invocation: how long it is, whether it carries sound, what rate
+ * the picture runs at, and what the container calls itself.  It used to be three
+ * invocations and every one of them was waited for with the event loop stopped,
+ * which is the freeze -- and the reason there was no point drawing a spinner,
+ * because nothing in the program was running to turn it.
+ *
+ * WITH THE KEYS PRINTED, not with nokey=1.  ffprobe emits only the entries that
+ * exist, in the container's own order, so bare values cannot be told apart -- a
+ * file with an artist and no title would put the artist where the title goes, and
+ * a stream section would be indistinguishable from the format section.
+ *
+ * A PROBE THAT FAILS IS NOT A REASON NOT TO PLAY.  No ffprobe on the card, a
+ * container it cannot parse, a timeout: all of them end in onProbeFinished() with
+ * whatever was understood, and the caller is started anyway.  What is lost is a
+ * length on the bar and a title from the tags, and the file name covers the
+ * second of those.
+ */
+void MediaPage::probeThen(const QString &path, int purpose, const Entry &entry,
+                          double startAt)
 {
+    m_waiting = purpose;
+    m_waitEntry = entry;
+    m_waitStart = startAt;
+
     /*
-     * Asked because the film's sound is a SEPARATE ffmpeg now, and a process that
-     * is started on a silent clip does not sit there quietly: it exits at once with
-     * "Stream map '0:a:0' matches no streams", which this page would then paint
-     * under the picture as though something had broken.  The old single-process
-     * form got this for free from the `?' on its map, and the `?' cannot be used
-     * here -- an output with no streams in it is its own error.
-     *
-     * TRUE WHEN THERE IS NO FFPROBE, which is the useful way to be wrong: nearly
+     * Already known.  Queued rather than called, so that this function returns to
+     * its caller before the caller is re-entered -- openVideo() is in the middle
+     * of tearing a film down when it asks, and openVideoNow() running inside that
+     * would be openVideo() running inside itself.
+     */
+    if (m_probedPath == path && !path.isEmpty()) {
+        QTimer::singleShot(0, this, &MediaPage::onProbeFinished);
+        return;
+    }
+
+    endProcess(m_probe);
+    m_probedPath = path;
+    m_probeDuration = 0.0;
+    m_probeFps = 0.0;
+    m_probeAudio = true;      /* see below: the useful way to be wrong */
+    m_probeTitle.clear();
+
+    const QString ffprobe = ffprobePath();
+    if (ffprobe.isEmpty() || path.isEmpty()) {
+        QTimer::singleShot(0, this, &MediaPage::onProbeFinished);
+        return;
+    }
+
+    m_probe = new QProcess(this);
+    connect(m_probe, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
+            this, &MediaPage::onProbeFinished);
+    /* errorOccurred and not only finished: an ffprobe that cannot be executed
+     * emits no exit code at all, and a caller left waiting for one would be a
+     * spinner that never stops. */
+    connect(m_probe, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart)
+            onProbeFinished();
+    });
+    m_probe->start(ffprobe, QStringList()
+                                << "-v" << "error"
+                                << "-show_entries"
+                                << "stream=codec_type,r_frame_rate:"
+                                   "format=duration:format_tags=title,artist"
+                                << "-of" << "default=noprint_wrappers=1"
+                                << path);
+}
+
+void MediaPage::onProbeFinished()
+{
+    if (m_probe && m_probe->state() == QProcess::Running)
+        return;                      /* an errorOccurred that was not fatal */
+
+    if (m_probe) {
+        /*
+         * Parsed in one walk.  r_frame_rate arrives as a rational -- "30000/1001"
+         * for anything that came off American television -- and only the FIRST
+         * stream's is taken, because ffprobe prints one per stream and the audio
+         * stream's is meaningless.  hasAudio is set from codec_type rather than
+         * from a second -select_streams run.
+         */
+        QString title, artist;
+        bool sawStreams = false, audio = false;
+        const QStringList lines =
+            QString::fromUtf8(m_probe->readAllStandardOutput()).split('\n');
+        for (const QString &line : lines) {
+            const QString t = line.trimmed();
+            if (t.startsWith(QStringLiteral("codec_type="))) {
+                sawStreams = true;
+                if (t.mid(11) == QStringLiteral("audio"))
+                    audio = true;
+            } else if (t.startsWith(QStringLiteral("r_frame_rate=")) && m_probeFps <= 0.0) {
+                const QStringList r = t.mid(13).split('/');
+                if (r.size() == 2 && r.at(1).toDouble() > 0.0)
+                    m_probeFps = r.at(0).toDouble() / r.at(1).toDouble();
+                else
+                    m_probeFps = r.value(0).toDouble();
+            } else if (t.startsWith(QStringLiteral("duration="))) {
+                const double d = t.mid(9).toDouble();
+                if (d > 0.0)
+                    m_probeDuration = d;
+            } else if (t.startsWith(QStringLiteral("TAG:title="))) {
+                title = t.mid(10).trimmed();
+            } else if (t.startsWith(QStringLiteral("TAG:artist="))) {
+                artist = t.mid(11).trimmed();
+            }
+        }
+
+        /* Only when the probe actually described some streams.  A run that printed
+         * nothing at all understood nothing, and "there is no audio" is a much
+         * worse guess than "there probably is" -- see the note below. */
+        if (sawStreams)
+            m_probeAudio = audio;
+
+        if (!title.isEmpty())
+            m_probeTitle = artist.isEmpty() ? title
+                                            : artist + QStringLiteral(" - ") + title;
+
+        m_probe->deleteLater();
+        m_probe = nullptr;
+    }
+
+    /*
+     * TRUE WHEN NOTHING COULD BE ASKED, which is the useful way to be wrong: nearly
      * every film has sound, so assuming it plays the ones that do and costs a note
      * on the ones that do not.  Assuming the other way would silence everything on
-     * an image that happens to ship ffmpeg without ffprobe.
-     *
-     * Probed alongside the duration and kept for the same lifetime, so seeking --
-     * which is openVideo() again with a start time -- does not pay for it twice.
+     * a card that happens to ship ffmpeg without ffprobe.
      */
-    const QString ffprobe = firstExisting(QStringList()
-                                          << "/usr/bin/ffprobe" << "/bin/ffprobe");
-    if (ffprobe.isEmpty())
-        return true;
 
-    QProcess p;
-    p.start(ffprobe, QStringList()
-                         << "-v" << "error"
-                         << "-select_streams" << "a:0"
-                         << "-show_entries" << "stream=index"
-                         << "-of" << "default=noprint_wrappers=1:nokey=1"
-                         << path);
-    if (!Shell::waitForStarted(p, 1500) || !Shell::waitForFinished(p, 4000)) {
-        p.kill();
-        Shell::waitForFinished(p, 500);
-        return true;
-    }
-    return !QString::fromLatin1(p.readAllStandardOutput()).trimmed().isEmpty();
+    const int purpose = m_waiting;
+    m_waiting = WaitNothing;
+
+    if (purpose == WaitVideo)
+        openVideoNow(m_waitEntry, m_waitStart);
+    else if (purpose == WaitMusic)
+        playQueuedNow(m_waitStart);
 }
 
-QString MediaPage::probeTitle(const QString &path) const
+/*
+ * THE TAGS WIN, THE FILE NAME IS THE FLOOR, AND THERE IS NO THIRD ANSWER.
+ *
+ * A film had no title at all before this -- probeTitle() was only ever called from
+ * the music path -- so the strip over a picture showed the file name and the label
+ * over a track showed the tags, which is two rules for one question.  One rule
+ * now, used by both: what the container says it is called, and failing that what
+ * it is called on disk, without the extension, because ".mkv" is not part of a
+ * film's name and never was.
+ */
+QString MediaPage::displayTitle(const Entry &entry, const QString &tagged) const
 {
-    /*
-     * The tags, so the player shows "Blue Monday" and not "03 - bm (1).mp3".
-     *
-     * WITH the key printed and parsed by name, not with nokey=1: ffprobe emits
-     * only the tags that exist, in the order the container stores them, so two
-     * bare lines cannot be told apart -- a file with an artist and no title would
-     * put the artist where the title goes.
-     */
-    const QString ffprobe = firstExisting(QStringList()
-                                          << "/usr/bin/ffprobe" << "/bin/ffprobe");
-    if (ffprobe.isEmpty())
-        return QString();
-
-    QProcess p;
-    p.start(ffprobe, QStringList()
-                         << "-v" << "error"
-                         << "-show_entries" << "format_tags=title,artist"
-                         << "-of" << "default=noprint_wrappers=1"
-                         << path);
-    if (!Shell::waitForStarted(p, 1500) || !Shell::waitForFinished(p, 4000)) {
-        p.kill();
-        Shell::waitForFinished(p, 500);
-        return QString();
-    }
-
-    QString title;
-    QString artist;
-    const QStringList lines = QString::fromUtf8(p.readAllStandardOutput()).split('\n');
-    for (const QString &line : lines) {
-        const QString t = line.trimmed();
-        if (t.startsWith(QStringLiteral("TAG:title=")))
-            title = t.mid(10).trimmed();
-        else if (t.startsWith(QStringLiteral("TAG:artist=")))
-            artist = t.mid(11).trimmed();
-    }
-
-    if (title.isEmpty())
-        return QString();
-    if (artist.isEmpty())
-        return title;
-    return artist + QStringLiteral(" - ") + title;
+    if (!tagged.isEmpty())
+        return tagged;
+    const QString base = QFileInfo(entry.path).completeBaseName();
+    return base.isEmpty() ? entry.name : base;
 }
 
 QStringList MediaPage::audioDecodeArgs(const QString &path, double startAt,
@@ -1340,6 +1384,32 @@ QStringList MediaPage::audioDecodeArgs(const QString &path, double startAt,
 
 /* ── video ───────────────────────────────────────────────────────────────── */
 
+/*
+ * "I am waiting", said once per change of answer.
+ *
+ * The shell is what draws the ring, because over a film this page cannot draw a
+ * widget over itself and because there should be one spinner on the glass rather
+ * than one per page.  All this end has to be careful about is not shouting: every
+ * frame that arrives clears the flag and every seek sets it again, so an unguarded
+ * emit here would be twenty-five signals a second, each of them restarting an
+ * animation timer in another object.
+ */
+void MediaPage::setLoading(bool on, const QString &what)
+{
+    if (m_loading == on && (!on || m_loadingWhat == what))
+        return;
+    m_loading = on;
+    m_loadingWhat = on ? what : QString();
+    emit busyRequested(m_loading, m_loadingWhat);
+}
+
+/*
+ * THE HALF THAT WAITS.  A film that has not been probed cannot be started -- the
+ * rate the picture is paced at and whether there is any sound to pace it against
+ * both come from ffprobe -- so this puts the spinner up, asks, and gets out of the
+ * way.  A seek is the same container with the answer already in hand and goes
+ * straight through.
+ */
 void MediaPage::openVideo(const Entry &entry, double startAt)
 {
     /* By value before anything is torn down: commitSeek() passes m_showing, and
@@ -1351,6 +1421,44 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
         return;
     }
 
+    if (!item.path.isEmpty() && m_probedPath == item.path) {
+        openVideoNow(item, startAt);
+        return;
+    }
+
+    /*
+     * A different film.  Everything of the last one comes down here rather than in
+     * openVideoNow(), because ffprobe is about to take a moment and a page still
+     * showing the previous picture while it does is a page that looks like it
+     * ignored the press.
+     */
+    stopMusic();
+    stopVideo();
+    dropFrame();
+
+    m_showing = item;
+    m_videoDuration = 0.0;
+    m_videoHasAudio = false;
+    m_videoFps = 0.0;
+    m_trackTitle.clear();
+    m_paused = false;
+    m_note.clear();
+    m_clock.restart();
+    m_pausedAt = (qint64)(startAt * 1000.0);
+    setLoading(true, item.name);
+    setView(ViewVideo);
+    refresh();
+
+    probeThen(item.path, WaitVideo, item, startAt);
+}
+
+void MediaPage::openVideoNow(const Entry &entry, double startAt)
+{
+    const Entry item = entry;
+
+    if (ffmpegPath().isEmpty())
+        return;
+
     /* A film takes the sound card, so the record has to come off first.  This is
      * the one direction the asymmetry in onLeave() runs the other way. */
     stopMusic();
@@ -1360,12 +1468,26 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
     m_buffer.clear();
     m_framesShown = 0;
     m_framesDropped = 0;
+    m_framesDecoded = 0;
+    m_videoStart = startAt;
     m_paused = false;
     m_note.clear();
-    if (m_videoDuration <= 0.0 || startAt <= 0.0) {
-        m_videoDuration = probeDuration(item.path);
-        m_videoHasAudio = probeHasAudio(item.path);
-    }
+    setLoading(true, item.name);
+
+    m_videoDuration = m_probeDuration;
+    m_videoHasAudio = m_probeAudio;
+    /*
+     * Clamped, and the ceiling is not squeamishness about 60 fps material -- it is
+     * that the whole cost of a frame on this board is paid whether or not the eye
+     * can use it, and `-r' below makes ffmpeg do the dropping in the one place that
+     * can do it without decoding twice.  The floor covers a container whose
+     * r_frame_rate is nonsense, which is most of them when the stream is a slide
+     * show.  25 when there was no answer at all.
+     */
+    m_videoFps = m_probeFps > 0.0 ? qBound(1.0, m_probeFps, 30.0) : 25.0;
+    /* The tags win and the file name is the floor -- for a film exactly as for a
+     * track.  See displayTitle(). */
+    m_trackTitle = displayTitle(item, m_probeTitle);
 
     /* Even dimensions: several of the scalers and every yuv420 path want them, and
      * an odd width is a whole class of "ffmpeg exited 1" that is not worth having. */
@@ -1409,11 +1531,57 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
         GlVideo::instance()->available())
         m_gl = GlVideo::instance();
 
-    const QString filter = QString("scale=w=%1:h=%2:force_original_aspect_ratio=decrease,"
-                                   "pad=%1:%2:(ow-iw)/2:(oh-ih)/2,format=%3")
-                               .arg(m_frameW).arg(m_frameH)
-                               .arg(m_gl ? "yuv420p" : "bgra");
+    /*
+     * ── FIT OR FILL, AND WHY IT IS AN ffmpeg ARGUMENT ────────────────────────
+     *
+     * The panel is 4:3 and most film is not, so letterboxed is the honest default
+     * and there are two black bands.  The transport's fullscreen button trades
+     * them for a crop -- scale UP until the short side fits and cut the overhang
+     * off -- which is what everything from a television to a video site calls
+     * zoom, and on a 640x480 screen it is the difference between a face you can
+     * read and a letterbox.
+     *
+     * It has to be done here because ffmpeg is what scales: this end receives
+     * frames that are already exactly panel-sized, which is the whole reason a
+     * Cortex-A7 can play anything at all.  So pressing the button restarts the
+     * decoder where the film stood, and that is not a special case -- it is the
+     * seek path, which already exists because a pipe cannot seek.
+     */
+    const QString fit = m_fill
+        ? QString("scale=w=%1:h=%2:force_original_aspect_ratio=increase,crop=%1:%2")
+              .arg(m_frameW).arg(m_frameH)
+        : QString("scale=w=%1:h=%2:force_original_aspect_ratio=decrease,"
+                  "pad=%1:%2:(ow-iw)/2:(oh-ih)/2")
+              .arg(m_frameW).arg(m_frameH);
+    const QString filter = fit + ",format=" + (m_gl ? "yuv420p" : "bgra");
 
+    /*
+     * ── `-re' STAYS, AND `-r' IS WHAT WAS MISSING ────────────────────────────
+     *
+     * `-re' is the ceiling: it makes ffmpeg emit at roughly real time, which is
+     * what keeps a decoder that is faster than the film from putting the whole
+     * container in this program's heap.  QProcess has no read-buffer limit to
+     * throttle it with -- that is QAbstractSocket -- so the producer is the only
+     * place a bound can come from.
+     *
+     * What `-re' is NOT is a synchroniser, and treating it as one is what was
+     * wrong.  It delays a frame that is early and does nothing at all to a frame
+     * that is late, so the moment this end stalled -- a blocking ffprobe in front
+     * of a play, a launch that stopped the event loop, one full-screen repaint
+     * that ran long -- ffmpeg blocked in write(2), fell behind its own schedule,
+     * and every frame after that was late by the length of the stall while the
+     * ALSA stream kept perfect time.  The old drop-to-the-newest could not fix it:
+     * it dropped whatever happened to be queued, against no clock at all, so it
+     * threw frames away without ever knowing whether that helped.
+     *
+     * The recovery `-re' does give is the burst: having been held up it emits as
+     * fast as it can until it is back on schedule.  Those are the spare frames
+     * pump() needs, and `-r' with `-vsync cfr' is what lets pump() know which ones
+     * to keep -- constant rate means the Nth frame out of the pipe belongs at
+     * startAt + N/fps, so a raw pipe that carries no timestamps does not have to.
+     * It is also where a 60 fps source is halved, once, by the process that has
+     * already decoded it.
+     */
     QStringList args;
     args << "-nostdin" << "-hide_banner" << "-loglevel" << "error" << "-re";
     if (startAt > 0.0)
@@ -1421,6 +1589,8 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
     args << "-i" << item.path
          << "-map" << "0:v:0"
          << "-vf" << filter
+         << "-vsync" << "cfr"
+         << "-r" << QString::number(m_videoFps, 'f', 3)
          << "-f" << "rawvideo" << "-pix_fmt" << (m_gl ? "yuv420p" : "bgra")
          << "-an" << "pipe:1";
 
@@ -1514,57 +1684,139 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
     refresh();
 }
 
-void MediaPage::readFrames()
+/*
+ * DRAINED COMPLETELY, EVERY TIME, and the bound is `-re' at the other end.
+ *
+ * The pipe must never be what stops ffmpeg, because an ffmpeg blocked in write(2)
+ * is an ffmpeg that has stopped decoding, and the frames it is not decoding are
+ * the ones pump() needs to catch the sound up with.  So everything Qt has comes
+ * out here and the queue is bounded from the producer instead.
+ *
+ * m_capped is the backstop for the case `-re' does not cover: a stall long enough
+ * that the burst afterwards is measured in seconds of film.  Twenty-four frames is
+ * about a second, which is far more than pump() can ever make use of -- anything
+ * older than that is going to be dropped unwatched anyway, so it is dropped here
+ * instead of after it has been carried around.
+ */
+void MediaPage::fill()
 {
     if (!m_decoder)
         return;
-
-    /*
-     * yuv420p is twelve bits a pixel, bgra is thirty-two.  That ratio is most of
-     * what the GPU path buys before a single instruction runs on the GPU: it is
-     * the size of every write ffmpeg makes into a 64 KiB pipe and of every read
-     * this slot makes out of it.
-     */
-    const int frameBytes = m_gl ? (m_frameW * m_frameH * 3) / 2
-                                : m_frameW * m_frameH * 4;
-    if (frameBytes <= 0)
-        return;
-
     m_buffer.append(m_decoder->readAllStandardOutput());
-    if (m_buffer.size() < frameBytes)
+
+    const int bytes = frameBytes();
+    if (bytes <= 0)
+        return;
+    const int cap = bytes * 24;
+    if (m_buffer.size() <= cap)
         return;
 
-    /*
-     * DROP TO THE NEWEST.  If more than one whole frame is waiting, the decoder ran
-     * ahead of the paint -- which on this CPU happens the moment anything else asks
-     * for time.  Painting the older ones would put the picture further behind the
-     * sound with every frame; skipping them keeps the two together and the count of
-     * what was skipped goes on the screen instead of being hidden.
-     */
-    const int whole = m_buffer.size() / frameBytes;
-    if (whole > 1)
-        m_framesDropped += whole - 1;
+    const int over = (m_buffer.size() - cap) / bytes;
+    if (over <= 0)
+        return;
+    m_buffer.remove(0, over * bytes);
+    m_framesDecoded += over;
+    m_framesDropped += over;
+}
 
-    const int offset = (whole - 1) * frameBytes;
+void MediaPage::readFrames()
+{
+    fill();
+    pump();
+}
 
-    if (m_gl) {
-        /* Kept rather than consumed: a paused film and a repaint forced from
-         * outside both have to put this same frame back, and there is nowhere
-         * else to get it from once the GPU has drawn it into scanout memory. */
-        m_planes = m_buffer.mid(offset, frameBytes);
-        m_buffer.remove(0, whole * frameBytes);
+/*
+ * ── THE PICTURE, HELD AGAINST THE CLOCK THE SOUND IS ALREADY KEEPING ─────────
+ *
+ * The frame number IS the timestamp.  ffmpeg was asked for constant-rate output,
+ * so the Nth frame to come out of the pipe belongs at startAt + N/fps, and a raw
+ * pipe that carries no timestamps does not have to.
+ *
+ * Three cases, and only the first one is new:
+ *
+ *   EARLY.  The frame is decoded and its moment has not come.  It stays in the
+ *   buffer and m_pace is armed for the difference.  This is what did not exist
+ *   before: `-re' meant a frame was never early, which meant the buffer only ever
+ *   held frames that were LATE, which meant the drop below ran constantly and the
+ *   film sat permanently behind the sound with the count of what was skipped
+ *   climbing on the strip.
+ *
+ *   DUE.  Draw it.  One frame per call, so a long stall does not turn into a
+ *   burst of a dozen presents in one trip round the event loop -- which would be
+ *   the freeze this whole change is about, arriving from the other direction.
+ *
+ *   LATE, WITH ANOTHER ONE BEHIND IT.  Skip it without drawing.  Nothing is drawn
+ *   that is not going to be seen, and now that ffmpeg is running ahead rather than
+ *   in lock step there are genuinely spare frames to skip, so the film reaches the
+ *   sound again instead of trailing it for ever.
+ */
+void MediaPage::pump()
+{
+    if (m_pace)
+        m_pace->stop();
+
+    const int bytes = frameBytes();
+    if (bytes <= 0 || m_view != ViewVideo || m_paused)
+        return;
+
+    const double rate = m_videoFps > 0.0 ? m_videoFps : 25.0;
+
+    for (;;) {
+        if (m_buffer.size() < bytes)
+            return;
+
+        /* Milliseconds into the film that this frame belongs at, against the same
+         * position() the strip and the seek bar are drawn from. */
+        const double due = (m_videoStart + m_framesDecoded / rate) * 1000.0;
+        const double now = position() * 1000.0;
+
+        /*
+         * A whole frame period of slack before anything is called early.  The
+         * alternative is arming a timer for three milliseconds, twenty-five times
+         * a second, on a board where the timer itself costs more than the wait.
+         */
+        const double ahead = due - now;
+        if (ahead > 1000.0 / rate) {
+            if (m_pace)
+                m_pace->start(qMax(1, (int)(ahead - 1000.0 / rate)));
+            return;
+        }
+
+        /* Late, and there is a fresher frame already decoded: this one is not worth
+         * the memcpy and the GPU pass, because the next one is closer to the truth
+         * and is going to overwrite it within milliseconds. */
+        const bool late = ahead < -1000.0 / rate;
+        if (late && m_buffer.size() >= 2 * bytes) {
+            m_buffer.remove(0, bytes);
+            ++m_framesDecoded;
+            ++m_framesDropped;
+            continue;
+        }
+
+        if (m_gl) {
+            /* Kept rather than consumed: a paused film and a repaint forced from
+             * outside both have to put this same frame back, and there is nowhere
+             * else to get it from once the GPU has drawn it into scanout memory. */
+            m_planes = m_buffer.left(bytes);
+            m_buffer.remove(0, bytes);
+            ++m_framesDecoded;
+            ++m_framesShown;
+            setLoading(false);
+            present();
+            return;
+        }
+
+        m_frame = QImage((const uchar *)m_buffer.constData(), m_frameW, m_frameH,
+                         m_frameW * 4, QImage::Format_RGB32).copy();
+        m_buffer.remove(0, bytes);
+        ++m_framesDecoded;
         ++m_framesShown;
-        present();
+        setLoading(false);
+
+        if (isVisible())
+            update();
         return;
     }
-
-    m_frame = QImage((const uchar *)m_buffer.constData() + offset,
-                     m_frameW, m_frameH, m_frameW * 4, QImage::Format_RGB32).copy();
-    m_buffer.remove(0, whole * frameBytes);
-    ++m_framesShown;
-
-    if (isVisible())
-        update();
 }
 
 void MediaPage::refresh()
@@ -1643,6 +1895,10 @@ void MediaPage::onDecoderFinished()
     if (!m_decoder || sender() != m_decoder)
         return;
 
+    /* Whatever this is, it is not loading any more -- the spinner has to come down
+     * even when the answer is "that file would not open". */
+    setLoading(false);
+
     const QString err = QString::fromLocal8Bit(m_decoder->readAllStandardError()).trimmed();
     const int code = m_decoder->exitCode();
 
@@ -1652,6 +1908,23 @@ void MediaPage::onDecoderFinished()
         m_note = tr("ffmpeg exited %1").arg(code);
     else
         m_note = tr("end of file");
+
+    /*
+     * The loop button.  QUEUED, and that is not tidiness: this is a slot on the
+     * very process openVideo() would tear down, and deleting a QProcess from
+     * inside its own finished() is a use-after-free in Qt's own dispatch on the
+     * way back out.  Zero exit only -- a film that would not decode would
+     * otherwise restart itself for ever, several times a second.
+     */
+    if (code == 0 && m_loopVideo && m_view == ViewVideo && !m_showing.path.isEmpty()) {
+        const Entry again = m_showing;
+        QTimer::singleShot(0, this, [this, again]() {
+            if (m_loopVideo && m_view == ViewVideo && !videoLive())
+                openVideo(again, 0.0);
+        });
+        refresh();
+        return;
+    }
 
     /* The picture stays on the glass with the note under it, rather than dropping
      * back to the list -- which is what the old card did, and why the only thing
@@ -1755,7 +2028,32 @@ const MediaPage::Entry *MediaPage::queuedTrack() const
     return i < 0 ? nullptr : &m_queue[i];
 }
 
+/*
+ * THE HALF THAT WAITS -- the same split openVideo() has, for the same reason.
+ * The tags and the length used to be two blocking ffprobes in front of every
+ * track, so pressing A on a song stopped the whole program for as much as eight
+ * seconds before a note was heard.
+ */
 void MediaPage::playQueued(double startAt)
+{
+    const Entry *at = queuedTrack();
+    if (!at)
+        return;
+    const Entry track = *at;
+
+    if (!track.path.isEmpty() && m_probedPath == track.path) {
+        playQueuedNow(startAt);
+        return;
+    }
+
+    setLoading(true, track.name);
+    m_duration = 0.0;
+    m_trackTitle.clear();
+    rebuild();
+    probeThen(track.path, WaitMusic, track, startAt);
+}
+
+void MediaPage::playQueuedNow(double startAt)
 {
     const Entry *at = queuedTrack();
     if (!at)
@@ -1763,6 +2061,8 @@ void MediaPage::playQueued(double startAt)
     /* By value: everything below can touch m_queue, and a pointer into a QVector
      * that reallocates is the same use-after-free the header warns about. */
     const Entry track = *at;
+
+    setLoading(false);
 
     const QString ff = ffmpegPath();
     if (ff.isEmpty()) {
@@ -1818,10 +2118,11 @@ void MediaPage::playQueued(double startAt)
     m_childSaid.clear();
     m_note.clear();
     refreshMixerNote();
-    if (startAt <= 0.0 || m_duration <= 0.0) {
-        m_duration = probeDuration(track.path);
-        m_trackTitle = probeTitle(track.path);
-    }
+    m_duration = m_probeDuration;
+    /* The tags win; the file name is the floor.  A track called "03.mp3" with no
+     * title tag is still a track with a name, and "03" is a better label than the
+     * blank one this used to leave. */
+    m_trackTitle = displayTitle(track, m_probeTitle);
 
     m_music = new QProcess(this);
     connect(m_music, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
@@ -1934,6 +2235,9 @@ void MediaPage::stopVideo()
     m_buffer.clear();
     m_framesShown = 0;
     m_framesDropped = 0;
+    m_framesDecoded = 0;
+    if (m_pace)
+        m_pace->stop();
     m_seekTimer->stop();
     m_seekTarget = -1.0;
     /*
@@ -1989,6 +2293,17 @@ void MediaPage::togglePause()
     else
         m_pausedAt += m_clock.elapsed();
     m_paused = !m_paused;
+
+    /*
+     * The clock is what pump() paces against, so resuming has to give it a shove:
+     * the frame that is now due is already in the buffer, and readyRead will not
+     * fire again to say so until the decoder -- which has only just been sent
+     * SIGCONT -- gets round to writing the next one.
+     */
+    if (!m_paused)
+        pump();
+    else if (m_pace)
+        m_pace->stop();
 
     rebuild();
     refresh();
@@ -2175,6 +2490,18 @@ void MediaPage::tick()
     }
 
     if (m_view == ViewVideo) {
+        /*
+         * THE SAFETY NET UNDER pump()'s OWN RE-ARM.  Everything that normally
+         * moves the picture along is edge-triggered -- a readyRead from the pipe,
+         * a one-shot pace timer -- and a missed edge is missed for ever.  A
+         * decoder that filled the pipe while a frame was being held emits no
+         * further readyRead until something reads; a pace timer stopped by a pause
+         * has nothing but this to start it again.  Twice a second is far too slow
+         * to pace a film with and exactly right for noticing that the pacing has
+         * stopped.
+         */
+        if (videoLive() && !m_paused)
+            pump();
         refresh();
         return;
     }

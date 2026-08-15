@@ -58,6 +58,7 @@ SOURCES += \
     pointer.cpp \
     keyboard.cpp \
     volume.cpp \
+    busy.cpp \
     settingspage.cpp \
     wifi.cpp \
     sharing.cpp \
@@ -80,6 +81,7 @@ HEADERS += \
     pointer.h \
     keyboard.h \
     volume.h \
+    busy.h \
     settingspage.h \
     wifi.h \
     sharing.h \

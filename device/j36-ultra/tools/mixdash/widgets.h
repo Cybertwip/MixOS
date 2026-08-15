@@ -124,6 +124,15 @@ signals:
     /* Ask the shell to put a text-entry keyboard up.  reply is delivered by
      * calling textEntered() on the page that asked. */
     void textRequested(const QString &prompt, const QString &initial, bool password);
+    /*
+     * "I am waiting for something, please say so."  The shell owns the spinner --
+     * one of them, over whatever page is up -- because a page that owns the whole
+     * panel (a film) cannot draw a widget over itself, and because two pages that
+     * each drew their own would be two spinners the moment anything was pushed on
+     * top of anything.  `what' is one short line under the ring; false takes it
+     * down and the text is ignored.
+     */
+    void busyRequested(bool on, const QString &what);
 
 public:
     /* Answer to textRequested.  Default does nothing. */

@@ -79,6 +79,47 @@
  * smbd's lifecycle belongs to the init system, every command here can be checked
  * by hand over ssh, and a page that forked its own daemon would be a second
  * opinion about whether the share is up.
+ *
+ * ── WHY THE SWITCH USED TO FLICK STRAIGHT BACK OFF ───────────────────────────
+ *
+ * It did, on this board, every time, and the line under the title said "smbd would
+ * not start" -- which was not true and was the least useful sentence available.
+ * Three separate things were wrong and all three are fixed here, because any one of
+ * them on its own is enough to reproduce the report.
+ *
+ * ONE: THE START WAS SAMPLED, NOT WAITED FOR.  smbd.service is Type=notify, so
+ * `systemctl start smbd' does not return until smbd itself has told systemd it is
+ * ready.  Before it gets that far the unit runs testparm THREE times -- once for
+ * its own ExecCondition and twice inside the ExecStartPre apparmor script -- and
+ * each of those is a cold dynamic link of forty-odd samba libraries off an SD card
+ * on a Cortex-A7.  The old code allowed the whole sequence fifteen seconds, killed
+ * the systemctl client when that ran out, read is-active ONCE, and called what it
+ * got the answer.  What it got was `activating'.  So the switch went back to off
+ * while smbd was still coming up behind it, and the note said the daemon had
+ * refused.  Now a start that has not finished within the budget is a start still in
+ * progress: the page says so, polls faster until the unit settles, and only calls
+ * it a failure when systemd has.
+ *
+ * TWO: A SKIPPED UNIT LOOKS EXACTLY LIKE A SUCCESSFUL ONE.  Both units carry
+ * `ExecCondition=/usr/share/samba/is-configured <smb|nmb>', and to systemd a
+ * non-zero ExecCondition is not an error -- it is a reason to SKIP the unit.
+ * `systemctl start smbd' exits 0 with no output, the unit stays inactive, and there
+ * is nothing anywhere to read.  That script's first line is
+ * `[ -f /etc/samba/smb.conf ] || exit 1', and its second is a testparm.  So a
+ * missing or torn smb.conf produced a silent, reasonless refusal.  The failure path
+ * now asks systemd for Result= and says so in words, and runs testparm itself to
+ * quote samba's own complaint about the file.
+ *
+ * THREE: THE FILE WAS WRITTEN WITHOUT LOOKING.  writeConfig() ended with
+ * `s.flush(); f.close(); return QString();' -- success, unconditionally, whatever
+ * had become of the bytes.  On the rootfs this image shipped with there were about
+ * forty megabytes free to a non-root writer and two hundred to root, and a card
+ * that fills up mid-write leaves a truncated smb.conf and a page reporting that all
+ * is well.  Truncated is the worst of the three states the file can be in: samba
+ * skips itself over it (see TWO), so the symptom is once again a switch that will
+ * not move and nothing said.  Both writers check now -- the config and the password
+ * file -- and configIsOurs() no longer accepts a file that has this page's marker
+ * on line one and nothing after it.
  */
 #ifndef MIXDASH_SHARING_H
 #define MIXDASH_SHARING_H
@@ -129,10 +170,28 @@ private:
      * never finished, which is not the same answer as "it ran and said no". */
     static QString systemctl(const QStringList &args, int timeoutMs = 4000,
                              int *rc = nullptr);
+    /* What `is-active' printed, verbatim: active, activating, deactivating,
+     * reloading, inactive, failed -- or empty when the query itself did not
+     * answer.  The distinction between the first two is the whole of bug ONE. */
+    static QString activeState(const QString &unit);
     static bool unitActive(const QString &unit);
     static bool unitEnabled(const QString &unit);
+    /* True while the unit is still moving, so waiting longer might change the
+     * answer.  Anything else has settled and will not. */
+    static bool stateIsTransient(const QString &state);
+    /* One field out of `systemctl show', right-hand side only. */
+    static QString unitProperty(const QString &unit, const QString &prop);
     /* systemd's FragmentPath for the unit: where the .service file really is. */
     static QString unitPath(const QString &unit);
+    /* Why a unit that was asked to start is not running.  systemd's Result= put
+     * into words, with samba's own complaint about smb.conf when that is what it
+     * turns on.  Never empty: an unexplained switch that will not move is the
+     * thing this page keeps being reported for. */
+    static QString startFailureReason(const QString &unit);
+    /* What testparm says about the file on disk, first complaint only, empty when
+     * it has none.  Forked only on the failure path -- it is another cold load of
+     * the whole samba library stack, which is not a thing to do on the way in. */
+    static QString configComplaint();
     /* enable or disable, VERIFIED -- and with the .wants symlink written by hand
      * when systemctl could not.  Empty on success, the reason otherwise. */
     static QString setEnabled(const QString &unit, bool on);
@@ -165,6 +224,13 @@ private:
     void stop();
     void rebuild();
 
+    /* The start did not finish inside start()'s budget, so the page is now
+     * watching for it.  Sets the note, speeds the poll up and opens the grace. */
+    void beginWatch();
+    /* It settled.  `ok' writes the success line; otherwise the reason comes from
+     * startFailureReason().  Puts the poll back to its idle pace either way. */
+    void endWatch(bool ok);
+
     ListPane *m_list = nullptr;
     QTimer *m_timer = nullptr;
 
@@ -172,6 +238,13 @@ private:
     bool m_enabled = false;
     bool m_reveal = false;      /* the password is masked until it is asked for */
     QString m_note;             /* one line under the title: what just happened */
+
+    /* A start is in flight and this page is waiting for it -- see bug ONE in the
+     * block at the top of this file.  The grace counts down by one poll interval
+     * a tick and exists only as a backstop: a unit that reaches a settled state
+     * ends the wait long before it runs out. */
+    bool m_starting = false;
+    int m_startGraceMs = 0;
 };
 
 #endif /* MIXDASH_SHARING_H */

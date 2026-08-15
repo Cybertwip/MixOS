@@ -1243,8 +1243,40 @@ void Dashboard::toast(const QString &text, int ms)
     m_toastTimer->start(ms);
 }
 
+/*
+ * ── A LAUNCH DOES NOT STOP THE EVENT LOOP ANY MORE ───────────────────────────
+ *
+ * This was QProcess::execute, which is start() plus a blocking wait, and the wait
+ * was the whole problem.  For as long as Doom was up, mixdash was a process
+ * sitting in waitpid(): no timers, so the console guard never ran and a unit
+ * started behind the child could put fbcon back over it with nothing here to
+ * notice; no signal delivery through the event loop; and -- the reason this came
+ * up -- nothing could animate, so there was no way to tell a child that was slow
+ * to start from a shell that had hung.  It also meant a child that never exited
+ * was a dashboard that never came back, with no path in the program that could
+ * even say so.
+ *
+ * So the child is started and the loop keeps turning.  Two things have to be true
+ * for that to be an improvement rather than a mess:
+ *
+ *   THE SHELL MUST NOT DRAW.  The child owns the framebuffer -- that is what
+ *   taking the panel means -- and every repaint here is a memcpy over whatever it
+ *   is showing.  With the loop stopped that was free; now it is setUpdatesEnabled
+ *   (false) on the top level, which suppresses paint events and the linuxfb flush
+ *   for this window and every child of it, the status-bar clock and the console
+ *   guard's update() included.
+ *
+ *   THERE MUST BE ONLY ONE.  One panel, one set of input devices.  m_child being
+ *   non-null is that test, and it is a QPointer so a child whose QProcess was
+ *   destroyed some other way cannot be mistaken for a running one.
+ */
 void Dashboard::launch(const QString &title, const QString &exe, const QStringList &args)
 {
+    if (m_child) {
+        toast(tr("%1 is still running").arg(m_childTitle));
+        return;
+    }
+
     if (exe.isEmpty() || !QFileInfo(exe).isExecutable()) {
         toast(tr("%1 is not on this card").arg(title));
         return;
@@ -1252,8 +1284,9 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
 
     toast(tr("Starting %1").arg(title), 60000);
     /*
-     * Painted before we block, or the toast never reaches the glass: everything
-     * below this line runs with the event loop stopped.
+     * Painted now, and not left to the next trip round the loop: updates are about
+     * to be switched off, and the last thing on the glass before the child draws
+     * should be the sentence naming what is starting.
      */
     m_toast->repaint();
     QCoreApplication::processEvents();
@@ -1262,7 +1295,51 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
      * is discarded before the dashboard listens again. */
     m_pad->setSuspended(true);
     m_pointer->sleep();
-    const int rc = QProcess::execute(exe, args);
+
+    m_childTitle = title;
+    QProcess *child = new QProcess(this);
+    m_child = child;
+    /*
+     * Inherited, which is what QProcess::execute did and what the child wants: its
+     * output belongs wherever this program's own went -- the console before the
+     * first frame, /run/j36/mixdash.log after it -- and the alternative is Qt
+     * quietly accumulating a game's stdout in a buffer nobody reads.
+     */
+    child->setProcessChannelMode(QProcess::ForwardedChannels);
+
+    connect(child, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
+        /* Only the one that has no exit code to come.  Crashed, Timedout and the
+         * write errors all still reach finished(), and handling them here as well
+         * would report the same child twice. */
+        if (e == QProcess::FailedToStart)
+            childDone(tr("%1 would not start").arg(m_childTitle));
+    });
+    connect(child, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+            [this](int code, QProcess::ExitStatus status) {
+        if (status == QProcess::CrashExit)
+            childDone(tr("%1 crashed").arg(m_childTitle));
+        else if (code != 0)
+            childDone(tr("%1 exited %2").arg(m_childTitle).arg(code));
+        else
+            childDone(tr("%1 exited").arg(m_childTitle));
+    });
+
+    child->start(exe, args);
+
+    /* After start(), so a failure to start has already been queued and is answered
+     * by childDone() rather than leaving the panel blank. */
+    setUpdatesEnabled(false);
+}
+
+void Dashboard::childDone(const QString &message)
+{
+    if (QProcess *p = m_child.data()) {
+        m_child.clear();
+        p->disconnect(this);
+        p->deleteLater();
+    }
+    m_childTitle.clear();
+
     m_pad->setSuspended(false);
 
     /*
@@ -1270,19 +1347,16 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
      * mode of its own through /dev/dri/card0 has taken the scanout away from the
      * LK's simple-framebuffer as well, and no amount of repainting here brings that
      * back -- which is worth knowing when a launch comes back to a black panel.
+     *
+     * setUpdatesEnabled(true) marks this widget dirty by itself; the children were
+     * never dirtied while updates were off, so they are asked explicitly.
      */
+    setUpdatesEnabled(true);
     update();
     if (m_current)
         m_current->update();
 
-    if (rc == -2)
-        toast(tr("%1 would not start").arg(title));
-    else if (rc == -1)
-        toast(tr("%1 crashed").arg(title));
-    else if (rc != 0)
-        toast(tr("%1 exited %2").arg(title).arg(rc));
-    else
-        toast(tr("%1 exited").arg(title));
+    toast(message);
 }
 
 /*
