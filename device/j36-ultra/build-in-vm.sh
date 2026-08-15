@@ -4170,6 +4170,27 @@ RestartSec=2
 # and scrolls the first one off a 480-pixel panel, which is exactly how the last
 # bad_alloc was read as three unrelated failures.
 RestartPreventExitStatus=3 4
+# ── who the kernel kills when 946 MB and 768 MB of zram are both gone ────────
+#
+# There is swap on this board now, which moves the OOM killer from "the first thing
+# that goes wrong" to "the last", but it does not remove it: swap postpones the
+# decision, it does not make it. So the decision is worth having an opinion about.
+#
+# Left alone, oom_badness is essentially resident set size, and this process is one
+# of the larger ones on an idle board -- Qt, a font cache and a 640x480 framebuffer.
+# It is also the only shell this machine has. Killing it turns a device that is
+# short of memory into a black panel with no way back, which is indistinguishable
+# from a crash and is what somebody power-cycles out of. -300 does not make it
+# immortal; it moves it a few hundred points down a 0..1000 scale, which is enough
+# to put anything with a real appetite ahead of it.
+#
+# CHILDREN INHERIT THIS, and that is deliberate for the cube, Doom and the
+# emulators -- they are the thing the user is looking at, and the dashboard behind
+# them is redrawable. It is NOT right for the browser, which is the one child here
+# that can eat the whole board on its own, so j36-browser-session raises its own
+# score back above zero on the way in. That pair is the whole policy: the browser
+# dies first and lands back on a dashboard that is still running.
+OOMScoreAdjust=-300
 # /run/mixdash, 0700, for XDG_RUNTIME_DIR -- Qt keeps sockets and lock files there and
 # warns about it in its first line of output when it is not set.
 RuntimeDirectory=mixdash
@@ -10722,6 +10743,26 @@ export GDK_BACKEND=x11
 export GTK_OVERLAY_SCROLLING=0
 export GDK_CORE_DEVICE_EVENTS=1
 
+# THE BROWSER IS THE THING THAT SHOULD DIE FIRST, and this is where that is said.
+#
+# mixdash runs with OOMScoreAdjust=-300 so that a board out of memory does not lose
+# the only shell it has, and oom_score_adj is INHERITED, so without this line the
+# browser would arrive here at -300 as well -- better protected than the dashboard
+# it was launched from, and better protected than everything else on the machine.
+# That is exactly backwards. This session is Firefox, an X server and a pad bridge;
+# it is the largest resident set on the board by a wide margin and it is the one
+# thing here that can be restarted from a card on the dashboard.
+#
+# +300 is set on the session and inherited by all of it, so if the killer picks
+# within this tree it picks by size, which is Firefox. Killing the X server instead
+# would end the session too, and that is the same outcome: back to the dashboard.
+#
+# Raising oom_score_adj is always permitted; lowering it below the inherited value
+# needs CAP_SYS_RESOURCE. This only ever raises, so it works whoever runs it, and
+# the redirect is guarded because a kernel without CONFIG_PROC_FS writable here
+# should cost the tuning and not the browser.
+echo 300 > /proc/self/oom_score_adj 2>/dev/null || true
+
 WM=""; KBD=""; PAGE=""
 
 # matchbox: a kiosk window manager, 340 kB, no panel and no desktop.  It exists here
@@ -10745,12 +10786,17 @@ if [ -x /usr/bin/matchbox-keyboard ]; then
     KBD=$!
 fi
 
-# ── Firefox on 946 MB of RAM with no swap ────────────────────────────────────
+# ── Firefox on 946 MB of RAM ─────────────────────────────────────────────────
 #
 # Firefox is the browser this image installs, because JavaScript is not optional on
 # the 2026 web.  It is also 253 MB of package and a 130 MB libxul.so mmapped off an
-# SD card, on a board with 946 MB of usable memory and no swap device at all, and
-# NONE OF THAT IS A REASON TO SHIP IT UNTUNED.  Out of the box it would start four
+# SD card, on a board with 946 MB of usable memory, and NONE OF THAT IS A REASON TO
+# SHIP IT UNTUNED.  There is 768 MB of lz4 zram swap behind it now -- see
+# setup_zram in /init -- and that changes how much room there is, not how much
+# Firefox asks for; a browser that needs 1.4 GB on a machine with 1.3 GB of
+# effective memory is still a browser that gets killed, and it gets killed after
+# spending the intervening minute compressing pages.  The swap buys the headroom
+# these prefs then live inside.  Out of the box it would start four
 # or five content processes -- Fission gives every origin on a page its own -- and
 # the third one is where this board runs out.  So a user.js is written into an
 # explicit profile before every launch:
@@ -10767,9 +10813,11 @@ fi
 #   is worth having but not worth 300 MB of it; the session store's default is to
 #   write the whole session every fifteen seconds, which on this card is a stall.
 #
-#   Crash recovery OFF.  With no swap, the way Firefox dies here is the OOM killer,
-#   and a browser that restores the page that just got it killed is a loop somebody
-#   has to power-cycle out of.
+#   Crash recovery OFF.  The way Firefox dies on this board is still the OOM
+#   killer -- swap moves that from the first thing that goes wrong to the last, and
+#   the session above deliberately volunteers this process for it -- and a browser
+#   that restores the page that just got it killed is a loop somebody has to
+#   power-cycle out of.
 #
 #   The telemetry, Pocket and first-run pages off, because none of them can be
 #   dismissed comfortably on a D-pad and the first-run page is what would be on the
