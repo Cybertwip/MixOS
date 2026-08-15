@@ -1862,6 +1862,34 @@ static void j36_musb_host_kick(struct j36_usb_phy *p)
 		dev_warn(p->dev,
 			 "and it was measured, not forced: with DRVVBUS pad %d driven high the PHY's own comparator still reads VBUS %s, so the 5 V is not reaching the port -- look at the load switch and the pad, not at the role\n",
 			 p->vbus_pin, j36_musb_vbus_str(devctl));
+
+	/*
+	 * ── AND THEN TAKE THE MEASUREMENT BACK DOWN ──────────────────────────
+	 *
+	 * The sensed arm is a diagnostic, and it is finished the moment the line
+	 * above has read it. What it must not do is become the state the port
+	 * then RUNS in, because with the value forces released VBUSVALID is a
+	 * live comparator on the pin and any droop below its threshold ends the
+	 * session under whatever is enumerating.
+	 *
+	 * That distinction is invisible to a mouse and decisive for a hub. The 5 V
+	 * here comes through a load switch off VBAT, and what a hub presents when
+	 * it is plugged in is the bulk capacitance of its own regulator plus one
+	 * downstream port's worth for each socket -- hundreds of microfarads
+	 * charging through a switch and a connector, which is a real droop for a
+	 * few milliseconds. A mouse presents a fraction of that and never gets
+	 * near the threshold. So a port left sensed hosts single devices perfectly
+	 * and drops every hub at the instant of plug-in, which is a fault report
+	 * that reads like "hubs are not supported" and is nothing of the kind.
+	 *
+	 * Forcing them back is three writes and a settle, and both sequences are
+	 * idempotent: HOST_SET is AVALID|BVALID|VBUSVALID and HOST_CLR is
+	 * IDDIG|SESSEND, which is what a working A-device session already has, so
+	 * this asserts the state the bus is in rather than changing it. The
+	 * session is not touched.
+	 */
+	if (sensed)
+		j36_phy_force_host(p);
 }
 
 /*
