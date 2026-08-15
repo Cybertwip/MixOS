@@ -1053,10 +1053,13 @@ static void j36_phy_force_device(struct j36_usb_phy *p)
 static void j36_phy_force_host(struct j36_usb_phy *p)
 {
 	j36_phy_clock_on(p);
+	if (j36_phy_role_is(p, J36_PHY_R6C_HOST_SET, J36_PHY_R6C_HOST_CLR))
+		return;
 	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_HOST_CLR);
 	j36_phy_set(p, J36_PHY_R6C, J36_PHY_R6C_HOST_SET);
 	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_ALL);
 	usleep_range(J36_PHY_SETTLE_US, J36_PHY_SETTLE_US * 2);
+	msleep(J36_PHY_ROLE_SETTLE_MS);
 }
 
 /*
@@ -1545,6 +1548,13 @@ static void j36_musb_host_kick(struct j36_usb_phy *p)
 
 	j36_musb_stand_down(p);
 	j36_phy_force_host(p);
+	/*
+	 * Same gap decide_role() leaves between the role and the edge. There it is
+	 * nominally VBUS rise time; here VBUS never dropped, so it is purely the
+	 * settle -- and it is the one thing the boot that latched A-device had and
+	 * every boot that latched B-device did not.
+	 */
+	msleep(J36_VBUS_RISE_MS);
 	j36_musb_session(p, true);
 
 	devctl = j36_musb_settle(p);
