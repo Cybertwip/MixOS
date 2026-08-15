@@ -2827,6 +2827,7 @@ expand_root() {
     # The count lives on the ext2 partition and a Mac cannot reach it, so
     # `j36.expand=retry' in mvii/boot.conf clears it from the FAT one -- the same place
     # `j36.expand=0' is typed, for the same reason.
+    #
     # `:>' and not `rm', here and at the bottom, and it is not a style choice: this
     # initramfs has no rm applet -- INIT_APPLETS is the whole of what /bin holds, and
     # the scan channel a few hundred lines up is emptied the same way for the same
