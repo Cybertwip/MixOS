@@ -647,6 +647,8 @@ void WifiPage::refreshStatus()
  * NetworkManager is not running." when there is nothing to ask. */
 void WifiPage::applyRadio(int exitCode, const QString &out)
 {
+    const bool was = m_managerUp;
+
     if (exitCode != 0) {
         m_managerUp = false;
         m_radioOn = true;
@@ -660,6 +662,14 @@ void WifiPage::applyRadio(int exitCode, const QString &out)
     }
     m_managerUp = true;
     m_radioOn = (out.trimmed() != QLatin1String("disabled"));
+
+    /* The first answer of the session, or the first after the daemon came back.
+     * refreshProfiles() and refreshScan() skip themselves until this is known, so
+     * without this the page would sit empty until the next tick. */
+    if (!was) {
+        enqueue(QueryProfiles);
+        enqueue(QueryScan);
+    }
 }
 
 void WifiPage::applyDevice(int exitCode, const QString &show)
@@ -697,6 +707,13 @@ void WifiPage::applyDevice(int exitCode, const QString &show)
             m_gateway = value;
         }
     }
+
+    /* It connected after all -- whatever key is on the card now is the right one,
+     * so stop offering to retype it.  This catches the autoconnect that succeeds
+     * without anybody pressing anything as well as the one that does. */
+    if (m_deviceState == StateActivated && !m_badKeySsid.isEmpty()
+        && m_ssid == m_badKeySsid)
+        m_badKeySsid.clear();
 }
 
 void WifiPage::refreshProfiles()
@@ -1652,9 +1669,10 @@ bool WifiPage::handleNav(int action)
     case Joypad::NavDown:  m_list->step(1); return true;
     case Joypad::NavOk:    m_list->press(); return true;
     case Joypad::NavMenu:
-        nmcli(QStringList() << "device" << "wifi" << "rescan" << "ifname" << m_iface, 3000);
+        enqueue(QueryRescan);
+        enqueue(QueryScan);
         m_scanAge.restart();
-        refreshScan();
+        pumpQueries();
         rebuild();
         return true;
     default:
