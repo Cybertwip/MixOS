@@ -41,6 +41,17 @@
  *                is already running.
  *   key()     -- an evdev code and the modifier state.  Only devices that look
  *                like real keyboards produce it, and only the Terminal listens.
+ *
+ * AND ONE THING THAT IS NOT AN INPUT AT ALL: the headphone jack.  It is here
+ * because of where the kernel puts it and not because it belongs with the
+ * buttons -- j36_mt6592_input.c owns the SoC's ADC and its GPIO pads, so the
+ * detect line is sampled by the driver behind the pad and arrives as an EV_SW
+ * event on the pad's own evdev node.  This file already has every descriptor in
+ * /dev/input open and a 15 ms poll(2) over them, so noticing SW_HEADPHONE_INSERT
+ * is one more branch in a loop that is already running; a second reader would be
+ * a second open of the same node to hear one bit change.  What to DO about it --
+ * which of the two ALSA switches goes on and which goes off -- is not this file's
+ * business and is in Dashboard::onHeadphoneJack.
  */
 #ifndef MIXDASH_JOYPAD_H
 #define MIXDASH_JOYPAD_H
@@ -106,6 +117,23 @@ public:
      * the user having to find a text field to type into. */
     int mouseCount() const;
     int keyboardCount() const;
+
+    /*
+     * THE JACK, AND THE THREE-VALUED ANSWER IT REALLY HAS.
+     *
+     * jackKnown() is false when no open device reports SW_HEADPHONE_INSERT at
+     * all, and on this board that is the ordinary case for a kernel built before
+     * the detect line was found -- j36_mt6592_input only advertises the switch
+     * when jack_adc= or jack_gpio= gave it something to sample.  It is NOT the
+     * same as "nothing is plugged in", and everything that acts on this has to
+     * tell those two apart: with no detect line the two output switches are a
+     * setting the user makes, and something that quietly turned the speaker off
+     * because it read an unknown jack as empty would be worse than useless.
+     *
+     * jackPlugged() is only meaningful while jackKnown() is true.
+     */
+    bool jackKnown() const { return m_jackKnown; }
+    bool jackPlugged() const { return m_jackPlugged; }
 
     /*
      * Off while a child process owns the screen, then on again with whatever
@@ -197,6 +225,22 @@ signals:
 
     void key(int code, bool pressed, int modifiers);
 
+    /*
+     * Something went into the headphone jack, or came out of it.
+     *
+     * EMITTED ONLY WHILE THERE IS A DETECT LINE TO BELIEVE.  A driver that stops
+     * reporting the switch -- the module unloaded, the node gone -- does not emit
+     * a final unplugged: an absent jack is unknown and not empty, and the one
+     * thing this signal must never do is tell the shell to switch a user's
+     * headphones off because the thing that could see them went away.
+     *
+     * Emitted on change only, and not at construction: nothing is connected to
+     * this yet when openDevices() runs from the constructor, so the shell reads
+     * jackKnown()/jackPlugged() once for the state it started in and listens to
+     * this for every state after that.
+     */
+    void headphoneJack(bool plugged);
+
 private slots:
     void poll();
 
@@ -223,6 +267,13 @@ private:
 
         bool keyboard = false;
         bool mouse = false;
+
+        /* This node reports SW_HEADPHONE_INSERT, and what it last said.  Per
+         * device rather than per Joypad because a USB headset's node reports one
+         * too, and two of them disagreeing is a state this has to hold rather
+         * than overwrite -- see updateJack(). */
+        bool jack = false;
+        bool jackPlugged = false;
     };
 
     void openDevices();
@@ -236,6 +287,13 @@ private:
      * held at that moment.
      */
     void syncDevices();
+    /*
+     * Recompute the one jack answer from however many devices are reporting one,
+     * and emit if it moved.  Called from everywhere the set of devices or the
+     * state of one of them changes -- an arrival, a departure, an EV_SW event,
+     * and the re-read after a child process handed the descriptors back.
+     */
+    void updateJack();
     void drain();
     void feed(int action, bool pressed);
     void axis(Dev &d, int slot, int value);
@@ -249,6 +307,11 @@ private:
     bool m_suspended = false;
     bool m_textMode = false;
     int m_mods = ModNone;
+
+    /* The current answer to the two accessors, so a consumer can ask without
+     * this having to walk the device list on every call. */
+    bool m_jackKnown = false;
+    bool m_jackPlugged = false;
 
     /* Our own key repeat: the input core only autorepeats if a driver asks it to,
      * and neither the keypad nor gpio-keys does here. */

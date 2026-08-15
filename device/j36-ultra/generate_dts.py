@@ -1813,6 +1813,30 @@ def generate(sources: dict[str, str]) -> str:
 \t\tj36,raw-max = <3900>;
 \t\tj36,fallback-center = <{joy_center}>;
 \t\tj36,deadzone = <{joy_deadzone}>;
+\t\t/*
+\t\t * THE HEADPHONE JACK, AND WHY THERE IS NO PROPERTY HERE FOR IT.
+\t\t *
+\t\t * The driver will sample a detect line and report SW_HEADPHONE_INSERT
+\t\t * from either of:
+\t\t *
+\t\t *   j36,jack-adc  = <channel low high>;   AUXADC 0-15, raw 12-bit window
+\t\t *   j36,jack-gpio = <pad active_low>;     a pad sampled as a level
+\t\t *
+\t\t * Neither is emitted, because nothing in this tree knows which line it
+\t\t * would be. There is no schematic here, the MVII board header brings no
+\t\t * HP-detect pin out, and the vendor's own answer was ACCDET over an
+\t\t * ioctl on a driver that does not exist in this kernel -- so a channel
+\t\t * number written here would be a guess wearing the clothes of a hardware
+\t\t * description, and the one thing a DTS must not contain is a guess.
+\t\t *
+\t\t * Find it first: boot, then
+\t\t *
+\t\t *   echo 500 > /sys/module/j36_mt6592_input/parameters/jack_scan
+\t\t *
+\t\t * and work the jack while watching dmesg. Whichever channel or pad moves
+\t\t * with the plug is the line; confirm it with the matching module
+\t\t * parameter on the kernel command line, and only then put it here.
+\t\t */
 \t\tstatus = \"okay\";
 \t}};
 

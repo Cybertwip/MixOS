@@ -75,6 +75,11 @@ QString outputControl(Volume::Output which)
     return which == Volume::Speaker ? g_speakerCtl : g_headphoneCtl;
 }
 
+/* Filed by the shell, read by whoever draws the two output rows.  Not part of
+ * the probe: invalidate() is about a card that changed, and the jack is not on
+ * the card. */
+Volume::JackState g_jack = Volume::JackUnknown;
+
 /*
  * The last level this program set or read, and how long ago.  Only nudge() reads
  * it, and only inside kFreshMs -- see the note on nudge() in volume.h for why a
@@ -311,6 +316,16 @@ void Volume::setOn(Output which, bool on)
                                          << QStringLiteral("set") << ctl
                                          << (on ? QStringLiteral("on")
                                                 : QStringLiteral("off")));
+}
+
+void Volume::noteJack(JackState state)
+{
+    g_jack = state;
+}
+
+Volume::JackState Volume::jack()
+{
+    return g_jack;
 }
 
 int Volume::nudge(int delta, bool *mutedOut)

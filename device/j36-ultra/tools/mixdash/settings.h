@@ -167,6 +167,30 @@ public:
     QString timezone() const { return m_timezone; }
     void setTimezone(const QString &zone);
 
+    /*
+     * Whether the built-in speaker should be on when there is nothing in the
+     * headphone jack.
+     *
+     * AN INTENTION AND NOT A MIXER STATE, which is the entire reason it is in
+     * this file rather than being read back off the card.  Plugging headphones
+     * in switches the speaker off, and the only honest thing to switch back on
+     * unplugging is what the user had chosen BEFORE the plug -- so that choice
+     * has to be recorded somewhere the plug does not touch.  Reading the
+     * "Speaker Amp" control at that moment would answer "off", because that is
+     * what the insert just made it, and the speaker would never come back.
+     *
+     * IT ALSO OUTLIVES alsa-restore.  The mixer state is saved at shutdown and
+     * replayed at boot, so a device switched off with headphones in comes back
+     * up with the speaker muted and nothing in the jack -- silent, with no
+     * indication why.  The shell applies this at startup against what the jack
+     * actually says, and that is the boot that fixes itself.
+     *
+     * Default true: a handheld whose speaker is off by default is a handheld
+     * that appears broken.
+     */
+    bool speakerWanted() const { return m_speakerWanted; }
+    void setSpeakerWanted(bool on);
+
     /* The file the settings actually landed in, for the Settings page to print. */
     QString path() const;
     /* False when even the tmpfs fallback would not open, which is worth saying
@@ -191,6 +215,7 @@ private:
     int m_brightness = -1;
     int m_mediaRepeat = 0;
     bool m_mediaShuffle = false;
+    bool m_speakerWanted = true;
     bool m_writable = false;
 };
 

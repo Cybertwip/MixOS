@@ -210,11 +210,16 @@ MODULE_PARM_DESC(jack_debounce_ms,
 		 "how long a new jack reading has to hold before it is believed");
 
 /*
- * Writable, and the only one of these that is, because it is the instrument and
- * not the setting: echo 500 into it, work the jack, read dmesg, echo 0 back.
- * The others are 0444 because the capability this driver advertises on its input
- * device is decided at probe -- a switch that appears halfway through the life of
- * an open evdev node is not something userspace has any way to notice.
+ * The instrument rather than a setting: echo 500 into it, work the jack, read
+ * dmesg, echo 0 back. Writable like the window and the debounce above it, which
+ * are the knobs an operator turns while the answer is still being found.
+ *
+ * The three that choose the SOURCE are the 0444 ones, and that is not caution --
+ * the capability this driver advertises on its input device is decided once, at
+ * probe, and evdev hands a node's capabilities to userspace when the node is
+ * opened. A switch that appeared halfway through the life of an open descriptor
+ * is not something a reader has any way to notice, so the choice has to be made
+ * before there is anything to notice it with.
  */
 static int jack_scan;
 module_param(jack_scan, int, 0644);

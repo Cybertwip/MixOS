@@ -3527,8 +3527,9 @@ run_audio() {
     fi
     # The jack is on unless somebody turns it off, and it is not behind a word:
     # the headphone buffers run off the reference the DAC already needs, so unlike
-    # the class-D there is no rail to take down.  Nothing on this board detects a
-    # plug, so this is the only thing that decides it.
+    # the class-D there is no rail to take down.  This driver detects no plug --
+    # j36_mt6592_input does, when it has been given a line to watch, and mixdash is
+    # what moves these two switches when it reports one.
     say "audio: headphone jack on -- amixer -c0 set Headphone off, or Settings > Sound"
     return 0
 }
@@ -8967,15 +8968,36 @@ j36.audio=1
     to take down.  What it does not switch on is the class-D speaker amp: that has
     its own word, below, because it can switch the board off.
 
-    NOTHING ON THIS BOARD DETECTS A PLUG.  The MT6592 has an ACCDET block and the
-    vendor HAL drives it, but through an ioctl on a kernel driver that does not
-    exist here, and the J36 brings no headphone-detect GPIO out either.  So which
-    output is live is a setting and never a discovery.  Two mixer switches decide
-    it, both saved by alsa-restore, and the dashboard puts them on Settings > Sound:
+    WHICH OUTPUT IS LIVE IS TWO MIXER SWITCHES, both saved by alsa-restore, and the
+    dashboard puts them on Settings > Sound:
 
       amixer -c0 set Headphone off        speaker only
       amixer -c0 set "Speaker Amp" off    jack only
       both on                             both at once, which is a real setting
+
+    THE AUDIO DRIVER STILL DOES NOT DETECT A PLUG, and nothing in this word does.
+    The MT6592 has an ACCDET block and the vendor HAL drives it, but through an
+    ioctl on a kernel driver that does not exist here.  What can now notice a plug
+    is the INPUT driver -- j36.input, which already owns the SoC's AUXADC and its
+    GPIO pads -- and only once it has been told which line to watch:
+
+      j36_mt6592_input.jack_adc=<ch>      an AUXADC channel, 0-15
+      j36_mt6592_input.jack_gpio=<pad>    a GPIO pad, sampled as a level
+      j36_mt6592_input.jack_scan=500      print every channel and pad twice a
+                                          second, to FIND the line
+
+    It is in the input driver and not here on purpose: the two are separately
+    removable words on this command line, and an audio driver that called into the
+    input driver -- or the other way round -- would be a modprobe dependency that
+    drags one in whenever the other is asked for.  See the long note at the top of
+    linux/j36_mt6592_input.c, which also says what this board is known NOT to
+    document: no schematic, DTS or vendor source in this tree names a headphone
+    detect line, so jack_scan is how you find out whether there is one.
+
+    With a line configured, the driver reports SW_HEADPHONE_INSERT on its evdev
+    node and mixdash acts on it -- speaker off and headphones on when something
+    goes in, and back to what the user had chosen when it comes out.  Without one,
+    the two switches above are exactly what they always were.
 
     "Master Playback Volume" moves whichever of them is up: the class-D level and
     the headphone buffer gain are two different registers under one element, so the
@@ -9909,12 +9931,22 @@ the speaker alone -- and then j36_speaker_up() adds the class-D on top if it was
 asked for.  Changing which outputs are live tears the front end down and rebuilds
 it, because the mux is not a runtime switch.
 
-NOTHING DETECTS A PLUG, so both outputs are switches and neither is a status.  The
+THIS DRIVER DETECTS NOTHING, and that is deliberate rather than unfinished.  The
 MT6592 has ACCDET, but no register map for it exists in the reference material --
 only the vendor HAL's ioctls on /dev/accdet, a kernel driver this tree does not
-have -- and the J36 board header brings no HP-detect pin out.  "Headphone" is
-therefore on by default (the buffers run off the reference the DAC already needs,
-and there is no rail for them to pull down) and "Speaker Amp" stays opt-in.
+have -- and the J36 board header brings no HP-detect pin out either.  So both
+outputs here are switches and neither is a status: "Headphone" is on by default
+(the buffers run off the reference the DAC already needs, and there is no rail for
+them to pull down) and "Speaker Amp" stays opt-in.
+
+The plug is noticed somewhere else entirely.  j36_mt6592_input already owns the
+SoC's AUXADC and its GPIO pads and is already polling them every 5 ms, so it is
+the driver that samples the detect line -- if one has been found; see its
+jack_scan= parameter and the j36.audio note in --help.  It reports the result as
+SW_HEADPHONE_INSERT on its own evdev node and mixdash moves the two switches
+above.  Nothing in this file changes, and nothing in this file has to be loaded
+for that to work or has to know it happened: an audio driver that called into the
+input driver would make two independently removable command-line words into one.
 
 Volume is analog on both.  "Master Playback Volume" writes the class-D level over
 SPK_CON9 and the headphone buffer gain into AUDTOP_CON5, whose two 4-bit fields are
@@ -11671,7 +11703,7 @@ fi
             echo "audio_snd_pcm=selected by SND_DUMMY=m, which is built and deliberately not staged"
             echo "audio_start=$(grep -o 'j36\.audio=[a-z0-9]*' sd-boot/mvii/boot.conf)"
             echo "audio_clock=first ungate of AFE_CG on this board; dmesg reports whether DL1_CUR advances on the first stream"
-            echo "audio_outputs=headphone jack (on by default) and class-D speaker; two mixer switches, no jack detect on this board"
+            echo "audio_outputs=headphone jack (on by default) and class-D speaker; two mixer switches, moved by the plug only when j36_mt6592_input has a jack line configured"
             echo "audio_volume=analog on both: SPK_CON9 level and AUDTOP_CON5 gain under one Master element, no softvol"
             echo "audio_speaker=off unless j36.audio=speaker, and then only after the cursor moves"
             echo "audio_speaker_hazard=class-D amp on VBAT, which is the system node; battery-less it trips the PMIC UVLO"

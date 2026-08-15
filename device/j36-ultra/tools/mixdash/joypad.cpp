@@ -136,6 +136,34 @@ bool testBit(const unsigned long *bits, int bit)
     return (bits[bit / (8 * sizeof(unsigned long))] >> (bit % (8 * sizeof(unsigned long)))) & 1UL;
 }
 
+/*
+ * Does this descriptor carry a headphone-detect line, and if so, is there
+ * something in the jack right now?
+ *
+ * BOTH QUESTIONS AT ONCE because the second is only askable when the first is
+ * yes, and both are ioctls on a descriptor the caller already has open.
+ * EVIOCGSW is the part that matters at open time: evdev only sends an EV_SW
+ * event when the switch CHANGES, so a dashboard that started with headphones
+ * already in would never hear about them and would sit there driving the
+ * speaker.  This is the "what is true now" read that every open has to do, and
+ * it is also what the resume path uses after a child process has been given the
+ * input devices for the length of a game.
+ */
+bool jackState(int fd, bool *plugged)
+{
+    unsigned long bits[(SW_MAX / (8 * sizeof(unsigned long))) + 1];
+    ::memset(bits, 0, sizeof(bits));
+    if (::ioctl(fd, EVIOCGBIT(EV_SW, sizeof(bits)), bits) < 0
+        || !testBit(bits, SW_HEADPHONE_INSERT))
+        return false;
+
+    ::memset(bits, 0, sizeof(bits));
+    if (plugged)
+        *plugged = ::ioctl(fd, EVIOCGSW(sizeof(bits)), bits) >= 0
+            && testBit(bits, SW_HEADPHONE_INSERT);
+    return true;
+}
+
 int modifierFor(int code)
 {
     switch (code) {
@@ -202,14 +230,32 @@ bool Joypad::openNode(const QString &node)
     if (fd < 0)
         return false;
 
-    /*
-     * A device with no keys, no axes and no relative motion is not an input we
-     * can navigate with -- on this board that is the power button's own node
-     * and anything a USB hub brings along.  Closed rather than polled.
-     */
     unsigned long evbits = 0;
-    if (::ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), &evbits) < 0
-        || !((evbits & (1UL << EV_KEY)) || (evbits & (1UL << EV_ABS))
+    if (::ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), &evbits) < 0) {
+        ::close(fd);
+        return false;
+    }
+
+    /*
+     * The jack is asked about BEFORE the gate below rather than after it, and
+     * that ordering is the whole reason this is not three lines further down.
+     * On this board the detect line arrives on the pad's own node, which has
+     * keys and axes and would be kept anyway -- but a USB headset's node is
+     * often nothing but SW_HEADPHONE_INSERT, and the gate as it stood would
+     * close the one descriptor that had the answer on it.
+     */
+    bool jack = false;
+    bool jackPlugged = false;
+    if (evbits & (1UL << EV_SW))
+        jack = jackState(fd, &jackPlugged);
+
+    /*
+     * A device with no keys, no axes, no relative motion and no jack is not an
+     * input we can navigate with -- on this board that is the power button's own
+     * node and anything a USB hub brings along.  Closed rather than polled.
+     */
+    if (!jack
+        && !((evbits & (1UL << EV_KEY)) || (evbits & (1UL << EV_ABS))
              || (evbits & (1UL << EV_REL)))) {
         ::close(fd);
         return false;
@@ -218,6 +264,8 @@ bool Joypad::openNode(const QString &node)
     Dev d;
     d.fd = fd;
     d.node = node;
+    d.jack = jack;
+    d.jackPlugged = jackPlugged;
 
     char name[128] = { 0 };
     if (::ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name) >= 0)
@@ -270,7 +318,44 @@ bool Joypad::openNode(const QString &node)
     }
 
     m_devs.append(d);
+    /* After the append, so the walk in there sees the device that just arrived.
+     * Cheap enough to do unconditionally: it returns without emitting unless the
+     * answer actually moved, and openNode is not on a hot path. */
+    updateJack();
     return true;
+}
+
+/*
+ * ONE ANSWER OUT OF HOWEVER MANY DEVICES ARE OFFERING ONE.
+ *
+ * "Any device that says something is plugged in" wins, and that is deliberate:
+ * the second reporter on this system is a USB headset, whose own node says
+ * plugged from the moment it enumerates, and a headset IS headphones -- the
+ * speaker should go quiet for it too.  Taking the last device to speak instead
+ * would make the answer depend on the order /dev/input happened to be listed in.
+ *
+ * The known/unknown half never emits a "no" of its own.  See headphoneJack() in
+ * joypad.h for why an absent detect line must not read as an empty jack.
+ */
+void Joypad::updateJack()
+{
+    bool known = false;
+    bool plugged = false;
+    for (const Dev &d : m_devs) {
+        if (!d.jack)
+            continue;
+        known = true;
+        if (d.jackPlugged)
+            plugged = true;
+    }
+
+    if (known == m_jackKnown && plugged == m_jackPlugged)
+        return;
+
+    m_jackKnown = known;
+    m_jackPlugged = plugged;
+    if (known)
+        emit headphoneJack(plugged);
 }
 
 void Joypad::closeDevices()
@@ -345,8 +430,12 @@ void Joypad::syncDevices()
         emit deviceAdded(d.name, d.mouse, d.keyboard);
     }
 
-    if (changed)
+    if (changed) {
+        /* openNode() already did this for every arrival; this one is for the
+         * departures, which have no such hook. */
+        updateJack();
         emit devicesChanged();
+    }
 }
 
 void Joypad::rescan()
@@ -356,6 +445,10 @@ void Joypad::rescan()
     m_held = NavNone;
     m_down = 0;
     m_mods = ModNone;
+    /* closeDevices() emptied the list without touching m_jackKnown, and openNode
+     * only ever raises it -- so a kernel module unloaded between two rescans
+     * would leave a stale "there is a jack" behind without this. */
+    updateJack();
     emit devicesChanged();
 }
 
@@ -414,6 +507,22 @@ void Joypad::setSuspended(bool suspended)
         syncDevices();
         m_scanClock.restart();
         drain();
+
+        /*
+         * AND THE JACK IS RE-READ, because drain() just threw its event away.
+         *
+         * A switch is reported once, when it moves.  Headphones pulled out
+         * halfway through a game are one EV_SW sitting in a descriptor's queue,
+         * and the drain above -- which exists to stop every button the child was
+         * pressed with replaying into the dashboard -- discards it along with
+         * everything else.  EVIOCGSW asks the driver for the level rather than
+         * for the edge, so it does not matter that the edge is gone.
+         */
+        for (Dev &d : m_devs)
+            if (d.jack)
+                jackState(d.fd, &d.jackPlugged);
+        updateJack();
+
         m_tick.restart();
         m_timer->start();
     }
@@ -475,6 +584,10 @@ void Joypad::poll()
          * the read loop is done with the indices.
          */
         QVector<int> gone;
+        /* Set by an EV_SW below; acted on once, after the read loop, because
+         * updateJack() walks the whole list and a headset that reports its
+         * switch on every SYN would otherwise do that walk per event. */
+        bool jackMoved = false;
 
         for (int i = 0; i < n; ++i) {
             /*
@@ -535,6 +648,14 @@ void Joypad::poll()
                     }
                 } else if (ev.type == EV_REL) {
                     relative(ev.code, ev.value);
+                } else if (ev.type == EV_SW) {
+                    /* The only switch this device has any use for.  Recorded
+                     * against the device that reported it -- the arbitration
+                     * between two of them is updateJack()'s. */
+                    if (ev.code == SW_HEADPHONE_INSERT) {
+                        d.jackPlugged = ev.value != 0;
+                        jackMoved = true;
+                    }
                 } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
                     if (m_relPendX != 0.0 || m_relPendY != 0.0) {
                         emit pointerMove(m_relPendX, m_relPendY);
@@ -570,6 +691,11 @@ void Joypad::poll()
             m_mods = ModNone;
             emit devicesChanged();
         }
+
+        /* After the removals, so a jack that left with its device is already out
+         * of the list this walks. */
+        if (jackMoved || !gone.isEmpty())
+            updateJack();
     }
 
     driveStick((int)ms);

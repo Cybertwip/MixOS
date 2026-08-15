@@ -106,12 +106,21 @@ int nudge(int delta, bool *mutedOut = nullptr);
  * behind the jack.  They are not exclusive -- both on is a real setting and it
  * plays out of both.
  *
- * THIS IS A SETTING AND NOT A STATUS, and that is the part worth stating out
- * loud.  The board brings no jack-detect line out to anything the kernel can
- * read, so nothing anywhere in this system notices a plug going in.  A page that
- * drew these as "Headphones (connected)" would be inventing the connected part.
- * They are two switches, they say what they are, and the person holding the
- * device is the detect line.
+ * THESE TWO ARE STILL SETTINGS AND NOT A STATUS, even now that something else
+ * moves them.  What stood here said the board brings no jack-detect line out to
+ * anything the kernel can read, and that was true of every kernel this file had
+ * seen: nothing noticed a plug, and the person holding the device was the detect
+ * line.  j36_mt6592_input can now sample one -- an ADC channel or a GPIO pad,
+ * whichever jack_adc=/jack_gpio= names -- and reports SW_HEADPHONE_INSERT, which
+ * Joypad hears and Dashboard::onHeadphoneJack turns into a call to setOn() here.
+ *
+ * That changes who calls these and it does not change what they are.  There is
+ * no detect line on a kernel that was not given one, both outputs remain
+ * independently switchable while there is, and the user can still turn the
+ * speaker on with headphones in -- Settings::speakerWanted() is where that
+ * intention is kept, precisely because the mixer cannot hold it.  A page that
+ * drew these as "Headphones (connected)" would still be inventing something
+ * unless it had asked Joypad::jackKnown() first.
  *
  * present() is false for a card that has neither, which is every card but this
  * one -- a USB headset or an HDMI adapter has no such controls and the rows are
@@ -122,6 +131,28 @@ enum Output { Speaker, Headphones };
 bool present(Output which);
 bool isOn(Output which);
 void setOn(Output which, bool on);
+
+/*
+ * WHAT THE JACK IS DOING, KEPT WHERE A PAGE CAN ASK WITHOUT HOLDING A JOYPAD.
+ *
+ * The detect line arrives as an evdev switch, so the thing that knows about it
+ * is Joypad, and Joypad is the shell's -- a Settings page reaching into the
+ * input stack to word one line of text would be a page that has to be handed a
+ * Joypad pointer for the rest of its life.  The shell files the answer here
+ * instead, beside the two switches it is about, and anything that draws those
+ * switches reads it from the same place it reads everything else about them.
+ *
+ * THREE VALUES AND NOT A BOOL.  Unknown is the ordinary state on a kernel that
+ * was never told where the line is, and it is not Empty: with no detect line the
+ * two switches are the user's to set, and a page that said "nothing in the jack"
+ * on a board that cannot tell would be stating something it does not know.
+ *
+ * This is a note and not a probe: it changes nothing on the card and forks
+ * nothing.  Only Dashboard writes it.
+ */
+enum JackState { JackUnknown, JackEmpty, JackPlugged };
+void noteJack(JackState state);
+JackState jack();
 
 } /* namespace Volume */
 

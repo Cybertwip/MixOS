@@ -150,6 +150,12 @@ void Settings::load()
     m_mediaRepeat = clampInt(m_store->value(QStringLiteral("media/repeat"), 0).toInt(), 0, 2);
     m_mediaShuffle = m_store->value(QStringLiteral("media/shuffle"), false).toBool();
 
+    /* Defaulting to true and not to whatever the mixer happens to hold: see the
+     * note on speakerWanted() in settings.h.  A file that has never been written
+     * has to mean "the speaker works", because that is what a device out of the
+     * box does. */
+    m_speakerWanted = m_store->value(QStringLiteral("sound/speaker"), true).toBool();
+
     /*
      * The card arrangement.  Trimmed and emptied of blanks on the way in, because
      * a comma-separated INI value hand-edited on a PC comes back with spaces
@@ -265,6 +271,17 @@ void Settings::setMediaShuffle(bool on)
     m_mediaShuffle = on;
     if (m_store) {
         m_store->setValue(QStringLiteral("media/shuffle"), m_mediaShuffle);
+        m_store->sync();
+    }
+}
+
+void Settings::setSpeakerWanted(bool on)
+{
+    if (m_speakerWanted == on)
+        return;
+    m_speakerWanted = on;
+    if (m_store) {
+        m_store->setValue(QStringLiteral("sound/speaker"), m_speakerWanted);
         m_store->sync();
     }
 }

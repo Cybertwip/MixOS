@@ -254,16 +254,30 @@ void SettingsPage::rebuild()
      * playback element failed to register still has a jack somebody may need to
      * switch to.
      *
-     * THE DETAIL LINE ON THE JACK IS NOT AN APOLOGY.  This board brings no
-     * jack-detect line out to anything the kernel can read, so plugging
-     * headphones in changes nothing by itself -- and a person who does not know
-     * that will plug them in, hear the speaker keep playing, and conclude the
-     * jack is broken.  One line here is the difference.
+     * THE DETAIL LINE ON THE JACK IS NOT AN APOLOGY, AND IT NOW HAS THREE THINGS
+     * TO SAY.  It used to have one -- "this board brings no jack-detect line out
+     * to anything the kernel can read" -- because a person who does not know that
+     * will plug headphones in, hear the speaker keep playing, and conclude the
+     * jack is broken.  That sentence is still the honest one on a kernel that was
+     * never told where the line is, and it is still printed there.  When there IS
+     * a line, this says what it currently reads instead, which answers a
+     * different and better question: the user who has just plugged headphones in
+     * and heard nothing wants to know whether the system saw the plug at all.
+     *
+     * WHICH MEANS THIS ROW IS NOT ALWAYS A SETTING THE USER OWNS.  With detection
+     * on, the shell moves both of these on every plug -- so the speaker row says
+     * so rather than letting a toggle that gets overwritten look broken.
      */
+    const Volume::JackState jackNow = Volume::jack();
+
     if (Volume::present(Volume::Speaker)) {
         r = ListRow();
         r.kind = ListRow::Toggle;
         r.text = tr("Speaker");
+        if (jackNow == Volume::JackPlugged)
+            r.detail = tr("Off while there is something in the jack");
+        else if (jackNow == Volume::JackEmpty && !Settings::instance().speakerWanted())
+            r.detail = tr("Off by choice -- a plug will not turn it back on");
         r.on = m_speaker;
         r.id = RowSpeaker;
         rows << r;
@@ -272,7 +286,20 @@ void SettingsPage::rebuild()
         r = ListRow();
         r.kind = ListRow::Toggle;
         r.text = tr("Headphones");
-        r.detail = tr("The jack has no detect line; switch to it here");
+        switch (jackNow) {
+        case Volume::JackPlugged:
+            r.detail = tr("Something is in the jack");
+            r.badge = tr("plugged in");
+            r.badgeColour = Theme::green();
+            break;
+        case Volume::JackEmpty:
+            r.detail = tr("The jack is empty -- switch to it anyway if you like");
+            break;
+        case Volume::JackUnknown:
+        default:
+            r.detail = tr("The jack has no detect line; switch to it here");
+            break;
+        }
         r.on = m_headphones;
         r.id = RowHeadphones;
         rows << r;
@@ -387,10 +414,25 @@ void SettingsPage::onValueChanged(int index, int value)
         const bool on = (value != 0);
 
         Volume::setOn(jack ? Volume::Headphones : Volume::Speaker, on);
-        if (jack)
+        if (jack) {
             m_headphones = on;
-        else
+        } else {
             m_speaker = on;
+            /*
+             * AND THIS IS WHERE THE INTENTION IS WRITTEN DOWN.  On a board with a
+             * detect line the shell switches the speaker off on a plug and back on
+             * when the plug comes out -- and "back on" has to mean back to what the
+             * user had chosen, not literally on, or somebody who turned the speaker
+             * off in a quiet room gets it turned back on by pulling their
+             * headphones out.  The mixer cannot hold that: by then it holds what
+             * the plug did to it.  See Settings::speakerWanted().
+             *
+             * Written even while headphones are in, because a person reaching for
+             * this row with headphones in is saying what they want the speaker to
+             * do, and there is no other reading of it.
+             */
+            Settings::instance().setSpeakerWanted(on);
+        }
 
         /*
          * Said as where the sound is now rather than as what was just toggled,

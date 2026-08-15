@@ -223,6 +223,22 @@ private slots:
      */
     void onInputDeviceAdded(const QString &name, bool mouse, bool keyboard);
     void onInputDeviceRemoved(const QString &name);
+
+    /*
+     * Headphones went into the jack, or came out of it.
+     *
+     * WHY THE SHELL AND NOT THE DRIVER.  The kernel knows a pin changed; it does
+     * not know that this system has two ALSA switches, that the user may have
+     * turned the speaker off on purpose, or that there is a Settings page drawing
+     * both of them.  A driver that muted the amp itself would be making that
+     * policy in the one place nothing can see it or override it -- and it would
+     * need the audio module and the input module to know about each other, which
+     * on this board means a modprobe dependency between two things the kernel
+     * command line is supposed to be able to leave out independently.  So the
+     * kernel reports and the shell decides, which is also why the decision is one
+     * function and not two halves in two drivers.
+     */
+    void onHeadphoneJack(bool plugged);
     /* Re-file the device list into the System information page, which is the one
      * place that lists them by name. */
     void refreshInputSummary();
@@ -254,6 +270,13 @@ private:
     void applyChrome();
     void syncInputMode();
     void openDestination(int destination);
+
+    /*
+     * Put the two output switches where the jack says they belong.  `announce'
+     * is false for the one at startup, which is describing a plug that happened
+     * before this program existed and has no business toasting about it.
+     */
+    void applyJackRouting(bool plugged, bool announce);
 
     void activate(const AppEntry &entry);
     void launch(const QString &title, const QString &exe, const QStringList &args);

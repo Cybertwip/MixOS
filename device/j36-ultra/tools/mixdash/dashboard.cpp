@@ -343,12 +343,34 @@ Dashboard::Dashboard(QWidget *parent)
     connect(m_pad, &Joypad::deviceAdded, this, &Dashboard::onInputDeviceAdded);
     connect(m_pad, &Joypad::deviceRemoved, this, &Dashboard::onInputDeviceRemoved);
     connect(m_pad, &Joypad::devicesChanged, this, &Dashboard::refreshInputSummary);
+    connect(m_pad, &Joypad::headphoneJack, this, &Dashboard::onHeadphoneJack);
 
     /* Stats every candidate executable and IWAD on the card. */
     Trace::step("buildPages -- looks for the apps on disk");
     buildPages();
 
     refreshInputSummary();
+
+    /*
+     * THE STATE THE BOARD WAS ALREADY IN, applied once, before anything is on
+     * screen.
+     *
+     * A switch only produces an event when it moves, so headphones that were in
+     * the jack when this program started generate nothing to listen for -- and
+     * the mixer they meet was restored by alsa-restore from whatever the last
+     * shutdown saved, which on a device switched off with headphones in is a
+     * muted speaker and nothing plugged into it.  That boot is silent, and the
+     * only clue is a Settings row two levels down.  Joypad read the level at
+     * open, so the answer is already here; this is the one line that acts on it.
+     *
+     * Nothing happens when the jack is unknown.  See onHeadphoneJack.
+     */
+    Trace::step("headphone jack -- the state we booted into");
+    Volume::noteJack(!m_pad->jackKnown()
+                         ? Volume::JackUnknown
+                         : (m_pad->jackPlugged() ? Volume::JackPlugged : Volume::JackEmpty));
+    if (m_pad->jackKnown())
+        applyJackRouting(m_pad->jackPlugged(), false);
 
     Trace::step("goHome");
     goHome();
@@ -1241,6 +1263,78 @@ void Dashboard::onInputDeviceAdded(const QString &name, bool mouse, bool keyboar
 void Dashboard::onInputDeviceRemoved(const QString &name)
 {
     toast(tr("Input disconnected: %1").arg(name));
+}
+
+void Dashboard::onHeadphoneJack(bool plugged)
+{
+    Volume::noteJack(plugged ? Volume::JackPlugged : Volume::JackEmpty);
+    applyJackRouting(plugged, true);
+}
+
+/*
+ * ── WHAT A PLUG ACTUALLY DOES, AND WHY IT IS NOT "MUTE" ──
+ *
+ * Two switches move, not one.  "Speaker Amp" goes off and "Headphone" goes on,
+ * because they are two outputs off one DAC and this board will happily drive
+ * both -- so switching the amp off without switching the buffers on is a device
+ * that goes silent when headphones are plugged into it, which is a worse bug
+ * than the one being fixed.  Neither is the master mute: muting would take the
+ * level down for everything, the volume keys would fight it, and the bar would
+ * show a muted card while headphones were playing.
+ *
+ * AND WHAT COMES BACK ON UNPLUGGING IS WHAT THE USER CHOSE, not "on".  The
+ * speaker's state at the moment of the unplug is the one this function put
+ * there, so reading it back would be reading our own answer; Settings holds the
+ * intention instead, and speakerWanted() is that.  Somebody who deliberately
+ * turned the speaker off -- a quiet room, a broken amp -- does not get it turned
+ * back on by pulling their headphones out.
+ *
+ * The headphone amp is switched off on unplugging for the same symmetry, and
+ * because there is nothing on the other end of it to hear.
+ *
+ * TWO FORKS OF amixer, once per plug.  This is a human-speed event.
+ */
+void Dashboard::applyJackRouting(bool plugged, bool announce)
+{
+    const bool haveSpeaker = Volume::present(Volume::Speaker);
+    const bool haveHeadphones = Volume::present(Volume::Headphones);
+    if (!haveSpeaker && !haveHeadphones)
+        return;
+
+    /* Headphones first, so the plug never produces a moment with both outputs
+     * off -- which on a fast enough ear is an audible gap in whatever is
+     * playing.  Unplugging is the other order for the same reason. */
+    if (plugged) {
+        if (haveHeadphones)
+            Volume::setOn(Volume::Headphones, true);
+        if (haveSpeaker)
+            Volume::setOn(Volume::Speaker, false);
+    } else {
+        if (haveSpeaker)
+            Volume::setOn(Volume::Speaker, Settings::instance().speakerWanted());
+        if (haveHeadphones)
+            Volume::setOn(Volume::Headphones, false);
+    }
+
+    /*
+     * The Settings page caches the two toggles it drew, and it is the one page
+     * that would sit there showing the state from before the plug.  Re-entering
+     * it is how every other page in this shell refreshes, so that is what this
+     * does -- and only when it is actually on screen, because a page that is not
+     * visible rebuilds itself the next time it is walked into anyway.
+     */
+    if (m_settings && m_current == m_settings)
+        m_settings->onEnter();
+
+    if (!announce)
+        return;
+
+    if (plugged)
+        toast(tr("Headphones in -- speaker off"), 2600);
+    else if (haveSpeaker && Settings::instance().speakerWanted())
+        toast(tr("Headphones out -- speaker on"), 2600);
+    else
+        toast(tr("Headphones out"), 2600);
 }
 
 void Dashboard::refreshInputSummary()
