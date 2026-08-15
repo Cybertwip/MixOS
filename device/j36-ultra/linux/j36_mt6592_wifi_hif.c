@@ -260,8 +260,22 @@ static void j36_hif_tx_release(struct j36_wifi *w)
  * and the first credit that ever arrives shuts the valve for good: credited > 0
  * means the accounting is real and a starve is a real refusal; credited == 0 with
  * forced > 0 means WTSR is not reporting on this part at all.
+ *
+ * How many rounds the caller is willing to sleep for is the caller's business,
+ * because the two callers are not alike.  A command or a management frame is one
+ * packet with a join deadline behind it and nothing to requeue it into, so it
+ * waits.  A data frame comes from the poll worker, WHICH HOLDS w->lock: sleeping
+ * there stops the event pump, so the TX_DONE that would credit the page being
+ * waited for cannot arrive until the wait gives up.  That caller passes zero
+ * rounds and puts the packet back on its own queue instead.
+ *
+ * The unconditional re-read before the loop is what makes zero rounds useful.
+ * The free table is only ever as fresh as the last credit read, and under load
+ * the pages are usually already back and merely unclaimed -- two register reads
+ * recover them without sleeping at all.
  */
-static int j36_hif_tx_acquire(struct j36_wifi *w, unsigned int tc)
+static int j36_hif_tx_acquire_rounds(struct j36_wifi *w, unsigned int tc,
+				     unsigned int rounds)
 {
 	unsigned int round;
 
@@ -274,14 +288,20 @@ static int j36_hif_tx_acquire(struct j36_wifi *w, unsigned int tc)
 	}
 
 	w->hif_stats.tx_waits++;
-	for (round = 0; round < J36_HIF_TX_POLL_ROUNDS; round++) {
+	j36_hif_tx_release(w);
+	if (w->hif_stats.tx_free[tc]) {
+		w->hif_stats.tx_free[tc]--;
+		return 0;
+	}
+
+	for (round = 0; round < rounds; round++) {
+		usleep_range(J36_HIF_TX_POLL_INTERVAL_US,
+			     J36_HIF_TX_POLL_INTERVAL_US * 2);
 		j36_hif_tx_release(w);
 		if (w->hif_stats.tx_free[tc]) {
 			w->hif_stats.tx_free[tc]--;
 			return 0;
 		}
-		usleep_range(J36_HIF_TX_POLL_INTERVAL_US,
-			     J36_HIF_TX_POLL_INTERVAL_US * 2);
 	}
 
 	w->hif_stats.tx_starved++;
@@ -290,6 +310,11 @@ static int j36_hif_tx_acquire(struct j36_wifi *w, unsigned int tc)
 		return 0;
 	}
 	return -EBUSY;
+}
+
+static int j36_hif_tx_acquire(struct j36_wifi *w, unsigned int tc)
+{
+	return j36_hif_tx_acquire_rounds(w, tc, J36_HIF_TX_POLL_ROUNDS);
 }
 
 /* ── ownership and the one-time HIF programming ──────────────────────────────*/
@@ -1138,6 +1163,11 @@ u32 j36_wifi_hif_status(struct j36_wifi *w, u32 offset)
 int j36_wifi_hif_tx_acquire(struct j36_wifi *w, unsigned int tc)
 {
 	return j36_hif_tx_acquire(w, tc);
+}
+
+int j36_wifi_hif_tx_try(struct j36_wifi *w, unsigned int tc)
+{
+	return j36_hif_tx_acquire_rounds(w, tc, J36_HIF_TX_TRY_ROUNDS);
 }
 
 void j36_wifi_hif_tx_credit(struct j36_wifi *w)
