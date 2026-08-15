@@ -71,6 +71,7 @@
  * card: the line that would have said so was thirty lines above the crash on a screen
  * thirty lines tall.
  */
+#include "console.h"
 #include "dashboard.h"
 #include "stringsdb.h"
 #include "trace.h"
@@ -102,7 +103,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fb.h>
-#include <linux/kd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -114,14 +114,20 @@
 
 namespace {
 
-/* ── the trace, the tty and the watchdog ─────────────────────────────────────── */
+/* ── the trace and the watchdog ──────────────────────────────────────────────── */
 
-/* Opened before Qt is, and kept open, because the SIGALRM and SIGSEGV handlers need
- * it and open() is not something to do from a signal handler. */
-int g_ttyFd = -1;
-/* True only when THIS process set KD_GRAPHICS.  If Qt set it -- an older unit file
- * without nographicsmodeswitch -- restoring it is Qt's business, not ours. */
-volatile sig_atomic_t g_ownGraphics = 0;
+/*
+ * The tty and the console mode used to be two globals here.  They are console.cpp's
+ * now, and console.h says why at length: a page that shells out waits for the child
+ * with the event loop stopped, so the mode has to be re-takeable from somewhere
+ * other than a timer in this file.
+ *
+ * What is left is where the stream goes once there is a dashboard to protect.
+ * /run/j36 is the initramfs's own directory on the rootfs tmpfs, which is where
+ * eglprobe.log and bootdev already are, and j36-logdump copies it into
+ * BOOT:/mixos-log.txt so it comes off the board with everything else.
+ */
+const char kLogPath[] = "/run/j36/mixdash.log";
 
 /*
  * MIXDASH_EXPECT, copied into a fixed buffer at startup.  It is read again at the
@@ -237,22 +243,26 @@ void dismissSplash(int giveBackTheConsole)
  * second, so a KDSETMODE with the splash still alive is undone inside a second and
  * the crash report is written to a console nothing is drawing.
  *
- * And it is unconditional now, where it used to be `if (g_ownGraphics)'.  That guard
- * was for the case where Qt's plugin set the mode rather than this file, on the
- * grounds that undoing it was Qt's business -- true while the program is running, and
- * irrelevant here, because every path into this function ends in _exit, abort or a
- * re-raised fatal signal and Qt is never going to get the chance.  It also missed the
- * case that matters most: a dashboard that dies BEFORE its first paint never owned
- * the mode at all, the splash did, and leaving the panel in KD_GRAPHICS with the
- * splash gone is a black screen with the reason for it invisible behind it.
+ * And Console::text() is unconditional, where the ioctl it replaced used to be
+ * guarded by `if this process set the mode'.  That guard was for the case where Qt's
+ * plugin set it rather than this file, on the grounds that undoing it was Qt's
+ * business -- true while the program is running, and irrelevant here, because every
+ * path into this function ends in _exit, abort or a re-raised fatal signal and Qt is
+ * never going to get the chance.  It also missed the case that matters most: a
+ * dashboard that dies BEFORE its first paint never owned the mode at all, the splash
+ * did, and leaving the panel in KD_GRAPHICS with the splash gone is a black screen
+ * with the reason for it invisible behind it.
+ *
+ * IT ALSO PUTS THE STREAM BACK, which is the half that is easy to forget.  From the
+ * first paint this program's stdout and stderr are a file on a tmpfs; every line
+ * below every caller of this function is a failure report, and a failure report that
+ * goes to that file instead of to the panel is a failure report nobody will read.
+ * Console::text() restores the two descriptors before it touches the mode.
  */
 void textMode(void)
 {
     dismissSplash(1);
-    if (g_ttyFd >= 0) {
-        ::ioctl(g_ttyFd, KDSETMODE, KD_TEXT);
-        g_ownGraphics = 0;
-    }
+    Console::text();
 }
 
 /* The step, when there is one, printed as ` step "..."' and as nothing at all when
@@ -335,21 +345,6 @@ void onTerm(int)
     textMode();
     Trace::writeAll(2, "\nmixdash: asked to stop; console back in text mode\n");
     ::_exit(0);
-}
-
-/*
- * The handover.  Called from the first paintEvent -- not before -- so that anything
- * that goes wrong on the way to a frame is still readable on the glass.
- */
-void takeGraphicsMode(void)
-{
-    int mode = KD_TEXT;
-    if (g_ttyFd < 0 || g_ownGraphics)
-        return;
-    if (::ioctl(g_ttyFd, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS)
-        return;                 /* Qt's plugin already did it; leave it Qt's to undo */
-    if (::ioctl(g_ttyFd, KDSETMODE, KD_GRAPHICS) == 0)
-        g_ownGraphics = 1;
 }
 
 /*
@@ -578,8 +573,7 @@ int main(int argc, char **argv)
      * /dev/tty0 to open -- but on this board it is the console, and a dashboard that
      * cannot put it back into text mode is a dashboard that can silence the machine.
      */
-    g_ttyFd = ::open("/dev/tty0", O_RDWR | O_CLOEXEC);
-    if (g_ttyFd < 0)
+    if (!Console::open())
         ::printf("mixdash: /dev/tty0 will not open (%s); the console mode is not ours\n",
                  ::strerror(errno));
 
@@ -703,8 +697,19 @@ int main(int argc, char **argv)
              * KD_GRAPHICS every second, and between that stopping and this ioctl
              * landing the console would be free for the next thing that resets it.
              */
-            takeGraphicsMode();
+            Console::take();
             dismissSplash(0);
+            /*
+             * AND THE STREAM COMES OFF THE PANEL HERE TOO.  Up to this line stdout
+             * and stderr are the best thing the glass can show and the unit sends
+             * them to the console on purpose.  Past it they are the worst: a Qt
+             * warning, or the first line of a child that forgot to capture its
+             * output, is text drawn straight over the dashboard by a channel no
+             * amount of holding the VT mode can close, because the text is this
+             * program's own.  console.h has the rest of the argument; textMode()
+             * puts both descriptors back before any failure report is written.
+             */
+            Console::toLog(kLogPath);
             /*
              * AND THEN PAINT IT ALL AGAIN, once, a quarter of a second later.  The
              * splash draws at 25 fps and reads its channel between frames, so it can
@@ -716,6 +721,41 @@ int main(int argc, char **argv)
              * gone costs a frame nobody sees in the normal case and closes that.
              */
             QTimer::singleShot(250, &dash, [&dash]() { dash.update(); });
+
+            /*
+             * THE GUARD, and it is the same lesson as the line above generalised.
+             *
+             * KD_GRAPHICS is a mode and not a lock: agetty, systemd-vconsole-setup
+             * and systemd's own console logging each clear it, and this unit is
+             * StandardOutput=journal+console, so STARTING ANY UNIT from a page can
+             * be what does it.  That is what "changing the sharing settings puts a
+             * console with a few kernel lines on it over the dashboard" was, and
+             * mixsplash met the same thing first -- console_hold() in mixsplash.c
+             * has the list of suspects and the same answer.
+             *
+             * The splash could stop at re-taking the mode because it redraws every
+             * frame anyway.  This program does not, so the two halves are here: hold
+             * whenever it is not ours, and REPAINT THE WHOLE WINDOW when it turns
+             * out not to have been.  update() and not repaint(), because this runs
+             * on the event loop and a full synchronous paint from a timer would be
+             * one frame's worth of jitter for nothing.
+             *
+             * Once a second, which is mixsplash's interval and is chosen the same
+             * way: it costs one ioctl that reads a flag, and the window it leaves is
+             * one second of text on the panel in the rare case rather than text that
+             * stays until something else happens to be redrawn.  A page that blocks
+             * its own event loop waiting for a child gets no ticks at all while it
+             * waits, which is why Console::hold() is public and why SharingPage's
+             * shell-outs call it themselves between slices.
+             */
+            QTimer *guard = new QTimer(&dash);
+            guard->setInterval(1000);
+            QObject::connect(guard, &QTimer::timeout, &dash, [&dash]() {
+                if (Console::hold())
+                    dash.update();
+            });
+            guard->start();
+
             /* Startup is over; a deadline from here would kill a working dashboard. */
             ::alarm(0);
             ::signal(SIGALRM, SIG_DFL);

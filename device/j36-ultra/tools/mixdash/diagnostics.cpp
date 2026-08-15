@@ -695,19 +695,23 @@ void DiagnosticsPage::onActivated(int index)
         /*
          * -o, and never -c.  Both draw the same cube with the same shaders on the
          * same GPU; the difference is where the result lands.  -c hands its buffer
-         * to a CRTC, and a DRM client that has set a mode and then exits leaves the
-         * panel dark for the rest of the boot -- the kernel drops the client's
+         * to a CRTC, which used to cost a black screen every time this row was
+         * pressed: a DRM client that had set a mode and then exited left the panel
+         * dark for the rest of the boot, because the kernel drops the client's
          * framebuffers on close, dropping the framebuffer a CRTC scans out disables
          * that CRTC, and this kernel is CONFIG_DRM_FBDEV_EMULATION=n so nothing
-         * turns it back on.  It cost us a black screen every time this row was
-         * pressed, and the confirmation prompt that used to be here only made the
-         * black screen deliberate.
+         * turned it back on.  The confirmation prompt that used to be here only made
+         * the black screen deliberate.  preserve_lk_state has since fixed that at
+         * the source -- the CRTC disable now restores the LK's overlay instead of
+         * tearing the pipe down -- so -c would come back cleanly today.
          *
-         * -o renders into an FBO on the render node and copies the result into
-         * /dev/fb0 with the CPU.  No modesetting node is opened at all, so there is
-         * nothing to take away and nothing to hand back; when it exits the
-         * dashboard repaints over it.  It still proves the whole GL path -- lima,
-         * Mesa, both shaders, 36 vertices -- which is all this row was ever for.
+         * It is still -o, because giving the panel back is not the same as never
+         * taking it: -c sets a mode, so the dashboard is off the screen for the
+         * twenty seconds it runs.  -o renders into an FBO on the render node and
+         * copies the result into /dev/fb0 with the CPU.  No modesetting node is
+         * opened at all, so there is nothing to take away and nothing to hand back;
+         * when it exits the dashboard repaints over it.  It proves the whole GL path
+         * -- lima, Mesa, both shaders, 36 vertices -- which is all this row is for.
          */
         emit launchRequested(QStringLiteral("eglprobe"),
                              firstExisting(QStringList() << "/run/j36/eglprobe"

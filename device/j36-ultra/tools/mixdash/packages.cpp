@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "joypad.h"
+#include "shell.h"
 #include "theme.h"
 
 namespace {
@@ -103,11 +104,11 @@ QString PackagesPage::run(const QString &program, const QStringList &args, int t
     QProcess p;
     p.setProcessChannelMode(QProcess::SeparateChannels);
     p.start(program, args);
-    if (!p.waitForStarted(2000))
+    if (!Shell::waitForStarted(p, 2000))
         return QString();
-    if (!p.waitForFinished(timeoutMs)) {
+    if (!Shell::waitForFinished(p, timeoutMs)) {
         p.kill();
-        p.waitForFinished(500);
+        Shell::waitForFinished(p, 500);
         return QString();
     }
     return QString::fromLocal8Bit(p.readAllStandardOutput());

@@ -536,6 +536,11 @@ struct j36_usb_phy {
 	 * host, because that is the only role whose re-measurement costs the
 	 * connector a power cycle -- see role_probe_every. */
 	unsigned int polls_since_probe;
+	/* Edge flag for the one dev_info the attach latch emits.  The latch runs
+	 * every poll for as long as something is on the port, and a line per poll
+	 * for the life of the board is a line nobody reads; this makes it a line
+	 * per plug instead.  Nothing branches on it. */
+	bool attach_logged;
 	struct delayed_work role_work;
 	/* The role poll runs off a workqueue and .set_mode / .power_on /
 	 * .power_off run off musb's probe and remove. The generic PHY framework
@@ -1026,6 +1031,33 @@ static void j36_usb_phy_decide_role(struct j36_usb_phy *p)
 	}
 
 	if (p->role_host == 1 && j36_port_attached(p)) {
+		/*
+		 * SAY IT ONCE, BECAUSE THIS IS WHERE THE CHARGER GOES MISSING.
+		 *
+		 * FSDEV/LSDEV means "D+ or D- is being held high", and that is not
+		 * quite the same claim as "a device is here".  A divider-type
+		 * charger -- the Apple 2.4 A brick holds D+ near 2.7 V, and the
+		 * Samsung scheme holds both near 1.2 V -- drives the same line a
+		 * device's pull-up does, so it reads as attached, the probe is
+		 * suspended for as long as it stays plugged in, DRVVBUS never comes
+		 * back down, and the PMIC's interlock reports no cable at the very
+		 * moment there is one.  The dashboard's Charger row says exactly
+		 * that now; this is the other half of the same answer, and the two
+		 * of them together are the difference between "which of the two
+		 * suspects is it" and one boot log.
+		 *
+		 * The latch itself is deliberately left alone.  It is what keeps a
+		 * mounted USB stick from being power-cycled every fifteen seconds,
+		 * and nothing readable from this driver separates a charger that
+		 * holds D+ high from a device that does -- so the fix, if this line
+		 * turns out to be the one printing, belongs where that distinction
+		 * can actually be made and not in a guess here.
+		 */
+		if (!p->attach_logged) {
+			p->attach_logged = true;
+			dev_info(p->dev,
+				 "port reads attached (DEVCTL FSDEV/LSDEV): the role probe is suspended and DRVVBUS stays high, so the PMIC will report no cable until this comes out\n");
+		}
 		/* Busy; ask again next poll -- and do not let the interval
 		 * toward the next probe run down while the port is in use, or
 		 * the first idle poll after a stick is unplugged spends its
@@ -1033,6 +1065,7 @@ static void j36_usb_phy_decide_role(struct j36_usb_phy *p)
 		p->polls_since_probe = 0;
 		return;
 	}
+	p->attach_logged = false;
 
 	/*
 	 * ── HOW OFTEN THE EXPENSIVE ANSWER IS RE-ASKED ──

@@ -26,6 +26,7 @@
 
 #include "joypad.h"
 #include "settings.h"
+#include "shell.h"
 #include "theme.h"
 
 namespace {
@@ -156,11 +157,11 @@ QString WifiPage::cli(const QStringList &args, int timeoutMs) const
     QProcess p;
     p.setProcessChannelMode(QProcess::MergedChannels);
     p.start(wpaCli(), full);
-    if (!p.waitForStarted(1000))
+    if (!Shell::waitForStarted(p, 1000))
         return QString();
-    if (!p.waitForFinished(timeoutMs)) {
+    if (!Shell::waitForFinished(p, timeoutMs)) {
         p.kill();
-        p.waitForFinished(500);
+        Shell::waitForFinished(p, 500);
         return QString();
     }
     return QString::fromLocal8Bit(p.readAll());
@@ -492,14 +493,14 @@ QString WifiPage::psk(const QString &ssid, const QString &passphrase) const
      */
     QProcess p;
     p.start(wpaPassphrase(), QStringList() << ssid);
-    if (!p.waitForStarted(1000))
+    if (!Shell::waitForStarted(p, 1000))
         return QString();
     p.write(passphrase.toUtf8());
     p.write("\n");
     p.closeWriteChannel();
-    if (!p.waitForFinished(3000)) {
+    if (!Shell::waitForFinished(p, 3000)) {
         p.kill();
-        p.waitForFinished(500);
+        Shell::waitForFinished(p, 500);
         return QString();
     }
 

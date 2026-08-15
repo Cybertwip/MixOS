@@ -26,7 +26,7 @@ drivers bind unchanged on driver data that is already exact:
   - mt2701_color_driver_data.color_offset is DISP_COLOR_START_MT2701,
     which is the bootloader's COLOR start offset.
 
-Two things are genuinely MT6592's own, and they are the whole patch.
+Three things are genuinely this board's own, and they are the whole patch.
 
 1. The path.
 
@@ -43,6 +43,48 @@ Two things are genuinely MT6592's own, and they are the whole patch.
    ARGB8888 = 2, which is what fmt_rgb565_is_0 selects.  MT2701 numbers
    the first two the other way round, so mt2701_ovl_driver_data cannot be
    reused as is even though every other field of it is right.
+
+3. Not tearing the pipe down, which is preserve_lk_state.
+
+   The bootloader lights this panel and hands it over running, and there
+   is no cold start anywhere in this kernel to put it back: the panel
+   driver adopts a live panel and all four of its power callbacks are
+   empty by design.  So mtk_crtc_atomic_disable() is a one-way door here.
+   It is reached whenever the framebuffer a CRTC is scanning out goes
+   away -- drm_fb_release() removes a client's framebuffers when it
+   closes the device, and removing one from under an active CRTC disables
+   the CRTC -- and with CONFIG_DRM_FBDEV_EMULATION=n there is no
+   in-kernel client left for drm_client_dev_restore() to hand the pipe
+   back to.  One GL client that ran once cost the display until reboot.
+
+   The drm_WARN "vblank wait timed out on crtc 0" that this board printed
+   on every such exit is the same event seen from the other side.  That
+   wait exists to let the just-disabled planes reach the hardware at the
+   next SOF; a pipe being taken down underneath it does not produce one
+   inside the 100 ms drm_crtc_wait_one_vblank() allows.
+
+   With preserve_lk_state the CRTC disable does neither: no plane
+   teardown, no vblank wait, no mtk_crtc_ddp_hw_fini().  The DDP, the DSI
+   and the panel stay as the bootloader left them, and a later client
+   gets mtk_crtc_ddp_hw_init() over a live pipe -- which is exactly what
+   the first modeset after boot already does.
+
+   Leaving the pipe up is only half of it, because the commit that
+   disables the CRTC also turns every plane off, and an overlay with no
+   layers scans out an opaque background that nothing can paint over
+   again.  So the overlay keeps a copy of the programming it found at
+   probe -- taken there because the first modeset's mtk_ovl_config()
+   pulses OVL_RST and wipes it -- and mtk_crtc_atomic_flush() puts that
+   copy back once the CRTC has gone inactive.  What returns is the
+   bootloader's own framebuffer, which is the buffer simple-framebuffer
+   and everything writing through /dev/fb0 have been drawing into all
+   along.  A CRTC that has been used and released costs the display
+   nothing.
+
+   The snapshot is marked valid only where the block really was running
+   at probe, so a board that boots its own display saves nothing and
+   restores nothing.  The flag is on mt6592_mmsys_driver_data only, and
+   every other SoC keeps the existing path byte for byte.
 
 One measured difference is recorded here rather than changed.  The stock
 kernel writes 0x20402040 to DISP_RDMA_MEM_GMC_SETTING_0 (0x14008030);
@@ -64,11 +106,289 @@ each one less 32.
 
 Applies to linux-6.12.y.
 ---
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index aa8e6f6dd..a4761d2bc 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -802,12 +802,52 @@ static void mtk_crtc_atomic_disable(struct drm_crtc *crtc,
+ {
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
+ 	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[0];
++	struct mtk_drm_private *priv = crtc->dev->dev_private;
+ 	int i;
+ 
+ 	DRM_DEBUG_DRIVER("%s %d\n", __func__, crtc->base.id);
+ 	if (!mtk_crtc->enabled)
+ 		return;
+ 
++	/*
++	 * preserve_lk_state: leave the pipe running and hand nothing back.
++	 *
++	 * This function is reached whenever the framebuffer a CRTC is scanning
++	 * out goes away -- drm_fb_release() removes a client's framebuffers when
++	 * it closes the device, and removing one from under an active CRTC
++	 * disables the CRTC.  Where CONFIG_DRM_FBDEV_EMULATION=n there is no
++	 * in-kernel client left for drm_client_dev_restore() to hand the pipe to
++	 * afterwards, so on a board whose panel was brought up by the bootloader
++	 * and has no cold-start path here, everything below is a one-way door:
++	 * mtk_crtc_ddp_hw_fini() stops OVL, RDMA, COLOR and DSI, disconnects the
++	 * mmsys routing and disables the mutex, and nothing puts the panel back
++	 * until the next boot.  One client that ran once costs the display.
++	 *
++	 * The vblank wait further down is the other half of the same problem.
++	 * It is there to let the disabled planes reach the hardware at the next
++	 * SOF, and drm_crtc_wait_one_vblank() drm_WARNs "vblank wait timed out
++	 * on crtc 0" when that SOF does not arrive inside 100 ms -- which is
++	 * exactly what a pipe being taken down underneath it looks like.
++	 *
++	 * So do neither.  The planes are still disabled immediately afterwards
++	 * by mtk_crtc_atomic_flush(), which leaves the OVL showing its opaque
++	 * black background and not a freed buffer; the DDP, the DSI and the
++	 * panel stay as the bootloader left them; and the next client to modeset
++	 * gets mtk_crtc_ddp_hw_init() over a live pipe, which is precisely what
++	 * the FIRST modeset after boot already does and is known to work.
++	 *
++	 * drm_crtc_vblank_off() and mtk_ddp_comp_power_off() are kept because
++	 * they are bookkeeping rather than teardown: the first stops DRM
++	 * accounting vblanks for a CRTC it now believes is off, and the second
++	 * balances the reference mtk_crtc_atomic_enable() took.
++	 */
++	if (priv->data->preserve_lk_state) {
++		drm_crtc_vblank_off(crtc);
++		mtk_ddp_comp_power_off(comp);
++		mtk_crtc->enabled = false;
++		return;
++	}
++
+ 	/* Set all pending plane state to disabled */
+ 	for (i = 0; i < mtk_crtc->layer_nr; i++) {
+ 		struct drm_plane *plane = &mtk_crtc->planes[i];
+@@ -865,6 +905,8 @@ static void mtk_crtc_atomic_flush(struct drm_crtc *crtc,
+ 				  struct drm_atomic_state *state)
+ {
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
++	struct mtk_drm_private *priv = crtc->dev->dev_private;
++	struct drm_crtc_state *new_state;
+ 	int i;
+ 
+ 	if (crtc->state->color_mgmt_changed)
+@@ -873,6 +915,36 @@ static void mtk_crtc_atomic_flush(struct drm_crtc *crtc,
+ 			mtk_ddp_ctm_set(mtk_crtc->ddp_comp[i], crtc->state);
+ 		}
+ 	mtk_crtc_update_config(mtk_crtc, !!mtk_crtc->event);
++
++	/*
++	 * The commit above has just turned every plane off, because this is the
++	 * flush of the same commit whose mtk_crtc_atomic_disable() declined to
++	 * tear the pipe down -- see the comment there.  On a preserve_lk_state
++	 * SoC the pipe is still running, so what it shows now matters: the
++	 * client's framebuffer is about to be freed and reused, and an overlay
++	 * with no layers shows an opaque black screen that nothing can paint
++	 * over again.
++	 *
++	 * So give the panel back to whoever had it before DRM did.  The overlay
++	 * keeps a copy of the programming it found at probe, and putting that
++	 * back restores the bootloader's framebuffer -- which is the buffer the
++	 * simple-framebuffer fbdev and everything drawing through /dev/fb0 have
++	 * been writing into all along.  A CRTC that has been used and released
++	 * therefore costs the display nothing.
++	 *
++	 * new_state->active rather than mtk_crtc->enabled, because this flush
++	 * also runs BEFORE mtk_crtc_atomic_enable() on the commit that turns the
++	 * CRTC on, and restoring there would fight that client's first frame.
++	 */
++	if (!priv->data->preserve_lk_state)
++		return;
++
++	new_state = drm_atomic_get_new_crtc_state(state, crtc);
++	if (new_state && !new_state->active) {
++		mtk_mutex_acquire(mtk_crtc->mutex);
++		mtk_ddp_comp_restore_boot_layer(mtk_crtc->ddp_comp[0]);
++		mtk_mutex_release(mtk_crtc->mutex);
++	}
+ }
+ 
+ static const struct drm_crtc_funcs mtk_crtc_funcs = {
+diff --git a/drivers/gpu/drm/mediatek/mtk_ddp_comp.c b/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
+index 9672ea1f9..10d226c7b 100644
+--- a/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
++++ b/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
+@@ -357,6 +357,7 @@ static const struct mtk_ddp_comp_funcs ddp_ovl = {
+ 	.unregister_vblank_cb = mtk_ovl_unregister_vblank_cb,
+ 	.enable_vblank = mtk_ovl_enable_vblank,
+ 	.disable_vblank = mtk_ovl_disable_vblank,
++	.restore_boot_layer = mtk_ovl_restore_boot_layer,
+ 	.supported_rotations = mtk_ovl_supported_rotations,
+ 	.layer_nr = mtk_ovl_layer_nr,
+ 	.layer_check = mtk_ovl_layer_check,
+diff --git a/drivers/gpu/drm/mediatek/mtk_ddp_comp.h b/drivers/gpu/drm/mediatek/mtk_ddp_comp.h
+index 3f3d43f43..c32df6404 100644
+--- a/drivers/gpu/drm/mediatek/mtk_ddp_comp.h
++++ b/drivers/gpu/drm/mediatek/mtk_ddp_comp.h
+@@ -64,6 +64,7 @@ struct mtk_ddp_comp_funcs {
+ 	void (*unregister_vblank_cb)(struct device *dev);
+ 	void (*enable_vblank)(struct device *dev);
+ 	void (*disable_vblank)(struct device *dev);
++	void (*restore_boot_layer)(struct device *dev);
+ 	unsigned int (*supported_rotations)(struct device *dev);
+ 	unsigned int (*layer_nr)(struct device *dev);
+ 	int (*layer_check)(struct device *dev,
+@@ -161,6 +162,12 @@ static inline void mtk_ddp_comp_stop(struct mtk_ddp_comp *comp)
+ 		comp->funcs->stop(comp->dev);
+ }
+ 
++static inline void mtk_ddp_comp_restore_boot_layer(struct mtk_ddp_comp *comp)
++{
++	if (comp->funcs && comp->funcs->restore_boot_layer)
++		comp->funcs->restore_boot_layer(comp->dev);
++}
++
+ static inline void mtk_ddp_comp_register_vblank_cb(struct mtk_ddp_comp *comp,
+ 						   void (*vblank_cb)(void *),
+ 						   void *vblank_cb_data)
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_drv.h b/drivers/gpu/drm/mediatek/mtk_disp_drv.h
+index c0f7f77e0..d30c291ed 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_drv.h
++++ b/drivers/gpu/drm/mediatek/mtk_disp_drv.h
+@@ -103,6 +103,7 @@ void mtk_ovl_register_vblank_cb(struct device *dev,
+ void mtk_ovl_unregister_vblank_cb(struct device *dev);
+ void mtk_ovl_enable_vblank(struct device *dev);
+ void mtk_ovl_disable_vblank(struct device *dev);
++void mtk_ovl_restore_boot_layer(struct device *dev);
+ u32 mtk_ovl_get_blend_modes(struct device *dev);
+ const u32 *mtk_ovl_get_formats(struct device *dev);
+ size_t mtk_ovl_get_num_formats(struct device *dev);
 diff --git a/drivers/gpu/drm/mediatek/mtk_disp_ovl.c b/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
-index ca4a9a60b..aacfdfbd2 100644
+index ca4a9a60b..49c5645b2 100644
 --- a/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
 +++ b/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
-@@ -673,6 +673,26 @@ static const struct mtk_disp_ovl_data mt2701_ovl_driver_data = {
+@@ -157,6 +157,29 @@ struct mtk_disp_ovl_data {
+  * @crtc: associated crtc to report vblank events to
+  * @data: platform data
+  */
++/*
++ * The overlay programming this driver found already running, kept so that a
++ * board whose bootloader lit the panel can be given it back when the last DRM
++ * client goes away.  See mtk_ovl_restore_boot_layer() and preserve_lk_state.
++ */
++#define MTK_OVL_BOOT_LAYERS	4
++
++struct mtk_ovl_boot_layer {
++	bool	valid;
++	u32	en;
++	u32	roi_size;
++	u32	datapath_con;
++	u32	roi_bgclr;
++	u32	src_con;
++	u32	con[MTK_OVL_BOOT_LAYERS];
++	u32	src_size[MTK_OVL_BOOT_LAYERS];
++	u32	offset[MTK_OVL_BOOT_LAYERS];
++	u32	addr[MTK_OVL_BOOT_LAYERS];
++	u32	pitch[MTK_OVL_BOOT_LAYERS];
++	u32	rdma_ctrl[MTK_OVL_BOOT_LAYERS];
++	u32	rdma_gmc[MTK_OVL_BOOT_LAYERS];
++};
++
+ struct mtk_disp_ovl {
+ 	struct drm_crtc			*crtc;
+ 	struct clk			*clk;
+@@ -165,8 +188,86 @@ struct mtk_disp_ovl {
+ 	const struct mtk_disp_ovl_data	*data;
+ 	void				(*vblank_cb)(void *data);
+ 	void				*vblank_cb_data;
++	struct mtk_ovl_boot_layer	boot;
+ };
+ 
++static unsigned int mtk_ovl_boot_layers(struct mtk_disp_ovl *ovl)
++{
++	return min_t(unsigned int, ovl->data->layer_nr, MTK_OVL_BOOT_LAYERS);
++}
++
++/*
++ * Taken once, at probe, because that is the last moment the bootloader's
++ * programming is still all there: the first modeset runs mtk_ovl_config(),
++ * which pulses DISP_REG_OVL_RST and wipes it.
++ *
++ * It is only meaningful where something really did hand a running overlay
++ * over, so it is marked valid only if the block is enabled, at least one
++ * source is selected and layer 0 has an address.  Nothing reads it unless
++ * mtk_crtc asks, and mtk_crtc only asks on a preserve_lk_state SoC.
++ */
++static void mtk_ovl_save_boot_layer(struct mtk_disp_ovl *ovl)
++{
++	struct mtk_ovl_boot_layer *b = &ovl->boot;
++	unsigned int i, nr = mtk_ovl_boot_layers(ovl);
++
++	b->en = readl(ovl->regs + DISP_REG_OVL_EN);
++	b->roi_size = readl(ovl->regs + DISP_REG_OVL_ROI_SIZE);
++	b->datapath_con = readl(ovl->regs + DISP_REG_OVL_DATAPATH_CON);
++	b->roi_bgclr = readl(ovl->regs + DISP_REG_OVL_ROI_BGCLR);
++	b->src_con = readl(ovl->regs + DISP_REG_OVL_SRC_CON);
++
++	for (i = 0; i < nr; i++) {
++		b->con[i] = readl(ovl->regs + DISP_REG_OVL_CON(i));
++		b->src_size[i] = readl(ovl->regs + DISP_REG_OVL_SRC_SIZE(i));
++		b->offset[i] = readl(ovl->regs + DISP_REG_OVL_OFFSET(i));
++		b->addr[i] = readl(ovl->regs + DISP_REG_OVL_ADDR(ovl, i));
++		b->pitch[i] = readl(ovl->regs + DISP_REG_OVL_PITCH(i));
++		b->rdma_ctrl[i] = readl(ovl->regs + DISP_REG_OVL_RDMA_CTRL(i));
++		b->rdma_gmc[i] = readl(ovl->regs + DISP_REG_OVL_RDMA_GMC(i));
++	}
++
++	b->valid = (b->en & 0x1) && (b->src_con & GENMASK(nr - 1, 0)) &&
++		   b->addr[0] && b->roi_size;
++}
++
++/*
++ * Put the bootloader's frame back on the overlay.  Called from
++ * mtk_crtc_atomic_flush() on a preserve_lk_state SoC once the CRTC has gone
++ * inactive, in place of leaving the panel showing either a black background or
++ * a buffer whose pages are about to be freed.  The caller holds the DDP mutex,
++ * so these land with the rest of that commit.
++ *
++ * Layer registers first, then the source select, then the enable, which is the
++ * order the bootloader itself brings the block up in.
++ */
++void mtk_ovl_restore_boot_layer(struct device *dev)
++{
++	struct mtk_disp_ovl *ovl = dev_get_drvdata(dev);
++	struct mtk_ovl_boot_layer *b = &ovl->boot;
++	unsigned int i, nr = mtk_ovl_boot_layers(ovl);
++
++	if (!b->valid)
++		return;
++
++	writel_relaxed(b->roi_size, ovl->regs + DISP_REG_OVL_ROI_SIZE);
++	writel_relaxed(b->datapath_con, ovl->regs + DISP_REG_OVL_DATAPATH_CON);
++	writel_relaxed(b->roi_bgclr, ovl->regs + DISP_REG_OVL_ROI_BGCLR);
++
++	for (i = 0; i < nr; i++) {
++		writel_relaxed(b->con[i], ovl->regs + DISP_REG_OVL_CON(i));
++		writel_relaxed(b->src_size[i], ovl->regs + DISP_REG_OVL_SRC_SIZE(i));
++		writel_relaxed(b->offset[i], ovl->regs + DISP_REG_OVL_OFFSET(i));
++		writel_relaxed(b->addr[i], ovl->regs + DISP_REG_OVL_ADDR(ovl, i));
++		writel_relaxed(b->pitch[i], ovl->regs + DISP_REG_OVL_PITCH(i));
++		writel_relaxed(b->rdma_gmc[i], ovl->regs + DISP_REG_OVL_RDMA_GMC(i));
++		writel_relaxed(b->rdma_ctrl[i], ovl->regs + DISP_REG_OVL_RDMA_CTRL(i));
++	}
++
++	writel_relaxed(b->src_con, ovl->regs + DISP_REG_OVL_SRC_CON);
++	writel(b->en, ovl->regs + DISP_REG_OVL_EN);
++}
++
+ static irqreturn_t mtk_disp_ovl_irq_handler(int irq, void *dev_id)
+ {
+ 	struct mtk_disp_ovl *priv = dev_id;
+@@ -642,6 +743,8 @@ static int mtk_disp_ovl_probe(struct platform_device *pdev)
+ 	priv->data = of_device_get_match_data(dev);
+ 	platform_set_drvdata(pdev, priv);
+ 
++	mtk_ovl_save_boot_layer(priv);
++
+ 	ret = devm_request_irq(dev, irq, mtk_disp_ovl_irq_handler,
+ 			       IRQF_TRIGGER_NONE, dev_name(dev), priv);
+ 	if (ret < 0)
+@@ -673,6 +776,26 @@ static const struct mtk_disp_ovl_data mt2701_ovl_driver_data = {
  	.num_formats = ARRAY_SIZE(mt8173_formats),
  };
  
@@ -95,7 +415,7 @@ index ca4a9a60b..aacfdfbd2 100644
  static const struct mtk_disp_ovl_data mt8173_ovl_driver_data = {
  	.addr = DISP_REG_OVL_ADDR_MT8173,
  	.gmc_bits = 8,
-@@ -744,6 +764,8 @@ static const struct mtk_disp_ovl_data mt8195_ovl_driver_data = {
+@@ -744,6 +867,8 @@ static const struct mtk_disp_ovl_data mt8195_ovl_driver_data = {
  static const struct of_device_id mtk_disp_ovl_driver_dt_match[] = {
  	{ .compatible = "mediatek,mt2701-disp-ovl",
  	  .data = &mt2701_ovl_driver_data},
@@ -105,7 +425,7 @@ index ca4a9a60b..aacfdfbd2 100644
  	  .data = &mt8173_ovl_driver_data},
  	{ .compatible = "mediatek,mt8183-disp-ovl",
 diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
-index e169e67e3..d5aa750d2 100644
+index e169e67e3..508c0cf47 100644
 --- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
 +++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
 @@ -71,6 +71,37 @@ static const unsigned int mt2701_mtk_ddp_ext[] = {
@@ -146,7 +466,7 @@ index e169e67e3..d5aa750d2 100644
  static const unsigned int mt7623_mtk_ddp_main[] = {
  	DDP_COMPONENT_OVL0,
  	DDP_COMPONENT_RDMA0,
-@@ -239,6 +270,21 @@ static const struct mtk_mmsys_driver_data mt2701_mmsys_driver_data = {
+@@ -239,6 +270,29 @@ static const struct mtk_mmsys_driver_data mt2701_mmsys_driver_data = {
  	.mmsys_dev_num = 1,
  };
  
@@ -157,18 +477,26 @@ index e169e67e3..d5aa750d2 100644
 + * what the bootloader does: mtk_crtc_update_config() then takes MUTEX0,
 + * programs the pipe and releases it, which is the same acquire/configure/release
 + * the bootloader's own commit performs.
++ *
++ * preserve_lk_state is this board rather than this SoC.  The bootloader
++ * lights the panel and j36_jd9365_panel.c adopts a live one with all four of
++ * its power callbacks empty, so there is no cold start anywhere in this
++ * kernel and a CRTC teardown would be permanent.  mtk_crtc_atomic_disable()
++ * therefore declines to perform one -- see the comment there, which is also
++ * where the vblank-wait timeout this removes is explained.
 + */
 +static const struct mtk_mmsys_driver_data mt6592_mmsys_driver_data = {
 +	.main_path = mt6592_mtk_ddp_main,
 +	.main_len = ARRAY_SIZE(mt6592_mtk_ddp_main),
 +	.shadow_register = true,
++	.preserve_lk_state = true,
 +	.mmsys_dev_num = 1,
 +};
 +
  static const struct mtk_mmsys_driver_data mt7623_mmsys_driver_data = {
  	.main_path = mt7623_mtk_ddp_main,
  	.main_len = ARRAY_SIZE(mt7623_mtk_ddp_main),
-@@ -329,6 +375,8 @@ static const struct mtk_mmsys_driver_data mt8195_vdosys1_driver_data = {
+@@ -329,6 +383,8 @@ static const struct mtk_mmsys_driver_data mt8195_vdosys1_driver_data = {
  static const struct of_device_id mtk_drm_of_ids[] = {
  	{ .compatible = "mediatek,mt2701-mmsys",
  	  .data = &mt2701_mmsys_driver_data},
@@ -177,3 +505,21 @@ index e169e67e3..d5aa750d2 100644
  	{ .compatible = "mediatek,mt7623-mmsys",
  	  .data = &mt7623_mmsys_driver_data},
  	{ .compatible = "mediatek,mt2712-mmsys",
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.h b/drivers/gpu/drm/mediatek/mtk_drm_drv.h
+index ce897984d..daecd784d 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.h
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.h
+@@ -44,6 +44,13 @@ struct mtk_mmsys_driver_data {
+ 	unsigned int num_conn_routes;
+ 
+ 	bool shadow_register;
++	/*
++	 * Set on a board whose bootloader hands the display over already
++	 * running and which has no cold-start path in the kernel to put the
++	 * panel back.  mtk_crtc_atomic_disable() then leaves the pipe alone
++	 * instead of tearing it down; the comment there has the argument.
++	 */
++	bool preserve_lk_state;
+ 	unsigned int mmsys_id;
+ 	unsigned int mmsys_dev_num;
+ 

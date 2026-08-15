@@ -39,6 +39,8 @@ SOURCES += \
     main.cpp \
     trace.cpp \
     alloc.cpp \
+    console.cpp \
+    shell.cpp \
     dashboard.cpp \
     widgets.cpp \
     joypad.cpp \
@@ -58,6 +60,8 @@ SOURCES += \
 HEADERS += \
     dashboard.h \
     trace.h \
+    console.h \
+    shell.h \
     widgets.h \
     joypad.h \
     theme.h \

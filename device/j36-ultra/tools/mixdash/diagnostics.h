@@ -14,17 +14,19 @@
  * mtk_drm, which at the time was a module nobody loaded.  Every derivative failed
  * the same way for the same reason: mpv's gpu output, SDL's KMSDRM backend, kmscube.
  *
- * MTK_DRM BINDS NOW, and that made the old card worse rather than better.  card1
- * appears, display_node() finds it, and eglprobe -c gets the modeset it always
- * wanted -- so the cube turns, and then the process exits, the kernel drops its
- * framebuffers, dropping the framebuffer a CRTC scans out disables that CRTC, and
- * with CONFIG_DRM_FBDEV_EMULATION=n nothing hands the pipe back.  The panel stays
- * dark until the next reboot, and the LK's simple-framebuffer at 0x82700000 --
- * which mixdash is drawing into right now, and which is a different path to the
- * same glass -- goes on accepting writes that no longer reach anyone's eyes.
- * That is why the GPU row on this page runs eglprobe -o and not -c: same cube,
- * same shaders, same GPU, copied into /dev/fb0 instead of scanned out, so there
- * is nothing to take away.  See onActivated().
+ * MTK_DRM BINDS NOW, and for a while that made the old card worse rather than
+ * better.  card1 appears, display_node() finds it, and eglprobe -c gets the modeset
+ * it always wanted -- so the cube turned, and then the process exited, the kernel
+ * dropped its framebuffers, dropping the framebuffer a CRTC scans out disabled that
+ * CRTC, and with CONFIG_DRM_FBDEV_EMULATION=n nothing handed the pipe back.  The
+ * panel stayed dark until the next reboot while the LK's simple-framebuffer at
+ * 0x82700000 -- which mixdash is drawing into right now, and which is a different
+ * path to the same glass -- went on accepting writes that reached nobody's eyes.
+ * preserve_lk_state in the kernel's mediatek-drm patch ends that: the CRTC disable
+ * leaves the pipe up and restores the overlay the bootloader programmed, so the
+ * dashboard is back when the client exits.  The GPU row still runs eglprobe -o and
+ * not -c, because -o proves the same thing without taking the screen at all.  See
+ * onActivated().
  *
  * SO THE CPU CUBE IS STILL HERE TOO, and it still turns -- rasterised by QPainter
  * into that framebuffer.  It is a measurement rather than a demo: the frame rate

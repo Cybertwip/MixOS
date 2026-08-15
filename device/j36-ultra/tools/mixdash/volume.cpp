@@ -15,6 +15,7 @@
 #include <QStringList>
 #include <QTimer>
 
+#include "shell.h"
 #include "theme.h"
 
 namespace {
@@ -49,11 +50,11 @@ QString runShort(const QString &program, const QStringList &args, int timeoutMs 
     QProcess p;
     p.setProcessChannelMode(QProcess::MergedChannels);
     p.start(program, args);
-    if (!p.waitForStarted(1000))
+    if (!Shell::waitForStarted(p, 1000))
         return QString();
-    if (!p.waitForFinished(timeoutMs)) {
+    if (!Shell::waitForFinished(p, timeoutMs)) {
         p.kill();
-        p.waitForFinished(400);
+        Shell::waitForFinished(p, 400);
         return QString();
     }
     return QString::fromLocal8Bit(p.readAll());

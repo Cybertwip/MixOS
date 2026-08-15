@@ -122,6 +122,8 @@
 #include <linux/power_supply.h>
 #include <linux/reboot.h>
 #include <linux/spinlock.h>
+#include <linux/sysfs.h>	/* ATTRIBUTE_GROUPS and sysfs_emit for the one
+				 * custom attribute this driver publishes */
 #include <linux/workqueue.h>
 
 #include "j36_battery_curve.h"
@@ -2360,6 +2362,53 @@ static const struct power_supply_desc j36_battery_desc = {
 	.property_is_writeable = j36_battery_property_is_writeable,
 };
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * usb/vbus_sourcing -- WHY `online' IS ZERO
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * ONE BIT, AND IT IS THE DIFFERENCE BETWEEN A BUG AND A BOARD.
+ *
+ * `online' has two ways of being zero and they mean opposite things.  Either
+ * CHRDET is clear, which is "nothing is plugged in", or j36_charger_online()
+ * short-circuited on the DRVVBUS interlock, which is "something IS plugged in and
+ * this board is the thing feeding it".  From userspace those are the same zero, and
+ * the second one on a board with a charger in it reads as a driver that cannot see
+ * a cable -- which is exactly the report this attribute exists to answer.
+ *
+ * There is one connector on this handheld: it is the charge port and it is the host
+ * port and it cannot be both at once.  When the USB PHY has decided the port is a
+ * host it raises the pad, the boost puts 5 V on the connector, and that 5 V lands on
+ * the PMIC's CHRIN net -- so CHRDET would read this board's own supply as a charger
+ * and the charger would try to charge the cell from the cell.  Holding it off is
+ * correct.  Being unable to SAY that is what was wrong.
+ *
+ * Read live rather than cached: the pad is the ground truth, the read is three
+ * register reads with no side effects, and a cached copy could only ever be a poll
+ * interval out of date in the direction that matters.
+ *
+ * -1 means the question does not apply -- no j36,gpio-controller or no
+ * j36,drvvbus-pad in the device tree, so this driver has no pad to interpret and
+ * `online' is CHRDET and nothing else.
+ */
+static ssize_t vbus_sourcing_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct power_supply *psy = dev_get_drvdata(dev);
+	struct j36_pmic *p = power_supply_get_drvdata(psy);
+
+	if (!p->gpio || p->vbus_pin < 0)
+		return sysfs_emit(buf, "-1\n");
+	return sysfs_emit(buf, "%d\n", j36_drvvbus_asserted(p) ? 1 : 0);
+}
+static DEVICE_ATTR_RO(vbus_sourcing);
+
+static struct attribute *j36_usb_attrs[] = {
+	&dev_attr_vbus_sourcing.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(j36_usb);
+
 static const struct power_supply_desc j36_usb_desc = {
 	.name = "usb",
 	.type = POWER_SUPPLY_TYPE_USB,
@@ -2585,6 +2634,7 @@ static int j36_pmic_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct power_supply_config cfg = { };
+	struct power_supply_config usb_cfg = { };
 	struct j36_pmic *p;
 	void __iomem *base;
 	u32 value;
@@ -2674,7 +2724,17 @@ static int j36_pmic_probe(struct platform_device *pdev)
 	if (IS_ERR(p->battery))
 		return dev_err_probe(dev, PTR_ERR(p->battery),
 				     "register the battery supply\n");
-	p->usb = devm_power_supply_register(dev, &j36_usb_desc, &cfg);
+
+	/*
+	 * A SECOND CONFIG, and the reason is that attr_grp is not a driver-wide
+	 * setting.  power_supply_register copies it straight into dev->groups, so
+	 * whichever supplies are handed this struct get the attribute -- and
+	 * vbus_sourcing under battery/ would be a lie about a pad that has nothing
+	 * to do with the cell.  The battery keeps the plain cfg above.
+	 */
+	usb_cfg.drv_data = p;
+	usb_cfg.attr_grp = j36_usb_groups;
+	p->usb = devm_power_supply_register(dev, &j36_usb_desc, &usb_cfg);
 	if (IS_ERR(p->usb))
 		return dev_err_probe(dev, PTR_ERR(p->usb),
 				     "register the USB supply\n");

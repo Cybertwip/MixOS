@@ -125,12 +125,20 @@ fi
 # linux/0001-mtk-sd-mt6592.patch fixes both, and its header records why neither
 # can be worked around from the device tree instead.
 #
-# linux/0002-drm-mediatek-mt6592.patch is the display half, and it is four hunks
-# in two files because MT6592's DDP is the MT2701/MT8173 generation: only the
-# pipeline order and the OVL colour-format numbering are genuinely this SoC's own.
-# Its header records, register by register, what was measured against the MVII LK
-# and against the stock 3.4 kernel to prove the rest of the mt2701 driver data
-# exact.  Everything else that port needs is device tree, not code.
+# linux/0002-drm-mediatek-mt6592.patch is the display half.  The SoC part of it is
+# six hunks in two files, because MT6592's DDP is the MT2701/MT8173 generation:
+# only the pipeline order and the OVL colour-format numbering are genuinely this
+# SoC's own.  Its header records, register by register, what was measured against
+# the MVII LK and against the stock 3.4 kernel to prove the rest of the mt2701
+# driver data exact.  Everything else that port needs is device tree, not code.
+#
+# The remaining ten hunks are not the SoC but the board: preserve_lk_state, which
+# stops mtk_crtc_atomic_disable() tearing the pipe down, and the OVL boot-layer
+# snapshot that hands the panel back afterwards.  The LK lights this panel and no
+# cold start exists here, so that teardown was permanent -- one GL client exiting
+# cost the display until reboot -- and the "vblank wait timed out on crtc 0" WARN
+# was the same event seen from inside the wait.  Sixteen hunks in seven files
+# altogether, all of it behind one flag that only mt6592_mmsys_driver_data sets.
 #
 # linux/0003-musb-mediatek-mt6592.patch is USB, and it is now one hunk: it moves
 # the two TXTOGEN/RXTOGEN writes in mtk_musb_init() from above phy_init() to
@@ -1118,7 +1126,7 @@ verify_armv7_kernel "$ZIMAGE" "the zImage"
 fits_in "$ZIMAGE" $((0x01800000)) "the zImage"
 log "Verified a 32-bit ARMv7 zImage: $(stat -c %s "$ZIMAGE") bytes"
 
-log "Building the out-of-tree J36 modules: the input adapter, the panel, the AFE, the USB PHY, the PMIC, the backlight and the radio"
+log "Building the out-of-tree J36 modules: the input adapter, the panel, the AFE, the USB PHY, the PMIC, the backlight, the framebuffer exporter and the radio"
 mkdir -p "$MODULE_SRC"
 rsync -a --delete "$ROOT/device/j36-ultra/linux/" "$MODULE_SRC/"
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
@@ -1168,6 +1176,16 @@ verify_arm_elf "$PMIC_MODULE" "the PMIC module"
 BACKLIGHT_MODULE="$MODULE_SRC/j36_mt6592_backlight.ko"
 [[ -s "$BACKLIGHT_MODULE" ]] || die "backlight module was not produced"
 verify_arm_elf "$BACKLIGHT_MODULE" "the backlight module"
+# And the dma-buf exporter over the LK's framebuffer carveout, staged with the
+# mtkdrm payload.  It is the only module here that imports a symbol namespace --
+# dma_buf_export and friends are EXPORT_SYMBOL_NS_GPL into DMA_BUF -- so if this
+# line ever fires, look above it for a modpost "uses symbol ... but does not
+# import it" rather than for a compile error.  A missing .ko is discovered on the
+# board as `eglprobe -z' saying /dev/j36fb does not exist, which reads like the
+# device tree is wrong when it is not.
+FBMEM_MODULE="$MODULE_SRC/j36_fbmem.ko"
+[[ -s "$FBMEM_MODULE" ]] || die "framebuffer dma-buf module was not produced"
+verify_arm_elf "$FBMEM_MODULE" "the framebuffer dma-buf module"
 # And the radio, staged as its own wifi payload.  It is the only module here built
 # from more than one translation unit -- main, consys and wmt -- and the only one
 # that links against another of these modules rather than against the kernel
@@ -2265,6 +2283,13 @@ run_lima() {
 # no panel module means no DRM master and no card node, however well the other
 # four loaded.  If /dev/dri stays empty after this, that is the first thing dmesg
 # will say.
+#
+# The FIRST line is j36_fbmem, and it is independent of everything after it: it
+# binds the device tree's j36,lk-framebuffer node and puts /dev/j36fb on the
+# board, which is the LK's framebuffer carveout as a dma-buf.  Nothing in the boot
+# uses it -- it is what lets a GL client render into the scanout instead of
+# copying into it, and `eglprobe -z' is what measures that -- so its absence costs
+# nothing at boot and is reported here rather than being fatal.
 run_mtkdrm() {
     if ! find_payload; then return 1; fi
     if [ ! -f "$payload/mtkdrm/load.order" ]; then
@@ -2282,6 +2307,11 @@ run_mtkdrm() {
     done < "$payload/mtkdrm/load.order"
     say "DRM devices:"
     ls -l /dev/dri 2>/dev/null || say "  none"
+    if [ -c /dev/j36fb ]; then
+        say "the LK framebuffer as a dma-buf: $(cat /sys/class/misc/j36fb/info 2>/dev/null)"
+    else
+        say "no /dev/j36fb: GL clients can only reach the panel by copying into /dev/fb0"
+    fi
     return 0
 }
 
@@ -3188,6 +3218,16 @@ Environment="QT_QPA_FB_DISABLE_INPUT=1"
 # QtGui links fontconfig -- so it is a fallback, not the font path.  main.cpp loads
 # the payload's faces by name through QFontDatabase::addApplicationFont.
 Environment="QT_QPA_FONTDIR=$mixos_root/qt/fonts"
+# journal AND console, and it is startup-only in practice.  Until the first frame the
+# panel is the best place these two can go: a dashboard that dies before it paints has
+# nothing else to say why, and the journal is on an ext2 partition the machine that
+# flashed this card cannot read.  From the first frame the dashboard takes both
+# descriptors off the console itself and points them at /run/j36/mixdash.log -- see
+# Console::toLog in tools/mixdash/console.cpp -- because after that a Qt warning here
+# is a line of text drawn straight across the grid, and it arrives through a channel
+# that holding the console mode cannot close, the text being the dashboard own output.
+# j36-logdump copies the tail of that file into BOOT:/mixos-log.txt, so nothing said
+# after the first frame is lost by the move.
 StandardOutput=journal+console
 StandardError=journal+console
 
@@ -3420,9 +3460,11 @@ UNITMIRROR
     # The binary is staged either way, so `/run/j36/eglprobe -f' from a shell answers
     # the same question after the fact without a rebuild.
     #
-    # It is NOT -p or -c even then: those two modeset, and on a kernel with no fbdev
-    # emulation the CRTC is disabled when the client exits, so either one would hide
-    # the dashboard for the rest of the boot.
+    # It is NOT -p or -c even then: those two modeset, so either one would own the
+    # screen for as long as it ran and the boot would be watching a cube instead of
+    # coming up.  That is a smaller objection than it was -- preserve_lk_state now
+    # gives the panel back when the client exits, where before either one hid the
+    # dashboard for the rest of the boot -- but a boot is still not where they go.
     #
     # A UNIT OF ITS OWN, AND NOT ExecStartPre, AND THIS IS THE FIX FOR A HANG.
     # ExecStartPre runs on every start ATTEMPT, restarts included.  mixdash.service is
@@ -4446,8 +4488,24 @@ dump() {
     run ls -l /sys/class/power_supply
     showall "every power supply this kernel registered" \
         /sys/class/power_supply/*/uevent
+
+    # THE ONE BIT THAT SAYS WHY usb/online IS ZERO, and without it the two cases
+    # are indistinguishable from userspace -- which is how "the charger is plugged
+    # in and the dashboard says no cable" gets reported as a driver that cannot
+    # see a cable.  There is a single connector on this handheld: it is the charge
+    # port and it is the host port, so when the USB PHY decides the port is a host
+    # it raises DRVVBUS, the boost puts this board's own 5 V on the connector, and
+    # that 5 V lands on the net CHRDET watches.  The PMIC holds the charger off
+    # rather than charge the cell from the cell, and online goes to 0 with a cable
+    # very much in.  1 here means that is what happened and the question is why
+    # the PHY chose host; 0 means CHRDET genuinely sees nothing and the question
+    # is the cable or the port; -1 means no j36,drvvbus-pad in the device tree, so
+    # online is CHRDET and nothing else.
+    showall "the DRVVBUS interlock -- is this board feeding the port itself?" \
+        /sys/class/power_supply/*/vbus_sourcing
+
     kgrep "the PMIC, the gauge and the ADC" \
-        'pmic|mt6323|battery|charger|auxadc|adc|power_supply|vchr|vbat'
+        'pmic|mt6323|battery|charger|auxadc|adc|power_supply|vchr|vbat|drvvbus'
 
     printf '\n\n########## 3.  GAMEPAD AND JOYSTICKS ##########\n'
     show /proc/bus/input/devices
@@ -4470,11 +4528,30 @@ dump() {
     showall "framebuffer geometry" \
         /sys/class/graphics/fb0/virtual_size /sys/class/graphics/fb0/bits_per_pixel \
         /sys/class/graphics/fb0/name /sys/class/graphics/fb0/state
+    # THE SAME MEMORY, SEEN FROM THE OTHER END.  fb0 above is simple-framebuffer
+    # over the LK's carveout; this is that carveout as a dma-buf, and the address
+    # and geometry here have to match the two lines above them.  A /dev/j36fb that
+    # is missing means j36_fbmem did not load, and a GL client can then only reach
+    # the panel by copying into /dev/fb0 -- which is why `eglprobe -z' would say
+    # nothing works when what is actually missing is this module.
+    run ls -l /dev/j36fb
+    showall "the LK framebuffer as a dma-buf" /sys/class/misc/j36fb/info
     show /sys/class/tty/tty0/active
     run ps -eo pid,ppid,stat,etimes,args
     run systemctl --no-pager status mixdash
+    # mixdash moves its own stdout and stderr into this file once it has painted a
+    # frame, so that a Qt warning is not drawn across the dashboard -- which means
+    # everything the dashboard has said since boot is HERE and not in the journal,
+    # and section 8 below would not show it.  Tailed rather than cat'd: the file is
+    # wrapped at 256 KB and the last screen of it is the part with the answer in.
+    sec "/run/j36/mixdash.log -- the dashboard's own output, last 200 lines"
+    if [ -r /run/j36/mixdash.log ]; then
+        tail -n 200 /run/j36/mixdash.log 2>&1 || printf '(unreadable)\n'
+    else
+        printf '(absent -- no first frame yet, so it is still on the console)\n'
+    fi
     run systemctl --no-pager status batt_led
-    kgrep "the display stack" 'fb0|fbcon|drm|mtkfb|mtkdrm|lima|mali|backlight'
+    kgrep "the display stack" 'fb0|fbcon|drm|mtkfb|mtkdrm|lima|mali|backlight|fbmem|j36fb'
 
     printf '\n\n########## 6.  MODULES ##########\n'
     show /proc/modules
@@ -5426,16 +5503,27 @@ fi
 # safe is elsewhere -- DRM_FBDEV_EMULATION=n means mediatek-drm binds, registers
 # card0 and programs not one display register until userspace opens the node.
 #
-# All five names are roots, and the two that matter are the last two: mediatek-drm
+# All six names are roots, and the two that matter are the last two: mediatek-drm
 # reaches phy-mtk-mipi-dsi-drv through the generic phy API and the panel through
 # the DSI host bus, neither of which is a symbol relationship, so a dependency walk
 # cannot find either from mediatek-drm alone.
+#
+# j36_fbmem is first, and it is here for what it is about rather than for what it
+# depends on -- which is nothing: dma_buf_export is in vmlinux, so it has no
+# depends edge to anything else in this list and could load in any order.  It is a
+# display module because the memory it exports is the memory the DDP is scanning,
+# and the same sentence that makes the rest of this payload safe makes it safe:
+# it programs no display register at all.  First rather than last so that
+# /dev/j36fb exists even on a boot where the DSI chain below it fails, because a
+# board with no card node is exactly the board somebody wants to ask "is the
+# bootloader's framebuffer still where it said it was" about.
 MTKDRM_MODULE_PATHS=()
 MTKDRM_MODULE_ORDER=()
 if [[ "${J36_MTKDRM:-1}" == 1 ]]; then
     set +e
     collect_modules mtkdrm MTKDRM_MODULE_ORDER MTKDRM_MODULE_PATHS \
-        phy-mtk-mipi-dsi-drv mtk-mmsys mtk-mutex mediatek-drm j36_jd9365_panel
+        j36_fbmem phy-mtk-mipi-dsi-drv mtk-mmsys mtk-mutex mediatek-drm \
+        j36_jd9365_panel
     mtkdrm_rc=$?
     set -e
     if (( mtkdrm_rc != 0 )); then
@@ -6055,9 +6143,11 @@ armhf_chroot_teardown() {
 # mediatek-drm never takes /dev/fb0 away from it.  The kernel console drawing on
 # this panel already proved the path end to end.
 #
-# WHAT IS BUILT.  Five files in device/j36-ultra/tools/mixdash, against Debian's own
-# qtbase5-dev in the armhf chroot above.  Nothing is cross-compiled, no Qt is built
-# from source, and QT does not include opengl.
+# WHAT IS BUILT.  Every .cpp and .h in device/j36-ultra/tools/mixdash, against
+# Debian's own qtbase5-dev in the armhf chroot above.  Nothing is cross-compiled, no
+# Qt is built from source, and QT does not include opengl.  The staging loop below
+# is a glob and mixdash.pro is the only list, so a new source file needs adding in
+# one place and not in two.
 #
 # WHERE IT GOES, AND WHY NOT ONTO BOOT.  Qt's runtime closure for the linuxfb path
 # is 14 MB of Qt plus 35 MB of ICU -- libQt5Core.so.5 carries libicui18n.so.76 and
@@ -6882,11 +6972,13 @@ changes nothing else:
   opt/mixos/j36/gl/        Mesa's GL front end, plus links
   opt/mixos/j36/eglprobe   -f reports and paints /dev/fb0 with no DRM at all and
                            runs on every boot; -o draws the GPU's cube into
-                           /dev/fb0 without a modeset; the other modes say what can
+                           /dev/fb0 without a modeset; -z draws the same cube
+                           straight into the scanout through /dev/j36fb, with no
+                           copy at either end; the other modes say what can
                            create a GL context, and why not, and whether a frame
-                           reaches the glass.  -p and -c take the panel for the
-                           rest of the boot and need -y.  See "j36/eglprobe -f",
-                           "-o" and "-p" below.
+                           reaches the glass.  -p and -c own the screen while they
+                           run and need -y; the dashboard is back when they exit.
+                           See "j36/eglprobe -f", "-o", "-z" and "-p" below.
 
 A TARBALL AND NOT A DIRECTORY, on purpose: this payload's symlinks, modes and
 ownership are load-bearing -- the Qt SONAME aliases are symlinks, mfgpower and the
@@ -7461,6 +7553,19 @@ j36.power=1
     usb_type (SDP, CDP, DCP or an Apple brick) and current_max, which is what the
     BC1.2 handshake decided the wall will actually give us.
 
+    It also reports one attribute that is not a standard power_supply property,
+    vbus_sourcing, and it is there because online has two ways of being zero that
+    mean opposite things. This handheld has ONE connector: it is the charge port
+    and it is the host port and it cannot be both. When the USB PHY decides the
+    port is a host it raises DRVVBUS, the boost puts this board's own 5 V on the
+    connector, and that 5 V arrives on the same net the charger detects a supply
+    on -- so the PMIC holds the charger off rather than charge the cell from the
+    cell, and online goes to 0 with a cable very much in it. vbus_sourcing reads
+    the pad directly: 1 is that case, 0 is the plain one where CHRDET sees
+    nothing, and -1 is a device tree with no j36,drvvbus-pad, where online is
+    CHRDET and nothing else. Diagnostics -> Power prints which, and so does
+    section 2 of mixos-log.txt.
+
     THE ONE FACT THAT EXPLAINS THE REST: this board has no power-path FET, so
     VBAT is the system node rather than a battery-only rail.  Every live ADC
     channel measures what the whole board is doing at that instant -- the
@@ -7599,8 +7704,9 @@ j36.gl=1
     /dev/fb0.  What needs it is the Diagnostics page's "GPU render test", which
     runs eglprobe -o: the cube on lima, read back and copied into /dev/fb0.  It
     used to run eglprobe -c, which scans the cube out through DRM instead, and
-    that took the panel for the rest of the boot every time -- see the -o and -y
-    notes under j36/eglprobe below.
+    that took the panel for the rest of the boot every time.  preserve_lk_state has
+    since made that survivable -- see "Giving the panel back" below -- but -o is
+    still the right test for a card that is only asked whether the GPU draws.
 
     j36.gl=debug adds Mesa's own EGL trace and runs the node probes before the
     dashboard starts, so the journal names every /dev/dri node and says which one
@@ -7831,6 +7937,9 @@ Loading these modules is a no-op on screen, and that is by construction:
   - mediatek-drm programs its first display register in atomic commit, which is to
     say when userspace opens card0 and sets a mode.  Until then it has enumerated
     hardware and touched none of it.
+  - j36_fbmem, loaded first in this set, is display MEMORY and not display: it
+    exports the LK carveout as a dma-buf and never ioremaps it, never reads a
+    register and never touches the pipe.  See /dev/j36fb further down.
 
 The panel module is out of tree and small, and it is worth knowing why it exists:
 mtk_dsi calls component_add from inside mtk_dsi_host_attach, and host_attach only
@@ -7841,6 +7950,45 @@ reset, pushed 155 init records and lit the backlight -- and it refuses to probe
 without j36,preserve-lk-state in the tree rather than pretend it can bring a dark
 panel up.  Cold start is not implemented; the device tree keeps the init table,
 the PMIC sequence and the GPIO sequence so that it can be.
+
+Giving the panel back
+---------------------
+
+That empty cold start used to have a price, and it was the largest single fault on
+this board: any program that opened card0 and set a mode spent the display for the
+rest of the boot.  Not because the program did anything wrong -- because closing the
+device is enough.  drm_fb_release() removes a client's framebuffers on close, taking
+one out from under an active CRTC disables the CRTC, and mtk_crtc_atomic_disable()
+then stops OVL, RDMA, COLOR and DSI, disconnects the mmsys routing and drops the
+mutex.  With DRM_FBDEV_EMULATION=n there is no in-kernel client for
+drm_client_dev_restore() to hand the pipe to afterwards, and with no cold start there
+is nothing else that can light the panel.  The screen went black, /dev/fb0 went on
+accepting writes nobody would ever see, and only a reboot fixed it.  The "vblank wait
+timed out on crtc 0" WARN in dmesg was the same event from inside: the 100 ms wait
+that lets disabled planes reach the hardware at the next SOF, on a pipe being torn
+down underneath it.
+
+preserve_lk_state, in linux/0002-drm-mediatek-mt6592.patch and set on this SoC's
+mmsys driver data alone, makes that disable do nothing at all: no plane teardown, no
+vblank wait, no mtk_crtc_ddp_hw_fini().  The DDP, the DSI and the panel stay exactly
+as the bootloader left them, and the next client to arrive gets mtk_crtc_ddp_hw_init()
+over a live pipe -- which is precisely what the FIRST modeset after boot has always
+done, so it is a path that was already load-bearing.
+
+Leaving the pipe up is only half of it.  The same commit that disables the CRTC also
+turns every plane off, and an overlay with no layers scans out an opaque background
+that nothing can paint over.  So mtk_disp_ovl keeps a copy of the programming it
+finds at probe -- taken there because the first modeset's mtk_ovl_config() pulses
+OVL_RST and wipes it -- and mtk_crtc_atomic_flush() writes that copy back, under the
+DDP mutex, once the CRTC has gone inactive.  What comes back on screen is the
+bootloader's own framebuffer at 0x82700000, which is the buffer simplefb, /dev/fb0,
+the dashboard and eglprobe -f have been drawing into all along.  A snapshot is only
+marked usable if the block really was running at probe, so this costs nothing on a
+board that boots its own display.
+
+What that buys: eglprobe -p, -c and -z can be run at any time and the dashboard is
+back when they exit, and a Qt application on eglfs can start and stop as often as it
+likes.  Running the dashboard itself on GL stops being a one-way decision.
 
 Sound, and where it comes out
 -----------------------------
@@ -8167,19 +8315,29 @@ one is an eye.  It speaks DRM with raw ioctls -- the uapi structs are ABI and li
 a fourth library that can be missing -- and prints the connector, the mode it was
 given, the CRTC and whatever framebuffer was already on it.
 
-It is NOT run at boot, it REFUSES to run without -y, and the reason is the same
-one.  A DRM client that sets a mode and exits leaves the panel black: on close the
-kernel runs drm_fb_release() over that client's framebuffers, and removing the
-framebuffer a CRTC is scanning out disables the CRTC.  This kernel is built
-CONFIG_DRM_FBDEV_EMULATION=n on purpose, so there is no in-kernel fbdev client for
-drm_client_dev_restore() to hand the pipe back to.  -p and -c therefore hold the
-panel until the next reboot, and /dev/fb0 keeps accepting writes that are no longer
-seen.  Run -f first, not after.
+It is NOT run at boot and it REFUSES to run without -y, because for the fifteen
+seconds it is up it owns the panel: it sets a mode of its own and whatever was on
+screen -- the dashboard, a video -- is gone until it exits.  That is the whole cost
+now, and it used to be very much more.
 
-This mattered less when mediatek-drm did not bind: -p and -c failed at
-display_node(), harmlessly, which is why the dashboard was once allowed to run -c
-behind a confirmation.  Now they succeed.  `eglprobe -p' on its own prints what it
-would cost and what to run instead; `eglprobe -p -y' runs it.
+A DRM client that sets a mode and exits used to leave the panel black for good.  On
+close the kernel runs drm_fb_release() over that client's framebuffers, and removing
+the framebuffer a CRTC is scanning out disables the CRTC; this kernel is built
+CONFIG_DRM_FBDEV_EMULATION=n on purpose, so there was no in-kernel fbdev client for
+drm_client_dev_restore() to hand the pipe back to, and no cold start anywhere here to
+light the panel again.  -p and -c therefore held the panel until the next reboot,
+and /dev/fb0 kept accepting writes that were no longer seen.
+
+preserve_lk_state in linux/0002-drm-mediatek-mt6592.patch ends that -- the CRTC
+disable leaves the pipe running and the overlay is put back the way the bootloader
+programmed it, so /dev/fb0 is live again the moment the client exits.  See "Giving
+the panel back" above.  Run -f afterwards if you want the numbers back on screen;
+you no longer have to run it first.
+
+The other half of the old warning was that -p and -c failed at display_node() when
+mediatek-drm did not bind, harmlessly, which is why the dashboard was once allowed
+to run -c behind a confirmation.  They succeed now.  `eglprobe -p' on its own prints
+what it would cost and what to run instead; `eglprobe -p -y' runs it.
 
   1  RED, XR24, filled with memset()          modeset + DSI + panel + OVL, no
                                               alpha and no Mesa anywhere
@@ -8227,13 +8385,86 @@ repaints over it and the panel is exactly as it was.
 
 The readback is the price, and -o prints the split -- GL, read, blit -- per run so
 it is visible.  On this board it is the readback and not the drawing that sets the
-frame rate, which is itself the finding: it is the number a zero-copy path would
-have to beat, and the reason the dma-buf exporter for the LK carveout is worth
-building.
+frame rate, which is itself the finding: it is the number a zero-copy path has to
+beat, and the reason /dev/j36fb and -z below exist.
 
 This is what the Diagnostics page's "GPU render test" row runs, and what anything
 that just wants to see whether the GPU draws should run.  `eglprobe -o 20' for
 twenty seconds; `eglprobe -o 20 /dev/dri/card1' to force a particular node.
+
+j36/eglprobe -z, and the same cube with no copies at all
+--------------------------------------------------------
+
+-z is -o with the two middle steps deleted.  It opens /dev/j36fb, asks it for a
+dma-buf over the LK carveout, imports that into EGL as an EGLImage
+(EGL_LINUX_DMA_BUF_EXT), hangs it off an FBO -- as a renderbuffer if the driver
+takes one, otherwise as a texture -- and draws the cube directly into the memory
+the DDP is scanning.  There is no glReadPixels and no fb_store: the frame is on
+the glass because lima wrote it where the display was already looking.
+
+So -z prints one number where -o prints three, and the pair is the measurement:
+
+  offload: 300 frames in 20.0s, 15.0 fps -- gl 8.1 ms, read 41.2 ms, blit 17.9 ms
+  scanout: 900 frames in 20.0s, 45.0 fps -- gl 8.1 ms per frame, and that is the
+           whole cost: no read, no blit
+
+The `gl' figure should be the same in both, because it is the same cube on the
+same GPU.  Everything else was copying.
+
+Two things it deliberately does not do.  It never opens a modesetting node and it
+never programs a display register, so like -o it cannot black the panel -- the
+LK's pipe is still running and this only changes what is in the buffer it reads.
+And it is single-buffered, so it tears: there is one carveout, the display does
+not wait for the draw, and adding a second buffer means a flip, which means owning
+the CRTC.  That is the same bargain /dev/fb0 makes, and every frame this board has
+ever painted has torn the same way.
+
+It needs the EGL_EXT_image_dma_buf_import extension, which it checks for and names
+if it is missing, and it needs /dev/j36fb, which needs j36.mtkdrm=1 in boot.conf.
+`eglprobe -z 20' for twenty seconds; `eglprobe -z 20 /dev/dri/card1' to force a
+node.
+
+/dev/j36fb, the LK framebuffer as a dma-buf
+-------------------------------------------
+
+j36_fbmem.ko is ours and it is fourteen registers short of trivial, because it
+programs nothing: it exports the carveout the LK left at 0x82700000 -- 640x480,
+32 bpp, 2560-byte pitch -- as a dma-buf, and that is the whole driver.  It is the
+first module in j36/mtkdrm/ and it has no dependency on the rest of the set, so
+/dev/j36fb appears even when the DSI chain under it does not bind.
+
+Why a driver at all, when the address is a constant and /dev/mem is right there:
+lima imports dma-bufs, not addresses.  There is no interface that hands EGL a
+physical address, and there is no reason to invent one when dma_buf_export is
+eleven lines.
+
+The one thing worth knowing about the implementation is that the sg_table it
+hands out carries DMA ADDRESSES AND NO PAGES.  The carveout is `no-map' in the
+device tree, and on ARM32 that means memblock never mapped it, pfn_valid() is
+false over it and there are no struct pages to put in an sg_table at all.  So
+j36fb_map_dma_buf builds a one-entry table with sg_dma_address/sg_dma_len set by
+hand and the page pointer left NULL.  That is exactly what lima wants --
+lima_vm.c walks an imported sgt with for_each_sgtable_dma_page and
+sg_page_iter_dma_address, and never asks for a page -- and there is no IOMMU and
+no dma-ranges between the GPU and DRAM, so the bus address is the physical one.
+An importer that does want pages will fail on this buffer, and that is honest.
+
+`no-map' has to stay, incidentally, and not only for this: ARM32's ioremap
+refuses memory that is in the linear map, so dropping no-map would break
+simplefb's own ioremap_wc and take /dev/fb0 with it.
+
+Two device-tree nodes therefore point at one carveout -- simple-framebuffer for
+/dev/fb0 and this for the dma-buf -- which is correct rather than a conflict.
+Neither owns the memory, neither modesets, and the LK's pipe is what makes either
+of them visible.
+
+  cat /sys/class/misc/j36fb/info
+  phys=0x82700000 size=1228800 640x480 stride=2560 bpp=32 fourcc=XR24
+
+The ioctls are in j36_fbmem.c and there are two: J36FB_IOC_INFO fills that same
+geometry into a struct, and J36FB_IOC_EXPORT returns a dma-buf fd.  The character
+device also mmaps, write-combined, for a client that wants the CPU view without
+going through /dev/fb0.
 
 Reading the dashboard's startup trace
 -------------------------------------
@@ -8418,7 +8649,7 @@ GNU General Public License, version 2 only:
                             drm/mediatek for MT6592)
     initrd.img              busybox and a shell /init
     j36/modules/*.ko        lima and its dependencies -- kernel modules
-    j36/mtkdrm/*.ko         mtk_drm, and MixOS's j36_jd9365_panel
+    j36/mtkdrm/*.ko         mtk_drm, and MixOS's j36_jd9365_panel and j36_fbmem
     j36/audio/*.ko          the ALSA core, and MixOS's j36_mt6592_audio
     j36/usb/*.ko            musb and its MediaTek glue, usbhid, udl, the SCSI and
                             mass-storage set, ntfs3, and MixOS's
@@ -8657,7 +8888,9 @@ SD cards.
                        them in the order insmod needs.        j36.lima=1
   j36/mfgpower         static ARMv7 helper that brings the GPU power domain up
                        through the SPM before lima probes.    j36.lima=1
-  j36/mtkdrm           the display set and its own load.order.  j36.mtkdrm=1
+  j36/mtkdrm           the display set and its own load.order.  j36_fbmem loads
+                       first and gives /dev/j36fb, the LK framebuffer as a
+                       dma-buf, whether or not the rest binds.   j36.mtkdrm=1
   j36/audio            the ALSA core and the MT6592 AFE adapter.  j36.audio=1 gets
                        the card and the headphone jack; j36.audio=speaker also
                        powers the class-D amp, which hangs off VBAT and so needs a
@@ -8911,7 +9144,7 @@ fi
                 echo "gl_probe_run=-f 1 from mixdash-probe.service, Type=oneshot RemainAfterExit=yes, so once per boot and NOT once per mixdash start attempt; under j36.gl=debug that unit also runs the node probes and -s with LIBGL_ALWAYS_SOFTWARE=1 as the control, and mixdash replays the log from ExecStopPost. As mixdash's own ExecStartPre these re-ran on all three restarts, which meant three EGL inits on lima and the bars repainted over each attempt's error"
                 echo "gl_probe_fb=-f opens /dev/fb0 and nothing else: it counts the pixels already there (all black = nothing drew, a picture = something took the scanout), undoes a backlight at brightness 0 and a tty0 left in KD_GRAPHICS, then paints eight colour bars with the CPU. Bars then a dashboard = both halves work; bars that stay = mixdash never started; no bars = nothing userspace draws will be seen."
                 echo "gl_probe_nodes=-i names every /dev/dri node and says which one modesets; nothing here hard-codes card0 any more, because on this kernel card0 is lima and GETRESOURCES on it returns EOPNOTSUPP"
-                echo "gl_probe_paint=-p (five CPU and lima frames) and -c (a rotating cube, GLES2 through lima, page-flipped) are NOT run at boot: both modeset, and on close the kernel releases their framebuffer and disables the CRTC, which with CONFIG_DRM_FBDEV_EMULATION=n nothing re-enables -- so either one holds the panel until the next reboot. The 3D cube card starts -c on request, after asking twice."
+                echo "gl_probe_paint=-p (five CPU and lima frames) and -c (a rotating cube, GLES2 through lima, page-flipped) are NOT run at boot: both modeset, so whatever is on screen is theirs until they exit. Either one used to hold the panel until the next reboot -- on close the kernel releases their framebuffer and disables the CRTC, and with CONFIG_DRM_FBDEV_EMULATION=n nothing re-enabled it -- which preserve_lk_state in 0002-drm-mediatek-mt6592.patch ends: the pipe stays up and the OVL is put back the way the LK programmed it, so /dev/fb0 is live again on exit. The Diagnostics GPU row runs -o, which draws the same cube on the same GPU and copies it into /dev/fb0, so it takes no screen from anyone."
             else
                 echo "gl_probe=not staged; j36.gl=debug will report only what Mesa says"
             fi

@@ -3002,7 +3002,27 @@ void InfoPage::refresh()
     if (!usb.isEmpty()) {
         const bool plugged = readTrimmed(usb + "/online") == QLatin1String("1");
         if (!plugged) {
-            add(tr("Charger"), tr("no cable"));
+            /*
+             * OFFLINE IS TWO ANSWERS AND THIS ROW HAS TO SAY WHICH ONE.
+             *
+             * There is one connector on this handheld.  It is the charge port and
+             * it is the host port and it cannot be both, so when the USB PHY
+             * decides the port is a host the board puts its own 5 V on the pins --
+             * and that 5 V lands on the same net the charger detects a supply on.
+             * The PMIC holds the charger off rather than charge the cell from the
+             * cell, and `online' goes to 0 with a cable very much in.
+             *
+             * vbus_sourcing is the pad itself, published by j36_mt6592_pmic for
+             * exactly this row: 1 is "the interlock is what you are looking at",
+             * anything else -- 0, -1, or the file not being there on an older
+             * kernel -- is the plain reading, which is that nothing is plugged in.
+             */
+            const QString sourcing = readTrimmed(usb + "/vbus_sourcing");
+            if (sourcing == QLatin1String("1"))
+                add(tr("Charger"),
+                    tr("held off -- the port is sourcing 5 V for a USB device"));
+            else
+                add(tr("Charger"), tr("no cable"));
         } else {
             const QString mv = milliUnits(usb + "/voltage_now", "mV");
             const QString ma = milliUnits(usb + "/current_max", "mA");

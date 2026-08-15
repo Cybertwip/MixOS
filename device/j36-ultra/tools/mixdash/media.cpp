@@ -22,6 +22,7 @@
 
 #include "joypad.h"
 #include "settings.h"
+#include "shell.h"
 #include "theme.h"
 #include "volume.h"
 
@@ -79,6 +80,15 @@ void endProcess(QProcess *&p)
         if (doomed->processId() > 0)
             ::kill((pid_t)doomed->processId(), SIGCONT);
         doomed->terminate();
+        /*
+         * QProcess's own wait and NOT Shell's, which is the only wait in this
+         * program that is deliberately left blind to the console.  Shell repaints
+         * the window when it has to take the mode back, and one caller of this
+         * function is ~MediaPage -- where painting would run this page's
+         * paintEvent over members that have already been destroyed, for exactly
+         * the reason the destructor gives for not calling stopMusic() either.
+         * It is 400 ms on a child that has just been sent SIGTERM.
+         */
         if (!doomed->waitForFinished(400))
             doomed->kill();
     }
@@ -1006,11 +1016,11 @@ bool MediaPage::ffmpegHasAlsa() const
 
     QProcess p;
     p.start(ffmpegPath(), QStringList() << "-hide_banner" << "-devices");
-    if (!p.waitForStarted(8000))
+    if (!Shell::waitForStarted(p, 8000))
         return false;
-    if (!p.waitForFinished(15000)) {
+    if (!Shell::waitForFinished(p, 15000)) {
         p.kill();
-        p.waitForFinished(500);
+        Shell::waitForFinished(p, 500);
         return false;
     }
 
@@ -1045,14 +1055,14 @@ double MediaPage::probeDuration(const QString &path) const
                              << "-show_entries" << "format=duration"
                              << "-of" << "default=noprint_wrappers=1:nokey=1"
                              << path);
-        if (p.waitForStarted(1500) && p.waitForFinished(4000)) {
+        if (Shell::waitForStarted(p, 1500) && Shell::waitForFinished(p, 4000)) {
             bool ok = false;
             const double d = QString::fromLatin1(p.readAllStandardOutput()).trimmed().toDouble(&ok);
             if (ok && d > 0.0)
                 return d;
         } else {
             p.kill();
-            p.waitForFinished(500);
+            Shell::waitForFinished(p, 500);
         }
     }
 
@@ -1062,9 +1072,9 @@ double MediaPage::probeDuration(const QString &path) const
         return 0.0;
     QProcess p;
     p.start(ffmpegPath(), QStringList() << "-hide_banner" << "-i" << path);
-    if (!p.waitForStarted(1500) || !p.waitForFinished(4000)) {
+    if (!Shell::waitForStarted(p, 1500) || !Shell::waitForFinished(p, 4000)) {
         p.kill();
-        p.waitForFinished(500);
+        Shell::waitForFinished(p, 500);
         return 0.0;
     }
     const QString err = QString::fromLocal8Bit(p.readAllStandardError());
@@ -1109,9 +1119,9 @@ bool MediaPage::probeHasAudio(const QString &path) const
                          << "-show_entries" << "stream=index"
                          << "-of" << "default=noprint_wrappers=1:nokey=1"
                          << path);
-    if (!p.waitForStarted(1500) || !p.waitForFinished(4000)) {
+    if (!Shell::waitForStarted(p, 1500) || !Shell::waitForFinished(p, 4000)) {
         p.kill();
-        p.waitForFinished(500);
+        Shell::waitForFinished(p, 500);
         return true;
     }
     return !QString::fromLatin1(p.readAllStandardOutput()).trimmed().isEmpty();
@@ -1138,9 +1148,9 @@ QString MediaPage::probeTitle(const QString &path) const
                          << "-show_entries" << "format_tags=title,artist"
                          << "-of" << "default=noprint_wrappers=1"
                          << path);
-    if (!p.waitForStarted(1500) || !p.waitForFinished(4000)) {
+    if (!Shell::waitForStarted(p, 1500) || !Shell::waitForFinished(p, 4000)) {
         p.kill();
-        p.waitForFinished(500);
+        Shell::waitForFinished(p, 500);
         return QString();
     }
 

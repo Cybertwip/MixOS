@@ -105,34 +105,56 @@
  * vertices -- and no modesetting node is opened at all, so the readback is the
  * whole of what it gives up and the panel is not part of the price.  See offload().
  *
- * WHAT -p AND -c COST, because it is not obvious and it is not undoable.  A DRM
- * client that sets a mode and then exits leaves the panel black: on close the
- * kernel runs drm_fb_release() over the client's framebuffers, and removing the
- * framebuffer a CRTC is scanning out disables that CRTC.  Nothing turns it back on,
- * because this kernel is built CONFIG_DRM_FBDEV_EMULATION=n on purpose -- there is
- * no in-kernel fbdev client for drm_client_dev_restore() to hand the pipe back to.
- * So -p and -c hold the panel until the next reboot, and /dev/fb0 -- which is
- * simple-framebuffer over the LK's memory, a different path to the same glass --
- * stops being visible even though writes to it still succeed.
+ * With -z it draws the same cube again with those two copies removed, and this is
+ * the one to reach for when the question is "how fast could this board actually
+ * present".  -o's own timings raise it: read and blit are 2.4 MB of memory traffic
+ * per frame, spent only because lima renders into memory nothing is scanning out
+ * of.  -z takes a dma-buf over the LK's framebuffer carveout from /dev/j36fb,
+ * imports it with EGL_EXT_image_dma_buf_import, hangs it off an FBO and renders
+ * into the scanout directly.  It opens no card node, takes no DRM master and sets
+ * no mode, so it is as safe as -o; run the two back to back and the difference
+ * between the numbers is exactly what a zero-copy client would save.  It needs
+ * j36_fbmem loaded -- see device/j36-ultra/linux/j36_fbmem.c, which is also where
+ * the ioctl ABI declared further down is defined.  One buffer, so it tears, the
+ * same way every write to /dev/fb0 tears today.  See scanout().
  *
- * This got worse rather than better the day mediatek-drm started binding: before
- * that, display_node() found nothing and -c failed harmlessly, which is why the
- * dashboard was allowed to run it behind a confirmation.  Now it succeeds, and a
- * confirmation only makes a black screen deliberate.  So -p and -c REFUSE unless
- * -y is also given (see spend_the_panel()), the dashboard's GPU row runs -o, and
- * -f covers everything -p was being used to prove about the panel without spending
- * the panel to prove it.
+ * WHAT -p AND -c COST.  Both modeset, so for as long as either runs the screen is
+ * theirs and whatever was on it -- the dashboard, a video -- is not.  That is the
+ * whole cost now, and it is worth knowing what it used to be, because the shape of
+ * this file is still the shape of that problem.
+ *
+ * A DRM client that set a mode and then exited used to leave the panel black for
+ * good: on close the kernel runs drm_fb_release() over the client's framebuffers,
+ * removing the framebuffer a CRTC is scanning out disables that CRTC, and nothing
+ * turned it back on -- this kernel is built CONFIG_DRM_FBDEV_EMULATION=n on purpose,
+ * so there is no in-kernel fbdev client for drm_client_dev_restore() to hand the
+ * pipe back to, and the panel has no cold-start path here at all.  -p and -c held
+ * the panel until the next reboot, and /dev/fb0 -- simple-framebuffer over the LK's
+ * memory, a different path to the same glass -- stopped being visible even though
+ * writes to it still succeeded.  It got worse rather than better the day
+ * mediatek-drm started binding: before that, display_node() found nothing and -c
+ * failed harmlessly, which is why the dashboard was allowed to run it behind a
+ * confirmation at all.
+ *
+ * preserve_lk_state, in device/j36-ultra/linux/0002-drm-mediatek-mt6592.patch, ends
+ * it: the CRTC disable leaves the pipe running and mtk_crtc_atomic_flush() puts the
+ * overlay back the way the bootloader programmed it, so /dev/fb0 is on the glass
+ * again the moment the client exits.  -p and -c still REFUSE without -y (see
+ * take_the_panel()) because taking the screen away from whatever is using it is
+ * worth one keystroke, and the dashboard's GPU row still runs -o because -o answers
+ * "does the GPU draw" without taking anything.  -f still covers everything -p was
+ * being used to prove about the panel without a DRM node in the way.
  *
  * Usage: eglprobe [-f [seconds] | -i | -s | -o [seconds] [/dev/dri/node] |
- * -p | -c [seconds] | -y | /dev/dri/node ...].  With no arguments it reports
- * /dev/fb0 read-only and then probes the display node and renderD128.  -f runs
- * alone and needs no library.  -y is consent for -p and -c and does nothing on its
- * own.  Exit status: 0 if some API created a context on some display (for -p, if
- * the mode was set; for -c and -o, if a frame was drawn; for -i, if a modesetting
- * node exists at all; for -f, if there was a framebuffer to look at), 1 otherwise
- * -- and 1 for a -p or -c that refused.  Apart from -f's bars, -o's frames, an
- * unblank and a backlight that measured zero, nothing is written anywhere; stdout
- * is the output.
+ * -z [seconds] [/dev/dri/node] | -p | -c [seconds] | -y | /dev/dri/node ...].
+ * With no arguments it reports /dev/fb0 read-only and then probes the display
+ * node and renderD128.  -f runs alone and needs no library.  -y is consent for -p
+ * and -c and does nothing on its own.  Exit status: 0 if some API created a
+ * context on some display (for -p, if the mode was set; for -c, -o and -z, if a
+ * frame was drawn; for -i, if a modesetting node exists at all; for -f, if there
+ * was a framebuffer to look at), 1 otherwise -- and 1 for a -p or -c that refused.
+ * Apart from -f's bars, -o's and -z's frames, an unblank and a backlight that
+ * measured zero, nothing is written anywhere; stdout is the output.
  */
 
 #define _GNU_SOURCE
@@ -1882,16 +1904,17 @@ static int paint(const char *path)
     printf("paint: %d of the 5 phases reached the CRTC without an error.  In "
            "order, the panel should have shown: red, magenta, magenta (or black, "
            "if alpha is blended), magenta, green.\n", ok);
-    /* Not "the console comes back": it does not, and saying so here was wrong.
-     * Dropping master gives up the right to modeset, not the mode.  The CRTC keeps
-     * scanning our last framebuffer, and when this process exits and the kernel
-     * releases that framebuffer the CRTC is disabled instead -- with
-     * CONFIG_DRM_FBDEV_EMULATION=n there is no in-kernel client to restore
-     * anything.  Either way /dev/fb0 is no longer what is on the glass. */
-    printf("paint: the panel belongs to this modeset until the next reboot.  "
-           "Master is dropped, but nothing hands the pipe back to "
-           "simple-framebuffer, so writes to /dev/fb0 still succeed and are no "
-           "longer seen.  Run eglprobe -f before this, not after.\n");
+    /* Not "the console comes back when master is dropped": dropping master gives
+     * up the right to modeset, not the mode, and the CRTC goes on scanning our last
+     * framebuffer until this process exits.  The exit is what returns the panel --
+     * the kernel releases that framebuffer, removing it disables the CRTC, and on
+     * this SoC's preserve_lk_state path that disable leaves the pipe running and
+     * puts the overlay back the way the bootloader programmed it.  Before that
+     * patch the CRTC simply stayed off and this printed a reboot warning. */
+    printf("paint: the panel belongs to this modeset until this process exits, and "
+           "goes back to /dev/fb0 when it does -- releasing the framebuffer disables "
+           "the CRTC, and preserve_lk_state restores the overlay the LK programmed "
+           "instead of tearing the pipe down.  Run eglprobe -f after this to see it.\n");
 
 out:
     drm_ioctl(DRM_IOCTL_DROP_MASTER, NULL);
@@ -1926,7 +1949,7 @@ out:
  */
 
 /* Long enough to see it turn several times, short enough that the dashboard does
- * not look wedged while it holds the panel. */
+ * not look wedged while this has the panel. */
 #define CUBE_SECONDS 20
 #define CUBE_PI 3.14159265358979f
 
@@ -2813,22 +2836,22 @@ static void fb_tty_take(struct fbtarget *t)
     t->ttymode = -1;
     t->ttyfd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
     if (t->ttyfd < 0) {
-        printf("offload: /dev/tty0: %m -- the console cannot be quietened, so "
+        printf("tty: /dev/tty0: %m -- the console cannot be quietened, so "
                "anything it prints will land on top of the frames\n");
         return;
     }
     if (ioctl(t->ttyfd, KDGETMODE, &t->ttymode) < 0) {
-        printf("offload: KDGETMODE: %m\n");
+        printf("tty: KDGETMODE: %m\n");
         t->ttymode = -1;
         return;
     }
     if (t->ttymode == KD_GRAPHICS) {
-        printf("offload: /dev/tty0 is already in KD_GRAPHICS -- something owns "
+        printf("tty: /dev/tty0 is already in KD_GRAPHICS -- something owns "
                "this panel, and it will be given back exactly as found\n");
         return;
     }
     if (ioctl(t->ttyfd, KDSETMODE, KD_GRAPHICS) < 0) {
-        printf("offload: KDSETMODE(KD_GRAPHICS): %m -- the console keeps "
+        printf("tty: KDSETMODE(KD_GRAPHICS): %m -- the console keeps "
                "drawing, so expect text over the cube\n");
         t->ttymode = -1;
     }
@@ -3298,37 +3321,593 @@ out_fb:
 }
 
 /*
- * The two modes that spend the panel say so and stop, unless the caller has
- * already said it knows.  This is not timidity: -p and -c are unrecoverable on
- * this kernel, the cost is a dark screen until the next reboot, and the cost is
- * paid AFTER the useful output has already scrolled past.  A prompt in the
- * dashboard was tried and it was worse -- it turned an accident into a decision
- * without changing the outcome.  -o is the answer for anything that just wants to
- * see the GPU draw; -y is the answer for a bring-up session that genuinely needs
- * a modeset and is willing to reboot afterwards.
+ * ── -z, the same cube with the two copies taken out ──────────────────────────
+ *
+ * -o answers "can this GPU draw".  This answers the question -o's own timings
+ * raise: the read and the blit are 2.4 MB of memory traffic per frame that
+ * exist only because lima renders into memory nothing is scanning out of.  Here
+ * it renders into the memory the display controller is already reading, and the
+ * per-frame cost of presentation becomes zero.
+ *
+ * WHAT MAKES THAT POSSIBLE.  The MVII LK left the display path programmed and
+ * pointed at a carveout at 0x82700000, and Linux never re-programs it -- that
+ * carveout is what the device tree's simple-framebuffer calls /dev/fb0, and the
+ * proof the DDP is still scanning it is that writes to /dev/fb0 appear.  So a
+ * buffer over that carveout is live scanout with no modeset anywhere in the
+ * picture.  j36_fbmem exports it as a dma-buf; this imports that fd as an
+ * EGLImage and hangs it off an FBO.
+ *
+ * WHY THIS TAKES NOTHING.  -p and -c need -y because they SETCRTC, which owns the
+ * whole screen for as long as they run.  This mode opens no card node, takes no DRM
+ * master, and issues no modesetting ioctl of any kind.  The worst it can do is
+ * leave a half-drawn cube on the screen, which the next thing to paint /dev/fb0
+ * overwrites.
+ *
+ * WHAT THE RESULT MEANS.  If the cube turns here and the timing shows only a
+ * `gl' figure, then zero-copy presentation works on this board, and both of the
+ * things that look slow -- the dashboard's software compositing and the media
+ * player's 1.2 MB-per-frame pipe into a QImage -- are copies that a client can
+ * stop making.  If the import fails, the message says which step refused, and
+ * that is the finding.
+ *
+ * ONE BUFFER, SO IT TEARS.  There is no second frame to flip to and no flip to
+ * do it with; the GPU is drawing into memory the panel is reading.  That is
+ * exactly as true of every write to /dev/fb0 today, so this is parity and not a
+ * regression -- but it is worth knowing before anybody reads a fps number here
+ * as a promise about a double-buffered dashboard.
  */
-static int spend_the_panel(const char *flag, int consent)
+
+/*
+ * /dev/j36fb's ABI, declared by hand the way EGL, GBM and the DRM uapi are
+ * declared by hand at the top of this file, so that this needs no headers
+ * beyond libc.  device/j36-ultra/linux/j36_fbmem.c is the authority; if these
+ * numbers ever disagree with that file, that file is right.
+ *
+ * The direction bits are the kernel's: 2 is _IOC_READ, 3 is read|write.
+ */
+#define J36FB_IOC(dir, nr, sz) (((unsigned)(dir) << 30) | ('j' << 8) | \
+                                (unsigned)(nr) | ((unsigned)(sz) << 16))
+
+struct j36fb_info {
+    uint64_t phys;
+    uint64_t size;
+    uint32_t width, height, stride, bpp, fourcc, reserved;
+};
+
+struct j36fb_export {
+    uint32_t flags;
+    int32_t  fd;
+};
+
+#define J36FB_IOC_INFO   J36FB_IOC(2u, 1u, sizeof(struct j36fb_info))
+#define J36FB_IOC_EXPORT J36FB_IOC(3u, 2u, sizeof(struct j36fb_export))
+
+/* EGL_KHR_image_base and EGL_EXT_image_dma_buf_import. */
+typedef void *EGLImageKHR;
+typedef void *EGLClientBuffer;
+
+#define EGL_NO_CONTEXT                ((EGLContext)0)
+#define EGL_NO_IMAGE_KHR              ((EGLImageKHR)0)
+#define EGL_EXTENSIONS                0x3055
+#define EGL_HEIGHT                    0x3056
+#define EGL_WIDTH                     0x3057
+#define EGL_LINUX_DMA_BUF_EXT         0x3270
+#define EGL_LINUX_DRM_FOURCC_EXT      0x3271
+#define EGL_DMA_BUF_PLANE0_FD_EXT     0x3272
+#define EGL_DMA_BUF_PLANE0_OFFSET_EXT 0x3273
+#define EGL_DMA_BUF_PLANE0_PITCH_EXT  0x3274
+
+#define GL_TEXTURE_2D              0x0DE1
+#define GL_TEXTURE_MAG_FILTER      0x2800
+#define GL_TEXTURE_MIN_FILTER      0x2801
+#define GL_TEXTURE_WRAP_S          0x2802
+#define GL_TEXTURE_WRAP_T          0x2803
+#define GL_NEAREST                 0x2600
+#define GL_CLAMP_TO_EDGE           0x812F
+
+static EGLImageKHR (*p_eglCreateImageKHR)(EGLDisplay, EGLContext, EGLenum,
+                                          EGLClientBuffer, const EGLint *);
+static EGLBoolean (*p_eglDestroyImageKHR)(EGLDisplay, EGLImageKHR);
+static void (*p_glEGLImageTargetRenderbufferStorageOES)(unsigned int, void *);
+static void (*p_glEGLImageTargetTexture2DOES)(unsigned int, void *);
+static void (*p_glGenTextures)(int, unsigned int *);
+static void (*p_glBindTexture)(unsigned int, unsigned int);
+static void (*p_glDeleteTextures)(int, const unsigned int *);
+static void (*p_glTexParameteri)(unsigned int, unsigned int, int);
+static void (*p_glFramebufferTexture2D)(unsigned int, unsigned int, unsigned int,
+                                        unsigned int, int);
+
+/*
+ * The two image entry points are required and the texture ones are not: the
+ * renderbuffer path is the direct one, and the texture path is only the
+ * fallback for a driver that will take an EGLImage as a texture but not as a
+ * renderbuffer.  A GLES2 with neither cannot do this at all, and that is worth
+ * saying rather than crashing on a NULL.
+ */
+static int load_scanout(void)
+{
+    *(void **)(&p_eglCreateImageKHR) = p_eglGetProcAddress("eglCreateImageKHR");
+    *(void **)(&p_eglDestroyImageKHR) = p_eglGetProcAddress("eglDestroyImageKHR");
+    if (!p_eglCreateImageKHR || !p_eglDestroyImageKHR) {
+        printf("scanout: this EGL has no eglCreateImageKHR/eglDestroyImageKHR, "
+               "so a dma-buf cannot become anything GL can draw into\n");
+        return 0;
+    }
+
+    *(void **)(&p_glEGLImageTargetRenderbufferStorageOES) =
+        glsym("glEGLImageTargetRenderbufferStorageOES");
+    *(void **)(&p_glEGLImageTargetTexture2DOES) =
+        glsym("glEGLImageTargetTexture2DOES");
+    if (!p_glEGLImageTargetRenderbufferStorageOES &&
+        !p_glEGLImageTargetTexture2DOES) {
+        printf("scanout: this GLES2 has neither glEGLImageTargetRenderbuffer"
+               "StorageOES nor glEGLImageTargetTexture2DOES, so GL_OES_EGL_image "
+               "is missing and there is no way to attach the imported buffer\n");
+        return 0;
+    }
+
+    *(void **)(&p_glGenTextures) = glsym("glGenTextures");
+    *(void **)(&p_glBindTexture) = glsym("glBindTexture");
+    *(void **)(&p_glDeleteTextures) = glsym("glDeleteTextures");
+    *(void **)(&p_glTexParameteri) = glsym("glTexParameteri");
+    *(void **)(&p_glFramebufferTexture2D) = glsym("glFramebufferTexture2D");
+    return 1;
+}
+
+static int scanout(const char *path, int seconds)
+{
+    EGLint attr[] = {
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_NONE
+    };
+    EGLint cattr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    EGLint iattr[16];
+    struct j36fb_info info;
+    struct j36fb_export req;
+    struct fbtarget tty;
+    EGLDisplay dpy = NULL;
+    EGLConfig pick[64], cfg;
+    EGLContext ctx = NULL;
+    EGLImageKHR img = EGL_NO_IMAGE_KHR;
+    struct gbm_device *gbm = NULL;
+    const unsigned char *s;
+    const char *exts, *attached = "nothing";
+    unsigned int fbo = 0, colour = 0, depth = 0, tex = 0, prog = 0, vs, fs, st = 0;
+    int a_pos, a_col, u_mvp, fbfd = -1, unblank = -1, fd = -1, dmafd = -1;
+    int rc = 1, have_depth = 0;
+    EGLint n = 0;
+    long frames = 0;
+    double t0, t, mark, gl_s = 0.0;
+    float proj[16];
+
+    printf("== %s, rotating cube straight into the scanout for %ds, "
+           "no readback, no blit, no modeset\n", path, seconds);
+
+    /* /dev/j36fb first: with no exporter there is no mode, and saying so before
+     * anything opens a GPU keeps the message about the missing piece. */
+    fbfd = open("/dev/j36fb", O_RDWR | O_CLOEXEC);
+    if (fbfd < 0) {
+        printf("scanout: /dev/j36fb: %m -- j36_fbmem is not loaded, or the "
+               "device tree has no j36,lk-framebuffer node.  Without it nothing "
+               "can name the memory the display is scanning out of.\n");
+        return 1;
+    }
+
+    memset(&info, 0, sizeof(info));
+    if (ioctl(fbfd, J36FB_IOC_INFO, &info) < 0) {
+        printf("scanout: J36FB_IOC_INFO: %m -- the driver behind /dev/j36fb is "
+               "not the one this was built against\n");
+        goto out_fbfd;
+    }
+    printf("scanout: the LK framebuffer is at 0x%08llx, %llu bytes, %ux%u "
+           "stride %u, %u bpp, fourcc %c%c%c%c\n",
+           (unsigned long long)info.phys, (unsigned long long)info.size,
+           info.width, info.height, info.stride, info.bpp,
+           (char)(info.fourcc & 0xff), (char)((info.fourcc >> 8) & 0xff),
+           (char)((info.fourcc >> 16) & 0xff), (char)((info.fourcc >> 24) & 0xff));
+    if (!info.width || !info.height || !info.stride) {
+        printf("scanout: that geometry cannot be right, so nothing is drawn\n");
+        goto out_fbfd;
+    }
+
+    memset(&req, 0, sizeof(req));
+    req.flags = O_CLOEXEC;
+    if (ioctl(fbfd, J36FB_IOC_EXPORT, &req) < 0) {
+        printf("scanout: J36FB_IOC_EXPORT: %m\n");
+        goto out_fbfd;
+    }
+    dmafd = req.fd;
+
+    /* Not mapped and not written -- opened only so the panel can be unblanked,
+     * because a blanked panel shows nothing and would be blamed on the import.
+     * Held for the run rather than closed straight away so that nothing happens
+     * on a close in the middle of the frames. */
+    unblank = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+    if (unblank >= 0)
+        (void)ioctl(unblank, FBIOBLANK, FB_BLANK_UNBLANK);
+
+    /* Same reasoning as -o: fbcon drawing into this very carveout while we draw
+     * into it is the problem, not the cure. */
+    memset(&tty, 0, sizeof(tty));
+    tty.fd = -1;
+    tty.ttyfd = -1;
+    tty.ttymode = -1;
+    fb_tty_take(&tty);
+
+    fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        printf("scanout: %s: %m -- lima is not loaded, or j36.lima=0, or "
+               "mfgpower refused to power the MFG domain\n", path);
+        goto out_tty;
+    }
+
+    gbm = p_gbm_create_device(fd);
+    if (gbm) {
+        if (p_eglGetPlatformDisplayEXT)
+            dpy = p_eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR, gbm, NULL);
+        if (!dpy && p_eglGetPlatformDisplay)
+            dpy = p_eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm, NULL);
+        if (!dpy)
+            dpy = p_eglGetDisplay(gbm);
+    }
+    if (!dpy) {
+        if (p_eglGetPlatformDisplayEXT)
+            dpy = p_eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, NULL, NULL);
+        if (!dpy && p_eglGetPlatformDisplay)
+            dpy = p_eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, NULL, NULL);
+        if (dpy)
+            printf("scanout: on the surfaceless platform, so the driver below is "
+                   "whatever Mesa picked -- check the renderer string\n");
+    }
+    if (!dpy || !p_eglInitialize(dpy, NULL, NULL)) {
+        printf("scanout: no EGL display on %s\n", path);
+        goto out_gbm;
+    }
+
+    eglclear();
+
+    /*
+     * Asked for by name rather than assumed, because the failure it prevents is
+     * the confusing one: without this extension eglCreateImageKHR returns
+     * EGL_NO_IMAGE with EGL_BAD_PARAMETER, which reads as "the attributes are
+     * wrong" and sends the reader off checking fourccs and strides.
+     */
+    exts = p_eglQueryString(dpy, EGL_EXTENSIONS);
+    if (!exts || !strstr(exts, "EGL_EXT_image_dma_buf_import")) {
+        printf("scanout: this EGL does not advertise EGL_EXT_image_dma_buf_import"
+               " -- Mesa builds it in for every gallium driver, so its absence "
+               "means the EGL that got loaded is not the payload's\n");
+        goto out_dpy;
+    }
+
+    if (!p_eglBindAPI(EGL_OPENGL_ES_API)) {
+        printf("scanout: eglBindAPI(ES): 0x%04x\n", p_eglGetError());
+        goto out_dpy;
+    }
+    if (!p_eglChooseConfig(dpy, attr, pick, 64, &n) || n == 0) {
+        printf("scanout: no ES2-renderable config at all on this display\n");
+        goto out_dpy;
+    }
+    cfg = pick[0];
+
+    ctx = p_eglCreateContext(dpy, cfg, NULL, cattr);
+    if (!ctx || !p_eglMakeCurrent(dpy, NULL, NULL, ctx)) {
+        int e = p_eglGetError();
+        printf("scanout: no current surfaceless ES2 context: 0x%04x %s\n",
+               e, eglerr(e));
+        goto out_ctx;
+    }
+
+    if (!load_gles() || !load_gles_fbo() || !load_scanout())
+        goto out_current;
+
+    s = p_glGetString(GL_RENDERER);
+    printf("scanout: renderer \"%s\"\n", s ? (const char *)s : "NULL");
+
+    /*
+     * EGL_NO_CONTEXT, because a dma_buf image belongs to the display and not to
+     * any one context -- passing a context here is the EGL_BAD_PARAMETER that
+     * catches everybody once.  One plane, offset zero: this is a single linear
+     * buffer and there is nothing else in it.  No modifier attributes either,
+     * which leaves the image implicitly linear, which is what the DDP is
+     * scanning and the only thing it can scan.
+     */
+    n = 0;
+    iattr[n++] = EGL_WIDTH;                    iattr[n++] = (EGLint)info.width;
+    iattr[n++] = EGL_HEIGHT;                   iattr[n++] = (EGLint)info.height;
+    iattr[n++] = EGL_LINUX_DRM_FOURCC_EXT;     iattr[n++] = (EGLint)info.fourcc;
+    iattr[n++] = EGL_DMA_BUF_PLANE0_FD_EXT;    iattr[n++] = dmafd;
+    iattr[n++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT; iattr[n++] = 0;
+    iattr[n++] = EGL_DMA_BUF_PLANE0_PITCH_EXT; iattr[n++] = (EGLint)info.stride;
+    iattr[n++] = EGL_NONE;
+
+    img = p_eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL,
+                              iattr);
+    if (img == EGL_NO_IMAGE_KHR) {
+        int e = p_eglGetError();
+        printf("scanout: eglCreateImageKHR over the dma-buf: 0x%04x %s -- the "
+               "import is what failed, before any GL was asked for.  A stride "
+               "this driver will not take, or a fourcc it does not render to, "
+               "are the two usual answers.\n", e, eglerr(e));
+        goto out_current;
+    }
+
+    p_glGenFramebuffers(1, &fbo);
+    p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+
+    /*
+     * Renderbuffer first, texture second.  Both are GL_OES_EGL_image and both
+     * end up as the same colour attachment; the renderbuffer is the one that
+     * says "this is a render target and nothing else", so it is the one to ask
+     * for, and a driver that only implements the texture entry point still
+     * works through the second path.
+     */
+    if (p_glEGLImageTargetRenderbufferStorageOES) {
+        (void)p_glGetError();
+        p_glGenRenderbuffers(1, &colour);
+        p_glBindRenderbuffer(GL_RENDERBUFFER, colour);
+        p_glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER, img);
+        if (p_glGetError() == GL_NO_ERROR) {
+            p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                        GL_RENDERBUFFER, colour);
+            attached = "renderbuffer";
+        } else {
+            p_glDeleteRenderbuffers(1, &colour);
+            colour = 0;
+        }
+    }
+    if (!colour && p_glEGLImageTargetTexture2DOES && p_glGenTextures &&
+        p_glBindTexture && p_glTexParameteri && p_glFramebufferTexture2D) {
+        (void)p_glGetError();
+        p_glGenTextures(1, &tex);
+        p_glBindTexture(GL_TEXTURE_2D, tex);
+        p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        p_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img);
+        if (p_glGetError() == GL_NO_ERROR) {
+            p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                     GL_TEXTURE_2D, tex, 0);
+            attached = "texture";
+        } else {
+            p_glDeleteTextures(1, &tex);
+            tex = 0;
+        }
+    }
+    if (!colour && !tex) {
+        printf("scanout: the image imported but neither a renderbuffer nor a "
+               "texture would take it, so this driver will not render into an "
+               "imported linear buffer\n");
+        goto out_image;
+    }
+
+    p_glGenRenderbuffers(1, &depth);
+    p_glBindRenderbuffer(GL_RENDERBUFFER, depth);
+    p_glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16,
+                            (int)info.width, (int)info.height);
+    if (p_glGetError() == GL_NO_ERROR) {
+        p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                    GL_RENDERBUFFER, depth);
+        have_depth = 1;
+    }
+
+    st = p_glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (st != GL_FRAMEBUFFER_COMPLETE && have_depth) {
+        p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                    GL_RENDERBUFFER, 0);
+        have_depth = 0;
+        st = p_glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    }
+    if (st != GL_FRAMEBUFFER_COMPLETE) {
+        printf("scanout: the FBO over the scanout is %s (0x%04x)\n",
+               fbo_status(st), st);
+        goto out_image;
+    }
+    printf("scanout: %ux%u FBO, colour is the LK carveout as a %s, depth %s\n",
+           info.width, info.height, attached, have_depth ? "16-bit" : "none");
+
+    vs = compile_shader(GL_VERTEX_SHADER, CUBE_VS, "vertex");
+    fs = vs ? compile_shader(GL_FRAGMENT_SHADER, CUBE_FS, "fragment") : 0;
+    if (!vs || !fs)
+        goto out_image;
+
+    prog = p_glCreateProgram();
+    if (prog) {
+        int ok = 0, len = 0;
+        char log[512];
+        p_glAttachShader(prog, vs);
+        p_glAttachShader(prog, fs);
+        p_glLinkProgram(prog);
+        p_glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            log[0] = '\0';
+            p_glGetProgramInfoLog(prog, (int)sizeof(log), &len, log);
+            log[sizeof(log) - 1] = '\0';
+            printf("scanout: the program did not link: %s\n",
+                   log[0] ? log : "(the driver returned no log)");
+            prog = 0;
+        }
+    }
+    if (!prog) {
+        printf("scanout: no program, so there is nothing to draw with\n");
+        goto out_image;
+    }
+
+    a_pos = p_glGetAttribLocation(prog, "a_pos");
+    a_col = p_glGetAttribLocation(prog, "a_col");
+    u_mvp = p_glGetUniformLocation(prog, "u_mvp");
+    if (a_pos < 0 || a_col < 0 || u_mvp < 0) {
+        printf("scanout: the linked program has no a_pos/a_col/u_mvp (%d/%d/%d)\n",
+               a_pos, a_col, u_mvp);
+        goto out_image;
+    }
+
+    build_cube();
+    m_perspective(proj, 45.0f,
+                  (float)info.width / (float)info.height, 0.1f, 20.0f);
+
+    /*
+     * THE FLIP THAT -o DID IN THE COPY.  GL's origin is the lower-left corner
+     * and the scanout's row 0 is the top, and fb_store() over in -o reconciles
+     * them by walking its rows backwards.  There is no copy here to do that in,
+     * so the flip moves into the projection: negating row 1 of the matrix --
+     * elements 1, 5, 9 and 13, this being column-major -- mirrors clip space in
+     * y, and the GPU rasterises the cube the right way up directly into memory.
+     * Winding is unaffected because glCullFace is looking at a mirrored viewport
+     * as well; a cube that comes out inside-out here is a sign this negation was
+     * applied twice.
+     */
+    proj[1] = -proj[1];
+    proj[5] = -proj[5];
+    proj[9] = -proj[9];
+    proj[13] = -proj[13];
+
+    p_glViewport(0, 0, (int)info.width, (int)info.height);
+    if (have_depth) {
+        p_glEnable(GL_DEPTH_TEST);
+        p_glDepthFunc(GL_LESS);
+    }
+    p_glEnable(GL_CULL_FACE);
+    p_glUseProgram(prog);
+    p_glVertexAttribPointer((unsigned int)a_pos, 3, GL_FLOAT, 0,
+                            6 * (int)sizeof(float), cube_verts);
+    p_glVertexAttribPointer((unsigned int)a_col, 3, GL_FLOAT, 0,
+                            6 * (int)sizeof(float), cube_verts + 3);
+    p_glEnableVertexAttribArray((unsigned int)a_pos);
+    p_glEnableVertexAttribArray((unsigned int)a_col);
+
+    quit_open();
+    t0 = mark = now_s();
+    for (;;) {
+        float mv[16], rx[16], ry[16], tr[16], tmp[16], mvp[16];
+        double a;
+
+        t = now_s();
+        if (t - t0 >= (double)seconds || quit_pressed())
+            break;
+
+        m_rot_x(rx, (float)(t - t0) * 0.9f);
+        m_rot_y(ry, (float)(t - t0) * 1.3f);
+        m_translate(tr, 0.0f, 0.0f, -6.0f);
+        m_mul(tmp, ry, rx);
+        m_mul(mv, tr, tmp);
+        m_mul(mvp, proj, mv);
+
+        p_glClearColor(0.04f, 0.05f, 0.09f, 1.0f);
+        p_glClear(GL_COLOR_BUFFER_BIT | (have_depth ? GL_DEPTH_BUFFER_BIT : 0u));
+        p_glUniformMatrix4fv(u_mvp, 1, 0, mvp);
+        p_glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        /*
+         * glFinish and not eglSwapBuffers, because there is no surface and
+         * nothing to swap -- the frame is finished when lima's writeback has
+         * landed in the carveout, and from that instant the DDP is scanning it.
+         * Without the finish the timing below would measure command submission
+         * rather than rendering, and the whole point of this mode is the number.
+         */
+        if (p_glFinish)
+            p_glFinish();
+        a = now_s();
+
+        gl_s += a - t;
+        frames++;
+
+        if (a - mark >= 5.0) {
+            printf("scanout: %ld frames, %.1f fps\n", frames,
+                   (double)frames / (a - t0));
+            mark = a;
+        }
+    }
+    quit_close();
+
+    t = now_s();
+    printf("scanout: %ld frames in %.1fs, %.1f fps -- gl %.1f ms per frame, "
+           "and that is the whole cost: no read, no blit\n",
+           frames, t - t0, t > t0 ? (double)frames / (t - t0) : 0.0,
+           gl_s * 1000.0 / (double)(frames ? frames : 1));
+    if (frames == 0) {
+        printf("scanout: nothing was drawn, so the messages above are the "
+               "finding\n");
+    } else {
+        printf("scanout: compare this against `eglprobe -o' on the same board. "
+               "The gl figure should match; everything -o spends beyond it is "
+               "the two copies this mode does not make.\n");
+        rc = 0;
+    }
+
+out_image:
+    if (fbo) {
+        p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        p_glDeleteFramebuffers(1, &fbo);
+    }
+    if (colour)
+        p_glDeleteRenderbuffers(1, &colour);
+    if (tex && p_glDeleteTextures)
+        p_glDeleteTextures(1, &tex);
+    if (depth)
+        p_glDeleteRenderbuffers(1, &depth);
+    if (img != EGL_NO_IMAGE_KHR)
+        p_eglDestroyImageKHR(dpy, img);
+out_current:
+    p_eglMakeCurrent(dpy, NULL, NULL, NULL);
+out_ctx:
+    if (ctx)
+        p_eglDestroyContext(dpy, ctx);
+out_dpy:
+    p_eglTerminate(dpy);
+out_gbm:
+    if (gbm)
+        p_gbm_device_destroy(gbm);
+    if (fd >= 0)
+        close(fd);
+out_tty:
+    fb_tty_give_back(&tty);
+    if (unblank >= 0)
+        close(unblank);
+    close(dmafd);
+out_fbfd:
+    close(fbfd);
+    return rc;
+}
+
+/*
+ * The two modes that take the panel say so and stop, unless the caller has already
+ * said it knows.  The cost is no longer what it was -- preserve_lk_state gives the
+ * panel back when the client exits, where -p and -c used to be unrecoverable and
+ * cost a dark screen until the next reboot -- but they still take the screen away
+ * from whatever is using it, for fifteen or twenty seconds, and they take it AFTER
+ * the useful output has already scrolled past.  One keystroke is a fair price for
+ * that.  -o is the answer for anything that just wants to see the GPU draw, and -y
+ * is the answer for a bring-up session that genuinely needs a modeset.
+ */
+static int take_the_panel(const char *flag, int consent)
 {
     if (consent)
         return 1;
 
-    printf("%s wants the CRTC, and this kernel cannot give it back.  Setting a "
-           "mode and then exiting leaves the panel dark until the next reboot: on "
-           "close the kernel removes this process's framebuffers, removing the "
-           "framebuffer a CRTC is scanning out disables that CRTC, and there is no "
-           "in-kernel fbdev client here to restore it (CONFIG_DRM_FBDEV_EMULATION=n). "
-           "/dev/fb0 keeps accepting writes that nobody can see.\n", flag);
+    printf("%s takes the CRTC and the whole screen for as long as it runs: it sets "
+           "a mode of its own, so the dashboard or whatever else is on the panel is "
+           "gone until it exits.  It comes back afterwards -- releasing the "
+           "framebuffer disables the CRTC, and preserve_lk_state restores the "
+           "overlay the bootloader programmed rather than tearing the pipe down, so "
+           "/dev/fb0 is on the glass again.  That was NOT true before that patch, "
+           "when this cost the display until the next reboot.\n", flag);
     printf("  eglprobe -o 20   the same cube on the same GPU, copied into "
            "/dev/fb0, no modeset -- this is almost certainly what you want\n");
+    printf("  eglprobe -z 20   the same cube again, rendered straight into the "
+           "scanout through /dev/j36fb, no copies and still no modeset\n");
     printf("  eglprobe -f      colour bars into /dev/fb0, no DRM node opened at "
            "all, tells a dark panel apart from an unpainted one\n");
-    printf("  eglprobe %s -y   run it anyway, and reboot when it is done\n", flag);
+    printf("  eglprobe %s -y   run it anyway\n", flag);
     return 0;
 }
 
 int main(int argc, char **argv)
 {
     int wins = 0, painted = -1, cubed = -1, listed = -1, offloaded = -1, i;
+    int scanned = -1;
     const char *node;
     int fb_secs = 3;
     int consent = 0;
@@ -3376,7 +3955,7 @@ int main(int argc, char **argv)
             } else if (!strcmp(argv[i], "-p")) {
                 /* No node that modesets is not a reason to fall back to card0 -- that
                  * is precisely the assumption that made -p meaningless before. */
-                if (!spend_the_panel("-p", consent)) {
+                if (!take_the_panel("-p", consent)) {
                     painted = 1;
                     continue;
                 }
@@ -3388,7 +3967,7 @@ int main(int argc, char **argv)
                 int secs = CUBE_SECONDS;
                 if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
                     secs = atoi(argv[++i]);
-                if (!spend_the_panel("-c", consent)) {
+                if (!take_the_panel("-c", consent)) {
                     cubed = 1;
                     continue;
                 }
@@ -3405,6 +3984,16 @@ int main(int argc, char **argv)
                 else if (i + 1 < argc && !strncmp(argv[i + 1], "/dev/", 5))
                     dev = argv[++i];
                 offloaded = offload(dev, secs > 0 ? secs : CUBE_SECONDS);
+            } else if (!strcmp(argv[i], "-z")) {
+                /* Same two optional arguments as -o, and no -y: this mode never
+                 * asks for a CRTC, so there is nothing for it to spend. */
+                int secs = CUBE_SECONDS;
+                const char *dev = "/dev/dri/renderD128";
+                if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+                    secs = atoi(argv[++i]);
+                else if (i + 1 < argc && !strncmp(argv[i + 1], "/dev/", 5))
+                    dev = argv[++i];
+                scanned = scanout(dev, secs > 0 ? secs : CUBE_SECONDS);
             } else {
                 wins += probe(argv[i], strstr(argv[i], "/card") != NULL);
             }
@@ -3418,8 +4007,10 @@ int main(int argc, char **argv)
         wins += probe("/dev/dri/renderD128", 0);
     }
 
-    if (painted >= 0 || cubed >= 0 || listed >= 0 || offloaded >= 0)
-        return (painted > 0 || cubed > 0 || listed > 0 || offloaded > 0) ? 1 : 0;
+    if (painted >= 0 || cubed >= 0 || listed >= 0 || offloaded >= 0 ||
+        scanned >= 0)
+        return (painted > 0 || cubed > 0 || listed > 0 || offloaded > 0 ||
+                scanned > 0) ? 1 : 0;
 
     printf("eglprobe: %s\n", wins ? "a context came up, see which API above"
                                   : "no API created a context on any node");

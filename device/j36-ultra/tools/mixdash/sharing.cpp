@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "joypad.h"
+#include "shell.h"
 #include "theme.h"
 #include "widgets.h"
 
@@ -107,6 +108,14 @@ QString smbpasswdPath()
  * timeout returns empty, and every caller reads empty as "no" -- so a wedged
  * systemd shows up as a share that will not switch on rather than as a dashboard
  * that stops painting.
+ *
+ * AND THE WAITS ARE Shell'S, WHICH ON THIS PAGE IS NOT A DETAIL.  Starting a unit
+ * is what makes systemd reset the console it logs to, and this function is the
+ * only thing in the program that asks systemd to start one -- so the fifteen
+ * seconds spent inside `systemctl start smbd' were both the likeliest moment for
+ * the panel to be taken and the one stretch in which nothing here could notice.
+ * That was "changing the sharing settings puts the console back on the glass".
+ * shell.h has the mechanism; console.h has the reason there is one.
  */
 QString SharingPage::systemctl(const QStringList &args, int timeoutMs)
 {
@@ -116,11 +125,11 @@ QString SharingPage::systemctl(const QStringList &args, int timeoutMs)
     QProcess p;
     p.setProcessChannelMode(QProcess::MergedChannels);
     p.start(systemctlPath(), args);
-    if (!p.waitForStarted(1000))
+    if (!Shell::waitForStarted(p, 1000))
         return QString();
-    if (!p.waitForFinished(timeoutMs)) {
+    if (!Shell::waitForFinished(p, timeoutMs)) {
         p.kill();
-        p.waitForFinished(500);
+        Shell::waitForFinished(p, 500);
         return QString();
     }
     return QString::fromUtf8(p.readAll()).trimmed();
@@ -280,15 +289,15 @@ QString SharingPage::applyPassword(const QString &password)
     p.start(smbpasswdPath(),
             QStringList() << QStringLiteral("-a") << QStringLiteral("-s")
                           << QString::fromLatin1(kUser));
-    if (!p.waitForStarted(2000))
+    if (!Shell::waitForStarted(p, 2000))
         return tr("smbpasswd would not start");
 
     const QByteArray twice = (password + "\n" + password + "\n").toUtf8();
     p.write(twice);
     p.closeWriteChannel();
-    if (!p.waitForFinished(8000)) {
+    if (!Shell::waitForFinished(p, 8000)) {
         p.kill();
-        p.waitForFinished(500);
+        Shell::waitForFinished(p, 500);
         return tr("smbpasswd did not finish");
     }
     if (p.exitCode() != 0)

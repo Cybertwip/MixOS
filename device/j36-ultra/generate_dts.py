@@ -1679,6 +1679,37 @@ def generate(sources: dict[str, str]) -> str:
 \t\tstatus = \"okay\";
 \t}};
 
+\t/*
+\t * The same carveout again, and not a duplicate of the node above. That
+\t * one is simple-framebuffer, which gives Linux a /dev/fb0 and nothing
+\t * else -- fbdev has no way to say \"here is this buffer as something a
+\t * GPU can render into\". This one binds j36_fbmem, which exports it as a
+\t * dma-buf, which is the only form Mesa will take a buffer in.
+\t *
+\t * Both are correct at once because neither owns the memory: the MVII LK
+\t * programmed OVL0 at this address before the kernel started and nothing
+\t * in Linux re-programs the display path, so the DDP is scanning out of
+\t * here continuously. simplefb writes it from the CPU, j36_fbmem lets the
+\t * GPU write it directly, and the pixels land on the panel either way with
+\t * no modeset -- which on this board is the difference between drawing to
+\t * the screen and taking the screen away from whatever else is using it.
+\t *
+\t * The geometry is repeated rather than inherited because the two drivers
+\t * read it independently and a phandle to the reserved region carries the
+\t * address and the size, not the layout. The values come from the same
+\t * three constants in mvii-board/mt6592_board_j36.h, so they cannot drift
+\t * apart here.
+\t */
+\tj36_fbmem: framebuffer-dmabuf {{
+\t\tcompatible = \"j36,lk-framebuffer\";
+\t\tmemory-region = <&lk_framebuffer>;
+\t\twidth = <{width}>;
+\t\theight = <{height}>;
+\t\tstride = <{fb_pitch}>;
+\t\tformat = \"x8r8g8b8\";
+\t\tstatus = \"okay\";
+\t}};
+
 \tj36_input: gamepad-input {{
 \t\tcompatible = \"j36,j36-ultra-input\";
 \t\tj36,gpio-controller = <&gpio>;
