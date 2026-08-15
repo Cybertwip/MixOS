@@ -491,8 +491,14 @@
 #define J36_PHY_SETTLE_US		800
 
 /* And how long a ROLE change is given on top of it, in milliseconds, before
- * anything is allowed to put a session edge on DEVCTL. See j36_phy_force_host(). */
-#define J36_PHY_ROLE_SETTLE_MS		20
+ * anything is allowed to put a session edge on DEVCTL. See j36_phy_force_host().
+ *
+ * Fifty and not a smaller round number because fifty is the gap the one boot
+ * that latched A-device actually had -- decide_role()'s VBUS rise time, which
+ * happened to sit between the role write and the session edge -- and every boot
+ * that latched B-device had the 800 us above and nothing else. This is not a
+ * timing margin picked for comfort; it is the measurement. */
+#define J36_PHY_ROLE_SETTLE_MS		50
 
 /* How long the port is given to fall after DRVVBUS is dropped, before DEVCTL's
  * VBUS field is read to find out whether anything ELSE is holding it up. It is

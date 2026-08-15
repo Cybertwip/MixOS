@@ -207,10 +207,26 @@ static int j36_wlan_frame(struct j36_wifi *w, const u8 *frame, u32 frame_len,
 	const u32 packet_size = J36_HIF_DATA_HEADER_SIZE + frame_len;
 	const u32 transfer = ALIGN(packet_size, 4);
 	const u8 record = sta_index;
+	/*
+	 * TC5 IS NOT REACHABLE FROM HERE, and the omission is the point.
+	 *
+	 * qmEnqueueTxPackets' TC5 arm is an ACCESS POINT's: it is where a device
+	 * with several peers puts the frames it has to repeat to all of them, and
+	 * it is paired with a BMCAST record whose transmit key is the GTK.  A
+	 * station has one peer and no GTK to transmit under, so every frame it
+	 * sends belongs to that peer's record on TC1.
+	 *
+	 * Routing anything here is worse than merely wrong, because TC5 owns ONE
+	 * page -- "TX pages 01 14 01 01 04 01" in this driver's HIF dump, against
+	 * TC1's twenty -- and a class is only credited back when the firmware
+	 * drains it, which in an AIS session it has no reason to do.  So one frame
+	 * on TC5 takes the only page and never returns it, the next frame gets
+	 * -EBUSY from j36_wifi_hif_tx_acquire(), and the interface's transmit
+	 * queue is wedged for the life of the association with nothing above able
+	 * to see why.
+	 */
 	const u8 tc = (packet_type == J36_HIF_PACKET_TYPE_MGMT || is_1x) ?
-			J36_HIF_TC_COMMAND :
-			(record == J36_STA_INDEX_NOT_FOUND ?
-				 J36_HIF_TC_BROADCAST : J36_HIF_TC_DATA);
+			J36_HIF_TC_COMMAND : J36_HIF_TC_DATA;
 	/*
 	 * ucPacketSeqNo and the NEED_ACK bit move together, because the sequence
 	 * only means anything as the tag on the TX-status event NEED_ACK asks

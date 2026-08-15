@@ -152,6 +152,9 @@ struct j36_wlan {
 	bool channel_held;
 	u8 channel_token;
 	u8 sta_index;
+	/* The firmware confirmed the record with ACTIVATE_STA_REC. Reporting only:
+	 * the data path does NOT wait for it -- see j36_wlan_on_sta_active(). */
+	bool sta_confirmed;
 	u16 aid;
 	ktime_t gtk_deadline;
 	u8 assoc_ies[J36_WLAN_MAX_IES];
@@ -534,6 +537,11 @@ static void j36_wlan_drop_link(struct j36_wlan *wlan, bool send_deauth,
 	if (wlan->state == J36_WLAN_IDLE)
 		return;
 
+	/* Before anything is cleared, because the counters are the only account of
+	 * why a link that came up did nothing, and the only moment they are worth
+	 * printing is the moment it goes away. */
+	j36_wlan_net_trace(w);
+
 	netif_carrier_off(wlan->ndev);
 
 	if (wlan->state == J36_WLAN_CONNECTED) {
@@ -547,6 +555,7 @@ static void j36_wlan_drop_link(struct j36_wlan *wlan, bool send_deauth,
 
 	wlan->state = J36_WLAN_IDLE;
 	wlan->sta_index = J36_STA_INDEX_NOT_FOUND;
+	wlan->sta_confirmed = false;
 	wlan->ptk_ready = false;
 	wlan->gtk_ready = false;
 	wlan->key_ready = false;
@@ -872,6 +881,24 @@ void j36_wlan_on_assoc_response(struct j36_wifi *w, const u8 *frame,
 	j36_wlan_cmd_bss_info(w, &wlan->bss, wlan->secure, false);
 	j36_wlan_cmd_sta_record(w, &wlan->bss, J36_STA_STATE_3, wlan->aid);
 
+	/*
+	 * ── THE RECORD INDEX IS OURS, NOT THE FIRMWARE'S ─────────────────────
+	 *
+	 * J36_STA_RECORD_INDEX is a constant this driver chose and just sent in
+	 * the command above; the firmware does not allocate it and does not hand
+	 * it back.  ACTIVATE_STA_REC is a CONFIRMATION that the record it names
+	 * went valid, and it used to be the only thing that set this field -- so
+	 * an event that did not arrive left every data frame carrying
+	 * STA_INDEX_NOT_FOUND, which is a descriptor the firmware cannot place.
+	 *
+	 * There is exactly one peer in an infrastructure BSS and it is the one
+	 * the association just completed with, so waiting for permission to name
+	 * it buys nothing and costs the whole data path.  The event still arrives
+	 * or does not; it sets sta_confirmed and the trace prints it.
+	 */
+	wlan->sta_index = J36_STA_RECORD_INDEX;
+	wlan->sta_confirmed = false;
+
 	wlan->state = J36_WLAN_CONNECTED;
 	wlan->joins++;
 	wlan->reported = true;
@@ -906,7 +933,10 @@ void j36_wlan_on_sta_active(struct j36_wifi *w, const u8 *peer)
 		return;
 	if (!j36_same_mac(peer, wlan->bss.bssid))
 		return;
+	/* The index was set when the record was sent -- see
+	 * j36_wlan_on_assoc_response().  All this adds is that the firmware agrees. */
 	wlan->sta_index = J36_STA_RECORD_INDEX;
+	wlan->sta_confirmed = true;
 }
 
 void j36_wlan_on_ap_disconnect(struct j36_wifi *w, const u8 *frame,
@@ -1741,9 +1771,15 @@ void j36_wlan_net_trace(struct j36_wifi *w)
 	if (!wlan)
 		return;
 	dev_info(w->dev,
-		 "wlan: %u scans, %u BSS known, %u joins, %u refused, %u links lost; tx %u frames %u deferred %u backpressure %u starved (%u deep now); rx %u events %u mgmt %u data\n",
+		 "wlan: %u scans, %u BSS known, %u joins, %u refused, %u links lost; peer record %u%s, keys %s/%s%s; tx %u frames %u deferred %u backpressure %u starved (%u deep now); rx %u events %u mgmt %u data\n",
 		 wlan->scans, wlan->result_count, wlan->joins,
 		 wlan->join_failures, wlan->link_losses,
+		 wlan->sta_index,
+		 wlan->sta_confirmed ? " (firmware confirmed)"
+				     : " (no ACTIVATE_STA_REC)",
+		 wlan->ptk_ready ? "PTK" : "-",
+		 wlan->gtk_ready ? "GTK" : "-",
+		 wlan->key_ready ? ", encryption enabled" : "",
 		 w->hif_stats.tx_frames, wlan->tx_deferred,
 		 wlan->tx_backpressure, wlan->tx_starved,
 		 skb_queue_len(&wlan->tx_queue), w->hif_stats.rx_events,
