@@ -125,7 +125,6 @@ struct j36_wlan {
 	struct j36_wlan_bss bss;
 	bool secure;
 	bool reported;		/* cfg80211 has been told the connection took */
-	bool sta_active;
 	bool ptk_ready;
 	bool gtk_ready;
 	bool key_ready;
@@ -509,7 +508,6 @@ static void j36_wlan_drop_link(struct j36_wlan *wlan, bool send_deauth,
 
 	wlan->state = J36_WLAN_IDLE;
 	wlan->sta_index = J36_STA_INDEX_NOT_FOUND;
-	wlan->sta_active = false;
 	wlan->ptk_ready = false;
 	wlan->gtk_ready = false;
 	wlan->key_ready = false;
@@ -1179,11 +1177,13 @@ static int j36_wlan_cfg_scan(struct wiphy *wiphy,
 	}
 
 	/*
-	 * The SSID list and the channel list are both ignored: CMD_SCAN_REQ goes
-	 * out as the wildcard 2.4 GHz sweep stock sends, which returns a superset
-	 * of what was asked for.  The one thing it cannot do is find a hidden
-	 * SSID, which is why max_scan_ssids is 1 rather than a number that would
-	 * imply directed probes this does not send.
+	 * The SSID list, the channel list and request->ie are all ignored:
+	 * CMD_SCAN_REQ goes out as the wildcard 2.4 GHz sweep stock sends, and
+	 * the firmware builds the probe request body itself, so there is nowhere
+	 * to put a caller's IEs.  What comes back is a superset of what was
+	 * asked for.  The one thing it cannot do is find a hidden SSID, which is
+	 * why max_scan_ssids is 1 rather than a number that would imply directed
+	 * probes this does not send.
 	 */
 	ret = j36_wlan_cmd_scan(w, true, &wlan->scan_sequence);
 	if (ret)
@@ -1269,7 +1269,6 @@ static int j36_wlan_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 	wlan->reported = false;
 	wlan->resp_ies_len = 0;
 	wlan->sta_index = J36_STA_INDEX_NOT_FOUND;
-	wlan->sta_active = false;
 	wlan->ptk_ready = false;
 	wlan->gtk_ready = false;
 	wlan->key_ready = false;
@@ -1534,7 +1533,15 @@ int j36_wlan_net_attach(struct j36_wifi *w)
 	wiphy->bands[NL80211_BAND_2GHZ] = &wlan->band;
 	wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
 	wiphy->max_scan_ssids = 1;
-	wiphy->max_scan_ie_len = 0;
+	/*
+	 * nl80211 rejects a scan whose IEs are longer than this before the
+	 * driver ever sees it, so a zero here would turn every supplicant that
+	 * appends anything to a probe request -- WPS, MBO, plain extended
+	 * capabilities -- into "scan trigger failed" and no networks at all.
+	 * The firmware builds its own probe request, so the room is advertised
+	 * and the IEs are dropped in j36_wlan_cfg_scan().
+	 */
+	wiphy->max_scan_ie_len = 256;
 	wiphy->cipher_suites = j36_wlan_cipher_suites;
 	wiphy->n_cipher_suites = ARRAY_SIZE(j36_wlan_cipher_suites);
 	wiphy->akm_suites = j36_wlan_akm_suites;

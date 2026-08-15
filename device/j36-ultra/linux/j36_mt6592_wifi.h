@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * J36 Ultra MT6592 CONSYS Wi-Fi: the register map and the state the five
+ * J36 Ultra MT6592 CONSYS Wi-Fi: the register map and the state the six
  * translation units share.
  *
  * Ported from PowerEngine/OS/MVII's mt6592_wifi_sdio.c and mt6592_wifi_wmt.c.

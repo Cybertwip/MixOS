@@ -856,9 +856,12 @@ config_y BACKLIGHT_CLASS_DEVICE
 # defconfig bump cannot bring it back by dependency.
 #
 # =m and not =y for both, because they are only needed once the radio module
-# loads and both are staged behind j36.wifi in load.order. RFKILL comes with
-# CFG80211 whether it is asked for or not (cfg80211 select RFKILL), and it is
-# named anyway so its tristate is ours rather than whatever got selected first.
+# loads and both are staged behind j36.wifi in load.order. RFKILL is asked for
+# rather than inherited: cfg80211 does not select it, it says `depends on RFKILL
+# || !RFKILL', which is Kconfig for "either build me modular too, or leave rfkill
+# out entirely". Naming it =m alongside CFG80211=m satisfies that in the
+# direction that keeps a real rfkill switch instead of the no-op stubs, which is
+# what NetworkManager reads before it will bring a radio up.
 config_y WIRELESS
 config_m CFG80211
 config_m RFKILL
@@ -1263,13 +1266,13 @@ FBMEM_MODULE="$MODULE_SRC/j36_fbmem.ko"
 [[ -s "$FBMEM_MODULE" ]] || die "framebuffer dma-buf module was not produced"
 verify_arm_elf "$FBMEM_MODULE" "the framebuffer dma-buf module"
 # And the radio, staged as its own wifi payload.  It is the only module here built
-# from more than one translation unit -- main, consys and wmt -- and the only one
-# that links against another of these modules rather than against the kernel
-# alone: the PMIC exports the two wrapper accessors it needs, because the WACS2
-# bridge has one owner.  Both facts are why a missing .ko is worth failing over
-# and not worth guessing about.  If this line ever fires, read the modpost output
-# above it: an undefined j36_pmic_pwrap_* is the PMIC having been dropped from
-# this same M= directory, not the radio failing to compile.
+# from more than one translation unit -- main, consys, wmt, hif, cmd, net -- and
+# the only one that links against another of these modules rather than against
+# the kernel alone: the PMIC exports the two wrapper accessors it needs, because
+# the WACS2 bridge has one owner.  Both facts are why a missing .ko is worth
+# failing over and not worth guessing about.  If this line ever fires, read the
+# modpost output above it: an undefined j36_pmic_pwrap_* is the PMIC having been
+# dropped from this same M= directory, not the radio failing to compile.
 WIFI_MODULE="$MODULE_SRC/j36_mt6592_wifi.ko"
 [[ -s "$WIFI_MODULE" ]] || die "Wi-Fi module was not produced"
 verify_arm_elf "$WIFI_MODULE" "the Wi-Fi module"

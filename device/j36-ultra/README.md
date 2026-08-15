@@ -213,8 +213,9 @@ j36/mtkdrm/            the MT6592 display set, plus load.order (j36.mtkdrm=1)
 j36/audio/             the ALSA core and the MT6592 AFE, plus load.order (j36.audio=1)
 j36/usb/               the MUSB host stack, HID, udl and the disk set (j36.usb=1)
 j36/power/             the MT6592 PMIC and the panel backlight (j36.power=1)
-j36/wifi/              the CONSYS connectivity MCU, plus firmware/ holding the two
-                       ROM patches that go down the BTIF link (j36.wifi=1)
+j36/wifi/              cfg80211, rfkill and the CONSYS driver, plus firmware/
+                       holding the two ROM patches and the WLAN firmware the
+                       driver downloads to bring up wlan0 (j36.wifi=1)
 j36/gl/                Mesa's GL front end, plus links (vfat has no symlinks)
 j36/eglprobe           what can create a GL context, and with -p whether a frame
                        reaches the glass: five held colours, CPU then lima
@@ -323,9 +324,10 @@ shipped `kernel.config` instead of by another boot — it also removes
 The fix that matters is not `NET=y`, it is that **everything PID 1 cannot start
 without is now asserted after `olddefconfig`**, including the symbols that arrive
 by dependency. `UNIX` had been requested all along; what was missing was any
-check that the request survived. `WIRELESS` and `BT` are asserted *off* for the
-mirror-image reason: `WIRELESS` defaults to `y` under `NET`, and this image has
-2.5 MiB of slack in a fixed 9 MiB partition.
+check that the request survived. `BT` and `MAC80211` are asserted *off* for the
+mirror-image reason — this image has 2.5 MiB of slack in a fixed 9 MiB partition,
+and neither is reachable from anything on the card. `MAC80211` in particular is a
+refusal and not an omission; see the Wi-Fi section below.
 
 `root=` on the command line is a **hint that `/init` verifies**, not an order to
 the kernel: `rdinit=/init` keeps the kernel out of root mounting entirely, so a
@@ -704,6 +706,80 @@ Three things about the port itself, none of them software:
   DisplayLink one, which is a USB device rather than a mode switch — `udl.ko` is
   already staged in `j36/usb/load.order` for it.
 
+## Wi-Fi: four stages, and only the last one is 802.11
+
+`j36.wifi=1` loads `j36_mt6592_wifi.ko` and ends in a `wlan0` that
+NetworkManager and the dashboard's Wi-Fi page drive like any other interface.
+Getting there is four stages, and each one is a different kind of hardware:
+
+1. **Power.** MTCMOS for the CONSYS domain, then VCN18/VCN28/VCN33 on the MT6323
+   over PWRAP, then the INFRA connectivity-MCU clock. Reading a CONSYS register
+   before this is the same AXI stall the Mali section describes.
+2. **The link.** BTIF is a UART-shaped mailbox to the connectivity MCU; STP is
+   the framing on it and WMT the command set. Two ROM patches go down it, in the
+   order their headers declare, and the MCU is muted and reset between them.
+3. **The firmware.** `WIFI_RAM_CODE_SOC` is downloaded over the AHB HIF — not
+   over BTIF — section by section, CRC checked, and the driver waits for
+   `WLAN_READY`. The chip calibrates its RF during this and it is not quick.
+4. **The radio.** Everything above is MediaTek's connectivity subsystem and
+   would be identical for Bluetooth. Only here does 802.11 appear, and it appears
+   as a *command and event protocol*, not as registers.
+
+### It is fullmac, which decides the kernel configuration
+
+The MAC lives in the firmware. The driver does not build frames, does not run a
+retry counter, does not see an ACK; it sends `CMD_BSS_ACTIVATE`, `CMD_JOIN`,
+`CMD_ADD_STA` and reads events back. So `j36_mt6592_wifi_net.c` registers a
+`wiphy` and a netdev and never registers an `ieee80211_hw`.
+
+That is why `CONFIG_CFG80211=m` is the whole wireless configuration and
+`CONFIG_MAC80211` is asserted **off**. mac80211 is a softmac stack — a rate
+control algorithm, a TX queueing discipline and a frame builder for parts whose
+MAC is in the driver. On a fullmac part it is roughly 700 KB of code that
+nothing calls, in a boot payload with 2.5 MiB of slack. `RFKILL=m` is asked for
+alongside it — cfg80211 does not select rfkill, it `depends on RFKILL ||
+!RFKILL`, and the half of that which keeps a real switch rather than the no-op
+stubs is the half NetworkManager reads before it will bring a radio up.
+
+The division of labour that follows from fullmac is worth stating, because it is
+where the driver's boundaries are:
+
+| | does |
+| --- | --- |
+| firmware | scanning, the probe request body, ACKs, retries, rate selection, CCMP encrypt/decrypt, power save |
+| driver | the SME — channel lease, auth, assoc — plus key install, the netdev, and the event→cfg80211 translation |
+| `wpa_supplicant` | the 4-way handshake, as EAPOL frames over `wlan0` and `NL80211_CMD_NEW_KEY` back down |
+
+### Why it polls
+
+The `wifi` node in the generated tree has **no `interrupts` property**, because
+nothing in the sources this tree is derived from names one for the WLAN
+function. So stage 4 runs an ordered workqueue that drains the HIF's RX FIFO,
+services deadlines, and pushes queued TX. It sleeps 50 ms when idle, one jiffy
+while a join or a scan is outstanding, and reschedules immediately after any
+poll that moved data.
+
+The TX queue is not an optimisation either. `ndo_start_xmit` is called with
+softirqs disabled and may not sleep; the HIF's page accounting can wait up to
+200 ms for the firmware to return credits. So `ndo_start_xmit` linearizes,
+queues, and kicks the worker, which is the only context allowed to block.
+
+### What it does and does not do
+
+2.4 GHz only, channels 1–13, open and WPA2-PSK/CCMP, up to 54 Mb/s. There is no
+802.11n here: this is a single-stream 802.11g radio and the rate table stops at
+54. Not implemented, and each for a reason rather than an oversight — hidden
+SSIDs (the scan command is a wildcard sweep with no directed probe),
+WPA3/SAE and TKIP/WEP (only CCMP and PSK are advertised, so `wpa_supplicant`
+never offers the rest), AP and monitor mode, and 5 GHz, which this part has not
+got.
+
+When it stops early it says where, by stage name, in one `dmesg` line —
+`consys-mtcmos-timeout`, `rom-patch-missing`, `wmt-rf-calibration-failed`,
+`firmware-ready-timeout`, `wlan-netdev-register` and about forty others. The
+name is the first thing that failed, not the last thing that was tried, and
+`j36-logdump` on the card collects them.
+
 ## Licence and attribution
 
 The original MixOS work here — `build-in-vm.sh`, `generate_dts.py`,
@@ -722,7 +798,7 @@ distinction is not cosmetic:
 
 - Everything under `linux/` — the seven MixOS modules (`j36_mt6592_input.c`,
   `j36_mt6592_audio.c`, `j36_jd9365_panel.c`, `j36_mt6592_usb_phy.c`,
-  `j36_mt6592_pmic.c`, `j36_mt6592_backlight.c` and the three-file
+  `j36_mt6592_pmic.c`, `j36_mt6592_backlight.c` and the six-file
   `j36_mt6592_wifi` build) and the three `linux/*.patch` files — is
   **`GPL-2.0-only`**. They derive from and link against GPL-2.0-only kernel
   internals, which is narrower than either half of the dual grant, so relicensing
