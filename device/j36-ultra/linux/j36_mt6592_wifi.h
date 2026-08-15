@@ -750,6 +750,9 @@ struct j36_hif_stats {
 
 #define J36_WLAN_MAX_SCAN_RESULTS	48
 #define J36_WLAN_MAX_RX_PER_POLL	32
+/* How many times the "on" half of a BSS reactivation is retried before the radio
+ * is declared deactivated.  See j36_wlan_cmd_bss_reactivate(). */
+#define J36_WLAN_ACTIVATE_ATTEMPTS	4
 #define J36_WLAN_MAX_ASSOC_FRAME	512
 #define J36_WLAN_MAX_IES		384
 

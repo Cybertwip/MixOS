@@ -504,9 +504,18 @@ int j36_wlan_cmd_bss_disconnect(struct j36_wifi *w,
  * at -47 in a scan taken while associated to a different one.  Deactivating and
  * immediately reactivating makes the firmware rebuild the context, and the AIS
  * network stays live so nothing here has to track an inactive BSS.
+ *
+ * THE SECOND HALF IS THE ONE THAT MATTERS AND IT IS THE ONE MOST LIKELY TO FAIL.
+ * It is the fourth or fifth command of a teardown burst on a class with four
+ * pages, so it is exactly where the accounting runs out -- and a refused "on"
+ * leaves the AIS network deactivated, which is a radio that accepts every later
+ * command and answers none of them: no channel grants, no scan results, nothing
+ * to log.  So the off half may fail and be reported, but the on half is retried
+ * until a page comes free or the transport is gone.
  */
 int j36_wlan_cmd_bss_reactivate(struct j36_wifi *w)
 {
+	unsigned int attempt;
 	u8 command[4] = {};
 	int ret;
 
@@ -516,9 +525,17 @@ int j36_wlan_cmd_bss_reactivate(struct j36_wifi *w)
 			       sizeof(command));
 	if (ret)
 		return ret;
+
 	command[1] = 1;
-	return j36_wlan_command(w, J36_CMD_BSS_ACTIVATE_CTRL, true, command,
-				sizeof(command));
+	for (attempt = 0; attempt < J36_WLAN_ACTIVATE_ATTEMPTS; attempt++) {
+		ret = j36_wlan_command(w, J36_CMD_BSS_ACTIVATE_CTRL, true,
+				       command, sizeof(command));
+		if (ret != -EBUSY)
+			return ret;
+	}
+	dev_err(w->dev,
+		"wlan: the AIS network could not be reactivated -- the radio is deactivated and will answer nothing\n");
+	return ret;
 }
 
 /*
@@ -532,23 +549,64 @@ int j36_wlan_cmd_bss_reactivate(struct j36_wifi *w)
  * a BEACON rather than a probe response, because only a beacon carries the TIM
  * element the DTIM count lives in.
  *
- * So this refuses rather than fabricating.  A wrong DTIM here is the one command
- * that tells the firmware how long to keep its receiver off, and getting it wrong
- * is missed multicast and missed buffered traffic, silently.
+ * So the beacon is waited for rather than guessed at -- but only for a while, and
+ * this is where MVII's port and stock part company for a reason worth writing
+ * down.  Stock waits forever because stock always gets its beacon: its receive
+ * path hands every beacon of the connected BSS to scanProcessBeaconAndProbeResp
+ * whether it is scanning or not.  This driver, on this firmware, has been
+ * observed to get none at all while associated -- 47 management frames in a whole
+ * session, all of them accounted for by four scans -- so "wait for a beacon" here
+ * means "never send it", and never sending it is not the safe option:
+ *
+ *   SET_BSS_INFO HAS NO BEACON INTERVAL FIELD.  This command is the only one in
+ *   the protocol that carries u2BeaconInterval, so a link brought up without it
+ *   leaves the firmware supervising an AP it has been told beacons every zero
+ *   time units.  The result is EVENT_BSS_BEACON_TIMEOUT about a minute after a
+ *   perfectly good association, with the AP a metre away at -46 dBm.
+ *
+ * Hence dtim_fallback.  Fabricating a DTIM period of 1 is safe HERE and only
+ * here, because j36_wlan_cmd_configure() puts this radio in Param_PowerModeCAM
+ * and never takes it out: the receiver is on continuously, so the DTIM period
+ * cannot cost a buffered frame.  It sets the cadence the firmware's supervision
+ * expects and nothing else.  The day this driver learns to power-save, this
+ * argument stops being true and the fallback has to go with it.
  */
 int j36_wlan_cmd_pm_connected(struct j36_wifi *w, const struct j36_wlan_bss *bss,
-			      u16 aid)
+			      u16 aid, bool dtim_fallback)
 {
 	u8 command[12] = {};
 
-	if (!bss->dtim_period || !bss->beacon_interval)
+	if (!bss->beacon_interval)
+		return -EAGAIN;
+	if (!bss->dtim_period && !dtim_fallback)
 		return -EAGAIN;
 
 	command[0] = J36_NETWORK_TYPE_AIS;
-	command[1] = bss->dtim_period;
+	command[1] = bss->dtim_period ? bss->dtim_period : 1;
 	j36_put_le16(command + 2, aid);
 	j36_put_le16(command + 4, bss->beacon_interval);
 	return j36_wlan_command(w, J36_CMD_INDICATE_PM_CONNECTED, true, command,
+				sizeof(command));
+}
+
+/*
+ * CMD_INDICATE_PM_BSS_ABORT, 4 bytes: the network index and three reserved.
+ *
+ * The counterpart of the command above and, like it, easy to leave out and hard
+ * to miss the absence of.  aisFsmDisconnect() sends it FIRST -- before
+ * rlmBssAborted(), before the media state changes, before nicUpdateBss() -- on
+ * every path that ends a link, including the one that ends it to start another.
+ * Skipping it leaves the firmware's power-management module holding a BSS
+ * context while the host pulls SET_BSS_INFO(DISCONNECTED), REMOVE_STA_RECORD and
+ * BSS_ACTIVATE_CTRL out from under it, and what that costs is not a message: it
+ * is a radio that takes the next join's commands and never answers one.
+ */
+int j36_wlan_cmd_pm_abort(struct j36_wifi *w)
+{
+	u8 command[4] = {};
+
+	command[0] = J36_NETWORK_TYPE_AIS;
+	return j36_wlan_command(w, J36_CMD_INDICATE_PM_ABORT, true, command,
 				sizeof(command));
 }
 
@@ -858,9 +916,15 @@ int j36_wlan_cmd_assoc(struct j36_wifi *w, const struct j36_wlan_bss *bss,
  * and it is treated differently twice: it goes out on TC4 with an acknowledgement
  * requested, and its tag is remembered so the pairwise key install can be ordered
  * behind it.
+ *
+ * may_wait is false from the poll worker and true from nowhere at present, but it
+ * stays a parameter rather than a constant because the distinction is the caller's
+ * lock state and not this function's business.  -EBUSY here is not an error: it
+ * means the class is full, and the caller is expected to hand the same frame back
+ * on the next tick rather than to drop it.
  */
 int j36_wlan_cmd_tx_ethernet(struct j36_wifi *w, const u8 *frame, u32 len,
-			     u8 sta_index, bool is_1x)
+			     u8 sta_index, bool is_1x, bool may_wait)
 {
 	u8 tag = 0;
 	int ret;
@@ -869,7 +933,7 @@ int j36_wlan_cmd_tx_ethernet(struct j36_wifi *w, const u8 *frame, u32 len,
 		return -EINVAL;
 
 	ret = j36_wlan_frame(w, frame, len, J36_HIF_PACKET_TYPE_DATA, sta_index,
-			     false, is_1x, false, &tag);
+			     false, is_1x, false, may_wait, &tag);
 	if (!ret && is_1x && tag)
 		w->pending_1x = tag;
 	return ret;
