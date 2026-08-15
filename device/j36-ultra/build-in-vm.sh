@@ -4656,6 +4656,78 @@ dump() {
     # this board no matter what the hub's box says.
     showall "and the IDs their drivers actually match on" \
         /sys/bus/usb/devices/*/idVendor /sys/bus/usb/devices/*/idProduct
+    # ── CAN ANYTHING IN THIS BUILD DRIVE WHAT IS PLUGGED IN? ──────────────────
+    #
+    # The IDs above are the evidence; this is the verdict, one line per device,
+    # because "the adapter does nothing" and "the adapter is fine and its HDMI
+    # needs a thing this SoC does not physically have" are the same silence
+    # otherwise, and the second one is not fixable by any amount of driver work.
+    #
+    # A USB device can put a picture on a monitor only by BEING a display device:
+    # receiving pixels over the bus and driving the panel itself.  The other kind
+    # of USB-C-to-HDMI -- the cheap kind, and the majority of them -- is
+    # DisplayPort Alt Mode, where the connector's high-speed pairs are switched
+    # away from USB and onto a DisplayPort transmitter inside the host.  That
+    # needs a USB-C receptacle, CC pins, a USB-PD controller to negotiate the
+    # mode, and a DisplayPort transmitter to switch onto.  MT6592 has a micro-USB
+    # 2.0 MUSB core and none of the other four.  Nothing is disabled; there is
+    # nothing there to enable.
+    sec "what is on the bus, and whether anything in this build can drive it"
+    _anydev=0
+    for _u in /sys/bus/usb/devices/*; do
+        [ -r "$_u/idVendor" ] || continue        # skip interfaces; devices only
+        _vid="$(cat "$_u/idVendor" 2>/dev/null)"
+        _pid="$(cat "$_u/idProduct" 2>/dev/null)"
+        _cls="$(cat "$_u/bDeviceClass" 2>/dev/null)"
+        _nam="$(cat "$_u/product" 2>/dev/null)"
+        # 1d6b is the Linux Foundation root hub -- the kernel's own virtual hub at
+        # the top of every bus, present on a board with an empty port.  It is not
+        # a thing anybody plugged in, and reading it as one is a standing way to
+        # conclude that a port enumerated something when it did not.
+        case "$_vid" in 1d6b) continue ;; esac
+        _anydev=1
+        _drvs=""
+        for _i in "$_u"/*:*; do
+            [ -d "$_i" ] || continue
+            _d="$(readlink "$_i/driver" 2>/dev/null)"
+            _d="${_d##*/}"
+            [ -n "$_d" ] || _d="(unclaimed)"
+            _drvs="$_drvs $_d"
+        done
+        [ -n "$_drvs" ] || _drvs=" (no interfaces)"
+        printf -- '--- %s  %s:%s  class %s  %s\n' \
+            "${_u##*/}" "$_vid" "$_pid" "$_cls" "${_nam:-(no product string)}"
+        printf '    drivers:%s\n' "$_drvs"
+        case " $_drvs " in
+        *" udl "*)
+            printf '    VERDICT: DisplayLink, bound to udl.  It has a card node and j36-mixmirror\n'
+            printf '             will find it.  This is the one adapter class that works here.\n'
+            continue ;;
+        esac
+        case "$_vid" in
+        17e9)
+            printf '    VERDICT: DisplayLink silicon that mainline udl did NOT bind.  udl speaks the\n'
+            printf '             USB 2.0 DL-1x0/DL-1x5 protocol only.  DL-3xxx/5xxx/6xxx need\n'
+            printf '             DisplayLink proprietary plus evdi, which this image does not ship\n'
+            printf '             and which has no armhf build.\n'
+            continue ;;
+        esac
+        case "$_cls" in
+        09)
+            printf '    VERDICT: a hub.  A hub carries no video of its own.  If this one has an HDMI\n'
+            printf '             socket then either a DisplayLink chip sits behind it -- which would\n'
+            printf '             enumerate above as its own 17e9 device -- or that socket is\n'
+            printf '             DisplayPort Alt Mode, which needs a USB-C host with a DisplayPort\n'
+            printf '             transmitter.  No 17e9 line above means it is the second one, and no\n'
+            printf '             driver can change that.\n'
+            continue ;;
+        esac
+        printf '    VERDICT: nothing in this build claims it.  If this is the video half of the\n'
+        printf '             adapter, look %s:%s up before buying another: Fresco Logic FL2000 and\n' "$_vid" "$_pid"
+        printf '             the MacroSilicon parts have no mainline driver at all, on any\n'
+        printf '             architecture, so there is no kernel option that turns them on.\n'
+    done
+    [ "$_anydev" = 1 ] || printf '(nothing but the root hub -- the port enumerated no device at all)\n'
     kgrep "USB, the PHY and MUSB" 'usb|musb|phy|xhci|ehci|hub |otg|vbus'
 
     printf '\n\n########## 5.  THE PANEL, THE SPLASH AND THE DASHBOARD ##########\n'
@@ -6150,9 +6222,13 @@ build_eglprobe() {
 
 # ── The USB-HDMI mirror ───────────────────────────────────────────────────────
 #
-# WHAT IT IS FOR.  Plug a DisplayLink dongle or a USB-C hub with HDMI on it into this
-# board and udl binds, a /dev/dri/cardN appears with the monitor's modes on it, and
-# the screen stays black.  Nothing is broken: CONFIG_DRM_FBDEV_EMULATION is =n on
+# WHAT IT IS FOR.  Plug a DisplayLink dongle into this board and udl binds, a
+# /dev/dri/cardN appears with the monitor's modes on it, and the screen stays black.
+# (A DisplayLink dongle, and not the USB-C hub with an HDMI socket on the side that
+# most people mean by "USB HDMI adapter".  Those are DisplayPort Alt Mode -- the
+# connector's high-speed pairs switched onto a DisplayPort transmitter in the host --
+# and MT6592 has neither the connector nor the transmitter.  Nothing below applies to
+# one, because udl never binds and no card node ever appears.)  Nothing is broken: CONFIG_DRM_FBDEV_EMULATION is =n on
 # purpose -- see the DRM prune far above, it is a global bool and turning it on would
 # have mtk_drm register a second /dev/fb and take the panel -- so udl has a card node
 # and no framebuffer, while mixdash is Qt on linuxfb and knows only /dev/fb0.  The two

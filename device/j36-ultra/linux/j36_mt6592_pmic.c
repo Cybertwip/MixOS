@@ -109,6 +109,30 @@
  * published through usb/vbus_sourcing, and still said once in the log when both
  * are up at the same time -- which here is the ordinary state of a console
  * charging with a stick plugged in, and no longer a reason to refuse.
+ *
+ *
+ * ── AND THEN THE CABLE COULD GO IN BUT NEVER COME OUT ──
+ *
+ * With the interlock gone the DC inlet charged, and the plug edge was reported
+ * once and then never again: pull the cable and the driver went on saying VBUS
+ * present, went on publishing a charging status, and went on arming a charger
+ * into a disconnected input.
+ *
+ * Not a filtering problem and not a missing interrupt.  CHRDET is bit 5 of
+ * CHR_CON0, and CHR_CON0 also holds VCDT_HV_EN and CHR_EN, which this driver
+ * writes every second.  pwrap has no bitwise write, so every one of those writes
+ * was a sixteen-bit word carrying the comparators back down with it at whatever
+ * they read -- and a comparator this driver reasserts once a second is a latch,
+ * not a comparator.  The first rising edge was real; every reading after it was
+ * this driver's own last write coming back.
+ *
+ * Two things follow from that, and the second one is not redundant.  Writes now
+ * mask off the bits the charger FSM owns, in j36_pmic_write() and
+ * j36_pmic_update() rather than at the call sites.  And the poll converts AUXADC
+ * channel 4 every pass and lets a measured input below J36_VCHR_ABSENT_MV veto a
+ * CHRDET that claims a charger -- one instrument on the same pin that shares no
+ * register with the other, so "the bit is stuck" stops being a state the driver
+ * cannot see from the inside.
  */
 
 #include <linux/bitops.h>
@@ -180,6 +204,31 @@ MODULE_PARM_DESC(chrin_shared,
 		 "the charger input and the USB port are one connector, so hold the "
 		 "charger off while DRVVBUS is up (default 0: this board has a "
 		 "separate DC inlet and CHRDET is always a real charger)");
+
+/*
+ * The escape hatch on the AUXADC cross-check, and the reason it has one.
+ *
+ * The check reads the charger input on channel 4 and refuses to believe a CHRDET
+ * that claims a cable while the input measures below J36_VCHR_ABSENT_MV.  That is
+ * a second instrument on the same pin, which is the whole point -- but it is a
+ * second instrument with its own divider constants, and if those are wrong for
+ * this board it will read low on a charger that is really there and veto a charge
+ * that was working.  The failure is silent by construction: nothing else on the
+ * board disagrees with it, because the register bit is exactly what it is there to
+ * doubt.
+ *
+ * So it is 0644 rather than a compile-time choice.  A console that stops charging
+ * after this driver changed, with "treating the cable as out" in dmesg and a
+ * millivolt figure that does not match a meter on the inlet, is this check being
+ * wrong; write 0 here and it charges again on the next poll, with the read-only
+ * masking -- which is the actual fix for the stuck bit -- still in place.
+ */
+static bool vchr_veto = true;
+module_param(vchr_veto, bool, 0644);
+MODULE_PARM_DESC(vchr_veto,
+		 "let a measured charger input below the absent threshold overrule a "
+		 "CHRDET that claims a cable (default 1; set 0 if the ADC scaling on "
+		 "this board vetoes a charger that is really connected)");
 
 static bool poweroff = true;
 module_param(poweroff, bool, 0444);
@@ -286,6 +335,29 @@ MODULE_PARM_DESC(chgreboot,
 #define J36_VCHR_DIVIDER_DEN		39
 #define J36_R_SENSE_MOHM		68
 
+/*
+ * ══ THE SECOND OPINION ON THE CABLE, AND WHY IT ONLY EVER SAYS NO ══
+ *
+ * CHRDET is one bit from one comparator, and the register it sits in is one this
+ * driver also writes -- so "the bit is stuck" is a failure mode it cannot report
+ * about itself.  AUXADC channel 4 is on the same pin through a resistor divider
+ * and shares nothing with it but the pin, which makes it the one instrument that
+ * can contradict the comparator.
+ *
+ * The contradiction is allowed in ONE direction.  A measured input below this
+ * threshold vetoes a CHRDET that says yes; a measurement is never allowed to
+ * veto a CHRDET that says no.  The asymmetry is deliberate: if these divider
+ * constants are ever wrong the failure is a charger that reads low, and under a
+ * symmetric rule that would refuse to charge a board that can -- trading a
+ * cosmetic bug for a real one.  Vetoing in one direction can only ever cost a
+ * charge that was already not happening.
+ *
+ * 3000 mV sits in a gap with nothing in it.  An open pin reads near zero; the
+ * feeblest supply that could hold this board up is a USB port at 4.4 V, and the
+ * VCDT comparator itself would have dropped out long before either.
+ */
+#define J36_VCHR_ABSENT_MV		3000
+
 /* Five, from stock, and a median rather than a mean: the only failure this ADC
  * actually shows is a single bad conversion, which a median rejects completely
  * and a mean spreads over five. */
@@ -296,11 +368,42 @@ MODULE_PARM_DESC(chgreboot,
  * CHR_CONn lives at offset n*2.  Only the registers this driver writes are named;
  * the bit names are the stock kernel's own accessor names (upmu_set_rg_*).
  */
+/*
+ * ══ CONTROL AND STATUS SHARE A WORD, AND THAT COST THE UNPLUG ══
+ *
+ * CHR_CON0 and CHR_CON2 are not control registers with a status register beside
+ * them.  Each holds a couple of writable RG_ bits interleaved with the charger
+ * FSM's read-only RGS_ comparators, and pwrap has no bitwise write -- the
+ * smallest thing it can put on the bus is the whole sixteen-bit word.  So a
+ * read-modify-write of "clear VCDT_HV_EN" necessarily carries CHRDET, both VCDT
+ * detects and LDO_DET back down with it, at whatever value they happened to be
+ * read at.
+ *
+ * That is how the DC inlet came to have no unplug.  Plug in, CHRDET rises
+ * honestly, and the arm pass a second later reads CHR_CON0 with bit 5 set and
+ * writes bit 5 set.  From then on the bit is a value this driver keeps
+ * reasserting once a second rather than a comparator, so pulling the cable
+ * changes nothing it can see: the charger stays armed, the watchdog stays
+ * kicked, and the gauge reports a supply that is not there.  Only the first edge
+ * was ever real, which is exactly the shape of "it detects the cable going in
+ * and never the cable coming out".
+ *
+ * The fix is a read-only mask per register, applied in the two write paths
+ * rather than at the call sites, because there is no call site that wants this
+ * and a rule enforced in one place cannot be forgotten in the next one.
+ */
 #define J36_CHR_CON0			0x0000
 #define J36_CHR_CON0_VCDT_HV_EN		BIT(0)
+#define J36_CHR_CON0_LDO_DET		BIT(1)	/* RO: the input LDO is up */
 #define J36_CHR_CON0_CSDAC_EN		BIT(3)
 #define J36_CHR_CON0_CHR_EN		BIT(4)
-#define J36_CHR_CON0_CHRDET		BIT(5)	/* live comparator on the CHRIN pin */
+#define J36_CHR_CON0_CHRDET		BIT(5)	/* RO: live comparator on CHRIN */
+#define J36_CHR_CON0_VCDT_LV_DET	BIT(6)	/* RO: input above the LV vth */
+#define J36_CHR_CON0_VCDT_HV_DET	BIT(7)	/* RO: input above the HV vth */
+#define J36_CHR_CON0_RO			(J36_CHR_CON0_LDO_DET | \
+					 J36_CHR_CON0_CHRDET | \
+					 J36_CHR_CON0_VCDT_LV_DET | \
+					 J36_CHR_CON0_VCDT_HV_DET)
 #define J36_CHR_CON2			0x0004
 #define J36_CHR_CON2_VBAT_CV_EN		BIT(1)
 #define J36_CHR_CON2_CS_EN		BIT(3)
@@ -310,6 +413,11 @@ MODULE_PARM_DESC(chgreboot,
  * j36_charging_line() for why a snapshot of it is worth so little.
  */
 #define J36_CHR_CON2_CS_DET		BIT(5)
+#define J36_CHR_CON2_VBAT_CV_DET	BIT(6)	/* RO: node at the CV setpoint */
+#define J36_CHR_CON2_VBAT_CC_DET	BIT(7)	/* RO: node above the CC vth */
+#define J36_CHR_CON2_RO			(J36_CHR_CON2_CS_DET | \
+					 J36_CHR_CON2_VBAT_CV_DET | \
+					 J36_CHR_CON2_VBAT_CC_DET)
 /*
  * CHR_CON3[4:0] indexes stock's CV table.  Code 0 is 4200 mV.  The register
  * POWERS ON AT 29, which is 4162 mV -- twenty-one millivolts below this pack's
@@ -352,7 +460,8 @@ MODULE_PARM_DESC(chgreboot,
 #define J36_CHR_CON15			0x001e
 #define J36_CHR_CON15_CHRWDT_INT_EN	BIT(0)
 #define J36_CHR_CON15_CHRWDT_FLAG_WR	BIT(1)
-#define J36_CHR_CON15_CHRWDT_OUT	BIT(2)	/* 1 = it has already expired */
+#define J36_CHR_CON15_CHRWDT_OUT	BIT(2)	/* RO: 1 = it has already expired */
+#define J36_CHR_CON15_RO		J36_CHR_CON15_CHRWDT_OUT
 /*
  * USBDL is a HARDWARE charging mode, and it is why a board that read back every
  * register as intended still would not charge.  The preloader's pl_charging(1) is
@@ -583,6 +692,8 @@ struct j36_pmic {
 	bool vbus_warned;	/* the DRVVBUS line in j36_charger_online() is said
 				 * once per run of the state that provokes it, and
 				 * chrin_shared picks which line that is */
+	bool vchr_vetoed;	/* CHRDET says a cable and the ADC says otherwise;
+				 * held so the line is one per run of the state */
 	unsigned int poll_kicks;	/* rate-limits j36_charging_line() */
 
 	/* When an operator's CV write stops the re-arm stamping 4200 back over
@@ -678,10 +789,35 @@ static int j36_pmic_read(struct j36_pmic *p, u32 adr, u32 *rdata)
 	return ret;
 }
 
+/*
+ * The bits of a register that the charger FSM owns and this driver may only
+ * read.  Zero for every register not listed, so the masking below is free for
+ * the ones that are pure control.
+ *
+ * This is not defensive tidiness.  Writing a comparator back is not ignored on
+ * this PMIC -- it holds, and a held CHRDET is a cable that can be plugged in and
+ * never unplugged.  See the block comment at J36_CHR_CON0.
+ */
+static u32 j36_pmic_ro_bits(u32 adr)
+{
+	switch (adr) {
+	case J36_CHR_CON0:
+		return J36_CHR_CON0_RO;
+	case J36_CHR_CON2:
+		return J36_CHR_CON2_RO;
+	case J36_CHR_CON15:
+		return J36_CHR_CON15_RO;
+	default:
+		return 0;
+	}
+}
+
 static int j36_pmic_write(struct j36_pmic *p, u32 adr, u32 wdata)
 {
 	unsigned long flags;
 	int ret;
+
+	wdata &= ~j36_pmic_ro_bits(adr);
 
 	spin_lock_irqsave(&p->lock, flags);
 	ret = j36_pwrap_xfer_locked(p, true, adr, wdata, NULL);
@@ -698,15 +834,22 @@ static int j36_pmic_write(struct j36_pmic *p, u32 adr, u32 wdata)
 static int j36_pmic_update(struct j36_pmic *p, u32 adr, u32 clr, u32 set)
 {
 	unsigned long flags;
-	u32 old, new;
+	u32 old, new, ro = j36_pmic_ro_bits(adr);
 	int ret;
 
 	spin_lock_irqsave(&p->lock, flags);
 	ret = j36_pwrap_xfer_locked(p, false, adr, 0, &old);
 	if (ret)
 		goto out;
-	new = (old & ~(clr | set)) | set;
-	if (new == old) {
+	new = ((old & ~(clr | set)) | set) & ~ro;
+	/*
+	 * Compared against the writable half of what was read, not against the
+	 * whole word.  A plain `new == old' would differ on every pass the moment
+	 * a comparator was set -- turning the skip into a write every second, and
+	 * turning this function's 1/0 return into a permanent "something moved"
+	 * for the log lines that key on it.
+	 */
+	if (new == (old & ~ro)) {
 		ret = 0;
 		goto out;
 	}
@@ -2029,12 +2172,19 @@ static int j36_gauge_status(struct j36_pmic *p, bool online, int ma, bool ma_val
  *
  * DRVVBUS is still read, because the pad still says something worth saying -- just
  * not this.  See chrin_shared for the board where it does.
+ *
+ * `flags' takes CHR_CON0 as it was read, for the caller that wants the other
+ * three comparators in the same word to say something about a CHRDET it does not
+ * believe.  NULL is fine; the DRVVBUS interlock returns before there is one.
  */
-static int j36_charger_online(struct j36_pmic *p)
+static int j36_charger_online(struct j36_pmic *p, u32 *flags)
 {
 	bool sourcing = j36_drvvbus_asserted(p);
 	u32 con0;
 	int online;
+
+	if (flags)
+		*flags = 0;
 
 	if (chrin_shared && sourcing) {
 		if (!p->vbus_warned) {
@@ -2056,6 +2206,8 @@ static int j36_charger_online(struct j36_pmic *p)
 	if (j36_pmic_read(p, J36_CHR_CON0, &con0))
 		return -1;
 	online = (con0 & J36_CHR_CON0_CHRDET) ? 1 : 0;
+	if (flags)
+		*flags = con0;
 
 	/*
 	 * Said once, and only because the old behaviour was to refuse here: a
@@ -2163,9 +2315,11 @@ static void j36_pmic_poll(struct work_struct *work)
 	struct j36_pub pub;
 	unsigned long flags;
 	int online, bat_raw, isense_raw, vchr_raw;
-	int bat_mv = -1, ocv_mv = -1, ma = 0;
+	int bat_mv = -1, ocv_mv = -1, ma = 0, vchr_mv = -1;
 	bool ma_valid = false;
+	bool vchr_valid;
 	bool changed;
+	u32 con0 = 0;
 
 	if (!j36_pwrap_up(p)) {
 		dev_warn_once(p->dev, "pwrap is not up; nothing can be read yet\n");
@@ -2174,10 +2328,46 @@ static void j36_pmic_poll(struct work_struct *work)
 
 	j36_hw_ocv_prime(p);
 
-	online = j36_charger_online(p);
+	online = j36_charger_online(p, &con0);
 	if (online < 0) {
 		dev_warn_once(p->dev, "CHRDET unreadable\n");
 		goto again;
+	}
+
+	/*
+	 * MEASURE THE INPUT EVERY POLL, not only when CHRDET has already agreed
+	 * there is something to measure.  Gating the conversion on `online' made
+	 * the two agree by construction: the only reading ever taken was one
+	 * taken because the bit was set, so a bit that could not fall had nothing
+	 * to fall against.  A conversion costs one AUXADC channel a second.
+	 */
+	vchr_valid = !j36_adc_convert(p, J36_ADC_VCHR_CHANNEL, J36_ADC_VCHR_DATA,
+				      &vchr_raw);
+	if (vchr_valid)
+		vchr_mv = j36_vchr_mv(vchr_raw);
+
+	if (vchr_veto && online == 1 && vchr_valid &&
+	    vchr_mv < J36_VCHR_ABSENT_MV) {
+		online = 0;
+		if (!p->vchr_vetoed) {
+			p->vchr_vetoed = true;
+			/* All four CHR_CON0 comparators, because they share the
+			 * word this driver writes and the ADC does not: if the
+			 * detects disagree with the millivolts, the word is the
+			 * suspect and this line is where that shows.  The
+			 * parameter is named because this line is also what a
+			 * wrong divider looks like, and the reader needs to know
+			 * there is a way to answer that without a rebuild. */
+			dev_warn(p->dev,
+				 "CHRDET says a charger but the input measures %d mV: treating the cable as out (CHR_CON0=%04x ldo=%d chrdet=%d lv=%d hv=%d); if a meter disagrees, set vchr_veto=0\n",
+				 vchr_mv, con0,
+				 !!(con0 & J36_CHR_CON0_LDO_DET),
+				 !!(con0 & J36_CHR_CON0_CHRDET),
+				 !!(con0 & J36_CHR_CON0_VCDT_LV_DET),
+				 !!(con0 & J36_CHR_CON0_VCDT_HV_DET));
+		}
+	} else {
+		p->vchr_vetoed = false;
 	}
 
 	/*
@@ -2209,8 +2399,12 @@ static void j36_pmic_poll(struct work_struct *work)
 		j36_ring_push(&p->batsns, bat_raw);
 		j36_ring_push(&p->delta, isense_raw - bat_raw);
 	}
-	if (online && !j36_adc_convert(p, J36_ADC_VCHR_CHANNEL, J36_ADC_VCHR_DATA,
-				       &vchr_raw))
+	/* Pushed here rather than where it was converted, so the plug-edge block
+	 * above cannot forget the one sample that detected the edge.  The
+	 * conversion already happened either way; only the ring is conditional,
+	 * and only because a ring of open-pin readings would be a median about a
+	 * cable that is not there. */
+	if (vchr_valid && online)
 		j36_ring_push(&p->vchr, vchr_raw);
 
 	if (p->batsns.valid)
@@ -2617,7 +2811,7 @@ static int j36_pmic_power_off(struct sys_off_data *data)
 		return NOTIFY_DONE;
 	}
 
-	online = j36_charger_online(p);
+	online = j36_charger_online(p, NULL);
 	dev_emerg(p->dev, "power off: charger %s\n",
 		  online < 0 ? "unreadable" : online ? "ATTACHED" : "absent");
 
