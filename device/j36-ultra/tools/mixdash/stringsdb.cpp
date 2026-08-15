@@ -2024,12 +2024,12 @@ const char *const kPhrases[][Lang::Count] = {
       "A instala o elimina -- dos veces, para estar seguro." },
 
     /* ── media.cpp -- Media ──────────────────────────────────────────────── */
-    { "Nothing playable here.\nB goes up a directory.",
-      "Rien de lisible ici.\nB remonte d'un dossier.",
-      "Niente di riproducibile qui.\nB sale di una cartella.",
-      "Hier ist nichts abspielbar.\nB geht ein Verzeichnis nach oben.",
-      "Nada reproduzível aqui.\nB sobe uma pasta.",
-      "Nada reproducible aquí.\nB sube una carpeta." },
+    { "Nothing playable here.\nThe .. row goes up, B leaves.",
+      "Rien de lisible ici.\nLa ligne .. remonte, B quitte.",
+      "Niente di riproducibile qui.\nLa riga .. sale, B esce.",
+      "Hier ist nichts abspielbar.\nDie Zeile .. geht hinauf, B verlässt.",
+      "Nada reproduzível aqui.\nA linha .. sobe, B sai.",
+      "Nada reproducible aquí.\nLa fila .. sube, B sale." },
     { "up one level",
       "remonter d'un niveau",
       "su di un livello",
@@ -2948,12 +2948,12 @@ const char *const kPhrases[][Lang::Count] = {
       "%1 Zeilen zurück  --  Ab kehrt zurück",
       "recuou %1 linhas  --  Baixo regressa",
       "%1 líneas hacia atrás  --  Abajo regresa" },
-    { "%1x%2  --  B leaves, Menu types, A is Enter",
-      "%1x%2  --  B quitte, Menu écrit, A vaut Entrée",
-      "%1x%2  --  B esce, Menu scrive, A è Invio",
-      "%1x%2  --  B verlässt, Menü schreibt, A ist Eingabe",
-      "%1x%2  --  B sai, Menu escreve, A é Enter",
-      "%1x%2  --  B sale, Menú escribe, A es Intro" },
+    { "%1x%2  --  B leaves, Menu types, A is Enter, FN is Ctrl+C",
+      "%1x%2  --  B quitte, Menu écrit, A vaut Entrée, FN vaut Ctrl+C",
+      "%1x%2  --  B esce, Menu scrive, A è Invio, FN è Ctrl+C",
+      "%1x%2  --  B verlässt, Menü schreibt, A ist Eingabe, FN ist Strg+C",
+      "%1x%2  --  B sai, Menu escreve, A é Enter, FN é Ctrl+C",
+      "%1x%2  --  B sale, Menú escribe, A es Intro, FN es Ctrl+C" },
 
     /* ── keyboard.cpp -- the on-screen keyboard ──────────────────────────── */
     { "shift",
@@ -2968,6 +2968,17 @@ const char *const kPhrases[][Lang::Count] = {
       "UMSCH",
       "MAIÚSC",
       "MAYÚS" },
+    /* The cap that locks upper case.  Every one of these is the word that
+     * language's own keyboards print on the key, not a translation of the
+     * English one: "verr maj" is what a French keyboard says, "bloq mayús" what
+     * a Spanish one does.  They are also all wider than "CAPS" and the cap is
+     * 1.5 spans on a 640-pixel panel, so they are the SHORT forms. */
+    { "CAPS",
+      "VERR",
+      "BLOC",
+      "FEST",
+      "FIXAR",
+      "BLOQ" },
     { "back",
       "retour",
       "canc",

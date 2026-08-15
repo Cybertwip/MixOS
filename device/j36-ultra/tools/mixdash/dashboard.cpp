@@ -266,9 +266,24 @@ bool FilesPage::handleNav(int action)
         enter();
         return true;
     case Joypad::NavLeft:
-    case Joypad::NavBack:
-        /* False at the top of the tree: the shell takes that as "pop me". */
+        /* Up a directory.  This is the ONLY thing that goes up now -- see B
+         * below -- and it is the mirror of Right, which goes down. */
         return leave();
+    case Joypad::NavBack:
+        /*
+         * B leaves the page, from any depth, and never changes directory.
+         *
+         * It used to climb one directory per press and only pop the page once it
+         * reached the top, so the number of presses it took to get back to the
+         * dashboard was however deep the browsing had gone -- and every press on
+         * the way redrew a directory nobody was looking at.  One button doing two
+         * jobs also meant a press could not be predicted without knowing where in
+         * the tree you were.
+         *
+         * m_root is a member and nothing here resets it, so the directory is
+         * remembered across leaving and re-entering the page.
+         */
+        return false;
     default:
         return false;
     }

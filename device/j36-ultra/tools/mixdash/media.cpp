@@ -143,12 +143,63 @@ QString defaultMediaRoot()
     return QDir::rootPath();
 }
 
+/*
+ * ── THE TOP OF THE TREE, AND WHY THERE IS ONE ────────────────────────────────
+ *
+ * This page is the MEDIA browser and /home/virtua is the media directory: it is
+ * the DATA partition, it is the only place on the card the user can put anything,
+ * and it is the only place anything they put is going to be.  Above it is a
+ * Debian rootfs -- /usr/lib full of shared objects, /proc, /sys -- none of which
+ * has a single playable file in it and all of which is reachable by holding Up on
+ * the `..' row.  Walking out into that was not a feature, it was a way to get
+ * lost in a directory of device nodes with nothing on screen to explain how you
+ * got there, on a handheld with no path bar to type your way back from.
+ *
+ * So there is a ceiling and this is it.  It is not a security boundary -- the
+ * Files page still browses the whole disk, and that page is the one whose job
+ * that is -- it is a browser that stays inside what it browses.
+ *
+ * mediaCeiling() is defaultMediaRoot() and not the remembered directory: the
+ * remembered one is where you WERE, which is somewhere under the ceiling, not
+ * the ceiling itself.
+ */
+QString mediaCeiling()
+{
+    return QDir::cleanPath(defaultMediaRoot());
+}
+
+/* True if `dir' is the ceiling or anything beneath it.  Compared with a trailing
+ * separator so that /home/virtua-old is not mistaken for a child of
+ * /home/virtua, which a bare startsWith() would do. */
+bool underCeiling(const QString &dir)
+{
+    const QString top = mediaCeiling();
+    const QString d = QDir::cleanPath(dir);
+
+    if (d == top)
+        return true;
+    return d.startsWith(top.endsWith(QLatin1Char('/')) ? top : top + QLatin1Char('/'));
+}
+
+/* Whatever was asked for if it is inside the tree, the ceiling if it is not.
+ * Every path that reaches m_dir goes through here, so there is one place that
+ * decides and no way round it. */
+QString clampToCeiling(const QString &dir)
+{
+    if (dir.isEmpty())
+        return mediaCeiling();
+    return underCeiling(dir) ? QDir::cleanPath(dir) : mediaCeiling();
+}
+
 /* The remembered root if it is still a directory, the default if not.  Checked
- * again here and not just at load time because the card it named can be pulled. */
+ * again here and not just at load time because the card it named can be pulled.
+ * Clamped as well: a settings file written before the ceiling existed can name
+ * / or /usr, and that would put the page outside the tree on the first frame. */
 QString mediaStartDir()
 {
     const QString remembered = Settings::instance().mediaRoot();
-    return QFileInfo(remembered).isDir() ? remembered : defaultMediaRoot();
+    return QFileInfo(remembered).isDir() ? clampToCeiling(remembered)
+                                         : mediaCeiling();
 }
 
 } /* namespace */
@@ -158,7 +209,9 @@ MediaPage::MediaPage(QWidget *parent)
 {
     m_list = new ListPane(this);
     m_list->setRowHeight(30);
-    m_list->setPlaceholder(tr("Nothing playable here.\nB goes up a directory."));
+    /* Names the row, because the row is now the only way up and an empty
+     * directory is exactly where somebody needs telling. */
+    m_list->setPlaceholder(tr("Nothing playable here.\nThe .. row goes up, B leaves."));
     connect(m_list, &ListPane::activated, this, &MediaPage::onActivated);
     connect(m_list, &ListPane::valueChanged, this, &MediaPage::onValueChanged);
 
@@ -353,7 +406,7 @@ void MediaPage::populate(QString dir)
      * and neither an empty nor a relative path has an absolutePath() to climb to,
      * so a page that got one could be entered and never left.  See
      * defaultMediaRoot() above for how it used to get one. */
-    QDir d(dir.isEmpty() ? defaultMediaRoot() : dir);
+    QDir d(clampToCeiling(dir));
     m_dir = d.absolutePath();
     m_entries.clear();
 
@@ -363,7 +416,15 @@ void MediaPage::populate(QString dir)
         return;
     }
 
-    if (!d.isRoot()) {
+    /*
+     * `..' only while there is somewhere above to go that is still inside the
+     * tree.  The test used to be !d.isRoot(), which meant the row was on every
+     * directory but / and was the way out of the media tree entirely.  Dropping
+     * the row rather than leaving it and refusing the press is deliberate: a row
+     * that is on the list and does nothing reads as a bug, and the absence of the
+     * row is itself the message that this is the top.
+     */
+    if (m_dir != mediaCeiling() && underCeiling(QFileInfo(m_dir).absolutePath())) {
         Entry up;
         up.kind = KindUp;
         up.name = QStringLiteral("..");
@@ -2192,17 +2253,29 @@ bool MediaPage::handleNav(int action)
             return true;
         }
         return false;
-    case Joypad::NavBack: {
-        /* Up a directory first; only leave the page from the top of the tree. */
-        const QString parent = QFileInfo(m_dir).absolutePath();
-        if (!m_dir.isEmpty() && parent != m_dir && QFileInfo(parent).isDir()
-            && m_dir != QDir::rootPath()) {
-            populate(parent);
-            m_list->setCurrent(0);
-            return true;
-        }
+    case Joypad::NavBack:
+        /*
+         * ── B IS THE WAY OUT, NOT THE WAY UP ────────────────────────────────
+         *
+         * B used to climb a directory and only leave the page once it ran out of
+         * parents.  That made the cost of leaving depend on how deep you had
+         * browsed: four directories in, getting back to the dashboard was four
+         * presses, and each one redrew a directory listing nobody wanted to look
+         * at on the way past.  It also meant B did two unrelated jobs, so it was
+         * never possible to know what a press would do without first knowing
+         * where you were.
+         *
+         * Now it does one job, from anywhere: return false, the shell pops the
+         * page, and the dashboard is one press away from every depth.  Going UP
+         * is the `..' row -- manual navigation, the same list, in the same
+         * direction as going down.  Nothing is lost: `..' was always there, and
+         * it is now the only thing that moves the directory.
+         *
+         * m_dir is untouched on the way out and populate() writes it to Settings
+         * on every entry, so coming back lands where you left rather than at the
+         * top -- which is what makes one-press exit cheap instead of destructive.
+         */
         return false;
-    }
     default:
         return false;
     }

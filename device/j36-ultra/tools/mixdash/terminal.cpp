@@ -1546,7 +1546,10 @@ void TerminalPage::paintEvent(QPaintEvent *)
                    ? tr("scrolled back 1 line  --  Down returns")
                    : tr("scrolled back %1 lines  --  Down returns").arg(m_view);
     else
-        foot = tr("%1x%2  --  B leaves, Menu types, A is Enter")
+        /* FN is named here because it is the one binding on this page nobody
+         * would guess: there is no Ctrl key on the case to suggest it, and a
+         * command that will not stop is exactly when the footer gets read. */
+        foot = tr("%1x%2  --  B leaves, Menu types, A is Enter, FN is Ctrl+C")
                    .arg(m_cols).arg(m_rows);
 
     p.setFont(Theme::font(11));

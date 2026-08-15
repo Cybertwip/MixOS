@@ -157,7 +157,13 @@ void Keyboard::buildLayout()
             /* The short row gets the two edits, so backspace is never more than
              * two presses from wherever the cursor is. */
             Cap shift;
-            shift.label = m_layer == 1 ? tr("shift") : tr("SHIFT");
+            /* The label names what the NEXT press gives, which is the rule the
+             * two-state version already followed and the only one that survives
+             * a third state.  It is also the only thing on the glass that tells
+             * one-shot upper from locked upper, since both draw the same caps. */
+            shift.label = m_layer != 1     ? tr("SHIFT")   /* -> one-shot upper */
+                        : m_shiftLatched   ? tr("CAPS")    /* -> locked         */
+                                           : tr("shift");  /* -> lower          */
             shift.special = KeyShift;
             shift.span = 1.5;
             row.prepend(shift);
@@ -288,8 +294,33 @@ void Keyboard::pressCap(const Cap &cap)
         insert(cap.value);
         return;
     case KeyShift:
-        m_layer = (m_layer == 1) ? 0 : 1;
-        m_shiftLatched = (m_layer == 1);
+        /*
+         * Three states, cycled by tapping, which is what every phone keyboard
+         * does and what typing a WPA passphrase on this thing needs.
+         *
+         *     lower  --tap-->  one-shot upper  --tap-->  CAPS LOCK  --tap-->  lower
+         *
+         * It used to be two, and the middle one was missing: shift capitalised
+         * exactly one character and then dropped back, so a key that is genuinely
+         * all upper case -- a network name, a serial, a password somebody wrote
+         * down in capitals -- cost one shift press PER LETTER, with the D-pad
+         * travelling back to the shift cap between each one.  Twelve characters
+         * was twenty-four presses and a wrong one anywhere was invisible in a
+         * password field.
+         *
+         * The two upper states differ only in m_shiftLatched, which insert()
+         * already reads: latched means "for one character" and it drops the layer
+         * after that character; unlatched means the layer stays where it is,
+         * which IS caps lock and needs no other machinery.
+         */
+        if (m_layer != 1) {
+            m_layer = 1;
+            m_shiftLatched = true;      /* one-shot */
+        } else if (m_shiftLatched) {
+            m_shiftLatched = false;     /* locked: stays until tapped again */
+        } else {
+            m_layer = 0;                /* back to lower */
+        }
         buildLayout();
         relayout();
         update();
