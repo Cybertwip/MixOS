@@ -1006,6 +1006,54 @@ static int j36_wlan_domain_table(struct j36_wifi *w, u16 table,
 }
 
 /*
+ * CMD_SET_RX_FILTER -- which classes of received frame the firmware is allowed
+ * to hand to the host at all, as one 32-bit PARAM_PACKET_FILTER_* mask.
+ *
+ * Stock sends this from ndo_set_rx_mode, and Linux calls ndo_set_rx_mode out of
+ * dev_open() before anything can be received, so stock is never running without
+ * having sent it and the firmware's power-on default is whatever it happens to
+ * be.  This driver had no set_rx_mode at all and so never sent the command, and
+ * the symptom was exact: the only data frames that ever arrived were the two
+ * unencrypted EAPOL frames of the four-way handshake, which the firmware punts
+ * to the host whatever the filter says because otherwise no supplicant could
+ * ever run.  Everything else -- the DHCP offer, ARP, router advertisements --
+ * was dropped inside the chip, so the link associated, the handshake completed,
+ * the keys went in, and then the address never came.
+ *
+ * ALL_MULTICAST rather than MULTICAST alone, because the group-address list is
+ * a separate command (CMD_ID_MAC_MCAST_ADDR) that this driver does not send:
+ * asking for MULTICAST with no list installed is asking for the empty set,
+ * which is how IPv6 loses both its router advertisements and its own duplicate
+ * address detection.  Letting every group address up and filtering in the host
+ * costs a handful of frames a second on a home network, and the radio is in
+ * constantly-awake mode anyway.
+ *
+ * DIRECTED is set even though stock's OS layer never sets it -- stock leans on
+ * the firmware always passing frames addressed to the station -- because the
+ * adapter's own shadow copy of this mask starts life as
+ * PARAM_PACKET_FILTER_SUPPORTED, which does include it, and unicast is the one
+ * class where guessing wrong costs the whole link rather than a corner of it.
+ */
+enum {
+	J36_RX_FILTER_DIRECTED		= 0x00000001,
+	J36_RX_FILTER_MULTICAST		= 0x00000002,
+	J36_RX_FILTER_ALL_MULTICAST	= 0x00000004,
+	J36_RX_FILTER_BROADCAST		= 0x00000008,
+};
+
+int j36_wlan_cmd_rx_filter(struct j36_wifi *w)
+{
+	u8 payload[4] = {};
+
+	j36_put_le32(payload, J36_RX_FILTER_DIRECTED |
+			      J36_RX_FILTER_MULTICAST |
+			      J36_RX_FILTER_ALL_MULTICAST |
+			      J36_RX_FILTER_BROADCAST);
+	return j36_wlan_command(w, J36_CMD_SET_RX_FILTER, true, payload,
+				sizeof(payload));
+}
+
+/*
  * Everything wlanAdapterStart does between the firmware download and the first
  * scan that actually talks to the chip, in stock's own order.
  *
@@ -1056,6 +1104,16 @@ int j36_wlan_cmd_configure(struct j36_wifi *w)
 	if (ret) {
 		j36_wifi_fail(w, "wlan-basic-config-refused",
 			      "the WLAN firmware would not take the station address");
+		return ret;
+	}
+
+	/* After the station address and not before it: the DIRECTED class in the
+	 * mask means "addressed to this station", and this is the command that
+	 * tells the firmware which station that is. */
+	ret = j36_wlan_cmd_rx_filter(w);
+	if (ret) {
+		j36_wifi_fail(w, "wlan-rx-filter-refused",
+			      "the WLAN firmware would not take the receive filter; nothing but the 802.1X handshake would ever be received");
 		return ret;
 	}
 

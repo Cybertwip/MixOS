@@ -1192,6 +1192,18 @@ static int j36_wlan_open(struct net_device *ndev)
 		mutex_unlock(&w->lock);
 		return -ENODEV;
 	}
+	/*
+	 * Where stock sends the receive filter: Linux calls ndo_set_rx_mode out
+	 * of dev_open(), and stock's set_rx_mode is the only caller of
+	 * CMD_SET_RX_FILTER on the station path.  It is sent from the adapter
+	 * start as well, so the first open is a harmless repeat -- this one is
+	 * for the down-and-up cycle, after which the adapter start does not run
+	 * again and a firmware that had dropped the mask would go deaf without
+	 * anything saying so.  The command is fire-and-forget and the interface
+	 * still comes up if it fails; the failure is already reported by the
+	 * caller of the same command at attach.
+	 */
+	j36_wlan_cmd_rx_filter(w);
 	wlan->running = true;
 	mutex_unlock(&w->lock);
 

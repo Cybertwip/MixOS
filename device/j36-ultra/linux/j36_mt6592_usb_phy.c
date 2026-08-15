@@ -560,10 +560,19 @@
  */
 #define J36_MUSB_SESSION_GAP_MS		20
 
-/* How many times the poll will re-bounce a session that came up without HM
- * before it gives up and says so once. Two is a retry rather than a loop: if the
- * core will not take host mode after three attempts the fault is not the edge. */
-#define J36_MUSB_HM_KICKS		2u
+/* How many times the poll will re-drive ID and restart a session that came up
+ * without HM before it gives up and says so once. Four is a retry rather than a
+ * loop: each attempt costs about a third of a second of sleeps inside the poll
+ * worker and they are spread over the first fifteen seconds of uptime, and if
+ * the core will not take host mode after five the fault is not the edge.
+ *
+ * It was two while the kick only bounced SESSION, which changed nothing the core
+ * could act on, so more attempts would only have repeated the same non-event.
+ * They do something different now -- see j36_phy_rearm_host() -- and one of the
+ * things they may have to outlast is MUSB's own A-device connect timeout, which
+ * drops the session about a second after it is granted if no connect interrupt
+ * arrives. Giving up while that race is still open is giving up too early. */
+#define J36_MUSB_HM_KICKS		4u
 
 /*
  * And how long the core is given to answer after a session is started, before
@@ -1580,8 +1589,8 @@ static u8 j36_musb_settle(struct j36_usb_phy *p)
  *   nothing enumerated   j36_usb_devices() is the guard the attach latch already
  *                        uses. A device that is up is a role that worked, whatever
  *                        HM reads, and it is never disturbed.
- *   at most two kicks    J36_MUSB_HM_KICKS. Three attempts and the fault is not
- *                        a missing edge; saying so once beats retrying forever.
+ *   a bounded count      J36_MUSB_HM_KICKS. Past that the fault is not a missing
+ *                        edge; saying so once beats retrying forever.
  *   reset on role change only, so unplugging and replugging earns fresh retries
  *                        but a port sitting still does not.
  *

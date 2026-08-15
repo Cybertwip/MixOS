@@ -668,6 +668,7 @@ struct j36_hif_stats {
  */
 #define J36_CMD_POWER_SAVE_MODE		0x06
 #define J36_CMD_ADD_REMOVE_KEY		0x08
+#define J36_CMD_SET_RX_FILTER		0x0b
 #define J36_CMD_SET_DOMAIN_INFO		0x13
 #define J36_CMD_BSS_ACTIVATE_CTRL	0x15
 #define J36_CMD_SET_BSS_INFO		0x16
@@ -969,6 +970,11 @@ u8 j36_wifi_hif_sequence(struct j36_wifi *w);
 /* j36_mt6592_wifi_cmd.c -- the firmware's own protocol, one function per
  * command, plus the receive pump that turns a FIFO into events and frames. */
 int j36_wlan_cmd_configure(struct j36_wifi *w);
+/* Which classes of received frame the firmware may hand up at all.  Stock sends
+ * this from ndo_set_rx_mode and Linux calls that out of dev_open(), so it is
+ * sent from both places this driver has an equivalent of: the adapter start and
+ * every interface up. */
+int j36_wlan_cmd_rx_filter(struct j36_wifi *w);
 int j36_wlan_cmd_scan(struct j36_wifi *w, bool active, u8 *sequence_out);
 int j36_wlan_cmd_channel_request(struct j36_wifi *w, const struct j36_wlan_bss *bss,
 				 u8 *token_out);
