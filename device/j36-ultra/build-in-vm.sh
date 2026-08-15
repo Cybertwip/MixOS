@@ -9677,6 +9677,27 @@ if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" || -n "$MIXMIRROR_BIN" ]]; then
         log "dash: the dashboard was built but its Qt payload was not, so neither is staged"
     fi
 
+    # The startup chime.
+    #
+    # STAGED LIKE THE IWAD AND NOT LIKE THE SPLASH, and the difference is worth
+    # naming because both are files in resources/.  MixOS.jpg is decoded by
+    # tools/jpeg2raw.py at build time into /splash.mixspl in the INITRAMFS, because
+    # it has to be on the glass before any partition is mounted.  This is played by
+    # the dashboard, seconds later, off a filesystem that is by then mounted -- so
+    # it is an ordinary payload asset under share/, in the same shape as Doom's
+    # IWAD, and mixdash looks for it at exactly this path.
+    #
+    # Guarded on the dashboard being staged: nothing else on this card can play it,
+    # and half a megabyte of mp3 that no binary will ever open is half a megabyte of
+    # an image whose whole point is to stay small.
+    if [[ -n "$MIXDASH_BIN" && -n "$QT_PAYLOAD" &&
+          -f "$ROOT/device/j36-ultra/resources/startup.mp3" ]]; then
+        mkdir -p "$SDROOT/opt/mixos/share/mixdash"
+        cp "$ROOT/device/j36-ultra/resources/startup.mp3" \
+           "$SDROOT/opt/mixos/share/mixdash/startup.mp3"
+        log "dash: staged the startup chime into opt/mixos/share/mixdash/"
+    fi
+
     # Doom, and the IWAD under the name doomgeneric's iwads[] table knows it by --
     # d_iwad.c matches the filename before it opens the file.
     if [[ -n "$DOOM_BIN" ]]; then
