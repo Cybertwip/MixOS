@@ -103,6 +103,21 @@ const int kAxis[4] = { ABS_X, ABS_Y, ABS_Z, ABS_RZ };
 const int kRepeatFirstMs = 380;
 const int kRepeatNextMs = 90;
 
+/*
+ * How long FN has to be down before it is a hold and not a tap.
+ *
+ * 700 ms, and the number is borrowed rather than invented: j36-padx uses 1000 for
+ * the same gesture on the same physical key, and the card grid's long press is
+ * 500.  This sits between them because it has to beat both -- longer than a press
+ * anybody meant as a tap, and short enough that it fires before a user who is
+ * holding a button and getting no feedback concludes the device has locked up.
+ *
+ * IT IS ALSO WHY THE TAP GOES OUT ON THE RELEASE.  At 700 ms in, the press has
+ * already been claimed by the hold; a tap that had been sent at press time would
+ * have gone to the Terminal as a Ctrl+C on the way to opening the switcher.
+ */
+const int kFnHoldMs = 700;
+
 int lookup(int code)
 {
     for (size_t i = 0; i < sizeof(kMap) / sizeof(kMap[0]); ++i)
@@ -478,54 +493,64 @@ int Joypad::keyboardCount() const
     return n;
 }
 
-void Joypad::setSuspended(bool suspended)
+void Joypad::setWatching(bool watching)
 {
-    if (m_suspended == suspended)
+    if (m_watching == watching)
         return;
-    m_suspended = suspended;
+    m_watching = watching;
 
-    if (suspended) {
-        m_timer->stop();
-        m_held = NavNone;
-        /* Whatever was down when the child took the input devices is not down as
-         * far as this dashboard is concerned: the release will be delivered to
-         * the child, or discarded by drain() on the way back. */
-        m_down = 0;
-        m_mods = ModNone;
-    } else {
-        /*
-         * Sync BEFORE the drain, and both before the timer restarts.
-         *
-         * The tick is stopped while a child owns the screen, so nothing has been
-         * watching /dev/input for however long the game ran -- and a mouse plugged
-         * in during it, or the one pulled out to make room for a headset, is
-         * exactly the state this dashboard comes back to.  Doing it here rather
-         * than waiting for the next sweep also means the drain that follows flushes
-         * the devices that just appeared as well as the ones that were already
-         * open, which is the whole point of the drain.
-         */
-        syncDevices();
-        m_scanClock.restart();
-        drain();
+    /*
+     * THE TICK KEEPS RUNNING EITHER WAY, and that is the difference between this
+     * and the setSuspended() it replaces -- see the header.  What is reset here
+     * is the state that describes a button the DASHBOARD is holding, because the
+     * dashboard is about to stop being the thing the buttons are for.
+     */
+    m_held = NavNone;
+    /* Whatever was down when the child took the input devices is not down as far
+     * as this dashboard is concerned: the release goes to the child as well, and
+     * m_down being clear is what stops navReleased() firing for a press that, as
+     * far as this program is concerned, never happened. */
+    m_down = 0;
+    m_mods = ModNone;
+    /* The press that opened the switcher, or the one that chose a task with it,
+     * is finished with.  Not clearing this would leave a hold armed across the
+     * handover and fire it again on the far side. */
+    m_fnDown = false;
+    m_fnFired = false;
 
-        /*
-         * AND THE JACK IS RE-READ, because drain() just threw its event away.
-         *
-         * A switch is reported once, when it moves.  Headphones pulled out
-         * halfway through a game are one EV_SW sitting in a descriptor's queue,
-         * and the drain above -- which exists to stop every button the child was
-         * pressed with replaying into the dashboard -- discards it along with
-         * everything else.  EVIOCGSW asks the driver for the level rather than
-         * for the edge, so it does not matter that the edge is gone.
-         */
-        for (Dev &d : m_devs)
-            if (d.jack)
-                jackState(d.fd, &d.jackPlugged);
-        updateJack();
+    if (watching)
+        return;
 
-        m_tick.restart();
-        m_timer->start();
-    }
+    /*
+     * Coming back to the dashboard.  Sync BEFORE the drain, and both before the
+     * clock restarts.
+     *
+     * The sync is less load-bearing than it was -- the once-a-second sweep has
+     * been running all along now -- but it is still the right thing at this exact
+     * moment: a mouse plugged in during a game, or the one pulled out to make
+     * room for a headset, should be on the list before the drain rather than up
+     * to a second afterwards, so that the drain flushes it too.
+     */
+    syncDevices();
+    m_scanClock.restart();
+    drain();
+
+    /*
+     * AND THE JACK IS RE-READ, because drain() just threw its event away.
+     *
+     * A switch is reported once, when it moves.  Headphones pulled out halfway
+     * through a game are one EV_SW sitting in a descriptor's queue, and the drain
+     * above -- which exists to stop every button the child was pressed with
+     * replaying into the dashboard -- discards it along with everything else.
+     * EVIOCGSW asks the driver for the level rather than for the edge, so it does
+     * not matter that the edge is gone.
+     */
+    for (Dev &d : m_devs)
+        if (d.jack)
+            jackState(d.fd, &d.jackPlugged);
+    updateJack();
+
+    m_tick.restart();
 }
 
 void Joypad::drain()
@@ -609,6 +634,35 @@ void Joypad::poll()
             Dev &d = m_devs[i];
             struct input_event ev;
             while (::read(d.fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+                /*
+                 * WATCH MODE: READ EVERYTHING, REPORT ALMOST NOTHING.
+                 *
+                 * The read above still has to happen -- that is what stops this
+                 * program's client buffer filling up behind a child that is in
+                 * front for twenty minutes, and a full buffer is where the input
+                 * core starts SYN_DROPPING.  What must not happen is any of the
+                 * emitting below it, because the buttons belong to the child.
+                 *
+                 * Two events survive.  FN goes through feed(), which is where the
+                 * tap/hold split lives, so the hold can still fire the switcher.
+                 * The jack switch is recorded, because headphones going in during
+                 * a game are still headphones going in and the routing is the
+                 * shell's job no matter who is drawing.  Note that it deliberately
+                 * does NOT clear the pending pointer deltas: nothing accumulated
+                 * them, because EV_REL never reaches relative() from here.
+                 */
+                if (m_watching) {
+                    if (ev.type == EV_KEY && ev.value != 2
+                        && lookup(ev.code) == NavQuit) {
+                        feed(NavQuit, ev.value != 0);
+                    } else if (ev.type == EV_SW
+                               && ev.code == SW_HEADPHONE_INSERT) {
+                        d.jackPlugged = ev.value != 0;
+                        jackMoved = true;
+                    }
+                    continue;
+                }
+
                 if (ev.type == EV_KEY) {
                     /* value 2 is the input core's own autorepeat; ours is below.
                      * A USB keyboard DOES autorepeat, and in text mode that is the
@@ -697,6 +751,30 @@ void Joypad::poll()
         if (jackMoved || !gone.isEmpty())
             updateJack();
     }
+
+    /*
+     * THE HOLD FIRES ON THE TICK, NOT ON THE RELEASE.
+     *
+     * Waiting for the release would mean the switcher only appeared once the user
+     * let go, and a gesture with no feedback until it ends is a gesture people
+     * abandon halfway through -- they hold, nothing happens, they let go.  Firing
+     * at 700 ms means the panel changes UNDER the thumb that is still down, which
+     * is the feedback.  m_fnFired then makes the release a no-op, so leaning on
+     * the button does not open the switcher twice.
+     *
+     * Above the watch-mode return on purpose: this is the one thing that has to
+     * keep working while a child owns the screen, and it is the entire reason the
+     * poll tick no longer stops.
+     */
+    if (m_fnDown && !m_fnFired && m_fnSince.elapsed() >= kFnHoldMs) {
+        m_fnFired = true;
+        emit switcherRequested();
+    }
+
+    /* No pointer and no autorepeat for a program that is not on the glass.  The
+     * stick is under the same thumb that is driving the child. */
+    if (m_watching)
+        return;
 
     driveStick((int)ms);
 
@@ -841,6 +919,41 @@ void Joypad::feed(int action, bool pressed)
      * share it and they would release each other. */
     if (action == NavNone)
         return;
+
+    /*
+     * FN, AND THE ONE BUTTON ON THIS DEVICE THAT IS TWO BUTTONS.
+     *
+     * Intercepted before any of the bookkeeping below, because none of that
+     * bookkeeping applies: FN does not autorepeat, nothing listens for its
+     * release, and the m_down bit exists to pair a release with a press that this
+     * object saw -- which is exactly the pairing being replaced here.
+     *
+     * Down: remember when, and send nothing.  The gesture is not yet decided.
+     * Up:   if the hold already fired, the press has been spent, so the release
+     *       is silent.  Otherwise it was a tap and the press goes out NOW, late
+     *       but complete -- one nav(NavQuit, false), which is precisely what the
+     *       Terminal's Ctrl+C and everything else that reads NavQuit expects.
+     *
+     * A tap is not delivered at all while watching.  The child in front has the
+     * same button and is entitled to it; only the hold is the shell's.
+     */
+    if (action == NavQuit) {
+        if (pressed) {
+            if (!m_fnDown) {
+                m_fnDown = true;
+                m_fnFired = false;
+                m_fnSince.restart();
+            }
+            return;
+        }
+        const bool tap = m_fnDown && !m_fnFired;
+        m_fnDown = false;
+        m_fnFired = false;
+        if (tap && !m_watching)
+            emit nav(NavQuit, false);
+        return;
+    }
+
     const quint32 bit = 1u << (action & 31);
 
     if (!pressed) {

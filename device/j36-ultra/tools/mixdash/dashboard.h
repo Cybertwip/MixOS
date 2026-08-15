@@ -37,12 +37,14 @@
 #ifndef MIXDASH_DASHBOARD_H
 #define MIXDASH_DASHBOARD_H
 
+#include <QByteArray>
 #include <QPointer>
 #include <QString>
 #include <QStringList>
 #include <QVector>
 #include <QWidget>
 
+#include "switcher.h"
 #include "widgets.h"
 
 class Busy;
@@ -282,8 +284,56 @@ private:
     void activate(const AppEntry &entry);
     void launch(const QString &title, const QString &exe, const QStringList &args);
     /* Everything launch() has to undo, in one place, so that the two ways a child
-     * can end -- it exited, it never started -- cannot drift apart. */
-    void childDone(const QString &message);
+     * can end -- it exited, it never started -- cannot drift apart.  `index' is
+     * into m_tasks and the task is removed from the list here. */
+    void childDone(int index, const QString &message);
+
+    /*
+     * ── MULTITASKING, IN FIVE FUNCTIONS ──────────────────────────────────────
+     *
+     * Read setForeground() in dashboard.cpp first; it is the one that carries the
+     * rules, and the other four are in service of it.
+     */
+
+    /*
+     * Give the panel and the pad to one task, or to this dashboard.
+     *
+     * `index' is into m_tasks; -1 means the dashboard itself.  Everything else is
+     * stopped.  Safe to call with the value it already has -- the switcher's
+     * cancel path does exactly that on purpose, so that "put it back" is the same
+     * code as "switch to it" and cannot drift from it.
+     */
+    void setForeground(int index);
+    /*
+     * SIGSTOP whatever is in front and keep its frame, leaving nothing owning the
+     * panel.  The half of setForeground() that launch() needs on its own -- it is
+     * on its way to a program that does not exist yet.
+     */
+    void stopForeground();
+    /*
+     * Stop the task in front, if any, and put the switcher up.  The ordering is
+     * the contract switcher.h describes: nothing may be drawing when the overlay
+     * paints.
+     */
+    void showSwitcher();
+    /* The rows, built from m_tasks.  Row 0 is always this dashboard, so row n+1
+     * is task n and setForeground(row - 1) is the inverse. */
+    QVector<Switcher::Entry> switcherRows() const;
+    /* New rows for a switcher that is already up.  Does nothing when it is not,
+     * which is most of the time, so callers need not check. */
+    void refreshSwitcher();
+    /*
+     * Ask a task to go away: SIGCONT and then SIGTERM to its process group.
+     *
+     * THE SIGCONT IS NOT OPTIONAL.  A stopped process cannot run a signal
+     * handler, so SIGTERM on its own would sit pending against a program that
+     * never gets the chance to act on it -- the task would look closed, stay in
+     * the list, and only die when something else eventually continued it.
+     */
+    void closeTask(int index);
+    /* Where a QProcess is in m_tasks, or -1.  By pointer and not by a captured
+     * index, because closing one task renumbers every task after it. */
+    int indexOfTask(QProcess *proc) const;
     /* Not launch(): a shutdown is the one child that must not be waited for, and
      * the one that needs the panel to say so first.  See dashboard.cpp. */
     void powerOff();
@@ -345,13 +395,75 @@ private:
     QString m_armedExe;
 
     /*
-     * The launched child, while there is one.  Null the rest of the time, and that
-     * null is also the "may I start another" test -- there is one framebuffer and
-     * one set of input devices, so two children would be two programs drawing over
-     * each other with the pad going to neither.
+     * ── THE TASKS ────────────────────────────────────────────────────────────
+     *
+     * This was `QPointer<QProcess> m_child' and a title, and the null was the "may
+     * I start another" test.  There is a list now, and switcher.h explains at
+     * length why one-at-a-time was the wrong rule to draw from a board with one
+     * framebuffer.  What has NOT changed is the part that was always true: one of
+     * these owns the panel and the rest are stopped.
      */
-    QPointer<QProcess> m_child;
-    QString m_childTitle;
+    /*
+     * How many programs may be up at once, not counting this dashboard.
+     *
+     * Four, and both halves of the number are real.  It is what switcher.cpp can
+     * lay out without a scrollbar on a 480 px panel -- five rows including the
+     * dashboard's -- and it is about as much as 946 MB of RAM will hold, given
+     * that a browser session is an X server plus Firefox and that alone is a
+     * third of it.  A fifth task would be a switcher that scrolls leading to an
+     * out-of-memory kill.
+     */
+    static const int kMaxTasks = 4;
+
+    struct Task {
+        /* A QPointer so a QProcess destroyed some other way cannot be mistaken
+         * for a running one -- the same reason m_child was one. */
+        QPointer<QProcess> proc;
+        QString title;
+        /* What was launched.  Kept so that pressing the same card twice switches
+         * to the copy that is running instead of starting a second one. */
+        QString exe;
+        /*
+         * The process group, which is the pid because launch() makes every child
+         * a group leader.  Signals go to -pid: a session is a shell that runs
+         * xinit that forks an X server, and stopping only the shell would leave
+         * the server drawing over the switcher.
+         *
+         * Kept as a number of its own rather than read from `proc' at signal
+         * time, because a QProcess that has finished answers 0 for its pid and
+         * the SIGCONT on the way out of a close is sent to a task that is on its
+         * way to being finished.
+         */
+        qint64 pgid = 0;
+        bool stopped = false;
+        /*
+         * The panel as this task last drew it, while it is stopped.  Cleared the
+         * moment it is put back, so the memory is only spent on tasks that are
+         * actually in the background.  See panel.h for why an event-driven
+         * program needs this and a game does not.
+         */
+        QByteArray frame;
+    };
+
+    QVector<Task> m_tasks;
+    /*
+     * Who is in front: an index into m_tasks, or -1 for this dashboard.
+     *
+     * -1 IS NOT "NOTHING IS RUNNING".  Tasks can be running -- stopped, but alive
+     * -- with the dashboard in front, and that is the ordinary state after the
+     * switcher is used to come back to the grid.  m_tasks.isEmpty() is the test
+     * for nothing running, and the two are asked for different reasons.
+     */
+    int m_fg = -1;
+    Switcher *m_switcher = nullptr;
+    /* Which row the switcher was opened on, so that cancelling puts back exactly
+     * what was in front rather than whatever the highlight has since moved to. */
+    int m_switcherWas = -1;
+    /*
+     * Polls SwitcherRequest::take().  Runs only while a task is in front, which
+     * is the only time anything can send that signal -- see switcher.h.
+     */
+    QTimer *m_requestTimer = nullptr;
 };
 
 #endif /* MIXDASH_DASHBOARD_H */

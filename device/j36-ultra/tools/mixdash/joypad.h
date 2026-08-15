@@ -136,11 +136,44 @@ public:
     bool jackPlugged() const { return m_jackPlugged; }
 
     /*
-     * Off while a child process owns the screen, then on again with whatever
-     * arrived in the meantime thrown away -- otherwise every button the child was
-     * pressed with replays into the dashboard the moment it exits.
+     * ── WATCH MODE: A CHILD OWNS THE SCREEN, AND ONE BUTTON STILL COMES BACK ──
+     *
+     * This used to be setSuspended(), and what it did was stop the poll tick
+     * dead for as long as a launched program was up.  That was right when a
+     * launch was a one-way door -- the child had the machine until it exited --
+     * and it is wrong now that FN is a task switcher, because a switcher whose
+     * button is not being read is a switcher you cannot reach.
+     *
+     * So the tick keeps running and the reading keeps happening; what stops is
+     * the REPORTING.  In watch mode every event is read and dropped except two:
+     *
+     *   FN, which is fed through so its hold can fire switcherRequested()
+     *   SW_HEADPHONE_INSERT, because headphones going in during a game are
+     *   still headphones going in, and jack routing is the shell's job whoever
+     *   is in front
+     *
+     * Nothing else emits: no nav, no key, no pointer, no autorepeat.  The child
+     * has the input devices and this is not competing for them.
+     *
+     * READING THE SAME DEVICE TWICE IS NOT A CONFLICT.  Every open of an evdev
+     * node gets its own copy of the stream, so the child sees every event this
+     * one sees and neither takes anything from the other.  Draining continuously
+     * is in fact the point: with the tick stopped, this program's client buffers
+     * used to fill up and the input core would start SYN_DROPPING into them.
+     *
+     * THE ONE PLACE IT DOES NOT WORK is a child that calls EVIOCGRAB, which is
+     * j36-padx during a browser session -- a grab means the kernel delivers to
+     * the grabber and to nobody else, and that grab is deliberate.  That case is
+     * covered from the other end: mixdash puts its own pid in the child's
+     * environment as MIXDASH_PID and j36-padx sends SIGUSR1 to it when Menu is
+     * held.  See the comment above Dashboard::showSwitcher().
+     *
+     * Coming back out re-scans the devices, re-reads the jack level and drops
+     * whatever is queued, because the button the user let go of to get here is
+     * not a button the dashboard should act on.
      */
-    void setSuspended(bool suspended);
+    void setWatching(bool watching);
+    bool watching() const { return m_watching; }
 
     /*
      * Text mode: a page that wants characters rather than actions.  Keyboard-class
@@ -226,6 +259,33 @@ signals:
     void key(int code, bool pressed, int modifiers);
 
     /*
+     * FN was held down rather than tapped: put the task switcher up.
+     *
+     * ── WHY FN IS SPLIT IN TWO AND NOT SIMPLY REASSIGNED ─────────────────────
+     *
+     * FN is BTN_MODE, the MENU key on the keypad matrix, and outside the
+     * Terminal it has never done anything: Dashboard::onNav lets NavQuit fall
+     * through to `default' and nothing happens.  Inside the Terminal it is
+     * Ctrl+C, and that is the one binding on that page nobody could otherwise
+     * reach -- there is no Ctrl key on this device.  Taking the button outright
+     * would take the interrupt key away with it.
+     *
+     * A hold is also the right gesture for the OTHER reason, which is that while
+     * a child is in front the child sees this button too.  A tap is a plausible
+     * thing to send a game; three quarters of a second of one button held is
+     * not, and it is the same gesture j36-padx already uses on the same key for
+     * the same reason.
+     *
+     * SO THE TAP IS DELIVERED ON THE RELEASE.  A press cannot be sent at press
+     * time any more, because at press time it is not yet known which of the two
+     * gestures it is going to be -- sending both would type Ctrl+C into the
+     * Terminal every time somebody reached for the switcher.  The cost is that
+     * FN acts a few milliseconds later than the other buttons, and for an
+     * interrupt key that is not a cost anybody can perceive.
+     */
+    void switcherRequested();
+
+    /*
      * Something went into the headphone jack, or came out of it.
      *
      * EMITTED ONLY WHILE THERE IS A DETECT LINE TO BELIEVE.  A driver that stops
@@ -304,9 +364,20 @@ private:
 
     QVector<Dev> m_devs;
     QTimer *m_timer = nullptr;
-    bool m_suspended = false;
+    bool m_watching = false;
     bool m_textMode = false;
     int m_mods = ModNone;
+
+    /*
+     * FN's press, while it is down.  Separate from m_held and m_down on purpose:
+     * those two are about autorepeat and about matching releases to presses, and
+     * this is about telling two gestures apart on one button.  m_fnFired is what
+     * stops the hold firing twice on a button somebody keeps leaning on, and it
+     * is also what makes the release do nothing once the hold has gone.
+     */
+    bool m_fnDown = false;
+    bool m_fnFired = false;
+    QElapsedTimer m_fnSince;
 
     /* The current answer to the two accessors, so a consumer can ask without
      * this having to walk the device list on every call. */
@@ -325,7 +396,7 @@ private:
      * A quint32 and not a QSet: there are fourteen actions and this is tested on
      * every key event.  It exists so navReleased() cannot fire for a press that
      * never happened -- the keypad matrix and a USB gamepad both map to BTN_SOUTH
-     * here, so one physical press can arrive twice, and setSuspended() throws
+     * here, so one physical press can arrive twice, and setWatching() throws
      * presses away whose releases arrive afterwards.
      */
     quint32 m_down = 0;

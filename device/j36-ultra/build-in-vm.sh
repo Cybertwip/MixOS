@@ -11293,6 +11293,171 @@ Section "ServerLayout"
 EndSection
 XORGCONF
 
+    # ── The on-screen keyboard's layout ──────────────────────────────────────
+    #
+    # THE STOCK MATCHBOX LAYOUT CANNOT TYPE ".com".  That is not an exaggeration
+    # and it is worth being precise about, because it is the whole reason this
+    # file exists.  Debian's matchbox-keyboard ships keyboard.xml, which includes
+    # base-fragment.xml, which is 127 lines and three rows: q..p and backspace,
+    # a..l and return, shift and z..m and space.  No digits.  No full stop.  No
+    # slash, no colon, no at sign, no symbols layer of any kind.  The one shift
+    # key on it is a one-shot that only ever reaches A..Z.  A person handed that
+    # keyboard and a URL bar cannot type an address, an email, or a password.
+    #
+    # So the browser gets the dashboard's keyboard instead -- the same shape, the
+    # same key names, the same four-rows-of-ten grid, and the same two things the
+    # user asked for by name: a special characters button and a caps lock that
+    # STAYS DOWN.  See tools/mixdash/keyboard.cpp for the original; kLower,
+    # kUpper and kSymbols there are what the layers below are built from.
+    #
+    # HOW THE THREE LAYERS MAP ONTO A KEYBOARD THAT ONLY HAS MODIFIERS.  mixdash
+    # switches whole layers -- m_layer is 0, 1 or 2 and buildLayout() redraws.
+    # matchbox has no layer concept at all; it has per-key faces and a keyboard
+    # state, and each <key> may carry a <default>, a <shifted>, a <caps> and a
+    # <mod1>/<mod2>/<mod3>.  Whichever face matches the current state is the one
+    # drawn and the one sent.  So:
+    #
+    #   <default>  is mixdash's lower layer
+    #   <shifted>  is its upper layer, reached by shift or held by caps
+    #   <mod2>     is its symbols layer, reached by the ?123 key
+    #
+    # IT HAS TO BE mod2 AND NOT mod1.  mod1 adds FAKEKEYMOD_META to every
+    # synthesized press, so a symbols layer built on mod1 types Meta+[ instead of
+    # [ and the browser sees a shortcut, not a bracket.  mod2 and mod3 add no
+    # flags.  This uses mod2; mod3 is left free.
+    #
+    # AND IT HAS TO BE LOWERCASE.  config_str_to_modtype() matches the modifier
+    # name with a case-sensitive streq against a lowercase table, so "modifier:
+    # Caps" -- which is how the upstream README writes it -- parses to nothing
+    # and produces a key that draws correctly and does absolutely nothing.  Every
+    # modifier below is spelled the way ModLookup[] spells it.
+    #
+    # THE CAPS LOCK IS A REAL LOCK.  action="modifier:caps" toggles
+    # MBKeyboardStateCaps, and unlike shift and mod2 that state is never cleared
+    # on the next key release -- those two are one-shot, caps is not.  The key
+    # also carries a <caps> face, which is what the drawing code reaches for
+    # first when the lock is on, so it reads "caps" when it is off and "CAPS"
+    # when it is on: the lock is visible, which was the complaint.  The letters
+    # carry obey-caps="true" and follow it to their <shifted> face; the digits
+    # and the punctuation deliberately do not, so a locked keyboard still types
+    # 1 and . and / rather than ! and > and ?.  Long-pressing shift for 700 ms
+    # toggles the same lock, which is upstream behaviour and worth knowing.
+    #
+    # WHAT ACTUALLY FIXES ".com" IS NONE OF THAT.  A layer switch you have to
+    # find is still a layer switch, so the characters an address bar is made of
+    # are on the base layer where no modifier can move them: the digit row is
+    # row one, and - , . / : @ are all one press with nothing held.  Typing
+    # .com is four keys.  The four punctuation keys have no <mod2> face at all,
+    # on purpose -- a key with no face for the current state falls back to its
+    # <default>, so the full stop is a full stop in every layer of this
+    # keyboard rather than something that moves when ?123 is down.
+    #
+    # The same fallback is why back, enter, tab, shift, space and the arrows
+    # keep working and keep their labels in the symbols layer without needing a
+    # <mod2> face each.
+    #
+    # Row widths are in thousandths of a base key and every row here totals
+    # 11500, which is eleven and a half keys across 640 px -- about 55 px each,
+    # a comfortable thumb target.  The space bar is fill="true" and takes the
+    # 3000 the bottom row leaves it.
+    #
+    # One honest limitation: caps lock and the symbols layer do not combine.
+    # With the lock on, a letter's obey-caps wins and draws its <shifted> face,
+    # so ?123 reaches the symbols on the digit row but not the ones parked on
+    # the letters.  Turn the lock off first.  It is an upstream ordering in the
+    # drawing and sending paths both, so at least it is consistent.
+    mkdir -p "$SDROOT/opt/mixos/share/keyboard"
+    cat > "$SDROOT/opt/mixos/share/keyboard/j36-keyboard.xml" <<'KEYBOARDXML'
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Written by device/j36-ultra/build-in-vm.sh for the J36 Ultra's browser session.
+  It mirrors the dashboard keyboard in tools/mixdash/keyboard.cpp.  Do not edit
+  this file on the card: the next image writes over it.  Edit the builder.
+
+  Selected by MB_KBD_CONFIG in /opt/mixos/bin/j36-browser-session, which beats
+  every other place matchbox looks, so Debian's own keyboard.xml is left alone.
+-->
+<keyboard>
+
+  <layout id="j36">
+
+    <!-- Digits, and the symbols a password is made of, one shift away. -->
+    <row>
+      <key><default display="1"/><shifted display="!"/><mod2 display="`"/></key>
+      <key><default display="2"/><shifted display="@"/><mod2 display="~"/></key>
+      <key><default display="3"/><shifted display="#"/><mod2 display="|"/></key>
+      <key><default display="4"/><shifted display="$"/><mod2 display="\"/></key>
+      <key><default display="5"/><shifted display="%"/><mod2 display="°"/></key>
+      <key><default display="6"/><shifted display="^"/><mod2 display="€"/></key>
+      <key><default display="7"/><shifted display="&amp;"/><mod2 display="£"/></key>
+      <key><default display="8"/><shifted display="*"/><mod2 display="¥"/></key>
+      <key><default display="9"/><shifted display="("/><mod2 display="¢"/></key>
+      <key><default display="0"/><shifted display=")"/><mod2 display="§"/></key>
+      <key width="1500"><default display="back" action="backspace"/></key>
+    </row>
+
+    <!-- q..p, and the brackets on the symbols layer. -->
+    <row>
+      <key obey-caps="true"><default display="q"/><shifted display="Q"/><mod2 display="["/></key>
+      <key obey-caps="true"><default display="w"/><shifted display="W"/><mod2 display="]"/></key>
+      <key obey-caps="true"><default display="e"/><shifted display="E"/><mod2 display="{"/></key>
+      <key obey-caps="true"><default display="r"/><shifted display="R"/><mod2 display="}"/></key>
+      <key obey-caps="true"><default display="t"/><shifted display="T"/><mod2 display="("/></key>
+      <key obey-caps="true"><default display="y"/><shifted display="Y"/><mod2 display=")"/></key>
+      <key obey-caps="true"><default display="u"/><shifted display="U"/><mod2 display="&lt;"/></key>
+      <key obey-caps="true"><default display="i"/><shifted display="I"/><mod2 display="&gt;"/></key>
+      <key obey-caps="true"><default display="o"/><shifted display="O"/><mod2 display="«"/></key>
+      <key obey-caps="true"><default display="p"/><shifted display="P"/><mod2 display="»"/></key>
+      <key width="1500"><default display="enter" action="return"/></key>
+    </row>
+
+    <!-- a..l, the hyphen that every URL and package name needs, and tab. -->
+    <row>
+      <key obey-caps="true"><default display="a"/><shifted display="A"/><mod2 display="+"/></key>
+      <key obey-caps="true"><default display="s"/><shifted display="S"/><mod2 display="="/></key>
+      <key obey-caps="true"><default display="d"/><shifted display="D"/><mod2 display="*"/></key>
+      <key obey-caps="true"><default display="f"/><shifted display="F"/><mod2 display="/"/></key>
+      <key obey-caps="true"><default display="g"/><shifted display="G"/><mod2 display="%"/></key>
+      <key obey-caps="true"><default display="h"/><shifted display="H"/><mod2 display="¡"/></key>
+      <key obey-caps="true"><default display="j"/><shifted display="J"/><mod2 display="¿"/></key>
+      <key obey-caps="true"><default display="k"/><shifted display="K"/><mod2 display="÷"/></key>
+      <key obey-caps="true"><default display="l"/><shifted display="L"/><mod2 display="×"/></key>
+      <key><default display="-"/><shifted display="_"/></key>
+      <key width="1500"><default display="tab" action="tab"/></key>
+    </row>
+
+    <!-- z..m, and the comma, full stop and slash that stay put in every layer. -->
+    <row>
+      <key width="1500"><default display="shift" action="modifier:shift"/></key>
+      <key obey-caps="true"><default display="z"/><shifted display="Z"/><mod2 display="&quot;"/></key>
+      <key obey-caps="true"><default display="x"/><shifted display="X"/><mod2 display="'"/></key>
+      <key obey-caps="true"><default display="c"/><shifted display="C"/><mod2 display=";"/></key>
+      <key obey-caps="true"><default display="v"/><shifted display="V"/><mod2 display=":"/></key>
+      <key obey-caps="true"><default display="b"/><shifted display="B"/><mod2 display="&amp;"/></key>
+      <key obey-caps="true"><default display="n"/><shifted display="N"/><mod2 display="!"/></key>
+      <key obey-caps="true"><default display="m"/><shifted display="M"/><mod2 display="?"/></key>
+      <key><default display=","/><shifted display="&lt;"/></key>
+      <key><default display="."/><shifted display="&gt;"/></key>
+      <key><default display="/"/><shifted display="?"/></key>
+    </row>
+
+    <!-- The lock, the symbols button, and the rest of an address bar. -->
+    <row>
+      <key width="1500"><default display="caps" action="modifier:caps"/><caps display="CAPS" action="modifier:caps"/></key>
+      <key width="1500"><default display="?123" action="modifier:mod2"/><mod2 display="abc" action="modifier:mod2"/></key>
+      <key><default display=":"/><shifted display=";"/></key>
+      <key><default display="@"/><shifted display="~"/></key>
+      <key fill="true"><default display="space" action="space"/></key>
+      <key><default display="&lt;" action="left"/></key>
+      <key><default display="&gt;" action="right"/></key>
+      <key width="1500"><default display="esc" action="escape"/></key>
+    </row>
+
+  </layout>
+
+</keyboard>
+KEYBOARDXML
+
     # The launcher.  This is what the dashboard runs, and it does four things: work
     # out which browser is on the card, work out where the URL comes from, make the
     # writable directories on tmpfs, and hand the whole lot to xinit.
@@ -11494,8 +11659,26 @@ fi
 # It types with XTEST through libfakekey, so it never takes focus away from the
 # browser it is typing into -- and it starts AFTER the window manager because
 # daemon mode busy-waits for one before it will realize its window at all.
+#
+# MB_KBD_CONFIG IS WHAT MAKES IT THE DASHBOARD'S KEYBOARD AND NOT DEBIAN'S.  The
+# stock layout has no digits and no punctuation whatsoever -- it cannot type
+# ".com" -- so the browser gets the layout the builder stages next to xorg.conf,
+# with the ?123 symbols button and the locking caps key.  Read config-parser.c's
+# search order backwards and this variable is the first thing it checks: a full
+# path here overrides $HOME/.matchbox/keyboard.xml and the packaged file both,
+# which is the point.  Debian's own files are left exactly as installed.
+#
+# It is only set if the file is really there, so a card that predates it still
+# gets a keyboard -- the old useless one, but a keyboard.
+#
+# --fontptsize 10 over the built-in 8: five rows at 10 pt is about 200 px of the
+# 480 this panel has, and 8 pt on a key 55 px wide reads as a smudge in the hand.
 if [ -x /usr/bin/matchbox-keyboard ]; then
-    matchbox-keyboard --daemon >/dev/null 2>&1 &
+    if [ -r /opt/mixos/share/keyboard/j36-keyboard.xml ]; then
+        MB_KBD_CONFIG=/opt/mixos/share/keyboard/j36-keyboard.xml
+        export MB_KBD_CONFIG
+    fi
+    matchbox-keyboard --daemon --fontptsize 10 >/dev/null 2>&1 &
     KBD=$!
 fi
 
@@ -11658,7 +11841,7 @@ kill -9 "$PAGE" 2>/dev/null
 exit 0
 BROWSERSESSION
     chmod 0755 "$SDROOT/opt/mixos/bin/j36-browser-session"
-    log "dash: staged the browser session into opt/mixos/bin/ and opt/mixos/share/xorg/"
+    log "dash: staged the browser session into opt/mixos/bin/, opt/mixos/share/xorg/ and opt/mixos/share/keyboard/"
 
     # The start page.
     #
@@ -11729,6 +11912,25 @@ screen, the D-pad for landing on a small link.</p>
 <p>To type a URL: <b>Start</b>, then <b>Select</b> for the keyboard, then tap the
 keys with <b>A</b>, then <b>X</b> for Enter. A USB keyboard or mouse in the dock
 works too, and is much faster.</p>
+
+<h2>The keyboard</h2>
+
+<p>It is laid out like the dashboard's: digits along the top, letters below, and
+everything an address is made of on the face of the keys, so
+<b>.com</b> is four taps with nothing held down.
+<b>&minus;</b>&nbsp;<b>,</b>&nbsp;<b>.</b>&nbsp;<b>/</b>&nbsp;<b>:</b>&nbsp;<b>@</b>
+are all there without switching anything.</p>
+
+<table>
+<tr><td class="k">shift</td><td>next letter only &mdash; hold it to lock instead</td></tr>
+<tr><td class="k">caps</td><td>locks; reads <b>CAPS</b> while it is on, tap again to release</td></tr>
+<tr><td class="k">?123</td><td>the symbols on the other faces of the keys, for the
+next key you press. Tap it again, or press <b>abc</b>, to come back</td></tr>
+<tr><td class="k">&lt; &gt;</td><td>move the text cursor left and right</td></tr>
+</table>
+
+<p>Caps lock and <b>?123</b> do not stack: with the lock on you get capitals, not
+symbols. Release the lock first.</p>
 
 <p>So does a USB gamepad &mdash; Xbox, PlayStation, Switch or a plain one. Plug it
 in and it drives this page with the same bindings, whether the browser is already

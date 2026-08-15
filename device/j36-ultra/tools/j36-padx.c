@@ -53,6 +53,13 @@
  * X's.  It is released by closing the fd, which happens on every exit path
  * including a signal, so a crash here gives the pad back rather than wedging it.
  *
+ * AND IT IS HANDED BACK FOR THE SWITCHER.  Holding Menu now asks mixdash to show
+ * the list of what is running instead of closing this session, and mixdash drives
+ * that list with the pad -- which it cannot read while this process has it.  So
+ * the grab is given up at that moment and taken again on SIGCONT, when the
+ * dashboard lets this session run in front once more.  set_grab() is where both
+ * halves are, and the hold in main() says why the order matters.
+ *
  * WHAT IS DELIBERATELY NOT GRABBED.  A USB keyboard or mouse in the dock is a
  * real X input device that libinput will pick up and drive properly, and it must
  * keep working.  So the match is narrow -- see looks_like_pad() -- and a device
@@ -293,6 +300,31 @@ static void close_pads(void)
         close(pad_fd[i]);
         clear_pad(i);
     }
+}
+
+/*
+ * Take the pad, or give it back, without closing anything.
+ *
+ * ADDED FOR THE TASK SWITCHER, and it is worth saying why a grab has to be
+ * temporary now.  Holding Menu used to close this session outright; it asks
+ * mixdash for its switcher instead (see the hand-over in main()), and mixdash
+ * cannot show a switcher it is unable to drive.  The grab is what stops it
+ * reading the pad, and a grab is a property of the open descriptor -- it survives
+ * this process being SIGSTOP'd along with the rest of the session, so "we are
+ * stopped, so we are not using it" is not something the kernel knows.  It has to
+ * be handed back explicitly, before the stop, and taken again afterwards.
+ *
+ * A failure is ignored on purpose: the ungrab side cannot meaningfully fail, and
+ * on the way back in something else having taken the device is the same case
+ * scan_pads() already tolerates -- the session keeps working, and the dashboard
+ * sees the buttons too.
+ */
+static void set_grab(int on)
+{
+    int i;
+    for (i = 0; i < MAX_PADS; i++)
+        if (pad_fd[i] >= 0)
+            (void)ioctl(pad_fd[i], EVIOCGRAB, on ? 1 : 0);
 }
 
 static int pad_count(void)
@@ -1017,12 +1049,33 @@ static void on_signal(int sig)
     stop_asked = 1;
 }
 
+/*
+ * This session has just been let run again.
+ *
+ * mixdash stops the whole process group when the switcher takes the panel, and
+ * continues it when the user comes back -- so SIGCONT is the only notification
+ * this process gets that it is in front once more, and the one thing it has to do
+ * about it is take the pad back.  A flag and nothing else: the re-grab is an
+ * ioctl per device and belongs in the loop, not in a handler.
+ *
+ * Harmless when nothing stopped us.  SIGCONT is delivered to a process that was
+ * never stopped as well, and a re-grab of a device already grabbed is a no-op.
+ */
+static volatile sig_atomic_t cont_asked;
+
+static void on_cont(int sig)
+{
+    (void)sig;
+    cont_asked = 1;
+}
+
 static void usage(void)
 {
     fprintf(stderr,
         "j36-padx -- the J36 Ultra pad as an X pointer and keyboard\n"
         "\n"
-        "  --watch PID       quit when PID exits; Menu held sends it SIGTERM\n"
+        "  --watch PID       quit when PID exits; Menu held closes the session,\n"
+        "                    or asks $MIXDASH_PID for its task switcher instead\n"
         "  --display NAME    which server (default $DISPLAY)\n"
         "  --no-grab         read the pad without taking it from other readers\n"
         "  --list            name the devices that would be used, then exit\n"
@@ -1072,6 +1125,20 @@ int main(int argc, char **argv)
     const char *display_name = NULL;
     pid_t watch_pid = 0;
     int grab = 1, list_only = 0;
+    /*
+     * Whether the pad is grabbed AT THIS MOMENT, as against whether it was asked
+     * for on the command line.  The two differ for as long as the switcher is up:
+     * see the hand-over below.
+     */
+    int grabbing;
+    /*
+     * The dashboard, if this session was started by one.  mixdash puts its pid in
+     * every child's environment; nothing else sets this, and when it is unset --
+     * j36-padx run by hand, or a session started some other way -- the Menu hold
+     * keeps the behaviour it has always had and closes the session.
+     */
+    pid_t mixdash_pid = 0;
+    const char *mixdash_env;
     int i, xt_event, xt_error, xt_major, xt_minor;
 
     long move_last = 0, next_scan = 0;
@@ -1093,6 +1160,12 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+
+    mixdash_env = getenv("MIXDASH_PID");
+    if (mixdash_env && *mixdash_env)
+        mixdash_pid = (pid_t)strtol(mixdash_env, NULL, 10);
+    if (mixdash_pid < 0)
+        mixdash_pid = 0;
 
     for (i = 0; i < MAX_PADS; i++)
         clear_pad(i);
@@ -1117,6 +1190,9 @@ int main(int argc, char **argv)
      * gets to them; a write to a dead X connection must not take the process out
      * before close_pads() has run. */
     signal(SIGPIPE, SIG_IGN);
+    /* The dashboard's switcher stopped this whole group and has now let it run
+     * again; the pad has to be taken back.  See on_cont(). */
+    signal(SIGCONT, on_cont);
 
     dpy = XOpenDisplay(display_name);
     if (!dpy) {
@@ -1145,7 +1221,8 @@ int main(int argc, char **argv)
      * nothing and the alternative is doing this inside a button press. */
     atom_im_command = XInternAtom(dpy, "_MB_IM_INVOKER_COMMAND", False);
 
-    if (!scan_pads(grab)) {
+    grabbing = grab;
+    if (!scan_pads(grabbing)) {
         fail("no pad among /dev/input/event*, so nothing can drive this session "
              "-- run with --list to see what was rejected");
         XCloseDisplay(dpy);
@@ -1392,14 +1469,68 @@ int main(int argc, char **argv)
          */
         if (now >= next_scan) {
             next_scan = now + RESCAN_MS;
-            scan_pads(grab);
+            scan_pads(grabbing);
         }
 
+        /*
+         * ── MENU HELD: THE SWITCHER, OR THE OLD WAY OUT ──────────────────────
+         *
+         * With a dashboard behind this session the gesture means "show me what is
+         * running", which is what the same hold means everywhere else on this
+         * device.  Closing the browser is one of the things that switcher can do,
+         * so nothing has been taken away -- it has been moved behind a screen
+         * that says what it is about to close.
+         *
+         * THE PAD GOES BACK BEFORE THE SIGNAL, and that ordering is the whole
+         * trick.  mixdash is about to draw a switcher and drive it with the pad;
+         * it cannot read a device this process has grabbed, and a moment later it
+         * will stop this process -- with the grab still held, because a grab
+         * belongs to the descriptor and not to whether its owner is scheduled.
+         * Handing it over first is the only order that leaves a usable switcher.
+         *
+         * Then the hold is cleared and this carries on as normal.  The SIGSTOP
+         * arrives when it arrives; nothing here has to wait for it, and if it
+         * never comes -- a dashboard that has since died, a pid that has been
+         * reused -- the session is exactly as it was, minus a grab it takes back
+         * on the next SIGCONT or keeps living without.
+         *
+         * With no dashboard to ask, the old behaviour stands unchanged.
+         */
         if (menu_down_at && now - menu_down_at >= MENU_HOLD_MS) {
-            note("Menu held, closing the session");
-            if (watch_pid > 0)
-                kill(watch_pid, SIGTERM);
-            break;
+            if (mixdash_pid > 0 && kill(mixdash_pid, 0) == 0) {
+                note("Menu held, asking the dashboard for its switcher");
+                set_grab(0);
+                grabbing = 0;
+                kill(mixdash_pid, SIGUSR1);
+                menu_down_at = 0;
+                /* The buttons that were down belong to a session that is about to
+                 * be stopped, and their releases will be delivered to a switcher
+                 * instead.  Cancelling the repeats here is what stops a shoulder
+                 * paging the browser for the whole time the switcher is up. */
+                rep_clear();
+            } else {
+                note("Menu held, closing the session");
+                if (watch_pid > 0)
+                    kill(watch_pid, SIGTERM);
+                break;
+            }
+        }
+
+        /*
+         * Let run again: back in front, so the pad is ours once more.
+         *
+         * Checked after the hold and not before it, so that the two cannot fight
+         * over one trip round the loop -- a SIGCONT that arrived while Menu was
+         * still being held would otherwise re-grab in the same iteration that
+         * gave the pad away.
+         */
+        if (cont_asked) {
+            cont_asked = 0;
+            if (grab && !grabbing) {
+                note("continued by the dashboard, taking the pad back");
+                set_grab(1);
+                grabbing = 1;
+            }
         }
 
         /*

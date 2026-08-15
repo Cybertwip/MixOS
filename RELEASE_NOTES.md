@@ -148,7 +148,8 @@ together, because a device out of a box does not know where it is and everything
 follows from where it is is the same question.
 
 **Terminal**, **Info**, **Power off**, and a **Browser** session — Firefox on an X server on
-the framebuffer, with the pad usable inside it.
+the framebuffer, with the pad usable inside it and an on-screen keyboard laid out like the
+dashboard's.
 
 **Virtual keyboard.** Three ways in at once, all live: the D-pad walks the grid and A
 presses, the pointer clicks a key, and a real USB keyboard types straight through. Shift
@@ -196,6 +197,22 @@ filesystem check is skipped when the superblock already says `clean` (and forced
 `j36.expand=fsck`), roughly halving the window; the splash carries **Do not turn the device
 off** for the duration; and a card left damaged by an interrupted grow says **Reflash MixOS
 into the installation media** rather than presenting as an intermittent fault.
+
+**The browser's on-screen keyboard could not type `.com`.** Not an exaggeration — the
+session was using matchbox-keyboard's packaged layout, which is three rows: `q`–`p` and
+backspace, `a`–`l` and return, shift and `z`–`m` and space. No digits, no full stop, no
+slash, no colon, no at sign, no symbols layer of any kind, and its one shift key was a
+one-shot that only ever reached `A`–`Z`. Handed that keyboard and an address bar, there is
+no address you can type.
+
+The browser now uses a layout built to match the dashboard's, staged to
+`/opt/mixos/share/keyboard/` and selected with `MB_KBD_CONFIG` — Debian's own files are
+left as installed. Digits are the top row; `-` `,` `.` `/` `:` `@` are on the base layer
+where no modifier can move them, so `.com` is four taps with nothing held. A **`?123`** key
+reaches the brackets, currency and the rest of the symbol set on the other faces of the
+keys, and a **`caps`** key is a real lock — it holds until pressed again and reads `CAPS`
+while it is on, so the state is visible. Caps and `?123` do not stack; with the lock on you
+get capitals.
 
 **The battery collapsed to 0% after a full charge.** Three defects in the gauge, all in
 `j36_mt6592_pmic.c`:

@@ -76,6 +76,7 @@
 #include "media.h"
 #include "region.h"
 #include "stringsdb.h"
+#include "switcher.h"
 #include "trace.h"
 #include "disks.h"
 
@@ -351,6 +352,25 @@ void onTerm(int)
 }
 
 /*
+ * SIGUSR1 -- "put the task switcher up".
+ *
+ * The odd one out among the handlers in this file: every other one here is a
+ * program on its way down, and this one is a request from a child that is very
+ * much alive.  j36-padx grabs the pad during a browser session, so this process
+ * cannot see the button being held; it sends this instead.  switcher.h has the
+ * whole story and Dashboard polls for it.
+ *
+ * ONE STORE AND NOTHING ELSE.  Not a Qt call, not a print, not an allocation --
+ * a signal can land between any two instructions of the main thread, including
+ * the middle of malloc, and everything this handler is allowed to touch is the
+ * one volatile sig_atomic_t inside SwitcherRequest::post().
+ */
+void onSwitcher(int)
+{
+    SwitcherRequest::post();
+}
+
+/*
  * WHICH BUILD IS ON THE GLASS.  This board is updated across two partitions by two
  * different means: the boot image -- kernel, initramfs, /init -- is dragged onto the
  * vfat BOOT partition, which is the only one a Mac can write, while this binary lives
@@ -592,6 +612,7 @@ int main(int argc, char **argv)
                  ::strerror(errno));
 
     ::signal(SIGALRM, onStall);
+    ::signal(SIGUSR1, onSwitcher);
     ::signal(SIGTERM, onTerm);
     ::signal(SIGINT, onTerm);
     ::signal(SIGHUP, onTerm);

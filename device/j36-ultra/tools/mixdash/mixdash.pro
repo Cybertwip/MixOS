@@ -59,6 +59,8 @@ SOURCES += \
     stringsdb.cpp \
     pointer.cpp \
     keyboard.cpp \
+    switcher.cpp \
+    panel.cpp \
     volume.cpp \
     busy.cpp \
     settingspage.cpp \
@@ -85,6 +87,8 @@ HEADERS += \
     stringsdb.h \
     pointer.h \
     keyboard.h \
+    switcher.h \
+    panel.h \
     volume.h \
     busy.h \
     settingspage.h \

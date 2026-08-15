@@ -12,11 +12,13 @@
 #include "keyboard.h"
 #include "media.h"
 #include "packages.h"
+#include "panel.h"
 #include "pointer.h"
 #include "region.h"
 #include "settingspage.h"
 #include "sharing.h"
 #include "stringsdb.h"
+#include "switcher.h"
 #include "terminal.h"
 #include "theme.h"
 #include "trace.h"
@@ -33,15 +35,23 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QRadialGradient>
 #include <QResizeEvent>
 #include <QTimer>
 
+#include <signal.h>
+#include <unistd.h>
+
 /*
- * There is no <linux/vt.h>, <linux/kd.h>, <sys/ioctl.h>, <sys/wait.h>, <signal.h>,
- * <fcntl.h>, <errno.h>, <string.h> or <unistd.h> here any more.  They were all for
- * the Console card's fork-a-shell-onto-a-spare-VT, which is gone; launching is
- * QProcess::execute and nothing else in this file speaks to the kernel directly.
+ * There is no <linux/vt.h>, <linux/kd.h>, <sys/ioctl.h>, <sys/wait.h>, <fcntl.h>,
+ * <errno.h> or <string.h> here any more.  They were all for the Console card's
+ * fork-a-shell-onto-a-spare-VT, which is gone.
+ *
+ * <signal.h> and <unistd.h> ARE back, and for one thing each: kill(-pgid, ...),
+ * which is how a task in the background is stopped and continued, and setpgid(),
+ * which is what makes there be a -pgid to send it to.  Both are in launch() and
+ * setForeground() and nowhere else in this file.
  */
 
 namespace {
@@ -318,6 +328,39 @@ Dashboard::Dashboard(QWidget *parent)
     connect(m_keyboard, &Keyboard::finished, this, &Dashboard::onKeyboardFinished);
 
     /*
+     * Last of the overlays, because it is the only one that has to appear over a
+     * program this shell does not own -- see switcher.h.  Its three signals are
+     * indices into the rows switcherRows() built, and row 0 is this dashboard, so
+     * every one of them is `row - 1' away from a task.
+     */
+    Trace::step("Switcher overlay");
+    m_switcher = new Switcher(this);
+    connect(m_switcher, &Switcher::chosen, this, [this](int row) {
+        setForeground(row - 1);
+    });
+    connect(m_switcher, &Switcher::closeRequested, this, [this](int row) {
+        closeTask(row - 1);
+    });
+    connect(m_switcher, &Switcher::dismissed, this, [this]() {
+        /* Cancel is "put back what was in front", and it is the ordinary switch
+         * rather than a path of its own so that the two cannot drift apart. */
+        setForeground(m_switcherWas);
+    });
+
+    /*
+     * The other way in.  A child that grabbed the pad sends SIGUSR1 and main.cpp's
+     * handler sets a flag; this is what notices.  Quarter of a second is under the
+     * time it takes to let go of a button, and the timer only runs while a task is
+     * in front -- which is the only time anything can send that signal.
+     */
+    m_requestTimer = new QTimer(this);
+    m_requestTimer->setInterval(250);
+    connect(m_requestTimer, &QTimer::timeout, this, [this]() {
+        if (SwitcherRequest::take())
+            showSwitcher();
+    });
+
+    /*
      * The pad comes before the Diagnostics page because that page reports on it --
      * how many devices are open, how many of them look like a mouse -- and holding
      * the pointer to a Joypad that does not exist yet would be a null on the first
@@ -386,6 +429,7 @@ Dashboard::Dashboard(QWidget *parent)
     connect(m_pad, &Joypad::deviceRemoved, this, &Dashboard::onInputDeviceRemoved);
     connect(m_pad, &Joypad::devicesChanged, this, &Dashboard::refreshInputSummary);
     connect(m_pad, &Joypad::headphoneJack, this, &Dashboard::onHeadphoneJack);
+    connect(m_pad, &Joypad::switcherRequested, this, &Dashboard::showSwitcher);
 
     /* Stats every candidate executable on the card. */
     Trace::step("buildPages -- looks for the apps on disk");
@@ -942,6 +986,10 @@ void Dashboard::applyChrome()
         m_volumeBar->raise();
     if (m_busy->isVisible())
         m_busy->raise();
+    /* Over all of them, because it is the only overlay that is on the glass while
+     * a program outside this process is what the panel belongs to. */
+    if (m_switcher->isVisible())
+        m_switcher->raise();
     m_pointer->raise();
 
     /* Leaving a film is the one cursor mode change nothing else notices: the arrow
@@ -989,6 +1037,10 @@ void Dashboard::resizeEvent(QResizeEvent *event)
     /* Centred on the whole panel, for the same reason: the page it is waiting for
      * is usually the one that has taken the status bar away. */
     m_busy->placeIn(rect());
+
+    /* The whole panel too, and for the strongest version of that reason: what it
+     * covers is not a page at all but a stopped program. */
+    m_switcher->setGeometry(rect());
 
     applyChrome();
     QWidget::resizeEvent(event);
@@ -1367,6 +1419,46 @@ void Dashboard::toast(const QString &text, int ms)
     m_toastTimer->start(ms);
 }
 
+namespace {
+
+/*
+ * ── ITS OWN PROCESS GROUP, AND WHY A TASK IS NOT A PROCESS ───────────────────
+ *
+ * The Browser card starts a shell script, which execs xinit, which forks an X
+ * server and a second shell script, which starts a window manager, an on-screen
+ * keyboard, a pad bridge and Firefox.  That is one TASK and nine processes, and
+ * stopping the one this program has a pid for would stop the shell and leave the
+ * X server drawing over the switcher.
+ *
+ * setpgid(0, 0) between fork and exec makes the whole tree one group -- nothing
+ * in it calls setsid, which was checked rather than assumed -- so
+ * kill(-pgid, ...) reaches all of it.  It cannot be done from this side of the
+ * fork: setpgid() on a child that has already exec'd fails with EACCES, and
+ * started() is emitted after the exec, so by the time there is a pid to use it is
+ * too late to use it.
+ *
+ * Hence a subclass.  setupChildProcess() is Qt 5's hook for exactly this and it
+ * is the only one Qt 5 has -- setChildProcessModifier(), which would have saved
+ * these eight lines, is Qt 6, and the armhf chroot has 5.15.15.  The override
+ * runs in the forked child, so it may call nothing that is not
+ * async-signal-safe: setpgid is one syscall and it is on the list.
+ *
+ * No Q_OBJECT: this adds no signals, slots or properties, so it needs no
+ * metaobject of its own, and connecting to QProcess's own signals through a base
+ * pointer works exactly as it did.
+ */
+class GroupLeaderProcess : public QProcess
+{
+public:
+    explicit GroupLeaderProcess(QObject *parent = nullptr)
+        : QProcess(parent) {}
+
+protected:
+    void setupChildProcess() override { ::setpgid(0, 0); }
+};
+
+}
+
 /*
  * ── A LAUNCH DOES NOT STOP THE EVENT LOOP ANY MORE ───────────────────────────
  *
@@ -1390,19 +1482,44 @@ void Dashboard::toast(const QString &text, int ms)
  *   for this window and every child of it, the status-bar clock and the console
  *   guard's update() included.
  *
- *   THERE MUST BE ONLY ONE.  One panel, one set of input devices.  m_child being
- *   non-null is that test, and it is a QPointer so a child whose QProcess was
- *   destroyed some other way cannot be mistaken for a running one.
+ *   THERE MUST BE ONLY ONE ON THE GLASS.  One panel, one set of input devices.
+ *   That sentence used to end "ONLY ONE" and the test for it was m_child being
+ *   null, which meant a second card could not be opened at all -- switcher.h is
+ *   the long version of why that was the wrong rule to draw.  Several children
+ *   run now; exactly one is in front and every other one is stopped by the
+ *   kernel, so the count of programs able to draw is still exactly one.
+ *
+ *   AND THERE IS A CEILING.  kMaxTasks, because each background task holds a
+ *   framebuffer's worth of pixels (panel.h) and, far more expensively, its own
+ *   address space: this board has 946 MB and a browser session on its own is a
+ *   third of it.  Four is what the switcher can show without scrolling and it is
+ *   more than this device can comfortably hold at once.
  */
 void Dashboard::launch(const QString &title, const QString &exe, const QStringList &args)
 {
-    if (m_child) {
-        toast(tr("%1 is still running").arg(m_childTitle));
+    if (exe.isEmpty() || !QFileInfo(exe).isExecutable()) {
+        toast(tr("%1 is not on this card").arg(title));
         return;
     }
 
-    if (exe.isEmpty() || !QFileInfo(exe).isExecutable()) {
-        toast(tr("%1 is not on this card").arg(title));
+    /*
+     * THE SAME CARD TWICE IS THE SAME PROGRAM, NOT A SECOND ONE.
+     *
+     * Pressing a card whose program is already running switches to it.  Starting
+     * a second copy would be wrong for the browser (two X servers on one
+     * framebuffer) and merely wasteful for everything else, and "it is already
+     * running, go and find it in the switcher" is an error message for a problem
+     * the shell can simply solve.
+     */
+    for (int i = 0; i < m_tasks.size(); ++i) {
+        if (m_tasks[i].exe != exe)
+            continue;
+        setForeground(i);
+        return;
+    }
+
+    if (m_tasks.size() >= kMaxTasks) {
+        toast(tr("Too many things are running -- close one first"));
         return;
     }
 
@@ -1415,9 +1532,16 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
     m_toast->repaint();
     QCoreApplication::processEvents();
 
-    /* The child gets the input devices to itself, and whatever it was pressed with
-     * is discarded before the dashboard listens again. */
-    m_pad->setSuspended(true);
+    /*
+     * Anything already in front is stopped before the new one is started, so that
+     * the two never overlap on the panel even for the length of an exec.  -1 is
+     * not used here: this is on its way to the new task, not back to the grid.
+     */
+    stopForeground();
+
+    /* The child gets the input devices, and this keeps reading them for one
+     * button -- see the watch-mode comment in joypad.h. */
+    m_pad->setWatching(true);
     m_pointer->sleep();
 
     /*
@@ -1431,9 +1555,9 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
     m_busy->setPointerStyle(false);
     m_busy->start(title);
 
-    m_childTitle = title;
-    QProcess *child = new QProcess(this);
-    m_child = child;
+    /* Its own process group, so the whole tree can be stopped and continued as
+     * one thing -- see GroupLeaderProcess above. */
+    QProcess *child = new GroupLeaderProcess(this);
     /*
      * Inherited, which is what QProcess::execute did and what the child wants: its
      * output belongs wherever this program's own went -- the console before the
@@ -1442,24 +1566,48 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
      */
     child->setProcessChannelMode(QProcess::ForwardedChannels);
 
-    connect(child, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
+    /*
+     * MIXDASH_PID, so a child that has taken the pad away from this program can
+     * still ask for the switcher.  Only j36-padx does that today; the variable is
+     * set for every child because a rule with one exception is a rule that gets
+     * the exception wrong.  See switcher.h.
+     */
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.insert(QStringLiteral("MIXDASH_PID"),
+               QString::number(QCoreApplication::applicationPid()));
+    child->setProcessEnvironment(env);
+
+    connect(child, &QProcess::errorOccurred, this, [this, child](QProcess::ProcessError e) {
         /* Only the one that has no exit code to come.  Crashed, Timedout and the
          * write errors all still reach finished(), and handling them here as well
          * would report the same child twice. */
-        if (e == QProcess::FailedToStart)
-            childDone(tr("%1 would not start").arg(m_childTitle));
+        if (e != QProcess::FailedToStart)
+            return;
+        const int i = indexOfTask(child);
+        if (i >= 0)
+            childDone(i, tr("%1 would not start").arg(m_tasks[i].title));
     });
     connect(child, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
-            [this](int code, QProcess::ExitStatus status) {
+            [this, child](int code, QProcess::ExitStatus status) {
+        /*
+         * Looked up by pointer, every time.  The index this task had when it was
+         * started is not the index it has now -- closing an earlier one shifts
+         * every task after it -- and a captured index would report the wrong
+         * program's exit and remove the wrong row.
+         */
+        const int i = indexOfTask(child);
+        if (i < 0)
+            return;
+        const QString what = m_tasks[i].title;
         if (status == QProcess::CrashExit)
-            childDone(tr("%1 crashed").arg(m_childTitle));
+            childDone(i, tr("%1 crashed").arg(what));
         else if (code != 0)
-            childDone(tr("%1 exited %2").arg(m_childTitle).arg(code));
+            childDone(i, tr("%1 exited %2").arg(what).arg(code));
         else
-            childDone(tr("%1 exited").arg(m_childTitle));
+            childDone(i, tr("%1 exited").arg(what));
     });
 
-    connect(child, &QProcess::started, this, [this]() {
+    connect(child, &QProcess::started, this, [this, child]() {
         /*
          * The child is running and every pixel is its business from here.  Updates
          * go off HERE and not straight after start(): between the two calls this
@@ -1468,42 +1616,309 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
          */
         m_busy->stop();
         setUpdatesEnabled(false);
+        const int i = indexOfTask(child);
+        if (i < 0)
+            return;
+        /*
+         * The pid is only real once the fork has happened, which is what started()
+         * means.  It is the group id too, because setupChildProcess() made the
+         * child its own leader.
+         */
+        m_tasks[i].pgid = child->processId();
+        m_fg = i;
+        /* Something outside this process can ask for the switcher now, and only
+         * now.  See switcher.h. */
+        m_requestTimer->start();
     });
+
+    Task task;
+    task.proc = child;
+    task.title = title;
+    task.exe = exe;
+    m_tasks.append(task);
 
     child->start(exe, args);
 }
 
-void Dashboard::childDone(const QString &message)
+void Dashboard::childDone(int index, const QString &message)
 {
-    if (QProcess *p = m_child.data()) {
-        m_child.clear();
+    if (index < 0 || index >= m_tasks.size())
+        return;
+
+    if (QProcess *p = m_tasks[index].proc.data()) {
         p->disconnect(this);
         p->deleteLater();
     }
-    m_childTitle.clear();
+    const bool wasForeground = (m_fg == index);
+    m_tasks.remove(index);
+
+    /*
+     * The indices after the removed one have all moved down by one.  m_fg is an
+     * index, so it moves with them -- and the task that was in front is the one
+     * case where it does not point at anything any more.
+     */
+    if (wasForeground)
+        m_fg = -1;
+    else if (m_fg > index)
+        --m_fg;
 
     /* Either it never started or it has stopped; either way nothing is loading.
      * Idempotent, so the usual case -- started() took the ring down already --
      * costs nothing here. */
     m_busy->stop();
 
-    m_pad->setSuspended(false);
+    /*
+     * A background task exiting changes the switcher's list and nothing else.  It
+     * is not on the glass, it did not have the pad, and taking the dashboard out
+     * of the state a DIFFERENT task put it in would be a game losing its input
+     * because something finished behind it.
+     */
+    if (!wasForeground) {
+        refreshSwitcher();
+        toast(message);
+        return;
+    }
 
     /*
-     * The child had the framebuffer, so every pixel is suspect.  A child that set a
-     * mode of its own through /dev/dri/card0 has taken the scanout away from the
-     * LK's simple-framebuffer as well, and no amount of repainting here brings that
-     * back -- which is worth knowing when a launch comes back to a black panel.
-     *
-     * setUpdatesEnabled(true) marks this widget dirty by itself; the children were
-     * never dirtied while updates were off, so they are asked explicitly.
+     * It was the one in front, so the panel is free.  Where it goes depends on
+     * whether anything else is left: with a background task waiting this could
+     * switch straight to it, and deliberately does not -- a program ending should
+     * put the user somewhere they chose to be, not somewhere the exit order
+     * chose for them.
      */
+    setForeground(-1);
+    toast(message);
+}
+
+/*
+ * ── WHO OWNS THE PANEL ───────────────────────────────────────────────────────
+ *
+ * The single rule this whole feature rests on: ONE TASK RUNS, EVERY OTHER TASK IS
+ * STOPPED.  Not throttled, not asked to idle -- SIGSTOP, so the kernel will not
+ * schedule it and it cannot write a pixel into a framebuffer it still has mapped.
+ * That is what makes a compositor unnecessary on a board that has no compositor.
+ *
+ * The order inside this function is the part that matters, and every step of it
+ * is there because the other order is visibly wrong:
+ *
+ *   1. Stop what is in front, and keep its frame.  Stop first, copy second: a
+ *      running program can be halfway through drawing and the copy would tear.
+ *   2. Turn updates off before anything is put back, and on again only when this
+ *      dashboard is the thing that should be drawing.  Qt flushes dirty regions,
+ *      so a repaint that arrives after step 3 would land on top of a resumed
+ *      program's screen.
+ *   3. Put the incoming task's frame back, THEN continue it.  panel.h says why:
+ *      a game redraws immediately and does not need this, an X server redraws
+ *      only damage and would otherwise leave the switcher on the glass for as
+ *      long as the page sat still.
+ *   4. Hand the pad over last, so no button can be delivered to a task that is
+ *      not yet running.
+ */
+void Dashboard::setForeground(int index)
+{
+    if (index >= m_tasks.size())
+        index = -1;
+
+    stopForeground();
+
+    /* The switcher, if it is up, is coming down whatever was chosen -- including
+     * the case where what was chosen is what was already in front. */
+    if (m_switcher->isVisible())
+        m_switcher->dismiss();
+    m_switcherWas = -1;
+
+    if (index < 0) {
+        /*
+         * Back to the dashboard.  It draws every pixel of itself, so nothing is
+         * restored here -- and a frame kept for the dashboard would be a frame of
+         * a grid that may have changed while a game was in front.
+         */
+        m_fg = -1;
+        m_requestTimer->stop();
+        m_pad->setWatching(false);
+
+        /*
+         * The child had the framebuffer, so every pixel is suspect.  A child that
+         * set a mode of its own through /dev/dri/card0 has taken the scanout away
+         * from the LK's simple-framebuffer as well, and no amount of repainting
+         * here brings that back -- which is worth knowing when a launch comes
+         * back to a black panel.
+         *
+         * setUpdatesEnabled(true) marks this widget dirty by itself; the children
+         * were never dirtied while updates were off, so they are asked
+         * explicitly.
+         */
+        setUpdatesEnabled(true);
+        update();
+        if (m_current)
+            m_current->update();
+        return;
+    }
+
+    Task &task = m_tasks[index];
+
+    /* Off before the frame goes back, and it stays off for as long as this task
+     * is in front.  See the numbered note above. */
+    setUpdatesEnabled(false);
+    Panel::restore(task.frame);
+    task.frame.clear();
+
+    if (task.stopped && task.pgid > 0) {
+        ::kill(-(pid_t)task.pgid, SIGCONT);
+        task.stopped = false;
+    }
+
+    m_fg = index;
+    m_pointer->sleep();
+    m_pad->setWatching(true);
+    m_requestTimer->start();
+}
+
+/*
+ * Freeze whatever is in front, if it is a task.  Split out of setForeground()
+ * because launch() needs exactly this half and none of the rest: it is on its way
+ * to a program that does not exist yet, so there is nothing to hand the panel to.
+ */
+void Dashboard::stopForeground()
+{
+    if (m_fg < 0 || m_fg >= m_tasks.size())
+        return;
+
+    Task &task = m_tasks[m_fg];
+    if (task.pgid > 0 && !task.stopped) {
+        ::kill(-(pid_t)task.pgid, SIGSTOP);
+        task.stopped = true;
+        /* AFTER the stop.  panel.h: a program that is still running can be in
+         * the middle of a frame, and what is wanted is the last thing the user
+         * actually saw. */
+        task.frame = Panel::grab();
+    }
+    m_fg = -1;
+}
+
+int Dashboard::indexOfTask(QProcess *proc) const
+{
+    for (int i = 0; i < m_tasks.size(); ++i)
+        if (m_tasks[i].proc.data() == proc)
+            return i;
+    return -1;
+}
+
+void Dashboard::closeTask(int index)
+{
+    if (index < 0 || index >= m_tasks.size())
+        return;
+
+    Task &task = m_tasks[index];
+    if (task.pgid <= 0)
+        return;
+
+    /*
+     * SIGCONT FIRST, and the header says why: a stopped process cannot run a
+     * signal handler, so SIGTERM on its own would sit pending against something
+     * that never gets to act on it.  The task would vanish from the switcher and
+     * carry on existing.
+     *
+     * Then SIGTERM, and then nothing.  There is no SIGKILL after a timeout here:
+     * the browser session's own teardown gives its X server thirty seconds and
+     * kills it itself, and a shell that decided a program had had long enough
+     * would be second-guessing a script that already handles it.  A task that
+     * genuinely ignores SIGTERM stays in the list, which is at least honest.
+     */
+    ::kill(-(pid_t)task.pgid, SIGCONT);
+    task.stopped = false;
+    ::kill(-(pid_t)task.pgid, SIGTERM);
+
+    /*
+     * The row is not removed here.  finished() is what removes it, through
+     * childDone(), and letting the exit do it means the list says "still there"
+     * for the half-second a browser takes to tear an X server down -- which is
+     * true, and better than a row that disappears while the program behind it is
+     * still on the way out.
+     */
+    toast(tr("Closing %1").arg(task.title));
+    refreshSwitcher();
+}
+
+/*
+ * ── PUTTING THE SWITCHER UP ──────────────────────────────────────────────────
+ *
+ * The contract switcher.h describes, in the order it has to happen: stop the task
+ * in front FIRST, so that when the overlay paints there is nothing else writing
+ * to /dev/fb0 and ordinary Qt painting is enough.  Then take the pad back, since
+ * the switcher is driven by it and the task that had it is no longer running.
+ *
+ * Reachable two ways and they meet here: Joypad::switcherRequested (FN held) and
+ * SwitcherRequest::take() (SIGUSR1 from a child that grabbed the pad).
+ */
+void Dashboard::showSwitcher()
+{
+    if (m_switcher->isVisible())
+        return;
+
+    /* Remembered before anything is stopped, because stopForeground() clears
+     * m_fg and cancelling has to put back what was actually in front. */
+    m_switcherWas = m_fg;
+    stopForeground();
+
+    m_requestTimer->stop();
+    /* Full reporting again: the switcher is driven by the D-pad, A, B and Menu,
+     * none of which arrive in watch mode. */
+    m_pad->setWatching(false);
+
+    /*
+     * Shown while updates are still off, so the dashboard underneath is never
+     * painted for the one frame between the two calls.  The switcher is opaque
+     * and covers the panel, so the repaint that follows draws it and nothing
+     * else.
+     */
+    m_switcher->setGeometry(rect());
+    m_switcher->open(switcherRows(), m_switcherWas + 1);
     setUpdatesEnabled(true);
     update();
-    if (m_current)
-        m_current->update();
+    /* The arrow belongs on top of every overlay, the same way the toast puts it
+     * back.  Asleep behind a task, awake if this was opened from the grid. */
+    m_pointer->raise();
+}
 
-    toast(message);
+/*
+ * The rows, and the mapping between a row and a task: row 0 is this dashboard,
+ * row n+1 is m_tasks[n].  One function so the two directions cannot disagree --
+ * setForeground(row - 1) is the whole of the inverse.
+ */
+QVector<Switcher::Entry> Dashboard::switcherRows() const
+{
+    QVector<Switcher::Entry> rows;
+
+    Switcher::Entry home;
+    home.title = tr("Dashboard");
+    home.detail = m_tasks.isEmpty() ? tr("nothing else is running")
+                                    : tr("cards and settings");
+    /* The one row that cannot be closed.  A flag rather than an index test, so
+     * switcher.cpp never has to know that row 0 is special. */
+    home.closable = false;
+    rows.append(home);
+
+    for (int i = 0; i < m_tasks.size(); ++i) {
+        Switcher::Entry e;
+        e.title = m_tasks[i].title;
+        /*
+         * "running" is the truth for the one in front and for one that is about
+         * to be: a stopped task is stopped because it is not being looked at, and
+         * telling the user their browser is "stopped" invites them to think it
+         * crashed.  The word for the state that matters is which one is in front,
+         * and the highlight already says that.
+         */
+        e.detail = (i == m_fg || i == m_switcherWas) ? tr("in front") : tr("waiting");
+        rows.append(e);
+    }
+    return rows;
+}
+
+void Dashboard::refreshSwitcher()
+{
+    if (m_switcher && m_switcher->isVisible())
+        m_switcher->refresh(switcherRows());
 }
 
 /*
@@ -1556,7 +1971,20 @@ void Dashboard::powerOff()
     curtain->repaint();
     QCoreApplication::processEvents();
 
-    m_pad->setSuspended(true);
+    /*
+     * THE PAD IS DISCONNECTED, not suspended.  There is no setSuspended() any more
+     * -- watch mode keeps reading, because a task switcher whose button is not
+     * read is a switcher nobody can reach -- and "keeps reading" is exactly what
+     * this one path does not want.  Everything after this line is a machine on its
+     * way down behind a curtain, and a switcher opened over it, or a card grid
+     * walked under it, would both be the shell answering buttons that can no
+     * longer lead anywhere.
+     *
+     * Severed and not re-connected, because this function has no other side: the
+     * request has gone to PID 1 and the only way back is a power cycle.
+     */
+    m_pad->disconnect(this);
+    m_pad->setWatching(true);
     m_pointer->sleep();
     QProcess::startDetached(exe, QStringList());
 }
@@ -1805,6 +2233,18 @@ void Dashboard::onNav(int action, bool repeat)
         return;
     }
 
+    /*
+     * The switcher is above even the keyboard, and it is the one overlay that
+     * swallows everything rather than passing on what it does not want.  It has
+     * to: the thing underneath it is a stopped program or a page that is not on
+     * the glass, and acting on either would be acting on something the user
+     * cannot see.  handleNav() returns false only when it is not up at all.
+     */
+    if (m_switcher->isVisible()) {
+        if (m_switcher->handleNav(action))
+            return;
+    }
+
     /* The keyboard is an overlay, so it gets first refusal: Back closes it rather
      * than popping the page being typed into. */
     if (m_keyboard->isVisible()) {
@@ -1820,10 +2260,13 @@ void Dashboard::onNav(int action, bool repeat)
      * control rather than an effect of the one that was pressed.  A button whose
      * only behaviour is to describe another button is a button with no behaviour.
      *
-     * FN is now the page's, like any other action -- the Terminal makes it the
-     * interrupt key, which is the thing a handheld with no Ctrl key cannot
-     * otherwise do -- and a page that has no use for it lets it fall through to
-     * the switch below, where it lands on `default' and nothing happens.  Nothing
+     * A TAP OF FN IS STILL THE PAGE'S, and a HOLD never arrives here at all.
+     * Joypad splits the two -- see the switcherRequested() comment in joypad.h --
+     * so holding it goes straight to showSwitcher() through a signal of its own,
+     * and what reaches this function is only ever the tap.  The Terminal makes
+     * that tap the interrupt key, which is the thing a handheld with no Ctrl key
+     * cannot otherwise do; a page with no use for it lets it fall through to the
+     * switch below, where it lands on `default' and nothing happens.  Nothing
      * happening is the honest outcome and it is silent.
      *
      * Quitting is still not among the options, and NavQuit keeps its name only
@@ -1897,7 +2340,7 @@ void Dashboard::onNavReleased(int action)
 {
     if (action == Joypad::NavVolumeUp || action == Joypad::NavVolumeDown)
         return;
-    if (m_keyboard->isVisible())
+    if (m_keyboard->isVisible() || m_switcher->isVisible())
         return;
 
     PageWidget *page = current();
