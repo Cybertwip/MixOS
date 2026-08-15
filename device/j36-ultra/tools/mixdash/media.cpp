@@ -57,6 +57,18 @@ QString firstExisting(const QStringList &paths)
     return QString();
 }
 
+/* One argument for /bin/sh, safe whatever is in it.  Single quotes protect
+ * everything except a single quote, and the standard dance closes the string,
+ * escapes one, and opens it again.  Used by exactly one caller -- playOnce() --
+ * and written properly anyway, because the one thing a quoting helper must never
+ * be is nearly right. */
+QString shellQuote(const QString &s)
+{
+    QString out = s;
+    out.replace(QLatin1String("'"), QLatin1String("'\\''"));
+    return QLatin1Char('\'') + out + QLatin1Char('\'');
+}
+
 /*
  * Kill a child and forget it, in the one order that works.
  *
@@ -1049,11 +1061,55 @@ QString MediaPage::ffmpegPath()
     return path;
 }
 
-QString MediaPage::aplayPath() const
+QString MediaPage::aplayPath()
 {
     static const QString path = firstExisting(QStringList()
                                               << "/usr/bin/aplay" << "/bin/aplay");
     return path;
+}
+
+/*
+ * ── ONE SOUND, ONCE, WITH NOBODY WAITING FOR IT ─────────────────────────────
+ *
+ * The startup chime, and anything else this shell ever wants to make a noise
+ * about.  It is here rather than in main.cpp because everything it has to get
+ * right is here already: which ffmpeg, which card, and the fact that `default' is
+ * a trap on this image -- see the header.
+ *
+ * DETACHED, and that is the whole design.  A chime that the dashboard waited for
+ * would be a dashboard that does not appear until the sound has finished, which
+ * is the exact failure this batch of work exists to remove.  Nothing reads its
+ * output, nothing reaps it, and if it fails there is no message: a chime is not
+ * evidence about anything, and a page that reported one would be reporting on a
+ * sound card the user can hear for themselves.
+ *
+ * THE `||' IS FOR AN ffmpeg WITHOUT THE ALSA OUTDEV.  ffmpegHasAlsa() answers
+ * that question and takes up to fifteen seconds to do it, which cannot happen at
+ * startup -- so the fallback is expressed as a shell pipeline instead and the
+ * shell decides at run time.  `A || B | C' is `A || (B | C)': a pipeline binds
+ * tighter than the or, which is what is wanted here.
+ */
+void MediaPage::playOnce(const QString &path)
+{
+    if (path.isEmpty() || !QFileInfo(path).isReadable())
+        return;
+
+    const QString ff = ffmpegPath();
+    const QString dev = alsaDevice();
+    if (ff.isEmpty() || dev.isEmpty())
+        return;
+
+    const QString decode = shellQuote(ff) +
+                           " -nostdin -hide_banner -loglevel quiet -i " + shellQuote(path) +
+                           " -vn -ar " + QString::number(kRate) + " -ac 2 ";
+
+    QString cmd = decode + "-f alsa " + shellQuote(dev);
+    const QString ap = aplayPath();
+    if (!ap.isEmpty())
+        cmd += " || " + decode + "-f wav - | " + shellQuote(ap) +
+               " -q -D " + shellQuote(dev) + " -";
+
+    QProcess::startDetached(QStringLiteral("/bin/sh"), QStringList() << "-c" << cmd);
 }
 
 QString MediaPage::alsaDevice()

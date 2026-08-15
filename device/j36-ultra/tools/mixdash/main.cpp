@@ -73,6 +73,7 @@
  */
 #include "console.h"
 #include "dashboard.h"
+#include "media.h"
 #include "stringsdb.h"
 #include "trace.h"
 
@@ -441,6 +442,17 @@ int probe(void)
  * copies are the fallback, and if neither is there Qt falls back to whatever
  * fontconfig can find and the dashboard still draws.
  */
+/* The first of these that exists and can be opened, or nothing.  loadFont() below
+ * does the same walk for the same reason -- the payload first, the tree it was
+ * built in second -- and this is the one-file version of it. */
+QString firstReadable(const QStringList &paths)
+{
+    for (const QString &p : paths)
+        if (QFileInfo(p).isReadable())
+            return p;
+    return QString();
+}
+
 QString loadFont()
 {
     QStringList files;
@@ -755,6 +767,26 @@ int main(int argc, char **argv)
                     dash.update();
             });
             guard->start();
+
+            /*
+             * ── AND THE NOISE THE THING MAKES WHEN IT IS READY ──
+             *
+             * Here and not one line earlier: this runs from the first paint, so
+             * the chime starts at the moment the dashboard is actually on the
+             * glass rather than at the moment this program decided it would be.
+             * Detached, so nothing about it can delay the line below.
+             *
+             * The payload path first and the source tree second, which is the
+             * order every other asset in this program is looked for in -- see the
+             * font search in main() -- so a development run out of the build
+             * directory finds the file it was just built next to.
+             */
+            MediaPage::playOnce(firstReadable(QStringList()
+                                              << "/opt/mixos/share/mixdash/startup.mp3"
+                                              << QCoreApplication::applicationDirPath()
+                                                     + "/startup.mp3"
+                                              << QCoreApplication::applicationDirPath()
+                                                     + "/../resources/startup.mp3"));
 
             /* Startup is over; a deadline from here would kill a working dashboard. */
             ::alarm(0);

@@ -146,6 +146,16 @@ public:
     bool openPath(const QString &path);
 
     /*
+     * Play a sound file once, in a process nobody waits for and nobody reaps.
+     * Static, because the startup chime happens before there is a Media page to
+     * ask and would be absurd as a reason to build one; here rather than in
+     * main.cpp because which ffmpeg and which ALSA device are questions this file
+     * already answers -- and answers differently from `default', which is a trap
+     * on this image.  Silent about every failure, deliberately: see media.cpp.
+     */
+    static void playOnce(const QString &path);
+
+    /*
      * ── THE TWO THINGS THE SHELL HAS TO KNOW WHILE A FILM IS UP ──
      *
      * True while the GPU owns this page: a film is up, it came up on GL, and at
@@ -469,7 +479,7 @@ private:
      * does, one process plays both streams; if not, audio needs its own chain. */
     bool ffmpegHasAlsa() const;
     static QString ffmpegPath();
-    QString aplayPath() const;
+    static QString aplayPath();
     QString ffprobePath() const;
 
     /*
