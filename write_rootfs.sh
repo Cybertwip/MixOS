@@ -69,22 +69,24 @@ elif [[ "${ROOT_FILESYSTEM_FORMAT}" == *"ext"* ]]; then
   # touching the filesystem at all.
   #
   # The dd copies ${STORAGE_SIZE} MB instead of the shrunk size, so the difference goes
-  # across as zeros.  That was a few hundred MB and a couple of seconds when the
-  # partition was 4000 MB; at 16000 it is around 12 GB and minutes, which is the price
-  # of a card that has room for the packages this device exists to install.  It still
-  # buys back the second e2fsck of the whole root, the second resize2fs, the loop
-  # device, and every "it stays that size with no free space" half-failure that block
-  # could end in.
+  # across as zeros.  With the partition sized by the rule below -- the rootfs rounded up
+  # to the next GiB -- that difference is a few hundred megabytes and a couple of
+  # seconds.  It briefly was not: at STORAGE_SIZE=16000 it was 12 GB and minutes, and
+  # getting rid of that is most of why the layout changed.  It still buys back the second
+  # e2fsck of the whole root, the second resize2fs, the loop device, and every "it stays
+  # that size with no free space" half-failure that block could end in.
   #
   # THE FILESYSTEM MUST FILL ITS PARTITION and not merely fit in it -- that is what the
   # grow-back was for.  A rootfs left at its minimum has ZERO free blocks, and the card
   # boots on it: a read-write root with nothing writable in it.  It surfaced as the J36
   # payload's first mkdir answering "No space left on device", but nothing about it was
   # J36-specific -- ldconfig, apt, a journal and every dpkg on the R36S meet the same
-  # wall.  Nothing on the device fixes it either; firstboot resizes the DATA partition,
-  # not this one.  Sizing the shrink to the partition satisfies that by construction,
-  # which is the other reason this is the better shape: the free space is no longer
-  # something a later step has to remember to add back.
+  # wall.  The device does fix it now, on the first boot, by growing this partition to
+  # the end of the card -- but "on the first boot" is one boot too late for the initramfs
+  # staging that happens before it, and for a card the resize could not finish on.
+  # Sizing the shrink to the partition satisfies it by construction instead, which is the
+  # other reason this is the better shape: the free space is no longer something a later
+  # step has to remember to add back.
   fs_geometry="$(dumpe2fs -h "${FILESYSTEM}" 2>/dev/null)"
   fs_bsize="$(printf '%s\n' "${fs_geometry}" | awk -F: '/^Block size:/{gsub(/ /,"",$2); print $2}')"
   if [[ -z "${fs_bsize}" ]]; then
@@ -98,41 +100,53 @@ elif [[ "${ROOT_FILESYSTEM_FORMAT}" == *"ext"* ]]; then
   # STORAGE_SIZE without arithmetic.
   fs_mib=$(( ((fs_min_blocks * fs_bsize) + 1048575) / 1048576 ))
   echo -e "Root filesystem holds ${fs_mib} MB of the ${STORAGE_SIZE} MB partition"
-  # THE PARTITION IS NOT SIZED FOR THE ROOTFS, and that is the whole point of the
-  # numbers below.  It used to be -- "the rootfs, rounded up to the next whole 1000 MB"
-  # -- and the card that rule produced shipped with 240 MB free, 200 of which is
-  # mkfs.ext2's root reservation, on a device whose Packages page exists so that people
-  # install things on it.  STORAGE_SIZE in device/r36-ultra/build-in-vm.sh is now sized
-  # for the base system plus roughly 12 GB of somebody else's packages; the arithmetic
-  # here is only the FLOOR, the point below which the dd would run over the DATA
-  # partition.  It cannot be applied automatically either way: the partition table is
-  # written in the `image' stage and this is the first moment the rootfs has a size at
-  # all.  So the two cases below say the numbers out loud -- one as a failure, one as a
-  # warning -- instead of leaving a reader to do the arithmetic.
-  fs_next_step=$(( ((fs_mib + 999) / 1000) * 1000 ))
-  # What the layout wants spare for packages, on top of whatever the base system
-  # weighs.  Named rather than inlined so the two messages below cannot drift apart
-  # from each other or from the comment beside STORAGE_SIZE.
-  fs_package_headroom=12000
+  # THE PARTITION IS SIZED FOR THE ROOTFS AGAIN, and this time that is the right rule.
+  #
+  # It was, once: "the rootfs, rounded up to the next whole 1000 MB".  That was wrong for
+  # a layout in which p3 sat immediately after p2, because the OS partition could never
+  # grow afterwards and 240 MB of slack was all a device with a Packages page was ever
+  # going to get.  The answer then was to ship the headroom -- 16000 MB, twelve of them
+  # empty, in every copy of the image anybody ever downloaded.
+  #
+  # p3 is gone and p2 is the last partition on the disk, so the J36 initramfs hands it
+  # the rest of the card before systemd starts.  The headroom is the card now.  What the
+  # image has to hold is the base system and enough slack to reach that first resize, so
+  # the rule is the rootfs rounded up to the next whole GiB -- and the arithmetic below
+  # is both the floor and the recommendation, rather than a floor under a decision made
+  # somewhere else.
+  #
+  # GiB and not 1000 MB: everything either side of this counts in MiB (STORAGE_SIZE is
+  # multiplied by 1024*1024 to reach a sector), and a partition whose size is a whole
+  # power of two is one that mkfs, the MBR and a human all describe with the same number.
+  fs_next_step=$(( ((fs_mib + 1023) / 1024) * 1024 ))
+  # The slack the image itself has to carry, on top of the base system.  It covers the
+  # first boot up to the moment the resize lands -- a journal, apt's lists if somebody is
+  # impatient, and mkfs.ext2's 5% root reservation coming out of the same space.
+  fs_first_boot_slack=256
   if [[ ${fs_min_blocks} -gt 0 ]]; then
     if [[ ${fs_mib} -gt ${STORAGE_SIZE} ]]; then
       printf "\n\nThe root filesystem needs %s MB and the partition is %s MB.\n" "${fs_mib}" "${STORAGE_SIZE}"
       printf "btrfs hid this behind compress=zlib:1; ext2 does not compress, so the\n"
       printf "rootfs now costs what it actually weighs.\n\n"
-      printf "  Set STORAGE_SIZE=%s in device/r36-ultra/build-in-vm.sh\n\n" \
-             "$(( fs_next_step + fs_package_headroom ))"
-      printf "That is %s MB rounded up to the next whole 1000 MB, plus the %s MB of\n" \
-             "${fs_mib}" "${fs_package_headroom}"
-      printf "package headroom this layout is sized by -- see the comment beside\n"
-      printf "STORAGE_SIZE for why the headroom is the rule and not the leftovers.\n"
+      printf "  Set STORAGE_SIZE=%s in device/r36-ultra/build-in-vm.sh\n\n" "${fs_next_step}"
+      printf "That is %s MB rounded up to the next whole GiB, which is the whole of the\n" "${fs_mib}"
+      printf "sizing rule now that the OS partition grows to the card on the first boot.\n"
       printf "setup_partition.sh reads that value, so it is the only place to change.\n"
       printf "Taking content out of the build root works too.\n"
-      printf "Refusing to dd over the DATA partition.  Exiting...\n\n"
+      printf "Refusing to dd a filesystem that does not fit its partition.  Exiting...\n\n"
       exit 1
     fi
-    if [[ $(( STORAGE_SIZE - fs_mib )) -lt ${fs_package_headroom} ]]; then
-      echo -e "The OS partition has $(( STORAGE_SIZE - fs_mib )) MB spare, and this layout is sized for ${fs_package_headroom} MB of packages"
-      echo -e "Set STORAGE_SIZE=$(( fs_next_step + fs_package_headroom )) in device/r36-ultra/build-in-vm.sh to get it back"
+    if [[ $(( STORAGE_SIZE - fs_mib )) -lt ${fs_first_boot_slack} ]]; then
+      echo -e "The OS partition has $(( STORAGE_SIZE - fs_mib )) MB spare, and the first boot wants ${fs_first_boot_slack} MB before the resize lands"
+      echo -e "Set STORAGE_SIZE=${fs_next_step} in device/r36-ultra/build-in-vm.sh to get it back"
+    fi
+    # Said on every build, not only the ones that are wrong.  A partition more than a
+    # whole GiB above the rule is 1024 MB of zeros in every copy of the artifact, which
+    # is the exact mistake this layout was changed to stop making -- and it is invisible
+    # unless something says the two numbers next to each other.
+    if [[ ${STORAGE_SIZE} -gt ${fs_next_step} ]]; then
+      echo -e "The OS partition is ${STORAGE_SIZE} MB and the rule gives ${fs_next_step} MB for a ${fs_mib} MB rootfs"
+      echo -e "That is $(( STORAGE_SIZE - fs_next_step )) MB of zeros in the image; the card supplies the rest on the first boot"
     fi
   else
     echo -e "resize2fs -P did not report a minimum size; the shrink below is the real check"

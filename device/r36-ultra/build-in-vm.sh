@@ -146,66 +146,49 @@ ROOT_FILESYSTEM_FORMAT=ext2
 # 1 KiB-block filesystem would cap the rootfs at 16 GB after expansion.
 ROOT_FILESYSTEM_FORMAT_PARAMETERS="-F -b 4096 -L ROOTFS"
 ROOT_FILESYSTEM_MOUNT_OPTIONS="defaults,noatime"
-# p3, the data partition: ext2 and labelled DATA rather than vfat and EASYROMS.  The
-# long form of why is in setup_partition.sh, which sets the same four values; the short
-# form is that it holds Linux content, and the old flow formatted it vfat here only for
-# firstboot to reformat it to exfat and untar /roms.tar back onto it on the device.
-DATA_LABEL="DATA"
-DATA_FILESYSTEM_FORMAT="ext2"
-DATA_FILESYSTEM_FORMAT_PARAMETERS="-F -b 1024 -L ${DATA_LABEL}"
-# Deliberately no umask/uid/gid: mount refuses them on ext2, and an fstab line that
-# carries them is a partition that does not mount at all.  Ownership is set once, in
-# finishing_touches.sh, while the partition is still a loop device.  nofail because this
-# partition is the home directory now, and a card without it must still reach a shell.
-DATA_MOUNT_OPTIONS="defaults,auto,noatime,nofail"
-# The mount point is a home directory, not a rom library -- see setup_partition.sh.
+# THERE IS NO p3.  It was EASYROMS, then DATA -- a separate ext2 partition mounted at
+# /home/virtua -- and the long form of why it is gone is in setup_partition.sh.  The
+# short form is that a partition sitting after ROOTFS is what stopped ROOTFS from being
+# grown into the card, so the image had to ship its own headroom instead.
+#
+# DATA_MOUNT_POINT stays, and names a plain directory on the rootfs: bootstrap_rootfs.sh
+# and finishing_touches.sh write the login user's dotfiles into it, and spelling the path
+# out in twenty places is how the old `ark'/`virtua' split happened in the first place.
 DATA_MOUNT_POINT="/home/virtua"
 SYSTEM_SIZE=100
-# 16000 MB for the OS partition, and the rule that produced the old 4000 is what was
-# wrong with it -- not the arithmetic.  "The rootfs, rounded up to the next whole
-# 1000 MB" sizes the partition for the image and for nothing else, and it was applied
-# to a build that measures 3384 MB, so the card shipped with this:
+# 4096 MB for the OS partition: what the rootfs weighs, rounded up to the next whole
+# GiB.  A build that measures 3384 MB lands here, and the whole image is 4.2 GB.
 #
-#     Block count:  1024000        1024000 x 4096 = 4000 MB, the partition
-#     Free blocks:     61476          61476 x 4096 =  240 MB, and that is all of it
-#     Block size:       4096
+# IT WAS 16000, AND THE REASONING WAS SOUND FOR THE LAYOUT IT WAS WRITTEN IN.  p3 sat
+# immediately after this partition, so p2 could never grow: whatever headroom a person
+# was ever going to need for packages had to be in the image on the day it was built.
+# 12 GB of it was, and every one of those gigabytes was compressed, uploaded, downloaded
+# and written to a card by everybody who flashed it, empty.
 #
-# read out of MixOS_armhf_trixie_ec3b06f.img with debugfs.  240 MB, less mkfs.ext2's
-# default 5% root reservation -- 51200 blocks, 200 MB -- which leaves about 40 MB to
-# anything not running as root.  That is not a small margin, it is no margin: a single
-# `apt-get update' against trixie/main/armhf writes roughly 56 MB of uncompressed
-# Packages, 30 MB of Translation-en, the compressed copies of both in lists/partial
-# while they arrive, and then 60-100 MB of pkgcache.bin and srcpkgcache.bin under
-# /var/cache/apt.  It does not fit, and this is a device with a Packages page on it
-# whose entire purpose is installing things afterwards.
+# p3 IS GONE, so p2 is the last partition on the disk and the J36 initramfs grows it to
+# the end of the card before systemd starts -- setup_expand() in
+# device/j36-ultra/build-in-vm.sh.  Headroom now comes from the card the operator bought,
+# which is larger than 12 GB and costs this build nothing.  What the image has to carry
+# is the base system plus enough slack to reach that first resize, and a GiB of rounding
+# is a great deal more than enough.
 #
-# THE RULE NOW: the partition is sized for what the device is FOR, which is a base
-# system plus everything the person holding it installs later.  16000 MB is that --
-# 3.4 GB of base leaves about 12 GB of card for packages -- and the number is round
-# rather than derived because nothing about a user's future package list is derivable.
-# write_rootfs.sh still refuses to dd a rootfs that would run over the DATA partition
-# and still prints the exact value to set, so the floor is enforced; this is the
-# ceiling, and it is a decision rather than a measurement.
+# The floor is still enforced from below: write_rootfs.sh refuses to dd a rootfs that
+# does not fit and prints the exact value to put here.
 #
-# WHAT IT COSTS.  DISK_SIZE becomes 16417 MB, so the artifact and every copy of it are
-# that long -- both files are sparse and copied with --sparse=always, so the bytes on
-# the build host are still only what the rootfs weighs, but the card must be 16.5 GB
-# or bigger and the dd in write_rootfs.sh now pushes 16 GB of mostly-zeros instead of
-# 4 GB.  At bs=8M that is minutes, not seconds, and it is paid once per build.
+# WHAT IT SAVES.  DISK_SIZE goes from 16417 MB to 4213, so the artifact is a quarter of
+# the length it was, and the dd in write_rootfs.sh pushes 4 GB instead of 16 -- seconds
+# rather than minutes, once per build.
 #
-# setup_partition.sh reads this rather than setting its own copy (`${STORAGE_SIZE:-16000}'),
+# setup_partition.sh reads this rather than setting its own copy (`${STORAGE_SIZE:-4096}'),
 # so the sourced partition stage and the resumed build that skips it cannot disagree.
-STORAGE_SIZE=16000
-ROM_PART_SIZE=300
+STORAGE_SIZE=4096
 BUILD_SIZE=52000
 SYSTEM_PART_START=32768
 SYSTEM_PART_END=$(( SYSTEM_PART_START + (SYSTEM_SIZE * 1024 * 1024 / 512) - 1 ))
 STORAGE_PART_START=$(( SYSTEM_PART_END + 1 ))
 STORAGE_PART_END=$(( STORAGE_PART_START + (STORAGE_SIZE * 1024 * 1024 / 512) - 1 ))
-ROM_PART_START=$(( STORAGE_PART_END + 1 ))
-ROM_PART_END=$(( ROM_PART_START + (ROM_PART_SIZE * 1024 * 1024 / 512) - 1 ))
 DISK_START_PADDING=$(( (SYSTEM_PART_START + 2048 - 1) / 2048 ))
-DISK_SIZE=$(( DISK_START_PADDING + SYSTEM_SIZE + STORAGE_SIZE + ROM_PART_SIZE + 1 ))
+DISK_SIZE=$(( DISK_START_PADDING + SYSTEM_SIZE + STORAGE_SIZE + 1 ))
 # THE ONE ARTIFACT THIS BUILD SHIPS, and the only one: MixOS_<arch>_<debian>_base.img,
 # uncompressed.  There is no .7z beside it any more -- see the finalization stage for why
 # that went, and darkos_base_image_name() in device/common/multipass.sh for where this
@@ -222,10 +205,9 @@ DISK_SIZE=$(( DISK_START_PADDING + SYSTEM_SIZE + STORAGE_SIZE + ROM_PART_SIZE + 
 # commit belongs on what build-j36-ultra.sh copies out of this, and that is where it is.
 DISK="${DARKOS_IMAGE_NAME:-MixOS_${USERSPACE_ARCH}_${DEBIAN_CODE_NAME}_base.img}"
 export ROOT_FILESYSTEM_FORMAT ROOT_FILESYSTEM_FORMAT_PARAMETERS
-export DATA_LABEL DATA_FILESYSTEM_FORMAT DATA_FILESYSTEM_FORMAT_PARAMETERS
-export DATA_MOUNT_OPTIONS DATA_MOUNT_POINT
+export DATA_MOUNT_POINT
 export ROOT_FILESYSTEM_MOUNT_OPTIONS SYSTEM_PART_START SYSTEM_PART_END
-export STORAGE_PART_START STORAGE_PART_END ROM_PART_START ROM_PART_END
+export STORAGE_PART_START STORAGE_PART_END
 export DISK_SIZE FILESYSTEM DISK
 
 KERNEL_SRC=rg351
@@ -591,16 +573,21 @@ verify_native_userspace() {
 # whether the checkpoints beside it describe the layout it is being asked for.  A
 # finished build writes it; a build from before this existed has no file, which reads
 # as "unknown" and is treated as foreign.
-# The geometry is in here as well as the two formats, because "the layout changed" has
-# to include "the partitions moved".  STORAGE_SIZE has been 7500, then 4000, and is now
-# 16000; each of those shifts where p3 begins, so an image built before a change is not
-# a smaller version of this one, it is a different card.  Having the sizes in the string
-# invalidates every layout file written by an earlier build, which is exactly right --
-# they all describe a partition table that is no longer the one being written.
+# The geometry is in here as well as the format, because "the layout changed" has to
+# include "the partitions moved".  STORAGE_SIZE has been 7500, then 4000, then 16000, and
+# is now 4096 with no third partition behind it at all; an image built before any of
+# those changes is not a smaller version of this one, it is a different card.  Having the
+# sizes in the string invalidates every layout file written by an earlier build, which is
+# exactly right -- they all describe a partition table that is no longer the one being
+# written.
+#
+# data_part=0MB is said out loud rather than dropped from the string.  A signature that
+# simply stopped mentioning p3 would compare equal to nothing and unequal to nothing; one
+# that says the partition is zero megabytes long is a statement that differs from every
+# recorded 300, which is the answer this function exists to give.
 layout_signature() {
-    printf 'rootfs=%s data=%s boot=%sMB os=%sMB data_part=%sMB\n' \
-        "$ROOT_FILESYSTEM_FORMAT" "$DATA_FILESYSTEM_FORMAT" \
-        "$SYSTEM_SIZE" "$STORAGE_SIZE" "$ROM_PART_SIZE"
+    printf 'rootfs=%s data=none boot=%sMB os=%sMB data_part=0MB\n' \
+        "$ROOT_FILESYSTEM_FORMAT" "$SYSTEM_SIZE" "$STORAGE_SIZE"
 }
 
 # What is actually IN the finished image, which is the only evidence that survives the
@@ -651,16 +638,13 @@ image_layout_is_foreign() {
                     log "$img: puts it at $STORAGE_PART_START..$STORAGE_PART_END (${STORAGE_SIZE} MB)"
                     return 0
                 fi ;;
-            3)  [[ -n "$fs" && "$fs" != "$DATA_FILESYSTEM_FORMAT" ]] && {
-                    log "$img: the DATA partition holds $fs, not $DATA_FILESYSTEM_FORMAT"
-                    return 0
-                }
-                if ! sectors_agree "$begin" "$ROM_PART_START" ||
-                   ! sectors_agree "$end" "$ROM_PART_END"; then
-                    log "$img: the DATA partition is sectors $begin..$end, and this layout"
-                    log "$img: puts it at $ROM_PART_START..$ROM_PART_END"
-                    return 0
-                fi ;;
+            # A THIRD PARTITION IS ITSELF THE MISMATCH.  This layout writes two, and p2
+            # is grown into whatever follows it on the first boot -- so an image with a
+            # p3 in it is not merely stale, it is a card on which the expansion has
+            # something in its way.  No field is examined: the line existing is the
+            # finding.
+            3)  log "$img: has a third partition, and this layout ends at the OS partition"
+                return 0 ;;
         esac
     done < <(parted -m -s "$img" unit s print 2>/dev/null || true)
     return 1
@@ -1051,9 +1035,9 @@ if ! marked finalization; then
     # first and configuring afterwards means the configuration is the last word.
     #
     # Neither script needs the other's output.  finishing_touches.sh makes its own
-    # loop device for the DATA partition (LOOP_ROM, at its line 461) and does not
-    # read anything cleanup writes; cleanup wants $extension from build_sdl2.sh,
-    # which the userspace stage above has already resolved.
+    # loop devices for the partitions it formats and does not read anything cleanup
+    # writes; cleanup wants $extension from build_sdl2.sh, which the userspace stage
+    # above has already resolved.
     final_scripts=(
         device/r36-ultra/install_boot.sh
         cleanup_filesystem.sh
