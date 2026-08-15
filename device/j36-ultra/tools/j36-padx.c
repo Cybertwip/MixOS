@@ -117,9 +117,17 @@
  * deflection squared -- a third of the way over is a ninth of the speed.  On the
  * D-pad, which has no deflection to measure, it is time-held squared over about a
  * second, reset on release, so a tap nudges and a hold crosses the panel.  The
- * remainder is carried between ticks (see the motion block in main) so that the
- * slow end still moves at all; XTEST takes whole pixels, and a per-tick delta that
- * rounds to zero is a pointer that does not move.
+ * remainder is kept between ticks -- it lives in the sub-pixel position, see
+ * pointer_move() -- so that the slow end still moves at all; XTEST takes whole
+ * pixels, and a per-tick step that rounds to zero is a pointer that does not move.
+ *
+ * THE POINTER IS PLACED AND NOT PUSHED, which is the other half of that: the
+ * server accelerates a relative XTEST delta exactly as it accelerates a mouse's,
+ * so the speeds above were arriving on the glass multiplied by something this file
+ * had no say in.  pointer_move() says where instead, and the long comment there is
+ * the whole of it.  The speeds themselves are a fraction of the SCREEN per second
+ * rather than a count of pixels, because what a thumb judges is how much of the
+ * panel went by.
  *
  * HOW IT ENDS.  Three ways, all of them tidy:
  *   - --watch PID and that process exits: the browser closed itself, so the
@@ -150,6 +158,7 @@
 
 #include <linux/input.h>
 
+#include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/extensions/XTest.h>
 #include <X11/keysym.h>
@@ -541,6 +550,29 @@ static long now_ms(void)
 /* ── X ───────────────────────────────────────────────────────────────────── */
 
 static Display *dpy;
+static int      scr;              /* the one screen this session has */
+static int      scr_w, scr_h;     /* and its size, which sets every speed below */
+
+/* The two speed ceilings, in pixels per second, worked out from the screen at
+ * startup: see pointer_start() and the two SCREENS_PER_S constants it reads. */
+static double   stick_max, dpad_max;
+
+/*
+ * X errors are reported and not fatal, because the only calls here that can raise
+ * one are the window walk in kbd_win_find() and the send that follows it, and both
+ * race with a keyboard that can exit between the two.  A BadWindow there is the
+ * ordinary answer to "is it still there", not a bug: Xlib's default handler would
+ * print it and carry on anyway, so this only stops it printing when nobody asked.
+ */
+static int on_x_error(Display *d, XErrorEvent *e)
+{
+    char buf[128];
+    if (!verbose)
+        return 0;
+    XGetErrorText(d, e->error_code, buf, sizeof(buf));
+    note("X error: %s (request %d)", buf, (int)e->request_code);
+    return 0;
+}
 
 /* The keycodes are resolved once, at startup, because XKeysymToKeycode walks the
  * server's whole keymap and the answer cannot change without a keymap change --
@@ -587,6 +619,82 @@ static void tap(KeyCode mod, KeyCode key)
     XFlush(dpy);
 }
 
+/* ── where the pointer is ────────────────────────────────────────────────── */
+
+/*
+ * THE POINTER IS PLACED, NOT PUSHED, and that is a bug fix and not a preference.
+ *
+ * This used XTestFakeRelativeMotionEvent, which hands the server a delta -- and
+ * the server puts that delta through the same pointer acceleration a real mouse's
+ * goes through.  Xext/xtest.c asks for POINTER_RELATIVE without POINTER_NORAW, so
+ * dix/getevents.c runs accelPointer() over it, and the XTEST device is created
+ * with the server's default profile: threshold 4, accel 2.  One tick of a stick
+ * pushed anywhere past halfway is 18 pixels, which is four times the threshold, so
+ * the pointer moved at about twice the speed this file asked for -- and every
+ * curve and ramp below was being read through a multiplier it knew nothing about.
+ * That is what "faster than the mouse" was.
+ *
+ * XTestFakeMotionEvent takes a position instead, and a position is not
+ * accelerated: it arrives at the screen as the number given.  So the position is
+ * kept here, in doubles, and the fraction that used to be carried between ticks is
+ * carried by the position itself.  Two things fall out of that for free, and both
+ * are wanted.  The screen edges become a clamp, so the pointer cannot be driven
+ * off a panel that has no second screen to sweep it back from.  And a real mouse
+ * in the dock stays in charge of where it left the pointer, because the server is
+ * asked before every move: if the pointer is not where this program last put it,
+ * somebody else moved it, and that is the position to move on from.
+ */
+static double ptr_x, ptr_y;         /* where it is, to the sub-pixel */
+static int    sent_x, sent_y;       /* the last whole position asked for */
+
+static void pointer_resync(void)
+{
+    Window root_ret, child_ret;
+    int rx, ry, wx, wy;
+    unsigned mask;
+
+    if (!XQueryPointer(dpy, RootWindow(dpy, scr), &root_ret, &child_ret,
+                       &rx, &ry, &wx, &wy, &mask))
+        return;
+    if (rx == sent_x && ry == sent_y)
+        return;                     /* exactly where this put it: keep the fraction */
+    ptr_x = (double)rx;
+    ptr_y = (double)ry;
+    sent_x = rx;
+    sent_y = ry;
+}
+
+static void pointer_move(double dx, double dy)
+{
+    int ix, iy;
+
+    if (dx == 0.0 && dy == 0.0)
+        return;
+
+    pointer_resync();
+    ptr_x += dx;
+    ptr_y += dy;
+    if (ptr_x < 0.0)
+        ptr_x = 0.0;
+    else if (ptr_x > (double)(scr_w - 1))
+        ptr_x = (double)(scr_w - 1);
+    if (ptr_y < 0.0)
+        ptr_y = 0.0;
+    else if (ptr_y > (double)(scr_h - 1))
+        ptr_y = (double)(scr_h - 1);
+
+    ix = (int)ptr_x;
+    iy = (int)ptr_y;
+    /* Below a pixel per tick this is the slow end doing its job, not a stall: the
+     * fraction stays in ptr_x/ptr_y and the move happens a few ticks later. */
+    if (ix == sent_x && iy == sent_y)
+        return;
+    XTestFakeMotionEvent(dpy, scr, ix, iy, 0);
+    XFlush(dpy);
+    sent_x = ix;
+    sent_y = iy;
+}
+
 static void click(unsigned button, int press)
 {
     XTestFakeButtonEvent(dpy, button, press ? True : False, 0);
@@ -598,6 +706,104 @@ static void wheel(unsigned button)
     XTestFakeButtonEvent(dpy, button, True, 0);
     XTestFakeButtonEvent(dpy, button, False, 0);
     XFlush(dpy);
+}
+
+/* ── the on-screen keyboard ──────────────────────────────────────────────── */
+
+/*
+ * SELECT TOGGLES matchbox-keyboard, AND IT IS NOT A SIGNAL.
+ *
+ * This sent SIGUSR1 to the keyboard's pid.  That is what a decade of matchbox
+ * recipes on the web say to do and it is not what matchbox-keyboard has ever
+ * implemented: there is no signal handler anywhere in it -- not in
+ * src/matchbox-keyboard.c, not in src/matchbox-keyboard-ui.c, not in
+ * src/matchbox-keyboard-remote.c -- so the default disposition applied, and the
+ * default disposition of SIGUSR1 is to kill the process.  THE FIRST PRESS OF
+ * SELECT KILLED THE KEYBOARD.  That is why it never appeared, and why every press
+ * after the first found nothing left to signal.
+ *
+ * What --daemon actually listens for is an X ClientMessage.  main.c's event loop
+ * feeds every event to mb_kbd_remote_process_xevents() while the daemon flag is
+ * set; that function answers with data.l[0] when the message type is the
+ * _MB_IM_INVOKER_COMMAND atom, and the loop maps or unmaps the window on the
+ * answer.  The values are MBKeyboardRemoteOperation in
+ * src/matchbox-keyboard-remote.h: 0 none, 1 show, 2 hide, 3 toggle.
+ *
+ * TOGGLE AND NOT SHOW, for the same reason the old comment here gave: the keyboard
+ * owns whether it is up.  Nothing on this side counts presses, so nothing on this
+ * side can be wrong about it.
+ *
+ * THE MESSAGE GOES TO THE KEYBOARD'S OWN WINDOW, with an empty event mask, which
+ * is the one delivery rule that does not depend on what the receiver selected for:
+ * an XSendEvent with no mask goes to the client that created the destination
+ * window.  Finding that window is a walk of the tree looking for the name
+ * "Keyboard", because matchbox-keyboard publishes nothing better -- it sets no
+ * WM_CLASS at all, and XSetStandardProperties(..., "Keyboard", ...) in
+ * matchbox-keyboard-ui.c is the whole of its identification.  The walk is depth
+ * limited because the window is a child of the root while it is hidden and a child
+ * of a matchbox frame once it has been mapped, and neither is deep.
+ */
+#define MB_IM_TOGGLE 3
+
+static Atom   atom_im_command;
+static Window kbd_win;          /* cached across presses; re-found when it goes */
+
+static int win_is_keyboard(Window w)
+{
+    char *name = NULL;
+    int match;
+
+    if (!XFetchName(dpy, w, &name) || !name)
+        return 0;
+    match = strcmp(name, "Keyboard") == 0;
+    XFree(name);
+    return match;
+}
+
+static Window kbd_win_find(Window w, int depth)
+{
+    Window root_ret, parent_ret, *kids = NULL, hit = None;
+    unsigned int n = 0, i;
+
+    if (depth > 0 && win_is_keyboard(w))
+        return w;
+    if (depth >= 3)
+        return None;
+    if (!XQueryTree(dpy, w, &root_ret, &parent_ret, &kids, &n))
+        return None;
+    for (i = 0; i < n && hit == None; i++)
+        hit = kbd_win_find(kids[i], depth + 1);
+    if (kids)
+        XFree(kids);
+    return hit;
+}
+
+static void kbd_toggle(void)
+{
+    XClientMessageEvent ev;
+
+    /* One round trip to check the cached window is still the keyboard, and a walk
+     * only when it is not.  A press is a human action, so neither is worth
+     * avoiding -- and a keyboard that died and was restarted has a new window. */
+    if (kbd_win != None && !win_is_keyboard(kbd_win))
+        kbd_win = None;
+    if (kbd_win == None)
+        kbd_win = kbd_win_find(RootWindow(dpy, scr), 0);
+    if (kbd_win == None) {
+        fail("no on-screen keyboard on this display -- Select toggles "
+             "matchbox-keyboard --daemon, and nothing is running it");
+        return;
+    }
+
+    memset(&ev, 0, sizeof(ev));
+    ev.type = ClientMessage;
+    ev.window = kbd_win;
+    ev.message_type = atom_im_command;
+    ev.format = 32;
+    ev.data.l[0] = MB_IM_TOGGLE;
+    XSendEvent(dpy, kbd_win, False, NoEventMask, (XEvent *)&ev);
+    XFlush(dpy);
+    note("toggled the on-screen keyboard (window 0x%lx)", (unsigned long)kbd_win);
 }
 
 /*
@@ -616,7 +822,17 @@ static int on_io_error(Display *unused)
 
 /* ── the sticks ──────────────────────────────────────────────────────────── */
 
-#define STICK_MAX   1100.0   /* pixels per second at full deflection */
+/*
+ * SPEEDS ARE A FRACTION OF THE SCREEN, not a number of pixels.
+ *
+ * 1100 pixels per second was written for no panel in particular and read as
+ * "crosses this one in half a second", which on 640x480 is a pointer nobody can
+ * land on a link with -- and that was before the acceleration described above
+ * doubled it.  What a thumb is actually judging is how much of the SCREEN goes by,
+ * so that is what these say, and the panel decides the rest.  Full deflection
+ * crosses the width in about a second, which is quick without being a flick.
+ */
+#define STICK_SCREENS_PER_S  1.0
 #define SCROLL_MAX  16.0     /* wheel notches per second at full deflection */
 
 /*
@@ -683,18 +899,24 @@ static int sticks_active(void)
 
 /* ── the D-pad ───────────────────────────────────────────────────────────── */
 
-/* Pixels per second at the start of a press and at the end of the ramp, and how
- * long the ramp takes. */
-#define SPEED_MIN   110.0
-#define SPEED_MAX   1000.0
-#define RAMP_MS     900.0
+/*
+ * The start of a press, the end of the ramp, and how long the ramp takes.
+ *
+ * The floor is in PIXELS and the ceiling is in screens, and the mismatch is the
+ * point: what the start of a press is for is landing on a link, and a link is a
+ * dozen pixels wide on any panel, so the slow end must not scale with the screen.
+ * The far end is travel, and travel is measured in how much of the screen is left.
+ */
+#define SPEED_MIN            110.0   /* px/s: a tap is two pixels, whatever the panel */
+#define DPAD_SCREENS_PER_S   0.85
+#define RAMP_MS              900.0
 
 static double speed_at(long held_ms)
 {
     double t = (double)held_ms / RAMP_MS;
     if (t > 1.0)
         t = 1.0;
-    return SPEED_MIN + (SPEED_MAX - SPEED_MIN) * t * t;
+    return SPEED_MIN + (dpad_max - SPEED_MIN) * t * t;
 }
 
 static unsigned dirs_all(void)
@@ -801,29 +1023,63 @@ static void usage(void)
         "j36-padx -- the J36 Ultra pad as an X pointer and keyboard\n"
         "\n"
         "  --watch PID       quit when PID exits; Menu held sends it SIGTERM\n"
-        "  --keyboard PID    Select sends SIGUSR1 to PID (the on-screen keyboard)\n"
         "  --display NAME    which server (default $DISPLAY)\n"
         "  --no-grab         read the pad without taking it from other readers\n"
         "  --list            name the devices that would be used, then exit\n"
-        "  -v                say what is happening\n");
+        "  -v                say what is happening\n"
+        "\n"
+        "Select toggles matchbox-keyboard --daemon if one is on this display; it is\n"
+        "found by its window and needs no pid.\n");
+}
+
+/*
+ * The screen, and the speeds that come out of it.
+ *
+ * Down here rather than beside the rest of the pointer code because it reads both
+ * of the SCREENS_PER_S ceilings, and those are declared with the stick and the
+ * D-pad they belong to.
+ */
+static void pointer_start(void)
+{
+    scr   = DefaultScreen(dpy);
+    scr_w = DisplayWidth(dpy, scr);
+    scr_h = DisplayHeight(dpy, scr);
+    /* A server that answers with nothing usable would otherwise make every speed
+     * below zero, which is a pointer that never moves and no message about why. */
+    if (scr_w < 2 || scr_h < 2) {
+        fail("this screen says it is %dx%d; using 640x480 for the speeds", scr_w, scr_h);
+        scr_w = 640;
+        scr_h = 480;
+    }
+
+    stick_max = STICK_SCREENS_PER_S * (double)scr_w;
+    dpad_max  = DPAD_SCREENS_PER_S * (double)scr_w;
+    if (dpad_max < SPEED_MIN)
+        dpad_max = SPEED_MIN;       /* a panel narrow enough to invert the ramp */
+
+    /* Nothing has been asked for yet, and no real position is negative, so the
+     * first resync always adopts wherever the server starts the pointer. */
+    sent_x = -1;
+    sent_y = -1;
+    pointer_resync();
+
+    note("screen %dx%d: %.0f px/s at full stick, %.0f px/s at the end of the D-pad ramp",
+         scr_w, scr_h, stick_max, dpad_max);
 }
 
 int main(int argc, char **argv)
 {
     const char *display_name = NULL;
-    pid_t watch_pid = 0, kbd_pid = 0;
+    pid_t watch_pid = 0;
     int grab = 1, list_only = 0;
     int i, xt_event, xt_error, xt_major, xt_minor;
 
     long move_last = 0, next_scan = 0;
-    double frac_x = 0.0, frac_y = 0.0;
     double scroll_x = 0.0, scroll_y = 0.0;
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--watch") && i + 1 < argc)
             watch_pid = (pid_t)strtol(argv[++i], NULL, 10);
-        else if (!strcmp(argv[i], "--keyboard") && i + 1 < argc)
-            kbd_pid = (pid_t)strtol(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--display") && i + 1 < argc)
             display_name = argv[++i];
         else if (!strcmp(argv[i], "--no-grab"))
@@ -869,6 +1125,7 @@ int main(int argc, char **argv)
         return 1;
     }
     XSetIOErrorHandler(on_io_error);
+    XSetErrorHandler(on_x_error);
 
     if (!XTestQueryExtension(dpy, &xt_event, &xt_error, &xt_major, &xt_minor)) {
         fail("this X server has no XTEST extension, so the pad cannot drive it");
@@ -883,6 +1140,10 @@ int main(int argc, char **argv)
     XTestGrabControl(dpy, True);
 
     resolve_keys();
+    pointer_start();
+    /* Interned once, and created if no keyboard has interned it yet: an atom costs
+     * nothing and the alternative is doing this inside a button press. */
+    atom_im_command = XInternAtom(dpy, "_MB_IM_INVOKER_COMMAND", False);
 
     if (!scan_pads(grab)) {
         fail("no pad among /dev/input/event*, so nothing can drive this session "
@@ -901,7 +1162,6 @@ int main(int argc, char **argv)
         long now;
         double dt, dx, dy;
         unsigned dirs;
-        int ix, iy;
 
         for (i = 0; i < MAX_PADS; i++) {
             if (pad_fd[i] < 0)
@@ -1051,16 +1311,10 @@ int main(int argc, char **argv)
                 case KEY_VOLUMEUP:   if (down) tap(kc.ctrl, kc.plus);  break;
 
                 case BTN_SELECT:
-                    /*
-                     * The on-screen keyboard is matchbox-keyboard started with
-                     * --daemon, which is hidden until it is sent SIGUSR1 and
-                     * toggles on every one after that.  Nothing here tracks
-                     * whether it is up: the keyboard owns that state, and a
-                     * counter kept on this side would drift the first time
-                     * anything else toggled it.
-                     */
-                    if (down && kbd_pid > 0 && kill(kbd_pid, SIGUSR1) < 0)
-                        fail("the on-screen keyboard is gone (%s)", strerror(errno));
+                    /* See kbd_toggle(): a ClientMessage to the keyboard's window,
+                     * which is what matchbox-keyboard --daemon listens for. */
+                    if (down)
+                        kbd_toggle();
                     break;
 
                 case BTN_MODE:
@@ -1084,8 +1338,8 @@ int main(int argc, char **argv)
         if (dt > (double)TICK_MS * 4.0 / 1000.0)
             dt = (double)TICK_MS * 4.0 / 1000.0;   /* woken from idle; do not lurch */
 
-        dx = axis_rate(AX_LX, STICK_MAX) * dt;
-        dy = axis_rate(AX_LY, STICK_MAX) * dt;
+        dx = axis_rate(AX_LX, stick_max) * dt;
+        dy = axis_rate(AX_LY, stick_max) * dt;
 
         dirs = dirs_all();
         if (dirs) {
@@ -1108,18 +1362,9 @@ int main(int argc, char **argv)
             move_start = now;
         }
 
-        /* The remainder is kept, so a speed below one pixel per tick is a slow
-         * pointer and not a still one. */
-        frac_x += dx;
-        frac_y += dy;
-        ix = (int)frac_x;
-        iy = (int)frac_y;
-        frac_x -= ix;
-        frac_y -= iy;
-        if (ix || iy) {
-            XTestFakeRelativeMotionEvent(dpy, ix, iy, 0);
-            XFlush(dpy);
-        }
+        /* The remainder is kept inside the position, so a speed below one pixel per
+         * tick is a slow pointer and not a still one. */
+        pointer_move(dx, dy);
 
         /* The right stick, as a wheel.  Same carry: a notch is a discrete thing, so
          * what accumulates is fractions of one.  Buttons 6 and 7 are the horizontal
