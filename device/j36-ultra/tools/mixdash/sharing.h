@@ -8,13 +8,13 @@
  * WHAT IT IS FOR.  This is a handheld with one USB port and a card slot, and
  * every way of getting a file onto it up to now has been "power it off and take
  * the card out".  A share turns that into a drag and drop from a PC on the same
- * Wi-Fi: /home/virtua for the things the dashboard itself reads -- media, ROMs,
- * IWADs -- and /media for whatever is plugged into the port.
+ * Wi-Fi: /home/virtua for the things the dashboard itself reads -- media and
+ * ROMs -- and /media for whatever is plugged into the port.
  *
  * /home/virtua IS THE USER'S HALF OF THE CARD, and that is the reason it is the
  * share rather than one directory inside it.  Exporting that path exports
- * everything the dashboard reads on the operator's behalf -- media, roms/, IWADs
- * -- and nothing of the rootfs around it.
+ * everything the dashboard reads on the operator's behalf -- media, roms/ -- and
+ * nothing of the rootfs around it.
  *
  * IT USED TO BE A PARTITION.  There was a p3, ext2, labelled DATA, mounted rw at
  * /home/virtua, and it was the one partition the image writer was told never to

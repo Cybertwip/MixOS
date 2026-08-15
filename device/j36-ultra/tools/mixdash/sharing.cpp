@@ -83,8 +83,9 @@ QString firstExecutable(const QStringList &candidates)
 
 QString systemctlPath()
 {
-    /* Named, not built inline: see dashboard.cpp's firstWad() for the
-     * use-after-free that an inline `QStringList() << ...' in a range-for is. */
+    /* Named, not built inline: an inline `QStringList() << ...' as a range-for's
+     * range is a use-after-free -- the temporary dies at the end of the full
+     * expression and the loop then walks what is left of it. */
     static const QStringList paths = QStringList()
         << QStringLiteral("/usr/bin/systemctl") << QStringLiteral("/bin/systemctl");
     static const QString found = firstExecutable(paths);

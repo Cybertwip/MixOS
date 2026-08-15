@@ -150,7 +150,8 @@ public:
  * you read and a grid you scan: nine cards times two lines of 12 px text is more
  * words than the rest of the shell put together, and none of them told you
  * anything the name and the icon had not.  A card is a glyph and a noun.  What is
- * wrong with one -- Doom with no IWAD -- is said by the card going grey and by
+ * wrong with one -- a card whose program is not installed -- is said by the card
+ * going grey and by
  * the toast that comes when it is pressed, not by a caption that is there whether
  * or not anything is wrong.
  */

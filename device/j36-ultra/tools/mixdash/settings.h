@@ -111,8 +111,9 @@ public:
      * How the user arranged the cards on the Apps grid, as AppEntry keys in slot
      * order.
      *
-     * KEYS AND NOT INDICES, because the set of cards is not fixed: Doom appears
-     * when an IWAD is on the card and packages will add their own, and a saved
+     * KEYS AND NOT INDICES, because the set of cards is not fixed: a card whose
+     * program is not installed is dropped, packages will add their own, and a
+     * saved
      * list of slot numbers would silently mean something different the moment the
      * number of cards changed.  A key that no longer matches anything is skipped
      * on load, and a card whose key is not in this list lands at the end -- so
@@ -120,7 +121,7 @@ public:
      *
      * QStringList, which QSettings writes as a comma-separated value.  That is
      * deliberate too: the file is a plain INI on a partition somebody will mount
-     * on a PC, and `cards=doom, terminal, files' explains itself there.
+     * on a PC, and `cards=browser, terminal, files' explains itself there.
      */
     QStringList cardOrder() const { return m_cardOrder; }
     void setCardOrder(const QStringList &keys);

@@ -25,7 +25,6 @@
  * THESE PHRASES ARE DELIBERATELY NOT IN THE TABLE, and adding them would be a
  * regression rather than an improvement:
  *
- *   "Doom"                                               (dashboard.cpp)
  *   "Wi-Fi"                                              (dashboard.cpp)
  *   "USB"                                                (widgets.cpp)
  *   "MixOS on J36 Ultra"                                 (settingspage.cpp)
@@ -36,7 +35,7 @@
  *   "?"                                                  (diagnostics.cpp)
  *   "%1 -- %2"                                           (sharing.cpp)
  *
- * They are proper nouns (Doom, Wi-Fi, MixOS), acronyms that are the same word in
+ * They are proper nouns (Wi-Fi, MixOS), acronyms that are the same word in
  * all six languages (CPU, USB), or format strings whose entire content is
  * placeholders and SI units.  Translating a unit is how "5 V" becomes wrong.
  *
@@ -104,18 +103,6 @@ const char *const kPhrases[][Lang::Count] = {
       "kein /dev/input/event* -- nichts zum Navigieren",
       "nenhum /dev/input/event* -- nada para navegar",
       "ningún /dev/input/event* -- nada con lo que navegar" },
-    { "Not installed. Build with J36_DOOM=1 to put it in /opt/mixos.",
-      "Non installé. Compilez avec J36_DOOM=1 pour le mettre dans /opt/mixos.",
-      "Non installato. Compila con J36_DOOM=1 per metterlo in /opt/mixos.",
-      "Nicht installiert. Mit J36_DOOM=1 bauen, um es nach /opt/mixos zu legen.",
-      "Não instalado. Compile com J36_DOOM=1 para o colocar em /opt/mixos.",
-      "No instalado. Compila con J36_DOOM=1 para ponerlo en /opt/mixos." },
-    { "No IWAD in /opt/mixos/share/doom.",
-      "Aucun IWAD dans /opt/mixos/share/doom.",
-      "Nessun IWAD in /opt/mixos/share/doom.",
-      "Kein IWAD in /opt/mixos/share/doom.",
-      "Nenhum IWAD em /opt/mixos/share/doom.",
-      "Ningún IWAD en /opt/mixos/share/doom." },
     { "Browser",
       "Navigateur",
       "Browser",

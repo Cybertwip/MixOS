@@ -100,7 +100,8 @@ public:
      * its own, it is the Terminal page opened on a command -- and it is now the
      * FALLBACK half of the Browser card, taken only when there is no X server on
      * the rootfs to run a graphical browser in.  With one, the same card carries an
-     * exe and goes out through launch() like Doom.  buildPages() says why both.
+     * exe and goes out through launch() like the cards that are programs.
+     * buildPages() says why both.
      *
      * APPENDED, NEVER INSERTED.  These values are compared against m_armed and
      * passed around as ints; a new one in the middle renumbers every card below it
@@ -288,7 +289,6 @@ private:
     void powerOff();
     void toast(const QString &text, int ms = 2400);
     static QString firstExisting(const QStringList &candidates);
-    static QString firstWad();
 
     StatusBar *m_bar = nullptr;
 

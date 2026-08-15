@@ -9,8 +9,9 @@
  * four private methods and five members of SettingsPage, and that was right for
  * as long as the Settings slider was the only thing that ever changed the volume.
  * The two hardware volume keys are not on a page: they work from the Media
- * player, from a full-screen Doom, from the Apps grid.  Two copies of "which
- * control is the playback control" would be two probes of amixer, two caches to
+ * player, from whatever a card has launched full screen, from the Apps grid.
+ * Two copies of "which control is the playback control" would be two probes of
+ * amixer, two caches to
  * disagree with each other, and a Settings slider that shows the level from
  * before the last VOL+.  So there is one, here, and SettingsPage uses it too.
  *
