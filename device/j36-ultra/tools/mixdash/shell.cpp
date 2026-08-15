@@ -68,6 +68,26 @@ void refresh()
     busy = false;
 }
 
+/*
+ * ONE MORE LOOK ON THE WAY OUT, and it closes the window the loops below cannot.
+ *
+ * Every hold() in this file happens because a slice expired -- which is to say,
+ * because the child was still running.  The slice in which the child FINALLY
+ * finishes is the one nobody checks: waitForFinished() returns true and the
+ * function returns, so anything the console lost in that last fifth of a second
+ * stays on the panel until main.cpp's guard timer comes round, up to a second
+ * later.  For `systemctl start smbd' that last slice is precisely the interesting
+ * one, because the job completing is what systemd announces.
+ *
+ * One ioctl that reads a flag, on a path that has just spent milliseconds to
+ * seconds in a child.  It is free.
+ */
+void settle()
+{
+    if (Console::hold())
+        refresh();
+}
+
 /* One slice's worth of the budget, or a whole slice when there is no budget. */
 int nextSlice(int timeoutMs, int left)
 {
@@ -87,8 +107,10 @@ bool waitForStarted(QProcess &proc, int timeoutMs)
     for (;;) {
         const int slice = nextSlice(timeoutMs, left);
 
-        if (proc.waitForStarted(slice))
+        if (proc.waitForStarted(slice)) {
+            settle();
             return true;
+        }
 
         /*
          * A missing binary is not a slow one.  QProcess reports FailedToStart the
@@ -117,8 +139,10 @@ bool waitForFinished(QProcess &proc, int timeoutMs)
     for (;;) {
         const int slice = nextSlice(timeoutMs, left);
 
-        if (proc.waitForFinished(slice))
+        if (proc.waitForFinished(slice)) {
+            settle();
             return true;
+        }
 
         /*
          * FALSE HERE IS TWO DIFFERENT ANSWERS and the state is what separates them.
@@ -133,8 +157,10 @@ bool waitForFinished(QProcess &proc, int timeoutMs)
          * on, because true is what makes the caller read exitCode(), and exitCode()
          * on a process that never ran is 0, which is to say success.
          */
-        if (proc.state() == QProcess::NotRunning)
+        if (proc.state() == QProcess::NotRunning) {
+            settle();
             return proc.error() != QProcess::FailedToStart;
+        }
 
         if (Console::hold())
             refresh();

@@ -68,9 +68,11 @@ elif [[ "${ROOT_FILESYSTEM_FORMAT}" == *"ext"* ]]; then
   # answer was then used for nothing except a diagnostic, which `-P' prints without
   # touching the filesystem at all.
   #
-  # The dd copies ${STORAGE_SIZE} MB instead of the shrunk size, so a few hundred MB of
-  # zeros go across that did not before.  At 8M blocks that is a couple of seconds, and
-  # it buys back the second e2fsck of the whole root, the second resize2fs, the loop
+  # The dd copies ${STORAGE_SIZE} MB instead of the shrunk size, so the difference goes
+  # across as zeros.  That was a few hundred MB and a couple of seconds when the
+  # partition was 4000 MB; at 16000 it is around 12 GB and minutes, which is the price
+  # of a card that has room for the packages this device exists to install.  It still
+  # buys back the second e2fsck of the whole root, the second resize2fs, the loop
   # device, and every "it stays that size with no free space" half-failure that block
   # could end in.
   #
@@ -96,28 +98,41 @@ elif [[ "${ROOT_FILESYSTEM_FORMAT}" == *"ext"* ]]; then
   # STORAGE_SIZE without arithmetic.
   fs_mib=$(( ((fs_min_blocks * fs_bsize) + 1048575) / 1048576 ))
   echo -e "Root filesystem holds ${fs_mib} MB of the ${STORAGE_SIZE} MB partition"
-  # The partition is sized by the rule "the rootfs, rounded up to the next whole
-  # 1000 MB" -- see STORAGE_SIZE in device/r36-ultra/build-in-vm.sh.  It cannot be
-  # applied automatically: the partition table is written in the `image' stage and this
-  # is the first moment the rootfs has a size at all.  So the number is computed here
-  # and the two cases below say it out loud -- one as a failure, one as a warning --
-  # instead of leaving a reader to do the arithmetic.
+  # THE PARTITION IS NOT SIZED FOR THE ROOTFS, and that is the whole point of the
+  # numbers below.  It used to be -- "the rootfs, rounded up to the next whole 1000 MB"
+  # -- and the card that rule produced shipped with 240 MB free, 200 of which is
+  # mkfs.ext2's root reservation, on a device whose Packages page exists so that people
+  # install things on it.  STORAGE_SIZE in device/r36-ultra/build-in-vm.sh is now sized
+  # for the base system plus roughly 12 GB of somebody else's packages; the arithmetic
+  # here is only the FLOOR, the point below which the dd would run over the DATA
+  # partition.  It cannot be applied automatically either way: the partition table is
+  # written in the `image' stage and this is the first moment the rootfs has a size at
+  # all.  So the two cases below say the numbers out loud -- one as a failure, one as a
+  # warning -- instead of leaving a reader to do the arithmetic.
   fs_next_step=$(( ((fs_mib + 999) / 1000) * 1000 ))
+  # What the layout wants spare for packages, on top of whatever the base system
+  # weighs.  Named rather than inlined so the two messages below cannot drift apart
+  # from each other or from the comment beside STORAGE_SIZE.
+  fs_package_headroom=12000
   if [[ ${fs_min_blocks} -gt 0 ]]; then
     if [[ ${fs_mib} -gt ${STORAGE_SIZE} ]]; then
       printf "\n\nThe root filesystem needs %s MB and the partition is %s MB.\n" "${fs_mib}" "${STORAGE_SIZE}"
       printf "btrfs hid this behind compress=zlib:1; ext2 does not compress, so the\n"
       printf "rootfs now costs what it actually weighs.\n\n"
-      printf "  Set STORAGE_SIZE=%s in device/r36-ultra/build-in-vm.sh\n\n" "${fs_next_step}"
-      printf "That is %s MB rounded up to the next whole 1000 MB, which is the rule this\n" "${fs_mib}"
-      printf "layout is sized by.  setup_partition.sh reads that value, so it is the only\n"
-      printf "place to change.  Taking content out of the build root works too.\n"
+      printf "  Set STORAGE_SIZE=%s in device/r36-ultra/build-in-vm.sh\n\n" \
+             "$(( fs_next_step + fs_package_headroom ))"
+      printf "That is %s MB rounded up to the next whole 1000 MB, plus the %s MB of\n" \
+             "${fs_mib}" "${fs_package_headroom}"
+      printf "package headroom this layout is sized by -- see the comment beside\n"
+      printf "STORAGE_SIZE for why the headroom is the rule and not the leftovers.\n"
+      printf "setup_partition.sh reads that value, so it is the only place to change.\n"
+      printf "Taking content out of the build root works too.\n"
       printf "Refusing to dd over the DATA partition.  Exiting...\n\n"
       exit 1
     fi
-    if [[ $(( STORAGE_SIZE - fs_mib )) -lt 256 ]]; then
-      echo -e "The OS partition has only $(( STORAGE_SIZE - fs_mib )) MB spare, which the J36 payload alone can fill"
-      echo -e "Set STORAGE_SIZE=$(( fs_next_step + 1000 )) in device/r36-ultra/build-in-vm.sh if the next build fails on space"
+    if [[ $(( STORAGE_SIZE - fs_mib )) -lt ${fs_package_headroom} ]]; then
+      echo -e "The OS partition has $(( STORAGE_SIZE - fs_mib )) MB spare, and this layout is sized for ${fs_package_headroom} MB of packages"
+      echo -e "Set STORAGE_SIZE=$(( fs_next_step + fs_package_headroom )) in device/r36-ultra/build-in-vm.sh to get it back"
     fi
   else
     echo -e "resize2fs -P did not report a minimum size; the shrink below is the real check"

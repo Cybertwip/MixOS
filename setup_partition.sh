@@ -75,21 +75,27 @@ DATA_MOUNT_POINT="${DATA_MOUNT_POINT:-/home/virtua}"
 SYSTEM_SIZE=100      # FAT32 boot partition size in MB
 # The OS partition, and the number that decides how big the shipped image is.
 #
-# HOW 4000 WAS ARRIVED AT, AND THE RULE FOR CHANGING IT.  write_rootfs.sh shrinks the
-# build root to what it actually weighs and prints that: "Root filesystem shrank to
-# 3384 MB".  4000 is that number rounded up to the next whole 1000 MB, which is the
-# rule -- keep the base system compact and give it one round step of headroom, no more.
-# It was 7500, which put 4 GB of zeros in every image and 4 GB of nothing on every card;
-# that cost nothing while btrfs compressed the image and a .7z shipped it, and both of
-# those are gone.  If the rootfs ever outgrows this, write_rootfs.sh refuses to dd over
-# the DATA partition and names the next 1000 MB step to put here.
+# HOW 16000 WAS ARRIVED AT.  It used to be "what the rootfs weighs, rounded up to the
+# next whole 1000 MB", which gave 4000 for a build that measures 3384 MB -- and the
+# card that shipped had 240 MB free in p2, of which mkfs.ext2's default 5% reservation
+# claims 200.  One `apt-get update' against trixie/main/armhf does not fit in what is
+# left, never mind installing anything with it, and this image has a Packages page.
+#
+# So the rule changed rather than the arithmetic: the partition is sized for the base
+# system PLUS what somebody installs on the device afterwards, which is what a handheld
+# with a package manager on it is for.  16000 MB leaves about 12 GB for that.  The
+# floor is still enforced from below -- write_rootfs.sh refuses to dd a rootfs that
+# would run over the DATA partition and names the value to put here -- and the card has
+# to be 16.5 GB or bigger, DISK_SIZE having become 16417.  The long version, including
+# the debugfs read that produced those numbers, is beside STORAGE_SIZE in
+# device/r36-ultra/build-in-vm.sh.
 #
 # Assigned conditionally so that a caller which already set it wins: this file is
 # sourced by the checkpointed build in device/r36-ultra/build-in-vm.sh, which sets the
 # same geometry for the runs where this stage is skipped.  Two unconditional copies of
 # one number is one number that goes stale, and a build whose partition table and image
 # disagree about where p2 ends writes p2 over p3.
-STORAGE_SIZE="${STORAGE_SIZE:-4000}"    # Root filesystem size in MB
+STORAGE_SIZE="${STORAGE_SIZE:-16000}"   # Root filesystem size in MB
 ROM_PART_SIZE=300    # DATA partition size in MB (ext2, grown by firstboot)
 BUILD_SIZE=52000     # Initial file system size in MB during the build.  Then will be reduced to the DISK_SIZE or below upon completion
 

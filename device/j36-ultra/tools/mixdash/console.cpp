@@ -85,6 +85,34 @@ void trimLog()
         ::lseek(g_log, 0, SEEK_SET);
 }
 
+/*
+ * ── ASKING PID 1 TO STOP RATHER THAN RACING IT ───────────────────────────────
+ *
+ * hold() is a race and always was.  systemd resets the console and writes
+ * "Starting Samba SMB Daemon..." in one breath; the best this file can do
+ * afterwards is notice within a slice and paint over it.  That is a fifth of a
+ * second of console text per unit started, and the Sharing page starts four
+ * units and polls three more every four seconds -- which is why that page, and
+ * not any other, is the one the text was reported on.
+ *
+ * systemd has a switch for exactly this and it is documented in systemd(1):
+ * SIGRTMIN+21 turns off status messages on the console, SIGRTMIN+20 turns them
+ * back on.  It is the same thing `systemd.show_status=0' does on the kernel
+ * command line, only asked for at the moment the panel changes hands rather
+ * than for the whole boot -- so a boot that never reaches a dashboard still
+ * prints everything it always did onto the glass.
+ *
+ * kill(2) is on the async-signal-safe list, and SIGRTMIN is a call into glibc
+ * that reads a cached int, so this is safe from text()'s side too.  A failure
+ * is ignored on purpose: not being able to signal PID 1 means this is not
+ * running as root, or not on a systemd machine, and in both of those cases
+ * hold() is still the whole mechanism and is still enough.
+ */
+void systemdStatus(bool on)
+{
+    ::kill(1, on ? SIGRTMIN + 20 : SIGRTMIN + 21);
+}
+
 } /* namespace */
 
 namespace Console {
@@ -114,6 +142,9 @@ void take()
      * as much as one where this did.
      */
     g_held = 1;
+    /* Before the ioctl, so there is no window in which the mode is ours and PID 1
+     * still believes the console is a console. */
+    systemdStatus(false);
     if (::ioctl(g_tty, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS)
         return;
     ::ioctl(g_tty, KDSETMODE, KD_GRAPHICS);
@@ -143,6 +174,11 @@ void text()
     g_held = 0;
     if (g_tty >= 0)
         ::ioctl(g_tty, KDSETMODE, KD_TEXT);
+    /* And systemd gets its voice back with the panel.  This is reached from the
+     * fatal handlers and from atexit, which is to say from the two moments when
+     * "what is systemd doing" is the question somebody is standing over the board
+     * asking. */
+    systemdStatus(true);
 }
 
 void toLog(const char *path)

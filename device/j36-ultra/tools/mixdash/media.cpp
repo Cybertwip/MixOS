@@ -856,10 +856,60 @@ void MediaPage::onValueChanged(int index, int value)
     }
 }
 
+/*
+ * Put the cursor on the row that shows `path', if this listing has one.
+ *
+ * Rows are not entries and the index of one is not the index of the other:
+ * buildBrowseRows() pins a now-playing row above the listing while music is
+ * live, so every entry row is shifted down by one whenever that is true.  The
+ * row's `id' IS the entry index -- that is what onActivated() looks it up by --
+ * so this searches the rows for the id rather than doing arithmetic on an
+ * offset it would have to keep in step with buildBrowseRows() by hand.
+ */
+bool MediaPage::selectPath(const QString &path)
+{
+    int entry = -1;
+
+    if (path.isEmpty())
+        return false;
+    for (int i = 0; i < m_entries.size(); ++i) {
+        if (m_entries[i].path == path) {
+            entry = i;
+            break;
+        }
+    }
+    if (entry < 0)
+        return false;
+
+    const QVector<ListRow> &rows = m_list->rows();
+    for (int r = 0; r < rows.size(); ++r) {
+        if (rows[r].kind == ListRow::Item && rows[r].id == entry) {
+            m_list->setCurrent(r);
+            return true;
+        }
+    }
+    return false;
+}
+
 void MediaPage::open(Entry entry)
 {
     switch (entry.kind) {
-    case KindUp:
+    case KindUp: {
+        /*
+         * Going up lands the cursor on the directory just left, not on row 0.
+         *
+         * `..' is the only way up now that B leaves the page, so this is the
+         * whole of the "where was I" mechanism.  Without it, climbing out of a
+         * directory puts the selection back on `..' -- the row at index 0 of the
+         * parent -- and the very next press climbs again, so one press too many
+         * walks you to the top of the tree instead of one level up.
+         */
+        const QString child = m_dir;
+        populate(entry.path);
+        if (!selectPath(child))
+            m_list->setCurrent(0);
+        return;
+    }
     case KindDir:
         populate(entry.path);
         m_list->setCurrent(0);

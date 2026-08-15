@@ -117,8 +117,11 @@ QString smbpasswdPath()
  * That was "changing the sharing settings puts the console back on the glass".
  * shell.h has the mechanism; console.h has the reason there is one.
  */
-QString SharingPage::systemctl(const QStringList &args, int timeoutMs)
+QString SharingPage::systemctl(const QStringList &args, int timeoutMs, int *rc)
 {
+    if (rc)
+        *rc = -1;               /* "it did not run", which is not "it said no" */
+
     if (systemctlPath().isEmpty())
         return QString();
 
@@ -132,6 +135,8 @@ QString SharingPage::systemctl(const QStringList &args, int timeoutMs)
         Shell::waitForFinished(p, 500);
         return QString();
     }
+    if (rc)
+        *rc = p.exitCode();
     return QString::fromUtf8(p.readAll()).trimmed();
 }
 
@@ -149,6 +154,90 @@ bool SharingPage::unitEnabled(const QString &unit)
      * there is no install section to enable, so the switch would lie. */
     return systemctl(QStringList() << QStringLiteral("is-enabled") << unit, 2500)
                == QLatin1String("enabled");
+}
+
+/* Where systemd says the unit file actually is.  Asked rather than assumed: it is
+ * /usr/lib/systemd/system on this rootfs and /lib/systemd/system on an older one,
+ * and a symlink pointing at the wrong one is a unit that silently does not exist. */
+QString SharingPage::unitPath(const QString &unit)
+{
+    return systemctl(QStringList() << QStringLiteral("show")
+                                   << QStringLiteral("--property=FragmentPath")
+                                   << QStringLiteral("--value") << unit,
+                     4000);
+}
+
+/*
+ * ── "AT BOOT" HAS TO BE VERIFIED, NOT ISSUED ─────────────────────────────────
+ *
+ * This used to be two systemctl calls and a re-read of is-enabled, and when the
+ * enable did not take there was nothing to say so: the switch simply went back to
+ * off, which reads from the outside as "the setting is not saved between boots".
+ *
+ * So the exit code is looked at now, the state is re-read, and when the two
+ * disagree there is a fallback -- because `systemctl enable' has more ways to fail
+ * on this image than on a desktop.  It writes into /etc, which is on the card and
+ * has been remounted rw by the initramfs but is not guaranteed to have stayed that
+ * way; it wants to talk to PID 1 over D-Bus, and finishing_touches.sh disables
+ * polkit; and it refuses outright for a unit systemd calls `static' or `alias',
+ * which is a packaging decision the samba maintainers can make without telling us.
+ *
+ * The fallback is the .wants symlink, written by hand.  That is not a trick: it is
+ * exactly what `systemctl enable' produces, .wants directories are merged across
+ * /etc, /run and /usr/lib, and build-in-vm.sh already boots mixdash itself this way
+ * for the same reason -- see the note above the multi-user.target.wants link there.
+ * is-enabled reads the same symlink back, so the switch on the glass and the state
+ * on the card cannot drift apart afterwards.
+ *
+ * Returns an empty string when the unit really is in the asked-for state, and the
+ * reason -- systemd's own first line, where there is one -- when it is not.
+ */
+QString SharingPage::setEnabled(const QString &unit, bool on)
+{
+    int rc = -1;
+    const QString out = systemctl(QStringList()
+                                      << (on ? QStringLiteral("enable")
+                                             : QStringLiteral("disable"))
+                                      << unit,
+                                  8000, &rc);
+
+    if (unitEnabled(unit) == on)
+        return QString();
+
+    const QString wants =
+        QStringLiteral("/etc/systemd/system/multi-user.target.wants");
+    const QString link = wants + QLatin1Char('/') + unit + QStringLiteral(".service");
+
+    if (on) {
+        const QString frag = unitPath(unit);
+
+        if (frag.isEmpty() || !QFileInfo(frag).exists())
+            return tr("there is no %1.service on this card").arg(unit);
+        QDir().mkpath(wants);
+        /* Removed first: QFile::link will not overwrite, and a stale link is the
+         * likeliest thing to be standing here. */
+        QFile::remove(link);
+        if (!QFile::link(frag, link))
+            return tr("cannot write %1").arg(link);
+    } else if (QFileInfo(link).isSymLink() && !QFile::remove(link)) {
+        return tr("cannot remove %1").arg(link);
+    }
+
+    /* So that this boot's systemd agrees with the card, and so that the is-enabled
+     * below is answered from the same picture the next boot will build. */
+    systemctl(QStringList() << QStringLiteral("daemon-reload"), 8000);
+
+    if (unitEnabled(unit) == on)
+        return QString();
+
+    /* Still not.  systemd's own words if it left any, and the exit code if it did
+     * not -- an empty message with a switch that will not move is the thing this
+     * whole function exists to stop happening again. */
+    if (!out.isEmpty())
+        return out.section('\n', 0, 0);
+    return tr("systemctl %1 %2 exited %3")
+               .arg(on ? QStringLiteral("enable") : QStringLiteral("disable"),
+                    unit, QString::number(rc));
 }
 
 bool SharingPage::sambaInstalled()
@@ -789,13 +878,17 @@ void SharingPage::onActivated(int index)
                 break;
             }
         }
-        const QString verb = turningOn ? QStringLiteral("enable")
-                                       : QStringLiteral("disable");
-        systemctl(QStringList() << verb << QString::fromLatin1(kSmbd), 8000);
-        systemctl(QStringList() << verb << QString::fromLatin1(kNmbd), 8000);
+        const QString err = setEnabled(QString::fromLatin1(kSmbd), turningOn);
+        /* nmbd's is best-effort here for the same reason its start is: the share
+         * works without the NetBIOS name, so its failure is not the switch's. */
+        setEnabled(QString::fromLatin1(kNmbd), turningOn);
+
         m_enabled = unitEnabled(QString::fromLatin1(kSmbd));
-        m_note = m_enabled ? tr("sharing will start at boot")
-                           : tr("sharing will not start at boot");
+        if (!err.isEmpty())
+            m_note = err;
+        else
+            m_note = m_enabled ? tr("sharing will start at boot")
+                               : tr("sharing will not start at boot");
         break;
     }
 

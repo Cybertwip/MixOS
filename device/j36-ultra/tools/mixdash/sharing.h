@@ -125,9 +125,17 @@ private:
 
     /* ── the pieces underneath ── */
 
-    static QString systemctl(const QStringList &args, int timeoutMs = 4000);
+    /* `rc', when asked for, is the child's exit code -- or -1 when it never ran or
+     * never finished, which is not the same answer as "it ran and said no". */
+    static QString systemctl(const QStringList &args, int timeoutMs = 4000,
+                             int *rc = nullptr);
     static bool unitActive(const QString &unit);
     static bool unitEnabled(const QString &unit);
+    /* systemd's FragmentPath for the unit: where the .service file really is. */
+    static QString unitPath(const QString &unit);
+    /* enable or disable, VERIFIED -- and with the .wants symlink written by hand
+     * when systemctl could not.  Empty on success, the reason otherwise. */
+    static QString setEnabled(const QString &unit, bool on);
     static bool sambaInstalled();
     static QString hostName();
     /* Every IPv4 address that is not loopback, in the order getifaddrs gives

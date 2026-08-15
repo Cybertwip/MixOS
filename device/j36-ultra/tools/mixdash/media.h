@@ -258,6 +258,8 @@ private:
      */
     void populate(QString dir);
     void open(Entry entry);
+    /* Cursor onto the row showing this path; false if this listing has none. */
+    bool selectPath(const QString &path);
     void openImage(const Entry &entry);
     /* startAt is why this takes a time: a pipe cannot seek, so seeking is running
      * ffmpeg again from somewhere else, and that is the same code path as opening. */

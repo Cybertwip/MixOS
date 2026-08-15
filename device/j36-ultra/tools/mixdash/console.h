@@ -60,8 +60,17 @@ namespace Console {
  */
 bool open();
 
-/* The handover, from the first paint and not one moment sooner.  Everything before
- * that is still readable on the glass. */
+/*
+ * The handover, from the first paint and not one moment sooner.  Everything before
+ * that is still readable on the glass.
+ *
+ * It also asks systemd to stop printing status messages to the console
+ * (SIGRTMIN+21, documented in systemd(1)), and that is the half of this file that
+ * is not a race.  hold() can only notice the console has been taken and paint over
+ * it, which is a slice of visible text per unit started -- and the Sharing page
+ * starts four units and polls three more every four seconds, which is why that
+ * page is where the text kept being reported.  text() turns them back on.
+ */
 void take();
 
 /*

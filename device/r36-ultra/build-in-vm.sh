@@ -161,22 +161,41 @@ DATA_MOUNT_OPTIONS="defaults,auto,noatime,nofail"
 # The mount point is a home directory, not a rom library -- see setup_partition.sh.
 DATA_MOUNT_POINT="/home/virtua"
 SYSTEM_SIZE=100
-# 4000 MB for the OS partition, not 7500.  write_rootfs.sh reports what the rootfs
-# actually weighs -- "Root filesystem holds 3384 MB" -- and 4000 is that rounded up
-# to the next whole 1000 MB: compact base system, one round step of headroom.  The old
-# 7500 put 4 GB of zeros in the image and 4 GB nothing would ever use on the card, which
-# was free only while btrfs compressed the image and a .7z shipped it.  Both are gone, so
-# the image is now 4417 MB instead of 7917 MB and every copy of it is that much shorter.
+# 16000 MB for the OS partition, and the rule that produced the old 4000 is what was
+# wrong with it -- not the arithmetic.  "The rootfs, rounded up to the next whole
+# 1000 MB" sizes the partition for the image and for nothing else, and it was applied
+# to a build that measures 3384 MB, so the card shipped with this:
 #
-# THE RULE IF THE BASE SYSTEM OUTGROWS IT: round up to the next 1000 MB step and change
-# it here.  Nothing has to guess -- write_rootfs.sh refuses to dd a rootfs that would run
-# over the DATA partition and prints the exact value to set.  It cannot be derived
-# automatically, because image_setup.sh writes the partition table in the `image' stage
-# and the rootfs is not measurable until finalization, thousands of packages later.
+#     Block count:  1024000        1024000 x 4096 = 4000 MB, the partition
+#     Free blocks:     61476          61476 x 4096 =  240 MB, and that is all of it
+#     Block size:       4096
 #
-# setup_partition.sh reads this rather than setting its own copy (`${STORAGE_SIZE:-4000}'),
+# read out of MixOS_armhf_trixie_ec3b06f.img with debugfs.  240 MB, less mkfs.ext2's
+# default 5% root reservation -- 51200 blocks, 200 MB -- which leaves about 40 MB to
+# anything not running as root.  That is not a small margin, it is no margin: a single
+# `apt-get update' against trixie/main/armhf writes roughly 56 MB of uncompressed
+# Packages, 30 MB of Translation-en, the compressed copies of both in lists/partial
+# while they arrive, and then 60-100 MB of pkgcache.bin and srcpkgcache.bin under
+# /var/cache/apt.  It does not fit, and this is a device with a Packages page on it
+# whose entire purpose is installing things afterwards.
+#
+# THE RULE NOW: the partition is sized for what the device is FOR, which is a base
+# system plus everything the person holding it installs later.  16000 MB is that --
+# 3.4 GB of base leaves about 12 GB of card for packages -- and the number is round
+# rather than derived because nothing about a user's future package list is derivable.
+# write_rootfs.sh still refuses to dd a rootfs that would run over the DATA partition
+# and still prints the exact value to set, so the floor is enforced; this is the
+# ceiling, and it is a decision rather than a measurement.
+#
+# WHAT IT COSTS.  DISK_SIZE becomes 16417 MB, so the artifact and every copy of it are
+# that long -- both files are sparse and copied with --sparse=always, so the bytes on
+# the build host are still only what the rootfs weighs, but the card must be 16.5 GB
+# or bigger and the dd in write_rootfs.sh now pushes 16 GB of mostly-zeros instead of
+# 4 GB.  At bs=8M that is minutes, not seconds, and it is paid once per build.
+#
+# setup_partition.sh reads this rather than setting its own copy (`${STORAGE_SIZE:-16000}'),
 # so the sourced partition stage and the resumed build that skips it cannot disagree.
-STORAGE_SIZE=4000
+STORAGE_SIZE=16000
 ROM_PART_SIZE=300
 BUILD_SIZE=52000
 SYSTEM_PART_START=32768
@@ -573,10 +592,11 @@ verify_native_userspace() {
 # finished build writes it; a build from before this existed has no file, which reads
 # as "unknown" and is treated as foreign.
 # The geometry is in here as well as the two formats, because "the layout changed" has
-# to include "the partitions moved".  STORAGE_SIZE went from 7500 to 4000, which shifts
-# where p3 begins; an image built before that is not a smaller version of this one, it is
-# a different card.  Adding the sizes also invalidates every layout file written by an
-# earlier build, which is correct: those all describe the 7500 MB layout.
+# to include "the partitions moved".  STORAGE_SIZE has been 7500, then 4000, and is now
+# 16000; each of those shifts where p3 begins, so an image built before a change is not
+# a smaller version of this one, it is a different card.  Having the sizes in the string
+# invalidates every layout file written by an earlier build, which is exactly right --
+# they all describe a partition table that is no longer the one being written.
 layout_signature() {
     printf 'rootfs=%s data=%s boot=%sMB os=%sMB data_part=%sMB\n' \
         "$ROOT_FILESYSTEM_FORMAT" "$DATA_FILESYSTEM_FORMAT" \
