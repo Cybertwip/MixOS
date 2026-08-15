@@ -122,6 +122,48 @@ QString graphicalBrowserSession()
 }
 
 /*
+ * WHICH OF THE FOUR PIECES IS NOT ON THIS CARD, in a sentence, for the boot where
+ * the answer above is empty.
+ *
+ * This exists because the fallback is silent and the fallback is WRONG-LOOKING.  A
+ * card that cannot start the graphical session opens links2 -- a text browser with
+ * no JavaScript -- and does it with no more ceremony than a card that opens Firefox,
+ * so the whole report it produces is "the default browser is not Mozilla".  Every
+ * one of the four reasons is a package or a payload file, none of them is a setting,
+ * and none of them can be guessed at from the outside.
+ *
+ * AND THE REASON IS ALMOST ALWAYS THE SAME ONE: the rootfs.  firefox-esr, xinit and
+ * the X server come from needed_packages.txt, which is the BASE build's business --
+ * `--mix-only' rebuilds the kernel, the initramfs and /opt/mixos and cannot install a
+ * package on a card that is already flashed.  So a card written before those packages
+ * were added keeps opening links2 no matter how many board layers are copied onto it,
+ * and this sentence is what says so out loud instead of leaving it to be inferred.
+ *
+ * The order matches graphicalBrowserSession()'s tests, so the sentence names the
+ * first thing that failed and not merely something that is also absent.
+ */
+QString graphicalBrowserMissing()
+{
+    if (!QFileInfo(QString::fromLatin1(kBrowserSession)).isExecutable())
+        return QCoreApplication::translate(
+            "Dashboard", "the /opt/mixos payload has no j36-browser script");
+    if (!QFileInfo(QStringLiteral("/usr/bin/xinit")).isExecutable())
+        return QCoreApplication::translate(
+            "Dashboard", "this card's rootfs has no xinit");
+
+    static const char *const kServers[] = {
+        "/usr/bin/Xorg", "/usr/lib/xorg/Xorg", "/usr/bin/X"
+    };
+    for (const char *const s : kServers) {
+        if (QFileInfo(QString::fromLatin1(s)).isExecutable())
+            return QCoreApplication::translate(
+                "Dashboard", "this card's rootfs has no graphical browser");
+    }
+    return QCoreApplication::translate(
+        "Dashboard", "this card's rootfs has no X server");
+}
+
+/*
  * Quote a path for /bin/sh.  Inside single quotes everything is literal except a
  * single quote, which has to leave the quoting to be written: ' -> '\''.  Paths
  * on an SD card come from whoever wrote the card, and a filename with a quote or
@@ -1709,6 +1751,14 @@ void Dashboard::activate(const AppEntry &entry)
         m_terminal->runCommand(QStringLiteral("cd /home/virtua 2>/dev/null || cd ~; HOME=\"$PWD\" ")
                                + QString::fromLatin1(kBrowserExe) + QLatin1Char(' ')
                                + shellQuote(start));
+        /*
+         * After the push, so it lands on the terminal the user is now looking at.
+         * The card is doing the right thing here -- links2 is what this rootfs can
+         * run -- but "the browser has no JavaScript" is not a diagnosis anybody can
+         * act on, and the sentence below is: it names the missing package, and the
+         * Packages page two cards away is where that is fixed.
+         */
+        toast(tr("Text browser: %1").arg(graphicalBrowserMissing()), 5000);
         break;
     }
     case InternalWifi:

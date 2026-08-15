@@ -2001,6 +2001,22 @@ want_log=1
 # 0 or auto, in MiB.  auto is 80% of MemTotal; a number is that many MiB, for
 # measuring one size against another without rebuilding anything.
 want_zram=auto
+# The third word that defaults to ON, and the only one whose OFF exists for a reason
+# none of the others have: expand_root is the one thing /init does that is DESTRUCTIVE,
+# LONG and NOT RESUMABLE-BY-GIVING-UP.  It unmounts the OS partition, rewrites the
+# partition table, and then spends minutes -- ten and more on a big card -- inside
+# e2fsck and resize2fs.  Every other word here guards a payload that either loads or
+# does not; this one guards the only code in the boot that can leave the card in a
+# state the next boot has to finish.
+#
+# So it gets the switch every one of those has, for the case none of them have to
+# handle: a board that will not come up, and an operator who needs to know whether
+# THIS is why, with nothing but a Mac and the FAT partition.  Put j36.expand=0 in
+# mvii/boot.conf and the step is skipped entirely -- the card keeps the size it has,
+# which is exactly what it did before this ever worked, and the boot carries on.
+# Take the word back out and the next boot grows it, because nothing about the
+# decision is remembered: both ends are read off the card every time.
+want_expand=1
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         j36.audio|j36.audio=1)
@@ -2144,6 +2160,23 @@ for arg in $(cat /proc/cmdline); do
         # that already has the answer.  Nothing else turns it off.
         j36.log=0|nolog)
             want_log=0
+            ;;
+        # Do not grow the OS partition on this boot.  The word to reach for when a
+        # board stopped coming up and the resize is the change under suspicion: it is
+        # the only step in /init that unmounts the root filesystem and writes the
+        # partition table, and it is the only one that can still be working after the
+        # operator has decided the boot is dead.  Skipping it puts the boot back to
+        # exactly the shape it had before the resize could run at all.
+        #
+        # It is a per-boot word and not a setting: nothing is written to remember it,
+        # so taking it out of boot.conf is all that is needed to let the next boot try
+        # again.  `j36.expand=1' is accepted for symmetry with every other word here,
+        # and is what happens anyway.
+        j36.expand=0|noexpand)
+            want_expand=0
+            ;;
+        j36.expand|j36.expand=1)
+            want_expand=1
             ;;
         # Swap off entirely, for the boot where the question is whether zram is
         # what is making the board feel slow.  It is a fair question and it has a
@@ -2663,6 +2696,15 @@ expand_read_superblock() {
 }
 
 expand_root() {
+    # BEFORE THE FIRST QUESTION AND NOT INSIDE THEM, because the point of the word is
+    # to make this function touch nothing: not the superblock, not the tools, and
+    # above all not the mount.  A card that boots with j36.expand=0 is a card on which
+    # this file might as well not have been written, which is what makes it an answer
+    # to "is the resize why this board stopped coming up".
+    if [ "$want_expand" = 0 ]; then
+        expand_note "j36.expand=0 in the bootargs, so the card is left exactly as it is"
+        return 0
+    fi
     if [ -z "$rootdev" ] || [ -z "$rootfs_type" ]; then return 0; fi
     case "$rootfs_type" in
         ext2|ext3|ext4) : ;;
@@ -8729,9 +8771,8 @@ initrd=initrd.img
 # cuts out in playback, `amixer -c0 set "Speaker Amp" off' -- no reboot needed.
 # j36.usb=1 sources 5 V on the OTG port off that same rail: j36.usb=novbus with no
 # cell.  It is not the connector that charges -- that is the DC inlet beside it.
-# j36.gl=debug adds Mesa's EGL trace; a diagnostic, not a default.
-# j36.splash=0 with loglevel=7 boots to text, which is the pair
-# ./build-j36-ultra.sh --no-splash writes here.
+# j36.gl=debug adds Mesa's EGL trace.  j36.splash=0 loglevel=7 boots to text.
+# j36.expand=0 skips growing p2 -- the recovery if a resize wedged the boot.
 # Each boot writes mixos-log.txt at the top of this partition; j36.log=0 stops it.
 bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=speaker j36.usb=1 j36.power=1 j36.wifi=1 j36.splash=1
 CONF
@@ -9008,6 +9049,23 @@ systemd.mask=firstboot.service
     /sys/block measured against what growing an ext2 by this many block groups
     has to write.  The console gets a line at every tenth of the way through, so
     a serial log tells the same story afterwards.
+
+    AND IT HAS AN OFF SWITCH, WHICH NOTHING ELSE IN /init NEEDED ONE FOR.  Put
+    j36.expand=0 in the bootargs in mvii/boot.conf and this step does not happen
+    at all: no unmount, no partition table written, no e2fsck, no resize2fs.  The
+    card keeps the size it has and the boot carries straight on.
+
+    It exists because this is the only work /init does that is destructive, long
+    and still running after an operator has decided the board is dead -- so it is
+    also the only step that can be the reason a board stopped coming up, and the
+    only one there was previously no way to rule out.  Ruling it out has to be
+    possible with nothing but the card in a reader, which is what putting the word
+    on the FAT partition buys.
+
+    Nothing is written to remember the word.  Take it back out and the next boot
+    grows the card, because both ends of "is there anything left to grow" are read
+    off the card itself every time -- so an interrupted resize is picked up rather
+    than skipped, and a card that was left alone is not marked as done.
 
 batt_led.service, no longer masked
     The RK3326 battery LED daemon, and the first unit the forwarded log caught:
@@ -11782,6 +11840,9 @@ fi
         echo "storage=msdc1 mtk-sd mediatek,mt6592-mmc (ext2, ext4, btrfs, exfat, vfat)"
         echo "card_layout=p1 BOOT vfat = launcher only (zImage, dtb, initrd.img, mvii/boot.conf, LICENSE.txt, README.txt); p2 ROOTFS ext2 = the OS, /opt/mixos included, and the login user's home at ${DATA_MOUNT_POINT:-/home/virtua} as an ordinary directory in it.  Two partitions: there is no p3, and p2 is last on the disk so /init can grow it to the card's size on the first boot"
         echo "card_expand=/init's expand_root, before switch_root: sfdisk -N extends p2 to the end of the disk, e2fsck -fp, then resize2fs with no size argument.  ext2 has no online resize, so this is the only moment in the boot it can happen; the three tools and their libraries are copied out of the rootfs before it is unmounted, and a copy that will not run leaves the card alone"
+        echo "card_expand_off=j36.expand=0 in the bootargs in mvii/boot.conf skips the whole step -- no unmount, no partition table write, no e2fsck, no resize2fs.  It is the only destructive thing /init does and the only one that is still working after an operator has decided the board is dead, so it is the one step that has to be rulable-out from a card reader alone.  Nothing remembers the word: take it out and the next boot grows the card"
+        echo "card_expand_libs=EXPAND_LIBS in /init names the shared libraries those tools are copied with, and this build checked it against the DT_NEEDED closure of sfdisk, e2fsck, resize2fs and dumpe2fs in the armhf chroot -- see verify_expand_libs.  A name missing from that list is not a build failure by itself, it is a loader exiting 127 on the device and a card that silently keeps the size it was flashed at, so the build fails on it instead"
+        echo "card_expand_reaches_a_flashed_card=yes, through --mix-only: expand_root lives in /init, /init is inside initrd.img, and initrd.img is in boot/.  Copying boot/ onto the BOOT partition is the whole update; nothing about the resize comes from the rootfs except the four tools it borrows"
         echo "card_expand_progress=the splash bar and detail line show a real percentage for the whole operation: e2fsck reports through -C 1, and resize2fs (which reports nothing) is measured as write_sectors in /sys/block/<disk>/stat against the inode tables and bitmaps that the added block groups cost.  dumpe2fs is copied out too, optionally, because that estimate needs the filesystem's own inode size and inodes-per-group; without it the phase falls back to naming itself"
         echo "rootfs_format=ext2, set in setup_partition.sh and device/r36-ultra/build-in-vm.sh; the MVII LK reads FAT32 only, so BOOT is FAT and the OS partition is free to be the simplest filesystem both kernels on this card handle"
         echo "payload=$PAYREL (J36_PAYLOAD_ON=$PAYLOAD_ON; /init looks in the rootfs /opt/mixos/j36 first, then j36/ on BOOT for a card written by an older build)"
