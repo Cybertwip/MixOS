@@ -5307,7 +5307,20 @@ dump() {
     showall "and what it says it can do (EV bits)" /sys/class/input/input*/capabilities/ev
     showall "absolute axes, which is where a dead stick shows" \
         /sys/class/input/input*/capabilities/abs
-    kgrep "input devices" 'input|joystick|gamepad|js[0-9]|event[0-9]|j36_input|adc.*key'
+    # Which driver claimed a plugged-in pad, which is the question /dev/input
+    # cannot answer.  An Xbox pad on no driver and an Xbox pad on a broken one are
+    # the same silence from every line above; xpad is a usb_driver and the other
+    # three are hid_drivers, so they are listed from two different places.
+    #
+    # hid-generic holding a DualShock is the specific failure to look for here: it
+    # binds anything nothing else wanted, so a DS3 shows up in this list bound and
+    # still never reports an event, because it is hid-sony that sends the report
+    # that wakes the pad up.
+    run ls /sys/bus/hid/drivers
+    run ls -l /sys/bus/hid/devices/*/driver
+    showall "and is xpad in the kernel?" /sys/module/xpad/initstate
+    kgrep "input devices" \
+        'input|joystick|gamepad|js[0-9]|event[0-9]|j36_input|adc.*key|xpad|hid-sony|hid-playstation|hid-nintendo'
 
     printf '\n\n########## 4.  USB ##########\n'
     run lsusb
@@ -7841,8 +7854,9 @@ if (( ${#AUDIO_MODULE_ORDER[@]} > 0 )); then
     log "audio: staged ${#AUDIO_MODULE_ORDER[@]} modules into $PAYREL/audio/"
 fi
 
-# j36/usb/ is the host stack: the PHY, MUSB and its glue, the HID pair, udl, and
-# the mass-storage set that turns a plugged-in disk into /dev/sda and mounts it.
+# j36/usb/ is the host stack: the PHY, MUSB and its glue, the HID pair, the four
+# gamepad drivers, udl, and the mass-storage set that turns a plugged-in disk into
+# /dev/sda and mounts it.
 # Its own directory and its own load.order on the same terms as the other three,
 # and the removal contract matters here as much as it does for audio, for the
 # same class of reason: this is the payload whose failure mode is a bus stall.
@@ -8096,8 +8110,10 @@ changes nothing else:
   opt/mixos/j36/modules/   lima and its dependencies, plus load.order
   opt/mixos/j36/mtkdrm/    the MT6592 display driver set, plus load.order
   opt/mixos/j36/audio/     the ALSA core and the MT6592 AFE driver, plus load.order
-  opt/mixos/j36/usb/       the USB host stack -- PHY, MUSB, HID, udl, and the disk
-                           set (scsi_mod, sd_mod, usb-storage, ntfs3) -- plus load.order
+  opt/mixos/j36/usb/       the USB host stack -- PHY, MUSB, HID, udl, the gamepad
+                           drivers (xpad, hid-sony, hid-playstation, hid-nintendo)
+                           and the disk set (scsi_mod, sd_mod, usb-storage, ntfs3)
+                           -- plus load.order
   opt/mixos/j36/power/     the MT6592 PMIC: battery gauge, charger, poweroff --
                            and the panel backlight, which is the same subject
   opt/mixos/j36/wifi/      the radio and wlan0: CONSYS rails, BTIF link, cfg80211
@@ -10621,14 +10637,17 @@ a { text-decoration: underline; }
 
 <h1>MixOS</h1>
 
-<p>A graphical browser, on the panel, driven by the pad. The D-pad moves the
-pointer &mdash; it starts slow and speeds up while you hold it &mdash; and
-<b>A</b> clicks whatever it is over.</p>
+<p>A graphical browser, on the panel, driven by the pad. The left stick moves the
+pointer and <b>A</b> clicks whatever it is over. The D-pad moves it too, slowly
+at first and faster the longer you hold it &mdash; the stick is for crossing the
+screen, the D-pad for landing on a small link.</p>
 
 <h2>The pad</h2>
 
 <table>
-<tr><td class="k">D-pad</td><td>move the pointer</td></tr>
+<tr><td class="k">Left stick</td><td>move the pointer</td></tr>
+<tr><td class="k">Right stick</td><td>scroll</td></tr>
+<tr><td class="k">D-pad</td><td>move the pointer, accelerating while held</td></tr>
 <tr><td class="k">A</td><td>click</td></tr>
 <tr><td class="k">B</td><td>back one page</td></tr>
 <tr><td class="k">X</td><td>Enter &mdash; submits the box you are typing in</td></tr>
@@ -10645,6 +10664,10 @@ pointer &mdash; it starts slow and speeds up while you hold it &mdash; and
 <p>To type a URL: <b>Start</b>, then <b>Select</b> for the keyboard, then tap the
 keys with <b>A</b>, then <b>X</b> for Enter. A USB keyboard or mouse in the dock
 works too, and is much faster.</p>
+
+<p>So does a USB gamepad &mdash; Xbox, PlayStation, Switch or a plain one. Plug it
+in and it drives this page with the same bindings, whether the browser is already
+open or not.</p>
 
 <p>Downloads, bookmarks and cookies land in <b>/home/virtua</b>, which is the
 directory the Sharing card exports over SMB &mdash; so a file saved here turns up

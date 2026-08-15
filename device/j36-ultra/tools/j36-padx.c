@@ -59,6 +59,26 @@
  * that looks like a keyboard (it has the letter keys) or like a mouse (it has
  * EV_REL) is left alone even if something about it also looks like a pad.
  *
+ * A USB PAD IS TAKEN TOO, and on purpose.  An Xbox, PlayStation or Switch pad in
+ * the port matches the same test, so it drives the browser exactly as the built-in
+ * one does -- which is the right answer on a console, and it is also why the axis
+ * handling below reads each device's real ranges instead of assuming this board's.
+ * Those pads do not agree with each other about anything:
+ *
+ *     built-in    left ABS_X/ABS_Y  right ABS_Z/ABS_RZ   -4096..4096
+ *     xpad        left ABS_X/ABS_Y  right ABS_RX/ABS_RY  -32768..32767,
+ *                 and ABS_Z/ABS_RZ are the TRIGGERS, 0..255 or 0..1023
+ *     hid-sony    left ABS_X/ABS_Y  right ABS_Z/ABS_RZ   0..255, centre 128
+ *     hid-playstation, hid-nintendo  right on ABS_RX/ABS_RY
+ *
+ * Reading ABS_Z as a right stick on an xpad would have turned the left trigger
+ * into a scroll wheel.  So the right stick is ABS_RX/ABS_RY when the device has
+ * that pair and ABS_Z/ABS_RZ when it does not, and every axis is scaled by the
+ * minimum, maximum and flat that EVIOCGABS reports for it rather than by a
+ * constant.  The D-pad is read from KEY_UP..KEY_RIGHT, from BTN_DPAD_UP..RIGHT
+ * and from the ABS_HAT0X/ABS_HAT0Y hat, because those three are how the same four
+ * directions arrive from the three families.
+ *
  * THE MAP.  Chosen so that the four things a browser needs -- point, click, go
  * back, scroll -- are the four things nearest the thumbs, and so that no binding
  * needs a chord:
@@ -125,6 +145,7 @@
 #include <unistd.h>
 
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 #include <linux/input.h>
@@ -133,19 +154,52 @@
 #include <X11/extensions/XTest.h>
 #include <X11/keysym.h>
 
-/* ── the pads ────────────────────────────────────────────────────────────── */
+/* ── shared shape ────────────────────────────────────────────────────────── */
 
+/* Four is not a limit anyone will reach -- it is the built-in pad plus whatever
+ * fits on the one USB port through a hub. */
 #define MAX_PADS 4
 
-static int   pad_fd[MAX_PADS];
-static char  pad_name[MAX_PADS][128];
-static int   pads;
+/* The four axis roles this program has a use for.  Triggers and hats are not in
+ * the list: a hat is read as the D-pad, and a trigger has no binding. */
+#define AX_LX 0
+#define AX_LY 1
+#define AX_RX 2
+#define AX_RY 3
+#define AX_N  4
+
+#define DIR_UP    0x1
+#define DIR_DOWN  0x2
+#define DIR_LEFT  0x4
+#define DIR_RIGHT 0x8
+
+static int    pad_fd[MAX_PADS];
+static dev_t  pad_dev[MAX_PADS];      /* which device node, so a rescan skips it */
+static char   pad_name[MAX_PADS][128];
+static unsigned pad_dirs[MAX_PADS];   /* the D-pad, per pad: see drop_pad */
+
+static int    ax_code[MAX_PADS][AX_N];    /* evdev code feeding this role, or -1 */
+static double ax_centre[MAX_PADS][AX_N];
+static double ax_half[MAX_PADS][AX_N];
+static double ax_dead[MAX_PADS][AX_N];    /* fraction of travel, 0..0.5 */
+static double ax_val[MAX_PADS][AX_N];     /* -1..1, deadzone already removed */
 
 #define BITS_PER_LONG  (int)(sizeof(long) * 8)
 #define NLONGS(x)      (((x) + BITS_PER_LONG - 1) / BITS_PER_LONG)
 #define TEST_BIT(b, a) (((a)[(b) / BITS_PER_LONG] >> ((b) % BITS_PER_LONG)) & 1UL)
 
 static int verbose;
+
+/* When the current D-pad hold started, for the acceleration ramp.  File scope
+ * because set_dir() is what notices the hold beginning and it is called from
+ * three places. */
+static long move_start;
+
+/* The two pieces of held-button state that are not per-pad.  They live here, and
+ * the repeat clock is reached through a forward declaration, because drop_pad()
+ * has to cancel both and it is defined long before either: see the comment there. */
+static long menu_down_at;
+static void rep_clear(void);
 
 static void note(const char *fmt, ...)
 {
@@ -169,29 +223,87 @@ static void fail(const char *fmt, ...)
     va_end(ap);
 }
 
+/* ── the pads ────────────────────────────────────────────────────────────── */
+
+static void clear_pad(int slot)
+{
+    int r;
+
+    pad_fd[slot] = -1;
+    pad_dev[slot] = 0;
+    pad_name[slot][0] = '\0';
+    /* Both of these matter on the unplug path and not at startup.  A pad pulled
+     * out mid-hold would otherwise leave its direction bit set for ever -- the
+     * release event is on the wire that just left the socket -- and a stick pulled
+     * out mid-deflection would leave the pointer travelling with nothing able to
+     * stop it.  Per-pad state is what makes both of those a two-line reset. */
+    pad_dirs[slot] = 0;
+    for (r = 0; r < AX_N; r++) {
+        ax_code[slot][r] = -1;
+        ax_val[slot][r] = 0.0;
+    }
+}
+
+static void drop_pad(int slot)
+{
+    if (pad_fd[slot] < 0)
+        return;
+    note("%s went away", pad_name[slot]);
+    ioctl(pad_fd[slot], EVIOCGRAB, 0);
+    close(pad_fd[slot]);
+    clear_pad(slot);
+
+    /*
+     * Cancel every held button, and not only this pad's.
+     *
+     * A release event arrives on the wire that has just been unplugged, so a
+     * shoulder held at the moment the cable came out never gets one -- and the
+     * auto-repeat below has no owner to attribute it to, so it would keep sending
+     * Page Down until the session ended.  Menu is the same shape with a worse
+     * result: held at the wrong moment, it would close the browser a second after
+     * the pad was pulled out.
+     *
+     * Cancelling a second pad's genuine hold along with it is the cost, and it is
+     * the right trade: the worst case there is one button that has to be pressed
+     * again, against a page that scrolls for ever on its own.
+     */
+    rep_clear();
+    menu_down_at = 0;
+}
+
 static void close_pads(void)
 {
     int i;
-    for (i = 0; i < pads; i++) {
-        if (pad_fd[i] >= 0) {
-            /* Explicit, though close() would do it: the ungrab is the thing that
-             * gives the dashboard its buttons back, and it should be visible on
-             * the page rather than implied by a close. */
-            ioctl(pad_fd[i], EVIOCGRAB, 0);
-            close(pad_fd[i]);
-            pad_fd[i] = -1;
-        }
+    for (i = 0; i < MAX_PADS; i++) {
+        if (pad_fd[i] < 0)
+            continue;
+        /* The ungrab is explicit though close() would do it: it is the thing that
+         * gives the dashboard its buttons back, and it should be visible on the
+         * page rather than implied by a close. */
+        ioctl(pad_fd[i], EVIOCGRAB, 0);
+        close(pad_fd[i]);
+        clear_pad(i);
     }
-    pads = 0;
+}
+
+static int pad_count(void)
+{
+    int i, n = 0;
+    for (i = 0; i < MAX_PADS; i++) {
+        if (pad_fd[i] >= 0)
+            n++;
+    }
+    return n;
 }
 
 /*
- * Is this /dev/input/eventN the built-in pad?
+ * Is this /dev/input/eventN a pad?
  *
- * Positive test: it carries BTN_A and BTN_START.  Those two together are what the
- * device tree's key map puts on this board and what nothing else on it has.  A
- * touchscreen or a tablet has ABS_X and BTN_TOUCH and neither of these, so it is
- * excluded by the positive test without needing a rule of its own.
+ * Positive test: it carries BTN_A and BTN_START.  Together those are what this
+ * board's key map puts on the built-in pad and what xpad, hid-sony,
+ * hid-playstation, hid-nintendo and hid-generic all put on a USB one, and nothing
+ * else on this device has either.  A touchscreen or a tablet has ABS_X and
+ * BTN_TOUCH and neither of these, so it is excluded here without a rule of its own.
  *
  * Negative tests, and they matter more than the positive one, because what is
  * being decided is whether to take a device away from the rest of the system:
@@ -234,13 +346,115 @@ static int looks_like_pad(int fd, const char *name)
     return 1;
 }
 
-static int find_pads(int grab)
+/*
+ * Learn one axis from the device rather than from a constant.
+ *
+ * min and max give the centre and the half-travel, which is what makes the same
+ * arithmetic work for -4096..4096, -32768..32767 and 0..255 without knowing which
+ * pad is on the other end.  `flat' is the driver's own idea of its deadzone and is
+ * honoured when it is the larger of the two -- xpad says 128 counts out of 32768,
+ * which is a tenth of what is wanted here, and hid-playstation says nothing at all.
+ *
+ * The current value is deliberately NOT read into ax_val.  A stick at rest sends
+ * no events, so zero is the honest starting point; seeding from EVIOCGABS would
+ * mean a pad that happened to be pushed over at startup left the pointer drifting
+ * until it was touched.
+ */
+static int learn_axis(int slot, int role, int fd, int code)
+{
+    struct input_absinfo ai;
+    double half, dead;
+
+    memset(&ai, 0, sizeof(ai));
+    if (ioctl(fd, EVIOCGABS(code), &ai) < 0)
+        return 0;
+    if (ai.maximum <= ai.minimum)
+        return 0;
+
+    half = ((double)ai.maximum - (double)ai.minimum) / 2.0;
+    dead = ai.flat > 0 ? (double)ai.flat / half : 0.0;
+    if (dead < 0.06)
+        dead = 0.06;
+    if (dead > 0.5)
+        dead = 0.5;
+
+    ax_centre[slot][role] = ((double)ai.maximum + (double)ai.minimum) / 2.0;
+    ax_half[slot][role]   = half;
+    ax_dead[slot][role]   = dead;
+    ax_code[slot][role]   = code;
+    ax_val[slot][role]    = 0.0;
+    return 1;
+}
+
+/*
+ * Which axes this pad has, and which of them are the two sticks.
+ *
+ * The left stick is ABS_X/ABS_Y on everything, so it needs no rule.  The right
+ * one does: ABS_RX/ABS_RY is what Documentation/input/gamepad.rst says and what
+ * xpad, hid-playstation and hid-nintendo follow, while this board's device tree
+ * and hid-sony's DualShock 3 both put it on ABS_Z/ABS_RZ.  Preferring RX/RY when
+ * the pair exists resolves that in the only direction that is safe -- on a pad
+ * that has both, ABS_Z and ABS_RZ are the analog triggers, and reading them as a
+ * stick would scroll the page whenever a trigger was pulled.
+ */
+static void learn_axes(int slot, int fd)
+{
+    unsigned long abs[NLONGS(ABS_MAX + 1)];
+
+    memset(abs, 0, sizeof(abs));
+    if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs)), abs) < 0)
+        return;
+
+    if (TEST_BIT(ABS_X, abs))
+        learn_axis(slot, AX_LX, fd, ABS_X);
+    if (TEST_BIT(ABS_Y, abs))
+        learn_axis(slot, AX_LY, fd, ABS_Y);
+
+    if (TEST_BIT(ABS_RX, abs) && TEST_BIT(ABS_RY, abs)) {
+        learn_axis(slot, AX_RX, fd, ABS_RX);
+        learn_axis(slot, AX_RY, fd, ABS_RY);
+    } else if (TEST_BIT(ABS_Z, abs) && TEST_BIT(ABS_RZ, abs)) {
+        learn_axis(slot, AX_RX, fd, ABS_Z);
+        learn_axis(slot, AX_RY, fd, ABS_RZ);
+    }
+
+    note("%s: left stick %s, right stick %s", pad_name[slot],
+         ax_code[slot][AX_LX] >= 0 ? "yes" : "none",
+         ax_code[slot][AX_RX] >= 0 ? "yes" : "none");
+}
+
+static int already_open(dev_t rdev)
+{
+    int i;
+    for (i = 0; i < MAX_PADS; i++) {
+        if (pad_fd[i] >= 0 && pad_dev[i] == rdev)
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * Fill any free slot from /dev/input.  Called once at startup and then every
+ * couple of seconds, which is what makes a pad plugged in halfway through a page
+ * work; there is no udev in this session to be told by, and an opendir of a
+ * directory with a dozen entries costs less than the poll it replaces.
+ *
+ * Devices are remembered by st_rdev rather than by path, because event node
+ * numbers are reused: unplug the pad on event4 and plug in another and it is
+ * event4 again, with a different major:minor.  Comparing paths would either miss
+ * the new device or re-open the one already held.
+ */
+static int scan_pads(int grab)
 {
     DIR *d;
     struct dirent *e;
+    struct stat st;
     char path[320];
     char name[128];
-    int fd;
+    int fd, slot, found = 0;
+
+    if (pad_count() >= MAX_PADS)
+        return 0;
 
     d = opendir("/dev/input");
     if (!d) {
@@ -248,13 +462,19 @@ static int find_pads(int grab)
         return 0;
     }
 
-    while ((e = readdir(d)) && pads < MAX_PADS) {
+    while ((e = readdir(d))) {
         if (strncmp(e->d_name, "event", 5) != 0)
             continue;
+        if (pad_count() >= MAX_PADS)
+            break;
         snprintf(path, sizeof(path), "/dev/input/%s", e->d_name);
         fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0)
             continue;
+        if (fstat(fd, &st) < 0 || already_open(st.st_rdev)) {
+            close(fd);
+            continue;
+        }
         name[0] = '\0';
         if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) < 0)
             snprintf(name, sizeof(name), "%s", path);
@@ -263,6 +483,13 @@ static int find_pads(int grab)
         if (!looks_like_pad(fd, name)) {
             close(fd);
             continue;
+        }
+
+        for (slot = 0; slot < MAX_PADS && pad_fd[slot] >= 0; slot++)
+            ;
+        if (slot == MAX_PADS) {
+            close(fd);
+            break;
         }
 
         /*
@@ -277,14 +504,17 @@ static int find_pads(int grab)
             fail("could not take %s for this session (%s); presses may also reach "
                  "whatever else has it open", name, strerror(errno));
 
-        pad_fd[pads] = fd;
-        snprintf(pad_name[pads], sizeof(pad_name[pads]), "%s", name);
+        clear_pad(slot);
+        pad_fd[slot] = fd;
+        pad_dev[slot] = st.st_rdev;
+        snprintf(pad_name[slot], sizeof(pad_name[slot]), "%s", name);
+        learn_axes(slot, fd);
         note("using %s (%s)", path, name);
-        pads++;
+        found++;
     }
 
     closedir(d);
-    return pads;
+    return found;
 }
 
 /* ── the clock ───────────────────────────────────────────────────────────── */
@@ -374,58 +604,72 @@ static int on_io_error(Display *unused)
 
 /* ── the sticks ──────────────────────────────────────────────────────────── */
 
-/*
- * J36_AXIS_FULL_SCALE in j36_mt6592_input.c: the axes are registered -4096..4096
- * with fuzz 16 and flat 0, and the driver has already subtracted its own deadzone
- * from the raw ADC reading and rescaled what is left across the whole range.  So
- * what arrives here is centred on zero and reaches the ends at the stops.
- */
-#define AXIS_FULL   4096.0
-
-/*
- * A SECOND DEADZONE ON TOP OF THE DRIVER'S, small, and it earns its place: the
- * driver's is computed from a centre that was measured when the device tree was
- * written, and a stick that has been used for a year does not return to the same
- * place it did then.  Six per cent of travel is below what a thumb can aim and
- * above what wear produces.  Without it the pointer drifts on its own, and on a
- * device with no mouse to correct it that is the difference between a browser and
- * a cursor that walks into a corner while you read.
- */
-#define STICK_DEAD  0.06
-
 #define STICK_MAX   1100.0   /* pixels per second at full deflection */
 #define SCROLL_MAX  16.0     /* wheel notches per second at full deflection */
 
-static int axis_lx, axis_ly;   /* left stick  -- ABS_X, ABS_Y  */
-static int axis_rx, axis_ry;   /* right stick -- ABS_Z, ABS_RZ */
-
-/* Squared, sign-preserving, zero inside the deadzone.  See the response-curve
- * paragraph in the file header for why squared. */
-static double stick(int raw, double full_scale_rate)
+/*
+ * Raw reading to -1..1, with the deadzone taken out and what is left stretched
+ * back over the whole range, so that the first movement past the deadzone is a
+ * small one rather than a step.
+ *
+ * The deadzone is the second one this value passes through: the driver has
+ * already subtracted its own, computed from a centre measured when the device
+ * tree was written.  A stick used for a year does not come back to where it did
+ * then, and on a device with no mouse to correct it, a pointer that drifts on its
+ * own walks into a corner while you read.  Six per cent of travel is below what a
+ * thumb can aim and above what wear produces.
+ */
+static double axis_norm(int slot, int role, int raw)
 {
-    double t = raw / AXIS_FULL;
+    double t, d;
 
+    if (ax_half[slot][role] <= 0.0)
+        return 0.0;
+    t = ((double)raw - ax_centre[slot][role]) / ax_half[slot][role];
     if (t > 1.0)
         t = 1.0;
     else if (t < -1.0)
         t = -1.0;
-    if (t > -STICK_DEAD && t < STICK_DEAD)
+
+    d = ax_dead[slot][role];
+    if (t > -d && t < d)
         return 0.0;
-    return (t < 0.0 ? -1.0 : 1.0) * t * t * full_scale_rate;
+    return (t < 0.0 ? t + d : t - d) / (1.0 - d);
+}
+
+/* Squared and sign-preserving, summed over every pad and clamped: two pads is not
+ * a real arrangement, and if it happens the answer should be a pointer that moves
+ * once rather than one that moves twice as fast. */
+static double axis_rate(int role, double full_scale_rate)
+{
+    double s = 0.0;
+    int i;
+
+    for (i = 0; i < MAX_PADS; i++) {
+        double t = ax_val[i][role];
+        if (t != 0.0)
+            s += (t < 0.0 ? -1.0 : 1.0) * t * t;
+    }
+    if (s > 1.0)
+        s = 1.0;
+    else if (s < -1.0)
+        s = -1.0;
+    return s * full_scale_rate;
 }
 
 static int sticks_active(void)
 {
-    return stick(axis_lx, 1.0) != 0.0 || stick(axis_ly, 1.0) != 0.0
-        || stick(axis_rx, 1.0) != 0.0 || stick(axis_ry, 1.0) != 0.0;
+    int i, r;
+    for (i = 0; i < MAX_PADS; i++) {
+        for (r = 0; r < AX_N; r++) {
+            if (ax_val[i][r] != 0.0)
+                return 1;
+        }
+    }
+    return 0;
 }
 
 /* ── the D-pad ───────────────────────────────────────────────────────────── */
-
-#define DIR_UP    0x1
-#define DIR_DOWN  0x2
-#define DIR_LEFT  0x4
-#define DIR_RIGHT 0x8
 
 /* Pixels per second at the start of a press and at the end of the ramp, and how
  * long the ramp takes. */
@@ -439,6 +683,34 @@ static double speed_at(long held_ms)
     if (t > 1.0)
         t = 1.0;
     return SPEED_MIN + (SPEED_MAX - SPEED_MIN) * t * t;
+}
+
+static unsigned dirs_all(void)
+{
+    unsigned d = 0;
+    int i;
+    for (i = 0; i < MAX_PADS; i++)
+        d |= pad_dirs[i];
+    return d;
+}
+
+/*
+ * The ramp belongs to the hold and not to the direction: a thumb rolling from up
+ * to up-right is one movement and should not drop back to walking pace halfway
+ * across the screen.  So it restarts only when nothing was held and something now
+ * is -- which is also why this is a function rather than three copies, since the
+ * same transition arrives as a key, as a BTN_DPAD_* and as a hat.
+ */
+static void set_dir(int slot, unsigned bit, int on, long now)
+{
+    unsigned was = dirs_all();
+
+    if (on)
+        pad_dirs[slot] |= bit;
+    else
+        pad_dirs[slot] &= ~bit;
+    if (!was && dirs_all())
+        move_start = now;
 }
 
 /* ── auto-repeat for the shoulders ───────────────────────────────────────── */
@@ -455,6 +727,13 @@ static double speed_at(long held_ms)
 #define REP_EVERY_MS  70
 
 static long rep_due[REP_N];
+
+static void rep_clear(void)
+{
+    int i;
+    for (i = 0; i < REP_N; i++)
+        rep_due[i] = 0;
+}
 
 static void rep_set(int which, int down, long now)
 {
@@ -493,6 +772,9 @@ static int rep_any(void)
 /* One frame at the panel's rate.  Everything that moves is stepped on this. */
 #define TICK_MS 16
 
+/* How often a free slot goes looking for a pad that was not there before. */
+#define RESCAN_MS 2000
+
 static volatile sig_atomic_t stop_asked;
 
 static void on_signal(int sig)
@@ -521,11 +803,9 @@ int main(int argc, char **argv)
     int grab = 1, list_only = 0;
     int i, xt_event, xt_error, xt_major, xt_minor;
 
-    unsigned dirs = 0;
-    long move_start = 0, move_last = 0;
+    long move_last = 0, next_scan = 0;
     double frac_x = 0.0, frac_y = 0.0;
     double scroll_x = 0.0, scroll_y = 0.0;
-    long menu_down_at = 0;
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--watch") && i + 1 < argc)
@@ -547,16 +827,18 @@ int main(int argc, char **argv)
     }
 
     for (i = 0; i < MAX_PADS; i++)
-        pad_fd[i] = -1;
+        clear_pad(i);
 
     if (list_only) {
         verbose = 1;
-        if (!find_pads(0)) {
-            fail("no built-in pad among /dev/input/event*");
+        if (!scan_pads(0)) {
+            fail("no pad among /dev/input/event*");
             return 1;
         }
-        for (i = 0; i < pads; i++)
-            printf("%s\n", pad_name[i]);
+        for (i = 0; i < MAX_PADS; i++) {
+            if (pad_fd[i] >= 0)
+                printf("%s\n", pad_name[i]);
+        }
         close_pads();
         return 0;
     }
@@ -590,26 +872,33 @@ int main(int argc, char **argv)
 
     resolve_keys();
 
-    if (!find_pads(grab)) {
-        fail("no built-in pad among /dev/input/event*, so nothing can drive this "
-             "session -- run with --list to see what was rejected");
+    if (!scan_pads(grab)) {
+        fail("no pad among /dev/input/event*, so nothing can drive this session "
+             "-- run with --list to see what was rejected");
         XCloseDisplay(dpy);
         return 1;
     }
 
     move_last = now_ms();
+    next_scan = move_last + RESCAN_MS;
 
     while (!stop_asked) {
         struct pollfd fds[MAX_PADS];
-        int timeout, n;
+        int map[MAX_PADS];
+        int nfd = 0, timeout, n, k;
         long now;
         double dt, dx, dy;
+        unsigned dirs;
         int ix, iy;
 
-        for (i = 0; i < pads; i++) {
-            fds[i].fd = pad_fd[i];
-            fds[i].events = POLLIN;
-            fds[i].revents = 0;
+        for (i = 0; i < MAX_PADS; i++) {
+            if (pad_fd[i] < 0)
+                continue;
+            map[nfd] = i;
+            fds[nfd].fd = pad_fd[i];
+            fds[nfd].events = POLLIN;
+            fds[nfd].revents = 0;
+            nfd++;
         }
 
         /* One frame while something is moving or repeating, so motion runs at the
@@ -617,33 +906,70 @@ int main(int argc, char **argv)
          * that a browser that exits is noticed at once and long enough that an idle
          * session is not a process spinning.  A deflected stick counts as moving
          * even when no event has arrived, because an axis held still sends nothing
-         * -- evdev reports changes, and a stick at rest against its stop has
+         * -- evdev reports changes, and a stick resting against its stop has
          * stopped changing. */
-        timeout = (dirs || menu_down_at || rep_any() || sticks_active()) ? TICK_MS : 250;
-        n = poll(fds, (nfds_t)pads, timeout);
+        timeout = (dirs_all() || menu_down_at || rep_any() || sticks_active())
+                  ? TICK_MS : 250;
+        n = poll(fds, (nfds_t)nfd, timeout);
         if (n < 0 && errno != EINTR)
             break;
 
         now = now_ms();
 
-        for (i = 0; i < pads && n > 0; i++) {
+        for (k = 0; k < nfd && n > 0; k++) {
             struct input_event ev;
+            int slot = map[k];
+            int gone = 0;
 
-            if (!(fds[i].revents & POLLIN))
+            if (fds[k].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                drop_pad(slot);
+                continue;
+            }
+            if (!(fds[k].revents & POLLIN))
                 continue;
 
-            while (read(pad_fd[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+            while (!gone) {
+                ssize_t got = read(pad_fd[slot], &ev, sizeof(ev));
                 int down;
 
+                if (got != (ssize_t)sizeof(ev)) {
+                    /* EAGAIN is the ordinary end of a batch on a non-blocking fd.
+                     * Anything else on an evdev node means the device is gone --
+                     * ENODEV is what an unplug gives -- and the slot has to be
+                     * released, or this spins on a dead fd for the rest of the
+                     * session. */
+                    if (got < 0 && (errno == EAGAIN || errno == EINTR))
+                        break;
+                    drop_pad(slot);
+                    gone = 1;
+                    break;
+                }
+
                 if (ev.type == EV_ABS) {
+                    int r;
+
+                    /* The hat is the D-pad on every USB pad that has one, and it
+                     * is three states on one axis rather than two buttons, so it
+                     * clears the opposite direction as well as setting its own. */
+                    if (ev.code == ABS_HAT0X) {
+                        set_dir(slot, DIR_LEFT,  ev.value < 0, now);
+                        set_dir(slot, DIR_RIGHT, ev.value > 0, now);
+                        continue;
+                    }
+                    if (ev.code == ABS_HAT0Y) {
+                        set_dir(slot, DIR_UP,   ev.value < 0, now);
+                        set_dir(slot, DIR_DOWN, ev.value > 0, now);
+                        continue;
+                    }
                     /* Only the value is kept; what to do with it happens once per
-                     * tick below, so a chatty ADC cannot make the pointer faster. */
-                    switch (ev.code) {
-                    case ABS_X:  axis_lx = ev.value; break;
-                    case ABS_Y:  axis_ly = ev.value; break;
-                    case ABS_Z:  axis_rx = ev.value; break;
-                    case ABS_RZ: axis_ry = ev.value; break;
-                    default: break;
+                     * tick below, so a chatty ADC cannot make the pointer faster.
+                     * An axis with no role -- a trigger, a second hat, a DualSense
+                     * accelerometer -- matches nothing here and is dropped. */
+                    for (r = 0; r < AX_N; r++) {
+                        if (ax_code[slot][r] == (int)ev.code) {
+                            ax_val[slot][r] = axis_norm(slot, r, ev.value);
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -657,26 +983,17 @@ int main(int argc, char **argv)
                 down = (ev.value == 1);
 
                 switch (ev.code) {
+                /* Two spellings of the same four directions: this board's device
+                 * tree uses the keyboard codes, and a USB pad whose D-pad is not a
+                 * hat uses BTN_DPAD_*. */
                 case KEY_UP:
+                case BTN_DPAD_UP:    set_dir(slot, DIR_UP,    down, now); break;
                 case KEY_DOWN:
+                case BTN_DPAD_DOWN:  set_dir(slot, DIR_DOWN,  down, now); break;
                 case KEY_LEFT:
-                case KEY_RIGHT: {
-                    unsigned bit = ev.code == KEY_UP    ? DIR_UP
-                                 : ev.code == KEY_DOWN  ? DIR_DOWN
-                                 : ev.code == KEY_LEFT  ? DIR_LEFT
-                                                        : DIR_RIGHT;
-                    unsigned was = dirs;
-                    if (down)
-                        dirs |= bit;
-                    else
-                        dirs &= ~bit;
-                    /* The ramp belongs to the press and not to the direction: a
-                     * thumb rolling from up to up-right is one movement and should
-                     * not drop back to walking pace halfway across the screen. */
-                    if (!was && dirs)
-                        move_start = now;
-                    break;
-                }
+                case BTN_DPAD_LEFT:  set_dir(slot, DIR_LEFT,  down, now); break;
+                case KEY_RIGHT:
+                case BTN_DPAD_RIGHT: set_dir(slot, DIR_RIGHT, down, now); break;
 
                 case BTN_A:      click(1, down); break;
                 case BTN_THUMBL: click(2, down); break;
@@ -755,9 +1072,10 @@ int main(int argc, char **argv)
         if (dt > (double)TICK_MS * 4.0 / 1000.0)
             dt = (double)TICK_MS * 4.0 / 1000.0;   /* woken from idle; do not lurch */
 
-        dx = stick(axis_lx, STICK_MAX) * dt;
-        dy = stick(axis_ly, STICK_MAX) * dt;
+        dx = axis_rate(AX_LX, STICK_MAX) * dt;
+        dy = axis_rate(AX_LY, STICK_MAX) * dt;
 
+        dirs = dirs_all();
         if (dirs) {
             double v = speed_at(now - move_start);
             double px = 0.0, py = 0.0;
@@ -795,15 +1113,30 @@ int main(int argc, char **argv)
          * what accumulates is fractions of one.  Buttons 6 and 7 are the horizontal
          * wheel; a client that does not understand them ignores them, which is the
          * right outcome for a page that does not scroll sideways. */
-        scroll_y += stick(axis_ry, SCROLL_MAX) * dt;
+        scroll_y += axis_rate(AX_RY, SCROLL_MAX) * dt;
         while (scroll_y >= 1.0)  { wheel(5); scroll_y -= 1.0; }
         while (scroll_y <= -1.0) { wheel(4); scroll_y += 1.0; }
-        scroll_x += stick(axis_rx, SCROLL_MAX) * dt;
+        scroll_x += axis_rate(AX_RX, SCROLL_MAX) * dt;
         while (scroll_x >= 1.0)  { wheel(7); scroll_x -= 1.0; }
         while (scroll_x <= -1.0) { wheel(6); scroll_x += 1.0; }
 
         for (i = 0; i < REP_N; i++)
             rep_fire(i, now);
+
+        /*
+         * Look for a pad that was not there before.  A slow cadence and only when
+         * there is somewhere to put one, so the usual case -- the built-in pad and
+         * nothing else, three free slots -- costs one opendir every two seconds.
+         *
+         * Losing the LAST pad is not an exit.  Nothing else in this session can
+         * drive the browser, so quitting would take the page away because a cable
+         * was knocked; instead this keeps the X server up and waits, and the next
+         * scan picks the pad back up when it is plugged in again.
+         */
+        if (now >= next_scan) {
+            next_scan = now + RESCAN_MS;
+            scan_pads(grab);
+        }
 
         if (menu_down_at && now - menu_down_at >= MENU_HOLD_MS) {
             note("Menu held, closing the session");
