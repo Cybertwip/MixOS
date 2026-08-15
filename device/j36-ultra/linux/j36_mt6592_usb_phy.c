@@ -103,6 +103,28 @@
  * enough while the role was fixed at boot and is not enough now. See
  * j36_musb_session().
  *
+ * AND CLEARING IT IS NOT OPTIONAL EVEN AT BOOT, which is the second half of the
+ * same bug and took a second log to find. With the PHY sequences fixed the board
+ * finally reported an A-device on a good rail --
+ *
+ *   DEVCTL 99 [SESSION PERIPHERAL BDEV ] VBUS above VBusValid, POWER 70   at power-on
+ *   DEVCTL 19 [SESSION PERIPHERAL ADEV ] VBUS above VBusValid, POWER e0   at +3 s and +9 s
+ *
+ * -- and still enumerated nothing, because HM is clear in both. MUSB decides
+ * which end of the cable it is when a session STARTS. The LK starts one: it
+ * brings this port up as a high-speed peripheral so the board can be flashed over
+ * it, and 0x99 with POWER 0x70 is exactly that, handed to the kernel still
+ * running. Forcing IDDIG low afterwards flips BDEVICE to 0 and changes nothing
+ * else, and neither j36_musb_session() -- which returns early on a bit that
+ * already reads the way it wants -- nor musb_start() -- which folds
+ * `devctl &= ~SESSION' and `devctl |= SESSION' into one write -- ever produces the
+ * 1 -> 0 -> 1 that would make the core ask again. So it stayed the peripheral the
+ * bootloader made it, the root hub had one port it never scanned, and the log
+ * says "1 port detected" and then nothing for the rest of the boot. Not a display
+ * fault: NOTHING enumerates on that port, hub or stick or mouse alike.
+ * j36_musb_stand_down() is the missing edge, and j36_musb_host_kick() is the poll
+ * checking that it took.
+ *
  * ── WHICH ROLE, THOUGH, AND WHY THE ANSWER STOPPED BEING A MEASUREMENT ────────
  *
  * THIS BOARD HAS TWO CONNECTORS. A DC inlet, which charges and has no data lines
@@ -292,6 +314,13 @@
 #define J36_MUSB_POWER_RESET		BIT(3)
 #define J36_MUSB_POWER_HSMODE		BIT(4)
 #define J36_MUSB_POWER_HSENAB		BIT(5)
+/* Both of these are peripheral-only bits, and both were missing from this list,
+ * which is why "POWER e0 [HSENAB ]" looked harmless in a log that was reporting
+ * the fault: e0 is ISOUPDATE | SOFTCONN | HSENAB, and SOFTCONN is the D+ pull-up
+ * a peripheral raises to say "I am here". A port that has decided to be the host
+ * has no business holding it. They are named in the dump now. */
+#define J36_MUSB_POWER_SOFTCONN		BIT(6)
+#define J36_MUSB_POWER_ISOUPDATE	BIT(7)
 #define J36_MUSB_DEVCTL			0x60
 #define J36_MUSB_DEVCTL_SESSION		BIT(0)
 #define J36_MUSB_DEVCTL_HR		BIT(1)
@@ -415,6 +444,40 @@
  * window is comfortable at both ends.
  */
 #define J36_VBUS_RISE_MS		50
+
+/*
+ * And how long DEVCTL.SESSION is held DOWN in between, which is the other half
+ * of the same story and the one that took a second log to find.
+ *
+ * MUSB decides which end of the cable it is when a session STARTS, and never
+ * again while that session runs. The bootloader starts one: MVII's LK brings the
+ * port up as a peripheral so it can be flashed over USB, and it hands the kernel
+ * DEVCTL 0x99 -- SESSION set, BDEVICE set, VBUS above VBusValid -- with POWER 0x70,
+ * SOFTCONN and HSMODE, a B-device that has actually chirped high-speed at
+ * somebody. Forcing IDDIG low after that flips BDEVICE to 0, and DEVCTL duly
+ * reads ADEV, and the core goes on being the peripheral it became, because
+ * nothing asked it the question again.
+ *
+ * "Ask it again" is a real 1 -> 0 -> 1 on this bit with the PHY already forced to
+ * A. Neither of the two places that could have done it did: this driver's own
+ * j36_musb_session() returns early when the bit already reads the way it wants,
+ * and musb_start() computes `devctl &= ~SESSION' and `devctl |= SESSION' into one
+ * value and writes it once, so the core sees no edge either. The result is in
+ * every log this board has produced -- DEVCTL 19 at three seconds and again at
+ * nine, SESSION set, ADEV, VBUS good, and HM clear -- and HM clear is a root hub
+ * that never scans its one port. Nothing enumerates on that port: not a display
+ * adapter, not a hub, not a stick, not a mouse.
+ *
+ * 20 ms is far longer than the core needs to retire a session -- it is a state
+ * machine, not a bus transaction -- and short enough to disappear inside the
+ * 50 ms rail rise that follows it.
+ */
+#define J36_MUSB_SESSION_GAP_MS		20
+
+/* How many times the poll will re-bounce a session that came up without HM
+ * before it gives up and says so once. Two is a retry rather than a loop: if the
+ * core will not take host mode after three attempts the fault is not the edge. */
+#define J36_MUSB_HM_KICKS		2u
 
 /* DEVCTL's VBUS field is four thresholds; this is the lowest one that means
  * somebody is actually driving the bus rather than leakage holding it off the
@@ -605,6 +668,13 @@ struct j36_usb_phy {
 	 * NOT feeding the port is a device after all, and re-measuring it every
 	 * grace period would power-cycle it forever. */
 	bool attach_probed;
+	/* Times the poll has re-bounced the session because the core came up as
+	 * host and DEVCTL.HM stayed clear. Bounded by J36_MUSB_HM_KICKS and reset
+	 * on every role change, so a port that is unplugged and replugged gets its
+	 * retries back and a port that simply cannot host says so once. */
+	unsigned int hm_kicks;
+	/* Edge flag for that one complaint. */
+	bool hm_gave_up;
 	struct delayed_work role_work;
 	/* The role poll runs off a workqueue and .set_mode / .power_on /
 	 * .power_off run off musb's probe and remove. The generic PHY framework
@@ -828,7 +898,14 @@ static void j36_phy_savecurrent(struct j36_usb_phy *p)
  * different things in DEVCTL depending on why: VBUS below the session-valid
  * threshold means the 5 V never came up, VBUS at 3 with nothing else set means
  * the rail is fine and nothing is attached, and HM clear on a node that asked
- * for host means the role override did not take.
+ * for host means the role never took.
+ *
+ * That last one has two causes and they are told apart by BDEVICE. HM clear with
+ * BDEV is the PHY override not landing -- the ID line still reads B. HM clear
+ * with ADEV is the override landing on a session that was already running, which
+ * MUSB will not re-arbitrate; that is the bootloader's peripheral session and it
+ * is what j36_musb_stand_down() exists to end. Both used to print as
+ * "PERIPHERAL", so the dump now says the second one out loud.
  */
 
 static const char *j36_musb_vbus_str(u8 devctl)
@@ -861,7 +938,7 @@ static void j36_musb_dump(struct j36_usb_phy *p, const char *when)
 	l1intm	= readl(p->musb + J36_MUSB_L1INTM);
 
 	dev_info(p->dev,
-		 "MUSB %s: DEVCTL %02x [%s%s%s%s%s%s] VBUS %s, POWER %02x [%s%s%s%s], FADDR %u\n",
+		 "MUSB %s: DEVCTL %02x [%s%s%s%s%s%s] VBUS %s, POWER %02x [%s%s%s%s%s%s], FADDR %u\n",
 		 when, devctl,
 		 devctl & J36_MUSB_DEVCTL_SESSION ? "SESSION " : "",
 		 devctl & J36_MUSB_DEVCTL_HM	  ? "HOST "    : "PERIPHERAL ",
@@ -870,11 +947,26 @@ static void j36_musb_dump(struct j36_usb_phy *p, const char *when)
 		 devctl & J36_MUSB_DEVCTL_FSDEV	  ? "FSDEV "   : "",
 		 devctl & J36_MUSB_DEVCTL_LSDEV	  ? "LSDEV"    : "",
 		 j36_musb_vbus_str(devctl), power,
+		 power & J36_MUSB_POWER_SOFTCONN  ? "SOFTCONN " : "",
+		 power & J36_MUSB_POWER_ISOUPDATE ? "ISOUPD "   : "",
 		 power & J36_MUSB_POWER_HSENAB	  ? "HSENAB "  : "",
 		 power & J36_MUSB_POWER_HSMODE	  ? "HSMODE "  : "",
 		 power & J36_MUSB_POWER_RESET	  ? "RESET "   : "",
 		 power & J36_MUSB_POWER_SUSPENDM  ? "SUSPEND"  : "",
 		 faddr & 0x7f);
+
+	/*
+	 * And the one sentence a reader should not have to decode the hex for.
+	 * A session running as an A-device with HM clear is the exact shape of the
+	 * bug this file's session bounce exists to prevent, and it is worth saying
+	 * out loud every time it is seen rather than leaving it in the bit list.
+	 */
+	if ((devctl & J36_MUSB_DEVCTL_SESSION) &&
+	    !(devctl & J36_MUSB_DEVCTL_BDEVICE) &&
+	    !(devctl & J36_MUSB_DEVCTL_HM))
+		dev_warn(p->dev,
+			 "MUSB %s: this is an A-device holding a session it never became the host of -- the root hub will not scan its port and nothing can enumerate\n",
+			 when);
 
 	/* EPINFO is TX count in [3:0] and RX count in [7:4], neither counting
 	 * ep0; RAMINFO is the FIFO RAM address width in [3:0] and the DMA
@@ -1094,6 +1186,104 @@ static void j36_musb_session(struct j36_usb_phy *p, bool on)
 }
 
 /*
+ * ── STAND THE PERIPHERAL DOWN, SO THE HOST CAN BE STARTED ────────────────────
+ *
+ * The early return in j36_musb_session() above is correct and it is also how the
+ * port spent every boot as a peripheral: the bit was ALREADY set, by the
+ * bootloader, in the other role, so asking for it produced no write and no edge.
+ * See J36_MUSB_SESSION_GAP_MS for the whole of that argument. This is the piece
+ * that was missing -- the deliberate 1 -> 0 with the pull-up taken down with it,
+ * so that the set which follows is a session the core arbitrates afresh.
+ *
+ * SOFTCONN is cleared here and not left to musb_start(). musb_start() does write
+ * POWER, and what it writes has no SOFTCONN in it, so on a good boot this is
+ * redundant -- but power_on runs BEFORE musb_start(), the session is restarted
+ * here, and a core told to start a session while it is still advertising a
+ * device's pull-up is being asked two things at once. Take the pull-up down
+ * first and there is only one question on the wire.
+ *
+ * Cheap enough to be unconditional: two byte reads, at most two byte writes and
+ * a 20 ms sleep, once per role change.
+ */
+static void j36_musb_stand_down(struct j36_usb_phy *p)
+{
+	u8 power;
+
+	if (!p->musb || !musb_session)
+		return;
+
+	j36_musb_session(p, false);
+
+	power = readb(p->musb + J36_MUSB_POWER);
+	if (power & J36_MUSB_POWER_SOFTCONN) {
+		writeb(power & (u8)~J36_MUSB_POWER_SOFTCONN,
+		       p->musb + J36_MUSB_POWER);
+		dev_dbg(p->dev,
+			"POWER.SOFTCONN cleared: the port was still holding a peripheral's D+ pull-up\n");
+	}
+
+	msleep(J36_MUSB_SESSION_GAP_MS);
+}
+
+/*
+ * ── DID IT TAKE? ─────────────────────────────────────────────────────────────
+ *
+ * HM is set by the core, not by anything here, and it is the only bit that says
+ * the role change actually happened rather than merely being asked for. So the
+ * poll checks it, and if a port that asked for host is running a session it never
+ * became the host of, it bounces the session again.
+ *
+ * WHAT KEEPS THIS FROM BEING A LOOP, in order:
+ *
+ *   nothing enumerated   j36_usb_devices() is the guard the attach latch already
+ *                        uses. A device that is up is a role that worked, whatever
+ *                        HM reads, and it is never disturbed.
+ *   at most two kicks    J36_MUSB_HM_KICKS. Three attempts and the fault is not
+ *                        a missing edge; saying so once beats retrying forever.
+ *   reset on role change only, so unplugging and replugging earns fresh retries
+ *                        but a port sitting still does not.
+ *
+ * Call with p->lock held, from the poll, and only when the role is host.
+ */
+static void j36_musb_host_kick(struct j36_usb_phy *p)
+{
+	u8 devctl;
+
+	if (!p->musb || !musb_session || p->hm_gave_up)
+		return;
+
+	devctl = readb(p->musb + J36_MUSB_DEVCTL);
+	if (devctl & J36_MUSB_DEVCTL_HM)
+		return;				/* the core is the host: done */
+	if (!(devctl & J36_MUSB_DEVCTL_SESSION))
+		return;				/* no session to be host of yet */
+	if (j36_usb_devices())
+		return;				/* something works; leave it alone */
+
+	if (p->hm_kicks >= J36_MUSB_HM_KICKS) {
+		p->hm_gave_up = true;
+		dev_warn(p->dev,
+			 "the port asked for host %u times and DEVCTL still reads %02x with HM clear: the core will not take host mode, so its root port cannot scan and nothing plugged in here will enumerate\n",
+			 p->hm_kicks + 1, devctl);
+		return;
+	}
+
+	p->hm_kicks++;
+	dev_info(p->dev,
+		 "DEVCTL %02x: session up, A-device, HM clear -- restarting the session so the core arbitrates the role again (attempt %u of %u)\n",
+		 devctl, p->hm_kicks, J36_MUSB_HM_KICKS);
+
+	j36_musb_stand_down(p);
+	j36_phy_force_host(p);
+	j36_musb_session(p, true);
+
+	devctl = readb(p->musb + J36_MUSB_DEVCTL);
+	dev_info(p->dev, "after the restart DEVCTL reads %02x: the core is %s\n",
+		 devctl,
+		 devctl & J36_MUSB_DEVCTL_HM ? "the HOST" : "still not the host");
+}
+
+/*
  * True while the role is the measurement's to decide, which on this board is
  * false: vbus defaults to 1 because the charger has an inlet of its own and this
  * port never has to give up 5 V for one. Everything below is what happens on a
@@ -1295,12 +1485,31 @@ apply:
 	 */
 	if (p->role_host == (int)host && !released) {
 		j36_usb_phy_vbus(p, host);
+		if (host)
+			j36_musb_host_kick(p);
 		return;
 	}
 	changed = p->role_host != (int)host;
 	p->role_host = host;
+	/* A role that has just been applied gets its retries back: the check
+	 * above is about a session that failed to become one, and this is a new
+	 * session. */
+	p->hm_kicks = 0;
+	p->hm_gave_up = false;
 
 	if (host) {
+		/*
+		 * END WHATEVER SESSION IS RUNNING BEFORE STARTING THIS ONE.
+		 *
+		 * At boot the session running is the bootloader's, taken out as a
+		 * B-device, and MUSB fixes the role when a session begins. Setting
+		 * a bit that is already set is not a beginning -- see
+		 * J36_MUSB_SESSION_GAP_MS -- so without this the core stayed the
+		 * peripheral the LK made it, HM never came up, and the root hub
+		 * had a port it never scanned. On every later role change the same
+		 * call is what the stock host switch does, for the same reason.
+		 */
+		j36_musb_stand_down(p);
 		j36_phy_force_host(p);
 		/*
 		 * VBUS, THEN THE RAIL'S RISE TIME, THEN THE SESSION.  The other

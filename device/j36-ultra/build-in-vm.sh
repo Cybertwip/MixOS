@@ -4774,7 +4774,45 @@ dump() {
         printf '             the MacroSilicon parts have no mainline driver at all, on any\n'
         printf '             architecture, so there is no kernel option that turns them on.\n'
     done
-    [ "$_anydev" = 1 ] || printf '(nothing but the root hub -- the port enumerated no device at all)\n'
+    # ── AN EMPTY BUS HAS TWO CAUSES AND THEY LOOK IDENTICAL HERE ──────────────
+    #
+    # "Nothing but the root hub" was printed for a whole run of logs and read as
+    # "nothing is plugged in", and it was not: the port had never become a host.
+    # MUSB fixes which end of the cable it is when a session STARTS, the
+    # bootloader starts one as a peripheral so the board can be flashed over this
+    # socket, and until j36_mt6592_usb_phy learned to end that session first the
+    # core stayed the peripheral the LK made it -- DEVCTL reading ADEV with HM
+    # clear, a root hub with one port it never scans, and nothing able to
+    # enumerate on it at all.  A hub, a stick and a display adapter all produce
+    # exactly this silence, so the verdicts above mean nothing until the line
+    # below says HOST.
+    if [ "$_anydev" = 1 ]; then
+        :
+    else
+        printf '(nothing but the root hub -- the port enumerated no device at all)\n'
+        _hm=""
+        _hm="$(dmesg 2>/dev/null | grep -a 'DEVCTL' | grep -a 'MUSB ' | tail -n 1)"
+        case "$_hm" in
+        *'HOST '*)
+            printf '    The core IS the host, so the port is up and simply empty: nothing is\n'
+            printf '    plugged in, or what is plugged in never pulled D+/D- up.\n' ;;
+        *'PERIPHERAL '*)
+            printf '    But the core is NOT the host -- the MUSB line below reads PERIPHERAL, so\n'
+            printf '    the root hub never scans its one port and NOTHING can enumerate here:\n'
+            printf '    not a hub, not a stick, not a mouse, not a display adapter.  Fix that\n'
+            printf '    first; every verdict above is about a bus that was never scanned.\n' ;;
+        *)
+            printf '    No MUSB readout in dmesg to say whether the core became the host.\n'
+            printf '    j36_mt6592_usb_phy prints one at power-on, at +3 s and at +9 s.\n' ;;
+        esac
+        [ -z "$_hm" ] || printf -- '    %s\n' "$_hm"
+    fi
+    # The next question after "is it the host" is "does the connect interrupt get
+    # delivered", and that is a count that either moves when something is plugged
+    # in or does not.  A musb line with 0 in it on a port that IS the host is the
+    # device tree naming the wrong SPI.
+    sec "the MUSB interrupt, and whether it has ever fired"
+    grep -i 'musb\|usb' /proc/interrupts || printf '(no USB interrupt is registered at all)\n'
     kgrep "USB, the PHY and MUSB" 'usb|musb|phy|xhci|ehci|hub |otg|vbus'
 
     printf '\n\n########## 5.  THE PANEL, THE SPLASH AND THE DASHBOARD ##########\n'
