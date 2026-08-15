@@ -24,14 +24,26 @@
  *   5. INIT_CMD_WIFI_START, then poll WCIR for WLAN_READY while sampling the
  *      connectivity program counter
  *
- * ── AND WHAT IT DOES NOT ──
+ * ── AND WHAT IT HANDS ON ──
  *
  * WLAN_READY is a running firmware, not a network interface.  Scanning,
- * association, key management and the data path are a further layer on top of
- * this transport, they are a great deal more code than this file, and they are
- * not in this build.  Nothing here registers a netdev or a wiphy, and the log
- * line at the end of the bring-up says which stage was actually reached rather
- * than implying a radio that can carry traffic.
+ * association, key management and the data path are stage 4, in
+ * j36_mt6592_wifi_cmd.c and j36_mt6592_wifi_net.c, and they are a great deal
+ * more code than this file.
+ *
+ * What this file lends them is the bottom of the transport and no more: the
+ * eight wrappers declared at the end of j36_mt6592_wifi.h.  The FIFO pair, the
+ * transfer descriptor and the ownership handshake stay private here, because
+ * there is one place that knows how a word gets into the port.  The page
+ * accounting crosses the line with them deliberately -- it is the one step a
+ * command sender must not be able to skip, since an AHB write into a full FIFO
+ * does not fault, it stops the CPU inside a bus transaction with no exception
+ * and no watchdog.
+ *
+ * The credit table is also why firmware_alive is raised in exactly one place,
+ * where the ready bit is seen: the download runs on an eight-page table the boot
+ * ROM provides, and no path may reach a stage-4 command sender with that table
+ * still installed.
  *
  *
  * ── WHAT THE PORT CHANGED ──
@@ -229,6 +241,55 @@ static void j36_hif_tx_release(struct j36_wifi *w)
 		w->hif_stats.tx_credited += freed[tc];
 		w->hif_stats.tx_free[tc] = (u8)credit;
 	}
+}
+
+/*
+ * nicTxAcquireResource with stock's caller folded in: take a page, and if the
+ * class is dry, poll for one the way nicTxPollingResource does.
+ *
+ * NOTHING WRITES A PACKET TO A TX PORT WITHOUT COMING THROUGH HERE FIRST, which
+ * is why it is the one thing the header exports alongside the submit.  A failure
+ * is a refused send and the caller reports it; the one thing it is not is a write
+ * into a full FIFO, which on this bus is a CPU that stops inside a transaction.
+ *
+ * The one part that is not stock is the last clause, and it is there for the same
+ * reason MVII put it there.  If the firmware has never credited a single page in
+ * this session then the table is a budget nothing has confirmed, and refusing a
+ * send on the strength of it would break a scan that works today on the strength
+ * of a model never checked against this chip.  So it is let through and counted,
+ * and the first credit that ever arrives shuts the valve for good: credited > 0
+ * means the accounting is real and a starve is a real refusal; credited == 0 with
+ * forced > 0 means WTSR is not reporting on this part at all.
+ */
+static int j36_hif_tx_acquire(struct j36_wifi *w, unsigned int tc)
+{
+	unsigned int round;
+
+	if (tc >= J36_HIF_TX_CLASSES)
+		return -EINVAL;
+
+	if (w->hif_stats.tx_free[tc]) {
+		w->hif_stats.tx_free[tc]--;
+		return 0;
+	}
+
+	w->hif_stats.tx_waits++;
+	for (round = 0; round < J36_HIF_TX_POLL_ROUNDS; round++) {
+		j36_hif_tx_release(w);
+		if (w->hif_stats.tx_free[tc]) {
+			w->hif_stats.tx_free[tc]--;
+			return 0;
+		}
+		usleep_range(J36_HIF_TX_POLL_INTERVAL_US,
+			     J36_HIF_TX_POLL_INTERVAL_US * 2);
+	}
+
+	w->hif_stats.tx_starved++;
+	if (!w->hif_stats.tx_credited) {
+		w->hif_stats.tx_forced++;
+		return 0;
+	}
+	return -EBUSY;
 }
 
 /* ── ownership and the one-time HIF programming ──────────────────────────────*/
@@ -1045,6 +1106,80 @@ int j36_wifi_hif_load_firmware(struct j36_wifi *w, const void *data, size_t size
 		 w->hif_stats.downloaded_bytes, start_address);
 
 	return j36_hif_start_firmware(w);
+}
+
+/* ── the transport, as stage 4 is allowed to see it ──────────────────────────
+ *
+ * Eight calls, and the line they draw is deliberate: the FIFO ports, the transfer
+ * descriptor, the two-dummy-read AHB workaround and the ownership handshake all
+ * stay in this file.  What crosses is a whole packet in either direction, the
+ * page accounting, and the sequence counter.
+ *
+ * The page accounting is exported precisely BECAUSE it is skippable-looking.  A
+ * command layer that composed its own packet and wrote the port directly would
+ * work for four commands and then stop the CPU inside an AHB transaction, with
+ * no exception and no watchdog -- so j36_wifi_hif_submit() is the only way out
+ * of this file with a packet, and it will not send one it has not paid for.
+ */
+
+int j36_wifi_hif_own(struct j36_wifi *w)
+{
+	return j36_hif_acquire_driver_own(w);
+}
+
+/* Read a HIF register that stage 4 has a reason to look at -- WHISR for the
+ * interrupt summary, WASR when it reports abnormal, WCIR to re-check the ready
+ * bit.  A read and nothing else: none of the three is written from up there. */
+u32 j36_wifi_hif_status(struct j36_wifi *w, u32 offset)
+{
+	return j36_hif_read(w, offset);
+}
+
+int j36_wifi_hif_tx_acquire(struct j36_wifi *w, unsigned int tc)
+{
+	return j36_hif_tx_acquire(w, tc);
+}
+
+void j36_wifi_hif_tx_credit(struct j36_wifi *w)
+{
+	j36_hif_tx_release(w);
+}
+
+/*
+ * One packet out, on the port its traffic class belongs to.
+ *
+ * TC4 -- commands, management frames and anything 802.1X -- goes to WTDR1, and
+ * everything else to WTDR0.  That split is the firmware's, not ours: TXD1 is the
+ * command/management ring and TXD0 the data one, and a management frame written
+ * to TXD0 is accepted by the FIFO and then never transmitted.
+ *
+ * Fails without writing anything if the class had no page and none came back,
+ * which is the whole point of the acquire being on this side of the call.
+ */
+void j36_wifi_hif_submit(struct j36_wifi *w, unsigned int tc, const u8 *packet,
+			 u32 size)
+{
+	if (tc == J36_HIF_TC_COMMAND)
+		j36_hif_write_port(w, J36_HIF_WTDR1, J36_HIF_TARGET_TXD1,
+				   packet, size);
+	else
+		j36_hif_write_port(w, J36_HIF_WTDR0, J36_HIF_TARGET_TXD0,
+				   packet, size);
+}
+
+bool j36_wifi_hif_pending(struct j36_wifi *w, u8 *port, u32 *length)
+{
+	return j36_hif_next_packet(w, port, length);
+}
+
+int j36_wifi_hif_collect(struct j36_wifi *w, u8 port, u32 length)
+{
+	return j36_hif_receive(w, port, length);
+}
+
+u8 j36_wifi_hif_sequence(struct j36_wifi *w)
+{
+	return j36_hif_next_sequence(w);
 }
 
 /*

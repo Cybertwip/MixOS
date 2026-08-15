@@ -3,8 +3,8 @@
  * J36 Ultra MT6592 CONSYS Wi-Fi: the platform driver.
  *
  * Maps the windows, waits for the PMIC, and runs the bring-up: power the
- * connectivity subsystem, open the BTIF link, put both ROM patches down it, then
- * push MediaTek's WLAN firmware down the AHB HIF and start it.
+ * connectivity subsystem, open the BTIF link, put both ROM patches down it, push
+ * MediaTek's WLAN firmware down the AHB HIF, start it, and register wlan0.
  *
  * A mirror of PowerEngine/OS/MVII's mt6592_wifi.c, which is where the same steps
  * are sequenced for the bootstrap.  What is different here is the waiting: MVII
@@ -13,19 +13,24 @@
  * and the images come from request_firmware().
  *
  *
- * ── WHAT THIS BUILD DOES AND DOES NOT GET YOU ──
+ * ── WHERE THIS CAN STOP, AND WHY IT SAYS SO ──
  *
- * It gets the connectivity MCU powered, clocked, talking, running a patched image
- * with its radio configured, and then WIFI_RAM_CODE_SOC downloaded and executing
- * -- WLAN_READY asserted.
+ * Four stages, and each one can be the last: the connectivity MCU powered and
+ * clocked, the BTIF link open with both ROM patches down it, WIFI_RAM_CODE_SOC
+ * downloaded and running with WLAN_READY asserted, and then cfg80211 and wlan0
+ * on top of that transport.
  *
- * It does NOT get a network interface.  WLAN_READY means the firmware is running,
- * not that anything can be sent through it: scanning, association, key management
- * and the data path are a further layer on top of that transport and are not in
- * this build.  There is deliberately no netdev registered and no wiphy, because a
- * driver that offers an interface it cannot carry traffic on is worse than one
- * that says plainly where it stopped -- so the last line this driver logs is which
- * stage it reached, every time, success or not.
+ * Only the fourth produces something userspace can see, and the first three fail
+ * in ways that look identical from up there -- no interface.  So the last line
+ * this driver logs is which stage it reached, every time, success or not, and on
+ * success it names the interface it registered.  A bring-up that reached
+ * WLAN_READY and then could not register is a real and distinct state, and it is
+ * reported as one rather than as silence.
+ *
+ * The attach happens OUTSIDE w->lock, at the end of the bring-up.  Registering a
+ * netdev takes the RTNL, and ndo_open takes w->lock under the RTNL -- so holding
+ * w->lock across the registration is the inversion of that, and lockdep would be
+ * right about it.
  */
 
 #include <linux/device.h>
@@ -210,6 +215,7 @@ static void j36_wifi_bring_up(struct work_struct *work)
 {
 	struct j36_wifi *w = container_of(work, struct j36_wifi, bring_up);
 	struct j36_wifi_device *jd = container_of(w, struct j36_wifi_device, w);
+	const char *interface;
 	unsigned int i;
 
 	mutex_lock(&w->lock);
@@ -243,17 +249,38 @@ static void j36_wifi_bring_up(struct work_struct *work)
 	j36_wifi_hif_load_firmware(w, jd->wlan_fw->data, jd->wlan_fw->size);
 
 out:
+	j36_wifi_wmt_trace(w, "bring-up");
+	j36_wifi_hif_trace(w);
+	mutex_unlock(&w->lock);
+
 	/*
-	 * The one line that is always printed, whatever happened.  Even the
-	 * success case names what is missing -- because a log that stops at "ok"
-	 * invites the reading that there is a network interface somewhere.
+	 * Stage 4, and NOT under the lock -- see the header block.  It takes the
+	 * lock itself for the radio configuration that precedes the registration,
+	 * and gives it up again before it goes near the RTNL.
 	 */
 	if (w->firmware_alive)
+		j36_wlan_net_attach(w);
+	interface = j36_wlan_net_interface(w);
+
+	/*
+	 * The one line that is always printed, whatever happened.  Even the
+	 * success case names the interface rather than stopping at "ok", because
+	 * a bring-up that reached WLAN_READY and then failed to register reads
+	 * exactly like one that succeeded until you go looking for wlan0.
+	 */
+	if (interface)
 		dev_info(w->dev,
-			 "WLAN firmware running: chip 0x%08x, %u ROM patches, RF %s, %u bytes downloaded, WLAN_READY -- there is no netdev, cfg80211 is not in this build\n",
-			 w->chip_id, w->patch_count,
+			 "%s is up: chip 0x%08x, %u ROM patches, RF %s, %u bytes downloaded, WLAN_READY\n",
+			 interface, w->chip_id, w->patch_count,
 			 w->calibrated ? "calibrated" : "uncalibrated",
 			 w->hif_stats.downloaded_bytes);
+	else if (w->firmware_alive)
+		dev_warn(w->dev,
+			 "WLAN firmware running: chip 0x%08x, %u ROM patches, RF %s, %u bytes downloaded, WLAN_READY -- but no interface was registered, stopped at [%s]\n",
+			 w->chip_id, w->patch_count,
+			 w->calibrated ? "calibrated" : "uncalibrated",
+			 w->hif_stats.downloaded_bytes,
+			 w->blocked ? w->blocked : "unknown");
 	else if (w->ready)
 		dev_warn(w->dev,
 			 "connectivity MCU up: chip 0x%08x, %u ROM patches, RF %s -- but the WLAN firmware did not start, stopped at [%s]\n",
@@ -263,10 +290,6 @@ out:
 	else
 		dev_warn(w->dev, "Wi-Fi bring-up stopped at [%s]\n",
 			 w->blocked ? w->blocked : "unknown");
-	j36_wifi_wmt_trace(w, "bring-up");
-	j36_wifi_hif_trace(w);
-
-	mutex_unlock(&w->lock);
 }
 
 /* ── probe ───────────────────────────────────────────────────────────────────*/
@@ -354,6 +377,24 @@ static void j36_wifi_cancel_bring_up(void *data)
 	cancel_work_sync(&w->bring_up);
 }
 
+/*
+ * Stage 4's teardown, and the session summary that goes with it.
+ *
+ * The trace is printed HERE rather than at the end of the bring-up, because at
+ * the end of a bring-up every number in it is zero.  Here it is the account of
+ * what the interface actually did between registration and unload, which is the
+ * only moment those counters mean anything.
+ */
+static void j36_wifi_detach_net(void *data)
+{
+	struct j36_wifi *w = data;
+
+	mutex_lock(&w->lock);
+	j36_wlan_net_trace(w);
+	mutex_unlock(&w->lock);
+	j36_wlan_net_detach(w);
+}
+
 static int j36_wifi_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -430,6 +471,16 @@ static int j36_wifi_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	j36_wifi_request_images(jd);
+
+	/*
+	 * Same reasoning one step further in.  Registered BEFORE the work item's
+	 * action so it runs AFTER it: the bring-up is what registers the interface,
+	 * and tearing one down while the work that creates it is still runnable is
+	 * a race with nothing to win.  Unwind order is cancel, detach, free.
+	 */
+	ret = devm_add_action_or_reset(dev, j36_wifi_detach_net, w);
+	if (ret)
+		return ret;
 
 	INIT_WORK(&w->bring_up, j36_wifi_bring_up);
 	ret = devm_add_action_or_reset(dev, j36_wifi_cancel_bring_up, w);

@@ -332,11 +332,20 @@ done
 # name, because none of them is on this SoC and all four are `default y' under
 # some dependency multi_v7_defconfig satisfies.
 #
-# WIRELESS, WLAN and BT stay off, and they are disabled here rather than left
-# out: all three live inside `if NET' in net/Kconfig and WIRELESS defaults to y,
-# so once NET is on they would come back by default. Both the =y for NET and the
-# "is not set" lines for these are in .config before the single olddefconfig
-# below, which is what makes the explicit n stick.
+# WLAN and BT stay off, and they are disabled here rather than left out: both
+# live inside `if NET' in net/Kconfig and would come back by default once NET is
+# on. Both the =y for NET and the "is not set" lines for these are in .config
+# before the single olddefconfig below, which is what makes the explicit n stick.
+#
+# WIRELESS IS NO LONGER IN THIS LIST, and WLAN still is, which looks like a
+# contradiction and is not. WIRELESS is the cfg80211/mac80211 menu; WLAN is the
+# in-tree driver menu under drivers/net/wireless. This board's radio driver is
+# out of tree, built from device/j36-ultra/linux, so it needs the first and none
+# of the second -- and the second is a large menu of drivers for hardware that is
+# not on this board, every one of which would be built and shipped for nothing.
+# The wireless section further down turns CFG80211 on as a module and refuses
+# MAC80211 outright: the MT6592 CONSYS part is FULLMAC, its firmware owns the MAC,
+# and mac80211 would be some 700 KiB of code with nothing to do.
 #
 # SCSI USED TO BE IN THIS LIST and is not any more.  It left for one reason: a USB
 # disk is a SCSI device.  usb-storage is a SCSI host adapter that speaks Bulk-Only
@@ -346,7 +355,7 @@ done
 # menu by name; ATA stays refused, because libata is the other thing under SCSI
 # and there is no SATA or PATA anywhere on this SoC.
 for symbol in \
-    MEDIA_SUPPORT WIRELESS WLAN BT ATA \
+    MEDIA_SUPPORT WLAN BT ATA \
     DEBUG_INFO DEBUG_KERNEL KALLSYMS LOGO; do
     config_n "$symbol"
 done
@@ -830,6 +839,45 @@ config_y POWER_SUPPLY
 # accidental dependency that disappears under a prune, taking
 # /sys/class/backlight and the dashboard's brightness slider with it.
 config_y BACKLIGHT_CLASS_DEVICE
+
+# ── Wireless: cfg80211 and nothing above it ───────────────────────────────────
+#
+# The MT6592's connectivity subsystem is on the die, not on an SDIO bus, and it
+# is FULLMAC: the firmware owns the MAC. It beacons, ACKs, retries, does its own
+# rate control and does the CCMP once j36_mt6592_wifi.ko hands it a key. What
+# crosses the AHB HIF is a command, an event, a whole 802.11 management frame or
+# an Ethernet frame -- so the driver is a cfg80211 driver, and there is nothing
+# for mac80211 to do.
+#
+# That is worth being explicit about, because "wifi needs CFG80211 and MAC80211"
+# is the shape of the answer for a softmac part and it is wrong here by about
+# 700 KiB of code in a boot partition with roughly two and a half megabytes of
+# slack. MAC80211 is refused below rather than merely not enabled, so a future
+# defconfig bump cannot bring it back by dependency.
+#
+# =m and not =y for both, because they are only needed once the radio module
+# loads and both are staged behind j36.wifi in load.order. RFKILL comes with
+# CFG80211 whether it is asked for or not (cfg80211 select RFKILL), and it is
+# named anyway so its tristate is ours rather than whatever got selected first.
+config_y WIRELESS
+config_m CFG80211
+config_m RFKILL
+# The regulatory domain this driver uses is a custom one compiled into the
+# module -- 2.4 GHz at 20 dBm, the intersection of every domain it hands the
+# firmware itself -- so no regulatory.db is loaded and none needs signing. With
+# REQUIRE_SIGNED_REGDB left on, cfg80211 rejects the absent database and every
+# channel comes up disabled.
+config_n CFG80211_REQUIRE_SIGNED_REGDB
+config_n CFG80211_CRDA_SUPPORT
+# Off deliberately: power save is a firmware-side decision on this part, made
+# through INDICATE_PM_BSS_CONNECTED once the DTIM period is known, and a default
+# from cfg80211 would be a second opinion about the same radio.
+config_n CFG80211_DEFAULT_PS
+# Wireless Extensions is the pre-nl80211 ioctl interface. wpa_supplicant on this
+# rootfs is built with the nl80211 backend and NetworkManager talks to
+# wpa_supplicant, so nothing here uses it.
+config_n CFG80211_WEXT
+config_n CFG80211_DEBUGFS
 
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm \
     CROSS_COMPILE=arm-linux-gnueabihf- olddefconfig

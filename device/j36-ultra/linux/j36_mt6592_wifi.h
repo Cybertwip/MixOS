@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * J36 Ultra MT6592 CONSYS Wi-Fi: the register map and the state the three
+ * J36 Ultra MT6592 CONSYS Wi-Fi: the register map and the state the five
  * translation units share.
  *
  * Ported from PowerEngine/OS/MVII's mt6592_wifi_sdio.c and mt6592_wifi_wmt.c.
@@ -26,13 +26,30 @@
  *      j36_mt6592_wifi_wmt.c.
  *   3. FIRMWARE.  WIFI_RAM_CODE_SOC over the AHB HIF, the A-die probe, the ROM
  *      handoff, WIFI_START, and WLAN_READY.  j36_mt6592_wifi_hif.c.
- *   4. cfg80211 and a netdev.
+ *   4. THE RADIO.  The firmware's own command and event protocol -- scan, channel
+ *      privilege, station record, BSS info, keys -- in
+ *      j36_mt6592_wifi_cmd.c, and cfg80211 plus wlan0 on top of it in
+ *      j36_mt6592_wifi_net.c.
  *
- * Stages 1 to 3 are what this build does.  Stage 4 is not here yet, and the
- * driver says so in its own log rather than implying a radio it has not got:
- * WLAN_READY means the firmware is executing, not that anything can be sent
- * through it.  The scan, association and data paths are a further layer on top
- * of this transport and are not in this build.
+ * All four are here.  Stage 4 is a FULLMAC driver and not a mac80211 one, which
+ * is the single most consequential fact about this port: the firmware owns the
+ * MAC.  It builds and answers management frames itself, it keeps the station
+ * record and the BSS, it does the encryption once we hand it a key, and what
+ * crosses the HIF in either direction is either a command, an event, a whole
+ * 802.11 management frame or an Ethernet frame.  There is nothing for mac80211
+ * to do here and it is not in this build.
+ *
+ * The division of labour with userspace is the ordinary fullmac one, and it is
+ * what wpa_supplicant and NetworkManager on this rootfs already expect:
+ *
+ *   this driver	scan, open-system authentication, association, the keys
+ *			the supplicant hands down, and the Ethernet data path.
+ *   wpa_supplicant	the PSK, the four-way handshake, and the saved networks.
+ *
+ * So the EAPOL frames of the handshake go out and come back through wlan0 like
+ * any other traffic -- see the is_1x flag on the transmit path, which is what
+ * puts them on TC4 and asks for an acknowledgement -- and the keys arrive back
+ * through cfg80211's .add_key.  Nothing in here computes a PMK.
  *
  *
  * ── WHY THIS DRIVER DOES NOT MAP THE PMIC WRAPPER ──
@@ -71,6 +88,8 @@
 
 #include <linux/bitops.h>
 #include <linux/device.h>
+#include <linux/ieee80211.h>
+#include <linux/if_ether.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
@@ -240,6 +259,17 @@
 #define J36_WHCR_RX_ENHANCE_MODE_EN	BIT(16)
 #define J36_WHCR_MAX_HIF_RX_LEN_MASK	0x000000f0
 #define J36_WHIER_DEFAULT		0xffffff0f
+
+/* WHISR's low nibble.  Only two of the four are acted on: TX_DONE says pages
+ * have been freed and WTSR should be read, ABNORMAL says the FIFO pair has
+ * faulted and nothing further will be carried on it.  The two RX_DONE bits are
+ * not consulted, because WRPLR reports a pending length directly and polling
+ * that is both cheaper and honest about a packet that arrived between the two
+ * reads. */
+#define J36_WHISR_TX_DONE_INT		BIT(0)
+#define J36_WHISR_RX0_DONE_INT		BIT(1)
+#define J36_WHISR_RX1_DONE_INT		BIT(2)
+#define J36_WHISR_ABNORMAL_INT		BIT(3)
 
 #define J36_HSTCR_BURST_4_DW		1
 #define J36_HSTCR_BURST_SHIFT		24
@@ -604,6 +634,155 @@ struct j36_hif_stats {
 	u8 start_event[8];
 	u32 start_event_length;
 	bool start_event_valid;
+
+	/* Stage 4, kept here rather than in the netdev's own statistics because
+	 * these are HIF-level counts and they exist whether a netdev has been
+	 * registered or not: a link that is up and passing nothing is a different
+	 * fault from one whose frames never left the FIFO. */
+	u32 tx_waits;
+	u32 tx_starved;
+	u32 tx_forced;
+	u32 rx_events;
+	u32 rx_management;
+	u32 rx_data;
+	u32 tx_commands;
+	u32 tx_frames;
+};
+
+/* ── stage 4: the firmware's own command and event protocol ──────────────────
+ *
+ * Everything below WLAN_READY is the boot ROM's INIT protocol, above; everything
+ * here is the running firmware's, and the two share nothing but the FIFO pair.
+ *
+ * The command IDs and event IDs are MediaTek's own CMD_ID_* / EVENT_ID_* from
+ * include/nic_cmd_event.h, confirmed against that header rather than guessed
+ * from the disassembly.  Two of them cost MVII a working link to get wrong and
+ * are worth naming out loud:
+ *
+ *   0x17 is UPDATE_STA_RECORD and 0x18 is REMOVE.  Sending the station record
+ *   under 0x18 removes a record that was never added, and the firmware answers
+ *   by going silent rather than by refusing.
+ *   0x20 CH_PRIVILEGE is a lease, not a request.  A grant that is never released
+ *   pins the radio to the operating channel, and every later scan comes back
+ *   empty for a reason nothing reports.
+ */
+#define J36_CMD_POWER_SAVE_MODE		0x06
+#define J36_CMD_ADD_REMOVE_KEY		0x08
+#define J36_CMD_SET_DOMAIN_INFO		0x13
+#define J36_CMD_BSS_ACTIVATE_CTRL	0x15
+#define J36_CMD_SET_BSS_INFO		0x16
+#define J36_CMD_UPDATE_STA_RECORD	0x17
+#define J36_CMD_REMOVE_STA_RECORD	0x18
+#define J36_CMD_INDICATE_PM_CONNECTED	0x1a
+#define J36_CMD_SCAN_REQ		0x1e
+#define J36_CMD_CH_PRIVILEGE		0x20
+#define J36_CMD_BASIC_CONFIG		0xc1
+
+#define J36_EVENT_CMD_RESULT		0x01
+#define J36_EVENT_SCAN_RESULT		0x04
+#define J36_EVENT_BASIC_CONFIG		0x09
+#define J36_EVENT_ACTIVATE_STA_REC	0x13
+#define J36_EVENT_SCAN_DONE		0x15
+#define J36_EVENT_TX_DONE		0x17
+#define J36_EVENT_CH_PRIVILEGE		0x18
+#define J36_EVENT_BSS_BEACON_TIMEOUT	0x1b
+
+/* The HIF's own framing.  A command is 8 bytes of header and a payload; a frame
+ * is 16 bytes of transmit descriptor and either an Ethernet frame or a whole
+ * 802.11 management frame.  Receive is 12 bytes of header in every direction,
+ * with the two low bits of the second half-word saying which of the three kinds
+ * of packet this is. */
+#define J36_HIF_CMD_HEADER_SIZE		8
+#define J36_HIF_DATA_HEADER_SIZE	16
+#define J36_HIF_RX_HEADER_SIZE		12
+#define J36_HIF_TX_PACKET_TYPE_SHIFT	6
+#define J36_HIF_TX_RESOURCE_SHIFT	2
+#define J36_HIF_PACKET_TYPE_DATA	0
+#define J36_HIF_PACKET_TYPE_CMD		1
+#define J36_HIF_PACKET_TYPE_EVENT	1
+#define J36_HIF_PACKET_TYPE_MGMT	3
+#define J36_HIF_RX_PACKET_TYPE_MASK	0x3
+
+/* Traffic classes.  TC4 is the command and management class and has FOUR pages,
+ * which is why nothing writes a port without acquiring one first -- an AHB write
+ * into a full FIFO does not fault, it stops the CPU inside a bus transaction with
+ * no exception and no watchdog. */
+#define J36_HIF_TC_DATA			1
+#define J36_HIF_TC_COMMAND		4
+#define J36_HIF_TC_BROADCAST		5
+
+/* NETWORK_TYPE_AIS: the infrastructure-station network index.  Every command
+ * below carries it, because this driver is a station and nothing else. */
+#define J36_NETWORK_TYPE_AIS		0
+
+/* cnmStaRecChangeState's three states, and its own numbering: STA_STATE_1 is 0.
+ * The join sends 0 before authenticating and 2 after associating; 1 is never
+ * sent, because stock's own dispatch returns before the send for a 1 -> 2
+ * transition (mgmt/cnm_mem.c:1049-1062). */
+#define J36_STA_STATE_1			0
+#define J36_STA_STATE_3			2
+#define J36_STA_RECORD_INDEX		0
+#define J36_STA_INDEX_NOT_FOUND		0xfe
+#define J36_STA_INDEX_BMCAST		0xff
+
+/* CMD_SCAN_REQ_T, nic_cmd_event.h:1434-1449.  110 bytes with no IEs, which is
+ * OFFSET_OF(CMD_SCAN_REQ, aucIE) and what stock sends for a wildcard sweep. */
+#define J36_SCAN_COMMAND_SIZE		110
+#define J36_SCAN_TYPE_PASSIVE		0
+#define J36_SCAN_TYPE_ACTIVE		1
+#define J36_SCAN_SSID_WILDCARD		BIT(0)
+#define J36_SCAN_CHANNEL_2G4		1
+
+#define J36_WLAN_MAX_SCAN_RESULTS	48
+#define J36_WLAN_MAX_RX_PER_POLL	32
+#define J36_WLAN_MAX_ASSOC_FRAME	512
+#define J36_WLAN_MAX_IES		384
+
+/* How long each step of a join is given before it is retried or abandoned.  The
+ * numbers are MVII's, measured against this radio. */
+#define J36_WLAN_SCAN_TIMEOUT_MS	12000
+#define J36_WLAN_CHANNEL_TIMEOUT_MS	1500
+#define J36_WLAN_AUTH_TIMEOUT_MS	1000
+#define J36_WLAN_ASSOC_TIMEOUT_MS	1500
+/* The window between "the pairwise key went in" and "no group key is coming".
+ * The supplicant installs the GTK immediately after the PTK in every handshake
+ * that has one; this only exists so a network that has not got one still opens
+ * its port. */
+#define J36_WLAN_GTK_GRACE_MS		400
+/* How long the pairwise key install waits for the last EAPOL frame to leave the
+ * firmware's own transmit queue.  Generous for one already-queued frame, and
+ * bounded because the alternative to giving up is never installing a key. */
+#define J36_WLAN_1X_DONE_TIMEOUT_MS	100
+#define J36_HIF_TX_POLL_ROUNDS		200
+#define J36_HIF_TX_POLL_INTERVAL_US	1000
+
+/*
+ * One scanned BSS, in the terms the firmware's commands want it rather than the
+ * terms cfg80211 wants it.
+ *
+ * cfg80211 keeps its own BSS table and this is not a second copy of it for the
+ * sake of one: SET_BSS_INFO and UPDATE_STA_RECORD need the operational and basic
+ * rate BITMAPS, the raw supported-rate bytes to echo back in the association
+ * request, the DTIM period out of the TIM element and the channel as a number --
+ * none of which survives cfg80211_get_bss(), which hands back the IEs and the
+ * signal and expects the driver to have kept whatever else it needs.
+ */
+struct j36_wlan_bss {
+	u8 bssid[ETH_ALEN];
+	u8 ssid[IEEE80211_MAX_SSID_LEN];
+	u8 ssid_len;
+	u8 channel;
+	u8 dtim_period;
+	u8 rcpi;
+	u16 beacon_interval;
+	u16 capability;
+	u16 operational_rates;
+	u16 basic_rates;
+	u8 rates[16];
+	u8 rate_count;
+	s16 signal;
+	bool valid;
+	bool privacy;
 };
 
 struct j36_wifi {
@@ -698,6 +877,27 @@ struct j36_wifi {
 	 * fourth byte and is how an answer is matched to its question. */
 	u8 command_sequence;
 
+	/*
+	 * Stage 4's four counters, here rather than in j36_mt6592_wifi_cmd.c
+	 * because they belong to the device and not to the file: a second radio
+	 * on a second probe would need its own set, and file statics would give
+	 * it somebody else's.
+	 *
+	 * frame_sequence is NOT command_sequence.  That one tags a command and
+	 * comes back in an event's header; this one tags a transmitted frame in
+	 * the HIF TX descriptor and comes back in EVENT_TX_DONE's payload.  They
+	 * are different fields of different packets and sharing a counter between
+	 * them would match a frame's completion to a command's answer.
+	 *
+	 * pending_1x is the tag of the last EAPOL frame handed to the firmware,
+	 * zero once its TX_DONE has arrived.  The pairwise key must not go in
+	 * while it is nonzero -- see j36_wlan_cmd_install_key().
+	 */
+	u8 frame_sequence;
+	u8 scan_sequence;
+	u8 channel_token;
+	u8 pending_1x;
+
 	/* Not on the stack: a patch fragment frame is 1011 bytes and this runs on
 	 * a workqueue thread whose stack is two pages. */
 	u8 frame[J36_WMT_FRAME_BUFFER_SIZE];
@@ -707,6 +907,21 @@ struct j36_wifi {
 	/* Same reasoning, one stage down: a download packet is 2072 bytes. */
 	u8 hif_tx[J36_HIF_TX_BUFFER_SIZE];
 	u8 hif_rx[J36_HIF_RX_BUFFER_SIZE];
+
+	/*
+	 * Stage 4.  NULL until the netdev layer has attached, which happens once
+	 * -- at the end of a bring-up that reached WLAN_READY -- and is what every
+	 * command sender in j36_mt6592_wifi_cmd.c tests before it touches the
+	 * radio.  Declared as an opaque pointer so that the three stages below it
+	 * are not compiled against cfg80211's headers.
+	 */
+	struct j36_wlan *wlan;
+
+	/* The station address the firmware answered with, or the board's own if it
+	 * would not.  Stage 4 needs it in three places -- the netdev, SET_BSS_INFO
+	 * and every management frame's address 2 -- so it is read once, here. */
+	u8 mac[ETH_ALEN];
+	bool mac_from_firmware;
 
 	/* Why the radio is not up, in the words the log used.  NULL once it is. */
 	const char *blocked;
@@ -727,7 +942,101 @@ int j36_wifi_hif_bind(struct j36_wifi *w);
 int j36_wifi_hif_load_firmware(struct j36_wifi *w, const void *data, size_t size);
 void j36_wifi_hif_trace(struct j36_wifi *w);
 
-/* Shared by all three: record why we stopped, once, in one place. */
+/*
+ * The transport primitives stage 4 needs, and only those.
+ *
+ * The FIFO pair, the transfer descriptor and the ownership handshake stay
+ * private to j36_mt6592_wifi_hif.c -- there is one place that knows how a word
+ * gets into the port and it is not the command layer.  What crosses this line is
+ * a whole packet in either direction plus the page accounting, because the page
+ * accounting is the thing a command sender must not be able to skip.
+ */
+int j36_wifi_hif_own(struct j36_wifi *w);
+u32 j36_wifi_hif_status(struct j36_wifi *w, u32 offset);
+int j36_wifi_hif_tx_acquire(struct j36_wifi *w, unsigned int tc);
+void j36_wifi_hif_tx_credit(struct j36_wifi *w);
+void j36_wifi_hif_submit(struct j36_wifi *w, unsigned int tc, const u8 *packet,
+			 u32 size);
+bool j36_wifi_hif_pending(struct j36_wifi *w, u8 *port, u32 *length);
+int j36_wifi_hif_collect(struct j36_wifi *w, u8 port, u32 length);
+u8 j36_wifi_hif_sequence(struct j36_wifi *w);
+
+/* j36_mt6592_wifi_cmd.c -- the firmware's own protocol, one function per
+ * command, plus the receive pump that turns a FIFO into events and frames. */
+int j36_wlan_cmd_configure(struct j36_wifi *w);
+int j36_wlan_cmd_scan(struct j36_wifi *w, bool active, u8 *sequence_out);
+int j36_wlan_cmd_channel_request(struct j36_wifi *w, const struct j36_wlan_bss *bss,
+				 u8 *token_out);
+int j36_wlan_cmd_channel_abort(struct j36_wifi *w, u8 token);
+int j36_wlan_cmd_sta_record(struct j36_wifi *w, const struct j36_wlan_bss *bss,
+			    u8 state, u16 aid);
+int j36_wlan_cmd_sta_remove(struct j36_wifi *w, const struct j36_wlan_bss *bss);
+int j36_wlan_cmd_bss_info(struct j36_wifi *w, const struct j36_wlan_bss *bss,
+			  bool secure, bool key_ready);
+int j36_wlan_cmd_bss_disconnect(struct j36_wifi *w, const struct j36_wlan_bss *bss);
+int j36_wlan_cmd_bss_reactivate(struct j36_wifi *w);
+int j36_wlan_cmd_pm_connected(struct j36_wifi *w, const struct j36_wlan_bss *bss,
+			      u16 aid);
+int j36_wlan_cmd_install_key(struct j36_wifi *w, const u8 *peer, u8 key_id,
+			     bool pairwise, const u8 *key);
+int j36_wlan_cmd_remove_key(struct j36_wifi *w, const u8 *peer, u8 key_id,
+			    bool pairwise);
+int j36_wlan_cmd_auth(struct j36_wifi *w, const struct j36_wlan_bss *bss);
+/* The one management frame stock's own join never sends, because stock never
+ * leaves a network on purpose.  Without it the AP keeps the association alive
+ * until its inactivity timer expires, and goes on buffering for a station that
+ * is not listening -- which is visible from the other side as a network that is
+ * slow to let the same device back on. */
+int j36_wlan_cmd_deauth(struct j36_wifi *w, const struct j36_wlan_bss *bss,
+			u16 reason);
+int j36_wlan_cmd_assoc(struct j36_wifi *w, const struct j36_wlan_bss *bss,
+		       const u8 *ies, u32 ies_len);
+int j36_wlan_cmd_tx_ethernet(struct j36_wifi *w, const u8 *frame, u32 len,
+			     u8 sta_index, bool is_1x);
+unsigned int j36_wlan_cmd_pump(struct j36_wifi *w);
+
+/*
+ * What the pump hands upwards.  Implemented in j36_mt6592_wifi_net.c, called
+ * from j36_mt6592_wifi_cmd.c, and every one of them runs with w->lock held on
+ * the poll worker -- so none of them may sleep on anything the worker owns.
+ */
+void j36_wlan_on_beacon(struct j36_wifi *w, const u8 *frame, u32 frame_len,
+			u8 channel, u8 rcpi);
+/*
+ * The same news by the other route.  This firmware reports what it heard in two
+ * different shapes -- the whole beacon as a management packet, and a digested
+ * descriptor as EVENT_SCAN_RESULT -- and which of the two a given build uses is
+ * not something this driver gets to choose.  Both are taken, because the cost of
+ * handling the one that never arrives is nothing and the cost of ignoring the one
+ * that does is an empty network list, which is the entire feature.
+ */
+void j36_wlan_on_scan_result(struct j36_wifi *w, const u8 *bssid, u16 capability,
+			     u8 channel, s32 signal, const u8 *ies, u32 ies_len);
+void j36_wlan_on_scan_done(struct j36_wifi *w, u8 sequence);
+void j36_wlan_on_channel_grant(struct j36_wifi *w, u8 token);
+void j36_wlan_on_auth_response(struct j36_wifi *w, const u8 *frame, u32 frame_len);
+void j36_wlan_on_assoc_response(struct j36_wifi *w, const u8 *frame, u32 frame_len);
+void j36_wlan_on_ap_disconnect(struct j36_wifi *w, const u8 *frame, u32 frame_len,
+			       bool deauth);
+void j36_wlan_on_beacon_timeout(struct j36_wifi *w);
+void j36_wlan_on_ethernet(struct j36_wifi *w, const u8 *frame, u32 frame_len);
+/* The firmware has validated the station record, which is the gate on the whole
+ * unicast data path: until this arrives every data frame has to go out as
+ * STA_INDEX_NOT_FOUND on the broadcast class. */
+void j36_wlan_on_sta_active(struct j36_wifi *w, const u8 *peer);
+/* Whose beacons and disconnects we are listening for, or NULL when there is no
+ * BSS in hand.  The pump needs it to tell an AP's deauth from a stranger's. */
+const u8 *j36_wlan_peer_bssid(struct j36_wifi *w);
+
+/* j36_mt6592_wifi_net.c -- cfg80211 and wlan0. */
+int j36_wlan_net_attach(struct j36_wifi *w);
+void j36_wlan_net_detach(struct j36_wifi *w);
+void j36_wlan_net_trace(struct j36_wifi *w);
+/* The interface's name, or NULL if stage 4 never attached.  Exists so the one
+ * line the bring-up always logs can name what it produced. */
+const char *j36_wlan_net_interface(struct j36_wifi *w);
+
+/* Shared by all five: record why we stopped, once, in one place. */
 void j36_wifi_fail(struct j36_wifi *w, const char *blocked, const char *fmt, ...)
 	__printf(3, 4);
 
