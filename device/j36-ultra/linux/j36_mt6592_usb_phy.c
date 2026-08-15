@@ -76,9 +76,11 @@
  *   J36_PHY_R69_FORCE     0x3c    0x69   -> 0x68 b10-13 P2C_RG_DATAIN
  *   J36_PHY_R6A_FORCE     0xbe    0x6a   -> 0x68 b17-21,23  the five FORCE_* plus
  *                                                       FORCE_DATAIN
- *   J36_PHY_R6A_BIT2      0x04    0x6a.2 -> 0x68 b18    P2C_FORCE_SUSPENDM
+ *   J36_PHY_R6A_FORCE_SUSPENDM    0x6a.2 -> 0x68 b18    P2C_FORCE_SUSPENDM
  *   J36_PHY_R6B_FORCE_UART_EN     0x6b.2 -> 0x68 b26    P2C_FORCE_UART_EN
  *   J36_PHY_R6E_UART_EN   0x01    0x6e.0 -> 0x6c b16    P2C_RG_UART_EN
+ *   J36_PHY_R00_INTR_EN   0x20    0x00.5 -> 0x00 b5     PA0_RG_USB20_INTR_EN
+ *   J36_PHY_R68_SUSPENDM  0x08    0x68.3 -> 0x68 b3     P2C_RG_SUSPENDM
  *
  * So 0x6c is U2PHYDTM1[7:0] -- RG_IDDIG b1, RG_AVALID b2, RG_BVALID b3,
  * RG_SESSEND b4, RG_VBUSVALID b5 -- and 0x6d is U2PHYDTM1[15:8], the five
@@ -124,6 +126,63 @@
  * fault: NOTHING enumerates on that port, hub or stick or mouse alike.
  * j36_musb_stand_down() is the missing edge, and j36_musb_host_kick() is the poll
  * checking that it took.
+ *
+ * ── AND THE EDGE WAS NOT ENOUGH EITHER, BECAUSE THE CORE HAD NO CLOCK ─────────
+ *
+ * The stand-down landed, and the port still enumerated nothing. What the third
+ * log says, read as one picture rather than line by line:
+ *
+ *   DEVCTL 19  A-device, SESSION set, VBUS above VBusValid -- and HM clear,
+ *              held for three seconds. Not a settle-time problem.
+ *   DEVCTL 99  after the bounce, three seconds later, still HM clear, and
+ *              BDEVICE back ON despite RG_IDDIG being forced low the whole time.
+ *   POWER  70 -> b0 -> f0   with HSMODE (read-only) set in every one of them,
+ *              on a port with nothing plugged into it and no session that ever
+ *              chirped. HSMODE is the bootloader's, from the high-speed gadget
+ *              it ran, and it has never been cleared.
+ *   41: 0 0 0 0 0 0 0 0  MT_SYSIRQ 64 Level musb-hdrc.3.auto
+ *              -- the controller's interrupt has NEVER FIRED, on any of the
+ *              eight CPUs, in the whole uptime.
+ *
+ * Every one of those is a register in MUSB's USB clock domain refusing to move,
+ * while every register in its APB domain reads and writes perfectly: HWVERS,
+ * EPINFO and RAMINFO come back correct, DEVCTL.SESSION takes a write and reads
+ * it back, and the DRVVBUS pad -- a GPIO, on nobody's USB clock -- does exactly
+ * what it is told. HM, BDEVICE, HSMODE and every interrupt source the core has
+ * are on the other side of that line. Zero interrupts is the one that settles
+ * it: CONNECT, RESET, SESSREQ, VBUS_ERROR and SOF are all generated from the
+ * 60 MHz the PHY hands back, and a core that had it would have raised SOMETHING
+ * in eleven seconds of being asked to be a host.
+ *
+ * So the role was never the last problem. The PHY's own circuits are off, its
+ * PLL is down, MUSB is being clocked on the bus side and nowhere else, and a
+ * dual-role core in that state answers register reads and arbitrates nothing.
+ *
+ * WHAT TURNS THEM ON is one bit, and this file was missing it. Mainline's
+ * u2_phy_instance_init() in phy-mtk-tphy.c is three writes under the comment
+ * "switch to USB function, and enable usb pll": clear P2C_FORCE_UART_EN and
+ * P2C_FORCE_SUSPENDM in U2PHYDTM0, clear P2C_RG_UART_EN in U2PHYDTM1, and set
+ * PA0_RG_USB20_INTR_EN in USBPHYACR0. The transcribed recover() here has the
+ * first two -- they are J36_PHY_R6B_FORCE_UART_EN, J36_PHY_R6A_FORCE and
+ * J36_PHY_R6E_UART_EN, and they were quoted right -- and does not have the
+ * third. USBPHYACR0 is byte 0x00 of this window and no routine in this file
+ * has ever written it. The LK's savecurrent() clears that bit on its way out,
+ * which is what a bootloader handing a port over is supposed to do, and the
+ * kernel side of the handshake was never here to put it back.
+ *
+ * j36_phy_clock_on() is that write, and it runs before any role sequence and
+ * before musb_core sees the core at all.
+ *
+ * SUSPENDM is the other half and it is a knob rather than a decision. UTMI's
+ * SuspendM gates the PHY's clock output, and once the force bit is clear -- as
+ * mainline leaves it, as recover() leaves it -- the link drives it, which means
+ * MUSB does. MUSB holds it high while POWER.ENSUSPEND is 0, and POWER.ENSUSPEND
+ * is 0 in every dump this board has produced, so the default follows mainline
+ * and lets the link have it. If the port is still dead with the circuits on,
+ * phy_suspendm=1 pins SuspendM high in the PHY instead and takes MUSB out of
+ * that loop entirely -- from the kernel command line, without a rebuild, which
+ * on a board that has to be reflashed to try an idea is the difference between
+ * a reboot and an afternoon.
  *
  * ── WHICH ROLE, THOUGH, AND WHY THE ANSWER STOPPED BEING A MEASUREMENT ────────
  *
@@ -348,6 +407,19 @@
 /* U2 PHY registers, byte-wide, offsets from 0x11210800. Named where the stock
  * decompile named them and left as bare offsets where it did not -- an invented
  * name for a bit whose meaning is unknown is worse than the number. */
+/*
+ * USBPHYACR0[7:0], and bit 5 of it is the one register in this whole file that
+ * decides whether MUSB has a clock. PA0_RG_USB20_INTR_EN enables the PHY's
+ * internal circuitry -- the 48 MHz reference, the PLL, and the 60 MHz UTMI clock
+ * the controller's entire USB-side state machine runs on. With it clear the core
+ * still answers every APB read, still takes a write to DEVCTL.SESSION, and
+ * arbitrates nothing: HM never sets, BDEVICE never tracks the forced ID, HSMODE
+ * stays at whatever the bootloader left in it, and not one interrupt is raised
+ * for the life of the boot. See the file header.
+ */
+#define J36_PHY_R00			0x00	/* USBPHYACR0[7:0] */
+#define J36_PHY_R00_INTR_EN		0x20	/* PA0_RG_USB20_INTR_EN */
+
 #define J36_PHY_R06			0x06	/* VRT / TERM_VREF trim, [2:0] kept */
 #define J36_PHY_R06_TRIM_KEEP		0x07
 #define J36_PHY_R06_TRIM_DEFAULT	0x68
@@ -360,11 +432,15 @@
 #define J36_PHY_R22_PULLDOWN		0x03	/* DP/DM 100k pull-downs */
 #define J36_PHY_R68			0x68
 #define J36_PHY_R68_FORCE		0xf4
+/* Bit 3 is deliberately NOT in J36_PHY_R68_FORCE above and never has been: it is
+ * P2C_RG_SUSPENDM, the VALUE half of the suspend override, and it gates the
+ * clock the controller runs on rather than being one more line-state force. */
+#define J36_PHY_R68_SUSPENDM		0x08
 #define J36_PHY_R69			0x69
 #define J36_PHY_R69_FORCE		0x3c
 #define J36_PHY_R6A			0x6a
 #define J36_PHY_R6A_FORCE		0xbe
-#define J36_PHY_R6A_BIT2		0x04
+#define J36_PHY_R6A_FORCE_SUSPENDM	0x04
 #define J36_PHY_R6B			0x6b
 #define J36_PHY_R6B_FORCE_UART_EN	0x04
 /* 0x6c and 0x6d are the two low bytes of U2PHYDTM1 and they carry the role, the
@@ -478,6 +554,26 @@
  * before it gives up and says so once. Two is a retry rather than a loop: if the
  * core will not take host mode after three attempts the fault is not the edge. */
 #define J36_MUSB_HM_KICKS		2u
+
+/*
+ * And how long the core is given to answer after a session is started, before
+ * anything reads DEVCTL and calls the result a failure.
+ *
+ * This file used to read DEVCTL on the line after the write that set SESSION --
+ * microseconds later, off the same CPU -- and print "after the restart DEVCTL
+ * reads 99: the core is still not the host". Which it was not, yet: HM and
+ * BDEVICE are set by the core once it has sampled ID and the VBUS comparators
+ * over its own clock, and that is a state machine taking its own time, not a
+ * register that changes with the store. The reading was therefore guaranteed to
+ * say "not the host" whether the role had taken or not, which spent both retries
+ * and produced a log line that has been wrong in three consecutive boots.
+ *
+ * 150 ms is comfortably past MUSB's own hundred-millisecond A-device window and
+ * still short enough to sit inside one role poll, and the wait is skipped the
+ * moment HM appears, so on a working port it costs one register read.
+ */
+#define J36_MUSB_SETTLE_MS		150u
+#define J36_MUSB_SETTLE_STEP_MS		5u
 
 /* DEVCTL's VBUS field is four thresholds; this is the lowest one that means
  * somebody is actually driving the bus rather than leakage holding it off the
@@ -615,6 +711,22 @@ MODULE_PARM_DESC(musb_session,
 		 "reason. musb_session=0 backs it out; host mode then works "
 		 "until the first role change and not after it.");
 
+static int phy_suspendm = -1;
+module_param(phy_suspendm, int, 0644);
+MODULE_PARM_DESC(phy_suspendm,
+		 "who drives UTMI SuspendM, which gates the 60 MHz the MUSB core "
+		 "runs its whole USB side on. -1 (default) is mainline's answer "
+		 "and this board's: clear P2C_FORCE_SUSPENDM and let the link "
+		 "have it, because MUSB holds it high while POWER.ENSUSPEND is 0 "
+		 "and that bit is 0 in every dump this board has produced. "
+		 "phy_suspendm=1 pins it high inside the PHY instead, taking the "
+		 "controller out of the loop -- try that from the kernel command "
+		 "line if the port still enumerates nothing with the PHY's "
+		 "circuits enabled, because it needs a reboot rather than a "
+		 "reflash. phy_suspendm=0 forces the PHY INTO suspend and is a "
+		 "diagnostic only: it is what a dead port looks like, on purpose, "
+		 "so the symptom can be confirmed from the other direction.");
+
 static bool musb_probe_layout;
 module_param(musb_probe_layout, bool, 0444);
 MODULE_PARM_DESC(musb_probe_layout,
@@ -675,6 +787,10 @@ struct j36_usb_phy {
 	unsigned int hm_kicks;
 	/* Edge flag for that one complaint. */
 	bool hm_gave_up;
+	/* Edge flag for j36_phy_clock_on()'s one line. It runs on every role
+	 * apply so a phy_suspendm= written through sysfs takes effect on the next
+	 * poll, and a line every three seconds is a line nobody reads. */
+	bool clock_logged;
 	struct delayed_work role_work;
 	/* The role poll runs off a workqueue and .set_mode / .power_on /
 	 * .power_off run off musb's probe and remove. The generic PHY framework
@@ -817,11 +933,79 @@ static void j36_phy_uart_off_and_trim(struct j36_usb_phy *p)
  * tail does not cover that path.
  */
 
+/*
+ * ── GIVE THE CONTROLLER A CLOCK, WHICH COMES BEFORE GIVING IT A ROLE ─────────
+ *
+ * PA0_RG_USB20_INTR_EN is the PHY's internal-circuitry enable: the 48 MHz
+ * reference, the PLL it drives, and the 60 MHz UTMI clock MUSB's USB side runs
+ * on. The LK clears it on its way out and nothing here ever put it back, which
+ * is why three boots' worth of role sequences landed on a core that answered
+ * every register and arbitrated nothing. See the file header for the whole
+ * reading.
+ *
+ * SuspendM is the gate downstream of it and phy_suspendm says who holds it. The
+ * default releases the override, which is what mainline does and what recover()
+ * already did on its own -- the link drives it then, and MUSB drives it high for
+ * as long as POWER.ENSUSPEND is clear, which it is. The other two settings exist
+ * so the question can be answered from a command line instead of a rebuild.
+ *
+ * Idempotent, cheap -- five byte accesses and one settle -- and called from both
+ * role sequences, so a phy_suspendm written through sysfs takes effect on the
+ * next role poll without a reload.
+ */
+static void j36_phy_clock_on(struct j36_usb_phy *p)
+{
+	u8 before = j36_phy_rd(p, J36_PHY_R00);
+
+	j36_phy_set(p, J36_PHY_R00, J36_PHY_R00_INTR_EN);
+
+	if (phy_suspendm < 0) {
+		/* The value is written anyway: it is ignored while unforced, and
+		 * it means anything that sets the force bit later -- a stock
+		 * sequence, a future power_off -- finds SuspendM already high
+		 * rather than latching the PHY asleep at the moment it forces. */
+		j36_phy_set(p, J36_PHY_R68, J36_PHY_R68_SUSPENDM);
+		j36_phy_clr(p, J36_PHY_R6A, J36_PHY_R6A_FORCE_SUSPENDM);
+	} else {
+		if (phy_suspendm)
+			j36_phy_set(p, J36_PHY_R68, J36_PHY_R68_SUSPENDM);
+		else
+			j36_phy_clr(p, J36_PHY_R68, J36_PHY_R68_SUSPENDM);
+		j36_phy_set(p, J36_PHY_R6A, J36_PHY_R6A_FORCE_SUSPENDM);
+	}
+
+	usleep_range(J36_PHY_SETTLE_US, J36_PHY_SETTLE_US * 2);
+
+	if (p->clock_logged)
+		return;
+	p->clock_logged = true;
+	dev_info(p->dev,
+		 "PHY circuits enabled: USBPHYACR0 %02x -> %02x (RG_USB20_INTR_EN was %s), SuspendM %s -- without this the 60 MHz never reaches MUSB and the core answers registers while arbitrating nothing\n",
+		 before, j36_phy_rd(p, J36_PHY_R00),
+		 before & J36_PHY_R00_INTR_EN ? "already set" : "OFF, which is the fault",
+		 phy_suspendm < 0 ? "left to the link, as mainline does"
+				  : (phy_suspendm ? "pinned high in the PHY (phy_suspendm=1)"
+						  : "FORCED LOW (phy_suspendm=0): the port is meant to be dead"));
+}
+
+/* And the other direction, for power_off: circuits off, PHY parked in suspend.
+ * This is u2_phy_instance_power_off()'s half of the same pair, and it is what
+ * the LK does on its way out -- which is how the bit came to be clear here in
+ * the first place. */
+static void j36_phy_clock_off(struct j36_usb_phy *p)
+{
+	j36_phy_clr(p, J36_PHY_R68, J36_PHY_R68_SUSPENDM);
+	j36_phy_set(p, J36_PHY_R6A, J36_PHY_R6A_FORCE_SUSPENDM);
+	j36_phy_clr(p, J36_PHY_R00, J36_PHY_R00_INTR_EN);
+	p->clock_logged = false;
+}
+
 /* Device: B-device, session valid, VBUS present. The low-power resting state and
  * the tail both stock routines end on, so it is also what the PHY sits in after
  * recover(). 0x6c ends at 0x2e and 0x6d at 0x3e, byte for byte as transcribed. */
 static void j36_phy_force_device(struct j36_usb_phy *p)
 {
+	j36_phy_clock_on(p);
 	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_DEV_CLR);
 	j36_phy_set(p, J36_PHY_R6C, J36_PHY_R6C_DEV_SET);
 	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_ALL);
@@ -835,6 +1019,7 @@ static void j36_phy_force_device(struct j36_usb_phy *p)
  * transcribed sequence ran. */
 static void j36_phy_force_host(struct j36_usb_phy *p)
 {
+	j36_phy_clock_on(p);
 	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_HOST_CLR);
 	j36_phy_set(p, J36_PHY_R6C, J36_PHY_R6C_HOST_SET);
 	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_ALL);
@@ -876,14 +1061,21 @@ static void j36_phy_recover(struct j36_usb_phy *p)
 	j36_phy_force_device(p);
 }
 
-/* FUN_81e093b8, savecurrent(). */
+/* FUN_81e093b8, savecurrent().
+ *
+ * The clock_off tail is not transcribed and is deliberate: this runs from
+ * .power_off, which is the port being given up, and the force-device tail it
+ * ends on now turns the PHY's circuits back ON through j36_phy_clock_on(). A
+ * routine whose whole job is to park the block cannot leave its PLL running, so
+ * the park is stated explicitly and last. */
 static void j36_phy_savecurrent(struct j36_usb_phy *p)
 {
 	j36_phy_uart_off_and_trim(p);
 	j36_phy_clr(p, J36_PHY_R22, J36_PHY_R22_PULLDOWN);
-	j36_phy_clr(p, J36_PHY_R6A, J36_PHY_R6A_BIT2);
+	j36_phy_clr(p, J36_PHY_R6A, J36_PHY_R6A_FORCE_SUSPENDM);
 	usleep_range(J36_PHY_SETTLE_US, J36_PHY_SETTLE_US * 2);
 	j36_phy_force_device(p);
+	j36_phy_clock_off(p);
 }
 
 /* ── the MUSB readout ─────────────────────────────────────────────────────────
@@ -923,6 +1115,7 @@ static const char *j36_musb_vbus_str(u8 devctl)
 static void j36_musb_dump(struct j36_usb_phy *p, const char *when)
 {
 	u8 faddr, power, devctl, epinfo, raminfo;
+	u8 acr0, dtm0, dtm0_f;
 	u16 hwvers;
 	u32 l1intm;
 
@@ -979,6 +1172,24 @@ static void j36_musb_dump(struct j36_usb_phy *p, const char *when)
 		 hwvers & BIT(15) ? " RC" : "",
 		 epinfo & 0xf, (epinfo >> 4) & 0xf,
 		 1u << ((raminfo & 0xf) + 2), (raminfo >> 4) & 0xf, l1intm);
+
+	/*
+	 * And the PHY side of the same question, because every bit printed above
+	 * is meaningless if this one is off. Reading it here rather than only at
+	 * the moment it is written is the point: it says whether anything took the
+	 * clock away again between power_on and now.
+	 */
+	acr0 = j36_phy_rd(p, J36_PHY_R00);
+	dtm0 = j36_phy_rd(p, J36_PHY_R68);
+	dtm0_f = j36_phy_rd(p, J36_PHY_R6A);
+	dev_info(p->dev,
+		 "PHY %s: USBPHYACR0 %02x [INTR_EN %s], U2PHYDTM0 %02x/%02x [SuspendM %u, %s] -- %s\n",
+		 when, acr0, acr0 & J36_PHY_R00_INTR_EN ? "on" : "OFF",
+		 dtm0, dtm0_f, !!(dtm0 & J36_PHY_R68_SUSPENDM),
+		 dtm0_f & J36_PHY_R6A_FORCE_SUSPENDM ? "forced" : "from the link",
+		 acr0 & J36_PHY_R00_INTR_EN
+			? "the core has a clock"
+			: "THE CORE HAS NO CLOCK: HM, BDEVICE, HSMODE and every interrupt are dead registers until this is set");
 }
 
 /*
@@ -1226,6 +1437,32 @@ static void j36_musb_stand_down(struct j36_usb_phy *p)
 }
 
 /*
+ * Wait for the core to answer, up to J36_MUSB_SETTLE_MS, and hand back whatever
+ * DEVCTL says at the end of it. Returns as soon as HM appears, so the cost on a
+ * port that works is one register read.
+ *
+ * Nothing here writes. It exists because HM and BDEVICE are not set by the store
+ * that sets SESSION -- they are set by the core once it has sampled ID and the
+ * VBUS comparators over its own clock -- and every caller that read DEVCTL on
+ * the next line was reading a decision that had not been taken yet.
+ */
+static u8 j36_musb_settle(struct j36_usb_phy *p)
+{
+	unsigned int waited = 0;
+	u8 devctl;
+
+	for (;;) {
+		devctl = readb(p->musb + J36_MUSB_DEVCTL);
+		if (devctl & J36_MUSB_DEVCTL_HM)
+			return devctl;
+		if (waited >= J36_MUSB_SETTLE_MS)
+			return devctl;
+		msleep(J36_MUSB_SETTLE_STEP_MS);
+		waited += J36_MUSB_SETTLE_STEP_MS;
+	}
+}
+
+/*
  * ── DID IT TAKE? ─────────────────────────────────────────────────────────────
  *
  * HM is set by the core, not by anything here, and it is the only bit that says
@@ -1277,10 +1514,13 @@ static void j36_musb_host_kick(struct j36_usb_phy *p)
 	j36_phy_force_host(p);
 	j36_musb_session(p, true);
 
-	devctl = readb(p->musb + J36_MUSB_DEVCTL);
-	dev_info(p->dev, "after the restart DEVCTL reads %02x: the core is %s\n",
+	devctl = j36_musb_settle(p);
+	dev_info(p->dev,
+		 "after the restart DEVCTL reads %02x: the core is %s\n",
 		 devctl,
-		 devctl & J36_MUSB_DEVCTL_HM ? "the HOST" : "still not the host");
+		 devctl & J36_MUSB_DEVCTL_HM
+			? "the HOST"
+			: "still not the host, after being given the full settle window");
 }
 
 /*
@@ -1525,6 +1765,23 @@ apply:
 		j36_usb_phy_vbus(p, true);
 		msleep(J36_VBUS_RISE_MS);
 		j36_musb_session(p, true);
+		/*
+		 * And say whether it took, here rather than only from the poll
+		 * three seconds later. This is the reading that matters -- a
+		 * session started as an A-device on a good rail either becomes
+		 * host or the core has no clock -- and the poll's version of it
+		 * used to be the first anyone saw.
+		 */
+		if (p->musb && musb_session) {
+			u8 devctl = j36_musb_settle(p);
+
+			dev_info(p->dev,
+				 "session started as an A-device: DEVCTL %02x, the core is %s\n",
+				 devctl,
+				 devctl & J36_MUSB_DEVCTL_HM
+					? "the HOST -- the root port can scan now"
+					: "NOT the host");
+		}
 	} else {
 		/* VBUS first. A B-device that went on driving 5 V would be
 		 * fighting whatever just plugged in, and on this board the
