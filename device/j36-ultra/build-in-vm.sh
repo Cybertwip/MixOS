@@ -5790,7 +5790,7 @@ dump() {
     # mixdash moves its own stdout and stderr into this file once it has painted a
     # frame, so that a Qt warning is not drawn across the dashboard -- which means
     # everything the dashboard has said since boot is HERE and not in the journal,
-    # and section 8 below would not show it.  Tailed rather than cat'd: the file is
+    # and section 9 below would not show it.  Tailed rather than cat'd: the file is
     # wrapped at 256 KB and the last screen of it is the part with the answer in.
     sec "/run/j36/mixdash.log -- the dashboard's own output, last 200 lines"
     if [ -r /run/j36/mixdash.log ]; then
@@ -5843,11 +5843,57 @@ dump() {
     printf '\n\n########## 6.  MODULES ##########\n'
     show /proc/modules
 
-    printf '\n\n########## 7.  THE WHOLE KERNEL RING BUFFER ##########\n'
+    printf '\n\n########## 7.  MEMORY, SWAP AND ZRAM ##########\n'
+    # The first question this section answers is whether there is any swap at all.
+    # An empty /proc/swaps means /init's setup_zram gave up, or j36.zram=0 is in
+    # the bootargs, and the two look identical from the dashboard -- what tells
+    # them apart is the "zram:" line in section 9's journal.
+    show /proc/swaps
+    run free -m
+    show /proc/meminfo
+    # mm_stat is the only place the ratio is visible, and the ratio is the whole
+    # bet.  The fields are, in order: original data size, compressed data size,
+    # total memory zram is holding, mem_limit, peak, same-page-merged, pages
+    # compacted, huge (incompressible) pages.  Divide the first by the second and
+    # that is what this workload actually compresses at -- 2.0 or better is the
+    # assumption every number in setup_zram was chosen under, and anything near 1
+    # means the pages being swapped are already compressed (media, mostly) and
+    # zram is spending CPU for nothing.
+    #
+    # mem_limit against mem_used_max is the other reading worth taking: max at the
+    # limit means zram has been refusing writes, which is the designed-for failure
+    # rather than the spiral, but it is also the sign that the algorithm should be
+    # zstd on this board.
+    showall "how well it is actually compressing, and what it cost" \
+        /sys/block/zram0/mm_stat /sys/block/zram0/disksize \
+        /sys/block/zram0/mem_limit /sys/block/zram0/mem_used_max \
+        /sys/block/zram0/comp_algorithm
+    # Read back rather than assumed.  setup_zram writes these into /proc before
+    # switch_root and nothing in this image writes them afterwards -- but the
+    # rootfs is shared, systemd-sysctl applies whatever /etc/sysctl.d holds, and a
+    # tuning file added there later would silently undo all three.  150 / 0 / 100
+    # is what /init set; anything else came from the rootfs.
+    showall "the three knobs that decide how the swap gets used" \
+        /proc/sys/vm/swappiness /proc/sys/vm/page-cluster \
+        /proc/sys/vm/watermark_scale_factor /proc/sys/vm/min_free_kbytes
+    # Who the kernel would pick if it had to, in the order it would pick them.
+    # -300 is mixdash and everything it launched; +300 is the browser session
+    # putting itself at the front of the queue on purpose.
+    sec "oom_score_adj by process"
+    for _p in /proc/[0-9]*; do
+        [ -r "$_p/oom_score_adj" ] || continue
+        printf -- '%-8s %-6s %s\n' "${_p#/proc/}" \
+            "$(cat "$_p/oom_score_adj" 2>/dev/null)" \
+            "$(tr '\0' ' ' < "$_p/cmdline" 2>/dev/null | cut -c1-60)"
+    done
+    kgrep "out of memory, and what was killed for it" \
+        'Out of memory|oom-kill|oom_reaper|Killed process|zram|zsmalloc|swapon|page allocation failure'
+
+    printf '\n\n########## 8.  THE WHOLE KERNEL RING BUFFER ##########\n'
     sec "dmesg"
     dmesg 2>&1 || printf '(dmesg failed)\n'
 
-    printf '\n\n########## 8.  THE JOURNAL FOR THIS BOOT ##########\n'
+    printf '\n\n########## 9.  THE JOURNAL FOR THIS BOOT ##########\n'
     sec "journalctl -b, last 4000 lines"
     journalctl -b --no-pager -n 4000 2>&1 || printf '(journalctl failed)\n'
 
