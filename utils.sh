@@ -93,12 +93,12 @@ function setup_virtua_user() {
   # -- which is worth having, because that link was relative for reasons that took a
   # paragraph to explain and broke silently for any mount point outside /home.
   #
-  # -m creates it on the ROOTFS as well, under what will be the mount point, and that
-  # is deliberate: it is the fallback.  A card with no p3, or a p3 that failed its
-  # fsck, still has a home directory with these dotfiles in it -- nofail in the fstab
-  # line means such a boot carries on, and it would otherwise carry on into a $HOME
-  # that does not exist.  finishing_touches.sh copies this tree onto p3 so the mounted
-  # and unmounted cases look the same.
+  # -m creates it, and since the DATA partition was removed that directory IS the home
+  # directory rather than a fallback under a mount point.  It used to be both: a card
+  # with no p3, or a p3 that failed its fsck, still reached a $HOME with these dotfiles
+  # in it, because the fstab line carried nofail and such a boot would otherwise have
+  # carried on into a $HOME that did not exist.  There is no p3 now, so there is one
+  # copy of this tree, on the root filesystem, and nothing mounts over it.
   MIXOS_HOME="${DATA_MOUNT_POINT:-/home/virtua}"
   sudo chroot ${CHROOT_DIR}/ useradd virtua -k /etc/skel -d "${MIXOS_HOME}" -m -s /bin/bash
   sudo chroot ${CHROOT_DIR}/ bash -c "echo virtua:virtua | chpasswd"

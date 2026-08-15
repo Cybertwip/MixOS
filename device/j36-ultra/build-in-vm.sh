@@ -403,20 +403,20 @@ done
 # EXT4 and BTRFS stay for the cards already in the field, written by the builds
 # that came before this one; /init tries all three.
 #
-# EXFAT and VFAT are not for /init -- they are for the other partitions on the same
-# card, and the rootfs mounts those itself.  finishing_touches.sh writes the
-# post-expansion fstab as
+# EXFAT and VFAT are not for /init -- they are for BOOT, which the rootfs mounts
+# itself, and for whatever the operator plugs into the USB port.  The card is two
+# partitions now, and bootstrap_rootfs.sh writes the whole of its fstab as
 #
-#   LABEL=BOOT /boot vfat defaults 0 2
-#   LABEL=DATA /home/virtua ext2 defaults,auto,noatime,nofail 0 2
+#   LABEL=ROOTFS / ext2 defaults,noatime 0 1
+#   LABEL=BOOT /boot vfat defaults 0 0
 #
-# and firstboot installs it over /etc/fstab as its last act, so from the second boot
-# onwards this kernel is asked for both.  p3 is the login user's home directory now,
-# ext2 and labelled DATA -- it used to be exfat and called EASYROMS, and exfat stays
-# built in for the cards already written that way.  The BOOT entry carries no nofail,
-# so a vfat driver this kernel did not have would fail local-fs and take a machine
-# with no keyboard driver into emergency mode; the home entry does carry it, because
-# a card whose p3 is missing or unformatted still has to reach a shell.
+# There is no third line and no nofail on either of these, because there is no longer
+# an optional partition to be missing: the login user's home is /home/virtua, a
+# directory on the root filesystem, so it is present whenever the root is.  A vfat
+# driver this kernel did not have would fail local-fs and take a machine with no
+# keyboard driver into emergency mode, which is why VFAT_FS is not optional here.
+# EXFAT stays built in for the cards already in the field, whose p3 was made vfat and
+# converted to exfat by firstboot, and for USB sticks formatted on a PC.
 for symbol in \
     BLOCK BLK_DEV MMC MMC_BLOCK MMC_MTK REGULATOR REGULATOR_FIXED_VOLTAGE \
     EXT2_FS EXT4_FS BTRFS_FS EXFAT_FS VFAT_FS; do
@@ -1353,10 +1353,10 @@ bb_disable() {
 # is what makes it callable.  chmod was the one that was missing, and it failed
 # the only way a missing applet can: "/init: line NNN: chmod: not found", twice,
 # which is why the probe log stayed unwritable.
-# rmdir is in this list because /init runs it, and it was missing: mount_card removes
-# its own mount point when there is nothing to mount there and again when it replaces
-# it with a symlink to the home partition.  A missing applet is not a no-op in the
-# second case -- `ln -s target dir' with dir still present creates the link INSIDE it,
+# rmdir is in this list because /init runs it, and it was missing: mount_card clears
+# /run/j36/card out of the way before replacing it with a symlink to /home/virtua.
+# A missing applet is not a no-op here -- `ln -s target dir' with dir still present
+# creates the link INSIDE it,
 # so the dashboard's Files page would open on a directory containing one dangling
 # symlink instead of on the card.  The assertion loop below is what would have caught
 # this, and it can only catch what is named here.
@@ -1470,7 +1470,7 @@ grep -q '^CONFIG_SH_IS_ASH=y$' "$BUSYBOX_SRC/.config" || \
 # Nor is this one, and without it `mount -o ro' silently becomes a mount attempt with
 # a filesystem type of "ro": busybox parses -o flag words only when
 # FEATURE_MOUNT_FLAGS is on.  Every probe /init makes -- the rootfs scan, BOOT, the
-# home partition -- mounts read-only first and remounts rw after, so this is not one
+# payload search -- mounts read-only first and remounts rw after, so this is not one
 # corner of the boot but the whole of how it looks at a card.
 grep -q '^CONFIG_FEATURE_MOUNT_FLAGS=y$' "$BUSYBOX_SRC/.config" || \
     die "busybox CONFIG_FEATURE_MOUNT_FLAGS is off; /init needs \`mount -o ro'"
@@ -2220,11 +2220,13 @@ expand_root() {
         # The node goes away and comes back when the kernel re-reads the table, so wait
         # for it rather than racing it.  Twenty seconds is far past anything real; a card
         # that has not come back by then has a problem the resize is not going to fix.
+        # Whole seconds because fractional sleep is a BusyBox build option and this
+        # build's applet list is the one at the top of the script, not a guess.
         ex_step "waiting for the partition to come back"
         ex_n=0
-        while [ ! -b "$rootdev" ] && [ "$ex_n" -lt 80 ]; do
+        while [ ! -b "$rootdev" ] && [ "$ex_n" -lt 20 ]; do
             ex_n=$((ex_n + 1))
-            sleep 0.25
+            sleep 1
         done
         if [ ! -b "$rootdev" ]; then
             ex_done "$rootdev did not come back after the table was rewritten"
@@ -2391,6 +2393,13 @@ fi
 : > "$scan_status"
 : > "$scan_result"
 
+# Here and not one line lower, and the line is load-bearing.  Everything below this
+# point reads or writes /newroot -- modules, the GL payload, the dashboard staging --
+# and the resize needs /newroot unmounted.  This is the last instant in the boot at
+# which the OS partition is known, mounted (so its tools can be copied out) and not
+# yet being used for anything.  It returns with /newroot mounted either way.
+expand_root
+
 # ── Optional payloads: modules, mfgpower, Mesa, the probe ────────────────────
 #
 # All of them are run here, after the wait loop and before the hand-over, for the
@@ -2460,7 +2469,8 @@ find_payload() {
 
 # ── Updating a flashed card from a machine that can only write FAT ────────────
 #
-# The OS partition is ext2 and the home partition is ext2, and macOS mounts neither.
+# The OS partition is ext2 -- and it is the only partition on this card that is not
+# FAT, the user's home being a directory inside it -- and macOS mounts ext2 not at all.
 # So the documented update -- untar sd-root.tar.gz onto ROOTFS -- needs a Linux
 # machine, and the only other way to change an already-flashed card is to write the
 # whole image again.  This is the third way: copy ONE FILE, sd-root.tar.gz, onto the
@@ -3270,7 +3280,7 @@ setup_gl() {
 # WHERE THE PAYLOAD IS, asked rather than assumed.  find_mixos() looks for it in the
 # rootfs first, because extracting sd-root.tar.gz there is what the artifact README
 # says to do, and then on every other partition of the card -- a tree extracted onto
-# a data partition works, read-only mounted, without a keyboard and without a shell.
+# any partition works, read-only mounted, without a keyboard and without a shell.
 #
 # WHY User=root.  The obvious unit runs as the login user, and three things the dashboard
 # does are not that user's: it puts /dev/tty0 into KD_GRAPHICS at its first paint so the
@@ -3317,16 +3327,16 @@ find_mixos() {
         if [ ! -b "$dev" ]; then continue; fi
         if [ "$dev" = "$rootdev" ]; then continue; fi
         dash_mounted=0
-        # exfat is in the list because that is what firstboot used to convert p3 to,
-        # and a payload unpacked there has to be reported as "found but crippled"
-        # rather than as "no such partition" -- the libQt5Core check below is what
-        # says which.
+        # exfat is in the list because that is what firstboot used to convert p3 to on
+        # a card written before this layout, and because a USB stick formatted on a PC
+        # is exfat as often as not; a payload unpacked on one has to be reported as
+        # "found but crippled" rather than as "no such partition" -- the libQt5Core
+        # check below is what says which.
         #
-        # A payload found on the home partition is left mounted read-only here, and
-        # that does cost systemd's rw mount of it at /home/virtua: one device cannot
-        # be both.  It is the price of a card whose rootfs has no /opt/mixos at all,
-        # it is announced on the console by the line below, and the fix is the
-        # documented one -- put the tarball in the rootfs.
+        # Whatever is found here is left mounted read-only for the rest of the boot,
+        # which is the price of a card whose rootfs has no /opt/mixos at all.  It is
+        # announced on the console by the line below, and the fix is the documented
+        # one -- put the tarball in the rootfs.
         for fs in ext2 ext4 btrfs exfat vfat; do
             if ! mount -t "$fs" -o ro "$dev" /newroot/run/j36/mixos 2>/dev/null; then continue; fi
             dash_mounted=1
@@ -3367,42 +3377,33 @@ find_mixos() {
     return 1
 }
 
-# ── the card, mounted because nobody can mount it by hand ─────────────────────
+# ── where the Files page opens ────────────────────────────────────────────────
 #
-# There is no keyboard on this board and the dashboard is the only shell, so a data
-# partition that systemd does not mount is a partition that cannot be reached at all.
-# The rootfs's own fstab mounts what it knows about; this covers the rest, and it is
-# what makes the Files page show something other than an empty home directory.
+# There is no keyboard on this board and the dashboard is the only shell, so
+# /run/j36/card is the one path the Files page opens on and it has to point at
+# something before the dashboard's first paint.
 #
-# Read-only, and that is a decision rather than caution: the operator writes this
-# partition from a PC, the dashboard only reads it, and a data partition mounted rw by
-# an initramfs is a partition that gets replayed dirty the next time the battery gives
-# out mid-write.
+# THIS USED TO MOUNT A PARTITION AND NOW IT DOES NOT, and the reason is that there
+# is no longer a partition for it to mount.  The card is two partitions -- BOOT and
+# ROOTFS -- and the user's space is /home/virtua, an ordinary directory on the root
+# filesystem that is mounted, by definition, before anything here runs.  So the whole
+# of the old job -- glob the mmcblk partitions, try five filesystems on each, skip the
+# ones carrying j36/ or mvii/, look for a .mixos-home stamp, unmount again and leave
+# the real mount to systemd -- collapses into naming a path.
 #
-# exfat and vfat are still in the list, for a card written before this layout: p3 used
-# to be made vfat here and converted to exfat by firstboot.  On a current card p3 is
-# ext2, labelled DATA, and it is the login user's HOME -- the rootfs fstab mounts it
-# rw at /home/virtua.  That partition is handled by pointing at systemd's mount instead
-# of making a second one, for the reason in the paragraph below.  BOOT is skipped by
-# what is in it rather than by its device name, because the name is only known when
-# mount_bootfs happened to run this boot.
-#
-# WHY THE HOME PARTITION IS NOT MOUNTED HERE.  A block device cannot be mounted ro and
-# rw at the same time: the ro mount holds the superblock, and systemd's fstab mount of
-# the same device comes back EBUSY.  With nofail on that fstab line -- which it needs,
-# so that a missing p3 still reaches a shell -- the failure is silent, and the symptom
-# is a home directory that is quietly the rootfs copy underneath the mount point while
-# everything the operator writes goes to the wrong partition.  So this identifies that
-# partition, unmounts it, and leaves /run/j36/card as a symlink to where systemd will
-# mount it a few seconds later.  One mount, writable, owned by systemd.
+# AND THE SYMLINK IS STILL RIGHT ON A CARD WRITTEN BEFORE THIS LAYOUT, which is why
+# the scan could be deleted rather than kept behind a condition.  Such a card has an
+# ext2 p3 labelled DATA and an fstab line mounting it at /home/virtua; this link names
+# that mount point, not that device, so systemd mounts p3 there a few seconds later
+# and the Files page follows it without knowing which of the two layouts it is on.
+# That was the reason for not mounting it here in the first place: a block device
+# cannot be held ro by the initramfs and mounted rw by systemd at the same time -- the
+# second mount comes back EBUSY, silently, that fstab line carrying nofail.
 mount_card() {
-    # /newroot and not /run: this runs before switch_root, so that is the path the
-    # kernel has recorded for the mount.
-    if grep -q " /newroot/run/j36/card " /proc/mounts 2>/dev/null; then return 0; fi
-
-    # Where the rootfs intends to mount it, read out of its own fstab rather than
-    # assumed.  Pure shell rather than awk: this initramfs has neither awk nor cut,
-    # and `read' splits a line into fields for free -- see INIT_APPLETS.
+    # Where the rootfs intends the user's space to be, read out of its own fstab if
+    # that card still mounts something there, and otherwise the path this build uses.
+    # Pure shell rather than awk: this initramfs has neither awk nor cut, and `read'
+    # splits a line into fields for free -- see INIT_APPLETS.
     home_mp=""
     if [ -r /newroot/etc/fstab ]; then
         while read -r fs_spec fs_mp fs_rest; do
@@ -3413,58 +3414,23 @@ mount_card() {
     fi
     [ -n "$home_mp" ] || home_mp=/home/virtua
 
-    # mmcblk ONLY, and /dev/sd* was deliberately taken out of this glob.  It used to
-    # be here and it used to be dead: with SCSI refused there was no path by which a
-    # /dev/sda could exist on this board.  There is one now -- usb-storage is in the
-    # j36/usb/ payload and run_usb has already loaded it by the time this runs -- so
-    # a stick left in the port while a card had no home partition would be mounted
-    # read-only as "the card" and the Files page would open on somebody's USB drive.
-    # External disks are not the card.  They are handled after switch_root, by udev
-    # and mixos-automount, and they land under /media with their own names on them.
-    mkdir -p /newroot/run/j36/card
-    for dev in /dev/mmcblk*p*; do
-        if [ ! -b "$dev" ]; then continue; fi
-        if [ "$dev" = "$rootdev" ] || [ "$dev" = "$bootdev" ]; then continue; fi
-        for fs in exfat vfat ext2 ext4 btrfs; do
-            if ! mount -t "$fs" -o ro "$dev" /newroot/run/j36/card 2>/dev/null; then
-                continue
-            fi
-            if [ -d /newroot/run/j36/card/j36 ] || \
-               [ -d /newroot/run/j36/card/mvii ]; then
-                umount /newroot/run/j36/card
-                break
-            fi
-            # The stamp is written by finishing_touches.sh at the root of p3, next to
-            # the dotfiles it seeds there, and it is the only way this initramfs can
-            # recognise that partition: identifying it by LABEL would need blkid, which
-            # is not in this busybox.  A card without the stamp predates this layout
-            # and falls through to the read-only mount below, which is right for it.
-            if [ -f /newroot/run/j36/card/.mixos-home ]; then
-                umount /newroot/run/j36/card
-                rmdir /newroot/run/j36/card 2>/dev/null
-                # Checked, because `ln -s target dir' with the directory still there
-                # puts the link inside it instead of failing, and the Files page would
-                # then open on a directory holding one dangling symlink.
-                if [ -d /newroot/run/j36/card ]; then
-                    say "dash: could not remove /run/j36/card, so it stays a directory"
-                    say "      and the Files page will show nothing.  The home"
-                    say "      partition is still mounted by systemd at $home_mp."
-                    return 1
-                fi
-                ln -sfn "$home_mp" /newroot/run/j36/card
-                say "dash: $dev ($fs) is the home partition; /run/j36/card -> $home_mp"
-                say "      left to systemd to mount rw -- a read-only mount here would"
-                say "      make its fstab entry fail with EBUSY."
-                return 0
-            fi
-            say "dash: $dev ($fs) mounted read-only at /run/j36/card"
-            return 0
-        done
-    done
-    # Removed rather than left empty: mixdash opens its Files page on /run/j36/card
-    # when that directory exists, and an empty directory would read as an empty card.
+    # Made if it is missing, because a dangling symlink and an empty directory look
+    # the same from the Files page and neither says which one went wrong.  On any card
+    # this build writes it is already there, owned by virtua; this covers the case
+    # where it is not, and the ownership is fixed by the login user's own home anyway.
+    mkdir -p "/newroot$home_mp" 2>/dev/null
+
+    # -n as well as -f: without it, `ln -s target dir' with the directory still there
+    # puts the link INSIDE it instead of replacing it, and the Files page would open on
+    # a directory holding one dangling symlink.  /newroot and not /run, because this
+    # runs before switch_root.
+    mkdir -p /newroot/run/j36
     rmdir /newroot/run/j36/card 2>/dev/null
-    say "dash: no data partition to mount at /run/j36/card"
+    if ln -sfn "$home_mp" /newroot/run/j36/card; then
+        say "dash: /run/j36/card -> $home_mp"
+        return 0
+    fi
+    say "dash: could not point /run/j36/card at $home_mp; the Files page will be empty"
     return 1
 }
 
@@ -3525,9 +3491,10 @@ setup_dash() {
 [Unit]
 Description=MixOS dashboard (J36 Ultra)
 Documentation=file:///opt/mixos/README.txt
-# Ordering only: firstboot resizes the data partition and a dashboard that lists it
-# should not race that.  A unit that is not installed is simply not ordered against,
-# so naming it costs nothing.
+# Ordering only, and kept for the cards already in the field: firstboot repartitioned
+# them, and a dashboard listing a partition that is being resized should not race it.
+# It is disabled in this rootfs -- see finishing_touches.sh -- and a unit that is not
+# installed is simply not ordered against, so naming it costs nothing.
 After=firstboot.service systemd-user-sessions.service
 # Three tries a minute and then it stops, and the number is not caution -- it is the
 # lesson from the shell this one replaced, whose Restart=on-failure ran a binary that
@@ -4445,11 +4412,11 @@ AUTOMOUNT
 #
 # WHAT THIS DOES.  Writes the two-stanza file this board actually wants into the
 # tmpfs and BIND-MOUNTS it over the one on the card.  A bind mount is not a write:
-# the bytes on p3 are untouched, the same card in an R36S gets its own file back,
-# and there is nothing to undo.  That matters more than usual here -- .asoundrc
-# lives on the home partition, which is shared with the other launcher, and the
-# invariant this whole initramfs is built on is that nothing on the shared rootfs
-# is written.
+# the bytes on the card are untouched, the same card in an R36S gets its own file
+# back, and there is nothing to undo.  That matters more than usual here -- .asoundrc
+# lives in /home/virtua, which is a directory on the rootfs and therefore shared with
+# the other launcher, and the invariant this whole initramfs is built on is that
+# nothing on the shared rootfs is written.
 #
 # WHY IT CANNOT BE A DROP-IN INSTEAD.  alsa-lib's hook list loads, in order,
 # /usr/share/alsa/alsa.conf.d/, /etc/alsa/conf.d/, /etc/asound.conf and finally
@@ -4528,9 +4495,11 @@ ASOUNDRC
 # j36-asound -- put this board's default PCM in front of the card's own.
 #
 # Written by the J36 Ultra initramfs into /run and started once by
-# j36-asound.service, after local-fs.target: the home partition carries the file
-# being covered, so binding before it is mounted would be covering the wrong one
-# and the mount would hide the work.
+# j36-asound.service, after local-fs.target.  The ordering is kept for the cards
+# written before this layout, where /home/virtua was a separate partition carrying
+# the file being covered: binding before it was mounted would have covered the wrong
+# file and the mount would have hidden the work.  On a current card /home/virtua is a
+# directory on the root filesystem and the ordering is simply free.
 #
 # Nothing here is a write.  Every path is bind-mounted over, so the card keeps
 # whatever it had and a reboot into anything else sees it.
@@ -4645,12 +4614,14 @@ ASOUNDSH
 
     # THE THREE ORDERING LINES ARE ONE DECISION EACH.
     #
-    # After=local-fs.target, because the file being covered is on the home
-    # partition.  Bind before that partition is mounted and two things go wrong at
-    # once: readlink -f resolves /etc/asound.conf into the empty /home/virtua on the
-    # rootfs and finds nothing to cover, and then the real mount arrives and brings
-    # the RG351MP's file back uncovered.  RequiresMountsFor names the path outright,
-    # so this also holds on a card where /home/virtua is not in fstab.
+    # After=local-fs.target, for the cards written before this layout, where the file
+    # being covered was on a separate home partition.  Bind before that partition was
+    # mounted and two things went wrong at once: readlink -f resolved /etc/asound.conf
+    # into the empty /home/virtua on the rootfs and found nothing to cover, and then
+    # the real mount arrived and brought the RG351MP's file back uncovered.
+    # RequiresMountsFor names a path and not a device, so it is satisfied by the root
+    # mount itself on a current card and by the p3 mount on an old one -- which is why
+    # both lines could stay as they were when the partition went away.
     #
     # Before=sysinit.target, which is as early as a unit that needs a mounted
     # filesystem can be.  `default' has to be right before the first process that
@@ -4693,235 +4664,6 @@ UNITASOUND
            /newroot/run/systemd/system/sysinit.target.wants/j36-asound.service
 
     say "asound: default is plug over hw:CARD=j36 for the whole system"
-    return 0
-}
-
-# ── the rest of the card, given to the DATA partition ─────────────────────────
-#
-# WHAT IS WRONG.  The image is a fixed 4.6 GB and the card is whatever the operator
-# bought.  p3 -- DATA, ext2, mounted at /home/virtua -- ends where the image ended,
-# so a 64 GB card carries 59 GB that nothing can reach and no page can show.  On
-# this board that is not an inconvenience: there is no keyboard, the dashboard is
-# the only shell, and gparted on a PC means taking the card out, which is the exact
-# thing a share and a Files page exist to stop being necessary.
-#
-# WHY NOT firstboot.service, WHICH ALREADY EXISTS.  Because it is the RK3326
-# script, it is masked in this board's bootargs, and the reasons are written out
-# under "systemd.mask=firstboot.service" in the README this file generates: it
-# expands in two stages with a reboot in the middle, it MKFS'S p3 -- deleting
-# whatever is on it -- and it then untars /roms.tar and /tempthemes, neither of
-# which a GUI-mode build ships, spinning 15000 subshells apiece before giving up.
-# Unmasking it would grow the card by destroying the partition being grown.
-#
-# WHY IT IS A UNIT AND NOT INITRAMFS CODE.  Growing an ext2 needs resize2fs and
-# e2fsck, and BusyBox has neither -- there is no ext2 resize applet at all.  Both
-# are on the rootfs, so the work has to happen after switch_root, which means a
-# unit.  It is written into the /run tmpfs like every other unit here, so nothing
-# of it is on the card and deleting the boot image takes the whole feature out.
-#
-# ORDERED BEFORE THE MOUNT, WHICH IS THE LOAD-BEARING LINE.  ext2 has no online
-# resize -- that is an ext4 feature and this filesystem is deliberately ext2 -- so
-# the partition has to be unmounted, and the one moment in the boot when it is
-# both present and unmounted is between udev finding it and systemd mounting it.
-# `Before=home-virtua.mount' is what buys that moment.  The name is spelt out
-# because systemd-escape is not something this initramfs can run, and /home/virtua
-# is the mount point this tree's own fstab writes -- and the script checks
-# /proc/mounts anyway, so an fstab that said something else costs the feature and
-# not the filesystem.
-#
-# AND THERE IS NO STAMP FILE.  No /boot/doneit, no /etc/mixos/expanded.  "Does the
-# partition already reach the end of the card" is answerable from two files in
-# sysfs on every boot, so there is no state to be wrong, nothing to clear when a
-# card is re-flashed, and no way for this to run twice or refuse to run once.
-setup_expand() {
-    if [ -z "$rootdev" ]; then
-        say "expand: no rootfs was found, so there is nothing to run the resize"
-        return 1
-    fi
-    if ! ensure_run_tmpfs; then
-        say "expand: no writable /run on the rootfs, so the resize unit is not written"
-        return 1
-    fi
-
-    mkdir -p /newroot/run/j36/bin
-    mkdir -p /newroot/run/systemd/system/local-fs.target.wants
-
-    # QUOTED HEREDOC.  Every $ below belongs to the script, not to this shell.
-    cat > /newroot/run/j36/bin/j36-expand-data <<'EXPANDSH'
-#!/bin/sh
-# j36-expand-data -- give the rest of the card to the DATA partition.
-#
-# Written into a tmpfs by the J36 Ultra initramfs and gone at the next power cut.
-# Runs once per boot, before /home/virtua is mounted, and does nothing at all on
-# every boot after the first because by then there is nothing left to give.
-say() { echo "expand: $*"; }
-
-# The splash is still up -- /dev came across switch_root with the root, so this is
-# the same channel /init has been writing to -- and the two commands below can take
-# minutes on a big slow card.  A progress bar that stops moving for three minutes is
-# indistinguishable from a boot that has hung.
-chan=/dev/.mixsplash
-tell() { [ -e "$chan" ] && echo "$1" >> "$chan"; return 0; }
-
-# ── FIND IT, AND WAIT FOR IT ─────────────────────────────────────────────────
-#
-# By label, because that is what the fstab this partition is mounted from uses and
-# it is the only name that survives the card being moved between readers.  Waited
-# for rather than assumed present: this unit is ordered before the mount, which is
-# early enough that udev may still be working through the coldplug.
-part=""
-n=0
-while [ "$n" -lt 40 ]; do
-    part=$(blkid -L DATA 2>/dev/null) || part=""
-    if [ -n "$part" ] && [ -b "$part" ]; then break; fi
-    part=""
-    n=$((n + 1))
-    sleep 0.25
-done
-if [ -z "$part" ]; then
-    say "no partition labelled DATA on this machine; nothing to grow"
-    exit 0
-fi
-
-# ── WHICH DISK, AND WHICH NUMBER ON IT ───────────────────────────────────────
-#
-# Out of sysfs and not out of the device name.  Stripping a trailing number works
-# for sda3 and is wrong for mmcblk0p3 and for nvme0n1p3; sysfs already knows both
-# answers and cannot be wrong about either.
-name=${part#/dev/}
-sysdir=/sys/class/block/$name
-if [ ! -r "$sysdir/partition" ]; then
-    say "$part is a whole disk and not a partition; nothing to grow"
-    exit 0
-fi
-pno=$(cat "$sysdir/partition")
-diskname=$(basename "$(readlink -f "$sysdir/..")")
-disk=/dev/$diskname
-if [ ! -b "$disk" ]; then
-    say "cannot find the disk $part is a partition of; nothing to grow"
-    exit 0
-fi
-
-# ── IS THERE ANYTHING TO DO?  ────────────────────────────────────────────────
-#
-# sysfs sizes are in 512-byte sectors regardless of the device's own block size,
-# so these three numbers are directly comparable and no unit conversion is needed.
-# The margin is 8 MiB: an MBR keeps its last sector to itself, an SD controller
-# may round the reported capacity, and re-writing the partition table to recover
-# four megabytes is a write to the one structure on the card worth not writing to.
-start=$(cat "$sysdir/start" 2>/dev/null || echo 0)
-size=$(cat "$sysdir/size" 2>/dev/null || echo 0)
-whole=$(cat "/sys/class/block/$diskname/size" 2>/dev/null || echo 0)
-slack=$((whole - start - size))
-
-if [ "$slack" -gt 16384 ]; then
-    say "$part ends $((slack / 2048)) MiB before the end of $disk; growing it"
-    tell "stage:Expanding storage"
-    tell "detail:$((slack / 2048)) MiB of the card was unused"
-
-    # ", +" is sfdisk's whole vocabulary for this: keep the start, take everything
-    # left.  -N names the one partition to touch, so the other three entries are
-    # rewritten byte for byte as they were.  Nothing in the filesystem is read or
-    # written by this -- it is four bytes of a partition entry.
-    if ! echo ", +" | sfdisk -N "$pno" --force "$disk" >/dev/null 2>&1; then
-        say "sfdisk would not extend partition $pno of $disk; leaving it alone"
-        exit 0
-    fi
-    sync
-
-    # The kernel is still using the table it read at boot, and it will refuse to
-    # re-read the whole thing while p1 and p2 are mounted -- which they are, one of
-    # them being the root filesystem.  partx resizes the single entry through BLKPG
-    # instead, which is allowed for the last partition on the disk precisely because
-    # nothing before it moves.  Both spellings, because util-linux has changed which
-    # one of them is a no-op more than once.
-    partx -u --nr "$pno" "$disk" >/dev/null 2>&1 || \
-        partx -u "$disk" >/dev/null 2>&1 || true
-
-    newsize=$(cat "$sysdir/size" 2>/dev/null || echo "$size")
-    if [ "$newsize" = "$size" ]; then
-        # Not an error and not a retry: the table on the card is correct now, the
-        # kernel simply has not taken it, and the next boot reads it from scratch.
-        say "the partition table now reaches the end of $disk but this kernel is"
-        say "       still using the old one; the filesystem grows on the next boot"
-        exit 0
-    fi
-else
-    say "$part already reaches the end of $disk"
-fi
-
-# ── AND THE FILESYSTEM INSIDE IT ─────────────────────────────────────────────
-#
-# Reached on every boot, not only the one that moved the partition: a card whose
-# table was extended by a PC, or by the paragraph above on a boot that then lost
-# power, has a partition bigger than the ext2 in it.  resize2fs with no size is a
-# no-op when there is nothing to grow into, so this costs one exec.
-if grep -q "^$part " /proc/mounts 2>/dev/null; then
-    say "$part is mounted already, and ext2 cannot be resized while it is."
-    say "       Something is ordered before this unit that should not be."
-    exit 0
-fi
-
-tell "detail:checking the filesystem"
-# resize2fs refuses a filesystem it has not seen checked, so this is not optional.
-# -p fixes what can be fixed without asking, because there is nobody to ask; status
-# 1 means it corrected something and the filesystem is now good, which is a success
-# here.  Anything above that is a filesystem to leave alone and report.
-e2fsck -fp "$part" >/dev/null 2>&1
-rc=$?
-if [ "$rc" -gt 1 ]; then
-    say "e2fsck says $part needs attention (status $rc), so it was not grown"
-    exit 0
-fi
-
-tell "detail:growing the filesystem"
-if resize2fs "$part" >/dev/null 2>&1; then
-    say "$part now fills the card"
-else
-    say "resize2fs could not grow $part"
-fi
-exit 0
-EXPANDSH
-    chmod 0755 /newroot/run/j36/bin/j36-expand-data
-
-    cat > /newroot/run/systemd/system/j36-expand-data.service <<'UNITEXPAND'
-# Written by the J36 Ultra initramfs, into a tmpfs.  Not on the card.
-[Unit]
-Description=Give the rest of the card to the MixOS DATA partition
-DefaultDependencies=no
-Conflicts=shutdown.target
-Before=shutdown.target
-# The one that matters.  ext2 has no online resize, so this has to finish before
-# anything mounts the partition -- and a mount unit is only ordered against what
-# names it.  local-fs.target is not enough on its own: the fstab mount is Before
-# that target too, which orders neither of them against the other.
-Before=home-virtua.mount local-fs.target
-After=systemd-remount-fs.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-# Leading dash: a resize that failed is a smaller partition, not a failed boot,
-# and the script says why on the journal either way.
-ExecStart=-/bin/sh /run/j36/bin/j36-expand-data
-# journal and NOT journal+console.  The splash owns the panel at this point in the
-# boot and gets told what is happening through its own channel; console output here
-# would be text drawn over the picture, which is the thing console.h in the
-# dashboard exists to prevent and the same argument applies one stage earlier.
-StandardOutput=journal
-StandardError=journal
-# e2fsck and resize2fs on a 128 GB card in a slow reader are minutes, and this is
-# the one boot in the life of the device where that is the right thing to wait for.
-TimeoutStartSec=900
-
-[Install]
-WantedBy=local-fs.target
-UNITEXPAND
-
-    ln -sf ../j36-expand-data.service \
-           /newroot/run/systemd/system/local-fs.target.wants/j36-expand-data.service
-
-    say "expand: DATA grows to fill the card before systemd mounts it"
     return 0
 }
 
@@ -5839,12 +5581,12 @@ fi
 # under the new root already carries the right name.  Gated on a rootfs and on
 # nothing else: this is not a feature any boot word turns on, it is who the machine
 # is, and a boot with j36.dash=0 and no audio still answers to it on the network.
+# The card's size used to be settled here too, by writing a unit that grew p3 before
+# systemd mounted it.  There is no p3 any more and the partition that grows is the one
+# this initramfs is standing on, so that work moved to expand_root, hundreds of lines
+# above -- to the only point in the boot where the OS partition is unmounted.
 if [ -n "$rootdev" ]; then
     setup_hostname
-    # Gated on a rootfs and on nothing else, for the same reason the name above is:
-    # this is not a feature a boot word turns on, it is the card being the size it
-    # is.  It writes a unit; the work happens after switch_root, before the mount.
-    setup_expand
 fi
 
 if [ -n "$rootdev" ] && [ "$want_log" = 1 ]; then
@@ -8051,19 +7793,22 @@ systemd.mask=firstboot.service
     a reboot between them, then untars /roms.tar and /tempthemes -- which a
     GUI-mode build does not ship.  With the tars missing, its two progress loops
     spin 15000 subshells apiece before giving up, which is minutes of dead panel,
-    and then it reboots.  Delete this word to let it run on a card that does
-    carry the tars; it grows ROOTFS to fill the card and rebuilds p3 -- the home
-    partition, ext2 and labelled DATA -- from /roms.tar.  It no longer converts
-    that partition to exfat, though this kernel still has exfat and vfat built in
-    for cards written before the change.
+    and then it reboots.
 
-    THE ONE THING IT DID THAT THIS BOARD STILL NEEDS -- growing the DATA
-    partition into the rest of the card -- is done instead by
-    j36-expand-data.service, which /init writes into the /run tmpfs on every
-    boot.  It runs before systemd mounts /home/virtua, extends p3 to the end of
-    the disk with sfdisk and then resize2fs's the ext2 inside it, and it does
-    none of that once there is nothing left to take.  It never mkfs's anything,
-    which is the whole reason it is not the script above.
+    IT IS ALSO DISABLED IN THE ROOTFS NOW, and this word is the belt to that
+    brace.  What it does is carve a third partition out of the free space at the
+    end of the card -- exactly the space /init hands to ROOTFS on the first boot
+    -- so on this layout it is not merely useless, it is the one thing that would
+    undo the expansion.  Do not delete this word.
+
+    THE ONE THING IT DID THAT THIS BOARD STILL NEEDS -- giving the rest of the
+    card to the operator -- is done instead by expand_root in /init, before
+    switch_root.  ext2 has no online resize, so it has to happen while the
+    filesystem is unmounted, and that is the only moment in the boot when the
+    root filesystem is not in use.  It extends ROOTFS to the end of the disk with
+    sfdisk, e2fsck's it and then resize2fs's the ext2 inside it, and it does none
+    of that once there is nothing left to take.  It never mkfs's anything, which
+    is the whole reason it is not the script above.
 
 batt_led.service, no longer masked
     The RK3326 battery LED daemon, and the first unit the forwarded log caught:
@@ -8263,8 +8008,9 @@ j36.audio=speaker
 
     THAT IS A BIND MOUNT AND NOT A WRITE, which is the invariant this whole
     initramfs is built on: nothing on the shared rootfs is written, and .asoundrc
-    lives on p3, the home partition an R36S boots from as well.  The bytes on the
-    card are untouched, the other launcher gets its own file back, and there is
+    lives in /home/virtua, a directory on the rootfs an R36S boots from as well.
+    The bytes on the card are untouched, the other launcher gets its own file back,
+    and there is
     nothing to undo.  The service resolves /etc/asound.conf, /home/virtua/.asoundrc
     and /root/.asoundrc with readlink -f and binds each distinct target once, so the
     symlink between the first two costs one mount rather than two.
@@ -8284,11 +8030,11 @@ j36.audio=speaker
       pcm.dmixer   { type dmix  ipc_key 1024
                      slave { pcm "hw:CARD=j36,DEV=0" rate 48000 } }
 
-    Either edit /home/virtua/.asoundrc on p3 from a PC and drop j36.audio back to a
-    word that does not stage the override -- there is none, so delete
-    /run/j36/asound.conf and restart j36-asound.service instead -- or change
-    setup_asound in the initramfs and rebuild.  Editing p3 changes it for the R36S
-    too; the /run file does not.
+    Either edit /home/virtua/.asoundrc from a PC -- it is on ROOTFS, so that means a
+    Linux machine -- and drop j36.audio back to a word that does not stage the
+    override; there is none, so delete /run/j36/asound.conf and restart
+    j36-asound.service instead.  Or change setup_asound in the initramfs and rebuild.
+    Editing the file on the card changes it for the R36S too; the /run file does not.
 
     THE SAME UNIT ALSO FIXES aplay, and for the same reason it fixes `default': the
     file the machine reaches for is the wrong one.
@@ -8835,20 +8581,21 @@ j36.dash=1
     mount anything by hand, and a file browser rooted in an empty directory is a file
     browser showing nothing.
 
-    On a current card that path is a SYMLINK to /home/virtua, the login user's home
-    and the mount point of p3: ext2, labelled DATA, and the one partition on the card
-    meant to be written.  /init recognises it by a .mixos-home stamp at its root --
-    it has no blkid to read the label with -- unmounts its own probe and leaves the
-    mounting to systemd's fstab entry.  Deliberately: a device cannot be mounted ro
-    and rw at once, so a read-only mount here would make that entry fail with EBUSY,
-    and because the entry carries nofail it would fail silently, leaving a home
-    directory that is really the rootfs copy underneath the mount point.
+    That path is a SYMLINK to /home/virtua, the login user's home -- a directory on
+    the ROOTFS partition, which the initramfs has mounted before it makes the link.
+    Nothing is mounted for it and nothing is probed.
 
-    On a card written before this layout it is a read-only mount instead, of the
-    first partition that is neither the rootfs nor BOOT -- exfat and vfat tried
-    first, p3 having been made vfat and converted to exfat by firstboot back then.
-    BOOT is recognised and skipped by carrying j36/ or mvii/ rather than by its
-    device name, which is only known on a boot that had reason to mount it.
+    It used to be a probe, and a fairly long one: this card had a third partition,
+    ext2 and labelled DATA, mounted at /home/virtua, and /init identified it by a
+    .mixos-home stamp at its root -- it has no blkid to read a label with -- then
+    unmounted its own probe and left the real mount to systemd, because a device
+    cannot be held ro and mounted rw at the same time.  There is no third partition
+    now; the space it used to occupy is given to ROOTFS on the first boot.
+
+    A card written before this layout still works, and works through the same one
+    line, because the link names a PATH and not a device: such a card mounts its p3
+    at /home/virtua from its own fstab a few seconds later, and the Files page
+    follows it there without knowing which layout it is on.
 
     Why a framebuffer dashboard rather than something on GL: everything that had
     been tried on the panel before it went through five layers that each fail
@@ -9768,19 +9515,19 @@ MixOS supports the MediaTek line of processors.  This card is that support: a
 keypad adapter and Mesa's lima/kmsro pair, on a Cortex-A7 from 2013.
 
 This file sits on the FAT32 BOOT partition, which is where a card is opened, but
-it covers everything MixOS put on the card.  Three partitions carry it, and BOOT
+it covers everything MixOS put on the card.  Two partitions carry it, and BOOT
 is FAT because the MVII LK reads FAT32 and nothing else:
 
     BOOT, FAT32   the launcher, and only that: zImage, mt6592-j36-ultra.dtb,
                   initrd.img, mvii/boot.conf, README.txt and this file.
     ROOTFS, ext2  Debian, and MixOS's own tree at /opt/mixos -- unpacked there
                   from sd-root.tar.gz.  Every "bin/", "qt/" and "j36/" path below
-                  means /opt/mixos/... on this partition.
-    DATA, ext2    your home directory, mounted at /home/virtua.  A shell starts
-                  here, the dashboard's Files page opens here, and nothing MixOS
-                  ships is licensed by this file on it -- what is on it is yours.
-                  roms/ inside it is the legacy media tree, which /roms still
-                  points at.
+                  means /opt/mixos/... on this partition.  Your home directory,
+                  /home/virtua, is a directory on it: a shell starts there, the
+                  dashboard's Files page opens there, and nothing MixOS ships is
+                  licensed by this file inside it -- what is in it is yours.
+                  ROOTFS grows to fill the card on the first boot, so the space
+                  that is yours is whatever the card has.
 
 This payload is not licensed uniformly.  Saying otherwise would be a false
 statement about other people's code.
@@ -10103,10 +9850,11 @@ already inside its ext2 OS partition, so a card that was written from that image
 needs nothing poured onto it.  The tarball is here for updating a card in place, and
 for a workstation that cannot write ext2 there is no way round reflashing.
 
-The third partition, DATA, is not this one.  It is your home directory, mounted at
-/home/virtua: a shell starts there, the dashboard's Files page opens there, and it is
-the only partition on the card meant to be written from the device.  Nothing in this
-payload is installed to it.
+Your own space is /home/virtua, a directory on this same partition: a shell starts
+there, the dashboard's Files page opens there, and it is the one place on the card
+meant to be written from the device.  Nothing in this payload is installed into it.
+It used to be a partition of its own; it is not any more, and the space it had went
+to this one, which grows to fill the card on the first boot.
 
 The dashboard and the games:
 
@@ -10303,7 +10051,8 @@ fi
         echo "dtb_sha256=$(sha256sum mt6592-j36-ultra.dtb | awk '{print $1}')"
         echo "bootimg_size=$(stat -c %s boot.img) (slot 0x900000)"
         echo "storage=msdc1 mtk-sd mediatek,mt6592-mmc (ext2, ext4, btrfs, exfat, vfat)"
-        echo "card_layout=p1 BOOT vfat = launcher only (zImage, dtb, initrd.img, mvii/boot.conf, LICENSE.txt, README.txt); p2 ROOTFS ext2 = the OS, /opt/mixos included; p3 DATA ext2 = the login user's home, mounted at ${DATA_MOUNT_POINT:-/home/virtua}, with the legacy roms/ tree inside it and /roms a symlink to that"
+        echo "card_layout=p1 BOOT vfat = launcher only (zImage, dtb, initrd.img, mvii/boot.conf, LICENSE.txt, README.txt); p2 ROOTFS ext2 = the OS, /opt/mixos included, and the login user's home at ${DATA_MOUNT_POINT:-/home/virtua} as an ordinary directory in it.  Two partitions: there is no p3, and p2 is last on the disk so /init can grow it to the card's size on the first boot"
+        echo "card_expand=/init's expand_root, before switch_root: sfdisk -N extends p2 to the end of the disk, e2fsck -fp, then resize2fs with no size argument.  ext2 has no online resize, so this is the only moment in the boot it can happen; the three tools and their libraries are copied out of the rootfs before it is unmounted, and a copy that will not run leaves the card alone"
         echo "rootfs_format=ext2, set in setup_partition.sh and device/r36-ultra/build-in-vm.sh; the MVII LK reads FAT32 only, so BOOT is FAT and the OS partition is free to be the simplest filesystem both kernels on this card handle"
         echo "payload=$PAYREL (J36_PAYLOAD_ON=$PAYLOAD_ON; /init looks in the rootfs /opt/mixos/j36 first, then j36/ on BOOT for a card written by an older build)"
         echo "msdc1_irq=GIC_SPI 72 (INTID 104 - 32)"
@@ -10311,7 +10060,7 @@ fi
         echo "wireless=off"
         echo "reboot=mtk_wdt via watchdog@10007000 (mediatek,mt6589-wdt)"
         echo "console=tty0 last, journald forwarded to it"
-        echo "firstboot=masked (RK3326 script, no /roms.tar in a GUI-mode build)"
+        echo "firstboot=disabled in the rootfs and masked in the bootargs (RK3326 script, no /roms.tar in a GUI-mode build -- and what it carves a third partition out of is exactly the free space expand_root gives to ROOTFS)"
         echo "batt_led=enabled (batt_life_warning.py finds the battery by power_supply type and treats a missing LED as normal; it no longer exits, so Restart=always never fires)"
         echo "bootimg_kernel=zImage-j36-ultra (device tree appended, ATAG path)"
         echo "sd_kernel=sd-boot/zImage (plain, LK passes the tree in r2)"
@@ -10329,7 +10078,7 @@ fi
             echo "shell_start=j36.dash=1; /init writes /run/systemd/system/mixdash.service and wants it from multi-user.target"
             echo "shell_find=/init looks in the rootfs first, then mounts every other partition read-only looking for opt/mixos/bin/mixdash (or mixos/bin/mixdash, for a tarball unpacked one level down); every partition it tries is named on the console, mounted or unreadable"
             echo "shell_missing=when nothing is found, /init also writes /run/systemd/system/mixdash-missing.service, which repeats the reason and the fix on the console six times at 20 s -- because the initramfs lines have scrolled off by then and a boot that ends at hostnamed looks the same as ten other faults"
-            echo "shell_card=/run/j36/card is what the dashboard's Files page opens on, there being no keyboard here to mount anything by hand; on a current card it is a symlink to ${DATA_MOUNT_POINT:-/home/virtua}, the home partition's mount point, which /init recognises by a .mixos-home stamp at the partition root and leaves for systemd to mount rw -- a read-only mount from the initramfs would make that fstab entry fail with EBUSY, silently, it carrying nofail; on a card written before this layout it is a read-only mount of the first partition that is neither the rootfs nor BOOT (skipped by carrying j36/ or mvii/, not by name), exfat and vfat first"
+            echo "shell_card=/run/j36/card is what the dashboard's Files page opens on, there being no keyboard here to mount anything by hand; it is a symlink to ${DATA_MOUNT_POINT:-/home/virtua}, which on a current card is a directory on ROOTFS and needs no mount of its own.  The link names a path and not a device, so on a card written before this layout -- where /home/virtua is p3, ext2 and labelled DATA -- systemd's own fstab entry mounts it there a few seconds later and the same link is still right"
             echo "shell_nodash=without j36.dash=1 nothing is staged at all and /init says so, naming the word to add -- this rootfs enables no shell of its own, so the alternative is a board that boots to nothing and explains nothing"
             echo "shell_render=Qt5 raster into /dev/fb0, which is simplefb's window onto the framebuffer the LK lit -- no EGL, no GBM, no DRM master, no modeset"
             echo "shell_input=evdev directly, QT_QPA_FB_DISABLE_INPUT=1 (gpio-keys plus the keypad, per the device tree)"
@@ -10511,8 +10260,9 @@ IMAGE_STAMP="$WORK/.image-export"
 # such file or directory" -- because its parent directory was the mkdir that had just
 # failed.
 #
-# Nothing on the device fixes it either.  firstboot.service is masked in bootargs, and
-# even unmasked, what it resizes is the DATA partition.  So the filesystem is grown here,
+# Nothing on the device fixes it in time either.  firstboot.service is disabled in the
+# rootfs and masked in the bootargs, and /init's own expand_root runs on the DEVICE, one
+# boot after this build has to write into p2.  So the filesystem is grown here,
 # to the end of its own partition, which is what both machines want anyway: an OS
 # partition whose filesystem stops short of its own end is not a smaller image, it is
 # space the running system cannot use.  The loop device is sizelimited to the partition,
@@ -10684,11 +10434,12 @@ print(p[0]["start"], p[0]["size"], p[1]["start"], p[1]["size"])
                     fi
                     if [[ "$fstype" == btrfs ]]; then
                         log "image: NOTE p2 is btrfs, so this image predates the ext2 layout."
-                        log "image: It boots and the dashboard runs, but p3 is still vfat/exfat"
-                        log "image: and there is no /home/virtua home partition in it.  To get"
-                        log "image: that layout the base image has to be rebuilt from its"
-                        log "image: filesystem stage -- see the README; resuming will not do it,"
-                        log "image: because the build root itself is btrfs."
+                        log "image: It boots and the dashboard runs, but it still has the old"
+                        log "image: three-partition table -- a vfat/exfat p3 sitting behind p2,"
+                        log "image: which is what stops /init growing ROOTFS to the card's size."
+                        log "image: To get the current layout the base image has to be rebuilt"
+                        log "image: from its filesystem stage -- see the README; resuming will"
+                        log "image: not do it, because the build root itself is btrfs."
                     fi
                     sudo umount "$mnt"
                 else
