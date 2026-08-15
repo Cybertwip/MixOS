@@ -30,6 +30,36 @@ QString readFirstLine(const QString &path)
     return QString::fromLocal8Bit(f.readLine()).trimmed();
 }
 
+/* ── WHAT THE INITRAMFS DID TO THE CARD, WHICH NOTHING ELSE CAN STILL SAY ──
+ *
+ * /init grows the OS partition to the size of the card before it hands over, and
+ * everything it says about that goes to a console the splash owns.  There is no
+ * journal to fall back on -- cleanup_filesystem.sh deletes /var/log/journal -- so by
+ * the time anybody is in a position to ask, the only account of the step is gone,
+ * and "it just skipped" was as much as anyone could report.  So /init writes one
+ * line per boot to the file below, and this reads the last of them.
+ *
+ * From the END of the file: it is appended to on every boot, and the line that
+ * matters is the newest.  The seek is because "read it all and take the last" is a
+ * habit that only looks harmless until the file has been appended to for a year.
+ */
+QString lastLineOf(const QString &path, qint64 tailBytes = 4096)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return QString();
+    if (f.size() > tailBytes)
+        f.seek(f.size() - tailBytes);
+    const QStringList lines = QString::fromLocal8Bit(f.readAll())
+                                  .split('\n', Qt::SkipEmptyParts);
+    for (int i = lines.size() - 1; i >= 0; --i) {
+        const QString line = lines.at(i).trimmed();
+        if (!line.isEmpty())
+            return line;
+    }
+    return QString();
+}
+
 bool moduleLoaded(const QString &name)
 {
     /* /sys/module is the honest answer for both a module and something built in;
@@ -737,6 +767,35 @@ void DiagnosticsPage::probeSystem(QVector<Finding> &out)
         root.colour = Theme::ink3();
     }
     out.append(root);
+
+    /* Directly under the size, because the size is what makes somebody ask.  A 4 GB
+     * root on a 32 GB card is the whole of the complaint this row exists to answer,
+     * and the answer is one line /init left behind on its way past. */
+    Finding grown;
+    grown.name = tr("Card expansion");
+    const QString note = lastLineOf("/var/log/mixos-expand.log");
+    if (note.isEmpty()) {
+        /* Not a fault.  A card flashed by a build older than the log, or one whose
+         * /var/log was cleared, has nothing to say here and is not broken for it. */
+        grown.detail = tr("no record on this card -- /init has not written one yet");
+        grown.badge = tr("info");
+        grown.colour = Theme::ink3();
+    } else {
+        /* "[+12.34s] " is /init's own stamp: uptime, because this board has no RTC
+         * and a wall clock in the initramfs is 1970 on every boot.  It says which
+         * moment of the boot, which is worth nothing to the reader of one line. */
+        QString text = note;
+        if (text.startsWith('['))
+            text = text.section(']', 1).trimmed();
+        const bool full = (text.contains("now fills") && !text.contains("READ-ONLY"))
+                          || text.contains("nothing to grow");
+        grown.detail = text;
+        grown.badge = full ? tr("done") : tr("check");
+        /* Orange for anything unrecognised as well as for the known failures: a line
+         * this does not recognise is precisely a line somebody should read. */
+        grown.colour = full ? Theme::green() : Theme::orange();
+    }
+    out.append(grown);
 
     Finding uptime;
     uptime.name = tr("Uptime");
