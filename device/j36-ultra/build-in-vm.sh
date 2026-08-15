@@ -864,11 +864,12 @@ config_m CFG80211
 config_m RFKILL
 # The regulatory domain this driver uses is a custom one compiled into the
 # module -- 2.4 GHz at 20 dBm, the intersection of every domain it hands the
-# firmware itself -- so no regulatory.db is loaded and none needs signing. With
-# REQUIRE_SIGNED_REGDB left on, cfg80211 rejects the absent database and every
-# channel comes up disabled.
+# firmware itself -- so no regulatory.db is loaded and none needs signing. This
+# is off for size and not for taste: it is `default y' and it selects
+# SYSTEM_DATA_VERIFICATION, which is the X.509 parser, PKCS#7 and the asymmetric
+# key infrastructure, all built IN rather than modular, for a database this image
+# does not ship.
 config_n CFG80211_REQUIRE_SIGNED_REGDB
-config_n CFG80211_CRDA_SUPPORT
 # Off deliberately: power save is a firmware-side decision on this part, made
 # through INDICATE_PM_BSS_CONNECTED once the DTIM period is known, and a default
 # from cfg80211 would be a second opinion about the same radio.
@@ -916,7 +917,7 @@ for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 DEVTMPFS DEVTMPFS_MOUNT TMPFS TMPFS_XATTR TMPFS_POSIX_ACL \
                 PROC_FS PROC_SYSCTL SYSFS \
                 EXT2_FS_XATTR EXT2_FS_POSIX_ACL BTRFS_FS_POSIX_ACL \
-                DRM DEVMEM SOUND POWER_SUPPLY BACKLIGHT_CLASS_DEVICE \
+                DRM DEVMEM SOUND POWER_SUPPLY BACKLIGHT_CLASS_DEVICE WIRELESS \
                 USB_SUPPORT USB_PHY GENERIC_PHY HID_SUPPORT \
                 FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER \
                 USB_MUSB_HOST MUSB_PIO_ONLY USB_ANNOUNCE_NEW_DEVICES; do
@@ -981,12 +982,35 @@ for refused in SND_SOC; do
     fi
 done
 
-# Off on purpose, and worth failing over: WIRELESS defaults to y under NET, and
-# an accidental =y here drags cfg80211 and a WLAN menu into an image with 2.5 MiB
-# of slack in a fixed partition.
-for refused in WIRELESS BT; do
+# cfg80211 and rfkill, both modular, both staged behind j36.wifi. Asserted
+# because CFG80211 is `default n' with no prompt-free path to it from anything
+# else in this configuration -- nothing selects it here -- so a lost config_m is
+# a wifi module that builds and then fails to insmod with unresolved symbols on
+# the board, which is the same symptom as three other faults.
+for wanted_module in CFG80211 RFKILL; do
+    grep -q "^CONFIG_${wanted_module}=m$" "$CONFIG" || \
+        die "CONFIG_${wanted_module}=m was not selected; j36_mt6592_wifi.ko links against cfg80211 and both must be modules so they land on BOOT rather than in the 9 MiB image"
+done
+
+# MAC80211 is a refusal, and this is the one that is easy to get wrong in the
+# helpful direction. The MT6592 CONSYS radio is FULLMAC -- its firmware owns the
+# MAC, and j36_mt6592_wifi.ko is a cfg80211 driver with no ieee80211_hw anywhere
+# in it -- so mac80211 has nothing to do here and would be some 700 KiB of it.
+# =m is refused along with =y for the same reason DRM_SIMPLEDRM is: /init loads
+# modules by filename from a text file, and a stray one is a loadable one.
+for refused in MAC80211; do
+    if grep -qE "^CONFIG_${refused}=(y|m)$" "$CONFIG"; then
+        die "CONFIG_${refused} came back after olddefconfig; the MT6592 CONSYS part is fullmac and its driver never registers an ieee80211_hw"
+    fi
+done
+
+# Off on purpose, and worth failing over. WLAN is the in-tree driver menu, and
+# this board's radio driver is out of tree -- everything behind that symbol is
+# hardware that is not here. BT is the Bluetooth stack, which nothing on this
+# image talks to yet.
+for refused in WLAN BT; do
     if grep -q "^CONFIG_${refused}=y$" "$CONFIG"; then
-        die "CONFIG_${refused}=y came back after olddefconfig; it must stay off until the WiFi driver lands"
+        die "CONFIG_${refused}=y came back after olddefconfig; the wifi driver is out of tree and nothing here needs the in-tree menus"
     fi
 done
 
@@ -2672,6 +2696,20 @@ run_power() {
 # Nothing is written to the rootfs and no /lib/firmware is populated: the blobs
 # ship inside j36/wifi/firmware/, so deleting j36/wifi/ takes the radio off the
 # card in one step, like every other payload here.
+
+# The wireless interface, by the one property that identifies one: phy80211 is
+# the symlink cfg80211 puts in a wireless netdev's sysfs directory.  The name is
+# not assumed, because the kernel numbers these and a USB Ethernet adapter that
+# was plugged in at boot can be there first.
+wlan_iface() {
+    for n in /sys/class/net/*; do
+        [ -e "$n/phy80211" ] || continue
+        printf '%s' "${n##*/}"
+        return 0
+    done
+    return 1
+}
+
 run_wifi() {
     if ! find_payload; then return 1; fi
     if [ ! -f "$payload/wifi/load.order" ]; then
@@ -2719,24 +2757,37 @@ run_wifi() {
     # Nothing is lost by walking away: the work item holds no reference to any
     # filesystem by this point, so it runs to completion across switch_root.
     #
-    # Two plain greps rather than one alternation: `\|' is a GNU extension to basic
-    # regular expressions, and which regex engine busybox grep ends up using is a
-    # property of how busybox was configured.  A boot-time test that silently never
-    # matches would turn every healthy bring-up into the "still running" verdict.
+    # THE SUCCESS TEST IS /sys AND NOT dmesg, because an interface either exists
+    # or it does not and that is exactly the question the dashboard's Wi-Fi page
+    # asks.
+    #
+    # The three failure tests are dmesg, and they are plain greps rather than one
+    # alternation: `\|' is a GNU extension to basic regular expressions, and which
+    # regex engine busybox grep ends up using is a property of how busybox was
+    # configured.  A boot-time test that silently never matches would turn every
+    # failed bring-up into the "still running" verdict.
     i=0
     while [ "$i" -lt 8 ]; do
-        if dmesg | grep -q 'j36-mt6592-wifi.*connectivity MCU up' ||
-           dmesg | grep -q 'j36-mt6592-wifi.*bring-up stopped'; then
-            break
-        fi
+        if wlan_iface >/dev/null; then break; fi
+        if dmesg | grep -q 'j36-mt6592-wifi.*no interface was registered'; then break; fi
+        if dmesg | grep -q 'j36-mt6592-wifi.*connectivity MCU up'; then break; fi
+        if dmesg | grep -q 'j36-mt6592-wifi.*bring-up stopped'; then break; fi
         sleep 1
         i=$((i + 1))
     done
 
-    if dmesg | grep -q 'j36-mt6592-wifi.*connectivity MCU up'; then
-        dmesg | grep 'j36-mt6592-wifi' | tail -n 3
-        say "wifi: the connectivity MCU is up and patched.  There is still no network"
-        say "      interface: the WLAN firmware and cfg80211 are not in this build."
+    iface=$(wlan_iface) || iface=""
+    if [ -n "$iface" ]; then
+        dmesg | grep 'j36-mt6592-wifi' | tail -n 2
+        say "wifi: $iface is up.  NetworkManager and wpa_supplicant take it from here"
+    elif dmesg | grep -q 'j36-mt6592-wifi.*no interface was registered'; then
+        dmesg | grep 'j36-mt6592-wifi' | tail -n 4
+        say "wifi: the WLAN firmware is running but no interface was registered;"
+        say "      the line above names where cfg80211 refused it"
+    elif dmesg | grep -q 'j36-mt6592-wifi.*connectivity MCU up'; then
+        dmesg | grep 'j36-mt6592-wifi' | tail -n 4
+        say "wifi: the connectivity MCU is up and patched, but the WLAN firmware"
+        say "      did not start, so there is no interface"
     elif dmesg | grep -q 'j36-mt6592-wifi.*bring-up stopped'; then
         dmesg | grep 'j36-mt6592-wifi' | tail -n 6
         say "wifi: bring-up did not finish; the lines above say where it stopped"
@@ -5807,7 +5858,7 @@ else
     log "power: J36_POWER=0, skipping the PMIC payload"
 fi
 
-# The connectivity subsystem: one out-of-tree module built from three translation
+# The connectivity subsystem: one out-of-tree module built from five translation
 # units, plus the two ROM patches it sends the connectivity MCU.
 #
 # THE WALK FINDS THE PMIC AND THAT IS CORRECT, not something to filter out.
@@ -5819,9 +5870,16 @@ fi
 # load order is complete on its own.  run_wifi skips whichever of them run_power
 # already loaded, which on any boot that reaches it is the PMIC.
 #
-# Nothing else is a root.  cfg80211 is not here and should not be looked for: this
-# build stops at a patched connectivity MCU, there is no netdev and no wiphy, so a
-# payload carrying the wireless stack would be carrying it for nothing.
+# THE WALK ALSO FINDS CFG80211 AND RFKILL, and they are not named as roots for
+# the same reason: they are real symbol dependencies of the radio module, so
+# `modinfo -F depends' reports them and the emit-dependency-first pass puts them
+# ahead of j36_mt6592_wifi.ko in load.order.  That ordering is the whole point --
+# the initramfs has insmod and not modprobe, it resolves nothing itself, and
+# loading the radio first fails on unresolved cfg80211 symbols.
+#
+# Nothing else is a root.  In particular there is no in-tree WLAN driver here to
+# find: CONFIG_WLAN is refused in the kernel configuration above, because the
+# only radio on this board is driven from device/j36-ultra/linux.
 WIFI_MODULE_PATHS=()
 WIFI_MODULE_ORDER=()
 if [[ "${J36_WIFI:-1}" == 1 ]]; then
@@ -6998,9 +7056,9 @@ initrd=initrd.img
 # under /opt/mixos/j36 on the OS partition, and the boot carries straight on.
 # lima gives a render node, mtkdrm a display node, gl puts Mesa ahead of the
 # RK3326 blob, dash runs the MixOS dashboard, audio a sound card, usb the one
-# MUSB port, splash the MixOS picture with the boot stage on it, wifi
-# powers and ROM-patches the connectivity MCU -- no network interface yet, and it
-# implies j36.power because the radio's rails come off the PMIC.
+# MUSB port, splash the MixOS picture with the boot stage on it, wifi brings the
+# connectivity MCU up and registers wlan0 -- and it implies j36.power, because
+# the radio's rails come off the PMIC.
 #
 # Only the four files the LK reads are on BOOT; the rest is in sd-root.tar.gz,
 # unpacked as /opt/mixos on the ext2 OS partition.
@@ -7824,9 +7882,10 @@ j36.power=nocharge
     behind, not from a clean slate.
 
 j36.wifi=1
-    The connectivity MCU.  One module, j36/wifi/j36_mt6592_wifi.ko, loaded after
-    the power payload, and it does the first three of the four things that stand
-    between a cold MT6592 and a network interface.
+    The radio, and wlan0.  Three modules -- cfg80211.ko, rfkill.ko and
+    j36/wifi/j36_mt6592_wifi.ko -- loaded in that order after the power payload,
+    and four stages between a cold MT6592 and an interface NetworkManager can
+    use.
 
     WHAT IT DOES.  It powers the CONSYS block -- the MT6323's VCN28/VCN33 rails
     through the PMIC's wrapper, then MTCMOS, then the INFRA_CONNMCU clock, then
@@ -7840,19 +7899,28 @@ j36.wifi=1
     checks, then the MT6625L A-die probe, then WIFI_START, then WLAN_READY.  At
     that point the firmware is executing on the connectivity core.
 
-    WHAT IT DOES NOT DO, said plainly: there is still no wlan0 after this word.
-    WLAN_READY means the firmware is running, not that anything can be sent
-    through it -- scanning, association, key management and the data path are the
-    fourth stage, they are a great deal more code than the first three, and they
-    are not in this build.  The driver says so itself in the last line it prints.
+    Then the fourth: the firmware's own command and event protocol -- scan,
+    channel privilege, station record, BSS info, keys -- and cfg80211 on top of
+    it.  The part is FULLMAC, which is the one fact that explains the shape of
+    everything above: the firmware owns the MAC, so it beacons, ACKs, retries and
+    does the CCMP itself, and mac80211 is deliberately not in this build because
+    there is nothing here for it to do.  What is left for the driver is the join
+    sequence and an Ethernet frame in each direction; the PSK and the four-way
+    handshake belong to wpa_supplicant, exactly as on any other fullmac radio.
 
-    Reading the boot log is the whole test.  "WLAN firmware running: chip 0x...,
-    WLAN_READY" means all three stages passed.  "connectivity MCU up: ... but the
-    WLAN firmware did not start" means the MCU is fine and stage 3 is not, which
-    is a different problem from the MCU never answering, and "Wi-Fi bring-up
-    stopped at [stage]" names it -- the stage names are the driver's own, and
-    consys-power, btif-link, rom-patch, wmt-handshake, wlan-firmware-missing and
-    firmware-ready-timeout are the ones worth grepping for.
+    The link is 2.4 GHz, WPA2-PSK with CCMP, up to 54 Mb/s.  No 802.11n: the
+    association request does not advertise HT and the station record declares a
+    non-QoS peer, and claiming it in one place and not the others is how a link
+    comes up and then carries nothing.
+
+    Reading the boot log is the whole test.  "wlan0 is up: chip 0x..., WLAN_READY"
+    means all four stages passed.  Each of the other three lines names the stage
+    that stopped: "WLAN firmware running: ... but no interface was registered"
+    is stage 4, "connectivity MCU up: ... but the WLAN firmware did not start" is
+    stage 3, and "Wi-Fi bring-up stopped at [stage]" is stages 1 and 2 -- the
+    stage names are the driver's own, and consys-power, btif-link, rom-patch,
+    wmt-handshake, wlan-firmware-missing, firmware-ready-timeout,
+    wlan-basic-config and wlan-netdev-register are the ones worth grepping for.
 
     Two lines below that are worth reading even on success.  "A-die probe ran"
     means the RF front end was configured by the ROM; "timed out" or "ROM went
