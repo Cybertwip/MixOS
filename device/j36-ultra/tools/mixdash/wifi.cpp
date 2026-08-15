@@ -639,31 +639,36 @@ QString WifiPage::failureText(int exitCode, const QString &err) const
 
 void WifiPage::refreshStatus()
 {
-    m_managerUp = false;
-    m_radioOn = true;
+    enqueue(QueryRadio);
+    enqueue(QueryDevice);
+}
+
+/* One command that answers two questions: nmcli exits non-zero with "Error:
+ * NetworkManager is not running." when there is nothing to ask. */
+void WifiPage::applyRadio(int exitCode, const QString &out)
+{
+    if (exitCode != 0) {
+        m_managerUp = false;
+        m_radioOn = true;
+        m_deviceState = -1;
+        m_ssid.clear();
+        m_address.clear();
+        m_gateway.clear();
+        m_profiles.clear();
+        m_aps.clear();
+        return;
+    }
+    m_managerUp = true;
+    m_radioOn = (out.trimmed() != QLatin1String("disabled"));
+}
+
+void WifiPage::applyDevice(int exitCode, const QString &show)
+{
     m_deviceState = -1;
     m_ssid.clear();
     m_address.clear();
     m_gateway.clear();
-
-    if (nmcliPath().isEmpty() || m_iface.isEmpty())
-        return;
-
-    /* One command that answers two questions: nmcli exits non-zero with "Error:
-     * NetworkManager is not running." when there is nothing to ask. */
-    int rc = -1;
-    const QString radio = nmcli(QStringList() << "-t" << "radio" << "wifi", 3000, &rc);
-    if (rc != 0)
-        return;
-    m_managerUp = true;
-    m_radioOn = (radio.trimmed() != QLatin1String("disabled"));
-
-    const QString show = nmcli(QStringList() << "-t" << "-f"
-                                             << "GENERAL.STATE,GENERAL.CONNECTION,"
-                                                "IP4.ADDRESS,IP4.GATEWAY"
-                                             << "device" << "show" << m_iface,
-                               4000, &rc);
-    if (rc != 0)
+    if (exitCode != 0)
         return;
 
     for (const QString &line : show.split('\n', Qt::SkipEmptyParts)) {
@@ -696,18 +701,20 @@ void WifiPage::refreshStatus()
 
 void WifiPage::refreshProfiles()
 {
-    m_profiles.clear();
-    if (!m_managerUp)
-        return;
+    if (m_managerUp)
+        enqueue(QueryProfiles);
+}
 
-    int rc = -1;
-    const QString out = nmcli(QStringList() << "-t" << "-f" << "NAME,UUID,TYPE"
-                                            << "connection" << "show",
-                              4000, &rc);
-    if (rc != 0)
+void WifiPage::applyProfiles(int exitCode, const QString &out)
+{
+    if (exitCode != 0) {
+        m_profiles.clear();
         return;
+    }
 
+    QVector<Profile> found;
     QSet<QString> live;
+    int asked = 0;
     for (const QString &line : out.split('\n', Qt::SkipEmptyParts)) {
         const QStringList cols = splitTerse(line);
         if (cols.size() < 3)
@@ -723,10 +730,24 @@ void WifiPage::refreshProfiles()
         pr.uuid = cols.at(1).trimmed();
         if (pr.uuid.isEmpty())
             continue;
-        pr.ssid = ssidOfProfile(pr.uuid);
+
+        /*
+         * The SSID is a second query per profile, so it is only ever asked once
+         * and then remembered -- and it is asked in the background like everything
+         * else here.  Until the answer lands the profile answers with its name,
+         * which is what the SSID is on every profile this page wrote anyway.  Four
+         * at a time, so a card with a dozen saved networks does not put a dozen
+         * nmcli runs on the queue in one tick.
+         */
+        QHash<QString, QString>::const_iterator hit = m_ssidCache.constFind(pr.uuid);
+        if (hit != m_ssidCache.constEnd() && !hit.value().isEmpty())
+            pr.ssid = hit.value();
+        else if (hit == m_ssidCache.constEnd() && asked++ < 4)
+            enqueue(QuerySsid, pr.uuid);
         if (pr.ssid.isEmpty())
             pr.ssid = pr.name;
-        m_profiles.append(pr);
+
+        found.append(pr);
         live.insert(pr.uuid);
     }
 
@@ -738,12 +759,105 @@ void WifiPage::refreshProfiles()
         else
             it = m_ssidCache.erase(it);
     }
+
+    m_profiles = found;
+    matchProfiles();
+}
+
+void WifiPage::applySsid(const QString &uuid, int exitCode, const QString &out)
+{
+    QString ssid;
+    if (exitCode == 0) {
+        for (const QString &line : out.split('\n', Qt::SkipEmptyParts)) {
+            const QStringList cols = splitTerse(line);
+            if (cols.size() >= 2 && cols.at(0) == QLatin1String("802-11-wireless.ssid")) {
+                ssid = cols.mid(1).join(QChar(':')).trimmed();
+                break;
+            }
+        }
+    }
+    if (ssid == QLatin1String("--"))
+        ssid.clear();
+
+    /* Cached even when it came back empty, so a profile with no readable SSID is
+     * asked about once rather than on every profile refresh for ever. */
+    m_ssidCache.insert(uuid, ssid);
+    if (ssid.isEmpty())
+        return;
+
+    for (int i = 0; i < m_profiles.size(); ++i)
+        if (m_profiles[i].uuid == uuid)
+            m_profiles[i].ssid = ssid;
+    matchProfiles();
+}
+
+/* Which of the APs on the air have a saved profile behind them.  Kept out of the
+ * scan parser because the two now arrive separately: an SSID that lands after the
+ * list did has to be able to mark its row without waiting for the next sweep. */
+void WifiPage::matchProfiles()
+{
+    for (int i = 0; i < m_aps.size(); ++i) {
+        m_aps[i].saved = false;
+        m_aps[i].uuid.clear();
+        for (int j = 0; j < m_profiles.size(); ++j) {
+            if (m_profiles[j].ssid != m_aps[i].ssid && m_profiles[j].name != m_aps[i].ssid)
+                continue;
+            m_aps[i].saved = true;
+            m_aps[i].uuid = m_profiles[j].uuid;
+            break;
+        }
+    }
+}
+
+/*
+ * The blocking read of the saved networks, and the only one left.  forgetProfilesFor()
+ * has to know what is there before it can delete the right things and then has to
+ * know what is left before it returns, and neither of those can be a promise: the
+ * caller writes a new profile on the next line.  It runs on a button press, once.
+ *
+ * SSIDs come from the cache only -- this deliberately does not spawn a query per
+ * profile the way the old refreshProfiles() did, because that was up to a dozen
+ * blocking nmcli runs in a row.  A profile whose SSID is not cached matches on its
+ * name, which is what this page writes into it.
+ */
+void WifiPage::syncProfiles()
+{
+    m_profiles.clear();
+    if (!m_managerUp)
+        return;
+
+    int rc = -1;
+    const QString out = nmcli(QStringList() << "-t" << "-f" << "NAME,UUID,TYPE"
+                                            << "connection" << "show",
+                              6000, &rc);
+    if (rc != 0)
+        return;
+
+    for (const QString &line : out.split('\n', Qt::SkipEmptyParts)) {
+        const QStringList cols = splitTerse(line);
+        if (cols.size() < 3)
+            continue;
+        const QString type = cols.at(2).trimmed();
+        if (type != QLatin1String("wifi") && type != QLatin1String("802-11-wireless"))
+            continue;
+
+        Profile pr;
+        pr.name = cols.at(0);
+        pr.uuid = cols.at(1).trimmed();
+        if (pr.uuid.isEmpty())
+            continue;
+        pr.ssid = m_ssidCache.value(pr.uuid);
+        if (pr.ssid.isEmpty())
+            pr.ssid = pr.name;
+        m_profiles.append(pr);
+    }
+    matchProfiles();
 }
 
 /*
  * The profile's name is usually its SSID and is not required to be, so the SSID
- * is asked for -- once per profile, and then remembered.  Without the cache this
- * would be a process spawn per saved network every two seconds.
+ * is asked for -- once per profile, and then remembered.  Nothing on a timer calls
+ * this any more; applySsid() fills the same cache from the query pump.
  */
 QString WifiPage::ssidOfProfile(const QString &uuid)
 {
@@ -781,37 +895,29 @@ int WifiPage::quality(int percent)
     return qBound(0, percent, 100);
 }
 
+/*
+ * `--rescan no' -- in queryArgs() -- matters more than it looks.  Without it nmcli
+ * asks for a fresh scan on every listing, and on this radio a scan is a
+ * thirteen-channel sweep that takes the antenna off the AP for the duration --
+ * which, done every two seconds by a page somebody left open, is enough to break a
+ * DHCP exchange in progress.  The list here is whatever NetworkManager last saw;
+ * the rescan is a separate, deliberate, occasional thing.
+ */
 void WifiPage::refreshScan()
 {
-    if (!m_managerUp || m_iface.isEmpty())
-        return;
+    if (m_managerUp)
+        enqueue(QueryScan);
+}
 
-    QStringList fields;
-    fields << "IN-USE" << "SSID";
-    if (m_ssidHex)
-        fields << "SSID-HEX";
-    fields << "BSSID" << "SIGNAL" << "FREQ" << "SECURITY";
-
-    /*
-     * `--rescan no' matters more than it looks.  Without it nmcli asks for a fresh
-     * scan on every listing, and on this radio a scan is a thirteen-channel sweep
-     * that takes the antenna off the AP for the duration -- which, done every two
-     * seconds by a page somebody left open, is enough to break a DHCP exchange in
-     * progress.  The list here is whatever NetworkManager last saw; the rescan is
-     * a separate, deliberate, occasional thing.
-     */
-    int rc = -1;
-    const QString out = nmcli(QStringList() << "-t" << "-f" << fields.join(QChar(','))
-                                            << "device" << "wifi" << "list"
-                                            << "ifname" << m_iface << "--rescan" << "no",
-                              6000, &rc);
-    if (rc != 0) {
+void WifiPage::applyScan(int exitCode, const QString &out)
+{
+    if (exitCode != 0) {
         if (m_ssidHex) {
             /* An nmcli old enough not to know SSID-HEX rejects the whole field
              * list rather than the one field, and the page would go blank.  Drop
              * it, once, and never ask again. */
             m_ssidHex = false;
-            refreshScan();
+            enqueue(QueryScan);
         }
         return;
     }
@@ -852,49 +958,66 @@ void WifiPage::refreshScan()
             found.append(ap);
     }
 
-    for (int i = 0; i < found.size(); ++i) {
-        for (int j = 0; j < m_profiles.size(); ++j) {
-            if (m_profiles[j].ssid != found[i].ssid && m_profiles[j].name != found[i].ssid)
-                continue;
-            found[i].saved = true;
-            found[i].uuid = m_profiles[j].uuid;
-            break;
-        }
-    }
+    m_aps = found;
+    matchProfiles();
 
-    std::sort(found.begin(), found.end(), [](const Ap &a, const Ap &b) {
+    std::sort(m_aps.begin(), m_aps.end(), [](const Ap &a, const Ap &b) {
         if (a.current != b.current)
             return a.current;
         if (a.saved != b.saved)
             return a.saved;
         return a.signal > b.signal;
     });
-
-    m_aps = found;
 }
 
 void WifiPage::poll()
 {
+    ++m_tick;
+
+    /*
+     * WHILE SOMETHING IS HAPPENING, WATCH IT; WHEN NOTHING IS, STOP ASKING.  Every
+     * one of these is a process, and a page left open on a settled connection was
+     * spending three of them every two seconds to learn that nothing had changed.
+     * A second and a half while a connection is coming up, five seconds when it is
+     * either up or down and staying that way.
+     */
+    const bool moving = busy() || isActivating(m_deviceState);
+    const int want = moving ? 1500 : 5000;
+    if (m_timer->interval() != want)
+        m_timer->setInterval(want);
+
     refreshStatus();
 
     /* Profiles change when somebody presses a button on this page, and otherwise
-     * never.  Every tenth second is often enough to notice one arriving from
+     * never.  Every fifth tick is often enough to notice one arriving from
      * somewhere else, and cheap enough not to matter. */
     if (++m_profileAge >= 5) {
         m_profileAge = 0;
         refreshProfiles();
     }
 
-    refreshScan();
+    /* The AP list is the heaviest query of the three, and during an association it
+     * is also the least interesting: NetworkManager stops scanning once it starts
+     * connecting, so the list cannot change.  Every fourth tick then, every tick
+     * otherwise. */
+    if (!moving || (m_tick % 4) == 0)
+        refreshScan();
 
-    /* NetworkManager scans on its own schedule while it is disconnected, and
-     * stops when it associates.  This is only for the page that is left open on
-     * the list: twenty seconds, and not while a verb is in flight. */
-    if (m_managerUp && m_radioOn && !busy() && m_scanAge.elapsed() > 20000) {
-        nmcli(QStringList() << "device" << "wifi" << "rescan" << "ifname" << m_iface, 3000);
+    /*
+     * NetworkManager scans on its own schedule while it is disconnected, and stops
+     * when it associates.  This is only for the page that is left open on the
+     * list -- and it must not happen while a connection is being made.  A sweep is
+     * thirteen channels with the antenna off the AP, and asking for one in the
+     * middle of a four-way handshake or a DHCP exchange is how a network that
+     * would have worked comes back as "Timeout expired".
+     */
+    if (m_managerUp && m_radioOn && !busy() && !isActivating(m_deviceState)
+        && m_deviceState != StateActivated && m_scanAge.elapsed() > 20000) {
+        enqueue(QueryRescan);
         m_scanAge.restart();
     }
 
+    pumpQueries();
     rebuild();
 }
 
