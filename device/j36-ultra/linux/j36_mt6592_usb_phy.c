@@ -1794,7 +1794,33 @@ static u8 j36_musb_host_arm(struct j36_usb_phy *p, bool sensed)
 		j36_phy_force_host(p);
 
 	/*
-	 * 7. HM is not set by the store that set SESSION; it is set by the core
+	 * 7. AND TAKE THE PULL-UP DOWN AGAIN, on the far side of the session.
+	 *
+	 *    Step 2 cleared POWER.SOFTCONN and the dumps kept reading it back
+	 *    set -- POWER f0 at every settle, over a session this driver had just
+	 *    started as an A-device. Nothing in mainline's host path writes that
+	 *    bit; musb_pullup() is the only writer and it cannot run in
+	 *    MUSB_PORT_MODE_HOST. So it is the core's own reset value coming back
+	 *    with the session, and while it is set the core is holding its D+
+	 *    pull-up onto the bus it is supposed to be the host OF.
+	 *
+	 *    That is not cosmetic. A host detects a connect as a pull-up
+	 *    appearing against its own 15k pull-downs; if the pull-up is already
+	 *    there because the port put it there, the device that plugs in
+	 *    changes nothing the core can see, no CONNECT interrupt is raised,
+	 *    and HM stays clear forever -- which is the second half of a socket
+	 *    that arms perfectly and still enumerates nothing.
+	 */
+	if (p->musb) {
+		u8 power = readb(p->musb + J36_MUSB_POWER);
+
+		if (power & J36_MUSB_POWER_SOFTCONN)
+			writeb(power & (u8)~J36_MUSB_POWER_SOFTCONN,
+			       p->musb + J36_MUSB_POWER);
+	}
+
+	/*
+	 * 8. HM is not set by the store that set SESSION; it is set by the core
 	 *    once it has sampled ID and the valids over its own clock. Give it
 	 *    the window before calling the result anything.
 	 */
@@ -1804,11 +1830,12 @@ static u8 j36_musb_host_arm(struct j36_usb_phy *p, bool sensed)
 /*
  * ── DID IT TAKE? ─────────────────────────────────────────────────────────────
  *
- * HM is set by the core, not by anything here, and it is the only bit that says
- * the role change actually happened rather than merely being asked for. So the
- * poll checks it, and if a port that asked for host is not the host, it runs the
- * stock arm again -- VBUS down inside the PHY, session restarted against the dead
- * bus, VBUS back up inside the session.
+ * j36_musb_host_armed() is the test, and the comment on it is the important one
+ * in this file: it is NOT DEVCTL.HM. A port that is an A-device, holding a
+ * session, with the VBUS comparators up is armed, and that is as far as the core
+ * will go on its own with nothing in the socket. If the poll finds less than
+ * that it runs the stock arm again -- VBUS down inside the PHY, session
+ * restarted against the dead bus, VBUS back up inside the session.
  *
  * THIS IS THE ONLY PLACE THAT CAN FIX IT, and that is a fact about ordering
  * rather than a design choice. power_on() runs inside musb_platform_init(), which
