@@ -150,6 +150,23 @@ public:
     QString language() const { return m_language; }
     void setLanguage(const QString &code);
 
+    /*
+     * The IANA time zone the user picked on the map, "Europe/Paris".
+     *
+     * REMEMBERED HERE AS WELL AS IN /etc, and the duplication is the point.  The
+     * real home of a time zone is /etc/localtime, which is a symlink into
+     * /usr/share/zoneinfo -- but /init mounts the OS partition read-only on some
+     * of the recovery paths in this bring-up, and on those boots the symlink
+     * cannot be replaced.  This file lives wherever path() found room, so the
+     * choice survives on a read-only rootfs as a TZ the dashboard sets on itself
+     * at startup: the clock in the status bar is then right even when the rest of
+     * the system's idea of local time is not.  Empty means nobody has chosen and
+     * whatever /etc/localtime says stands, which is what a device that was never
+     * taken to the Region page should do.
+     */
+    QString timezone() const { return m_timezone; }
+    void setTimezone(const QString &zone);
+
     /* The file the settings actually landed in, for the Settings page to print. */
     QString path() const;
     /* False when even the tmpfs fallback would not open, which is worth saying
@@ -169,6 +186,7 @@ private:
     QString m_wifiInterface;
     QString m_mediaRoot;
     QString m_language;
+    QString m_timezone;
     QStringList m_cardOrder;
     int m_brightness = -1;
     int m_mediaRepeat = 0;

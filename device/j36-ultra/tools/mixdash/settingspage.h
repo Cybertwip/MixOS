@@ -62,7 +62,7 @@ public:
         OpenNone = 0,
         OpenMouse,
         OpenDisplay,
-        OpenLanguage
+        OpenRegion
     };
 
     explicit SettingsPage(QWidget *parent = nullptr);
@@ -241,40 +241,15 @@ private:
 };
 
 /*
- * The language page: one row per language the strings database carries.
+ * The language page used to be here, and it is now region.h.
  *
- * EVERY ROW IS WRITTEN IN THE LANGUAGE IT SELECTS, and that is not decoration.
- * This is a handheld with no keyboard and no second screen: somebody who picks
- * the wrong row is looking at a settings hub they cannot read, and the only way
- * back is to recognise the word for their own language in a list.  "Deutsch"
- * next to "German" costs one column and is the difference between a wrong press
- * being a mistake and a wrong press being a reflash.
- *
- * The second column is the English name, for the same reason from the other
- * side: somebody helping over a phone can say "the row that says French".
+ * It was six rows -- one per language, each written in itself -- and the whole of
+ * it survives as one of the three panes of the Region & Language page, because
+ * the reason it was written that way has not changed: somebody who picks the
+ * wrong row is looking at a shell they cannot read, and the way back is to
+ * recognise the word for their own language.  What it did not have was any way to
+ * say where the device is, which is the other half of the same question and the
+ * half that decides what the clock says.
  */
-class LanguagePage : public PageWidget
-{
-    Q_OBJECT
-
-public:
-    explicit LanguagePage(QWidget *parent = nullptr);
-
-    QString title() const override { return tr("Language"); }
-    bool handleNav(int action) override;
-    void onEnter() override;
-
-protected:
-    void paintEvent(QPaintEvent *event) override;
-    void resizeEvent(QResizeEvent *event) override;
-
-private slots:
-    void onActivated(int index);
-
-private:
-    void rebuild();
-
-    ListPane *m_list = nullptr;
-};
 
 #endif /* MIXDASH_SETTINGSPAGE_H */

@@ -60,6 +60,7 @@ SOURCES += \
     volume.cpp \
     busy.cpp \
     settingspage.cpp \
+    region.cpp \
     wifi.cpp \
     sharing.cpp \
     terminal.cpp \
@@ -83,6 +84,7 @@ HEADERS += \
     volume.h \
     busy.h \
     settingspage.h \
+    region.h \
     wifi.h \
     sharing.h \
     terminal.h \

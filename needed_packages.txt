@@ -13,6 +13,7 @@ dos2unix
 espeak-ng
 exfatprogs
 ffmpeg
+firefox-esr
 firmware-mediatek
 firmware-realtek
 fonts-noto-cjk

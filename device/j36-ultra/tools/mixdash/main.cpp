@@ -74,6 +74,7 @@
 #include "console.h"
 #include "dashboard.h"
 #include "media.h"
+#include "region.h"
 #include "stringsdb.h"
 #include "trace.h"
 
@@ -667,6 +668,19 @@ int main(int argc, char **argv)
      */
     Trace::phase("strings -- the localisation table");
     Strings::install();
+
+    /*
+     * The time zone, in the same breath and for the same reason.
+     *
+     * The status bar starts telling the time a few milliseconds after the
+     * Dashboard constructor returns, and on a device whose /etc could not be
+     * written -- /init mounts the OS partition read-only on some of its recovery
+     * paths -- the only record of where the user said they are is the settings
+     * file.  This sets TZ on mixdash alone from that record: it writes nothing,
+     * needs no privilege, and is a no-op on a device that was never taken to the
+     * Region page.  See RegionPage::applyStoredTimezone().
+     */
+    RegionPage::applyStoredTimezone();
 
     /*
      * WHY THE REST OF main() IS INSIDE A try.  An exception that reaches the top of

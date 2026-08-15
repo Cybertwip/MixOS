@@ -182,6 +182,13 @@ void Settings::load()
      * codes exist, and it answers English for anything else -- so a hand-edited
      * language=xx costs a fallback, not a startup failure. */
     m_language = m_store->value(QStringLiteral("ui/language")).toString().trimmed().toLower();
+
+    /* Not validated here either, and for a stronger reason than the language:
+     * the set of legal values is /usr/share/zoneinfo, which is a directory tree
+     * on the card rather than a list this program could hold.  RegionPage checks
+     * that the file exists before it acts on this, and a zone that has gone away
+     * costs a fallback to whatever /etc/localtime says. */
+    m_timezone = m_store->value(QStringLiteral("ui/timezone")).toString().trimmed();
 }
 
 void Settings::setMouse(const MouseConfig &config)
@@ -283,6 +290,17 @@ void Settings::setLanguage(const QString &code)
     m_language = code;
     if (m_store) {
         m_store->setValue(QStringLiteral("ui/language"), code);
+        m_store->sync();
+    }
+}
+
+void Settings::setTimezone(const QString &zone)
+{
+    if (m_timezone == zone)
+        return;
+    m_timezone = zone;
+    if (m_store) {
+        m_store->setValue(QStringLiteral("ui/timezone"), zone);
         m_store->sync();
     }
 }

@@ -12,6 +12,7 @@
 #include "media.h"
 #include "packages.h"
 #include "pointer.h"
+#include "region.h"
 #include "settingspage.h"
 #include "sharing.h"
 #include "stringsdb.h"
@@ -94,9 +95,9 @@ QString graphicalBrowserSession()
         "/usr/bin/Xorg", "/usr/lib/xorg/Xorg", "/usr/bin/X"
     };
     static const char *const kBrowsers[] = {
-        "netsurf-gtk", "netsurf", "surf", "dillo", "badwolf", "luakit", "midori",
-        "epiphany-browser", "falkon", "qutebrowser", "firefox-esr", "firefox",
-        "chromium", "chromium-browser"
+        "firefox-esr", "firefox", "netsurf-gtk", "netsurf", "epiphany-browser",
+        "luakit", "surf", "dillo", "falkon", "qutebrowser", "chromium",
+        "chromium-browser"
     };
 
     if (!QFileInfo(QString::fromLatin1(kBrowserSession)).isExecutable())
@@ -442,8 +443,8 @@ Dashboard::Dashboard(QWidget *parent)
     m_mouse = new MousePage(this);
     Trace::step("DisplayPage");
     m_display = new DisplayPage(this);
-    Trace::step("LanguagePage");
-    m_language = new LanguagePage(this);
+    Trace::step("RegionPage");
+    m_region = new RegionPage(this);
     Trace::step("InfoPage");
     m_info = new InfoPage(this);
 
@@ -521,7 +522,7 @@ Dashboard::Dashboard(QWidget *parent)
     Trace::step("page tables");
     m_all << m_apps << m_media << m_settings
           << m_files << m_terminal << m_wifi << m_sharing << m_packages
-          << m_diagnostics << m_mouse << m_display << m_language << m_info;
+          << m_diagnostics << m_mouse << m_display << m_region << m_info;
     for (PageWidget *page : m_all) {
         adopt(page);
         page->hide();
@@ -741,12 +742,16 @@ void Dashboard::buildPages()
      *      XTEST, so the D-pad is a pointer and A is a click.  matchbox-keyboard is
      *      the on-screen keyboard inside the session, on Select.
      *
-     * WHICH BROWSER IS NOT DECIDED HERE.  The image installs netsurf-gtk -- its own
-     * engine, 4 MB, real CSS and TLS, no JavaScript -- because that is what 1 GB of
-     * RAM and eight A7s with no GPU driver can carry.  But the session script takes
-     * whichever of a dozen browsers is on the card, chromium and firefox-esr
-     * included, so a browser installed from the Packages page later is the one this
-     * card runs.  Nothing in this file has to change for that.
+     * WHICH BROWSER IS NOT DECIDED HERE.  The image installs firefox-esr, because
+     * the 2026 web is JavaScript and a browser without it shows a blank page on half
+     * the sites anybody would open -- Debian trixie has a real armhf build, 140 ESR,
+     * so this is Gecko with a JIT and not a compatibility shim.  It also installs
+     * netsurf-gtk beside it, 4 MB and no JavaScript, for the day 946 MB of RAM with
+     * no swap is not enough to start the other one.  Beyond those two the session
+     * script takes whichever of a dozen browsers is on the card, chromium included,
+     * so a browser installed from the Packages page later is the one this card runs.
+     * Nothing in this file has to change for that; the list below only has to stay
+     * in the same order as the script's.
      *
      * AND THE OLD CARD IS STILL HERE, one branch down, for a card with no X on it:
      * links2 in this dashboard's own terminal, driven by the arrow keys and Enter.
@@ -773,7 +778,7 @@ void Dashboard::buildPages()
                         || !firstExisting(QStringList() << kBrowserExe).isEmpty();
     if (!browser.available)
         browser.reason = tr("No browser on this card. The Packages page can add "
-                            "netsurf-gtk, or links2 for a text one.");
+                            "firefox-esr, or links2 for a text one.");
     apps.append(browser);
 
     /*
@@ -1614,8 +1619,8 @@ void Dashboard::openDestination(int destination)
     case SettingsPage::OpenDisplay:
         push(m_display);
         break;
-    case SettingsPage::OpenLanguage:
-        push(m_language);
+    case SettingsPage::OpenRegion:
+        push(m_region);
         break;
     default:
         break;

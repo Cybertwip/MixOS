@@ -162,8 +162,21 @@ polkit.addRule(function(action, subject) {
 });
 EOF
 
-# Default set timezone to New York
+# Default set timezone to New York.
+#
+# A DEFAULT AND NO LONGER A SENTENCE.  mixdash has a Region & Language page now --
+# a world map, sixty cities, one press -- and what it writes is exactly these two
+# files, through timedatectl where there is one and by hand where there is not.
+# So this is the zone the device has until somebody says otherwise, rather than
+# the zone the device has for ever because there was no way to change it short of
+# a terminal.
+#
+# /etc/timezone IS WRITTEN AS WELL AS THE SYMLINK, because Debian has two records
+# of this and packages read both: the symlink is what libc follows and the file is
+# what dpkg-reconfigure and half a dozen maintainer scripts believe.  Leaving them
+# disagreeing is how a device ends up with two different right answers.
 sudo chroot MixOSBuild/ bash -c "ln -sf /usr/share/zoneinfo/America/New_York /etc/localtime"
+echo "America/New_York" | sudo tee MixOSBuild/etc/timezone > /dev/null
 
 # fetch_compat_libs.sh used to run here: nineteen wget calls pulling Debian 10 and 11
 # library sonames out of snapshot.debian.org so PortMaster's prebuilt ports could find

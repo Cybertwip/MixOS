@@ -278,19 +278,29 @@ void SettingsPage::rebuild()
         rows << r;
     }
 
-    h.text = tr("Language");
+    h.text = tr("Region");
     rows << h;
 
     r = ListRow();
     r.kind = ListRow::Item;
-    r.glyph = GlyphInfo;
+    r.glyph = GlyphGlobe;
     r.accent = Theme::green();
-    r.text = tr("Language");
-    /* In the language itself, and that is the point: somebody who has landed on
-     * a language they cannot read has to be able to find the way out of it by
-     * recognising the name of their own. */
+    r.text = tr("Region & Language");
+    /*
+     * The language in the language itself, and that is the point: somebody who
+     * has landed on a language they cannot read has to be able to find the way
+     * out of it by recognising the name of their own.  The zone is beside it
+     * because this one row is now the door to both, and because a device whose
+     * clock is wrong is a device whose owner is looking for the word "time" --
+     * which is not in "Language".
+     */
     r.detail = Strings::nativeName(Strings::instance().language());
-    r.id = OpenLanguage;
+    {
+        const QString zone = Settings::instance().timezone();
+        if (!zone.isEmpty())
+            r.detail += QStringLiteral("  --  ") + zone;
+    }
+    r.id = OpenRegion;
     rows << r;
 
     h.text = tr("About");
@@ -1073,119 +1083,4 @@ void DisplayPage::paintEvent(QPaintEvent *)
     p.setPen(Theme::ink2());
     p.drawText(QRectF(body.x() + 12, body.y() + 2, body.width() - 24, 18),
                Qt::AlignLeft | Qt::AlignVCenter, line);
-}
-
-/* ── the language page ───────────────────────────────────────────────────── */
-
-LanguagePage::LanguagePage(QWidget *parent)
-    : PageWidget(parent)
-{
-    m_list = new ListPane(this);
-    m_list->setRowHeight(32);
-    connect(m_list, &ListPane::activated, this, &LanguagePage::onActivated);
-}
-
-void LanguagePage::resizeEvent(QResizeEvent *event)
-{
-    const QRect card(Theme::Margin, Theme::Margin,
-                     width() - 2 * Theme::Margin, height() - 2 * Theme::Margin);
-    m_list->setGeometry(card.x() + 6, card.y() + 36 + 20, card.width() - 12,
-                        card.height() - 36 - 26);
-    QWidget::resizeEvent(event);
-}
-
-void LanguagePage::onEnter()
-{
-    rebuild();
-}
-
-void LanguagePage::rebuild()
-{
-    QVector<ListRow> rows;
-    const int now = Strings::instance().language();
-
-    for (int i = 0; i < Lang::Count; ++i) {
-        ListRow r;
-        r.kind = ListRow::Item;
-        r.glyph = GlyphInfo;
-        /*
-         * The native name is the row.  The English name is the detail, not the
-         * other way round: on a screen somebody has landed on by accident, the
-         * word they are scanning for is the one their own language calls itself.
-         */
-        r.text = Strings::nativeName(i);
-        r.detail = Strings::englishName(i);
-        r.id = i + 1;              /* +1 so English is not the falsy id 0 */
-        r.accent = (i == now) ? Theme::green() : Theme::blue();
-        if (i == now) {
-            r.badge = tr("current");
-            r.badgeColour = Theme::green();
-        }
-        rows << r;
-    }
-
-    m_list->setRows(rows);
-    m_list->setCurrent(now);
-    update();
-}
-
-void LanguagePage::onActivated(int index)
-{
-    const QVector<ListRow> &rows = m_list->rows();
-    if (index < 0 || index >= rows.size())
-        return;
-
-    const int id = rows[index].id - 1;
-    if (id < 0 || id >= Lang::Count)
-        return;
-    if (id == Strings::instance().language())
-        return;
-
-    /*
-     * setLanguage() emits languageChanged(), which the Dashboard answers by
-     * rebuilding the dock and the cards.  This page rebuilds itself afterwards
-     * so the "current" badge moves in the same frame as the rest of the shell --
-     * a settings screen that has to be left and re-entered before it agrees with
-     * itself reads as a setting that did not take.
-     */
-    Strings::instance().setLanguage(id);
-    rebuild();
-    emit titleChanged();
-    emit toastRequested(tr("Language changed"), 2000);
-}
-
-bool LanguagePage::handleNav(int action)
-{
-    switch (action) {
-    case Joypad::NavUp:
-        m_list->step(-1);
-        return true;
-    case Joypad::NavDown:
-        m_list->step(1);
-        return true;
-    case Joypad::NavOk:
-        return m_list->press();
-    default:
-        break;
-    }
-    return false;
-}
-
-void LanguagePage::paintEvent(QPaintEvent *)
-{
-    QPainter p(this);
-    p.setRenderHint(QPainter::Antialiasing, true);
-
-    const QRectF card(Theme::Margin, Theme::Margin,
-                      width() - 2.0 * Theme::Margin, height() - 2.0 * Theme::Margin);
-    const QRectF body = paintSheet(p, card, title(),
-                                   Settings::instance().writable()
-                                       ? QString()
-                                       : tr("not saved"));
-
-    p.setFont(Theme::font(12));
-    p.setPen(Theme::ink2());
-    p.drawText(QRectF(body.x() + 12, body.y() + 2, body.width() - 24, 18),
-               Qt::AlignLeft | Qt::AlignVCenter,
-               tr("A changes the language everywhere at once."));
 }

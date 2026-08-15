@@ -50,7 +50,7 @@ class DiagnosticsPage;
 class DisplayPage;
 class Joypad;
 class Keyboard;
-class LanguagePage;
+class RegionPage;
 class MediaPage;
 class MousePage;
 class PackagesPage;
@@ -306,7 +306,7 @@ private:
     DiagnosticsPage *m_diagnostics = nullptr;
     MousePage *m_mouse = nullptr;
     DisplayPage *m_display = nullptr;
-    LanguagePage *m_language = nullptr;
+    RegionPage *m_region = nullptr;
     InfoPage *m_info = nullptr;
 
     QVector<PageWidget *> m_all;

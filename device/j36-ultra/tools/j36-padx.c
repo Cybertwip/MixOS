@@ -3,17 +3,19 @@
  * option; see device/j36-ultra/LICENSE for the texts and for what they do not
  * cover. */
 /*
- * j36-padx -- the eleven buttons, as a mouse and a keyboard, inside an X server.
+ * j36-padx -- the pad, as a mouse and a keyboard, inside an X server.
  *
  * WHY THIS EXISTS AT ALL.  Everything graphical in Debian that is not a text
  * browser wants an X server or a Wayland compositor, and both of them want a
- * pointer.  This board has no touchscreen and no trackpad; it has a D-pad, four
- * face buttons, four shoulders and Start/Select/Menu, and the kernel presents
- * them as ONE evdev device that is mostly BTN_GAMEPAD codes:
+ * pointer.  This board has no touchscreen and no trackpad; it has two analog
+ * sticks, a D-pad, four face buttons, four shoulders and Start/Select/Menu, and
+ * the kernel presents all of them as ONE evdev device:
  *
  *     j36_mt6592_input.c:  input->name = "J36 Ultra built-in gamepad"
- *                          EV_KEY: KEY_UP/DOWN/LEFT/RIGHT, KEY_VOLUME*, KEY_F12,
- *                                  BTN_A..BTN_MODE, BTN_THUMBL/R
+ *         EV_KEY: KEY_UP/DOWN/LEFT/RIGHT, KEY_VOLUME*, KEY_F12,
+ *                 BTN_A..BTN_MODE, BTN_THUMBL/R
+ *         EV_ABS: ABS_X/ABS_Y (left stick), ABS_Z/ABS_RZ (right stick),
+ *                 -4096..4096, with the driver's deadzone already taken out
  *
  * Nothing downstream can use that.  udev's input_id tags anything carrying
  * BTN_SOUTH..BTN_THUMBR as ID_INPUT_JOYSTICK, libinput refuses joysticks by
@@ -47,21 +49,23 @@
  * twice: once here, and once to a dashboard that would walk its card grid behind
  * the browser and act on whatever it landed on.  EVIOCGRAB makes the kernel
  * deliver this device's events to this fd and nowhere else, so for as long as this
- * runs the pad belongs to X.  It is released by closing the fd, which happens on
- * every exit path including a signal, so a crash here gives the pad back rather
- * than wedging the device.
+ * runs the whole pad -- sticks included, since they are on the same device -- is
+ * X's.  It is released by closing the fd, which happens on every exit path
+ * including a signal, so a crash here gives the pad back rather than wedging it.
  *
  * WHAT IS DELIBERATELY NOT GRABBED.  A USB keyboard or mouse in the dock is a
  * real X input device that libinput will pick up and drive properly, and it must
- * keep working.  So the match is narrow -- see find_pads() -- and a device that
- * looks like a keyboard (it has the letter keys) or like a mouse (it has EV_REL)
- * is left alone even if something about it also looks like a pad.
+ * keep working.  So the match is narrow -- see looks_like_pad() -- and a device
+ * that looks like a keyboard (it has the letter keys) or like a mouse (it has
+ * EV_REL) is left alone even if something about it also looks like a pad.
  *
  * THE MAP.  Chosen so that the four things a browser needs -- point, click, go
  * back, scroll -- are the four things nearest the thumbs, and so that no binding
  * needs a chord:
  *
- *     D-pad          pointer motion, accelerating while held
+ *     Left stick     pointer, proportional to deflection
+ *     Right stick    scroll, proportional to deflection
+ *     D-pad          pointer, accelerating while held
  *     A              left click
  *     B              Back            (Alt+Left)
  *     X              Return
@@ -75,6 +79,12 @@
  *     Vol- / Vol+    zoom out / zoom in      (Ctrl+minus / Ctrl+plus)
  *     Home (F12)     the start page          (Alt+Home)
  *
+ * BOTH the left stick and the D-pad move the pointer, and that is not redundancy.
+ * A stick is the right instrument for crossing the screen and a poor one for
+ * landing on a twelve-pixel link, because it never comes back to exactly centre;
+ * a D-pad is the opposite, and a tap of it is a nudge of two or three pixels.
+ * They add, so one thumb can do both without a mode to switch between them.
+ *
  * Menu is a hold and not a press because it is the only irreversible binding on
  * the pad and it sits under the thumb: a press would close the browser by
  * accident often enough to matter, and there is no undo for "the page you were
@@ -82,15 +92,14 @@
  * nothing in this session makes a sound and 640x480 is small enough that a page
  * built for a phone needs one press of zoom-out to be readable.
  *
- * THE POINTER ACCELERATES rather than moving at a fixed rate, because a D-pad has
- * no speed of its own.  A rate fast enough to cross 640 pixels without wearing out
- * a thumb cannot land on a link, and a rate slow enough to land on a link takes
- * four seconds to cross the screen.  So the speed starts slow, ramps over about a
- * second while the direction is held, and resets the moment it is released -- a
- * tap nudges by a couple of pixels, a hold crosses the panel.  The remainder is
- * carried between ticks (see move_tick) so that the slow end still moves at all;
- * XTEST takes whole pixels, and a per-tick delta that rounds to zero is a pointer
- * that does not move.
+ * BOTH RESPONSE CURVES ARE SQUARED, and for the same reason: the slow end is where
+ * a link is actually aimed at, so it gets most of the range.  On a stick that is
+ * deflection squared -- a third of the way over is a ninth of the speed.  On the
+ * D-pad, which has no deflection to measure, it is time-held squared over about a
+ * second, reset on release, so a tap nudges and a hold crosses the panel.  The
+ * remainder is carried between ticks (see the motion block in main) so that the
+ * slow end still moves at all; XTEST takes whole pixels, and a per-tick delta that
+ * rounds to zero is a pointer that does not move.
  *
  * HOW IT ENDS.  Three ways, all of them tidy:
  *   - --watch PID and that process exits: the browser closed itself, so the
@@ -180,16 +189,21 @@ static void close_pads(void)
  * Is this /dev/input/eventN the built-in pad?
  *
  * Positive test: it carries BTN_A and BTN_START.  Those two together are what the
- * device tree's matrix map puts on this board and what nothing else on it has.
+ * device tree's key map puts on this board and what nothing else on it has.  A
+ * touchscreen or a tablet has ABS_X and BTN_TOUCH and neither of these, so it is
+ * excluded by the positive test without needing a rule of its own.
  *
  * Negative tests, and they matter more than the positive one, because what is
  * being decided is whether to take a device away from the rest of the system:
  *   - EV_REL means a mouse, and a mouse in the dock is X's to drive.
  *   - KEY_A and KEY_Z mean a real keyboard, and so is that.
- *   - EV_ABS is a joystick or a tablet; the built-in pad's analog sticks are a
- *     SEPARATE input device (the adc-joystick node), and grabbing that here would
- *     take the sticks away from a game without giving X anything, since nothing
- *     below reads an axis.
+ *
+ * EV_ABS is NOT one of them, and that is the whole point: j36_mt6592_input.c
+ * registers the analog sticks on the SAME input device as the buttons -- one
+ * input_allocate_device, input_set_capability(EV_KEY) for every mapped code and
+ * input_set_abs_params() for every axis the device tree declares -- so a rule that
+ * rejected axes would reject the one device this needs, on every board whose DTS
+ * has a joystick.
  */
 static int looks_like_pad(int fd, const char *name)
 {
@@ -205,10 +219,6 @@ static int looks_like_pad(int fd, const char *name)
         return 0;
     if (TEST_BIT(EV_REL, evs)) {
         note("%s has EV_REL, so it is a mouse -- left for X", name);
-        return 0;
-    }
-    if (TEST_BIT(EV_ABS, evs)) {
-        note("%s has EV_ABS, so it is the analog stick node -- left alone", name);
         return 0;
     }
 
@@ -362,7 +372,55 @@ static int on_io_error(Display *unused)
     _exit(0);
 }
 
-/* ── pointer motion ──────────────────────────────────────────────────────── */
+/* ── the sticks ──────────────────────────────────────────────────────────── */
+
+/*
+ * J36_AXIS_FULL_SCALE in j36_mt6592_input.c: the axes are registered -4096..4096
+ * with fuzz 16 and flat 0, and the driver has already subtracted its own deadzone
+ * from the raw ADC reading and rescaled what is left across the whole range.  So
+ * what arrives here is centred on zero and reaches the ends at the stops.
+ */
+#define AXIS_FULL   4096.0
+
+/*
+ * A SECOND DEADZONE ON TOP OF THE DRIVER'S, small, and it earns its place: the
+ * driver's is computed from a centre that was measured when the device tree was
+ * written, and a stick that has been used for a year does not return to the same
+ * place it did then.  Six per cent of travel is below what a thumb can aim and
+ * above what wear produces.  Without it the pointer drifts on its own, and on a
+ * device with no mouse to correct it that is the difference between a browser and
+ * a cursor that walks into a corner while you read.
+ */
+#define STICK_DEAD  0.06
+
+#define STICK_MAX   1100.0   /* pixels per second at full deflection */
+#define SCROLL_MAX  16.0     /* wheel notches per second at full deflection */
+
+static int axis_lx, axis_ly;   /* left stick  -- ABS_X, ABS_Y  */
+static int axis_rx, axis_ry;   /* right stick -- ABS_Z, ABS_RZ */
+
+/* Squared, sign-preserving, zero inside the deadzone.  See the response-curve
+ * paragraph in the file header for why squared. */
+static double stick(int raw, double full_scale_rate)
+{
+    double t = raw / AXIS_FULL;
+
+    if (t > 1.0)
+        t = 1.0;
+    else if (t < -1.0)
+        t = -1.0;
+    if (t > -STICK_DEAD && t < STICK_DEAD)
+        return 0.0;
+    return (t < 0.0 ? -1.0 : 1.0) * t * t * full_scale_rate;
+}
+
+static int sticks_active(void)
+{
+    return stick(axis_lx, 1.0) != 0.0 || stick(axis_ly, 1.0) != 0.0
+        || stick(axis_rx, 1.0) != 0.0 || stick(axis_ry, 1.0) != 0.0;
+}
+
+/* ── the D-pad ───────────────────────────────────────────────────────────── */
 
 #define DIR_UP    0x1
 #define DIR_DOWN  0x2
@@ -370,8 +428,7 @@ static int on_io_error(Display *unused)
 #define DIR_RIGHT 0x8
 
 /* Pixels per second at the start of a press and at the end of the ramp, and how
- * long the ramp takes.  Squared interpolation rather than linear: the slow half is
- * where a link is actually aimed at, so it gets most of the ramp's duration. */
+ * long the ramp takes. */
 #define SPEED_MIN   110.0
 #define SPEED_MAX   1000.0
 #define RAMP_MS     900.0
@@ -420,9 +477,10 @@ static void rep_fire(int which, long now)
 static int rep_any(void)
 {
     int i;
-    for (i = 0; i < REP_N; i++)
+    for (i = 0; i < REP_N; i++) {
         if (rep_due[i])
             return 1;
+    }
     return 0;
 }
 
@@ -431,6 +489,9 @@ static int rep_any(void)
 /* Long enough that it cannot be a fumble, short enough that nobody wonders
  * whether it is working. */
 #define MENU_HOLD_MS 1000
+
+/* One frame at the panel's rate.  Everything that moves is stepped on this. */
+#define TICK_MS 16
 
 static volatile sig_atomic_t stop_asked;
 
@@ -463,6 +524,7 @@ int main(int argc, char **argv)
     unsigned dirs = 0;
     long move_start = 0, move_last = 0;
     double frac_x = 0.0, frac_y = 0.0;
+    double scroll_x = 0.0, scroll_y = 0.0;
     long menu_down_at = 0;
 
     for (i = 1; i < argc; i++) {
@@ -541,6 +603,8 @@ int main(int argc, char **argv)
         struct pollfd fds[MAX_PADS];
         int timeout, n;
         long now;
+        double dt, dx, dy;
+        int ix, iy;
 
         for (i = 0; i < pads; i++) {
             fds[i].fd = pad_fd[i];
@@ -548,11 +612,14 @@ int main(int argc, char **argv)
             fds[i].revents = 0;
         }
 
-        /* 16 ms while something is moving or repeating, so motion is at the
+        /* One frame while something is moving or repeating, so motion runs at the
          * panel's own rate; a quarter of a second otherwise, which is short enough
-         * that a browser that exits is noticed at once and long enough that an
-         * idle session is not a process spinning. */
-        timeout = (dirs || rep_any() || menu_down_at) ? 16 : 250;
+         * that a browser that exits is noticed at once and long enough that an idle
+         * session is not a process spinning.  A deflected stick counts as moving
+         * even when no event has arrived, because an axis held still sends nothing
+         * -- evdev reports changes, and a stick at rest against its stop has
+         * stopped changing. */
+        timeout = (dirs || menu_down_at || rep_any() || sticks_active()) ? TICK_MS : 250;
         n = poll(fds, (nfds_t)pads, timeout);
         if (n < 0 && errno != EINTR)
             break;
@@ -561,14 +628,25 @@ int main(int argc, char **argv)
 
         for (i = 0; i < pads && n > 0; i++) {
             struct input_event ev;
-            ssize_t got;
 
             if (!(fds[i].revents & POLLIN))
                 continue;
 
-            while ((got = read(pad_fd[i], &ev, sizeof(ev))) == (ssize_t)sizeof(ev)) {
+            while (read(pad_fd[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
                 int down;
 
+                if (ev.type == EV_ABS) {
+                    /* Only the value is kept; what to do with it happens once per
+                     * tick below, so a chatty ADC cannot make the pointer faster. */
+                    switch (ev.code) {
+                    case ABS_X:  axis_lx = ev.value; break;
+                    case ABS_Y:  axis_ly = ev.value; break;
+                    case ABS_Z:  axis_rx = ev.value; break;
+                    case ABS_RZ: axis_ry = ev.value; break;
+                    default: break;
+                    }
+                    continue;
+                }
                 if (ev.type != EV_KEY)
                     continue;
                 /* value 2 is the kernel's own auto-repeat.  Every repeating
@@ -595,11 +673,8 @@ int main(int argc, char **argv)
                     /* The ramp belongs to the press and not to the direction: a
                      * thumb rolling from up to up-right is one movement and should
                      * not drop back to walking pace halfway across the screen. */
-                    if (!was && dirs) {
+                    if (!was && dirs)
                         move_start = now;
-                        move_last = now;
-                        frac_x = frac_y = 0.0;
-                    }
                     break;
                 }
 
@@ -607,19 +682,41 @@ int main(int argc, char **argv)
                 case BTN_THUMBL: click(2, down); break;
                 case BTN_THUMBR: click(3, down); break;
 
-                case BTN_B: if (down) tap(kc.alt, kc.left);      break;
-                case BTN_X: if (down) tap(0, kc.ret);            break;
-                case BTN_Y: if (down) tap(0, kc.esc);            break;
+                case BTN_B: if (down) tap(kc.alt, kc.left); break;
+                case BTN_X: if (down) tap(0, kc.ret);       break;
+                case BTN_Y: if (down) tap(0, kc.esc);       break;
 
                 /* The shoulders fire once on the press and then on the repeat
                  * clock, so a tap is one notch and a hold is a scroll. */
-                case BTN_TL:  if (down) wheel(4);              rep_set(REP_L1, down, now); break;
-                case BTN_TR:  if (down) wheel(5);              rep_set(REP_R1, down, now); break;
-                case BTN_TL2: if (down) tap(0, kc.page_up);    rep_set(REP_L2, down, now); break;
-                case BTN_TR2: if (down) tap(0, kc.page_down);  rep_set(REP_R2, down, now); break;
+                case BTN_TL:
+                    if (down)
+                        wheel(4);
+                    rep_set(REP_L1, down, now);
+                    break;
+                case BTN_TR:
+                    if (down)
+                        wheel(5);
+                    rep_set(REP_R1, down, now);
+                    break;
+                case BTN_TL2:
+                    if (down)
+                        tap(0, kc.page_up);
+                    rep_set(REP_L2, down, now);
+                    break;
+                case BTN_TR2:
+                    if (down)
+                        tap(0, kc.page_down);
+                    rep_set(REP_R2, down, now);
+                    break;
 
-                case BTN_START:  if (down) tap(kc.ctrl, kc.l); break;
-                case KEY_F12:    if (down) tap(kc.alt, kc.home); break;
+                case BTN_START:
+                    if (down)
+                        tap(kc.ctrl, kc.l);
+                    break;
+                case KEY_F12:
+                    if (down)
+                        tap(kc.alt, kc.home);
+                    break;
 
                 case KEY_VOLUMEDOWN: if (down) tap(kc.ctrl, kc.minus); break;
                 case KEY_VOLUMEUP:   if (down) tap(kc.ctrl, kc.plus);  break;
@@ -647,42 +744,63 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Motion, once per tick and not once per event: a diagonal is two evdev
-         * events for one movement, and moving on each of them would make diagonals
-         * twice as fast as the straight directions. */
+        /*
+         * Motion, once per tick and not once per event.  Per event would make a
+         * D-pad diagonal twice as fast as a straight direction -- it is two evdev
+         * events for one movement -- and would tie the stick's speed to how often
+         * the ADC feels like reporting rather than to how far it is pushed.
+         */
+        dt = (double)(now - move_last) / 1000.0;
+        move_last = now;
+        if (dt > (double)TICK_MS * 4.0 / 1000.0)
+            dt = (double)TICK_MS * 4.0 / 1000.0;   /* woken from idle; do not lurch */
+
+        dx = stick(axis_lx, STICK_MAX) * dt;
+        dy = stick(axis_ly, STICK_MAX) * dt;
+
         if (dirs) {
-            double dt = (double)(now - move_last) / 1000.0;
             double v = speed_at(now - move_start);
-            double dx = 0.0, dy = 0.0;
-            int ix, iy;
-
-            move_last = now;
-            if (dirs & DIR_LEFT)  dx -= v * dt;
-            if (dirs & DIR_RIGHT) dx += v * dt;
-            if (dirs & DIR_UP)    dy -= v * dt;
-            if (dirs & DIR_DOWN)  dy += v * dt;
-
+            double px = 0.0, py = 0.0;
+            if (dirs & DIR_LEFT)  px -= v * dt;
+            if (dirs & DIR_RIGHT) px += v * dt;
+            if (dirs & DIR_UP)    py -= v * dt;
+            if (dirs & DIR_DOWN)  py += v * dt;
             /* A diagonal would otherwise travel sqrt(2) times as far as a straight
              * line for the same hold, which reads as the pad being faster on the
              * slant. */
-            if (dx != 0.0 && dy != 0.0) {
-                dx *= 0.7071;
-                dy *= 0.7071;
+            if (px != 0.0 && py != 0.0) {
+                px *= 0.7071;
+                py *= 0.7071;
             }
-
-            frac_x += dx;
-            frac_y += dy;
-            ix = (int)frac_x;
-            iy = (int)frac_y;
-            frac_x -= ix;
-            frac_y -= iy;
-            if (ix || iy) {
-                XTestFakeRelativeMotionEvent(dpy, ix, iy, 0);
-                XFlush(dpy);
-            }
+            dx += px;
+            dy += py;
         } else {
-            move_last = now;
+            move_start = now;
         }
+
+        /* The remainder is kept, so a speed below one pixel per tick is a slow
+         * pointer and not a still one. */
+        frac_x += dx;
+        frac_y += dy;
+        ix = (int)frac_x;
+        iy = (int)frac_y;
+        frac_x -= ix;
+        frac_y -= iy;
+        if (ix || iy) {
+            XTestFakeRelativeMotionEvent(dpy, ix, iy, 0);
+            XFlush(dpy);
+        }
+
+        /* The right stick, as a wheel.  Same carry: a notch is a discrete thing, so
+         * what accumulates is fractions of one.  Buttons 6 and 7 are the horizontal
+         * wheel; a client that does not understand them ignores them, which is the
+         * right outcome for a page that does not scroll sideways. */
+        scroll_y += stick(axis_ry, SCROLL_MAX) * dt;
+        while (scroll_y >= 1.0)  { wheel(5); scroll_y -= 1.0; }
+        while (scroll_y <= -1.0) { wheel(4); scroll_y += 1.0; }
+        scroll_x += stick(axis_rx, SCROLL_MAX) * dt;
+        while (scroll_x >= 1.0)  { wheel(7); scroll_x -= 1.0; }
+        while (scroll_x <= -1.0) { wheel(6); scroll_x += 1.0; }
 
         for (i = 0; i < REP_N; i++)
             rep_fire(i, now);

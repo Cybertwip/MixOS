@@ -778,8 +778,12 @@ done < <(grep -E '^CONFIG_USB[A-Z0-9_]*=(y|m)$' "$CONFIG")
 # The HID menu gets the same treatment and for a plainer reason: multi_v7_defconfig
 # turns on around eighty vendor HID drivers, every one of them a module this build
 # would compile and this card would never stage.  hid-generic is what binds a mouse
-# and a keyboard -- it claims any HID device no specific driver wanted -- so the
-# allowlist is the core, the gate and the generic driver, and nothing else.
+# and a keyboard -- it claims any HID device no specific driver wanted -- so this
+# sweep takes everything down and the four drivers this board actually wants are
+# named again below.  Down and back up rather than an allowlist here, because the
+# value matters as much as the symbol: several of the vendor drivers arrive from
+# multi_v7_defconfig as =y, and an allowlist would have kept them at =y and put
+# them in vmlinux, where the 9 MiB BOOTIMG budget is.
 while IFS='=' read -r option _value; do
     symbol="${option#CONFIG_}"
     case "$symbol" in
@@ -802,6 +806,57 @@ config_m USB_ROLE_SWITCH
 config_m HID
 config_m USB_HID
 config_m HID_GENERIC
+
+# ── USB gamepads ─────────────────────────────────────────────────────────────
+#
+# This is a games console with one USB port, so the pad somebody plugs into it is
+# not an accessory, it is the second controller.  hid-generic alone does not get
+# there, and the reason is different for each of the three families:
+#
+#   Xbox        NOT HID AT ALL.  The 360 pad's interface is vendor class 0xFF
+#               with a proprietary report format, and the One/Series pads speak
+#               GIP over the same kind of interface.  hid-generic never sees
+#               them because usbhid never claims them; xpad is a usb_driver of
+#               its own that matches the vendor interface directly.  Without it
+#               the pad enumerates, lights up, and produces no input device.
+#   PlayStation HID, but not usefully.  A DualShock 3 stays silent until
+#               something sends it the 0xF2 feature report, which hid-sony does
+#               in probe and hid-generic does not, so a DS3 on hid-generic is a
+#               device node that never reports an event.  A DualShock 4 or a
+#               DualSense does report under hid-generic, with the axes in the
+#               wrong places and the touchpad and battery missing; hid-playstation
+#               is what lays them out the way Documentation/input/gamepad.rst
+#               says, which is the layout everything downstream expects.
+#   Nintendo    a Switch Pro pad needs a handshake and a baud-rate change before
+#               it leaves its initial mode, and hid-nintendo is what performs it.
+#               It is here as much for the third-party pads as for Nintendo's own:
+#               8BitDo and the rest present as Switch Pro, as Xbox 360, or as
+#               plain HID depending on which mode the little switch is in, so
+#               these three drivers plus hid-generic is what makes all four modes
+#               of one popular pad work instead of three of them.
+#
+# All =m and all in the j36/usb/ payload, for the same reason as the rest of it:
+# they hang off usbcore, and usbcore may not exist before /init has ungated PERI.
+# They are loaded when the pad is not plugged in, which is the normal arrangement
+# -- each one registers a driver and binds nothing until a device turns up.
+#
+# Force feedback is on for all four.  It costs ff-memless, which is around six
+# kilobytes of module shared by every one of them, and it is the difference
+# between a pad that rumbles in a game and a pad that has a motor in it.
+#
+# INPUT_JOYSTICK is a menuconfig gate and not a driver: it makes the
+# drivers/input/joystick menu visible so that JOYSTICK_XPAD can be asked for.
+# Everything else behind it is `default n' and stays off; the assertion further
+# down is what keeps a future defconfig bump from quietly filling that menu.
+config_y INPUT_JOYSTICK
+config_m JOYSTICK_XPAD
+config_y JOYSTICK_XPAD_FF
+config_m HID_SONY
+config_y SONY_FF
+config_m HID_PLAYSTATION
+config_y PLAYSTATION_FF
+config_m HID_NINTENDO
+config_y NINTENDO_FF
 # The mass-storage class driver.  Its two dependencies are settled elsewhere --
 # USB is =m two lines up, SCSI is =m in the storage section -- and =m is the only
 # value it could take anyway with both of them modular.  See that section for why
@@ -946,7 +1001,8 @@ for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 PROC_FS PROC_SYSCTL SYSFS \
                 EXT2_FS_XATTR EXT2_FS_POSIX_ACL BTRFS_FS_POSIX_ACL \
                 DRM DEVMEM SOUND POWER_SUPPLY BACKLIGHT_CLASS_DEVICE WIRELESS \
-                USB_SUPPORT USB_PHY GENERIC_PHY HID_SUPPORT \
+                USB_SUPPORT USB_PHY GENERIC_PHY HID_SUPPORT INPUT_JOYSTICK \
+                INPUT_EVDEV INPUT_JOYDEV \
                 FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER \
                 USB_MUSB_HOST MUSB_PIO_ONLY USB_ANNOUNCE_NEW_DEVICES; do
     grep -q "^CONFIG_${required}=y$" "$CONFIG" || \
@@ -1084,6 +1140,39 @@ for wanted_module in USB USB_COMMON USB_MUSB_HDRC USB_MUSB_MEDIATEK \
     grep -q "^CONFIG_${wanted_module}=m$" "$CONFIG" || \
         die "CONFIG_${wanted_module}=m was not selected; the USB stack must be modular because an APB access to the clock-gated MUSB window hangs the bus, so nothing may probe before /init has ungated PERI"
 done
+
+# The pad drivers, asserted as their own list because they fail one at a time and
+# silently: a missing xpad is not a build error, it is an Xbox pad that enumerates
+# on the port and never appears in /dev/input, three months after anyone read this
+# file.  ff-memless is in the list because the three FF bools above only `select'
+# it -- if a Kconfig bump ever renames one of them, rumble would disappear with
+# nothing else changing.
+#
+# =m for the same reason as everything else in the USB payload, and the check is
+# for =m specifically: at =y they would be in vmlinux, inside the 9 MiB BOOTIMG
+# budget, and binding on a bus that /init has not ungated yet.
+for wanted_module in JOYSTICK_XPAD HID_SONY HID_PLAYSTATION HID_NINTENDO \
+                     INPUT_FF_MEMLESS; do
+    grep -q "^CONFIG_${wanted_module}=m$" "$CONFIG" || \
+        die "CONFIG_${wanted_module}=m was not selected; USB gamepads need xpad for Xbox, hid-sony and hid-playstation for PlayStation and hid-nintendo for Switch-mode pads, all modular and staged into j36/usb/"
+done
+
+# Nothing else in drivers/input/joystick, and this is the guard that makes turning
+# INPUT_JOYSTICK on safe.  That symbol is a menuconfig gate: switching it on makes
+# some forty drivers visible, for analogue gameport sticks, serial devices, and a
+# dozen arcade and racing-wheel interfaces that have no port on this board to
+# arrive through.  All of them are `default n' today, so the gate costs nothing
+# today -- and a defconfig bump that changed one of those defaults would otherwise
+# add a module to the payload with nobody noticing.
+while IFS='=' read -r option _value; do
+    symbol="${option#CONFIG_}"
+    case "$symbol" in
+        JOYSTICK_XPAD|JOYSTICK_XPAD_FF|JOYSTICK_XPAD_LEDS) ;;
+        *)
+            die "CONFIG_${symbol} came back after olddefconfig; INPUT_JOYSTICK is on for xpad alone and this board has no gameport, no serial port and no wheel"
+            ;;
+    esac
+done < <(grep -E '^CONFIG_JOYSTICK_[A-Z0-9_]*=(y|m)$' "$CONFIG")
 
 # The mass-storage half, asserted as its own list because it fails as a set and in
 # a way that is hard to read on the board: SCSI without BLK_DEV_SD enumerates a
@@ -6442,6 +6531,20 @@ fi
 #                       claims any HID device no specific driver wanted, so a
 #                       walk seeded at usbhid alone would build a payload that
 #                       enumerates a mouse and binds nothing to it.
+#   xpad                the Xbox pads, and a root for the strongest version of
+#                       the same reason: it is not a HID driver at all.  The 360
+#                       and One interfaces are vendor class 0xFF, usbhid never
+#                       claims them, and nothing in the HID chain names xpad --
+#                       it is a usb_driver hanging directly off usbcore.
+#   hid-sony,           the PlayStation and Switch families.  Roots for exactly
+#   hid-playstation,    the reason hid-generic is one: the HID bus binds by
+#   hid-nintendo        matching a table at probe time, so no module references
+#                       any of them and a dependency walk cannot find them.  They
+#                       are what turns a DualShock 3 from a silent device node
+#                       into a gamepad, and a Switch-mode pad from a device
+#                       waiting for a handshake into one that has had it.
+#                       ff-memless is NOT a root: it is a real depends edge from
+#                       all four, because all four are built with rumble on.
 #   udl                 the USB->HDMI adapter.  Also a root for a reason of its
 #                       own -- it hangs off usbcore and DRM, neither of which
 #                       knows it exists.
@@ -6466,7 +6569,8 @@ USB_MODULE_ORDER=()
 if [[ "${J36_USB:-1}" == 1 ]]; then
     set +e
     collect_modules usb USB_MODULE_ORDER USB_MODULE_PATHS \
-        j36_mt6592_usb_phy musb_hdrc mediatek usbhid hid-generic udl \
+        j36_mt6592_usb_phy musb_hdrc mediatek usbhid hid-generic \
+        xpad hid-sony hid-playstation hid-nintendo udl \
         usb-storage sd_mod ntfs3
     usb_rc=$?
     set -e
@@ -10133,13 +10237,20 @@ XORGCONF
     # out which browser is on the card, work out where the URL comes from, make the
     # writable directories on tmpfs, and hand the whole lot to xinit.
     #
-    # THE BROWSER IS CHOSEN AND NOT HARDCODED, because the request was "any armhf
-    # browser" and because the Packages card exists: somebody who installs chromium
-    # or firefox-esr from it should get that browser here without editing anything.
-    # The order is by what this board can actually carry -- NetSurf is 4 MB and its
-    # own engine, and the WebKit and Blink ones are at the end because 1 GB of RAM
-    # and eight A7s make them a swap test rather than a browser.  netsurf-gtk is
-    # what the image installs, so the first name normally wins.
+    # THE BROWSER IS CHOSEN AND NOT HARDCODED, because the Packages card exists:
+    # somebody who installs chromium or dillo from it should get that browser here
+    # without editing anything.  What the image itself installs is firefox-esr, and
+    # it is first in the list, because the web in 2026 is JavaScript and a browser
+    # that does not run it is a browser that shows a blank page on half the sites
+    # anybody would open.  Debian trixie has a real armhf build --
+    # 140.12.0esr, 253 MB installed -- so this is a genuine Gecko with a JIT and
+    # not a compatibility shim.
+    #
+    # netsurf-gtk is second and is also installed: 4 MB, its own engine, no
+    # JavaScript.  It is there because 946 MB of usable RAM with no swap is not
+    # much to run Firefox in, and the day it will not start is the day something
+    # still has to open a page.  Everything after those two is only reachable by
+    # installing it.
     #
     # POSIX sh and not bash: this is a script the user may end up running by hand
     # from the initramfs shell, and it has nothing in it that needs more.
@@ -10177,14 +10288,29 @@ if [ -z "$XORG" ] || [ ! -x /usr/bin/xinit ]; then
     exit 1
 fi
 
+# J36_BROWSER already in the environment wins over the search below, so a second
+# installed browser can be reached without uninstalling the first:
+#
+#     J36_BROWSER=/usr/bin/netsurf-gtk j36-browser
+#
+# which is the escape hatch for the day Firefox will not start on a board with
+# 946 MB and no swap.  Checked rather than trusted, because a typo here would
+# otherwise be an X server that comes up on an empty root window.
+J36_BROWSER="${J36_BROWSER:-}"
+if [ -n "$J36_BROWSER" ] && [ ! -x "$J36_BROWSER" ]; then
+    echo "j36-browser: J36_BROWSER=$J36_BROWSER is not an executable" >&2
+    exit 1
+fi
+
 # Any of these, first one wins.  See the comment above this heredoc for the order.
-J36_BROWSER=""
-for b in netsurf-gtk netsurf surf dillo badwolf luakit midori epiphany-browser \
-         falkon qutebrowser firefox-esr firefox chromium chromium-browser; do
-    if [ -x "/usr/bin/$b" ]; then J36_BROWSER="/usr/bin/$b"; break; fi
-done
 if [ -z "$J36_BROWSER" ]; then
-    echo "j36-browser: no browser installed -- the Packages card can add netsurf-gtk" >&2
+    for b in firefox-esr firefox netsurf-gtk netsurf epiphany-browser luakit surf \
+             dillo falkon qutebrowser chromium chromium-browser; do
+        if [ -x "/usr/bin/$b" ]; then J36_BROWSER="/usr/bin/$b"; break; fi
+    done
+fi
+if [ -z "$J36_BROWSER" ]; then
+    echo "j36-browser: no browser installed -- the Packages card can add firefox-esr" >&2
     exit 1
 fi
 export J36_BROWSER
@@ -10219,8 +10345,9 @@ BROWSERLAUNCH
     #
     # THE ORDER MATTERS.  The window manager starts first because matchbox maps
     # windows fullscreen and a browser that appears before the WM does gets whatever
-    # geometry it asked for -- NetSurf asks for 1000x700 on a 640x480 panel.  The
-    # keyboard starts before the browser so its pid is known when the bridge starts.
+    # geometry it asked for -- which for Firefox is the size of the window it had
+    # last, and for NetSurf is 1000x700, on a 640x480 panel.  The keyboard starts
+    # before the browser so its pid is known when the bridge starts.
     #
     # j36-padx IS THE FOREGROUND PROCESS, and that is the whole control flow: it
     # watches the browser's pid, so the session ends when the browser is closed from
@@ -10235,7 +10362,7 @@ BROWSERLAUNCH
 set -u
 
 URL="${1:-about:blank}"
-BROWSER="${J36_BROWSER:-/usr/bin/netsurf-gtk}"
+BROWSER="${J36_BROWSER:-/usr/bin/firefox-esr}"
 
 # HOME IS THE DATA PARTITION AND NOT ROOT'S.  Downloads, cookies, the browser's
 # profile and its cache all land under it, and /home/virtua is the one filesystem on
@@ -10251,9 +10378,10 @@ export XDG_DATA_HOME="$HOME/.local/share"
 export XDG_RUNTIME_DIR=/run/j36/xdg
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" 2>/dev/null
 
-# NO_AT_BRIDGE stops GTK spending its startup waiting for an accessibility bus that
-# is not running -- there is no session D-Bus here at all.  GDK_BACKEND is pinned
-# because GTK4 prefers Wayland and would find none.
+# NO_AT_BRIDGE stops GTK spending its startup waiting for an accessibility bus.  The
+# session bus further down is started for the browser's own sake; nothing on this
+# image runs an at-spi registry on it, so the wait would still time out.
+# GDK_BACKEND is pinned because GTK4 prefers Wayland and would find none.
 export NO_AT_BRIDGE=1
 export GDK_BACKEND=x11
 export GTK_OVERLAY_SCROLLING=0
@@ -10282,28 +10410,129 @@ if [ -x /usr/bin/matchbox-keyboard ]; then
     KBD=$!
 fi
 
+# ── Firefox on 946 MB of RAM with no swap ────────────────────────────────────
+#
+# Firefox is the browser this image installs, because JavaScript is not optional on
+# the 2026 web.  It is also 253 MB of package and a 130 MB libxul.so mmapped off an
+# SD card, on a board with 946 MB of usable memory and no swap device at all, and
+# NONE OF THAT IS A REASON TO SHIP IT UNTUNED.  Out of the box it would start four
+# or five content processes -- Fission gives every origin on a page its own -- and
+# the third one is where this board runs out.  So a user.js is written into an
+# explicit profile before every launch:
+#
+#   Fission off and processCount 1.  This is the pref that decides whether Firefox
+#   runs here at all: one content process instead of one per site, which trades the
+#   isolation for about 400 MB.  Content is still out of the parent, so a renderer
+#   that dies is a tab that dies.
+#
+#   Software WebRender and no hardware video.  There is no GPU driver for anything
+#   to accelerate with, and asking is a few seconds of probing and a fallback.
+#
+#   Small caches and a lazy session store.  The disk cache lives on the SD card and
+#   is worth having but not worth 300 MB of it; the session store's default is to
+#   write the whole session every fifteen seconds, which on this card is a stall.
+#
+#   Crash recovery OFF.  With no swap, the way Firefox dies here is the OOM killer,
+#   and a browser that restores the page that just got it killed is a loop somebody
+#   has to power-cycle out of.
+#
+#   The telemetry, Pocket and first-run pages off, because none of them can be
+#   dismissed comfortably on a D-pad and the first-run page is what would be on the
+#   glass instead of the start page.
+#
+# WRITTEN EVERY LAUNCH AND NOT ONCE.  user.js is re-read at each start and its
+# values win over anything the last session saved, so an image update that changes
+# a pref actually changes it -- and a profile somebody has broken by poking at
+# about:config comes back to a working state by being restarted.
+#
+# THE PROFILE IS NAMED, with -profile, rather than left to profiles.ini's random
+# `xxxxxxxx.default-esr'.  That is what makes it possible to write a file into it
+# from a shell script, and it puts it on the DATA partition where the rest of this
+# session's state already goes.
+firefox_profile() {
+    prof="$HOME/.mozilla/j36"
+    mkdir -p "$prof" 2>/dev/null || return 1
+
+    # A profile Firefox did not shut down cleanly keeps its lock, and the next start
+    # is a modal "Firefox is already running" that a D-pad cannot dismiss.  Nothing
+    # else can be holding it: mixdash starts one child at a time and this script is
+    # that child.
+    rm -f "$prof/.parentlock" "$prof/lock" 2>/dev/null
+
+    # The start page, quoted for a JS string literal.  It is a file:// URL off this
+    # card in the normal case, but it is whatever was passed in, so backslashes and
+    # quotes are escaped rather than assumed absent.
+    home_url=$(printf '%s' "$URL" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+
+    cat > "$prof/user.js" <<FFPREFS
+// Written by /opt/mixos/bin/j36-browser-session on every start.  Edits here are
+// overwritten; the reasoning is in device/j36-ultra/build-in-vm.sh.
+user_pref("fission.autostart", false);
+user_pref("dom.ipc.processCount", 1);
+user_pref("dom.ipc.processCount.webIsolated", 1);
+user_pref("gfx.webrender.software", true);
+user_pref("layers.acceleration.disabled", true);
+user_pref("media.hardware-video-decoding.enabled", false);
+user_pref("general.smoothScroll", false);
+user_pref("ui.prefersReducedMotion", 1);
+user_pref("browser.cache.disk.capacity", 32768);
+user_pref("browser.cache.memory.capacity", 16384);
+user_pref("browser.sessionstore.interval", 300000);
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("browser.startup.page", 1);
+user_pref("browser.startup.homepage", "$home_url");
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.uitour.enabled", false);
+user_pref("browser.download.folderList", 2);
+user_pref("browser.download.dir", "$HOME");
+user_pref("browser.download.useDownloadDir", true);
+user_pref("extensions.pocket.enabled", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("datareporting.healthreport.uploadEnabled", false);
+user_pref("toolkit.telemetry.enabled", false);
+user_pref("toolkit.telemetry.archive.enabled", false);
+user_pref("app.update.auto", false);
+user_pref("app.shield.optoutstudies.enabled", false);
+FFPREFS
+    return 0
+}
+
 # Per-engine flags, and only where the default is unusable:
+#
+#   firefox gets the profile above, and --no-remote so a second launch opens its own
+#   instance instead of quietly handing the URL to a dead one.
 #
 #   chromium refuses to start as root without --no-sandbox, and its GPU process has
 #   nothing to talk to here, so it is told not to look.  --disable-dev-shm-usage
 #   because /dev/shm on this image is small and a renderer that fills it crashes.
-#
-#   firefox gets --no-remote so a second launch opens its own instance instead of
-#   quietly handing the URL to a dead one.
+#   Its own single-process pref is --renderer-process-limit, for the same reason
+#   Fission is off above.
 #
 #   Everything else takes a URL and nothing more, which is the whole reason the list
 #   in j36-browser can be as long as it is.
+#
+# dbus-run-session WHEN IT IS THERE.  There is no session bus on this image -- no
+# desktop session ever starts -- and GTK, GIO and Firefox all look for one.  Without
+# it they each time out and carry on, which costs seconds of startup and a column of
+# warnings; with it they find a bus that lives exactly as long as this session does.
+DBUS=""
+[ -x /usr/bin/dbus-run-session ] && DBUS=/usr/bin/dbus-run-session
+
 case "${BROWSER##*/}" in
-    chromium|chromium-browser)
-        "$BROWSER" --no-sandbox --disable-gpu --disable-dev-shm-usage \
-                   --password-store=basic --window-size=640,480 \
-                   --window-position=0,0 "$URL" &
-        ;;
     firefox|firefox-esr)
-        "$BROWSER" --no-remote "$URL" &
+        firefox_profile
+        ${DBUS:+$DBUS --} "$BROWSER" --no-remote \
+            -profile "$HOME/.mozilla/j36" "$URL" &
+        ;;
+    chromium|chromium-browser)
+        ${DBUS:+$DBUS --} "$BROWSER" --no-sandbox --disable-gpu \
+            --disable-dev-shm-usage --renderer-process-limit=1 \
+            --password-store=basic --window-size=640,480 \
+            --window-position=0,0 "$URL" &
         ;;
     *)
-        "$BROWSER" "$URL" &
+        ${DBUS:+$DBUS --} "$BROWSER" "$URL" &
         ;;
 esac
 PAGE=$!
@@ -10419,14 +10648,21 @@ no-script version, which is the one that works here</li>
 
 <h2>What it can and cannot do</h2>
 
-<p>The browser this image ships is <b>NetSurf</b>: its own engine, real CSS,
-images, and TLS. It does not run JavaScript, so a site that renders nothing
-without it will render nothing here. The Packages card can install another one
-&mdash; <b>dillo</b>, <b>epiphany-browser</b>, <b>falkon</b>, <b>firefox-esr</b>
-or <b>chromium</b> are all built for this machine &mdash; and this card picks up
-whichever is installed. Be honest about the hardware first: this is eight
-1&nbsp;GHz cores and 1&nbsp;GB of RAM with no GPU driver, so the big two will
-start, and then they will swap.</p>
+<p>The browser this image ships is <b>Firefox ESR</b> &mdash; a real Gecko with a
+real JavaScript engine, so modern sites work. It is also a big program on a small
+machine: eight 1&nbsp;GHz cores, 1&nbsp;GB of RAM and no swap. It is set up here
+for that, with one content process instead of one per site, software rendering
+and small caches. Expect it to take a while to start and expect a page with
+thirty adverts on it to be the one that runs out of memory.</p>
+
+<p><b>NetSurf</b> is installed alongside it: 4&nbsp;MB, its own engine, CSS and
+images but no JavaScript. It is the one to fall back on when Firefox will not
+start. From the Terminal card:</p>
+
+<p><code>J36_BROWSER=/usr/bin/netsurf-gtk /opt/mixos/bin/j36-browser</code></p>
+
+<p>Any other browser from the Packages card works the same way, and with none
+named this card simply runs the first one it finds.</p>
 
 <h2>If nothing loads</h2>
 
