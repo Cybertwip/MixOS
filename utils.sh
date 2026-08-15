@@ -80,11 +80,12 @@ function setup_virtua_user() {
   else
     CHROOT_DIR="MixOSBuild"
   fi
-  # The login user is `virtua' and its home directory is the DATA partition's mount
-  # point.  The two names match on purpose: p3 is where the user's files are meant to
-  # live, so a login has to land on it or every file the operator creates goes onto the
-  # rootfs instead.  bash starts in $HOME, so this one field is what makes a shell open
-  # on the writable partition.
+  # The login user is `virtua' and its home directory is /home/virtua, which is where
+  # the user's files are meant to live -- a login has to land there or every file the
+  # operator creates ends up scattered through the system tree.  bash starts in $HOME,
+  # so this one field is what makes a shell open in the right place.  It used to be a
+  # separate partition mounted at that path; it is a directory on the root filesystem
+  # now, and the card's spare space goes to the root filesystem instead.
   #
   # It used to be `ark', with /home/ark a symlink to the mount point, because the
   # emulator build scripts wrote 800-odd lines into /home/ark and the runtime scripts

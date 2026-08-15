@@ -60,13 +60,17 @@ libudev1
 libvorbisidec1
 libvpx9
 libxkbcommon0
+libxtst6
 libzip5
 links2
+matchbox-keyboard
+matchbox-window-manager
 mbrola
 mbrola-us1
 mbrola-us2
 mbrola-us3
 netcat-openbsd
+netsurf-gtk
 ntfs-3g
 p7zip-full
 premake4
@@ -91,5 +95,9 @@ vlc-data
 vlc-plugin-base
 wget
 xfsprogs
+xinit
+xserver-xorg-core
+xserver-xorg-input-libinput
+xserver-xorg-video-fbdev
 xxd
 zip

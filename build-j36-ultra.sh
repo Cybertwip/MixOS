@@ -532,6 +532,6 @@ elif [[ "$FLASH_PAYLOAD" == "in-image" ]]; then
     darkos_log "  Iterating on the board specifics after this?  ./build-j36-ultra.sh --mix-only, then copy boot/ onto BOOT"
     darkos_report_stale_images "$BASE_ARTIFACT_DIR" "$FLASH_IMAGE"
 fi
-darkos_log "The card's three partitions: p1 BOOT vfat (launcher only), p2 ROOTFS ext2 (Debian + /opt/mixos), p3 DATA ext2 (your home, mounted at /home/virtua)"
+darkos_log "The card's two partitions: p1 BOOT vfat (launcher only), p2 ROOTFS ext2 (Debian, /opt/mixos, and your home at /home/virtua). p2 is last on the disk and /init grows it to the card's size on the first boot"
 darkos_log "Check the build log for the 'image:' lines -- they say whether the fold into the image succeeded, and on which partitions"
 darkos_warn "The R36 base image kernel is arm64 and this SoC is ARMv7; only the armhf rootfs is shared. sd-boot/mvii/boot.conf is what points the MVII LK at the 32-bit kernel."

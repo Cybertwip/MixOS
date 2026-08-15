@@ -1353,6 +1353,9 @@ bb_disable() {
 # is what makes it callable.  chmod was the one that was missing, and it failed
 # the only way a missing applet can: "/init: line NNN: chmod: not found", twice,
 # which is why the probe log stayed unwritable.
+# tail is in it for one line in expand_root: e2fsck writes one progress record per tick
+# to a file that grows for the length of the check, and only the last one is the answer
+# to "how far along is it".  Nothing else in this initramfs reads the end of a file.
 # rmdir is in this list because /init runs it, and it was missing: mount_card clears
 # /run/j36/card out of the way before replacing it with a symlink to /home/virtua.
 # A missing applet is not a no-op here -- `ln -s target dir' with dir still present
@@ -1375,7 +1378,7 @@ bb_disable() {
 # and takes the question away.
 INIT_APPLETS=(sh mount umount mkdir mknod cat cp ln ls tr grep echo sleep dmesg
               insmod hexdump setsid cttyhack switch_root sync poweroff reboot
-              uname chmod rmdir tar gunzip sed printf)
+              uname chmod rmdir tar gunzip sed printf tail)
 
 # Most applets are CONFIG_<applet in caps>; three are not, and guessing would
 # assert a symbol that does not exist, which greps false and dies on a correct
@@ -2169,6 +2172,11 @@ expand_root() {
         say "expand: the rootfs has no$ex_missing, so the card keeps the size it has"
         return 0
     fi
+    # A fourth one, and the only optional one: dumpe2fs is not part of doing the work,
+    # it is what turns resize2fs's silence into a percentage.  Its absence costs the
+    # progress bar and nothing else, so it is taken outside the loop above and its
+    # failure is not a failure.  It shares the whole library closure with e2fsck.
+    expand_take dumpe2fs "$EXPAND_BIN" || true
     # LD_LIBRARY_PATH as well as the copies being in /lib: the default search path is a
     # property of how glibc was configured, and this costs one environment variable.
     export LD_LIBRARY_PATH=/lib
@@ -2183,19 +2191,28 @@ expand_root() {
 
     # ── THE WORK, IN A CHILD, WITH THE PANEL STILL TALKING ───────────────────
     #
-    # e2fsck and resize2fs on a big slow card are minutes, and mixsplash gives the text
-    # console back when nothing has spoken to it for ninety seconds.  So this is forked
-    # for the same reason the card scan above is, and by the same means: the child says
-    # what it is doing in a file and answers in another one, and the loop below is what
-    # keeps the picture moving.  fork does not unshare the mount namespace, so the
-    # child's umount and mount are the parent's as well.
+    # e2fsck and resize2fs on a big slow card are minutes -- ten and more on a 64 GB
+    # card -- and mixsplash gives the text console back when nothing has spoken to it
+    # for ninety seconds.  So this is forked for the same reason the card scan above is,
+    # and by the same means: the child says what it is doing in a file and answers in
+    # another one, and the loop below is what keeps the picture moving.  fork does not
+    # unshare the mount namespace, so the child's umount and mount are the parent's too.
+    #
+    # AND IT SAYS HOW FAR ALONG IT IS, in a third file, because a seconds counter that
+    # has been climbing for ten minutes tells the operator nothing about whether to keep
+    # waiting or take the card out.  The two tools answer that question in two different
+    # ways and neither of them is a percentage, so both are converted into one here.
     : > /dev/.expand-status
     : > /dev/.expand-result
+    echo 0 > /dev/.expand-pct
     (
         ex_step() { echo "$1" > /dev/.expand-status 2>/dev/null; }
-        ex_done() { echo "$1" > /dev/.expand-result 2>/dev/null; }
+        ex_done() { echo 100 > /dev/.expand-pct 2>/dev/null
+                    echo "$1" > /dev/.expand-result 2>/dev/null; }
+        ex_pct()  { echo "$1" > /dev/.expand-pct 2>/dev/null; }
 
         ex_step "unmounting the OS partition"
+        ex_pct 1
         sync
         if ! umount /newroot 2>/dev/null; then
             ex_done "the root filesystem would not unmount, so it was left as it is"
@@ -2209,6 +2226,7 @@ expand_root() {
         # is mounted at this point in the boot, the kernel accepts the re-read that
         # follows instead of leaving the new table for the next power-on.
         ex_step "rewriting the partition table"
+        ex_pct 2
         if echo ", +" | "$EXPAND_BIN/sfdisk" -N "$ex_pno" --force "/dev/$ex_disk" >/dev/null 2>&1; then
             sync
         else
@@ -2223,6 +2241,7 @@ expand_root() {
         # Whole seconds because fractional sleep is a BusyBox build option and this
         # build's applet list is the one at the top of the script, not a guess.
         ex_step "waiting for the partition to come back"
+        ex_pct 3
         ex_n=0
         while [ ! -b "$rootdev" ] && [ "$ex_n" -lt 20 ]; do
             ex_n=$((ex_n + 1))
@@ -2233,13 +2252,87 @@ expand_root() {
             exit 0
         fi
 
+        # ── HOW MUCH resize2fs IS ABOUT TO WRITE, ASKED BEFORE IT STARTS ─────
+        #
+        # resize2fs has no progress output of any kind, and it is the long half of this.
+        # What it does have is a shape that is entirely predictable: growing an ext2 is
+        # writing a fresh block group every 128 MiB of new space, and almost all of each
+        # one is its inode table.  So the denominator is arithmetic -- groups added times
+        # bytes per group -- and the numerator is the disk's own write counter in sysfs.
+        # Both are exact; only the small change resize2fs also makes to the groups that
+        # were already there is not counted, which is why the bar is clamped below 100
+        # until the process actually exits.
+        #
+        # The numbers come out of dumpe2fs rather than being assumed, because inode size
+        # and inodes-per-group are mkfs-time choices and a card made by an older build
+        # will not have this build's.  dumpe2fs is optional: without it there is no
+        # denominator and the phase falls back to naming itself, which is what this did
+        # before.  ONE READ, and it has to be here -- after the partition grew and before
+        # the filesystem does, which is the only moment the old block count is still the
+        # filesystem's own answer.
+        ex_bs=0; ex_isz=0; ex_ipg=0; ex_bpg=0; ex_blocks=0
+        if [ -x "$EXPAND_BIN/dumpe2fs" ]; then
+            "$EXPAND_BIN/dumpe2fs" -h "$rootdev" > /dev/.expand-fsinfo 2>/dev/null
+            while read -r ex_k1 ex_k2 ex_k3 ex_k4; do
+                case "$ex_k1 $ex_k2 $ex_k3" in
+                    "Block size: "*|"Block size:")      ex_bs="$ex_k3" ;;
+                    "Inode size: "*|"Inode size:")      ex_isz="$ex_k3" ;;
+                    "Block count: "*|"Block count:")    ex_blocks="$ex_k3" ;;
+                    "Inodes per group:")               ex_ipg="$ex_k4" ;;
+                    "Blocks per group:")               ex_bpg="$ex_k4" ;;
+                esac
+            done < /dev/.expand-fsinfo
+        fi
+
         # resize2fs refuses a filesystem it has not seen checked, so this is not
         # optional.  -p fixes what can be fixed without asking, because there is nobody
         # to ask; status 1 means it corrected something and the filesystem is now good,
         # which is a success here.  Anything above that is a filesystem to leave alone.
+        #
+        # -C 1 IS WHAT MAKES IT COUNTABLE.  With a file descriptor given, e2fsck stops
+        # drawing a bar for a terminal and writes one line per tick -- "pass cur max
+        # device" -- which is the same channel systemd-fsck reads.  Its own preen output
+        # goes to the same file and is simply not four numbers, so the parser skips it.
+        # It runs in a grandchild so that this loop can read that file while it works;
+        # the exit status comes back through a file because BusyBox ash has no
+        # PIPESTATUS and no way to poll a background job.
         ex_step "checking the filesystem"
-        "$EXPAND_BIN/e2fsck" -fp "$rootdev" >/dev/null 2>&1
-        ex_rc=$?
+        ex_pct 4
+        : > /dev/.expand-fsck
+        : > /dev/.expand-fsck-rc
+        ( "$EXPAND_BIN/e2fsck" -fp -C 1 "$rootdev" > /dev/.expand-fsck 2>/dev/null
+          echo $? > /dev/.expand-fsck-rc ) &
+        while [ ! -s /dev/.expand-fsck-rc ]; do
+            if [ -s /dev/.expand-fsck ]; then
+                # Through a one-line file rather than a command substitution, because
+                # `$(tail ...)' forks a subshell every second for the length of a check
+                # that can run for minutes, and this shell has to stay responsive to the
+                # only other thing it does -- notice that the grandchild has finished.
+                ex_p=0; ex_c=0; ex_m=0
+                tail -n 1 /dev/.expand-fsck > /dev/.expand-fsck.last 2>/dev/null
+                read -r ex_p ex_c ex_m ex_rest < /dev/.expand-fsck.last 2>/dev/null
+                case "$ex_p" in
+                    1|2|3|4|5)
+                        # A pass's own share of the check is one fifth of it, which is
+                        # rough and is monotonic, and monotonic is the property that
+                        # matters on a bar somebody is watching.  The divide is turned
+                        # round when max is large because this arithmetic is 32-bit and
+                        # cur*100 on a 64 GB filesystem is not.
+                        if [ "$ex_m" -gt 100000 ] 2>/dev/null; then
+                            ex_in=$(( ex_c / (ex_m / 100) ))
+                        elif [ "$ex_m" -gt 0 ] 2>/dev/null; then
+                            ex_in=$(( ex_c * 100 / ex_m ))
+                        else
+                            ex_in=0
+                        fi
+                        if [ "$ex_in" -gt 100 ]; then ex_in=100; fi
+                        ex_pct $(( 4 + ((ex_p - 1) * 100 + ex_in) * 26 / 500 ))
+                        ;;
+                esac
+            fi
+            sleep 1
+        done
+        read -r ex_rc < /dev/.expand-fsck-rc
         if [ "$ex_rc" -gt 1 ]; then
             ex_done "e2fsck says $rootdev needs attention (status $ex_rc), so it was not grown"
             mount -t "$rootfs_type" "$rootdev" /newroot 2>/dev/null
@@ -2248,8 +2341,48 @@ expand_root() {
 
         # No size argument: resize2fs with none grows the filesystem to fill whatever
         # the partition now is, which is exactly the question that was just answered.
+        #
+        # The estimate assembled above becomes a percentage here.  Field 7 of a disk's
+        # /sys/block/<name>/stat is sectors written since boot, and nothing else on this
+        # machine is writing to this card at this moment, so the delta is resize2fs's own
+        # traffic.  Everything is kept in 512-byte sectors and never in bytes, because
+        # this shell's arithmetic is 32 bits wide and a 64 GB card in bytes is not.
         ex_step "growing the filesystem"
-        if "$EXPAND_BIN/resize2fs" "$rootdev" >/dev/null 2>&1; then
+        ex_pct 30
+        ex_est=0
+        if [ "$ex_bs" -gt 0 ] 2>/dev/null && [ "$ex_bpg" -gt 0 ] 2>/dev/null &&
+           [ "$ex_ipg" -gt 0 ] 2>/dev/null && [ "$ex_isz" -gt 0 ] 2>/dev/null &&
+           [ "$ex_blocks" -gt 0 ] 2>/dev/null; then
+            read -r ex_newsize < "$ex_sys/size" 2>/dev/null
+            # Sectors per block, not bytes per block, for the reason above.
+            ex_spb=$(( ex_bs / 512 ))
+            if [ "$ex_spb" -gt 0 ]; then
+                ex_addg=$(( (ex_newsize / ex_spb - ex_blocks) / ex_bpg ))
+                # Inode table plus the two bitmaps plus one block of descriptors, which
+                # is what a new group costs to write.
+                ex_gsec=$(( (ex_ipg * ex_isz) / 512 + 3 * ex_spb ))
+                if [ "$ex_addg" -gt 0 ]; then ex_est=$(( ex_addg * ex_gsec )); fi
+            fi
+        fi
+        ex_w0=0
+        read -r ex_f1 ex_f2 ex_f3 ex_f4 ex_f5 ex_f6 ex_w0 ex_rest \
+            < "/sys/block/$ex_disk/stat" 2>/dev/null
+        : > /dev/.expand-resize-rc
+        ( "$EXPAND_BIN/resize2fs" "$rootdev" >/dev/null 2>&1
+          echo $? > /dev/.expand-resize-rc ) &
+        while [ ! -s /dev/.expand-resize-rc ]; do
+            if [ "$ex_est" -gt 0 ]; then
+                read -r ex_f1 ex_f2 ex_f3 ex_f4 ex_f5 ex_f6 ex_w1 ex_rest \
+                    < "/sys/block/$ex_disk/stat" 2>/dev/null
+                ex_in=$(( (ex_w1 - ex_w0) * 100 / ex_est ))
+                if [ "$ex_in" -lt 0 ];  then ex_in=0;  fi
+                if [ "$ex_in" -gt 99 ]; then ex_in=99; fi
+                ex_pct $(( 30 + ex_in * 69 / 100 ))
+            fi
+            sleep 1
+        done
+        read -r ex_rrc < /dev/.expand-resize-rc
+        if [ "$ex_rrc" = 0 ]; then
             ex_result="$rootdev now fills /dev/$ex_disk"
         else
             ex_result="resize2fs could not grow $rootdev; the partition is bigger than the filesystem"
@@ -2263,6 +2396,7 @@ expand_root() {
         # because a root that is mounted read-only boots to a shell somebody can fix it
         # from, and a root that is not mounted at all boots to the initramfs.
         ex_step "remounting the OS partition"
+        ex_pct 99
         if mount -t "$rootfs_type" "$rootdev" /newroot 2>/dev/null; then
             ex_done "$ex_result"
         elif mount -t "$rootfs_type" -o ro "$rootdev" /newroot 2>/dev/null; then
@@ -2276,7 +2410,13 @@ expand_root() {
     # boot in the life of this device where half an hour is the right thing to wait for,
     # and the bound exists because the alternative to a bound is a board that counts
     # upwards forever.
+    #
+    # THE BAR BELONGS TO THE RESIZE WHILE THIS RUNS, and that is deliberate: on the boot
+    # where this happens at all, it is minutes and everything else in the boot is
+    # seconds, so a bar measuring the boot would sit still for the whole of the only part
+    # anybody is waiting through.  It is handed back at the bottom of this function.
     ex_waited=0
+    ex_shown=-1
     while [ ! -s /dev/.expand-result ]; do
         if [ "$ex_waited" -ge 1800 ]; then
             say "expand: the resize has not answered in ${ex_waited}s; carrying on"
@@ -2285,7 +2425,25 @@ expand_root() {
         ex_what=""
         if [ -s /dev/.expand-status ]; then read -r ex_what < /dev/.expand-status; fi
         if [ -z "$ex_what" ]; then ex_what="growing the OS partition"; fi
-        detail "$ex_what -- ${ex_waited}s"
+        ex_now=""
+        if [ -s /dev/.expand-pct ]; then read -r ex_now < /dev/.expand-pct; fi
+        case "$ex_now" in
+            ''|*[!0-9]*) detail "$ex_what -- ${ex_waited}s" ;;
+            *)  detail "$ex_what -- ${ex_now}%  (${ex_waited}s)"
+                # Only when it has moved: the channel is a file every line is appended
+                # to, and a percentage that has not changed is a line nothing will draw
+                # differently.  Said on the console too, but a tenth as often, because
+                # that one is a scrollback somebody reads afterwards.
+                if [ "$ex_now" != "$ex_shown" ]; then
+                    progress "$ex_now"
+                    case "$ex_now" in
+                        0|10|20|30|40|50|60|70|80|90|100)
+                            say "expand: ${ex_now}% -- $ex_what" ;;
+                    esac
+                    ex_shown="$ex_now"
+                fi
+                ;;
+        esac
         ex_waited=$((ex_waited + 1))
         sleep 1
     done
@@ -2295,6 +2453,7 @@ expand_root() {
     fi
     : > /dev/.expand-status
     : > /dev/.expand-result
+    : > /dev/.expand-pct
 
     # THE ONE THING THAT IS CHECKED TWICE.  Every failure above puts /newroot back and
     # says so, but "the child was killed", "the wait timed out" and "the node never came
@@ -2310,9 +2469,14 @@ expand_root() {
         say "expand: AND IT WOULD NOT MOUNT.  The hand-over below is going to fail."
     fi
 
-    # Whatever happened, the panel goes back to saying what the boot is doing.
+    # Whatever happened, the panel goes back to saying what the boot is doing, and the
+    # bar goes back to where the boot had got to when this started.  It walks down rather
+    # than up, which the splash eases over about half a second, and it happens on the
+    # same frame the headline changes -- so it reads as one job ending rather than as a
+    # bar losing its place.
     stage "Mounting the MixOS partition"
     detail "$rootdev  $rootfs_type"
+    progress 22
     return 0
 }
 
@@ -7243,6 +7407,110 @@ QTCONF
     return 0
 }
 
+# ── The browser session: an X server on the framebuffer, and the pad inside it ──
+#
+# WHAT CHANGED, because this file used to say the opposite.  The old note here and
+# in dashboard.cpp said an X server on this board would be the Console card again --
+# a VT switch onto a console driver that was never bound to this simplefb -- and
+# that half of it is wrong.  Two separate things were run together:
+#
+#   THE CONSOLE CARD needed fbcon.  It forked a shell onto a spare VT and wanted the
+#   KERNEL to draw the shell's characters, and the kernel cannot: fbcon is built
+#   with deferred takeover and never took this simplefb over, so the switch happened
+#   and nothing appeared.  That is still true and nothing here changes it.
+#
+#   AN X SERVER DRAWS ITS OWN PIXELS.  xf86-video-fbdev mmaps /dev/fb0 and writes
+#   into it exactly the way mixdash's linuxfb plugin and fbdoom already do.  It asks
+#   the console layer for nothing, because the only glyphs on the screen are ones it
+#   rendered itself.  The VT dance is separate from that and is entirely optional:
+#   `-sharevts -novtswitch -keeptty vt1' is Xorg's own way of saying "this VT
+#   already belongs to someone, leave it alone", and with those three it issues no
+#   VT_SETMODE, no VT_ACTIVATE and no KDSETMODE -- which matters here because mixdash
+#   is still running behind it holding /dev/tty0 in KD_GRAPHICS.
+#
+# So the panel is shared the same way Doom shares it: mixdash stops painting, the
+# child writes /dev/fb0, and when the child exits the dashboard repaints over it.
+# No DRM, no modeset, no GBM, no EGL, no lima.  The other half of the old note --
+# that netsurf-fb and links2 are both built without a framebuffer surface -- was
+# correct and has since been proved from the binaries themselves; it is why the
+# answer is an X server and not a smaller trick.
+#
+# WHAT IS STILL MISSING once X is up, and it is the whole reason this section
+# exists: a pointer.  This device has a D-pad, and udev tags the pad
+# ID_INPUT_JOYSTICK, which libinput refuses by design -- and BTN_A is evdev 0x130,
+# which is past the 255 an X keycode can hold, so the older evdev driver cannot map
+# it either.  tools/j36-padx.c does the translation itself with XTEST; its header
+# has the full reasoning, including why it grabs the pad and why not uinput.
+#
+# THE ONE WRITE THIS MAKES TO THE ROOTFS, said out loud because everything else in
+# this image goes to /run/j36: X compiles its keymap and caches the .xkm under
+# /var/lib/xkb.  That directory exists because of the xkb-data this build installs;
+# it is not somewhere an R36S keeps anything, and the X log and the runtime dir are
+# both pointed at /run/j36 explicitly for the same reason.
+#
+# BUILT IN THE ARMHF CHROOT and not cross-compiled, unlike eglprobe and mixmirror:
+# those two need nothing but libc, and this one needs libX11 and libXtst headers for
+# armhf, which the VM's cross toolchain does not have and which the chroot the
+# dashboard already uses does.  Non-fatal on failure, like every other accessory
+# here -- a browser that cannot be driven is a bad card, not a lost kernel.
+PADX_SRC="$ROOT/device/j36-ultra/tools/j36-padx.c"
+PADX_BIN=""
+PADX_BUILD_DEPS=(build-essential libx11-dev libxtst-dev)
+
+build_padx() {
+    local src="$ARMHF_CHROOT/home/build/padx" out="$CACHE/j36-padx"
+    local header needed lib unexpected=""
+
+    [[ -f "$PADX_SRC" ]] || { log "padx: $PADX_SRC is missing"; return 1; }
+
+    ensure_armhf_chroot || return 1
+    # Its own stamp, for the reason spelled out above chroot_install_deps: adding
+    # these names to MIXDASH_BUILD_DEPS would never install them in any chroot that
+    # already carries the `qt' stamp, which is every chroot on every machine that has
+    # built this image once.
+    chroot_install_deps padx "${PADX_BUILD_DEPS[@]}" || return 1
+
+    sudo rm -rf "$src"
+    sudo mkdir -p "$src"
+    sudo cp "$PADX_SRC" "$src/j36-padx.c" || return 1
+
+    log "padx: building the pad-to-X bridge for armhf (emulated)"
+    armhf_chroot_run "cd /home/build/padx && \
+        gcc -O2 -std=gnu11 -Wall -Wextra -o j36-padx j36-padx.c -lX11 -lXtst && \
+        strip j36-padx" || return 1
+    [[ -f "$src/j36-padx" ]] || { log "padx: the compile left no binary"; return 1; }
+
+    mkdir -p "$CACHE"
+    sudo cp "$src/j36-padx" "$out" || return 1
+    sudo chown "$(id -u):$(id -g)" "$out"
+    chmod 0755 "$out"
+
+    header="$(readelf -hd "$out" 2>/dev/null)" || return 1
+    grep -q 'Class:.*ELF32' <<<"$header" || { log "padx: not a 32-bit ELF"; return 1; }
+    grep -q 'Machine:.*ARM' <<<"$header" || { log "padx: not an ARM ELF"; return 1; }
+
+    # The whitelist is short on purpose: every name on it is a package this build
+    # puts on the card.  libX11 comes with xserver-xorg-core's own dependencies and
+    # libXtst is in needed_packages.txt beside it.  Anything else in here means the
+    # chroot linked something the card will not have, and the failure would surface
+    # on the board as a browser card that starts nothing.
+    needed="$(sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p' <<<"$header" | tr '\n' ' ')"
+    for lib in $needed; do
+        case "$lib" in
+            libX11.so.6|libXtst.so.6|libXext.so.6|libc.so.6|ld-linux-armhf.so.3) ;;
+            *) unexpected="$unexpected $lib" ;;
+        esac
+    done
+    if [[ -n "$unexpected" ]]; then
+        log "padx: the binary needs libraries the card's rootfs may not have:$unexpected"
+        return 1
+    fi
+
+    PADX_BIN="$out"
+    log "padx: j36-padx is $(stat -c %s "$out") bytes, dynamic ARM, needs $needed"
+    return 0
+}
+
 # J36_GL is Mesa and the probe, and it is worth keeping even now that the dashboard
 # needs no GL: eglprobe is still the only thing here that says whether a frame reaches
 # the glass, and anything launched from the dashboard that does want GL resolves it
@@ -7293,8 +7561,21 @@ if [[ "${J36_DASH:-1}" == 1 ]]; then
         collect_qt_payload
         dash_rc=$?
     fi
+    # Inside this block and before the teardown, because it needs the same chroot the
+    # dashboard just used and there is no point mounting it twice.  Its own rc: a pad
+    # bridge that failed to build must not blank MIXDASH_BIN and cost the card its
+    # dashboard.  Attempted even when the dashboard failed, so that a rerun after a
+    # mixdash fix does not also have to rebuild this.
+    build_padx
+    padx_rc=$?
     armhf_chroot_teardown
     set -e
+    if (( padx_rc != 0 )); then
+        PADX_BIN=""
+        log "padx: the pad-to-X bridge was not built, see the error above -- the Browser"
+        log "    card falls back to links2 in the terminal, which needs neither X nor a"
+        log "    pointer.  Nothing else in the image depends on it."
+    fi
     if (( dash_rc != 0 )); then
         MIXDASH_BIN=""
         QT_PAYLOAD=""
@@ -7825,6 +8106,14 @@ systemd.mask=firstboot.service
     sfdisk, e2fsck's it and then resize2fs's the ext2 inside it, and it does none
     of that once there is nothing left to take.  It never mkfs's anything, which
     is the whole reason it is not the script above.
+
+    ON A BIG CARD THIS IS MINUTES, so the splash carries a real percentage while
+    it runs -- the bar and the line under the headline both -- rather than a
+    seconds counter.  e2fsck is asked for its own progress records with -C 1; for
+    resize2fs, which has none, the percentage is the disk's write counter in
+    /sys/block measured against what growing an ext2 by this many block groups
+    has to write.  The console gets a line at every tenth of the way through, so
+    a serial log tells the same story afterwards.
 
 batt_led.service, no longer masked
     The RK3326 battery LED daemon, and the first unit the forwarded log caught:
@@ -10069,6 +10358,7 @@ fi
         echo "storage=msdc1 mtk-sd mediatek,mt6592-mmc (ext2, ext4, btrfs, exfat, vfat)"
         echo "card_layout=p1 BOOT vfat = launcher only (zImage, dtb, initrd.img, mvii/boot.conf, LICENSE.txt, README.txt); p2 ROOTFS ext2 = the OS, /opt/mixos included, and the login user's home at ${DATA_MOUNT_POINT:-/home/virtua} as an ordinary directory in it.  Two partitions: there is no p3, and p2 is last on the disk so /init can grow it to the card's size on the first boot"
         echo "card_expand=/init's expand_root, before switch_root: sfdisk -N extends p2 to the end of the disk, e2fsck -fp, then resize2fs with no size argument.  ext2 has no online resize, so this is the only moment in the boot it can happen; the three tools and their libraries are copied out of the rootfs before it is unmounted, and a copy that will not run leaves the card alone"
+        echo "card_expand_progress=the splash bar and detail line show a real percentage for the whole operation: e2fsck reports through -C 1, and resize2fs (which reports nothing) is measured as write_sectors in /sys/block/<disk>/stat against the inode tables and bitmaps that the added block groups cost.  dumpe2fs is copied out too, optionally, because that estimate needs the filesystem's own inode size and inodes-per-group; without it the phase falls back to naming itself"
         echo "rootfs_format=ext2, set in setup_partition.sh and device/r36-ultra/build-in-vm.sh; the MVII LK reads FAT32 only, so BOOT is FAT and the OS partition is free to be the simplest filesystem both kernels on this card handle"
         echo "payload=$PAYREL (J36_PAYLOAD_ON=$PAYLOAD_ON; /init looks in the rootfs /opt/mixos/j36 first, then j36/ on BOOT for a card written by an older build)"
         echo "msdc1_irq=GIC_SPI 72 (INTID 104 - 32)"
