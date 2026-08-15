@@ -166,7 +166,7 @@ SYSTEM_SIZE=100
 # and written to a card by everybody who flashed it, empty.
 #
 # p3 IS GONE, so p2 is the last partition on the disk and the J36 initramfs grows it to
-# the end of the card before systemd starts -- setup_expand() in
+# the end of the card before systemd starts -- expand_root() in the /init heredoc in
 # device/j36-ultra/build-in-vm.sh.  Headroom now comes from the card the operator bought,
 # which is larger than 12 GB and costs this build nothing.  What the image has to carry
 # is the base system plus enough slack to reach that first resize, and a GiB of rounding

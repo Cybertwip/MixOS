@@ -2524,12 +2524,31 @@ find_root() {
 # The loader's path is compiled into every binary copied below, so the copies have to
 # land at the paths their PT_INTERP and DT_NEEDED name.  /lib is that path on Debian
 # armhf and it does not exist in this initramfs until here.
+#
+# ── THIS LIST IS THE ONE THING HERE THAT CAN SILENTLY COST THE CARD ITS SIZE ──
+#
+# It is not a superset of what the tools might want; it is exactly what they name, and
+# a name missing from it does not make anything fail loudly.  The loader exits 127, the
+# expand_works loop below turns that into "sfdisk will not run in the initramfs", and
+# the boot carries on with a 4 GB filesystem on a 64 GB card -- which is precisely the
+# report this list was written from a second time.  libreadline.so.8 was the name:
+# Debian's sfdisk links it for its interactive prompt, a prompt this never reaches,
+# and its absence stopped the resize before sfdisk had been asked a single question.
+#
+# So the build CHECKS it rather than trusting it.  verify_expand_libs() reads this
+# assignment back out of the generated /init, walks the DT_NEEDED closure of the four
+# tools in the armhf chroot, and fails the build on the first name that is not here.
+# Adding a library the closure does not name costs nothing -- expand_take shrugs at a
+# file the rootfs has not got -- so the extras below stay: they are what older Debians
+# and other e2fsprogs builds have wanted, and a list that is too long is the harmless
+# direction to be wrong in.
 EXPAND_BIN=/lib/mixexpand
 EXPAND_LIBS="ld-linux-armhf.so.3 ld-linux.so.3 libc.so.6 libm.so.6 libdl.so.2
              libpthread.so.0 librt.so.1 libgcc_s.so.1 libcrypt.so.1
              libext2fs.so.2 libcom_err.so.2 libe2p.so.2 libss.so.2
              libblkid.so.1 libuuid.so.1 libmount.so.1
              libfdisk.so.1 libsmartcols.so.1
+             libreadline.so.8 libhistory.so.8 libncursesw.so.6
              libselinux.so.1 libpcre2-8.so.0 libz.so.1 libtinfo.so.6"
 
 # Copy one file out of the mounted rootfs, trying each place Debian might keep it.
@@ -2554,8 +2573,17 @@ expand_take() {
 # Runs a copied tool with a harmless argument.  127 is the shell's "not found" and the
 # loader's "a library it needs is not here"; either way the tool cannot be used, and
 # finding that out now is what keeps the umount below from being a one-way trip.
+#
+# STDERR IS KEPT, and that is the whole difference between two diagnoses.  The loader
+# names the library it could not open -- "sfdisk: error while loading shared libraries:
+# libreadline.so.8" -- and this used to throw that line away and report only "a library
+# it needs is not in EXPAND_LIBS", which says a list is wrong without saying which name
+# is missing from it.  One card shipped for months with a full-size partition it never
+# grew because of exactly that.  /dev is where the other two of these go (the fsck and
+# the dumpe2fs capture below), for the same reason: it is a tmpfs and the rootfs is
+# about to be unmounted.
 expand_works() {
-    "$EXPAND_BIN/$1" "$2" >/dev/null 2>&1
+    "$EXPAND_BIN/$1" "$2" >/dev/null 2>/dev/.expand-why
     [ "$?" != 127 ]
 }
 
@@ -2752,7 +2780,16 @@ expand_root() {
     export LD_LIBRARY_PATH=/lib
     for ex_tool in sfdisk:--version e2fsck:-V resize2fs:-h; do
         if ! expand_works "${ex_tool%%:*}" "${ex_tool#*:}"; then
-            expand_note "${ex_tool%%:*} will not run in the initramfs -- a library it needs is not in EXPAND_LIBS, so the card keeps the size it has and the root filesystem was never unmounted"
+            # The loader's own sentence, which names the file it could not open.  Read
+            # rather than cat'd because this initramfs has no cat worth the fork, and
+            # defaulted because a tool that was simply not executable prints nothing.
+            ex_why=""
+            read -r ex_why < /dev/.expand-why 2>/dev/null || ex_why=""
+            if [ -z "$ex_why" ]; then
+                ex_why="it exited 127 and said nothing"
+            fi
+            expand_note "${ex_tool%%:*} will not run in the initramfs, so the card keeps the size it has and the root filesystem was never unmounted -- $ex_why"
+            expand_note "add the library that line names to EXPAND_LIBS in device/j36-ultra/build-in-vm.sh and rebuild the initramfs"
             return 0
         fi
     done
@@ -7677,6 +7714,114 @@ armhf_chroot_teardown() {
     return 0
 }
 
+# ── EXPAND_LIBS, checked against the libraries the tools actually name ────────
+#
+# /init grows the OS partition to the end of the card on the first boot, and to do it
+# it copies sfdisk, e2fsck, resize2fs and dumpe2fs out of the mounted rootfs into the
+# initramfs along with a HAND-WRITTEN list of the shared libraries they need.  Nothing
+# about that list was ever verified, and the one way it can be wrong is the one way
+# that costs the operator the whole point of the step: a name missing from it makes the
+# loader exit 127, expand_root says "sfdisk will not run in the initramfs" into a log
+# nobody reads, and the board comes up on a 4 GB filesystem sitting on a 64 GB card
+# with the rest of it unallocated.  It looks exactly like a boot that had nothing to do.
+#
+# That is not hypothetical: Debian trixie's sfdisk carries libreadline.so.8 for the
+# interactive prompt this never uses, the list did not have it, and every card built
+# from this tree kept the size it was flashed at.
+#
+# THE CHROOT IS THE AUTHORITY, not this script's opinion.  The armhf chroot is the same
+# Debian release and architecture as the rootfs on the card, so the closure computed in
+# it is the closure the board will need.  It is walked transitively -- libfdisk names
+# libsmartcols, which names its own -- because a direct-dependency check would have
+# missed the layer below just as thoroughly.
+#
+# It reads the list back out of the GENERATED /init rather than keeping a second copy
+# out here: the heredoc that writes /init is single-quoted on purpose (nothing from
+# this script leaks into it), so the file is the only place the list exists, and a
+# check against a copy would only prove the copy right.
+#
+# FATAL, and deliberately so.  The alternative is an artifact that boots, says nothing
+# and quietly throws away most of the card -- the failure this whole function exists
+# because of.  It is skipped, with a line, only when there is nothing to check against.
+EXPAND_TOOLS="sfdisk e2fsck resize2fs dumpe2fs"
+
+verify_expand_libs() {
+    local listed closure missing="" lib tool found
+    local -a dirs=(lib/arm-linux-gnueabihf usr/lib/arm-linux-gnueabihf lib usr/lib)
+
+    [[ -f "$INITROOT/init" ]] || { log "expand: no /init to check EXPAND_LIBS in"; return 0; }
+    [[ -d "$ARMHF_CHROOT" ]] || { log "expand: no armhf chroot, so EXPAND_LIBS goes unchecked"; return 0; }
+
+    # The assignment spans several lines and ends at the first line with the closing
+    # quote on it, which is what the range address matches.  Newlines out, so the names
+    # come back as one whitespace-separated word list.
+    listed="$(sed -n '/^EXPAND_LIBS="/,/"$/p' "$INITROOT/init" \
+        | tr '\n' ' ' | sed -e 's/^EXPAND_LIBS="//' -e 's/" *$//')"
+    if [[ -z "$listed" ]]; then
+        die "could not read EXPAND_LIBS out of the generated /init; the resize check cannot run"
+    fi
+
+    # The closure, walked in the chroot with readelf.  A tool that is not there is not
+    # this function's business -- expand_root reports that case itself, at runtime, on
+    # the card whose rootfs it is -- so it is noted and skipped rather than failed on.
+    closure="$(
+        cd "$ARMHF_CHROOT" || exit 1
+        seen=" "
+        todo=""
+        for tool in $EXPAND_TOOLS; do
+            for d in sbin usr/sbin bin usr/bin; do
+                if [[ -f "$d/$tool" ]]; then
+                    todo="$todo $(readelf -d "$d/$tool" 2>/dev/null \
+                        | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')"
+                    break
+                fi
+            done
+        done
+        # Re-joined on single spaces each round: readelf's output arrives with newlines
+        # in it, and a `todo' that is nothing but whitespace is not empty to [[ -n ]].
+        todo="$(echo $todo)"
+        while [[ -n "$todo" ]]; do
+            next=""
+            for lib in $todo; do
+                [[ "$seen" == *" $lib "* ]] && continue
+                seen="$seen$lib "
+                for d in "${dirs[@]}"; do
+                    if [[ -e "$d/$lib" ]]; then
+                        next="$next $(readelf -d "$d/$lib" 2>/dev/null \
+                            | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')"
+                        break
+                    fi
+                done
+            done
+            todo="$(echo $next)"
+        done
+        printf '%s\n' "$seen"
+    )" || { log "expand: could not walk the tool closure in the chroot; EXPAND_LIBS unchecked"; return 0; }
+
+    for tool in $EXPAND_TOOLS; do
+        found=0
+        for lib in sbin usr/sbin bin usr/bin; do
+            [[ -f "$ARMHF_CHROOT/$lib/$tool" ]] && { found=1; break; }
+        done
+        (( found )) || log "expand: the chroot has no $tool, so its libraries were not checked"
+    done
+
+    for lib in $closure; do
+        # The interpreter is named in DT_NEEDED as well as in PT_INTERP on armhf, and
+        # it is on the list under both spellings already; the loop is uniform anyway.
+        [[ " $listed " == *" $lib "* ]] || missing="$missing $lib"
+    done
+
+    if [[ -n "$missing" ]]; then
+        die "EXPAND_LIBS in /init is missing$missing -- the first-boot resize would copy
+    sfdisk/e2fsck/resize2fs out of the rootfs and then find they will not run, and the
+    card would silently keep the size it was flashed at.  Add the name(s) to EXPAND_LIBS
+    beside EXPAND_BIN in this file."
+    fi
+    log "expand: EXPAND_LIBS covers the closure of $EXPAND_TOOLS ($(wc -w <<<"$closure") libraries)"
+    return 0
+}
+
 # ── mixdash: the dashboard, and what it does not need ─────────────────────────
 #
 # WHY THIS EXISTS.  Everything tried on this panel before it reached it through
@@ -8275,6 +8420,16 @@ if [[ "${J36_DASH:-1}" == 1 ]]; then
 else
     log "mixdash: J36_DASH=0, skipping the dashboard"
 fi
+
+# Here, and not up beside the initramfs it checks, because this is the first point in
+# the build at which the armhf chroot is on disk -- and the chroot is the only thing in
+# this VM that knows what Debian armhf's sfdisk links against.  The initramfs was packed
+# hundreds of lines ago; failing now still fails the run, which is the whole point, and
+# it fails before the image or the export directory is written.
+#
+# Reading only, so the teardown above having unmounted the chroot's /proc and /dev makes
+# no difference: nothing is executed in it.
+verify_expand_libs
 
 # J36_ES_BUILD=1 built the GLES 2.0 EmulationStation here, and it is gone rather than
 # defaulted off.  It had already been off by default for a while, and not because the

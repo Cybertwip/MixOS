@@ -69,8 +69,8 @@ SYSTEM_SIZE=100      # FAT32 boot partition size in MB
 # person who flashed it, on the chance that some of them would use it.
 #
 # p3 is gone (see above), so ROOTFS is the last partition on the disk and the initramfs
-# grows it to the end of the card on the first boot -- see setup_expand() in
-# device/j36-ultra/build-in-vm.sh.  The headroom now comes from the card the operator
+# grows it to the end of the card on the first boot -- see expand_root() in the /init
+# heredoc in device/j36-ultra/build-in-vm.sh.  The headroom now comes from the card the operator
 # actually bought, which is both bigger than 12 GB and free.  What the image has to hold
 # is the base system and a little slack for the first boot before the resize lands, and
 # a whole GiB of rounding is more than enough of that.
