@@ -7652,6 +7652,10 @@ changes nothing else:
 
   opt/mixos/bin/mixdash    the dashboard: Qt5 Widgets straight into /dev/fb0
   opt/mixos/qt/            Qt 5.15 and its runtime closure, ~30 SONAME symlinks
+  opt/mixos/share/mixdash/startup.mp3
+                           the chime the dashboard plays once, on the frame it
+                           first paints.  Delete it and the dashboard is silent
+                           at boot and otherwise unchanged.
   opt/mixos/bin/doom       framebuffer Doom, and share/doom/ its IWAD
   opt/mixos/bin/j36-mixmirror
                            copies /dev/fb0 onto a USB-HDMI (DisplayLink) adapter
@@ -9853,6 +9857,9 @@ The dashboard and the games:
                        whole-rootfs fontconfig scan.
   bin/doom             framebuffer Doom (doomgeneric), if the build staged it.
   share/doom           its IWAD.
+  share/mixdash        startup.mp3, played once when the dashboard's first frame
+                       reaches the glass.  Optional: the dashboard checks that the
+                       file is readable and stays quiet if it is not.
 
 j36/ -- what /init loads, one directory per bootargs word.  Delete any of them and
 the matching j36. word finds nothing, says so on the console, and the boot carries
