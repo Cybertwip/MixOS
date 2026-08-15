@@ -97,11 +97,34 @@
  * ndo_start_xmit kept returning NETDEV_TX_OK, the carrier stayed up, and the
  * counters showed a queue that never drained and no errors at all.
  *
- * Each acquire already polls for a page for J36_HIF_TX_POLL_ROUNDS *
- * J36_HIF_TX_POLL_INTERVAL_US, which is 200 ms, so eight of them is a page that
- * has not come back in a second and a half.  That is not a shortage any more.
+ * This used to be a count of polls, and it could be: each acquire spent up to
+ * 200 ms of its own inside w->lock, so eight of them was a page that had not come
+ * back in a second and a half.  The data path no longer sleeps for a page at all
+ * -- see J36_HIF_TX_TRY_ROUNDS, and the reason there is the lock -- so a poll is
+ * now a jiffy and eight of them is eighty milliseconds, which is a shortage and
+ * not a stall.  The wall clock says what was always meant.
  */
-#define J36_WLAN_TX_STALL_LIMIT		8
+#define J36_WLAN_TX_STALL_MS		1500u
+
+/*
+ * How many firmware operations may go unanswered in a row before the AIS network
+ * is re-armed, and how many re-arms before the radio is declared lost.
+ *
+ * "Unanswered" is narrow on purpose: a channel privilege that was never granted
+ * and a scan that never reported SCAN_DONE.  Both are commands the firmware
+ * accepted -- the page accounting says so -- and then did nothing about, and an
+ * authentication or association that times out is NOT counted, because that is
+ * the AP not answering and has nothing to do with the state of the chip.
+ *
+ * Two, because one of either is ordinary: an AP can vanish between the scan that
+ * found it and the connect that names it, and a sweep can collide with something
+ * else on the channel.  Two in a row is a firmware whose AIS network is no longer
+ * live, which this driver has now watched happen -- eighteen consecutive scans
+ * submitted, credited and abandoned on their own deadlines over three minutes,
+ * with not one message from the driver to say so.
+ */
+#define J36_WLAN_SILENCE_RECOVER	2
+#define J36_WLAN_RECOVER_LIMIT		2
 
 /* 1..13.  Channel 14 is 802.11b-only and Japan-only; the firmware's own domain
  * table stops at 13 and so does this. */
@@ -149,6 +172,11 @@ struct j36_wlan {
 	bool gtk_ready;
 	bool key_ready;
 	bool pm_sent;
+	/* When INDICATE_PM_CONNECTED stops waiting for a beacon to supply the real
+	 * DTIM period and goes out with an assumed one.  Zero until the indication
+	 * first becomes sendable, so a slow handshake spends its time waiting for
+	 * keys rather than spending the beacon window.  See j36_wlan_try_pm(). */
+	ktime_t pm_deadline;
 	bool channel_held;
 	u8 channel_token;
 	u8 sta_index;
@@ -181,11 +209,24 @@ struct j36_wlan {
 	u32 joins;
 	u32 join_failures;
 	u32 link_losses;
+	/* Beacons of the BSS this interface is associated to, counted separately
+	 * from every other management frame because the difference between the two
+	 * is a whole class of fault.  A link that is up and hearing its own AP has
+	 * a number here that climbs by ten a second; a link that is up and hearing
+	 * nothing has a zero, and that zero is why INDICATE_PM_CONNECTED has to be
+	 * willing to assume a DTIM period rather than wait for one. */
+	u32 beacons;
+	/* Consecutive firmware operations that were accepted and never answered,
+	 * and how many times that count has been acted on.  See j36_wlan_recover(). */
+	u32 silence;
+	u32 recoveries;
 	u32 tx_backpressure;
 	u32 tx_deferred;
-	/* Consecutive polls the head of the queue has been refused a page.  Reset
-	 * by anything at all going out, so it counts a stall and not traffic. */
+	/* Consecutive polls the head of the queue has been refused a page, and when
+	 * the run started.  Both reset by anything at all going out, so they count
+	 * a stall and not traffic. */
 	u32 tx_stalls;
+	ktime_t tx_stall_since;
 	/* And how many times that ran out and a frame was dropped for it, which
 	 * is cumulative and is the one of the two worth printing. */
 	u32 tx_starved;
@@ -525,6 +566,14 @@ static void j36_wlan_flush_tx(struct j36_wlan *wlan)
  * and a management frame addressed to a BSS it no longer holds is dropped on the
  * way out rather than transmitted.
  *
+ * INDICATE_PM_ABORT goes next and before anything is dismantled, which is where
+ * aisFsmDisconnect() puts it: the frame on the air first, then the firmware's
+ * power-management module told the BSS is finished, and only then the BSS itself
+ * taken apart.  Leaving it out -- which this driver did -- means the PM module
+ * goes on holding a context for an AP whose BSS info, station record and network
+ * activation are all being pulled out from under it, and what that costs is not a
+ * refused command.  It is the next join's commands accepted and never answered.
+ *
  * BSS_ACTIVATE_CTRL last, off and straight back on, is the one step that looks
  * superfluous and is not -- see j36_wlan_cmd_bss_reactivate(), where the AP that
  * went missing from three consecutive scans is described.
@@ -547,6 +596,7 @@ static void j36_wlan_drop_link(struct j36_wlan *wlan, bool send_deauth,
 	if (wlan->state == J36_WLAN_CONNECTED) {
 		if (send_deauth)
 			j36_wlan_cmd_deauth(w, &wlan->bss, reason);
+		j36_wlan_cmd_pm_abort(w);
 		j36_wlan_cmd_bss_disconnect(w, &wlan->bss);
 		j36_wlan_cmd_sta_remove(w, &wlan->bss);
 		j36_wlan_cmd_bss_reactivate(w);
@@ -560,6 +610,7 @@ static void j36_wlan_drop_link(struct j36_wlan *wlan, bool send_deauth,
 	wlan->gtk_ready = false;
 	wlan->key_ready = false;
 	wlan->pm_sent = false;
+	wlan->pm_deadline = 0;
 	wlan->aid = 0;
 	wlan->resp_ies_len = 0;
 	wlan->tx_stalls = 0;
@@ -620,19 +671,55 @@ static void j36_wlan_end_link(struct j36_wlan *wlan, u16 reason,
 }
 
 /*
- * INDICATE_PM_BSS_CONNECTED, once, and only once there is a real DTIM period to
- * put in it.  An association response does not carry one, so this is called from
- * two places -- the key settlement and the first beacon after connecting -- and
- * whichever of them has both halves first is the one that sends it.
+ * INDICATE_PM_BSS_CONNECTED, once, as soon as there is a real DTIM period to put
+ * in it -- AND, FAILING THAT, ONCE ANYWAY.
+ *
+ * An association response carries no DTIM period, so this is called from
+ * everywhere one might turn up: the key settlement, the association itself for an
+ * open network, the first beacon after connecting, and the deadline check.
+ * Whichever of them finds the link ready is the one that sends it.
+ *
+ * The deadline is the part that is not stock, and it is here because the reason
+ * stock can wait forever does not hold on this firmware.  Stock is handed every
+ * beacon of the connected BSS and sends the indication from the first one; this
+ * driver, on this chip, has been observed to receive NONE while associated -- the
+ * whole session's management-frame count was accounted for by its scans.  So
+ * "wait for a beacon" here reads as "never send it", and never sending it is the
+ * expensive option: this is the only command that carries the beacon interval, so
+ * without it the firmware supervises the link against zero and reports a beacon
+ * timeout about a minute into a perfectly good association.
+ *
+ * The clock therefore starts when the indication first becomes sendable rather
+ * than at association, so a slow four-way handshake spends its own time and not
+ * the beacon window; and the DTIM period that gets assumed is 1, which is safe
+ * only because this radio is left in CAM and never sleeps.
  */
 static void j36_wlan_try_pm(struct j36_wlan *wlan)
 {
+	bool fallback;
+
 	if (wlan->pm_sent || wlan->state != J36_WLAN_CONNECTED)
 		return;
 	if (wlan->secure && !wlan->key_ready)
 		return;
-	if (!j36_wlan_cmd_pm_connected(wlan->w, &wlan->bss, wlan->aid))
-		wlan->pm_sent = true;
+
+	if (!wlan->pm_deadline)
+		wlan->pm_deadline = ktime_add_ms(ktime_get(),
+						 J36_WLAN_PM_BEACON_WAIT_MS);
+	fallback = ktime_after(ktime_get(), wlan->pm_deadline);
+
+	if (j36_wlan_cmd_pm_connected(wlan->w, &wlan->bss, wlan->aid, fallback))
+		return;
+	wlan->pm_sent = true;
+	if (!wlan->bss.dtim_period || !wlan->bss.beacon_interval)
+		dev_info(wlan->w->dev,
+			 "%s: nothing from %pM supplied a %s%s%s in %u ms; the power-save indication went out with the standard value assumed\n",
+			 wlan->ndev->name, wlan->bss.bssid,
+			 wlan->bss.dtim_period ? "" : "DTIM period",
+			 (!wlan->bss.dtim_period && !wlan->bss.beacon_interval) ?
+				 " or a " : "",
+			 wlan->bss.beacon_interval ? "" : "beacon interval",
+			 J36_WLAN_PM_BEACON_WAIT_MS);
 }
 
 /*
@@ -706,6 +793,9 @@ void j36_wlan_on_beacon(struct j36_wifi *w, const u8 *frame, u32 frame_len,
 	 * response share: timestamp, beacon interval, capability. */
 	if (!wlan || frame_len < 36)
 		return;
+	/* Anything at all off the air is proof the radio is still working, which
+	 * is what the silence count is counting the absence of. */
+	wlan->silence = 0;
 	is_beacon = (j36_get_le16(frame) & 0x00f0) == 0x0080;
 	ies = frame + 36;
 	ies_len = frame_len - 36;
@@ -743,6 +833,10 @@ void j36_wlan_on_beacon(struct j36_wifi *w, const u8 *frame, u32 frame_len,
 	wlan->bss.rcpi = entry.rcpi;
 	if (!is_beacon)
 		return;
+	/* Counted apart from every other management frame because the trace is the
+	 * only place the difference shows, and the difference is the whole reason
+	 * the power-save indication has a deadline on it. */
+	wlan->beacons++;
 	if (entry.beacon_interval)
 		wlan->bss.beacon_interval = entry.beacon_interval;
 	if (entry.dtim_period)
@@ -758,6 +852,7 @@ void j36_wlan_on_scan_result(struct j36_wifi *w, const u8 *bssid, u16 capability
 
 	if (!wlan || !channel)
 		return;
+	wlan->silence = 0;
 
 	memcpy(entry.bssid, bssid, ETH_ALEN);
 	entry.capability = capability;
@@ -794,6 +889,11 @@ void j36_wlan_on_scan_done(struct j36_wifi *w, u8 sequence)
 
 	if (!wlan || !wlan->scan_request || sequence != wlan->scan_sequence)
 		return;
+	/* A sweep that ran to its own SCAN_DONE is the strongest evidence this
+	 * driver ever gets that the chip is working, so it clears the recovery
+	 * budget too -- the limit is meant to bound one episode, not a lifetime. */
+	wlan->silence = 0;
+	wlan->recoveries = 0;
 	j36_wlan_finish_scan(wlan, false);
 }
 
@@ -811,6 +911,7 @@ void j36_wlan_on_channel_grant(struct j36_wifi *w, u8 token)
 	    token != wlan->channel_token)
 		return;
 
+	wlan->silence = 0;
 	wlan->channel_held = true;
 	j36_wlan_cmd_sta_record(w, &wlan->bss, J36_STA_STATE_1, 0);
 	if (j36_wlan_cmd_auth(w, &wlan->bss)) {
@@ -962,12 +1063,27 @@ void j36_wlan_on_ap_disconnect(struct j36_wifi *w, const u8 *frame,
 	j36_wlan_end_link(wlan, reason, false);
 }
 
+/*
+ * EVENT_BSS_BEACON_TIMEOUT: the firmware's own supervision gave up on the AP.
+ *
+ * Reported rather than merely acted on, because the two ways of reaching it look
+ * identical from userspace and are not the same fault at all.  One is a station
+ * that walked out of range, and then the beacon count below is large and the
+ * signal is poor.  The other is a firmware that was never told how often to
+ * expect a beacon -- see j36_wlan_try_pm() -- and then the count is zero and the
+ * signal is whatever the scan last read, which is how this was found.
+ */
 void j36_wlan_on_beacon_timeout(struct j36_wifi *w)
 {
 	struct j36_wlan *wlan = j36_wlan_of(w);
 
 	if (!wlan)
 		return;
+	if (wlan->state == J36_WLAN_CONNECTED)
+		dev_info(w->dev,
+			 "%s: the firmware reported a beacon timeout for %pM after %u of its beacons reached us, last signal %d dBm, power-save indication %s\n",
+			 wlan->ndev->name, wlan->bss.bssid, wlan->beacons,
+			 wlan->bss.signal, wlan->pm_sent ? "sent" : "NEVER SENT");
 	j36_wlan_end_link(wlan, WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY, false);
 }
 
@@ -1022,6 +1138,16 @@ static bool j36_wlan_is_eapol(const struct sk_buff *skb)
  * the queue rather than dropping it, because the frame that could not get a page
  * is very often the one an EAPOL exchange is waiting on and TCP is not the only
  * thing that would notice it going missing.
+ *
+ * AND IT DOES NOT WAIT FOR A PAGE, which is the whole point of the may_wait
+ * argument below.  Waiting here is waiting with w->lock held, and the lock is
+ * what the event pump needs -- so the sixteen frames of a busy poll could spend
+ * six seconds between them not sending, during which no TX_DONE came back to
+ * credit the pages being waited on, no beacon or scan result was read out of a
+ * receive FIFO that was filling, and .scan and .connect sat on the mutex.  That
+ * is the shape of "the link drops when I run apt update": nothing was lost on
+ * the air, the driver simply stopped servicing the chip under its own load.
+ * Refused now means requeued now, and the next tick is a jiffy away.
  */
 static unsigned int j36_wlan_drain_tx(struct j36_wlan *wlan)
 {
@@ -1039,19 +1165,27 @@ static unsigned int j36_wlan_drain_tx(struct j36_wlan *wlan)
 		int ret;
 
 		ret = j36_wlan_cmd_tx_ethernet(w, skb->data, len,
-					       wlan->sta_index, is_1x);
-		if (ret == -EBUSY && ++wlan->tx_stalls < J36_WLAN_TX_STALL_LIMIT) {
-			skb_queue_head(&wlan->tx_queue, skb);
-			wlan->tx_deferred++;
-			break;
-		}
+					       wlan->sta_index, is_1x, false);
 		if (ret == -EBUSY) {
+			const ktime_t now = ktime_get();
+
+			if (!wlan->tx_stalls++)
+				wlan->tx_stall_since = now;
+			if (ktime_before(now,
+					 ktime_add_ms(wlan->tx_stall_since,
+						      J36_WLAN_TX_STALL_MS))) {
+				skb_queue_head(&wlan->tx_queue, skb);
+				wlan->tx_deferred++;
+				break;
+			}
 			/* Rate limited because the point of getting here is that
 			 * there are a lot of frames behind this one and every one
 			 * of them is about to say the same thing. */
 			dev_warn_ratelimited(w->dev,
-					     "%s: no transmit page after %u polls; dropping the frame at the head of the queue rather than stalling the interface behind it\n",
-					     wlan->ndev->name, wlan->tx_stalls);
+					     "%s: no transmit page in %u ms across %u polls; dropping the frame at the head of the queue rather than stalling the interface behind it\n",
+					     wlan->ndev->name,
+					     J36_WLAN_TX_STALL_MS,
+					     wlan->tx_stalls);
 			wlan->tx_starved++;
 		}
 
@@ -1109,21 +1243,39 @@ static void j36_wlan_check_deadlines(struct j36_wlan *wlan)
 
 	switch (wlan->state) {
 	case J36_WLAN_CHANNEL:
+		/* CMD_CH_PRIVILEGE was accepted -- the page accounting says so --
+		 * and EVENT_CH_PRIVILEGE never came back.  Nothing on the air was
+		 * involved, so this one is the chip and it counts. */
+		if (ktime_after(now, wlan->deadline)) {
+			wlan->silence++;
+			j36_wlan_join_failed(wlan,
+					     WLAN_STATUS_UNSPECIFIED_FAILURE);
+		}
+		break;
 	case J36_WLAN_AUTH:
 	case J36_WLAN_ASSOC:
+		/* Deliberately NOT counted.  An authentication or association
+		 * that goes unanswered is an AP not answering, and re-arming the
+		 * radio over it would be treating a crowded channel as a broken
+		 * chip. */
 		if (ktime_after(now, wlan->deadline))
 			j36_wlan_join_failed(wlan,
 					     WLAN_STATUS_UNSPECIFIED_FAILURE);
 		break;
 	case J36_WLAN_CONNECTED:
 		j36_wlan_settle_keys(wlan);
+		/* Here and not only from the beacon handler, because the case
+		 * this exists for is the one where no beacon ever arrives. */
+		j36_wlan_try_pm(wlan);
 		break;
 	default:
 		break;
 	}
 
-	if (wlan->scan_request && ktime_after(now, wlan->scan_deadline))
+	if (wlan->scan_request && ktime_after(now, wlan->scan_deadline)) {
+		wlan->silence++;
 		j36_wlan_finish_scan(wlan, true);
+	}
 }
 
 /*
@@ -1157,6 +1309,67 @@ static void j36_wlan_radio_lost(struct j36_wlan *wlan)
 	wlan->running = false;
 }
 
+/*
+ * The step between "one operation went unanswered" and "the radio is gone".
+ *
+ * There is a failure mode on this part that has no message of its own and used
+ * to have no end either: the firmware keeps taking commands -- they are credited,
+ * the page accounting is happy, nothing returns an error -- and answers none of
+ * them.  Every scan is submitted and then abandoned on its own deadline, every
+ * channel request times out, and from userspace it reads as an SSID that has
+ * stopped existing.  MVII's own log has three minutes and eighteen scans of it
+ * with not one line from this driver.
+ *
+ * The likeliest cause is now fixed at the source -- a teardown whose
+ * BSS_ACTIVATE_CTRL "on" was refused leaves the AIS network deactivated, and a
+ * deactivated network behaves in exactly this way -- but "likeliest" is not
+ * "only", and an interface that wedges until reboot is the worst outcome
+ * available.  So the network is re-armed, which is the largest thing that can be
+ * done to this chip short of downloading the firmware again, and if that does not
+ * take then the radio is declared lost with a message that says which of the two
+ * it was.
+ *
+ * Bounded, and the bound resets on the first scan that completes normally: the
+ * budget is meant to stop a re-arm loop inside one episode, not to ration a
+ * device's lifetime.
+ */
+static void j36_wlan_recover(struct j36_wlan *wlan)
+{
+	struct j36_wifi *w = wlan->w;
+
+	wlan->silence = 0;
+	wlan->recoveries++;
+
+	if (wlan->recoveries > J36_WLAN_RECOVER_LIMIT) {
+		dev_err(w->dev,
+			"%s: the firmware is still not answering after %u re-arms of the station network, and there is no reset short of the whole bring-up\n",
+			wlan->ndev->name, J36_WLAN_RECOVER_LIMIT);
+		j36_wlan_radio_lost(wlan);
+		return;
+	}
+
+	dev_warn(w->dev,
+		 "%s: %u firmware operations in a row were accepted and never answered; re-arming the station network (attempt %u of %u)\n",
+		 wlan->ndev->name, J36_WLAN_SILENCE_RECOVER, wlan->recoveries,
+		 J36_WLAN_RECOVER_LIMIT);
+
+	/*
+	 * What is in flight is finished first, and finished honestly: cfg80211 is
+	 * owed exactly one answer to any outstanding .connect and .scan, and
+	 * tearing the network down underneath one leaves wpa_supplicant waiting
+	 * for an event that is never coming -- which is the same wedge by another
+	 * road.
+	 */
+	j36_wlan_end_link(wlan, WLAN_REASON_UNSPECIFIED, false);
+	j36_wlan_finish_scan(wlan, true);
+	j36_wlan_release_channel(wlan);
+	j36_wlan_flush_tx(wlan);
+
+	if (j36_wlan_cmd_rearm(w))
+		dev_err(w->dev, "%s: the station network would not re-arm\n",
+			wlan->ndev->name);
+}
+
 static void j36_wlan_poll_work(struct work_struct *work)
 {
 	struct j36_wlan *wlan = container_of(to_delayed_work(work),
@@ -1181,6 +1394,15 @@ static void j36_wlan_poll_work(struct work_struct *work)
 	if (!w->firmware_alive) {
 		j36_wlan_radio_lost(wlan);
 		goto out;
+	}
+	/* And this is the other one, which reports nothing at all: a firmware
+	 * that takes every command and answers none.  Checked here rather than
+	 * inside the deadline pass so the recovery is not run from underneath the
+	 * state machine it is about to reset. */
+	if (wlan->silence >= J36_WLAN_SILENCE_RECOVER) {
+		j36_wlan_recover(wlan);
+		if (!wlan->running)
+			goto out;
 	}
 	queue_delayed_work(wlan->wq, &wlan->poll,
 			   j36_wlan_poll_delay(wlan, handled));
@@ -1212,6 +1434,11 @@ static int j36_wlan_open(struct net_device *ndev)
 	 * caller of the same command at attach.
 	 */
 	j36_wlan_cmd_rx_filter(w);
+	/* A fresh interface starts with a clean account of the firmware, so a
+	 * count left over from before it went down cannot re-arm a radio that was
+	 * never asked to do anything yet. */
+	wlan->silence = 0;
+	wlan->recoveries = 0;
 	wlan->running = true;
 	mutex_unlock(&w->lock);
 
@@ -1376,6 +1603,8 @@ static int j36_wlan_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 	wlan->gtk_ready = false;
 	wlan->key_ready = false;
 	wlan->pm_sent = false;
+	wlan->pm_deadline = 0;
+	wlan->beacons = 0;
 	wlan->aid = 0;
 	wlan->tx_stalls = 0;
 
@@ -1791,17 +2020,19 @@ void j36_wlan_net_trace(struct j36_wifi *w)
 	if (!wlan)
 		return;
 	dev_info(w->dev,
-		 "wlan: %u scans, %u BSS known, %u joins, %u refused, %u links lost; peer record %u%s, keys %s/%s%s; tx %u frames %u deferred %u backpressure %u starved (%u deep now); rx %u events %u mgmt %u data\n",
+		 "wlan: %u scans, %u BSS known, %u joins, %u refused, %u links lost, %u re-arms; peer record %u%s, keys %s/%s%s, power-save %s; tx %u frames %u deferred %u backpressure %u starved (%u deep now); rx %u events %u mgmt (%u of them this AP's beacons) %u data\n",
 		 wlan->scans, wlan->result_count, wlan->joins,
-		 wlan->join_failures, wlan->link_losses,
+		 wlan->join_failures, wlan->link_losses, wlan->recoveries,
 		 wlan->sta_index,
 		 wlan->sta_confirmed ? " (firmware confirmed)"
 				     : " (no ACTIVATE_STA_REC)",
 		 wlan->ptk_ready ? "PTK" : "-",
 		 wlan->gtk_ready ? "GTK" : "-",
 		 wlan->key_ready ? ", encryption enabled" : "",
+		 wlan->pm_sent ? "indicated" : "NOT indicated",
 		 w->hif_stats.tx_frames, wlan->tx_deferred,
 		 wlan->tx_backpressure, wlan->tx_starved,
 		 skb_queue_len(&wlan->tx_queue), w->hif_stats.rx_events,
-		 w->hif_stats.rx_management, w->hif_stats.rx_data);
+		 w->hif_stats.rx_management, wlan->beacons,
+		 w->hif_stats.rx_data);
 }

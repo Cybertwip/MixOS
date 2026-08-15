@@ -774,7 +774,7 @@ struct j36_hif_stats {
  * learning the real DTIM period and telling the firmware to assume one.  See
  * j36_wlan_cmd_pm_connected(): the alternative to a fabricated DTIM period is
  * never sending INDICATE_PM_CONNECTED at all, which is strictly worse. */
-#define J36_WLAN_PM_BEACON_WAIT_MS	1500
+#define J36_WLAN_PM_BEACON_WAIT_MS	1500u
 /* The window between "the pairwise key went in" and "no group key is coming".
  * The supplicant installs the GTK immediately after the PTK in every handshake
  * that has one; this only exists so a network that has not got one still opens
@@ -1013,6 +1013,9 @@ int j36_wlan_cmd_configure(struct j36_wifi *w);
  * sent from both places this driver has an equivalent of: the adapter start and
  * every interface up. */
 int j36_wlan_cmd_rx_filter(struct j36_wifi *w);
+/* Rebuild the per-network state a firmware that has stopped answering may have
+ * lost, without redoing the firmware download. */
+int j36_wlan_cmd_rearm(struct j36_wifi *w);
 int j36_wlan_cmd_scan(struct j36_wifi *w, bool active, u8 *sequence_out);
 int j36_wlan_cmd_channel_request(struct j36_wifi *w, const struct j36_wlan_bss *bss,
 				 u8 *token_out);

@@ -194,8 +194,8 @@ static int j36_wlan_command(struct j36_wifi *w, u8 cid, bool set,
  * confirmed)" in this driver's own status line -- so unicast stays on TC1's
  * twenty pages and only the genuinely group-addressed frames take TC5's one,
  * which is all stock ever needs at a time.  A starve on TC5 is no longer fatal
- * either: j36_wlan_drain_tx() retries at the head of the queue up to
- * J36_WLAN_TX_STALL_LIMIT and then drops that one frame and moves on.
+ * either: j36_wlan_drain_tx() retries at the head of the queue for
+ * J36_WLAN_TX_STALL_MS and then drops that one frame and moves on.
  *
  * And what does a freshly associated station send?  A DHCPDISCOVER, to
  * ff:ff:ff:ff:ff:ff, because it has no address yet to be spoken to at.  Then
@@ -570,21 +570,26 @@ int j36_wlan_cmd_bss_reactivate(struct j36_wifi *w)
  * cannot cost a buffered frame.  It sets the cadence the firmware's supervision
  * expects and nothing else.  The day this driver learns to power-save, this
  * argument stops being true and the fallback has to go with it.
+ *
+ * The beacon interval falls back too, to the 100 TU every consumer AP on this
+ * band ships with, and for a narrower reason: it is normally known -- the fixed
+ * fields of a PROBE RESPONSE carry it just as a beacon's do, so an active scan
+ * gets it -- but a BSS learned only from EVENT_SCAN_RESULT has no value for it at
+ * all, and 100 TU is a far better guess than not sending the command.
  */
 int j36_wlan_cmd_pm_connected(struct j36_wifi *w, const struct j36_wlan_bss *bss,
 			      u16 aid, bool dtim_fallback)
 {
 	u8 command[12] = {};
 
-	if (!bss->beacon_interval)
-		return -EAGAIN;
-	if (!bss->dtim_period && !dtim_fallback)
+	if (!dtim_fallback && (!bss->dtim_period || !bss->beacon_interval))
 		return -EAGAIN;
 
 	command[0] = J36_NETWORK_TYPE_AIS;
 	command[1] = bss->dtim_period ? bss->dtim_period : 1;
 	j36_put_le16(command + 2, aid);
-	j36_put_le16(command + 4, bss->beacon_interval);
+	j36_put_le16(command + 4, bss->beacon_interval ? bss->beacon_interval :
+							 100);
 	return j36_wlan_command(w, J36_CMD_INDICATE_PM_CONNECTED, true, command,
 				sizeof(command));
 }
@@ -1135,6 +1140,51 @@ int j36_wlan_cmd_rx_filter(struct j36_wifi *w)
 			      J36_RX_FILTER_BROADCAST);
 	return j36_wlan_command(w, J36_CMD_SET_RX_FILTER, true, payload,
 				sizeof(payload));
+}
+
+/*
+ * The narrowest useful thing that can be done to a firmware that has stopped
+ * answering.
+ *
+ * There is no reset command on this part.  The only true reset is the whole
+ * four-stage bring-up, which means downloading the firmware again, and that is
+ * not something to reach for while an interface is up.  What CAN be rebuilt from
+ * here is the per-network state -- and the per-network state is what actually
+ * goes missing: a teardown whose BSS_ACTIVATE_CTRL "on" was refused leaves the
+ * AIS network deactivated, and a deactivated network accepts every command that
+ * follows without complaint and answers none of them.  From outside, that is
+ * indistinguishable from a dead radio.
+ *
+ * So: the power-management context released, the power-save profile and the
+ * receive filter restated, and the network itself cycled -- the same commands
+ * j36_wlan_cmd_configure() establishes them with, in the same order.  The station
+ * address and the domain table are deliberately NOT re-sent: they are
+ * adapter-wide rather than per-network, they were accepted at start-up, and the
+ * channel list alone is several more pages on a class that has four.
+ */
+int j36_wlan_cmd_rearm(struct j36_wifi *w)
+{
+	u8 ps_profile[4] = {};
+	int ret;
+
+	if (!w->firmware_alive)
+		return -ENODEV;
+
+	ret = j36_wifi_hif_own(w);
+	if (ret)
+		return ret;
+
+	j36_wlan_cmd_pm_abort(w);
+
+	ps_profile[0] = J36_NETWORK_TYPE_AIS;
+	ps_profile[1] = 0;		/* Param_PowerModeCAM	*/
+	j36_wlan_command(w, J36_CMD_POWER_SAVE_MODE, true, ps_profile,
+			 sizeof(ps_profile));
+
+	ret = j36_wlan_cmd_rx_filter(w);
+	if (ret)
+		return ret;
+	return j36_wlan_cmd_bss_reactivate(w);
 }
 
 /*

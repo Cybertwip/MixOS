@@ -424,7 +424,9 @@ MODULE_PARM_DESC(chgreboot,
  * 4.2 V is the CV target it regulates to.  The margin therefore has nothing to
  * separate -- it only has to swallow the fact that VCHR and BATSNS reach the ADC
  * through different dividers, so a systematic offset between the two channels
- * cannot tip the comparison.  300 mV is that, with room left on both sides.
+ * cannot tip the comparison -- and, as the next block explains, the swing the
+ * charge path itself puts on the pin, which is the larger of the two and is what
+ * the margin was originally sized too small for.
  *
  * IF THIS BOARD'S 5 V IS A TRUE BOOST RATHER THAN A SWITCH the test cannot see the
  * difference, because both read about 5 V, and the answer is then the USB driver's
@@ -436,10 +438,60 @@ MODULE_PARM_DESC(chgreboot,
  * it) or a volt apart (a boost, and vbus=-1 is the lever).
  */
 #define J36_VCHR_ABSENT_MV		3000
-#define J36_VCHR_OVER_VBAT_MV		300
+
+/*
+ * ══ WHAT THE BOARD ACTUALLY MEASURED, AND WHY 300 mV WAS A RELAY ══
+ *
+ * The paragraph above asked the board a question and the board answered it.  With
+ * the cable out and the port up, the charging: line reads
+ *
+ *     VCHR 3412 mV ... VBAT 3353 mV        VCHR 3435 mV ... VBAT 3384 mV
+ *
+ * and with a charger in
+ *
+ *     VCHR 4894 ... VBAT 3571              VCHR 4978 ... VBAT 3584
+ *
+ * So it is a SWITCH, not a boost -- the two populations are a volt and a half
+ * apart -- and the mechanism was right.  The number was not.  300 mV is smaller
+ * than the swing the veto's own actuator puts on the pin, and that made the test
+ * into an oscillator: hold the charger off and the sink comes off the net, VCHR
+ * rises by about a third of a volt and clears bat+300, so the charger is armed;
+ * arm it and the CSDAC pulls the same third of a volt back out, so VCHR falls
+ * under bat+300 and the charger is held off again.  One poll each way, 112 flips
+ * in the log, and every flip a plug edge -- which forgets three median rings,
+ * re-runs BC1.2 and, on the port, reads as an over-current and a VBUS_ERROR.
+ * The hub never got two consecutive seconds of a rail to start into.
+ *
+ * A LOOP CANNOT BE FIXED BY A LARGER MARGIN ON THE SAME COMPARISON, because both
+ * of its states are legitimate readings of the same net.  It is fixed by moving
+ * the bar out of the actuator's reach entirely: a CHARGER-CLASS bar, above
+ * anything a pack-derived rail can reach and below anything a charger sags to.
+ * The pack tops out at the 4.2 V CV target and the 4.3 V over-voltage cutoff
+ * this driver programs; USB says 4.4 V at the far end of a bad cable and the one
+ * in this log holds 4.89 V while sinking 1.4 A.  4400 to 4600 is that gap, and
+ * the CSDAC's third of a volt no longer reaches across it from either side.
+ *
+ * The pack term is kept, clamped into that window, so a cell far from full does
+ * not have to be trusted to be low -- it only ever raises the bar, never lowers
+ * it below the charger class.
+ */
+#define J36_VCHR_OVER_VBAT_MV		800
+#define J36_VCHR_CHARGER_MIN_MV		4400
+#define J36_VCHR_CHARGER_MAX_MV		4600
 /* Asymmetric on purpose: added to the bar only while the veto is already holding,
  * so leaving it takes more than entering it did.  See the poll. */
-#define J36_VCHR_VETO_HYST_MV		100
+#define J36_VCHR_VETO_HYST_MV		200
+
+/*
+ * And a debounce on the ARM, which is the thing with teeth.  The bar above should
+ * make this unreachable; it is here because the failure it prevents is a port
+ * that browns out once a second, and the cost of preventing it is that a genuine
+ * cable starts charging five seconds late.  Asymmetric, in the direction that
+ * protects the port: the path comes DOWN on the first poll that asks for it and
+ * only goes back UP after this many consecutive polls have all seen a real
+ * charger on the pin.
+ */
+#define J36_CHR_HOLDOFF_POLLS		5
 
 /* Five, from stock, and a median rather than a mean: the only failure this ADC
  * actually shows is a single bad conversion, which a median rejects completely
@@ -780,6 +832,8 @@ struct j36_pmic {
 	bool chr_held_off;	/* the charge path is disabled because the only
 				 * thing on CHRIN is this board's own DRVVBUS;
 				 * held so the line is one per run of the state */
+	unsigned int chr_holdoff_run;	/* consecutive polls disagreeing with
+					 * chr_held_off; see J36_CHR_HOLDOFF_POLLS */
 	unsigned int poll_kicks;	/* rate-limits j36_charging_line() */
 
 	/* When an operator's CV write stops the re-arm stamping 4200 back over
@@ -2199,11 +2253,32 @@ static int j36_gauge_percent(struct j36_pmic *p, bool online, int bat_mv,
 		/* Discharging, or a current this driver could not read -- which
 		 * is not a charge, and stock does not treat it as one either.
 		 * Here the terminal voltage IS the cell, so the curve is the best
-		 * estimate there is and the level walks towards it. */
+		 * estimate there is and the level walks towards it.
+		 *
+		 * ── TOWARDS IT MEANS BOTH WAYS, AND IT ONLY WENT ONE ──
+		 *
+		 * This used to be `if (soc_dep < target_dep) ++soc_dep' and
+		 * nothing else: depletion could rise and never fall.  On a board
+		 * where nothing else moves the level downward that is a ratchet.
+		 * Every sag drags the level towards empty and the recovery cannot
+		 * bring it back, because the only path that decreases depletion
+		 * is the coulomb integrator and the integrator only runs while a
+		 * charger is delivering current.  Run the port into a load that
+		 * pulls the system node under the curve's bottom row -- which the
+		 * oscillating charge path did once a second, at over an amp --
+		 * and the meter walks to 0% and stays at 0% for the rest of the
+		 * session, whatever the cell recovers to.  That is "the battery
+		 * says 0% and it is mostly full": not a scale error, a latch.
+		 *
+		 * The same thirty-second gate governs both directions, so a
+		 * transient cannot lift the level any faster than it could drop
+		 * it, and stock's oam_run converges in both directions too. */
 		p->soc_car_base = -1;
 		p->soc_car = 0;
 		if (p->soc_dep < target_dep)
 			++p->soc_dep;
+		else if (p->soc_dep > target_dep)
+			--p->soc_dep;
 		p->soc_slew = now;
 	}
 
@@ -2545,9 +2620,19 @@ static void j36_pmic_poll(struct work_struct *work)
 		 */
 		int bar = J36_VCHR_ABSENT_MV;
 
-		if (sourcing && bat_now_mv > 0 &&
-		    bat_now_mv + J36_VCHR_OVER_VBAT_MV > bar)
-			bar = bat_now_mv + J36_VCHR_OVER_VBAT_MV;
+		/*
+		 * A BATSNS that would not convert used to leave the bar at 3000
+		 * mV while the pad was up -- which is the one value our own
+		 * switch clears, so a failed conversion un-vetoed the port.  The
+		 * pad being up is enough to know the pin has an owner, so the
+		 * charger-class floor stands whether or not the pack was read.
+		 */
+		if (sourcing)
+			bar = bat_now_mv > 0
+			      ? clamp(bat_now_mv + J36_VCHR_OVER_VBAT_MV,
+				      J36_VCHR_CHARGER_MIN_MV,
+				      J36_VCHR_CHARGER_MAX_MV)
+			      : J36_VCHR_CHARGER_MIN_MV;
 
 		/*
 		 * Hysteresis, and it is on the way OUT of the veto rather than
@@ -2690,15 +2775,21 @@ static void j36_pmic_poll(struct work_struct *work)
 	 * open only while this board is feeding its own charger input.
 	 */
 	held_off = chrdet && sourcing && p->vchr_vetoed;
-	if (p->chr_held_off != held_off) {
+	if (held_off == p->chr_held_off) {
+		p->chr_holdoff_run = 0;
+	} else if (held_off || ++p->chr_holdoff_run >= J36_CHR_HOLDOFF_POLLS) {
+		p->chr_holdoff_run = 0;
 		p->chr_held_off = held_off;
-		dev_info(p->dev,
-			 held_off
-			 ? "charge path off: the only supply on CHRIN is this port's own DRVVBUS, and a charger armed against it would sink the 5 V the port is sourcing -- a hub cannot start into that\n"
-			 : "charge path on: the input cleared the pack, so there is a real supply on CHRIN to charge from\n");
+		if (held_off)
+			dev_info(p->dev,
+				 "charge path off: the only supply on CHRIN is this port's own DRVVBUS, and a charger armed against it would sink the 5 V the port is sourcing -- a hub cannot start into that\n");
+		else
+			dev_info(p->dev,
+				 "charge path on: the input has cleared the charger bar for %u polls running, so there is a real supply on CHRIN to charge from\n",
+				 J36_CHR_HOLDOFF_POLLS);
 	}
 
-	j36_charger_arm(p, chrdet && !held_off);
+	j36_charger_arm(p, chrdet && !p->chr_held_off);
 
 	/* AFTER the arm, not before: charge_step_ma is read back out of CHR_CON4
 	 * inside it, so sampling it above would publish the previous second's
