@@ -2176,7 +2176,9 @@ expand_root() {
     # it is what turns resize2fs's silence into a percentage.  Its absence costs the
     # progress bar and nothing else, so it is taken outside the loop above and its
     # failure is not a failure.  It shares the whole library closure with e2fsck.
-    expand_take dumpe2fs "$EXPAND_BIN" || true
+    if ! expand_take dumpe2fs "$EXPAND_BIN"; then
+        say "expand: no dumpe2fs on the rootfs; the resize runs without a percentage"
+    fi
     # LD_LIBRARY_PATH as well as the copies being in /lib: the default search path is a
     # property of how glibc was configured, and this costs one environment variable.
     export LD_LIBRARY_PATH=/lib
