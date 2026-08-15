@@ -122,17 +122,33 @@ public:
                    int w, int h, const QRect &into);
 
     /*
-     * The strip that goes over the picture: an ARGB image and where on the
+     * The things that go over the picture: an ARGB image and where on the
      * framebuffer to put it.  Kept as a texture and re-blended by every
      * drawFrame() until it is replaced or cleared, so the caller should call this
-     * only when the strip's CONTENT changes -- once a second for the clock, not
-     * once a frame.  Any QImage format is taken; it is converted here.
+     * only when the CONTENT changes -- once a second for the clock, not once a
+     * frame.  Any QImage format is taken; it is converted here.
      *
-     * Alpha is honoured, which is the whole reason it is a texture and not a
-     * second fill: the bar over a film is meant to be see-through.
+     * Alpha is honoured, which is the whole reason these are textures and not
+     * fills: the bar over a film is meant to be see-through.
+     *
+     * THERE ARE TWO OF THEM, AND THE SECOND ONE IS NOT A CONVENIENCE.  Everything
+     * that has to appear over a film has to be blended by this pass, because this
+     * pass is what is actually in the scanout -- a Qt widget drawn over the film
+     * is a memcpy that the next frame overwrites twenty-five times a second,
+     * which is not a stacking-order problem and cannot be fixed with raise().
+     * The transport strip was the first such thing and the volume bar is the
+     * second; they change on completely different schedules and live in
+     * completely different rectangles, so folding them into one texture would
+     * mean re-rendering the strip every time the volume moved and carrying a
+     * texture the size of both.  Two slots, drawn in order, Volume last because a
+     * volume bar over the clock is right and the clock over the volume bar is
+     * not.
      */
-    void setOverlay(const QImage &argb, const QRect &at);
-    void clearOverlay();
+    enum Layer { ChromeLayer, VolumeLayer, LayerCount };
+    void setOverlay(Layer which, const QImage &argb, const QRect &at);
+    void clearOverlay(Layer which);
+    /* Both at once, for the way out of a film. */
+    void clearOverlays();
 
     /*
      * Fill a rectangle of the scanout, in framebuffer coordinates.  Used to

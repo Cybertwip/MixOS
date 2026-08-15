@@ -349,6 +349,11 @@ private:
     /* The mixer, asked once per track: a muted card is the other way to have no
      * sound, and it is not the player's to fix silently. */
     QString mixerComplaint() const;
+    /* Re-derive m_mixerNote and re-stamp m_volGeneration.  True when the text
+     * changed and something on screen has to be redrawn. */
+    bool refreshMixerNote();
+    /* What the note strip actually shows: see m_mixerNote. */
+    QString noteText() const { return m_note.isEmpty() ? m_mixerNote : m_note; }
     /*
      * ffmpeg's decode arguments for one audio stream, shared by the music chain and
      * by the video page's fallback chain.
@@ -444,6 +449,24 @@ private:
     bool m_paused = false;
 
     QString m_note;
+
+    /*
+     * The mute/zero-volume complaint, KEPT APART FROM m_note and for one reason:
+     * m_note is where every transient thing the player has to say ends up -- "end
+     * of file", "ffmpeg exited 1", whatever a child wrote to stderr -- and the
+     * mixer complaint has a completely different lifetime.  It is true for
+     * exactly as long as the mixer says so, across starts, stops and end of file,
+     * and it stops being true the instant somebody presses VOL+.
+     *
+     * Sharing one member meant whichever was written last won, in both
+     * directions: a re-derived mixer note erasing the reason a child died, and a
+     * child's message leaving a stale "press VOL+" that nothing would ever clear.
+     * noteText() puts them back in order -- m_note first, because a chain that is
+     * broken outranks a mixer that is merely down.
+     */
+    QString m_mixerNote;
+    /* Volume::generation() as of the last time m_mixerNote was derived. */
+    unsigned m_volGeneration = 0;
 
     /*
      * The last thing a child of the music chain wrote to stderr, kept apart from

@@ -215,7 +215,7 @@ void MediaPage::layOutList()
 {
     const QRect card(Theme::Margin, Theme::Margin,
                      width() - 2 * Theme::Margin, height() - 2 * Theme::Margin);
-    const int foot = m_note.isEmpty() ? 10 : 30;
+    const int foot = noteText().isEmpty() ? 10 : 30;
     m_list->setGeometry(card.x() + 6, card.y() + 40, card.width() - 12,
                         qMax(24, card.height() - 40 - foot));
 }
@@ -991,6 +991,21 @@ QString MediaPage::mixerComplaint() const
     return QString();
 }
 
+bool MediaPage::refreshMixerNote()
+{
+    /*
+     * Stamped BEFORE the derive and not after: mixerComplaint() forks amixer and
+     * Volume::read() calls remember() with the answer, which is itself a move of
+     * the counter the first time it disagrees with what was cached.  Stamping
+     * afterwards would take that move as somebody else's and fork again on the
+     * next tick, and again on the one after -- twice a second, forever.
+     */
+    m_volGeneration = Volume::generation();
+    const QString was = m_mixerNote;
+    m_mixerNote = mixerComplaint();
+    return m_mixerNote != was;
+}
+
 bool MediaPage::ffmpegHasAlsa() const
 {
     /*
@@ -1347,13 +1362,15 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
          */
         m_note = tr("no sound card on this device");
     } else if (!m_videoHasAudio) {
-        m_note = mixerComplaint();      /* a silent clip, and that is not a fault */
+        m_note.clear();                 /* a silent clip, and that is not a fault */
+        refreshMixerNote();
     } else if (alsa) {
         m_videoAudio = new QProcess(this);
         connect(m_videoAudio, &QProcess::readyReadStandardError,
                 this, &MediaPage::onChildStderr);
         m_videoAudio->start(ffmpegPath(), audioDecodeArgs(item.path, startAt, m_device));
-        m_note = mixerComplaint();
+        m_note.clear();
+        refreshMixerNote();
     } else {
         /*
          * No alsa outdev in this ffmpeg, so the sound goes down a pipe into aplay
@@ -1686,7 +1703,8 @@ void MediaPage::playQueued(double startAt)
 
     m_paused = false;
     m_childSaid.clear();
-    m_note = mixerComplaint();
+    m_note.clear();
+    refreshMixerNote();
     if (startAt <= 0.0 || m_duration <= 0.0) {
         m_duration = probeDuration(track.path);
         m_trackTitle = probeTitle(track.path);
@@ -1826,7 +1844,7 @@ void MediaPage::dropFrame()
     m_chromeKey.clear();
     m_glShown = false;
     if (m_gl)
-        m_gl->clearOverlay();
+        m_gl->clearOverlays();
     m_gl = nullptr;
 }
 
@@ -2022,6 +2040,27 @@ void MediaPage::onChildStderr()
 
 void MediaPage::tick()
 {
+    /*
+     * ── THE NOTE HAS TO STOP BEING TRUE WHEN IT STOPS BEING TRUE ──
+     *
+     * "the output is muted -- press VOL+" is set once, where the sound chain is
+     * started, and pressing VOL+ was the one thing that could not clear it: the
+     * volume keys are handled by the shell and no page hears about them, which is
+     * deliberate and right, and it left this page with a note telling the user to
+     * do something they had already done.
+     *
+     * Watching a counter rather than the mixer is what makes this affordable.
+     * Volume::read() forks amixer, and doing that twice a second for the length
+     * of a film -- on an A7 that is also decoding one -- to re-derive a line of
+     * text that is usually empty would be absurd.  The counter moves only when
+     * the level or the mute actually changed, so the fork happens on the press
+     * and not on the tick.
+     */
+    if (m_volGeneration != Volume::generation() && refreshMixerNote()) {
+        layOutList();           /* the strip appearing or going costs the list a row */
+        refresh();              /* the chrome key includes the note; this re-renders it */
+    }
+
     if (m_view == ViewVideo) {
         refresh();
         return;
@@ -2198,7 +2237,7 @@ QString MediaPage::chromeRight() const
 QRect MediaPage::chromeRect() const
 {
     const int barH = 34;
-    const int noteH = m_note.isEmpty() ? 0 : 22;
+    const int noteH = noteText().isEmpty() ? 0 : 22;
     return QRect(0, height() - barH - noteH, width(), barH + noteH);
 }
 
@@ -2218,13 +2257,14 @@ void MediaPage::paintChrome(QPainter &p) const
     p.drawText(bar.adjusted(10, 0, -10, 0), Qt::AlignRight | Qt::AlignVCenter,
                chromeRight());
 
-    if (!m_note.isEmpty()) {
+    const QString note = noteText();
+    if (!note.isEmpty()) {
         const QRect noteRect(0, bar.top() - 22, width(), 22);
         p.fillRect(noteRect, QColor(8, 9, 14, 180));
         p.setFont(Theme::font(11));
         p.setPen(Theme::orange());
         p.drawText(noteRect.adjusted(10, 0, -10, 0),
-                   Qt::AlignLeft | Qt::AlignVCenter, m_note);
+                   Qt::AlignLeft | Qt::AlignVCenter, note);
     }
 }
 
@@ -2235,7 +2275,7 @@ void MediaPage::refreshChrome(const QRect &into)
 
     const QRect cr = chromeRect();
     if (cr.isEmpty()) {
-        m_gl->clearOverlay();
+        m_gl->clearOverlay(GlVideo::ChromeLayer);
         m_chromeKey.clear();
         return;
     }
@@ -2249,7 +2289,7 @@ void MediaPage::refreshChrome(const QRect &into)
      * so a resize cannot leave a stale texture behind.
      */
     const QString key = m_showing.name + QChar(0x1f) + chromeRight() + QChar(0x1f) +
-                        m_note + QChar(0x1f) + QString::number(cr.width()) + "x" +
+                        noteText() + QChar(0x1f) + QString::number(cr.width()) + "x" +
                         QString::number(cr.height());
     if (key == m_chromeKey)
         return;
@@ -2271,7 +2311,28 @@ void MediaPage::refreshChrome(const QRect &into)
         sp.translate(-cr.topLeft());
         paintChrome(sp);
     }
-    m_gl->setOverlay(strip, cr.translated(into.topLeft()));
+    m_gl->setOverlay(GlVideo::ChromeLayer, strip, cr.translated(into.topLeft()));
+}
+
+/*
+ * The volume bar, handed over as pixels because it cannot draw itself here -- see
+ * the note on setRedirected() in volume.h.  The image is already positioned in
+ * framebuffer coordinates by the shell, which is the one place that knows where
+ * the bar sits, so there is nothing to map.
+ *
+ * present() and not refresh(): this is called from the shell's key handler, and a
+ * volume press while a film is paused still has to put the bar on the glass.
+ * present() re-blends the frame that is already there, which is exactly that.
+ */
+void MediaPage::setVolumeOverlay(const QImage &argb, const QRect &at)
+{
+    if (!m_gl)
+        return;
+    if (argb.isNull() || at.isEmpty())
+        m_gl->clearOverlay(GlVideo::VolumeLayer);
+    else
+        m_gl->setOverlay(GlVideo::VolumeLayer, argb, at);
+    present();
 }
 
 void MediaPage::paintEvent(QPaintEvent *)
@@ -2350,12 +2411,13 @@ void MediaPage::paintEvent(QPaintEvent *)
      * open the card wrote its reason into a member that the browse view never
      * looked at.  That is the whole of "no audio and no message".
      */
-    if (!m_note.isEmpty()) {
+    const QString note = noteText();
+    if (!note.isEmpty()) {
         const QRectF strip(card.x() + 12, card.bottom() - 26, card.width() - 24, 20);
         const QFont small = Theme::font(11);
         p.setFont(small);
         p.setPen(Theme::orange());
         p.drawText(strip, Qt::AlignLeft | Qt::AlignVCenter,
-                   QFontMetrics(small).elidedText(m_note, Qt::ElideRight, (int)strip.width()));
+                   QFontMetrics(small).elidedText(note, Qt::ElideRight, (int)strip.width()));
     }
 }

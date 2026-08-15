@@ -90,9 +90,15 @@ const int kFreshMs = 1500;
 int g_level = -1;
 bool g_muted = false;
 QElapsedTimer g_stamp;
+unsigned g_generation = 0;
 
 void remember(int level, bool muted)
 {
+    /* Only when the answer is different, so a page watching the counter is not
+     * woken by the reads that confirm what it already knew -- nudge() alone reads
+     * on every press of a held key. */
+    if (level != g_level || muted != g_muted)
+        ++g_generation;
     g_level = level;
     g_muted = muted;
     /* start() and not restart(): restart() returns the elapsed time of a timer
@@ -204,6 +210,13 @@ void Volume::invalidate()
     g_level = -1;
     g_muted = false;
     g_stamp.invalidate();
+    /* A card arriving is exactly the kind of change the counter is for. */
+    ++g_generation;
+}
+
+unsigned Volume::generation()
+{
+    return g_generation;
 }
 
 bool Volume::read(int *percent, bool *muted)
@@ -373,7 +386,32 @@ VolumeOverlay::VolumeOverlay(QWidget *parent)
      * enough to read after the last press of a burst, short enough that it is
      * gone before it becomes part of the picture. */
     m_timer->setInterval(3000);
-    connect(m_timer, &QTimer::timeout, this, &QWidget::hide);
+    connect(m_timer, &QTimer::timeout, this, &VolumeOverlay::expire);
+}
+
+void VolumeOverlay::expire()
+{
+    m_up = false;
+    hide();
+    /* Emitted after the hide, so a redirected owner that asks isUp() from the
+     * slot gets the state this signal is about and not the one before it. */
+    emit changed();
+}
+
+void VolumeOverlay::setRedirected(bool on)
+{
+    if (m_redirected == on)
+        return;
+    m_redirected = on;
+    /* Coming back from redirected, the Qt widget must not inherit a bar that was
+     * being drawn by somebody else -- see the note in volume.h.  Going the other
+     * way, hide() is what stops Qt compositing what the new owner is about to
+     * draw; the timer is left alone either way, because the three seconds are the
+     * press's and nothing here restarted them. */
+    if (on)
+        hide();
+    else if (m_up)
+        show();
 }
 
 void VolumeOverlay::placeIn(const QRect &panel)
@@ -394,23 +432,52 @@ void VolumeOverlay::flash(int value, bool isMuted)
 {
     m_value = value;
     m_muted = isMuted;
+    m_up = true;
 
-    /* raise() on every flash, not only on the first: the shell shows and hides
-     * pages by stacking order, so a page entered since the last flash would
-     * otherwise be painted on top of this. */
-    raise();
-    show();
-    update();
+    if (!m_redirected) {
+        /* raise() on every flash, not only on the first: the shell shows and hides
+         * pages by stacking order, so a page entered since the last flash would
+         * otherwise be painted on top of this. */
+        raise();
+        show();
+        update();
+    }
     /* start() on a running single-shot timer restarts it, which is exactly the
      * behaviour wanted while a key is held: three seconds from the LAST press. */
     m_timer->start();
+    emit changed();
+}
+
+QImage VolumeOverlay::snapshot() const
+{
+    if (!m_up || width() <= 0 || height() <= 0)
+        return QImage();
+
+    /*
+     * Premultiplied because that is QPainter's own working format, and because
+     * every one of these pixels is blended: the sheet is drawn at ChromeAlpha and
+     * the corners are round, so the whole rectangle carries meaningful alpha.
+     * GlVideo::setOverlay un-multiplies on the way to the GPU.
+     */
+    QImage img(size(), QImage::Format_ARGB32_Premultiplied);
+    img.fill(Qt::transparent);
+    QPainter p(&img);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    paintBody(p);
+    return img;
 }
 
 void VolumeOverlay::paintEvent(QPaintEvent *)
 {
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
+    paintBody(p);
+}
 
+/* Widget-relative throughout, which is what lets the same code fill this widget
+ * and fill a bare QImage of the same size. */
+void VolumeOverlay::paintBody(QPainter &p) const
+{
     const QRectF box(0.5, 0.5, width() - 1.0, height() - 1.0);
 
     QColor sheet = Theme::window();

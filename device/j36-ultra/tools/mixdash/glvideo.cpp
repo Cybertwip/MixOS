@@ -283,12 +283,16 @@ struct GlVideo::Priv {
     int a_pos = -1;
     int a_tex = -1;
     unsigned ovprog = 0;
-    unsigned ovtex = 0;
     int ov_a_pos = -1;
     int ov_a_tex = -1;
-    int ovw = 0;
-    int ovh = 0;
-    QRect ovat;
+    /* One entry per GlVideo::Layer.  All four share texture unit 3 and the one
+     * overlay program: they are drawn one after the other, so the unit is rebound
+     * between draws rather than a unit spent per layer -- GLES2 guarantees only
+     * eight, and three of those are the film's planes. */
+    unsigned ovtex[GlVideo::LayerCount] = { 0, 0 };
+    int ovw[GlVideo::LayerCount] = { 0, 0 };
+    int ovh[GlVideo::LayerCount] = { 0, 0 };
+    QRect ovat[GlVideo::LayerCount];
     QString renderer;
     QByteArray repack;                  /* only used for a padded plane */
     QElapsedTimer clock;
@@ -806,10 +810,13 @@ bool GlVideo::programs()
     d->glUniform1i(uov, 3);
 
     d->glGenTextures(3, d->tex);
-    d->glGenTextures(1, &d->ovtex);
-    for (int i = 0; i < 4; ++i) {
-        d->glActiveTexture(GL_TEXTURE0 + (unsigned)i);
-        d->glBindTexture(GL_TEXTURE_2D, i < 3 ? d->tex[i] : d->ovtex);
+    d->glGenTextures(LayerCount, d->ovtex);
+    /* The three planes on units 0..2, then every overlay layer in turn on unit 3:
+     * the parameters are per-texture and not per-unit, so each one has to be bound
+     * once to receive them even though they will share the unit from here on. */
+    for (int i = 0; i < 3 + LayerCount; ++i) {
+        d->glActiveTexture(GL_TEXTURE0 + (unsigned)(i < 3 ? i : 3));
+        d->glBindTexture(GL_TEXTURE_2D, i < 3 ? d->tex[i] : d->ovtex[i - 3]);
         /* GL_LINEAR throughout: the luma is drawn about 1:1 so it barely matters
          * there, but the chroma planes are half size and are being stretched over
          * the luma, and nearest on those is what makes cheap players show blocky
@@ -1000,21 +1007,32 @@ bool GlVideo::drawFrame(const unsigned char *y, int ystride,
      * 640x56 texture is a few thousand fragments, which is nothing next to
      * re-rendering it with QPainter -- that is what setOverlay() is rationed for.
      */
-    if (d->ovw > 0 && d->ovh > 0 && !d->ovat.isEmpty()) {
-        quad(verts, d->ovat, m_size);
-        d->glUseProgram(d->ovprog);
-        d->glActiveTexture(GL_TEXTURE0 + 3u);
-        d->glBindTexture(GL_TEXTURE_2D, d->ovtex);
+    bool blending = false;
+    for (int L = 0; L < LayerCount; ++L) {
+        if (d->ovw[L] <= 0 || d->ovh[L] <= 0 || d->ovat[L].isEmpty())
+            continue;
+        if (!blending) {
+            /* The program, the attribute arrays and GL_BLEND are the same for
+             * every layer, so they are set once for however many there are. */
+            d->glUseProgram(d->ovprog);
+            d->glActiveTexture(GL_TEXTURE0 + 3u);
+            d->glEnableVertexAttribArray((unsigned)d->ov_a_pos);
+            d->glEnableVertexAttribArray((unsigned)d->ov_a_tex);
+            d->glEnable(GL_BLEND);
+            blending = true;
+        }
+        quad(verts, d->ovat[L], m_size);
+        d->glBindTexture(GL_TEXTURE_2D, d->ovtex[L]);
+        /* Re-pointed per layer because `verts' is a stack array that quad() has
+         * just rewritten -- these are client-side pointers, read at draw time. */
         d->glVertexAttribPointer((unsigned)d->ov_a_pos, 2, GL_FLOAT, 0,
                                  4 * (int)sizeof(float), verts);
         d->glVertexAttribPointer((unsigned)d->ov_a_tex, 2, GL_FLOAT, 0,
                                  4 * (int)sizeof(float), verts + 2);
-        d->glEnableVertexAttribArray((unsigned)d->ov_a_pos);
-        d->glEnableVertexAttribArray((unsigned)d->ov_a_tex);
-        d->glEnable(GL_BLEND);
         d->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        d->glDisable(GL_BLEND);
     }
+    if (blending)
+        d->glDisable(GL_BLEND);
 
     finish();
     m_lastMs = (double)d->clock.nsecsElapsed() / 1000000.0;
@@ -1033,12 +1051,12 @@ bool GlVideo::drawFrame(const unsigned char *y, int ystride,
     return true;
 }
 
-void GlVideo::setOverlay(const QImage &argb, const QRect &at)
+void GlVideo::setOverlay(Layer which, const QImage &argb, const QRect &at)
 {
-    if (!m_ready)
+    if (!m_ready || which < 0 || which >= LayerCount)
         return;
     if (argb.isNull() || at.isEmpty()) {
-        clearOverlay();
+        clearOverlay(which);
         return;
     }
     if (!bind())
@@ -1066,7 +1084,7 @@ void GlVideo::setOverlay(const QImage &argb, const QRect &at)
     const uchar *bits = src.constBits();
 
     d->glActiveTexture(GL_TEXTURE0 + 3u);
-    d->glBindTexture(GL_TEXTURE_2D, d->ovtex);
+    d->glBindTexture(GL_TEXTURE_2D, d->ovtex[which]);
 
     /* Same GLES2 limitation as the planes: no GL_UNPACK_ROW_LENGTH, so a padded
      * QImage has to be packed down.  At four bytes a pixel Qt's scanlines are
@@ -1080,25 +1098,31 @@ void GlVideo::setOverlay(const QImage &argb, const QRect &at)
         bits = (const uchar *)d->repack.constData();
     }
 
-    if (d->ovw != w || d->ovh != h) {
+    if (d->ovw[which] != w || d->ovh[which] != h) {
         d->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
                         GL_RGBA, GL_UNSIGNED_BYTE, bits);
-        d->ovw = w;
-        d->ovh = h;
+        d->ovw[which] = w;
+        d->ovh[which] = h;
     } else {
         d->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
                            GL_RGBA, GL_UNSIGNED_BYTE, bits);
     }
-    d->ovat = at;
+    d->ovat[which] = at;
 }
 
-void GlVideo::clearOverlay()
+void GlVideo::clearOverlay(Layer which)
 {
     /* The texture is kept -- only the rectangle is dropped, which is what
      * drawFrame() tests.  Nothing here is freed because the next film wants the
      * same texture at the same size. */
-    if (d)
-        d->ovat = QRect();
+    if (d && which >= 0 && which < LayerCount)
+        d->ovat[which] = QRect();
+}
+
+void GlVideo::clearOverlays()
+{
+    for (int L = 0; L < LayerCount; ++L)
+        clearOverlay((Layer)L);
 }
 
 bool GlVideo::fill(const QRect &r, unsigned int argb)

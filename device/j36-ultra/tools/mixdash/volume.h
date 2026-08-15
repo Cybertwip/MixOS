@@ -22,9 +22,11 @@
 #ifndef MIXDASH_VOLUME_H
 #define MIXDASH_VOLUME_H
 
+#include <QImage>
 #include <QString>
 #include <QWidget>
 
+class QPainter;
 class QTimer;
 
 namespace Volume {
@@ -59,6 +61,20 @@ bool read(int *percent, bool *muted);
  * what the level ended up as so the caller does not have to read it back. */
 int setPercent(int value);
 void setMuted(bool value);
+
+/*
+ * A counter that moves whenever this process learns a new level or mute -- set
+ * or read, from the keys or from the Settings slider.  It exists so a page can
+ * notice the mixer moved WITHOUT forking amixer to find out: the Media player's
+ * "the output is muted" note has to disappear the moment VOL+ unmutes, and its
+ * half-second tick asking amixer twice a second for the whole length of a film
+ * is not a price worth paying for a line of text that is usually absent.
+ *
+ * Compare it against the last value seen; any difference means ask properly.  It
+ * is a counter and not a bool so two changes between two looks are still one
+ * difference, and it never resets, so a missed look is caught by the next one.
+ */
+unsigned generation();
 
 /*
  * VOL+ and VOL- in one call: step by delta, unmute if the level is being raised,
@@ -123,6 +139,24 @@ void setOn(Output which, bool on);
  * whole panel -- the Media player at full screen, or a Terminal.  Overlays are
  * the shell's, like the toast and the keyboard, and they live outside the page
  * stack for the same reason those do.
+ *
+ * ── AND THERE IS ONE PAGE raise() CANNOT PUT IT OVER ──
+ *
+ * While a film is up, the picture in the scanout is not Qt's: GlVideo has the
+ * framebuffer memory imported as a GL colour buffer and rewrites the player's
+ * whole rectangle twenty-five times a second.  Qt's backing store has never heard
+ * of it.  So this widget painted over a film is a memcpy that the next GPU frame
+ * erases 40 ms later, and Qt repaints it, and the frame after that erases it
+ * again -- a bar that flickers at frame rate.  raise() cannot fix that, because
+ * there is no stacking order between the two: they are two writers to the same
+ * pixels, and the fast one wins.
+ *
+ * The fix is to stop painting and start being painted.  setRedirected(true) makes
+ * this a model with no surface of its own: it keeps the level, the mute and the
+ * three-second timer, it emits changed() whenever any of those move, and whoever
+ * owns the screen calls snapshot() and blends the result in its own pass.  That
+ * is one texture upload per press instead of a repaint per frame, and the bar is
+ * genuinely on top because it is drawn last by the thing that is drawing.
  */
 class VolumeOverlay : public QWidget
 {
@@ -141,12 +175,43 @@ public:
      * whether a dock is in the way. */
     void placeIn(const QRect &panel);
 
+    /*
+     * Hand the pixels to somebody else instead of painting them.  While
+     * redirected this never shows itself, and every change to what it would have
+     * drawn -- including the three-second expiry -- comes out as changed().
+     *
+     * The three seconds belong to the press and not to whoever is drawing, so
+     * switching mode does not restart or cancel them: a film that ends one second
+     * into a flash hands a bar with two seconds left back to Qt, which shows it.
+     */
+    void setRedirected(bool on);
+    bool isRedirected() const { return m_redirected; }
+
+    /* True while the three seconds are still running, whether or not this widget
+     * is the thing showing it. */
+    bool isUp() const { return m_up; }
+
+    /* What this would paint, as a premultiplied ARGB image at its own size.
+     * Null when nothing is up. */
+    QImage snapshot() const;
+
+signals:
+    /* The bar appeared, changed, or timed out.  Only connected to while
+     * redirected, but emitted either way -- a signal whose meaning depends on a
+     * mode is a signal somebody eventually connects in the other one. */
+    void changed();
+
 protected:
     void paintEvent(QPaintEvent *event) override;
 
 private:
+    void expire();
+    void paintBody(QPainter &p) const;
+
     int m_value = -1;
     bool m_muted = false;
+    bool m_up = false;
+    bool m_redirected = false;
     QTimer *m_timer = nullptr;
 };
 
