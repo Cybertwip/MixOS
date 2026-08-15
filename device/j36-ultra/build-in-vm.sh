@@ -2178,6 +2178,16 @@ for arg in $(cat /proc/cmdline); do
         j36.expand|j36.expand=1)
             want_expand=1
             ;;
+        # The third value, and the one that exists because of the trip switch in
+        # expand_root: a grow that never answers three boots running is written off,
+        # and after that the board boots at the size it has and says so.  This clears
+        # that count and asks for the grow again, which is a thing that has to be
+        # possible from the FAT partition, because the count is kept on the ext2 one
+        # and a Mac cannot reach it.  It is still a per-boot word: the count starts
+        # again from zero, and three more boots that end in a reset trip it again.
+        j36.expand=retry)
+            want_expand=retry
+            ;;
         # Swap off entirely, for the boot where the question is whether zram is
         # what is making the board feel slow.  It is a fair question and it has a
         # real answer: compressing a page costs CPU, and a machine that is thrashing
@@ -2788,6 +2798,53 @@ expand_root() {
         return 0
     fi
 
+    # ── THE TRIP SWITCH, AND THE FAILURE IT IS FOR ───────────────────────────
+    #
+    # Every failure this function knows about ends with a sentence and a mounted
+    # /newroot.  The one it cannot end that way is the board going off in the middle:
+    # nothing is written, nothing is said, and the next boot arrives at this same line
+    # with the same two numbers -- because both of them are read off the card and the
+    # card is exactly as it was.  So it starts the same work, and goes off again.  That
+    # is not a resize that failed; that is a device that does not boot, and it is the
+    # shape the report came in as.
+    #
+    # This is the only state this step keeps, and it is deliberately a count of
+    # FAILURES rather than a record of success.  The success path still remembers
+    # nothing -- a card that has been grown is one whose two ends already meet, which
+    # the block above sees for itself -- so re-flashing a card, or moving one to a
+    # bigger reader, still needs nothing cleared.  What is written here is written just
+    # before the unmount and removed as soon as the child answers, whatever it answers,
+    # because an answer of any kind means the board stayed up.  So the number can only
+    # be raised by a boot that did not finish, which is precisely the failure that has
+    # no other way of being noticed.
+    #
+    # Three, because the interesting failures are not all the same one.  A brownout on a
+    # cold pack is a thing that can happen once and not again with the charger in, and
+    # writing the card off after a single reset would be wrong.  Three of them is a
+    # pattern, and by then the operator has waited through three of these and would
+    # rather have the device.
+    #
+    # The count lives on the ext2 partition and a Mac cannot reach it, so
+    # `j36.expand=retry' in mvii/boot.conf clears it from the FAT one -- the same place
+    # `j36.expand=0' is typed, for the same reason.
+    ex_tries_file=/newroot/var/lib/mixos/expand-tries
+    ex_tries=0
+    if [ "$want_expand" = retry ]; then
+        if [ -f "$ex_tries_file" ]; then
+            say "expand: j36.expand=retry, so the ${ex_tries_file#/newroot} count starts again"
+            rm -f "$ex_tries_file" 2>/dev/null
+        fi
+    elif [ -f "$ex_tries_file" ]; then
+        read -r ex_tries < "$ex_tries_file" 2>/dev/null || ex_tries=0
+        case "$ex_tries" in
+            ''|*[!0-9]*) ex_tries=0 ;;
+        esac
+    fi
+    if [ "$ex_tries" -ge 3 ]; then
+        expand_note "the grow has been started $ex_tries times and the board went off before it finished each time, so it is not being started again -- the card keeps the size it has and the boot carries on"
+        expand_note "put j36.expand=retry in the bootargs in mvii/boot.conf to try once more, or delete ${ex_tries_file#/newroot} from the OS partition"
+        return 0
+    fi
     # ── THE TOOLS, TAKEN BEFORE THE FILESYSTEM GOES AWAY ─────────────────────
     #
     # The two slacks are added because they are end-to-end: unused card beyond the
@@ -2849,6 +2906,25 @@ expand_root() {
     # has been climbing for ten minutes tells the operator nothing about whether to keep
     # waiting or take the card out.  The two tools answer that question in two different
     # ways and neither of them is a percentage, so both are converted into one here.
+    #
+    # ── AND THE COUNT GOES DOWN FIRST ────────────────────────────────────────
+    #
+    # HERE and not at the check above, which is the difference between counting resets
+    # and counting boots.  Everything between the two is a reason to leave the card
+    # alone -- a tool the rootfs has not got, a loader that will not run one -- and none
+    # of those unmounts anything or takes a second; a boot that ends on one of them has
+    # not been through the risk this is counting and must not be charged for it.  From
+    # this line to the fork there is nothing left that can decline.
+    #
+    # Before the unmount because after it there is no filesystem to write to, and synced
+    # because what this records is the power going away and a number in the page cache
+    # goes away with it.  It is written to the partition that is about to be resized,
+    # which is safe in the one way that matters: resize2fs moves the end of the
+    # filesystem and not the files in it.
+    ex_tries=$((ex_tries + 1))
+    mkdir -p /newroot/var/lib/mixos 2>/dev/null
+    echo "$ex_tries" > "$ex_tries_file" 2>/dev/null
+    sync
     : > /dev/.expand-status
     : > /dev/.expand-result
     echo 0 > /dev/.expand-pct
@@ -3132,8 +3208,16 @@ expand_root() {
     # the paths on which the partition may have been unmounted when the child stopped.
     if [ -n "$ex_said" ]; then
         expand_note "$ex_said"
+        # AND THE COUNT COMES OFF, on any answer at all and not only on a good one.
+        # What it counts is boots that ended in the middle, and a child that reached
+        # its last line did not end in the middle -- whether it grew the card, refused
+        # to, or found the filesystem in a state it would not touch.  Those outcomes
+        # have their own sentences in this log and are their own problems; charging
+        # them to a counter meant for resets would trip it after three boots that each
+        # behaved exactly as designed.
+        rm -f "$ex_tries_file" 2>/dev/null
     else
-        expand_note "the resize did not report a result; the card is as the check above left it"
+        expand_note "the resize did not report a result after ${ex_waited}s; the card is as the check above left it (attempt $ex_tries of 3 before this step stands down)"
     fi
 
     # Whatever happened, the panel goes back to saying what the boot is doing, and the
@@ -8772,7 +8856,7 @@ initrd=initrd.img
 # j36.usb=1 sources 5 V on the OTG port off that same rail: j36.usb=novbus with no
 # cell.  It is not the connector that charges -- that is the DC inlet beside it.
 # j36.gl=debug adds Mesa's EGL trace.  j36.splash=0 loglevel=7 boots to text.
-# j36.expand=0 skips growing p2 -- the recovery if a resize wedged the boot.
+# j36.expand=0 skips growing p2 if a resize wedged the boot; =retry re-arms it.
 # Each boot writes mixos-log.txt at the top of this partition; j36.log=0 stops it.
 bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=speaker j36.usb=1 j36.power=1 j36.wifi=1 j36.splash=1
 CONF
@@ -9066,6 +9150,38 @@ systemd.mask=firstboot.service
     grows the card, because both ends of "is there anything left to grow" are read
     off the card itself every time -- so an interrupted resize is picked up rather
     than skipped, and a card that was left alone is not marked as done.
+
+    AND IT STANDS DOWN BY ITSELF AFTER THREE BOOTS THAT DIED IN THE MIDDLE, which
+    is the failure the paragraph above is otherwise the wrong answer to.  Every
+    other way this step can fail ends with a sentence in the log and the card
+    unchanged; the board going off partway through ends with neither, and leaves
+    the card in exactly the state that makes the next boot start the same work.
+    That loop is a device that does not boot, not a resize that failed, so the
+    number of boots that have started this and not finished it is kept in
+    /var/lib/mixos/expand-tries on the OS partition.  At three, the step says so
+    and is skipped, and the board comes up at the size it has.
+
+    That count is FAILURES ONLY, and it is removed the moment the resize answers
+    anything at all -- grew it, would not grow it, found the filesystem in a state
+    it would not touch.  All of those are outcomes; only the power going away is
+    not.  So the success path still remembers nothing, and a re-flashed card or a
+    card moved to a bigger reader still needs nothing cleared.
+
+    j36.expand=retry in the bootargs starts the count again from zero, because the
+    count lives on the ext2 partition and a Mac cannot reach it -- the same reason
+    j36.expand=0 is a word on the FAT partition and not a setting in the OS.  From
+    a Linux machine, or from the dashboard once the board is up, deleting that file
+    does the same thing.
+
+    IF THE BOARD RESTARTS HERE, THIS IS THE FIRST THING TO CHECK: put it on the
+    charger and start it again.  The grow is the only stretch of the boot that
+    holds the card at full write current for minutes, and it runs early -- before
+    the OS is up and before anything has taken charge of the battery.  A pack that
+    carries a thirty-second boot to the desktop will not necessarily carry ten
+    minutes of this.  It is not the kernel restarting the board: this build sets
+    no panic timeout, so a kernel panic here halts and stays halted, and the TOPRGU
+    watchdog is disarmed by its driver at probe.  A restart during the grow is the
+    power, not the software.
 
 batt_led.service, no longer masked
     The RK3326 battery LED daemon, and the first unit the forwarded log caught:
@@ -11841,6 +11957,8 @@ fi
         echo "card_layout=p1 BOOT vfat = launcher only (zImage, dtb, initrd.img, mvii/boot.conf, LICENSE.txt, README.txt); p2 ROOTFS ext2 = the OS, /opt/mixos included, and the login user's home at ${DATA_MOUNT_POINT:-/home/virtua} as an ordinary directory in it.  Two partitions: there is no p3, and p2 is last on the disk so /init can grow it to the card's size on the first boot"
         echo "card_expand=/init's expand_root, before switch_root: sfdisk -N extends p2 to the end of the disk, e2fsck -fp, then resize2fs with no size argument.  ext2 has no online resize, so this is the only moment in the boot it can happen; the three tools and their libraries are copied out of the rootfs before it is unmounted, and a copy that will not run leaves the card alone"
         echo "card_expand_off=j36.expand=0 in the bootargs in mvii/boot.conf skips the whole step -- no unmount, no partition table write, no e2fsck, no resize2fs.  It is the only destructive thing /init does and the only one that is still working after an operator has decided the board is dead, so it is the one step that has to be rulable-out from a card reader alone.  Nothing remembers the word: take it out and the next boot grows the card"
+        echo "card_expand_trip=three boots that start the grow and do not finish it stand the step down for good: the count is /var/lib/mixos/expand-tries on the OS partition, written just before the unmount and removed the moment the resize answers anything at all, so it counts resets and not outcomes.  It exists because a board that goes off partway leaves the card in the state that makes the next boot start the same work, which is a boot loop and not a failed resize.  j36.expand=retry starts the count again from the FAT partition; deleting the file does it from the OS"
+        echo "card_expand_reset=a restart during the grow is power and not software: CONFIG_PANIC_TIMEOUT=0, so a panic here halts rather than reboots, and mtk_wdt disarms the TOPRGU at probe.  The grow is the only stretch of the boot that holds the card at full write current for minutes, and it runs before the OS or anything that manages the battery, so a marginal pack is the thing to rule out first"
         echo "card_expand_libs=EXPAND_LIBS in /init names the shared libraries those tools are copied with, and this build checked it against the DT_NEEDED closure of sfdisk, e2fsck, resize2fs and dumpe2fs in the armhf chroot -- see verify_expand_libs.  A name missing from that list is not a build failure by itself, it is a loader exiting 127 on the device and a card that silently keeps the size it was flashed at, so the build fails on it instead"
         echo "card_expand_reaches_a_flashed_card=yes, through --mix-only: expand_root lives in /init, /init is inside initrd.img, and initrd.img is in boot/.  Copying boot/ onto the BOOT partition is the whole update; nothing about the resize comes from the rootfs except the four tools it borrows"
         echo "card_expand_progress=the splash bar and detail line show a real percentage for the whole operation: e2fsck reports through -C 1, and resize2fs (which reports nothing) is measured as write_sectors in /sys/block/<disk>/stat against the inode tables and bitmaps that the added block groups cost.  dumpe2fs is copied out too, optionally, because that estimate needs the filesystem's own inode size and inodes-per-group; without it the phase falls back to naming itself"
