@@ -286,7 +286,7 @@ authors set, and `mvii-board/PROVENANCE.txt` records a SHA-256 for each.
 **MediaTek** — the MT6592 documentation and vendor driver sources the J36 Ultra port reads \
 **[Mesa](https://www.mesa3d.org/)** — lima and kmsro, which are the entire reason a Mali-450 from 2013 can run a GLES 2.0 UI \
 **[Qt](https://www.qt.io/)** — the toolkit mixdash is painted with, on a framebuffer, with no window system under it \
-**The SDL, busybox, doomgeneric and Freedoom** projects \
+**The SDL and busybox** projects \
 [ChatGPT](https://chatgpt.com/) for guidance on how to build a Debian image \
 Jetup13 for many themes \
 dani7959 for the replica theme \

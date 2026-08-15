@@ -71,7 +71,6 @@ MPL-2.0 OR GPL-2.0-or-later, the dual grant above:
     build-in-vm.sh              the incremental bring-up builder
     generate_dts.py             the DTS generator
     create_boot_image.py        the MT6592 Android boot.img writer
-    fetch_freedoom.py           the optional Freedoom fetcher
     tools/j36-eglprobe.c        the EGL/GBM/DRM scanout probe
     tools/j36-mixmirror.c       the panel-to-USB-HDMI mirror
     tools/mfgpower.c            the MFG power-domain bring-up probe
@@ -116,8 +115,8 @@ Vendor material, redistributed unmodified for provenance:
                                 carry whatever terms their authors set.
 
 Nothing in this file changes the licence of anything a build downloads or stages:
-the Linux kernel, Mesa, Qt, SDL, busybox, the Debian rootfs and the Freedoom IWAD
-are each obtained under their own terms and are not covered here.  A card built
+the Linux kernel, Mesa, Qt, SDL, busybox and the Debian rootfs are each obtained
+under their own terms and are not covered here.  A card built
 by `build-in-vm.sh' is an aggregate of many licences; this one applies to the
 MixOS scripts, drivers, probes and dashboard that assembled it.
 

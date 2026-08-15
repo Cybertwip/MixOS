@@ -167,7 +167,6 @@ phrase table.
 | `j36-eglprobe` | Brings up an ES 2.0 context on lima's render node and draws a cube; the ground truth for "is the GPU working" |
 | `j36-mixmirror` | The USB-HDMI mirror, over `DRM_UDL` |
 | `mfgpower` | Powers up the MT6592 MFG (GPU) domain through the SPM's MTCMOS from userspace and proves a Mali-450 MP4 is answering, before anything hands the block to lima. Nothing on the Linux boot path un-gates it |
-| `fbdoom` | The first moving picture this panel ever showed |
 
 ---
 

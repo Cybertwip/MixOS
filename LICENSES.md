@@ -96,8 +96,8 @@ in the Public Interest, Inc. <https://www.debian.org/>
 #### Everything else a build downloads or stages
 
 The dual grant reaches none of it. Mesa (MIT), Qt and its runtime closure (LGPL-3
-with Qt's exceptions), SDL, busybox, doomgeneric and the Freedoom IWAD (GPL, as
-Debian and doomgeneric ship them) are each obtained under their own terms. The dual
+with Qt's exceptions), SDL and busybox (GPL, as Debian ships them) are each
+obtained under their own terms. The dual
 licence applies to the MixOS scripts, drivers, probes, dashboard and documentation
 that assembled the card — not to the card's contents as a whole.
 
