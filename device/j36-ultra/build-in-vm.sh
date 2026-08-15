@@ -1658,6 +1658,15 @@ if [[ ! -x "$BUSYBOX_SRC/busybox" || "${J36_REBUILD_BUSYBOX:-0}" == 1 ]]; then
     bb_enable CONFIG_TAR
     bb_enable CONFIG_GUNZIP
 
+    # And the pair that puts the zram block device into service as swap.  Both are
+    # in busybox defconfig already, so on a cached build the assertion below passes
+    # without this block ever running; they are named here so that a from-scratch
+    # build cannot end up with a kernel that has zram and an initramfs that cannot
+    # use it.  FEATURE_SWAPON_PRI is deliberately not asked for -- there is exactly
+    # one swap device on this board, so `swapon -p' has nothing to order it against.
+    bb_enable CONFIG_MKSWAP
+    bb_enable CONFIG_SWAPON
+
     yes '' | make -C "$BUSYBOX_SRC" oldconfig >/dev/null || true
 
     # oldconfig has the last word on all of the above -- it re-derives every
@@ -1952,6 +1961,17 @@ want_wifi=0
 # for about a second per pass -- see setup_logdump -- so the cost of it being on
 # by default is smaller than the cost of one boot where it was not.
 want_log=1
+# The second word that defaults to ON, and it is on for the reason the payload
+# words are off: it loads nothing.  zram is built into this kernel, the device
+# already exists by the time /init runs, and all that is left is to give it a size
+# and call swapon -- so there is no module that could refuse to insmod, no register
+# window that could hang the bus and no partition that has to be found first.  The
+# word is here to turn it OFF, from any machine that can write a FAT partition, on
+# the boot where swap is the thing under suspicion.
+#
+# 0 or auto, in MiB.  auto is 80% of MemTotal; a number is that many MiB, for
+# measuring one size against another without rebuilding anything.
+want_zram=auto
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         j36.audio|j36.audio=1)
@@ -2095,6 +2115,30 @@ for arg in $(cat /proc/cmdline); do
         # that already has the answer.  Nothing else turns it off.
         j36.log=0|nolog)
             want_log=0
+            ;;
+        # Swap off entirely, for the boot where the question is whether zram is
+        # what is making the board feel slow.  It is a fair question and it has a
+        # real answer: compressing a page costs CPU, and a machine that is thrashing
+        # -- swapping the same pages out and straight back in -- spends all of it
+        # for nothing.  This is the word that shows what the board does without it.
+        j36.zram=0|noswap)
+            want_zram=0
+            ;;
+        # The default, spelled out, and it is ABOVE the numeric pattern below on
+        # purpose: `j36.zram=1' is the way every other word in this list says "on",
+        # and a shell case reading top to bottom would otherwise hand it to
+        # [0-9]* and build a one-megabyte swap device.
+        j36.zram|j36.zram=1|j36.zram=auto)
+            want_zram=auto
+            ;;
+        # A size in MiB instead of the 80%-of-MemTotal default, because the right
+        # number here is not knowable from a datasheet: it depends on how well the
+        # thing running on the board compresses.  384 is conservative, 768 is what
+        # auto picks on this 946 MiB machine, and anything above MemTotal is allowed
+        # on purpose -- see the mem_limit in setup_zram, which is what actually
+        # bounds the damage.
+        j36.zram=[0-9]*)
+            want_zram="${arg#j36.zram=}"
             ;;
         root=/dev/*)
             root_hint="${arg#root=}"

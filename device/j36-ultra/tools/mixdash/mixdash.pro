@@ -51,6 +51,8 @@ SOURCES += \
     console.cpp \
     shell.cpp \
     dashboard.cpp \
+    files.cpp \
+    volumes.cpp \
     widgets.cpp \
     joypad.cpp \
     settings.cpp \
@@ -71,6 +73,8 @@ SOURCES += \
 
 HEADERS += \
     dashboard.h \
+    files.h \
+    volumes.h \
     trace.h \
     console.h \
     shell.h \
