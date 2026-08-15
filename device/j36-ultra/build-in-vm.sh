@@ -2181,6 +2181,18 @@ for arg in $(cat /proc/cmdline); do
         j36.expand=retry)
             want_expand=retry
             ;;
+        # The fourth, and the only one here that asks for MORE work rather than
+        # less: run e2fsck before the grow even though the superblock says the
+        # filesystem is clean.  expand_root skips the check on a clean filesystem
+        # because that check is the longest stretch of the boot with the root
+        # partition unmounted and nothing yet started that could survive it, and a
+        # clean superblock is the whole of what it would have confirmed on a card
+        # this same function unmounted a second earlier.  This is the word for the
+        # card where that turns out to have been the wrong call -- and, like every
+        # other one here, it lives where a Mac can reach it.
+        j36.expand=fsck)
+            want_expand=fsck
+            ;;
         # Swap off entirely, for the boot where the question is whether zram is
         # what is making the board feel slow.  It is a fair question and it has a
         # real answer: compressing a page costs CPU, and a machine that is thrashing
@@ -3167,6 +3179,10 @@ expand_root() {
         read -r ex_rrc < /dev/.expand-resize-rc
         if [ "$ex_rrc" = 0 ]; then
             ex_result="$rootdev now fills /dev/$ex_disk"
+        elif [ "$ex_rc" = 0 ] && [ "$ex_fsclean" = 1 ] && [ "$want_expand" != fsck ]; then
+            # The one failure the skip above could have caused, said as such so nobody
+            # has to guess.  Every other resize2fs failure gets the plain sentence.
+            ex_result="resize2fs could not grow $rootdev, and the check was skipped because the superblock said clean; put j36.expand=fsck in the bootargs to run it"
         else
             ex_result="resize2fs could not grow $rootdev; the partition is bigger than the filesystem"
         fi
