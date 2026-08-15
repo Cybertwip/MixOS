@@ -71,6 +71,35 @@
  * plugged in before the TV at the other end of it, and "adapter present, nothing
  * connected" has to become "connected" without the user unplugging anything.
  *
+ * ── SAYING WHY, WHICH IS MOST OF WHAT THIS PROGRAM TURNED OUT TO BE FOR ──────────
+ *
+ * This started life silent by design -- a mirror with nothing to mirror onto should
+ * not fill a journal -- and silent by design is exactly what "the HDMI mirror never
+ * runs" is a report of.  Every "not yet" branch was a chat(), which is -v only, so a
+ * board with a dock plugged into it and a black television wrote NOT ONE LINE for its
+ * whole uptime.  From the outside that is indistinguishable from a unit systemd never
+ * started, and there was no way to tell the two apart without a serial console.
+ *
+ * So it is a state machine now, and it says every transition at note() level while
+ * still saying nothing at all when nothing has changed.  The states are the questions
+ * somebody would ask in order:
+ *
+ *   no /dev/dri          no DRM driver registered anything.  The boot did not get as
+ *                        far as loading modules.
+ *   no "udl" node        the interesting one, and the one with three different
+ *                        answers underneath it -- see explain_no_node().
+ *   nothing connected    a DisplayLink adapter is bound and its HDMI socket is empty,
+ *                        or the television at the far end is switched off.
+ *   no mode              connected, and the EDID has not been read yet.
+ *   mirroring            with the mode, the scale and the offsets.
+ *
+ * The same line goes into /run/j36/mirror.status, one line, overwritten on every
+ * change, because the dashboard's Diagnostics page reads it: the person this matters
+ * to is holding the handheld and has no journal in front of them.  It is a tmpfs the
+ * initramfs already makes and NOTHING here writes to the shared rootfs.  -s and -o
+ * deliberately do not publish, so running this by hand to look at something cannot
+ * overwrite what the running service is reporting.
+ *
  * ── what it costs on the wire ────────────────────────────────────────────────────
  *
  * USB 2.0 bulk is about 30 MB/s in practice and 1280x960 at 32bpp is 4.7 MB, so a full
@@ -108,6 +137,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -281,8 +311,18 @@ struct fb_fix_screeninfo {
  * steady state of this program on a board nobody has docked. */
 #define SCAN_INTERVAL_MS 2000
 
+/* Where the current state goes for the dashboard to read.  A tmpfs path: /init makes
+ * /run/j36 on every boot and the rootfs on the card is never written to. */
+#define STATUS_PATH "/run/j36/mirror.status"
+
+/* DisplayLink's USB vendor ID, and the single most useful fact this program can
+ * report.  Mainline udl matches on it and on nothing else, so a bus with no 17e9 on
+ * it is a bus no version of this software will ever draw to. */
+#define DISPLAYLINK_VENDOR "17e9"
+
 static volatile sig_atomic_t stop_requested;
 static int verbose;
+static int publishing = 1;
 static const char *allow_name = "udl";
 
 static void on_signal(int sig)
@@ -328,6 +368,212 @@ static uint64_t now_ms(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000L);
 }
 
+/* ── where the program has got to, said once ────────────────────────────────────
+ *
+ * The header has the reasoning.  The mechanism is two lines: remember the last thing
+ * said, and say a new one only when it differs.  Comparing the whole STRING and not
+ * just the state is deliberate -- "no DisplayLink node, and here is what is on the
+ * bus" has to be said again when something is plugged into the hub, because that is
+ * the moment somebody is watching for it.
+ */
+enum stage {
+    STAGE_START = 0,
+    STAGE_NO_DRI,
+    STAGE_NO_UDL,
+    STAGE_NO_OUTPUT,
+    STAGE_NO_MODE,
+    STAGE_MIRRORING,
+};
+
+static enum stage stage_now = STAGE_START;
+static char stage_line[512];
+
+static void publish(const char *line)
+{
+    int fd;
+
+    if (!publishing)
+        return;
+    /* Best effort from here down.  /run/j36 exists on every boot that got as far as
+     * a dashboard, but this also runs from a rescue shell, and a mirror that refused
+     * to start because it could not write a status file would be the tail wagging
+     * the dog.  mkdir's failure is EEXIST in the normal case and is not read. */
+    mkdir("/run/j36", 0755);
+    fd = open(STATUS_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return;
+    if (write(fd, line, strlen(line)) < 0) {
+        /* Nothing useful to do: this is the reporting path, so failing to report
+         * that reporting failed is where it has to stop. */
+    }
+    if (write(fd, "\n", 1) < 0) {
+    }
+    close(fd);
+}
+
+static void report(enum stage s, const char *fmt, ...)
+{
+    char line[sizeof(stage_line)];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    if (s == stage_now && strcmp(line, stage_line) == 0)
+        return;
+    stage_now = s;
+    snprintf(stage_line, sizeof(stage_line), "%s", line);
+    publish(line);
+    note("%s", line);
+}
+
+/* ── what is actually on the port ───────────────────────────────────────────────
+ *
+ * sysfs only, and every one of these is a read of a file the kernel generates on
+ * demand: no ioctl, nothing opened that could be modeset, nothing that can disturb a
+ * screen.  They are run only when the mirror has just decided it has nothing to draw
+ * on, which is a handful of opens every two seconds on a board with a dock plugged
+ * into it and none at all on one that is mirroring.
+ */
+static int read_line_file(const char *path, char *buf, size_t bufsz)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    ssize_t n;
+
+    if (fd < 0)
+        return -1;
+    n = read(fd, buf, bufsz - 1);
+    close(fd);
+    if (n < 0)
+        return -1;
+    buf[n] = '\0';
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == ' '))
+        buf[--n] = '\0';
+    return 0;
+}
+
+/* /sys/module/udl is the cheapest question in this file and it halves the search
+ * space: no directory means the module was never insmodded -- an old j36/usb payload
+ * on the card, or a boot without j36.usb -- and nothing plugged in will ever bind. */
+static int udl_loaded(void)
+{
+    return access("/sys/module/udl", F_OK) == 0;
+}
+
+/*
+ * Every USB device on the bus as "vvvv:pppp" in one line, root hubs included because
+ * their absence is itself an answer.  Returns 1 if any of them is DisplayLink, 0 if
+ * none is, -1 if there is no /sys/bus/usb/devices at all -- which means usbcore is
+ * not loaded and the question is a different one.  An empty `out' with a 0 return is
+ * a bus with a controller and nothing on it.
+ */
+static int usb_inventory(char *out, size_t outsz)
+{
+    static const char *dir = "/sys/bus/usb/devices";
+    DIR *d;
+    struct dirent *e;
+    size_t used = 0;
+    int displaylink = 0;
+
+    out[0] = '\0';
+    d = opendir(dir);
+    if (!d)
+        return -1;
+
+    while ((e = readdir(d)) != NULL) {
+        char path[sizeof(e->d_name) + 64], vid[16], pid[16];
+
+        if (e->d_name[0] == '.')
+            continue;
+        /* "1-1:1.0" is an interface of a device already listed as "1-1", and it
+         * carries no idVendor of its own.  Skipping it keeps one physical thing to
+         * one entry in the line. */
+        if (strchr(e->d_name, ':'))
+            continue;
+
+        snprintf(path, sizeof(path), "%s/%s/idVendor", dir, e->d_name);
+        if (read_line_file(path, vid, sizeof(vid)) < 0)
+            continue;
+        snprintf(path, sizeof(path), "%s/%s/idProduct", dir, e->d_name);
+        if (read_line_file(path, pid, sizeof(pid)) < 0)
+            continue;
+
+        if (strcmp(vid, DISPLAYLINK_VENDOR) == 0)
+            displaylink = 1;
+        used += (size_t)snprintf(out + used, used < outsz ? outsz - used : 0,
+                                 "%s%s:%s", used ? " " : "", vid, pid);
+        if (used >= outsz)
+            break;          /* truncated, and snprintf already stopped writing */
+    }
+
+    closedir(d);
+    return displaylink;
+}
+
+/*
+ * ── THE LINE THIS WHOLE EXERCISE WAS ABOUT ──────────────────────────────────────
+ *
+ * Called when /dev/dri holds no node named "udl".  Three quite different things can
+ * be true underneath that and they want three different answers, so all three are
+ * measured rather than guessed at:
+ *
+ *   udl.ko not loaded         the j36/usb payload on the card is older than this
+ *                             feature, or the boot had j36.usb=0.  Nothing will ever
+ *                             bind, and it is fixed by unpacking sd-root.tar.gz.
+ *
+ *   loaded, nothing with      the common case, and it is NOT a software fault.  A
+ *   vendor 17e9 on the bus    USB-C hub whose HDMI socket is DisplayPort Alt Mode
+ *                             carries video on wires MT6592 does not have, and no
+ *                             driver can conjure a DisplayPort transmitter onto a
+ *                             2013 SoC.  Only a DisplayLink adapter has a chance.
+ *
+ *   loaded, 17e9 present,     a DL-3xxx or later part: USB 3.0, a different protocol,
+ *   still no card node        no in-tree driver.  Mainline udl is DL-1x0/DL-1x5 only.
+ *
+ * `seen' is what /dev/dri did hold, as "card0=mediatek card1=lima", because the first
+ * thing anybody wants confirmed is that the directory is not empty and that what is
+ * in it is the board's own two drivers.
+ */
+static void explain_no_node(const char *seen)
+{
+    char bus[256];
+    int dl = usb_inventory(bus, sizeof(bus));
+
+    if (!udl_loaded()) {
+        report(STAGE_NO_UDL,
+               "mirror: no DisplayLink display and udl.ko is not loaded -- "
+               "/dev/dri holds %s.  Nothing plugged into the port can bind.  "
+               "Unpack sd-root.tar.gz onto the OS partition and boot with j36.usb=1.",
+               seen[0] ? seen : "no cards at all");
+        return;
+    }
+    if (dl < 0) {
+        report(STAGE_NO_UDL,
+               "mirror: udl.ko is loaded but there is no /sys/bus/usb/devices -- "
+               "usbcore did not register, so the port is not enumerating anything.  "
+               "/dev/dri holds %s.", seen[0] ? seen : "no cards at all");
+        return;
+    }
+    if (dl == 0) {
+        report(STAGE_NO_UDL,
+               "mirror: udl.ko is loaded and waiting; nothing on the port is "
+               "DisplayLink (vendor %s).  The bus has %s and /dev/dri holds %s.  "
+               "A USB-C hub whose HDMI is DisplayPort Alt Mode cannot work here -- "
+               "MT6592 has no DisplayPort.  Only a DisplayLink DL-1x0/DL-1x5 "
+               "adapter drives a screen on this board.",
+               DISPLAYLINK_VENDOR, bus[0] ? bus : "nothing on it",
+               seen[0] ? seen : "no cards at all");
+        return;
+    }
+    report(STAGE_NO_UDL,
+           "mirror: a DisplayLink device is on the bus (%s) and udl.ko did not claim "
+           "it -- /dev/dri holds %s.  Mainline udl speaks the USB 2.0 DL-1x0/DL-1x5 "
+           "protocol only; a DL-3xxx or later part needs the out-of-tree evdi driver "
+           "and is USB 3.0 besides.  dmesg has udl's own refusal.",
+           bus, seen[0] ? seen : "no cards at all");
+}
+
 /* EINTR and EAGAIN retried, because a SIGTERM arriving in the middle of a modeset
  * should not be read as the modeset failing.  stop_requested is checked by the
  * callers, which is where stopping is a decision rather than an error. */
@@ -346,19 +592,27 @@ static int drm_call(int fd, unsigned long req, void *arg)
  * done before any other ioctl is sent, so a node belonging to mediatek or lima is
  * opened, named, and closed -- nothing is asked of it and nothing is set on it.
  *
- * Returns an open fd, or -1.  On success `path' holds what was opened.
+ * Returns an open fd, -1 when /dev/dri was read and held no "udl", or -2 when the
+ * directory could not be read at all.  Those two are told apart because they are
+ * different faults: -2 is "no DRM driver registered anything", which is a boot that
+ * did not get as far as loading modules, and -1 is the interesting one.
+ *
+ * On success `path' holds what was opened.  Either way `seen' is filled in with what
+ * WAS there, as "card0=mediatek card1=lima", for the message that follows.
  */
-static int open_mirror_node(char *path, size_t pathsz)
+static int open_mirror_node(char *path, size_t pathsz, char *seen, size_t seensz)
 {
     static const char *dir = "/dev/dri";
     DIR *d;
     struct dirent *e;
+    size_t used = 0;
     int found = -1;
 
+    seen[0] = '\0';
     d = opendir(dir);
     if (!d) {
         chat("mirror: %s: %s", dir, strerror(errno));
-        return -1;
+        return -2;
     }
 
     while ((e = readdir(d)) != NULL) {
@@ -390,9 +644,15 @@ static int open_mirror_node(char *path, size_t pathsz)
             /* No version ioctl means this is not a DRM node we understand, and a
              * node we do not understand is one we do not modeset. */
             chat("mirror: %s answers no DRM_IOCTL_VERSION -- left alone", candidate);
-            close(fd);
-            continue;
+            snprintf(name, sizeof(name), "?");
         }
+
+        /* Recorded before the allow-list refuses it, because "what IS in /dev/dri"
+         * is half of the answer when there is no udl in there. */
+        used += (size_t)snprintf(seen + used, used < seensz ? seensz - used : 0,
+                                 "%s%s=%s", used ? " " : "", e->d_name, name);
+        if (used >= seensz)
+            used = seensz;      /* full; snprintf has already stopped writing */
 
         if (strcmp(name, allow_name) != 0) {
             chat("mirror: %s is \"%s\" -- not \"%s\", left alone", candidate, name,
@@ -891,10 +1151,21 @@ static int mirror_session(int fd, const char *node, const char *fbpath, int forc
         return -1;
 
     if (pick_target(fd, src.w, src.h, &tgt) < 0) {
+        /* Both of these used to be chat(), which is -v only, and between them they
+         * cover every dock that IS bound and shows nothing.  A DisplayLink adapter
+         * with an empty HDMI socket, or one behind a television that is switched
+         * off, produced total silence and looked exactly like a service that was
+         * never started. */
         if (tgt.connected)
-            chat("mirror: %s has a connected output but no usable mode yet", node);
+            report(STAGE_NO_MODE,
+                   "mirror: %s is a DisplayLink display with something connected to "
+                   "it that has offered no mode list yet -- its EDID has not been "
+                   "read.  Retrying every %d ms.", node, SCAN_INTERVAL_MS);
         else
-            chat("mirror: %s has nothing connected yet", node);
+            report(STAGE_NO_OUTPUT,
+                   "mirror: %s is bound and ready and nothing is connected to its "
+                   "HDMI socket -- plug a screen in, or switch on the one that is "
+                   "there.  Retrying every %d ms.", node, SCAN_INTERVAL_MS);
         source_close(&src);
         return -1;
     }
@@ -940,9 +1211,10 @@ static int mirror_session(int fd, const char *node, const char *fbpath, int forc
      * something on the dashboard happened to change. */
     memset(shadow, 0xa5, src.map_len);
 
-    note("mirror: %s %ux%u \"%s\" <- %s %ux%u, %dx integer scale at +%u+%u",
-         node, tgt.mode.hdisplay, tgt.mode.vdisplay, tgt.mode.name, fbpath,
-         src.w, src.h, lay.scale, lay.off_x, lay.off_y);
+    report(STAGE_MIRRORING,
+           "mirror: %s %ux%u \"%s\" <- %s %ux%u, %dx integer scale at +%u+%u",
+           node, tgt.mode.hdisplay, tgt.mode.vdisplay, tgt.mode.name, fbpath,
+           src.w, src.h, lay.scale, lay.off_x, lay.off_y);
 
     last_check = now_ms();
 
@@ -1040,7 +1312,10 @@ static int mirror_session(int fd, const char *node, const char *fbpath, int forc
             struct target again;
             last_check = now_ms();
             if (pick_target(fd, src.w, src.h, &again) < 0) {
-                note("mirror: %s lost its output", node);
+                /* No note here on purpose: the caller comes straight back round,
+                 * pick_target fails the same way at the top of the next session and
+                 * the state machine says which of "unplugged" and "switched off" it
+                 * was.  One line, not two, and the useful one. */
                 rc = 0;
                 goto out;
             }
@@ -1083,7 +1358,10 @@ static void usage(void)
 "\n"
 "With no options it runs forever: it polls /dev/dri, mirrors while an adapter is\n"
 "there, and goes back to polling when it is unplugged.  Started that way by\n"
-"j36-mixmirror.service.\n");
+"j36-mixmirror.service.  In that mode it writes its current state -- the same one\n"
+"line it puts in the journal -- to " STATUS_PATH ", which is where the\n"
+"dashboard's Diagnostics page reads it from.  -s and -o do not write it, so\n"
+"running this by hand cannot overwrite what the service is reporting.\n");
 }
 
 int main(int argc, char **argv)
@@ -1098,8 +1376,11 @@ int main(int argc, char **argv)
         case 'f': fbpath = optarg; break;
         case 'n': allow_name = optarg; break;
         case '1': force_one = 1; break;
-        case 'o': once = 1; break;
-        case 's': scan_only = 1; verbose = 1; break;
+        /* Neither of the by-hand modes publishes: somebody looking at a dock from a
+         * shell must not overwrite the status the running service is showing on the
+         * dashboard. */
+        case 'o': once = 1; publishing = 0; break;
+        case 's': scan_only = 1; verbose = 1; publishing = 0; break;
         case 'v': verbose = 1; break;
         case 'h': usage(); return 0;
         default:  usage(); return 2;
@@ -1116,11 +1397,18 @@ int main(int argc, char **argv)
     sigaction(SIGHUP, &sa, NULL);
 
     if (scan_only) {
-        char node[288];
-        int fd = open_mirror_node(node, sizeof(node));
+        char node[288], seen[256];
+        int fd = open_mirror_node(node, sizeof(node), seen, sizeof(seen));
+        if (fd == -2) {
+            note("mirror: there is no /dev/dri at all -- no DRM driver has "
+                 "registered a card, so nothing could appear as one");
+            return 1;
+        }
         if (fd < 0) {
-            note("mirror: no \"%s\" node in /dev/dri -- nothing to mirror onto",
-                 allow_name);
+            /* The same three-way answer the service gives, because this is the
+             * command somebody runs when the service has already told them
+             * something they want to check by hand. */
+            explain_no_node(seen);
             return 1;
         }
         {
@@ -1155,14 +1443,26 @@ int main(int argc, char **argv)
     }
 
     while (!stop_requested) {
-        char node[288];
-        int fd = open_mirror_node(node, sizeof(node));
+        char node[288], seen[256];
+        int fd = open_mirror_node(node, sizeof(node), seen, sizeof(seen));
 
-        if (fd < 0) {
-            if (once) {
-                note("mirror: no \"%s\" node in /dev/dri", allow_name);
+        if (fd == -2) {
+            report(STAGE_NO_DRI,
+                   "mirror: there is no /dev/dri at all -- no DRM driver has "
+                   "registered a card, so a dock has nothing to appear as.  "
+                   "j36.usb=1 on the kernel command line is what loads udl.ko.");
+            if (once)
                 return 1;
-            }
+            nap(SCAN_INTERVAL_MS);
+            continue;
+        }
+        if (fd < 0) {
+            /* THE LINE THIS TASK EXISTED FOR.  What used to be here was `nap and
+             * continue', silently, forever -- so a board with a dock plugged into it
+             * and a black television said nothing at all for its whole uptime. */
+            explain_no_node(seen);
+            if (once)
+                return 1;
             nap(SCAN_INTERVAL_MS);
             continue;
         }
