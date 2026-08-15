@@ -207,7 +207,7 @@ static int j36_wlan_command(struct j36_wifi *w, u8 cid, bool set,
  */
 static int j36_wlan_frame(struct j36_wifi *w, const u8 *frame, u32 frame_len,
 			  u8 packet_type, u8 sta_index, bool is_80211,
-			  bool is_1x, bool basic_rate, u8 *tag_out)
+			  bool is_1x, bool basic_rate, bool may_wait, u8 *tag_out)
 {
 	const u32 packet_size = J36_HIF_DATA_HEADER_SIZE + frame_len;
 	const u32 transfer = ALIGN(packet_size, 4);
@@ -266,7 +266,8 @@ static int j36_wlan_frame(struct j36_wifi *w, const u8 *frame, u32 frame_len,
 	}
 	memcpy(packet + J36_HIF_DATA_HEADER_SIZE, frame, frame_len);
 
-	ret = j36_wifi_hif_tx_acquire(w, tc);
+	ret = may_wait ? j36_wifi_hif_tx_acquire(w, tc) :
+			 j36_wifi_hif_tx_try(w, tc);
 	if (ret)
 		return ret;
 	j36_wifi_hif_submit(w, tc, packet, transfer);
