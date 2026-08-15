@@ -183,9 +183,9 @@ bool run(const QString &exe, const QStringList &args, int msec, QString *said)
 
 } /* namespace */
 
-/* ── Volume ──────────────────────────────────────────────────────────────── */
+/* ── Disk ──────────────────────────────────────────────────────────────── */
 
-QString Volume::name() const
+QString Disk::name() const
 {
     if (!label.trimmed().isEmpty())
         return label.trimmed();
@@ -195,25 +195,25 @@ QString Volume::name() const
     return kernel;
 }
 
-QString Volume::key() const
+QString Disk::key() const
 {
     return QStringLiteral("vol:") + mountPoint.section(QLatin1Char('/'), -1);
 }
 
-/* ── Volumes ─────────────────────────────────────────────────────────────── */
+/* ── Disks ─────────────────────────────────────────────────────────────── */
 
-Volumes &Volumes::instance()
+Disks &Disks::instance()
 {
-    static Volumes v;
+    static Disks v;
     return v;
 }
 
-Volumes::Volumes(QObject *parent)
+Disks::Disks(QObject *parent)
     : QObject(parent)
 {
 }
 
-void Volumes::start()
+void Disks::start()
 {
     if (m_started)
         return;
@@ -222,7 +222,7 @@ void Volumes::start()
     m_settle = new QTimer(this);
     m_settle->setSingleShot(true);
     m_settle->setInterval(kSettleMs);
-    connect(m_settle, &QTimer::timeout, this, &Volumes::rescan);
+    connect(m_settle, &QTimer::timeout, this, &Disks::rescan);
 
     /*
      * O_CLOEXEC because this dashboard forks children constantly -- every launch,
@@ -232,18 +232,18 @@ void Volumes::start()
     m_fd = ::open(kMountInfo, O_RDONLY | O_CLOEXEC);
     if (m_fd >= 0) {
         m_notifier = new QSocketNotifier(m_fd, QSocketNotifier::Exception, this);
-        connect(m_notifier, &QSocketNotifier::activated, this, &Volumes::onMountEvent);
+        connect(m_notifier, &QSocketNotifier::activated, this, &Disks::onMountEvent);
     }
 
     m_backstop = new QTimer(this);
     m_backstop->setInterval(kBackstopMs);
-    connect(m_backstop, &QTimer::timeout, this, &Volumes::rescan);
+    connect(m_backstop, &QTimer::timeout, this, &Disks::rescan);
     m_backstop->start();
 
     m_list = scan();
 }
 
-void Volumes::onMountEvent()
+void Disks::onMountEvent()
 {
     if (m_fd < 0)
         return;
@@ -268,9 +268,9 @@ void Volumes::onMountEvent()
     m_settle->start();
 }
 
-void Volumes::rescan()
+void Disks::rescan()
 {
-    const QVector<Volume> next = scan();
+    const QVector<Disk> next = scan();
 
     bool same = next.size() == m_list.size();
     for (int i = 0; same && i < next.size(); ++i) {
@@ -286,10 +286,10 @@ void Volumes::rescan()
     emit changed();
 }
 
-QVector<Volume> Volumes::scan() const
+QVector<Disk> Disks::scan() const
 {
     QVector<MountRow> live = liveMounts();
-    QVector<Volume> out;
+    QVector<Disk> out;
 
     /*
      * The state files first, because they carry the one thing mountinfo cannot
@@ -305,7 +305,7 @@ QVector<Volume> Volumes::scan() const
         if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
             continue;
 
-        Volume v;
+        Disk v;
         v.kernel = n;
         while (!f.atEnd()) {
             const QString line = QString::fromUtf8(f.readLine()).trimmed();
@@ -346,7 +346,7 @@ QVector<Volume> Volumes::scan() const
      * mount, an older card, or the volume this dashboard was told about between
      * the mount and the file. */
     for (const MountRow &r : live) {
-        Volume v;
+        Disk v;
         v.mountPoint = r.point;
         v.fstype = r.fstype;
         v.readOnly = r.readOnly;
@@ -356,32 +356,32 @@ QVector<Volume> Volumes::scan() const
         out.append(v);
     }
 
-    std::sort(out.begin(), out.end(), [](const Volume &a, const Volume &b) {
+    std::sort(out.begin(), out.end(), [](const Disk &a, const Disk &b) {
         return a.mountPoint < b.mountPoint;
     });
     return out;
 }
 
-const Volume *Volumes::byKey(const QString &key) const
+const Disk *Disks::byKey(const QString &key) const
 {
-    for (const Volume &v : m_list) {
+    for (const Disk &v : m_list) {
         if (v.key() == key)
             return &v;
     }
     return nullptr;
 }
 
-bool Volumes::eject(const QString &key, QString *error)
+bool Disks::eject(const QString &key, QString *error)
 {
     if (error)
         error->clear();
 
-    const Volume *found = byKey(key);
+    const Disk *found = byKey(key);
     if (!found) {
         /* Already gone, which is the state the caller asked for. */
         return true;
     }
-    const Volume v = *found;   /* by value: the rescan below invalidates the list */
+    const Disk v = *found;   /* by value: the rescan below invalidates the list */
 
     QString said;
 

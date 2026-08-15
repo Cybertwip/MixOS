@@ -52,6 +52,11 @@
  * mount point that may by then be something else.  The direct call to the script
  * and the plain umount are the two rungs below it, for a system where systemd is
  * not the one that mounted this.
+ *
+ * THE NAME.  "Volume" is the obvious word for a mounted filesystem and it is taken:
+ * volume.h is the audio one, and it is a namespace, so the two cannot coexist in a
+ * translation unit that includes both -- which dashboard.cpp does.  Hence Disk and
+ * Disks here, and `volume' left to mean loudness everywhere in this program.
  */
 #ifndef MIXDASH_DISKS_H
 #define MIXDASH_DISKS_H
@@ -70,7 +75,7 @@ class QTimer;
  * shell wants a snapshot it can hold across a rebuild rather than a pointer into
  * something that is about to be rescanned.
  */
-struct Volume {
+struct Disk {
     /* The kernel name -- "sda1", never a path.  It is the systemd instance name
      * and therefore the only handle eject() needs. */
     QString kernel;
@@ -98,22 +103,22 @@ struct Volume {
     QString key() const;
 };
 
-class Volumes : public QObject
+class Disks : public QObject
 {
     Q_OBJECT
 
 public:
-    static Volumes &instance();
+    static Disks &instance();
 
     /* Begin watching.  Idempotent, and safe to call before anything is on screen;
      * the first scan happens inside it, so list() is right by the time the grid is
      * first built. */
     void start();
 
-    const QVector<Volume> &list() const { return m_list; }
+    const QVector<Disk> &list() const { return m_list; }
     /* Null when there is no such volume -- which is the normal answer a moment
      * after somebody pulled the stick out, so every caller checks. */
-    const Volume *byKey(const QString &key) const;
+    const Disk *byKey(const QString &key) const;
 
     /*
      * Unmount it and stop anything that would remount it.  True when the volume is
@@ -137,11 +142,11 @@ private slots:
     void rescan();
 
 private:
-    explicit Volumes(QObject *parent = nullptr);
+    explicit Disks(QObject *parent = nullptr);
 
-    QVector<Volume> scan() const;
+    QVector<Disk> scan() const;
 
-    QVector<Volume> m_list;
+    QVector<Disk> m_list;
     int m_fd = -1;
     QSocketNotifier *m_notifier = nullptr;
     QTimer *m_settle = nullptr;     /* debounce between the wake and the look */

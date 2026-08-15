@@ -21,7 +21,7 @@
 #include "theme.h"
 #include "trace.h"
 #include "volume.h"
-#include "volumes.h"
+#include "disks.h"
 #include "wifi.h"
 
 #include <QCoreApplication>
@@ -322,7 +322,7 @@ Dashboard::Dashboard(QWidget *parent)
      * insert because the grid's order is a saved list of keys and only buildPages()
      * knows how to apply it; the cost is a handful of AppEntry copies once per plug.
      */
-    connect(&Volumes::instance(), &Volumes::changed,
+    connect(&Disks::instance(), &Disks::changed,
             this, &Dashboard::onVolumesChanged);
     connect(m_files, &FilesPage::openRequested, this, &Dashboard::onOpenRequested);
     connect(m_settings, &SettingsPage::openRequested, this, &Dashboard::onSettingsOpen);
@@ -608,13 +608,13 @@ void Dashboard::buildPages()
      * lays the saved keys out first, so a stick that has been picked up and moved to
      * the front of the grid comes back to the front of the grid the next time it is
      * plugged in.  That is the whole reason Volume::key is derived from the mount
-     * point and not from the kernel name -- see volumes.h.
+     * point and not from the kernel name -- see disks.h.
      *
      * The greyed-out case is a read-only mount: a dirty NTFS volume, or a disk with
      * errors on it.  It still opens -- reading it is exactly what it is good for --
      * so `available' stays true and the state is said in the menu instead.
      */
-    for (const Volume &v : Volumes::instance().list()) {
+    for (const Disk &v : Disks::instance().list()) {
         AppEntry disk;
         disk.key = v.key();
         disk.title = v.name();
@@ -801,7 +801,7 @@ void Dashboard::onVolumesChanged()
 /*
  * Eject, from the long-press menu on a volume's card.
  *
- * The work is Volumes::eject(): stop the automounter's unit for that device, and if
+ * The work is Disks::eject(): stop the automounter's unit for that device, and if
  * that is not enough, sync and umount by hand.  It is seconds rather than instant --
  * a stick with a gigabyte of dirty pages behind it has to write them all before the
  * umount returns -- so the ring turns for the whole of it.  Blocking here is
@@ -815,7 +815,7 @@ void Dashboard::onEjectRequested(int index)
         return;
 
     const AppEntry entry = apps[index];
-    const Volume *v = Volumes::instance().byKey(entry.key);
+    const Disk *v = Disks::instance().byKey(entry.key);
     if (!v) {
         toast(tr("%1 is no longer plugged in").arg(entry.title), 3000);
         return;
@@ -832,7 +832,7 @@ void Dashboard::onEjectRequested(int index)
     m_busy->start(tr("Ejecting %1").arg(entry.title));
 
     QString error;
-    const bool ok = Volumes::instance().eject(entry.key, &error);
+    const bool ok = Disks::instance().eject(entry.key, &error);
 
     m_busy->stop();
 
@@ -1568,11 +1568,11 @@ void Dashboard::activate(const AppEntry &entry)
         /*
          * The mount point is looked up NOW rather than carried on the card, because
          * the card outlives the truth by up to a rescan: a stick pulled out is a
-         * card that is still on the grid until Volumes notices and the grid is
+         * card that is still on the grid until Disks notices and the grid is
          * rebuilt, and pressing it in that window must say so rather than open a
          * browser on a directory that is not a filesystem any more.
          */
-        const Volume *v = Volumes::instance().byKey(entry.key);
+        const Disk *v = Disks::instance().byKey(entry.key);
         if (!v) {
             toast(tr("%1 is no longer plugged in").arg(entry.title), 3000);
             break;

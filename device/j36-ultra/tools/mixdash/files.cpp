@@ -22,7 +22,7 @@
 #include "joypad.h"
 #include "theme.h"
 #include "trace.h"
-#include "volumes.h"
+#include "disks.h"
 
 namespace {
 
@@ -151,7 +151,7 @@ FilesPage::FilesPage(QWidget *parent)
      * the other half: the page is closed rather than left pointing at a mount point
      * that is not there any more.
      */
-    connect(&Volumes::instance(), &Volumes::changed, this, [this]() {
+    connect(&Disks::instance(), &Disks::changed, this, [this]() {
         rebuildPlaces();
         if (!m_scope.isEmpty() && !QFileInfo::exists(m_scope)) {
             emit toastRequested(tr("%1 was removed").arg(m_scopeName), 2600);
@@ -240,8 +240,8 @@ void FilesPage::rebuildPlaces()
         p.path = m_scope;
         p.glyph = GlyphDrive;
         p.volume = true;
-        const Volume *v = nullptr;
-        for (const Volume &candidate : Volumes::instance().list()) {
+        const Disk *v = nullptr;
+        for (const Disk &candidate : Disks::instance().list()) {
             if (candidate.mountPoint == m_scope)
                 v = &candidate;
         }
@@ -274,7 +274,7 @@ void FilesPage::rebuildPlaces()
     root.glyph = GlyphSettings;
     m_places.append(root);
 
-    for (const Volume &v : Volumes::instance().list()) {
+    for (const Disk &v : Disks::instance().list()) {
         Place p;
         p.label = v.name();
         p.path = v.mountPoint;
@@ -316,7 +316,7 @@ void FilesPage::openAt(const QString &path, const QString &scope)
     m_scopeName.clear();
     if (!m_scope.isEmpty()) {
         m_scopeName = m_scope.section(QLatin1Char('/'), -1);
-        for (const Volume &v : Volumes::instance().list()) {
+        for (const Disk &v : Disks::instance().list()) {
             if (v.mountPoint == m_scope)
                 m_scopeName = v.name();
         }

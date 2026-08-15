@@ -2166,6 +2166,142 @@ if [ "$want_wifi" = 1 ] && [ "$want_power" != 1 ]; then
     say "      (add j36.power=nocharge as well to leave the charger as the LK set it)"
 fi
 
+# ── Swap, in RAM, before anything has allocated ──────────────────────────────
+#
+# This is the earliest point in the boot where the swap device can be made, and it
+# is made here rather than from a unit on the rootfs for two reasons.  The rootfs
+# is shared with the R36S and nothing on it may be written, so a unit would have to
+# be generated into /run from this same script anyway; and by the time systemd runs
+# a generated unit, systemd, udev and journald have all made their first
+# allocations on a 946 MiB board with nowhere to put them.
+#
+# WHAT IT ACTUALLY BUYS.  Nothing, if the board is not short of memory -- an unused
+# swap device is a few kilobytes of metadata.  What it changes is the shape of the
+# failure when it IS short.  Without it the sequence is: allocation fails, the OOM
+# killer picks the biggest process, the browser disappears.  With it the kernel has
+# somewhere to put the pages nothing has touched for a while -- and on this board
+# that is most of Firefox, whose resident set is largely a 130 MB libxul it read
+# once and font caches it will not read again.  Those compress about 2:1, so the
+# machine gets roughly 768 MiB of address space back for about 380 MiB of RAM.
+#
+# THE TWO NUMBERS, AND WHY THERE ARE TWO.  disksize is what the kernel is allowed
+# to BELIEVE the swap device holds, and it is 80% of RAM.  mem_limit is what zram
+# is allowed to physically consume, and it is 35%.  They are different questions:
+# the first sets how much reclaim is possible, and the second is what stops the
+# swap-death spiral -- pages compressing badly, zram eating RAM to store them,
+# which is more pressure, which swaps more pages in.  Past mem_limit zram simply
+# refuses the write, the page stays where it was, and the machine degrades to the
+# behaviour it had before this function existed instead of collapsing.  With a 2:1
+# ratio the limit is never reached; with a 1.5:1 one it caps the swap at about
+# 480 MiB, which is still a win and is still bounded.
+setup_zram() {
+    if [ "$want_zram" = 0 ]; then
+        say "zram: j36.zram=0, so this boot has no swap at all"
+        return 0
+    fi
+    # A missing device is a kernel built without CONFIG_ZRAM, which is a thing to
+    # say out loud rather than a thing to fail on: everything else about this boot
+    # still works, it just works the way it did before there was swap.
+    if [ ! -d /sys/block/zram0 ] || [ ! -b /dev/zram0 ]; then
+        say "zram: no /sys/block/zram0 -- this kernel has no CONFIG_ZRAM, so there"
+        say "      is no swap on this boot"
+        return 1
+    fi
+
+    memkb=$(sed -n 's/^MemTotal: *\([0-9]*\) kB$/\1/p' /proc/meminfo)
+    case "$memkb" in
+        ""|*[!0-9]*)
+            say "zram: /proc/meminfo gave no MemTotal, so there is nothing to size against"
+            return 1
+            ;;
+    esac
+
+    # auto is 80%; a number from the command line is MiB and is taken as given,
+    # including a number larger than RAM.  That is not a mistake to guard against
+    # -- it is how a compressible workload is measured, and mem_limit below is the
+    # guard that makes trying it safe.
+    if [ "$want_zram" = auto ]; then
+        disk_kb=$((memkb * 80 / 100))
+    else
+        case "$want_zram" in
+            *[!0-9]*)
+                say "zram: j36.zram=$want_zram is not a number of MiB; using auto"
+                disk_kb=$((memkb * 80 / 100))
+                ;;
+            *)
+                disk_kb=$((want_zram * 1024))
+                ;;
+        esac
+    fi
+    lim_kb=$((memkb * 35 / 100))
+
+    # comp_algorithm FIRST.  Writing disksize is what initialises the device, and
+    # every knob that describes how it stores pages is -EBUSY after that.  lz4 is
+    # already the compiled-in default -- see the swap section in build-in-vm.sh --
+    # so this line is belt and braces against a kernel configured elsewhere, and it
+    # is allowed to fail without stopping anything.
+    echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+    echo "${lim_kb}K" > /sys/block/zram0/mem_limit 2>/dev/null || true
+    if ! echo "${disk_kb}K" > /sys/block/zram0/disksize 2>/dev/null; then
+        say "zram: the kernel refused a disksize of ${disk_kb} kB; no swap this boot"
+        return 1
+    fi
+
+    if ! mkswap /dev/zram0 >/dev/null 2>&1; then
+        say "zram: mkswap failed on /dev/zram0; no swap this boot"
+        return 1
+    fi
+    if ! swapon /dev/zram0 >/dev/null 2>&1; then
+        say "zram: swapon failed on /dev/zram0; no swap this boot"
+        return 1
+    fi
+
+    # ── the three knobs that decide whether the swap is used well ────────────
+    #
+    # Applied here and not in a sysctl.d file, because they are properties of this
+    # swap device rather than of the rootfs, and this rootfs is shared with a board
+    # that has none.  They are global kernel state, so they cross switch_root with
+    # the swap device itself; nothing in this image sets them afterwards, and
+    # section 7 of mixos-log.txt reads them back so a rootfs that starts to would
+    # be visible rather than mysterious.
+    #
+    # They are inside this function and not above the j36.zram=0 test on purpose:
+    # that word exists so the board can be measured with swap and without it, and a
+    # comparison where only half the tuning changes measures nothing.
+    #
+    #   swappiness 150.  The number has meant "how much to prefer reclaiming anon
+    #   over file" since the ceiling went from 100 to 200 in 5.8, and 150 is a
+    #   deliberate bias toward anon.  The default 60 assumes reclaiming a file page
+    #   is nearly free because it can be read back from disk -- here "disk" is a
+    #   microSD card at a few hundred microseconds a seek, and the anon page it is
+    #   avoiding costs about twenty-five microseconds of lz4.  Dropping page cache
+    #   to protect anonymous memory is the wrong trade by an order of magnitude on
+    #   this board, and this is the line that inverts it.
+    #
+    #   page-cluster 0.  The default 3 reads eight pages on every swap-in, which is
+    #   correct for a spinning disk where the seek is the cost and the transfer is
+    #   free.  zram has no seek: every one of those eight is a separate
+    #   decompression, seven of them for pages nobody asked for, and they land in
+    #   the memory the machine was short of.  0 means read one page.
+    #
+    #   watermark_scale_factor 100.  How far above the low watermark kswapd keeps
+    #   reclaiming, in tenths of a percent of the zone -- 10 by default, so 0.1%,
+    #   which on this board is about a megabyte of headroom.  An allocation that
+    #   arrives while kswapd is still working goes into DIRECT reclaim, where the
+    #   allocating thread does the compressing itself and stalls until it finishes;
+    #   that is what a UI freeze under memory pressure actually is.  100 is 1%,
+    #   roughly ten megabytes, which is enough for kswapd to stay ahead.
+    echo 150 > /proc/sys/vm/swappiness 2>/dev/null || true
+    echo 0   > /proc/sys/vm/page-cluster 2>/dev/null || true
+    echo 100 > /proc/sys/vm/watermark_scale_factor 2>/dev/null || true
+
+    say "zram: $((disk_kb / 1024)) MiB of lz4 swap, capped at $((lim_kb / 1024)) MiB of real RAM"
+    say "      (${memkb} kB total; j36.zram=0 in bootargs turns it off)"
+    return 0
+}
+
+setup_zram
+
 mkdir -p /newroot
 
 # ext2 first because that is what MixOS formats ROOTFS as now, and it has to be
