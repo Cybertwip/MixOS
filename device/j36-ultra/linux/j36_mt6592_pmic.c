@@ -396,7 +396,7 @@ MODULE_PARM_DESC(chgreboot,
  * J36_ADC_VOLTAGE_FULL_RANGE_MV to 1800 and the old behaviour returns, with the
  * same arithmetic on show.
  */
-#define J36_ADC_VOLTAGE_FULL_RANGE_MV	3600
+#define J36_ADC_VOLTAGE_FULL_RANGE_MV	1800
 #define J36_ADC_R_BAT_SENSE		4
 #define J36_ADC_FULL_SCALE_MV		(J36_ADC_VOLTAGE_FULL_RANGE_MV * \
 					 J36_ADC_R_BAT_SENSE)
