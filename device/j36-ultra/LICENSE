@@ -172,8 +172,8 @@ form is:
     device/r36-ultra/.
   * MediaTek -- the MT6592 register-level documentation and the vendor driver
     sources this port reads, via the MVII tree in mvii-board/.
-  * Mesa (lima and kmsro), Qt, SDL, busybox, doomgeneric and Freedoom, without
-    any of which there would be no port.
+  * Mesa (lima and kmsro), Qt, SDL and busybox, without any of which there would
+    be no port.
 
 Neither half of the dual grant conveys any right in a trademark -- MPL-2.0
 section 2.3 says so outright, and the GPL has never granted one.  Every trademark

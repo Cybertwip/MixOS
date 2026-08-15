@@ -223,9 +223,6 @@ LICENSE.txt            which licence covers which file above, and where the
                        GPL-2.0-only source is
 ```
 
-`j36/doom` and `j36/freedoom1.wad` are no longer staged — see the fbdoom section
-below. `J36_DOOM=1` puts them back.
-
 Everything under `j36/` is read by `/init` and by nothing else — no LK load
 window, no size limit, no partition table entry. Deleting the directory, or the
 matching word from `bootargs`, restores the previous boot exactly, from any
@@ -491,43 +488,31 @@ consumer whose provider has no driver does not fail — it defers, and keeps
 deferring until `driver_deferred_probe_timeout` expires. That was the whole gap
 between 0.87 s and 11.38 s, plus an error on the panel.
 
-## fbdoom: proving a program can drive the panel and the pad
+## What a game proved, and where the rule it left behind came from
 
-**Not staged any more.** `J36_DOOM` defaults to `0`: nothing is compiled, no IWAD
-is downloaded, and neither file reaches the BOOT partition, which carries the boot
-payload and not userland software. `/init` still runs `j36/doom` when `j36.doom=1`
-and the file is there, so `J36_DOOM=1` brings all of the below back unchanged. It
-is still the fastest way to split "the panel is broken" from "GL is broken", since
-Doom needs no DRM, no GL and no rootfs.
+There used to be a framebuffer Doom here. It was staged on the BOOT partition and
+`/init` ran it on `j36.doom=1`, and it existed because booting proves the machine
+runs but does not prove a *program* can drive this display or read this gamepad —
+32-bit pixels into `/dev/fb0` and events out of `/dev/input/event0` was the
+cheapest honest answer to that, needing no DRM, no GL and no rootfs. Nothing
+already on the card could ask the question: SDL2's video backends are KMSDRM,
+X11, Wayland, offscreen and dummy, with **no fbdev backend**, so the `gzdoom` and
+`lzdoom` in the shared rootfs both need DRM/KMS or a GL stack.
 
-Booting proves the machine runs. It does not prove a *program* can drive this
-display or read this gamepad, and the cheapest honest answer to that is
-doomgeneric writing 32-bit pixels into `/dev/fb0` and reading `/dev/input/event0`.
+**It is gone.** MixOS ships a base operating system: nothing is cloned, compiled,
+downloaded or staged for it, no IWAD reaches the card, and `j36.doom=1` is now an
+unrecognised word. The dashboard's Packages page installs Debian's own —
+`chocolate-doom`, `prboom-plus` and `freedoom` are in the Games collection there —
+which is where a game on this device comes from now.
 
-Nothing already on the card could ask the question. SDL2's video backends are
-KMSDRM, X11, Wayland, offscreen and dummy — there is **no fbdev backend** — so the
-`gzdoom` and `lzdoom` already in the shared rootfs both need DRM/KMS or a GL
-stack. doomgeneric needs neither, nor SDL, nor X11.
-
-The panel is `640x480`, stride 2560, `x8r8g8b8`, and doomgeneric's `rgba8888`
-packing is bit-identical to it, so the blit is one `memcpy` per line.
-`DOOMGENERIC_RESY=400` gives a clean 2× of Doom's 320x200 and is letterboxed with
-40 black lines top and bottom, because `i_video.c` computes a `y_offset` and then
-never applies it. `/init` puts `/dev/tty0` into `KD_GRAPHICS` while Doom holds the
-screen, including on the way out through a signal, so a crash cannot leave the
-panel frozen on the last frame and kernel messages cannot paint over a frame.
-
-The binary and the IWAD live on the FAT BOOT partition and not in the initramfs:
-the initramfs goes into `boot.img`, which is asserted against the fixed 9 MiB
-BOOTIMG slot, and 2 MiB of Doom plus 24 MiB of WAD would push that payload into
-RECOVERY. A vfat mount gives every file mode 0755, so the binary is executable
-straight off the card.
-
-The source list is *checked*, not written: it is derived from the pinned
-doomgeneric tree by exclusion and then diffed against upstream's own `SRC_DOOM`,
-so a file added upstream is a build failure here rather than a link error against
-a library this board has not got. The whole step runs with `errexit` suspended —
-a game must never cost the user the kernel artifacts.
+Two things it left behind are still load-bearing. `mixsplash` and `mixdash` hold
+`/dev/tty0` in `KD_GRAPHICS` for exactly the reason it did: a full-screen
+framebuffer program that lets go of the mode leaves the panel frozen on its last
+frame, or lets kernel messages paint over it. And a 26 MiB IWAD was the first
+thing that obviously did not belong on a 100 MB vfat launcher partition shared
+with an R36S card's own boot files — the initramfs goes into `boot.img`, which is
+asserted against the fixed 9 MiB BOOTIMG slot, so userland software goes to
+`/opt/mixos` on the ext2 OS partition. Everything staged since obeys that rule.
 
 ## The Mali-450, and why a userspace helper runs before the driver
 
@@ -568,7 +553,7 @@ The MFG power domain is **gated when Linux starts**. The MVII LK has a proven
 kernel, not in the LK's hand-off to Linux. Reading an unpowered MTK subsystem does
 not return garbage — it stalls the AXI bus, and the watchdog reboots the board with
 nothing in any log. A built-in lima would do that during probe on *every* boot,
-before the console, before the input driver, before Doom.
+before the console, before the input driver, before anything this card is for.
 
 So `CONFIG_DRM_LIMA=m`, and `tools/mfgpower.c` is the gate. It is a static ARMv7
 `/dev/mem` helper that transcribes the LK's sequence register for register — set
@@ -783,7 +768,7 @@ name is the first thing that failed, not the last thing that was tried, and
 ## Licence and attribution
 
 The original MixOS work here — `build-in-vm.sh`, `generate_dts.py`,
-`create_boot_image.py`, `fetch_freedoom.py`, `tools/j36-eglprobe.c`, `tools/j36-mixmirror.c`, `tools/mfgpower.c`,
+`create_boot_image.py`, `tools/j36-eglprobe.c`, `tools/j36-mixmirror.c`, `tools/mfgpower.c`,
 `tools/mixsplash.c`, `tools/mixdash/` and this documentation — is dual-licensed:
 take it under the **Mozilla Public License 2.0** or under the **GNU General Public
 License version 2 or later**, at your option. The reasoning, the exact per-file
@@ -811,8 +796,8 @@ distinction is not cosmetic:
   this device's own stock system image and redistributed unmodified with a
   SHA-256 each in `firmware/README.md`. MediaTek's terms, not this project's.
 
-A finished card is an aggregate: the Linux kernel, Mesa, Qt, SDL, busybox, the
-Freedoom IWAD and the Debian rootfs each arrive under their own terms.
+A finished card is an aggregate: the Linux kernel, Mesa, Qt, SDL, busybox and the
+Debian rootfs each arrive under their own terms.
 `build-in-vm.sh` writes the same statement onto the card as `sd-boot/LICENSE.txt`,
 mapped payload file by payload file and with both licence texts appended, because
 handing somebody a card is a distribution and both halves of the grant say the
@@ -833,6 +818,6 @@ Debian's work; to **ArkOS** and **dArkOS** for the distribution this grew out of
 to **MediaTek**, whose register documentation and vendor driver sources the device
 tree generator reads directly rather than guessing from; to **Mesa**, whose lima
 and kmsro drivers are the only reason a Utgard part from 2013 can run a GLES 2.0
-UI at all; and to the **Linux kernel**, **Qt**, **SDL**, **busybox** and
-**doomgeneric** projects. MixOS is not affiliated with or endorsed by any of them,
+UI at all; and to the **Linux kernel**, **Qt**, **SDL** and **busybox**
+projects. MixOS is not affiliated with or endorsed by any of them,
 and neither half of the dual grant conveys a right in anybody's trademark.
