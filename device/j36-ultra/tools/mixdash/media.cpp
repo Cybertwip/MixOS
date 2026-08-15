@@ -1041,7 +1041,7 @@ void MediaPage::stepImage(int delta)
 
 /* ── ffmpeg, aplay and the card ──────────────────────────────────────────── */
 
-QString MediaPage::ffmpegPath() const
+QString MediaPage::ffmpegPath()
 {
     static const QString path = firstExisting(QStringList()
                                               << "/usr/bin/ffmpeg" << "/bin/ffmpeg"
@@ -1056,7 +1056,7 @@ QString MediaPage::aplayPath() const
     return path;
 }
 
-QString MediaPage::alsaDevice() const
+QString MediaPage::alsaDevice()
 {
     /*
      * THE LOWEST-NUMBERED PLAYBACK PCM, BY NAME, AND NOT `default'.
@@ -3334,6 +3334,23 @@ void MediaPage::setVolumeOverlay(const QImage &argb, const QRect &at)
  * the cursor move while a film is PAUSED, which is exactly when somebody reaches
  * for the mouse.
  */
+/*
+ * The spinner, on the same terms as the two above it.  It arrives about twelve
+ * times a second while it is turning and not at all when it is not, which is why
+ * the ring stops its own timer the moment it is taken down -- an animation nobody
+ * can see would otherwise re-composite a film for the rest of its length.
+ */
+void MediaPage::setBusyOverlay(const QImage &argb, const QRect &at)
+{
+    if (!m_gl)
+        return;
+    if (argb.isNull() || at.isEmpty())
+        m_gl->clearOverlay(GlVideo::BusyLayer);
+    else
+        m_gl->setOverlay(GlVideo::BusyLayer, argb, at);
+    present();
+}
+
 void MediaPage::setPointerOverlay(const QImage &argb, const QRect &at)
 {
     if (!m_gl)

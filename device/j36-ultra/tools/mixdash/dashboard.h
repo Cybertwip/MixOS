@@ -45,6 +45,7 @@
 
 #include "widgets.h"
 
+class Busy;
 class DiagnosticsPage;
 class DisplayPage;
 class Joypad;
@@ -213,6 +214,18 @@ private slots:
     void syncPointerOverlay();
 
     /*
+     * A page is waiting for something, or has stopped waiting.  The shell owns the
+     * one spinner on the glass for the same reason it owns the one toast: a page
+     * that drew its own would draw it again the moment anything was pushed on top
+     * of it, and a page that has taken the whole panel cannot draw a widget over
+     * itself at all.
+     */
+    void onBusyRequested(bool on, const QString &what);
+    /* The ring turned.  Same three-line routing as the volume bar and the cursor,
+     * and it exists for the same reason: over a film the pixels are the GPU's. */
+    void syncBusyOverlay();
+
+    /*
      * Something was plugged into the port, or pulled out of it.
      *
      * WHY THE SHELL SAYS SO OUT LOUD.  This device has one USB connector and no
@@ -312,6 +325,9 @@ private:
      * overlay, like the toast and the keyboard, and for the same reason: it has
      * to appear over a page that has taken the whole panel. */
     VolumeOverlay *m_volumeBar = nullptr;
+    /* The ring that turns while something is being opened.  One of them, over
+     * whichever page asked -- see onBusyRequested(). */
+    Busy *m_busy = nullptr;
     Joypad *m_pad = nullptr;
 
     bool m_firstPaint = false;

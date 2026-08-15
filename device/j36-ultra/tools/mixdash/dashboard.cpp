@@ -5,6 +5,7 @@
  */
 #include "dashboard.h"
 
+#include "busy.h"
 #include "diagnostics.h"
 #include "joypad.h"
 #include "keyboard.h"
@@ -431,6 +432,9 @@ Dashboard::Dashboard(QWidget *parent)
     m_volumeBar = new VolumeOverlay(this);
     connect(m_volumeBar, &VolumeOverlay::changed, this, &Dashboard::syncVolumeOverlay);
 
+    m_busy = new Busy(this);
+    connect(m_busy, &Busy::changed, this, &Dashboard::syncBusyOverlay);
+
     Trace::step("Keyboard overlay");
     m_keyboard = new Keyboard(this);
     connect(m_keyboard, &Keyboard::finished, this, &Dashboard::onKeyboardFinished);
@@ -449,6 +453,9 @@ Dashboard::Dashboard(QWidget *parent)
 
     Trace::step("Pointer");
     m_pointer = new Pointer(this);
+    /* The two spinners are the same wait; which one is drawn follows the mouse.
+     * See the note on setPointerStyle() in busy.h. */
+    connect(m_pointer, &Pointer::awakeChanged, m_busy, &Busy::setPointerStyle);
 
     Trace::step("page tables");
     m_all << m_apps << m_media << m_settings
@@ -516,6 +523,7 @@ void Dashboard::adopt(PageWidget *page)
     connect(page, &PageWidget::closeRequested, this, &Dashboard::onCloseRequested);
     connect(page, &PageWidget::titleChanged, this, &Dashboard::onTitleChanged);
     connect(page, &PageWidget::textRequested, this, &Dashboard::onTextRequested);
+    connect(page, &PageWidget::busyRequested, this, &Dashboard::onBusyRequested);
 }
 
 QString Dashboard::firstExisting(const QStringList &candidates)
@@ -955,11 +963,16 @@ void Dashboard::applyChrome()
         m_toast->raise();
     if (m_volumeBar->isVisible())
         m_volumeBar->raise();
+    if (m_busy->isVisible())
+        m_busy->raise();
     m_pointer->raise();
 
     /* Leaving a film is the one cursor mode change nothing else notices: the arrow
-     * is not moving, so it will not ask on its own. */
+     * is not moving, so it will not ask on its own.  The ring has the same blind
+     * spot and for the same reason -- it may not be turning at the moment the film
+     * goes away. */
     syncPointerOverlay();
+    syncBusyOverlay();
 
     syncInputMode();
     update();
@@ -996,6 +1009,9 @@ void Dashboard::resizeEvent(QResizeEvent *event)
      * be placeable over a page that took the status bar away -- the Media player
      * at full screen is the main thing anybody presses VOL+ during. */
     m_volumeBar->placeIn(rect());
+    /* Centred on the whole panel, for the same reason: the page it is waiting for
+     * is usually the one that has taken the status bar away. */
+    m_busy->placeIn(rect());
 
     applyChrome();
     QWidget::resizeEvent(event);
@@ -1072,6 +1088,65 @@ void Dashboard::syncPointerOverlay()
      * adjustment -- see pointer.h. */
     const QRect at(m_pointer->mapToGlobal(QPoint(0, 0)), m_pointer->size());
     m_media->setPointerOverlay(m_pointer->snapshot(), at);
+}
+
+/*
+ * ── THE RING, AND WHY THE SHELL HOLDS IT ────────────────────────────────────
+ *
+ * Everything that used to freeze this dashboard froze it the same way: a fork and
+ * a blocking wait on the UI thread.  Shell::waitForFinished() sliced those waits
+ * up and repainted between the slices, which kept the panel from going black but
+ * could not make anything move -- so a four-second ffprobe was indistinguishable
+ * from a crash, and the honest answer would have been a spinner that no stopped
+ * event loop could ever have turned.
+ *
+ * The waits are asynchronous now.  This is the spinner they earned.  It is the
+ * shell's and not the page's for the two reasons every other overlay here is:
+ * a page that has taken the whole panel cannot draw a widget over itself while
+ * the GPU owns the pixels, and one spinner per page is several spinners the
+ * moment anything is pushed on top of anything.
+ */
+void Dashboard::onBusyRequested(bool on, const QString &what)
+{
+    /*
+     * From WHICHEVER page, including one that is no longer on the glass -- music
+     * keeps playing after the Media page is popped, so its probe can answer to a
+     * shell showing the card grid.  That is not a reason to ignore it: something
+     * really is being loaded, and saying so on the grid is more honest than a
+     * dashboard that looks idle while the SD card grinds.
+     */
+    if (!on) {
+        m_busy->stop();
+        syncBusyOverlay();
+        return;
+    }
+
+    m_busy->setPointerStyle(m_pointer->awake());
+    m_busy->start(what.isEmpty() ? tr("Loading") : what);
+    m_busy->raise();
+    syncBusyOverlay();
+}
+
+void Dashboard::syncBusyOverlay()
+{
+    const bool overFilm = m_media && m_media->glOwnsScreen();
+
+    if (m_busy->isRedirected() != overFilm) {
+        /* Down in whichever buffer it was drawn in, before it goes up in the
+         * other one -- the same two-sided clear syncPointerOverlay() does. */
+        if (!overFilm && m_media)
+            m_media->setBusyOverlay(QImage(), QRect());
+        m_busy->setRedirected(overFilm);
+        /* setRedirected() emits changed(), which re-enters here with the modes
+         * agreeing and hands the picture over.  Nothing left to do. */
+        return;
+    }
+
+    if (!overFilm)
+        return;
+
+    const QRect at(m_busy->mapToGlobal(QPoint(0, 0)), m_busy->size());
+    m_media->setBusyOverlay(m_busy->snapshot(), at);
 }
 
 /* ── the pages talking back ──────────────────────────────────────────────── */
@@ -1296,6 +1371,17 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
     m_pad->setSuspended(true);
     m_pointer->sleep();
 
+    /*
+     * The ring turns for as long as exec does.  That is a blink on a warm page
+     * cache and several seconds on a cold one -- a big binary comes off this SD
+     * card at a few megabytes a second and ld.so touches every page of it -- and
+     * the two used to be indistinguishable from a hang, because the old
+     * QProcess::execute() stopped the event loop for the whole of it.  The pointer
+     * has just been put to sleep, so the plain arc is the right one of the two.
+     */
+    m_busy->setPointerStyle(false);
+    m_busy->start(title);
+
     m_childTitle = title;
     QProcess *child = new QProcess(this);
     m_child = child;
@@ -1324,11 +1410,18 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
             childDone(tr("%1 exited").arg(m_childTitle));
     });
 
-    child->start(exe, args);
+    connect(child, &QProcess::started, this, [this]() {
+        /*
+         * The child is running and every pixel is its business from here.  Updates
+         * go off HERE and not straight after start(): between the two calls this
+         * dashboard is still the only thing on the glass, and a ring that cannot
+         * be painted is a ring that does not turn.
+         */
+        m_busy->stop();
+        setUpdatesEnabled(false);
+    });
 
-    /* After start(), so a failure to start has already been queued and is answered
-     * by childDone() rather than leaving the panel blank. */
-    setUpdatesEnabled(false);
+    child->start(exe, args);
 }
 
 void Dashboard::childDone(const QString &message)
@@ -1339,6 +1432,11 @@ void Dashboard::childDone(const QString &message)
         p->deleteLater();
     }
     m_childTitle.clear();
+
+    /* Either it never started or it has stopped; either way nothing is loading.
+     * Idempotent, so the usual case -- started() took the ring down already --
+     * costs nothing here. */
+    m_busy->stop();
 
     m_pad->setSuspended(false);
 

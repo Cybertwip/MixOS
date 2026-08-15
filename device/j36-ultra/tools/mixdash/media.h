@@ -170,6 +170,10 @@ public:
     bool glOwnsScreen() const;
     void setVolumeOverlay(const QImage &argb, const QRect &at);
     void setPointerOverlay(const QImage &argb, const QRect &at);
+    /* And the loading ring, which is the shell's for the same reason the other two
+     * are -- it goes over a film this page is drawing with the GPU, so it cannot be
+     * a widget.  See busy.h. */
+    void setBusyOverlay(const QImage &argb, const QRect &at);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -460,11 +464,11 @@ private:
 
     /* `plughw:C,D' for the lowest-numbered playback PCM, or empty when there is
      * no card.  See the header comment for why this is not `default'. */
-    QString alsaDevice() const;
+    static QString alsaDevice();
     /* Probed once: does this ffmpeg have the alsa output muxer compiled in.  If it
      * does, one process plays both streams; if not, audio needs its own chain. */
     bool ffmpegHasAlsa() const;
-    QString ffmpegPath() const;
+    static QString ffmpegPath();
     QString aplayPath() const;
     QString ffprobePath() const;
 
