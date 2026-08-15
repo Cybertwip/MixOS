@@ -48,6 +48,7 @@
 
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/etherdevice.h>
 #include <linux/if_ether.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
@@ -144,61 +145,65 @@ static int j36_wlan_command(struct j36_wifi *w, u8 cid, bool set,
  * The 16-byte transmit descriptor, and the derivation that is not in it.
  *
  * The traffic class follows the station record index and not the other way
- * round: qmEnqueueTxPackets picks TC5 for a record that is not valid, TC1 for a
- * valid record with no QoS, and management frames are forced to TC4 from
- * elsewhere.  802.1X is TC4 too, because stock never sends it down this path at
- * all -- wlanHardStartXmit turns an EAPOL frame into a security command on the
- * command queue, which is TC4's port.
+ * round, in that order, because that is the order qmEnqueueTxPackets does it in:
+ * qmDetermineStaRecIndex reads the ETHERNET destination first and a group
+ * address there is STA_REC_INDEX_BMCAST before anything else is looked at, and
+ * only then does the switch on the record pick the class -- TC5 for BMCAST or
+ * NOT_FOUND, TC1 for a valid record with no QoS.  Management frames are forced
+ * to TC4 from elsewhere.  802.1X is TC4 too, because stock never sends it down
+ * this path at all -- wlanHardStartXmit turns an EAPOL frame into a security
+ * command on the command queue, which is TC4's port.
  *
  * The port follows the class and nothing else: WTDR1 for TC4, WTDR0 for the
  * rest.  A management frame written to WTDR0 is accepted and never transmitted.
  *
- * ── AND THE BROADCAST ARM THAT USED TO BE HERE, WHICH IS WHAT KILLED DHCP ────
+ * ── THE BROADCAST ARM: WHY IT LEFT, AND WHY IT IS BACK ───────────────────────
  *
- * This function used to test the Ethernet destination for a group address and
- * send those frames under J36_STA_INDEX_BMCAST on TC5:
+ * It was taken out on the argument that a station never puts a group-addressed
+ * frame onto the medium -- true; it goes out as a ToDS unicast to the AP under
+ * the pairwise key, Addr1 the BSSID, Addr2 us, ff:ff:ff:ff:ff:ff carried in
+ * Addr3 -- and that TC5's single page would therefore never be credited back.
+ * The 802.11 half of that is right.  The conclusion drawn from it is not:
  *
- *     const bool group = !is_80211 && frame_len >= ETH_ALEN && (frame[0] & 0x01);
- *     const u8 record = group ? J36_STA_INDEX_BMCAST : sta_index;
+ *   The record is not this driver's decision to make.  qmDetermineStaRecIndex
+ *   says so in its own comment, on the arm in question: "For intrastructure mode
+ *   and P2P (playing as a GC), BMCAST frames shall be sent to the AP.  FW SHALL
+ *   TAKE CARE OF THIS.  The host driver is not able to distinguish these cases."
+ *   Stock takes that arm for an AIS station in infrastructure mode with no
+ *   exception anywhere.  The firmware is what turns the BMCAST record into a
+ *   frame for the AP under the pairwise key -- that is the whole reason the
+ *   comment is there.  Naming the AP's record instead tells the firmware the
+ *   destination is a peer that the Ethernet header in the same packet says it is
+ *   not, and what it does with that contradiction is undocumented and silent.
  *
- * That is stock's arm for an ACCESS POINT, and this driver is not one.  It is a
- * station in an infrastructure BSS, and A STATION NEVER TRANSMITS A GROUP-
- * ADDRESSED FRAME.  It has exactly one peer.  A frame the stack hands down with
- * ff:ff:ff:ff:ff:ff in the Ethernet destination goes onto the air as a UNICAST
- * 802.11 frame to the AP -- ToDS, Addr1 the BSSID, Addr2 us, the broadcast
- * destination carried in Addr3 -- and the AP is what repeats it to the segment.
- * It is protected with the PAIRWISE key, like everything else we send.  There is
- * no other way for a station to put a broadcast onto the medium, and the BMCAST
- * record is the firmware's transmit path for the other side of that: the group
- * key an AP encrypts its own beacons' worth of traffic with.
+ *   TC5 is credited back exactly like every other class.  nicTxReleaseResource
+ *   adds aucTxRlsCnt[i] for i = 0..5 out of the same two registers -- WTSR0
+ *   carries TC0..TC3, WTSR1 carries TC4 and TC5 -- and j36_hif_tx_release()
+ *   already decodes all six of them.  There is no arm anywhere, in stock or
+ *   here, that skips TC5.
  *
- * So the arm was wrong twice over, and both of them are silent:
+ * What actually wedged in the version that was reverted is visible in its own
+ * diff.  It sent BOTH the BMCAST record AND STA_REC_INDEX_NOT_FOUND to TC5:
  *
- *   The key.  j36_wlan_cmd_install_key() files the GTK with ucTxKey = 0, because
- *   a station's group key is a RECEIVE key and stock says so.  Asking the
- *   firmware to transmit under the BMCAST record is asking it to encrypt with a
- *   key that was never installed as a transmit key.
+ *     tc = (record == J36_STA_INDEX_BMCAST ||
+ *           record == J36_STA_INDEX_NOT_FOUND) ? TC5 : TC1;
  *
- *   The pages.  TC5 has ONE page in nicTxResetResource's table -- "TX pages 01 14
- *   01 01 04 01" in this driver's own HIF dump, TC1's twenty against TC5's one --
- *   and the firmware only ever credits a class back when it drains it.  In an AIS
- *   session it has no reason to drain TC5 at all.  So the FIRST group-addressed
- *   frame after the link came up took the only page and never gave it back, and
- *   every frame behind it hit j36_hif_tx_acquire()'s starve path and came back
- *   -EBUSY -- which j36_wlan_drain_tx() answers by putting the frame back at the
- *   HEAD of the queue and stopping.  One broadcast wedged the entire transmit
- *   queue of the interface, permanently, with nothing above it able to see why.
+ * and wlan->sta_index sits at NOT_FOUND until the firmware confirms the station
+ * record, so every UNICAST frame sent before that confirmation went onto a class
+ * with one page too.  The confirmation works now -- "peer record 0 (firmware
+ * confirmed)" in this driver's own status line -- so unicast stays on TC1's
+ * twenty pages and only the genuinely group-addressed frames take TC5's one,
+ * which is all stock ever needs at a time.  A starve on TC5 is no longer fatal
+ * either: j36_wlan_drain_tx() retries at the head of the queue up to
+ * J36_WLAN_TX_STALL_LIMIT and then drops that one frame and moves on.
  *
- * And what does a freshly associated station send first?  A DHCPDISCOVER, to
- * ff:ff:ff:ff:ff:ff, because it has no address yet to be spoken to at.  Then ARP,
- * broadcast.  Then IPv6 multicast.  Every single one of them took that arm.  So
- * the join succeeded, the four-way handshake completed with PTK=CCMP GTK=CCMP,
- * the carrier came up, wpa_supplicant said CTRL-EVENT-CONNECTED -- and then
- * NetworkManager sat in ip-config for forty-five seconds and gave up, because
- * not one byte this board sent after the handshake ever reached the air.
+ * And what does a freshly associated station send?  A DHCPDISCOVER, to
+ * ff:ff:ff:ff:ff:ff, because it has no address yet to be spoken to at.  Then
+ * ARP, broadcast.  Then IPv6 multicast.  For the whole of a failed DHCP there is
+ * not one unicast data frame in the trace -- eighteen frames out, none deferred,
+ * none starved, nothing back, forty-five seconds, twice -- so the group-
+ * addressed path is the ONLY path that was ever exercised after the handshake.
  * "Joined, but the router never sent an address" was never about the router.
- *
- * A station's frames all go to its one peer's record, and that is the whole rule.
  */
 static int j36_wlan_frame(struct j36_wifi *w, const u8 *frame, u32 frame_len,
 			  u8 packet_type, u8 sta_index, bool is_80211,
@@ -206,27 +211,22 @@ static int j36_wlan_frame(struct j36_wifi *w, const u8 *frame, u32 frame_len,
 {
 	const u32 packet_size = J36_HIF_DATA_HEADER_SIZE + frame_len;
 	const u32 transfer = ALIGN(packet_size, 4);
-	const u8 record = sta_index;
 	/*
-	 * TC5 IS NOT REACHABLE FROM HERE, and the omission is the point.
-	 *
-	 * qmEnqueueTxPackets' TC5 arm is an ACCESS POINT's: it is where a device
-	 * with several peers puts the frames it has to repeat to all of them, and
-	 * it is paired with a BMCAST record whose transmit key is the GTK.  A
-	 * station has one peer and no GTK to transmit under, so every frame it
-	 * sends belongs to that peer's record on TC1.
-	 *
-	 * Routing anything here is worse than merely wrong, because TC5 owns ONE
-	 * page -- "TX pages 01 14 01 01 04 01" in this driver's HIF dump, against
-	 * TC1's twenty -- and a class is only credited back when the firmware
-	 * drains it, which in an AIS session it has no reason to do.  So one frame
-	 * on TC5 takes the only page and never returns it, the next frame gets
-	 * -EBUSY from j36_wifi_hif_tx_acquire(), and the interface's transmit
-	 * queue is wedged for the life of the association with nothing above able
-	 * to see why.
+	 * qmDetermineStaRecIndex' first test, and it is on the ETHERNET
+	 * destination, so only an 802.3 data frame can reach it: an 802.11 frame
+	 * begins with a frame control field and its first octet's low bit means
+	 * nothing here.  802.1X is excluded as well -- it is never group-addressed
+	 * and its whole point on this path is TC4 with the 1X flag set, which is
+	 * what tells the firmware to leave it in the clear.
 	 */
+	const bool group = !is_80211 && !is_1x &&
+			   packet_type == J36_HIF_PACKET_TYPE_DATA &&
+			   frame_len >= ETH_ALEN &&
+			   is_multicast_ether_addr(frame);
+	const u8 record = group ? J36_STA_INDEX_BMCAST : sta_index;
 	const u8 tc = (packet_type == J36_HIF_PACKET_TYPE_MGMT || is_1x) ?
-			J36_HIF_TC_COMMAND : J36_HIF_TC_DATA;
+			J36_HIF_TC_COMMAND :
+			(group ? J36_HIF_TC_BROADCAST : J36_HIF_TC_DATA);
 	/*
 	 * ucPacketSeqNo and the NEED_ACK bit move together, because the sequence
 	 * only means anything as the tag on the TX-status event NEED_ACK asks
@@ -400,8 +400,7 @@ int j36_wlan_cmd_sta_remove(struct j36_wifi *w, const struct j36_wlan_bss *bss)
  *   53 ucEncStatus		DISABLED 1, ENCRYPTION3_ENABLED 6,
  *				ENCRYPTION3_KEY_ABSENT 7.  Note the aliasing in
  *				MediaTek's enum: WEP_ENABLED is 0, so "disabled"
- *				is 1 and not 0.  KEY_ABSENT until the handshake
- *				installs the pairwise key -- that is key_ready.
+ *				is 1 and not 0.
  *   77 ucUseShortPreamble	the AP's own capability BIT(5)
  *   78 ucUseShortSlotTime	the AP's own capability BIT(10)
  *   79 ucCheckId		0x72, the firmware's guard that the 16-byte tail
@@ -412,9 +411,29 @@ int j36_wlan_cmd_sta_remove(struct j36_wifi *w, const struct j36_wlan_bss *bss)
  * zero deliberately: this driver associates as a 20 MHz non-QoS station and the
  * settings that pair with that are all-zero.  They cost throughput near legacy
  * traffic; they cannot cost the association.
+ *
+ * ── ucEncStatus IS THE CIPHER, NOT THE STATE OF THE HANDSHAKE ────────────────
+ *
+ * It used to be 7 (ENCRYPTION3_KEY_ABSENT) at join and this command was then
+ * SENT A SECOND TIME after the four-way handshake, purely to move it to 6.  That
+ * is not what the field means and stock does neither half of it:
+ * mtk_cfg80211_connect calls wlanoidSetEncryptionStatus with
+ * ENUM_ENCRYPTION3_ENABLED -- 6 -- from the cipher suite in the connect request,
+ * before a single key exists, and nicUpdateBss copies that value straight out of
+ * prConnSettings->eEncStatus.  KEY_ABSENT is the arm stock takes for BOW and for
+ * P2P, never for AIS.
+ *
+ * And the second send has no equivalent anywhere: every nicUpdateBss() call site
+ * in the tree is a join, a disconnect, an IBSS transition or a roam, and not one
+ * of them is on the key path.  Re-sending a command that describes the whole BSS
+ * -- BSSID, rates, PHY, security -- at the instant the pairwise and group keys
+ * have just been written is asking a firmware that may reinitialise its BSS
+ * security context on receipt to discard both of them, and the symptom of that
+ * would be precisely what was seen: a handshake that completes and then not one
+ * encrypted frame in either direction.
  */
 int j36_wlan_cmd_bss_info(struct j36_wifi *w, const struct j36_wlan_bss *bss,
-			  bool secure, bool key_ready)
+			  bool secure)
 {
 	u8 command[80] = {};
 
@@ -430,7 +449,7 @@ int j36_wlan_cmd_bss_info(struct j36_wifi *w, const struct j36_wlan_bss *bss,
 	command[48] = J36_STA_RECORD_INDEX;
 	command[51] = 1;		/* PHY_TYPE_ERP_INDEX	*/
 	command[52] = secure ? 7 : 0;
-	command[53] = secure ? (key_ready ? 6 : 7) : 1;
+	command[53] = secure ? 6 : 1;
 	command[54] = 0x13;		/* PHY_TYPE_SET_802_11BGN */
 	memcpy(command + 55, w->mac, ETH_ALEN);
 	command[64] = J36_NETWORK_TYPE_AIS;

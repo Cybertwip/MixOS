@@ -641,14 +641,23 @@ static void j36_wlan_try_pm(struct j36_wlan *wlan)
  *
  * Message 3 of the handshake carries the group key and the supplicant installs it
  * immediately after the pairwise one, so the usual wait here is microseconds.
- * What the grace period buys is the case where it does not arrive at all: telling
- * the firmware encryption is fully enabled while it has no group key makes every
- * broadcast the AP sends undecryptable, and the first thing an AP broadcasts at a
- * freshly joined station is ARP.
+ * What the grace period buys is the case where it does not arrive at all: opening
+ * the port while the firmware has no group key makes every broadcast the AP sends
+ * undecryptable, and the first thing an AP broadcasts at a freshly joined station
+ * is ARP.
  *
  * Only now is the channel privilege given back, too.  Holding it through the
  * handshake keeps the radio on the AP's channel for the four frames that matter
- * most and cannot be retried by anything above us.
+ * most and cannot be retried by anything above us.  Stock holds it for the same
+ * span by a different clock -- rJoinTimeoutTimer runs for the granted interval
+ * less AIS_JOIN_CH_GRANT_THRESHOLD and aisFsmRunEventJoinTimeout releases it from
+ * AIS_STATE_NORMAL_TR when it fires.
+ *
+ * NO COMMAND IS SENT FROM HERE ANY MORE.  This used to re-send CMD_SET_BSS_INFO
+ * to move ucEncStatus from KEY_ABSENT to ENABLED, which stock does not do and no
+ * longer needs doing: j36_wlan_cmd_bss_info() writes ENCRYPTION3_ENABLED at join,
+ * from the cipher, exactly as nicUpdateBss does.  key_ready is now purely this
+ * driver's own gate -- the transmit queue and the PM indication wait on it.
  */
 static void j36_wlan_settle_keys(struct j36_wlan *wlan)
 {
@@ -660,7 +669,6 @@ static void j36_wlan_settle_keys(struct j36_wlan *wlan)
 		return;
 
 	wlan->key_ready = true;
-	j36_wlan_cmd_bss_info(wlan->w, &wlan->bss, true, true);
 	j36_wlan_release_channel(wlan);
 	j36_wlan_try_pm(wlan);
 }
@@ -878,7 +886,7 @@ void j36_wlan_on_assoc_response(struct j36_wifi *w, const u8 *frame,
 	wlan->resp_ies_len = (u16)min_t(u32, frame_len - 30, J36_WLAN_MAX_IES);
 	memcpy(wlan->resp_ies, frame + 30, wlan->resp_ies_len);
 
-	j36_wlan_cmd_bss_info(w, &wlan->bss, wlan->secure, false);
+	j36_wlan_cmd_bss_info(w, &wlan->bss, wlan->secure);
 	j36_wlan_cmd_sta_record(w, &wlan->bss, J36_STA_STATE_3, wlan->aid);
 
 	/*

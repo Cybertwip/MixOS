@@ -983,7 +983,7 @@ int j36_wlan_cmd_sta_record(struct j36_wifi *w, const struct j36_wlan_bss *bss,
 			    u8 state, u16 aid);
 int j36_wlan_cmd_sta_remove(struct j36_wifi *w, const struct j36_wlan_bss *bss);
 int j36_wlan_cmd_bss_info(struct j36_wifi *w, const struct j36_wlan_bss *bss,
-			  bool secure, bool key_ready);
+			  bool secure);
 int j36_wlan_cmd_bss_disconnect(struct j36_wifi *w, const struct j36_wlan_bss *bss);
 int j36_wlan_cmd_bss_reactivate(struct j36_wifi *w);
 int j36_wlan_cmd_pm_connected(struct j36_wifi *w, const struct j36_wlan_bss *bss,
