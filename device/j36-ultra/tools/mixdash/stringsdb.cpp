@@ -231,12 +231,26 @@ const char *const kPhrases[][Lang::Count] = {
       "%1 wurde beendet",
       "%1 terminou",
       "%1 ha salido" },
-    { "%1 takes the panel for good.\nPress A again to run it.",
-      "%1 prend l'écran définitivement.\nAppuyez de nouveau sur A pour le lancer.",
-      "%1 prende lo schermo per sempre.\nPremi di nuovo A per avviarlo.",
-      "%1 übernimmt den Bildschirm endgültig.\nErneut A drücken, um es zu starten.",
-      "%1 fica com o ecrã definitivamente.\nCarregue outra vez em A para o executar.",
-      "%1 se queda con la pantalla para siempre.\nPulsa A otra vez para ejecutarlo." },
+    /* FN is the button's own marking on this board -- it is silkscreened, not a
+     * word -- so it stays FN in all six, the way A and B do in the rows above. */
+    { "%1 takes the panel.  Hold FN to come back.\nPress A again to run it.",
+      "%1 prend l'écran.  Maintenez FN pour revenir.\nAppuyez de nouveau sur A pour le lancer.",
+      "%1 prende lo schermo.  Tieni premuto FN per tornare.\nPremi di nuovo A per avviarlo.",
+      "%1 übernimmt den Bildschirm.  FN gedrückt halten, um zurückzukommen.\nErneut A drücken, um es zu starten.",
+      "%1 fica com o ecrã.  Mantenha FN premido para voltar.\nCarregue outra vez em A para o executar.",
+      "%1 se queda con la pantalla.  Mantén pulsado FN para volver.\nPulsa A otra vez para ejecutarlo." },
+    { "Too many things are running -- close one first",
+      "Trop de choses tournent -- fermez-en une d'abord",
+      "Ci sono troppe cose in esecuzione -- chiudine prima una",
+      "Es laufen zu viele Dinge -- zuerst eines schließen",
+      "Estão demasiadas coisas a correr -- feche uma primeiro",
+      "Hay demasiadas cosas en marcha -- cierra una primero" },
+    { "Closing %1",
+      "Fermeture de %1",
+      "Chiusura di %1",
+      "%1 wird geschlossen",
+      "A fechar %1",
+      "Cerrando %1" },
     { "Press A again to power off",
       "Appuyez de nouveau sur A pour éteindre",
       "Premi di nuovo A per spegnere",
@@ -297,6 +311,57 @@ const char *const kPhrases[][Lang::Count] = {
       "%1 ist schreibgeschützt eingebunden",
       "%1 está montado só de leitura",
       "%1 está montado solo de lectura" },
+
+    /* ── switcher.cpp -- the list FN brings up over whatever is running ──── */
+    /*
+     * "Dashboard" is the switcher's first row and it is NOT here: the System
+     * information block below already has it, and the table is keyed by the
+     * English, so a second row would be the same phrase twice with one of them
+     * unreachable.  The same word for the same thing in both places is the point.
+     *
+     * The footer names four buttons and translates none of them.  A, B and Menu
+     * are printed on the case; FN is the marking on the key this overlay is opened
+     * with.  A translated button name is a button nobody can find.
+     */
+    { "Running",
+      "En cours",
+      "In esecuzione",
+      "Läuft",
+      "A correr",
+      "En ejecución" },
+    { "A switches  --  FN steps  --  Menu closes  --  B cancels",
+      "A bascule  --  FN avance  --  Menu ferme  --  B annule",
+      "A passa  --  FN avanza  --  Menu chiude  --  B annulla",
+      "A wechselt  --  FN blättert  --  Menu schließt  --  B bricht ab",
+      "A muda  --  FN avança  --  Menu fecha  --  B cancela",
+      "A cambia  --  FN avanza  --  Menu cierra  --  B cancela" },
+    /* The detail on the right of a row.  Two states and no third: what a stopped
+     * task is doing is waiting, and saying "stopped" invites the reader to think
+     * it crashed.  See switcherRows() in dashboard.cpp. */
+    { "in front",
+      "au premier plan",
+      "in primo piano",
+      "im Vordergrund",
+      "em primeiro plano",
+      "en primer plano" },
+    { "waiting",
+      "en attente",
+      "in attesa",
+      "wartet",
+      "à espera",
+      "esperando" },
+    { "nothing else is running",
+      "rien d'autre ne tourne",
+      "non c'è altro in esecuzione",
+      "sonst läuft nichts",
+      "não está mais nada a correr",
+      "no hay nada más en marcha" },
+    { "cards and settings",
+      "cartes et réglages",
+      "schede e impostazioni",
+      "Karten und Einstellungen",
+      "cartões e definições",
+      "tarjetas y ajustes" },
 
     /* ── widgets.cpp -- the card grid's long-press menu ──────────────────── */
     { "Open",

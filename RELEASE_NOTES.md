@@ -151,6 +151,19 @@ follows from where it is is the same question.
 the framebuffer, with the pad usable inside it and an on-screen keyboard laid out like the
 dashboard's.
 
+**Task switcher.** Hold **FN** and a list of what is running comes up over the top of it —
+the dashboard itself, every card that started a program, and every binary launched from the
+file browser. A tapped FN still means what it always did; only a hold opens the switcher, so
+Ctrl+C in the Terminal is untouched. FN steps down the list, A switches, Menu closes the
+highlighted task, B puts back whatever was in front.
+
+Several programs run at once and exactly one of them owns the panel: the rest are stopped by
+the kernel, on their own process group, so a browser session's nine processes go down and
+come back as one thing. A task's last frame is kept and put back before it is continued,
+because an X server only repaints what it thinks is damaged and would otherwise come back
+with the switcher still on its screen. Four at a time, which is what the list shows without
+scrolling and about what 946 MB will hold.
+
 **Virtual keyboard.** Three ways in at once, all live: the D-pad walks the grid and A
 presses, the pointer clicks a key, and a real USB keyboard types straight through. Shift
 latches for one character; a second press locks caps, the cap says which state it is in,
@@ -214,6 +227,71 @@ keys, and a **`caps`** key is a real lock — it holds until pressed again and r
 while it is on, so the state is visible. Caps and `?123` do not stack; with the lock on you
 get capitals.
 
+**The browser was not Firefox.** `needed_packages.txt` is read in exactly two places, and
+both of them sit inside checkpointed build stages — so on any machine that had completed a
+build once, editing that file did nothing at all. `firefox-esr` is how it was found: it was
+added to the list, every build afterwards reported success, and the card kept booting with
+`netsurf-gtk`, which has no JavaScript engine. No error, no warning, not even a line in the
+log naming the package. The build now digests the package lists it actually reads into the
+stage stamps — separately for the runtime list and the dev list, because honouring them
+costs very different amounts — so adding or removing a package invalidates the install and
+the finished image instead of being walked past. Alongside it, `j36-browser` now says out
+loud, on the console and in the log, when it is falling back to something that is not the
+browser this session was written for. **This one needs one more build**; the fix is in the
+builder, and an image already flashed cannot grow a browser it was never given. It is the
+cheap half of the build — the runtime list is reinstalled during finalization.
+
+**The on-screen keyboard came up thumbnail-sized on the first launch after a boot**, and the
+right size on every launch after that. Not a font cache: a race with the session's own
+window manager. `mb_kbd_ui_resources_create()` works out how small the keyboard can be from
+the font metrics, then stretches it to the width it finds in `_NET_WORKAREA` — a property
+published by matchbox-window-manager, which on a cold launch has not got that far yet, every
+binary involved still being faulted in off the card. `--daemon` realizes the window once at
+startup, so the minimum stuck for the rest of the session. The session now measures the
+panel itself, off `/sys/class/graphics/fb0/virtual_size`, and asks for `--width`/`--height`;
+that same function skips the `_NET_WORKAREA` path entirely when a size is requested, so there
+is no window left in which the answer can be wrong. It asks for two fifths of the panel
+height because that is what `mb_kbd_ui_resize()` clamps to anyway — the tallest keyboard it
+will agree to draw, and the font scales with the box.
+
+**The pointer crossed the screen in a second.** 560 px/s is the right instinct for a mouse on
+a desk and the wrong one for a thumb on a 12 mm stick with no wrist behind it: every target
+was overshot and the correction overshot back. The default is now **200 px/s**. `j36-padx`,
+which drives the pointer inside the browser's X session, had its own hard-coded "one screen
+width per second" and so ignored the dashboard entirely; it now reads `[mouse] pointerSpeed`
+out of `/var/lib/mixos/mixdash.conf` and uses that, with the same 200 px/s as a fallback —
+expressed as a fraction of the panel width, so a different screen gets a proportionate speed
+rather than this one's. A speed already saved from the Settings page is still honoured.
+
+**mixsplash dropped to a text console partway through "Starting Audio".** The splash has a
+90-second fuse for a boot that has gone quiet, and what it was actually measuring was "the
+headline has not changed" — the only messages that reset it were `stage:`, `detail:` and
+`progress:`. The audio stage is a run of `insmod`s under a single headline, and it got
+slower when the input driver began sampling the headphone jack line every 5 ms against a
+codec probe touching the same PMIC, which is why re-plugging a speaker was what made it
+appear. Every `say()` in `/init` now also sends `ping` — a message with nothing to draw,
+whose only job is to push both fuses out — so the fuse means what its own comment always
+claimed; and the module loop names each module as it loads it, so that stage visibly moves.
+
+**The grid did not close up when a USB stick was inserted.** The bottom row centred three
+cards and left the fourth, the one the insertion had just added, sitting where the old
+layout had put it. `CardGrid::setEntries()` recomputed the geometry and repainted, but never
+started the spring: `resetMotion()` deliberately leaves already-placed cards at their current
+coordinates and it is `step()` that walks them to their new slots, so with the animation
+timer asleep the new layout was worked out and never travelled to. It now wakes the spring
+on every change to the list.
+
+**Compiled shaders were being thrown away.** `j36-glwarm.service` brings EGL up once after
+the dashboard has painted, so the first graphics program does not pay for the whole stack
+arriving off the card — but it named a shader-cache directory on itself and nothing else
+did. What it compiled went somewhere no other process on the board could name, and every EGL
+program rebuilt its shaders from source on every launch. The Diagnostics page's GPU render
+row is the sharpest case: it runs the same `eglprobe`, with the same cube, whose two shaders
+the warm-up had already compiled at boot. The initramfs now picks one directory —
+`/var/cache/mixos/gl` when the rootfs can be written to, `/run/j36/glcache` when it cannot —
+and puts it in the environment of both the warm-up and `mixdash`, which is where every card
+and every program launched from the grid inherits it.
+
 **The battery collapsed to 0% after a full charge.** Three defects in the gauge, all in
 `j36_mt6592_pmic.c`:
 
@@ -269,5 +347,3 @@ These are in the tree's plan and are not in this release:
   the first frame and the audio clock are both in hand.
 - In the media player the sticks and D-pad are bound to commands rather than hover-navigating
   the controls, and the right stick's click is bound the same way.
-- There is no task switcher; the FN button does not yet raise a multitasking overlay across
-  cards and running binaries.

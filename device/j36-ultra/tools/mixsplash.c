@@ -34,6 +34,7 @@
  *     stage:<text>     the big line -- "Mounting the OS partition"
  *     detail:<text>    the small line under it -- a device node, a module name
  *     progress:<0-100> the bar at the foot of the screen
+ *     ping             nothing to show; the boot is still talking.  See below
  *     handover         the rootfs is about to take over; do not time out, and
  *                      leave the console in graphics mode when asked to quit
  *     quit             exit now, honouring any hand-over
@@ -41,6 +42,28 @@
  *
  * Anything without a recognised prefix is taken as stage text, so `say' can be
  * teed into the channel without every call site learning a vocabulary.
+ *
+ * WHY `ping' EXISTS, WHICH IS THE SAME BUG THREE TIMES.  The idle fuse below
+ * gives the text console back when the channel has been silent for ninety
+ * seconds, and it is the safety net that makes taking the console away
+ * reasonable at all.  But /init says most of what it says with say(), which goes
+ * to the cable, and only stage/detail/progress reach this channel -- so the fuse
+ * has never measured "the boot has gone quiet", it has measured "the boot has not
+ * changed the headline".  Those are the same thing right up until a stage does
+ * real work between its headline and the next one, and then a boot that is
+ * talking steadily on the serial console looks, from here, exactly like a boot
+ * that has died.
+ *
+ * It has now happened three times: unpacking sd-root.tar.gz, resizing the root
+ * filesystem, and loading the audio modules.  The first two were each given a
+ * forked heartbeat of their own; this is the general answer.  say() emits `ping',
+ * every line resets the fuse whatever it says, and the fuse goes back to meaning
+ * what the comment on it claims: nothing has been heard from /init at all.  It is
+ * not weaker -- a boot wedged inside one syscall still says nothing and still
+ * gets its console back.
+ *
+ * It draws nothing and it is not logged, because it arrives a few hundred times
+ * on a normal boot and a log of it would bury the messages worth reading.
  *
  * SURVIVING switch_root.  This process keeps running across it.  Its binary is
  * unlinked with the rest of the initramfs, which costs nothing -- the text is
@@ -1350,6 +1373,15 @@ int main(int argc, char **argv)
              */
             if (handover)
                 handover_at = last_msg;
+            /*
+             * First, and it returns rather than falling through the chain, for
+             * the two reasons on the protocol note at the top: it has nothing to
+             * draw, and note() below would turn a quiet boot into a few hundred
+             * lines of "msg ping".  The fuses have already been pushed out by the
+             * two lines above, which is the whole of what it is for.
+             */
+            if (!strcmp(line, "ping"))
+                continue;
             if (!strncmp(line, "stage:", 6)) {
                 set_text(stage, sizeof(stage), line + 6);
                 detail[0] = '\0';

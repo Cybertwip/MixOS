@@ -861,11 +861,113 @@ static int on_io_error(Display *unused)
  * "crosses this one in half a second", which on 640x480 is a pointer nobody can
  * land on a link with -- and that was before the acceleration described above
  * doubled it.  What a thumb is actually judging is how much of the SCREEN goes by,
- * so that is what these say, and the panel decides the rest.  Full deflection
- * crosses the width in about a second, which is quick without being a flick.
+ * so that is what these say, and the panel decides the rest.
+ *
+ * AND THEY ARE THE FALLBACK, NOT THE ANSWER.  A screen-fraction is the right shape
+ * for a program that knows nothing about the machine it is on, and this program is
+ * not in that position: it is started by mixdash, which has a Mouse settings page
+ * whose whole subject is how fast this pointer should move.  A browser session that
+ * ignored that setting gave the device two pointer speeds, one of them unreachable
+ * from any screen -- so the file is read, and these two only decide what happens on
+ * a card with no dashboard settings on it yet.  See read_dash_speed().
+ *
+ * 0.31 of a 640 px panel is 200 px/s, which is the number that was actually asked
+ * for after the 1.0 above -- 640 px/s -- turned out to be exactly the "extremely
+ * fast, difficult to navigate" the whole comment above was written to fix.  The
+ * D-pad keeps its old 0.85 ratio to the stick rather than a constant of its own.
  */
-#define STICK_SCREENS_PER_S  1.0
+#define STICK_SCREENS_PER_S  0.3125
 #define SCROLL_MAX  16.0     /* wheel notches per second at full deflection */
+
+/*
+ * ── THE DASHBOARD'S POINTER SPEED ────────────────────────────────────────────
+ *
+ * mixdash keeps its settings in a plain INI file -- see pickStorePath() in
+ * mixdash/settings.cpp for why that path and not another -- and the only value in
+ * it this program has any business with is the one the Mouse page writes:
+ *
+ *     [mouse]
+ *     pointerSpeed=200
+ *
+ * which is pixels per second at full stick deflection, the same quantity
+ * stick_max is.  So it is used as stick_max, unconverted, and the D-pad ceiling
+ * keeps its ratio to it.
+ *
+ * PARSED BY HAND AND NOT WITH A LIBRARY.  It is one integer under one section in a
+ * file this project writes, and linking an INI parser into a 40 kB bridge to read
+ * it would be the larger change.  The parse is deliberately narrow: a section
+ * header other than [mouse] is skipped, whitespace either side of the = is
+ * allowed, anything that is not a number is ignored, and every failure -- no file,
+ * no key, an unreadable value -- leaves the caller's default alone.  A browser
+ * that will not start because a config file has a typo in it is a worse outcome
+ * than a pointer moving at the built-in speed.
+ *
+ * THE RANGE IS THE SAME ONE mixdash CLAMPS TO (80..2400), and it is applied here
+ * too rather than trusted: this file is on a partition somebody can mount on a PC,
+ * and a hand-edited 0 is a pointer that cannot move on a device whose only other
+ * input is the pad now driving it.
+ */
+#define DASH_CONF     "/var/lib/mixos/mixdash.conf"
+#define DASH_SPEED_LO 80.0
+#define DASH_SPEED_HI 2400.0
+
+static double read_dash_speed(void)
+{
+    FILE *f;
+    char line[256];
+    int in_mouse = 0;
+    double found = 0.0;
+
+    f = fopen(DASH_CONF, "r");
+    if (!f)
+        return 0.0;
+
+    while (fgets(line, sizeof line, f)) {
+        char *p = line, *eq, *end;
+        double v;
+
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p == '#' || *p == ';')
+            continue;
+
+        if (*p == '[') {
+            /* Any other section, including one this build has never heard of.
+             * strncmp and not strcmp: the line still has its newline on it. */
+            in_mouse = (strncmp(p, "[mouse]", 7) == 0);
+            continue;
+        }
+        if (!in_mouse)
+            continue;
+
+        eq = strchr(p, '=');
+        if (!eq)
+            continue;
+        *eq = '\0';
+        /* Trailing space before the =, which QSettings does not write but a person
+         * editing the file by hand does. */
+        for (end = eq; end > p && (end[-1] == ' ' || end[-1] == '\t'); end--)
+            end[-1] = '\0';
+        if (strcmp(p, "pointerSpeed") != 0)
+            continue;
+
+        v = strtod(eq + 1, &end);
+        if (end == eq + 1)
+            continue;               /* the value was not a number at all */
+        found = v;
+        /* No break: a file with the key twice should mean what its last line says,
+         * which is what QSettings itself would read back. */
+    }
+    fclose(f);
+
+    if (found <= 0.0)
+        return 0.0;
+    if (found < DASH_SPEED_LO)
+        found = DASH_SPEED_LO;
+    else if (found > DASH_SPEED_HI)
+        found = DASH_SPEED_HI;
+    return found;
+}
 
 /*
  * Raw reading to -1..1, with the deadzone taken out and what is left stretched
@@ -934,13 +1036,20 @@ static int sticks_active(void)
 /*
  * The start of a press, the end of the ramp, and how long the ramp takes.
  *
- * The floor is in PIXELS and the ceiling is in screens, and the mismatch is the
- * point: what the start of a press is for is landing on a link, and a link is a
- * dozen pixels wide on any panel, so the slow end must not scale with the screen.
- * The far end is travel, and travel is measured in how much of the screen is left.
+ * The floor is in PIXELS and the ceiling is a fraction of the STICK, and the
+ * mismatch is the point: what the start of a press is for is landing on a link, and
+ * a link is a dozen pixels wide on any panel, so the slow end must not scale with
+ * anything.  The far end is travel, and travel should stay in proportion to the one
+ * speed the Mouse settings page actually names -- one slider, both inputs, the
+ * D-pad a little short of the stick because it has no analogue middle to sit in.
+ *
+ * SPEED_MIN is 110 and the stick's floor is 200, so on a card with the settings at
+ * their default the ramp is a real ramp and not a step.  If somebody drags the
+ * slider below the floor it collapses to a flat 110, which is handled where
+ * dpad_max is worked out rather than here.
  */
 #define SPEED_MIN            110.0   /* px/s: a tap is two pixels, whatever the panel */
-#define DPAD_SCREENS_PER_S   0.85
+#define DPAD_OF_STICK        0.85
 #define RAMP_MS              900.0
 
 static double speed_at(long held_ms)
@@ -1086,14 +1195,16 @@ static void usage(void)
 }
 
 /*
- * The screen, and the speeds that come out of it.
+ * The screen, the dashboard's setting, and the speeds that come out of them.
  *
- * Down here rather than beside the rest of the pointer code because it reads both
- * of the SCREENS_PER_S ceilings, and those are declared with the stick and the
- * D-pad they belong to.
+ * Down here rather than beside the rest of the pointer code because it reads the
+ * stick ceiling and the D-pad's ratio to it, and those are declared with the stick
+ * and the D-pad they belong to.
  */
 static void pointer_start(void)
 {
+    double want;
+
     scr   = DefaultScreen(dpy);
     scr_w = DisplayWidth(dpy, scr);
     scr_h = DisplayHeight(dpy, scr);
@@ -1105,10 +1216,18 @@ static void pointer_start(void)
         scr_h = 480;
     }
 
-    stick_max = STICK_SCREENS_PER_S * (double)scr_w;
-    dpad_max  = DPAD_SCREENS_PER_S * (double)scr_w;
+    /*
+     * The dashboard's number wins where there is one, and the screen fraction is
+     * what a card with no settings file falls back to.  Which of the two was used
+     * goes in the log line below, because "the browser's pointer is a different
+     * speed from the dashboard's" is exactly the report this code exists to answer
+     * and the answer is either "it did not read the file" or "it read this".
+     */
+    want = read_dash_speed();
+    stick_max = want > 0.0 ? want : STICK_SCREENS_PER_S * (double)scr_w;
+    dpad_max  = DPAD_OF_STICK * stick_max;
     if (dpad_max < SPEED_MIN)
-        dpad_max = SPEED_MIN;       /* a panel narrow enough to invert the ramp */
+        dpad_max = SPEED_MIN;       /* a setting slow enough to invert the ramp */
 
     /* Nothing has been asked for yet, and no real position is negative, so the
      * first resync always adopts wherever the server starts the pointer. */
@@ -1116,8 +1235,10 @@ static void pointer_start(void)
     sent_y = -1;
     pointer_resync();
 
-    note("screen %dx%d: %.0f px/s at full stick, %.0f px/s at the end of the D-pad ramp",
-         scr_w, scr_h, stick_max, dpad_max);
+    note("screen %dx%d: %.0f px/s at full stick (%s), %.0f px/s at the end of the D-pad ramp",
+         scr_w, scr_h, stick_max,
+         want > 0.0 ? "from " DASH_CONF : "built in; no dashboard setting on this card",
+         dpad_max);
 }
 
 int main(int argc, char **argv)

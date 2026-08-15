@@ -792,6 +792,30 @@ void CardGrid::setEntries(const QVector<AppEntry> &entries)
     m_scroll = qBound(0, m_scroll, maxScroll());
     invalidateArt();
 
+    /*
+     * AND START THE SPRING, WHICH IS THE WHOLE OF "THE GRID CLOSES UP".
+     *
+     * resetMotion() deliberately leaves every card that is already on the glass
+     * exactly where it is being drawn -- that is what stops a language change
+     * throwing the whole page back to its slots and sliding it in again.  The cost
+     * is that after this function the cards are at their OLD coordinates and
+     * slotRect() answers with new ones, and nothing closes that gap except step(),
+     * and step() only runs while m_anim does.  update() repaints; it does not
+     * animate.
+     *
+     * So a list that changed length repainted every card where it used to be.  Plug
+     * a USB stick into a grid of seven and the eighth card -- the only one with no
+     * old position to keep -- appeared on its real slot while the three above it
+     * stayed on the half-slot indent of a row that no longer had three cards in it:
+     * a bottom row of three centred cards with a fourth stranded to the right of
+     * them.  The same stale layout applies vertically, because a row appearing
+     * moves the whole grid up by half a row.
+     *
+     * One call, and the springs already written above do the rest.  It costs
+     * nothing when nothing moved: step() finds every card at rest on its first tick
+     * and stops the timer again.
+     */
+    wake();
     update();
     emit indexChanged(m_index);
 }

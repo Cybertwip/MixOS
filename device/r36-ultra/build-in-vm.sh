@@ -590,6 +590,124 @@ layout_signature() {
         "$ROOT_FILESYSTEM_FORMAT" "$SYSTEM_SIZE" "$STORAGE_SIZE"
 }
 
+# ── WHAT PACKAGES THE IMAGE WAS ASKED FOR, IN TWO STRINGS ────────────────────
+#
+# THE BUG THESE EXIST FOR, because it was silent and it shipped.  needed_packages.txt
+# is read in exactly two places -- build_deps.sh, inside the userspace stage, and
+# cleanup_filesystem.sh, inside finalization -- and both of those stages are
+# checkpointed.  So on any machine that has completed a build once, editing that file
+# does nothing at all: `marked userspace' skips the install and `marked finalization'
+# skips the reinstall, the run walks past both with "Skipping completed stage", and
+# the finished-image gate hands back the image that was built before the edit.  No
+# error, no warning, no line in the log even naming the package.
+#
+# firefox-esr is how it was found.  It was added to needed_packages.txt, every build
+# afterwards reported success, and the card kept booting with netsurf-gtk -- because
+# the last run that actually read the list read a 103-line version of it, and
+# j36-browser picks the first browser that is on the card.  A package list the build
+# is free to ignore is not a package list.
+#
+# TWO SIGNATURES AND NOT ONE, because the two lists cost different things to honour.
+# The runtime list is reinstalled by cleanup_filesystem.sh, which runs against the
+# STRIPPED root and needs no compiler; re-running finalization is enough and that is
+# the cheap half of the build.  The dev list is installed by build_deps.sh alone, and
+# reaching that means clearing the userspace stage, which sends restore_rootfs_snapshot
+# to the pre-final root and pays cleanup's two hours afterwards.  Digesting both into
+# one string would charge the expensive price for the cheap change.
+#
+# NORMALISED THROUGH read_package_list, so these compare what apt would be asked for
+# and not the bytes of the file: a comment rewritten or a blank line added is not a
+# reason to reinstall a rootfs.  Adding, removing or renaming a package is.
+#
+# ONLY THE LISTS THIS CONFIGURATION ACTUALLY READS.  needed_packages32.txt is for the
+# legacy multiarch build and bluetooth_needed_packages.txt for BUILD_BLUEALSA, and
+# neither is consumed here; digesting a file nobody reads would invalidate a good
+# checkpoint every time somebody edited it for another device.
+runtime_package_signature() {
+    {
+        read_package_list needed_packages.txt
+        if [[ "$BUILD_ARMHF" == "y" ]]; then
+            read_package_list needed_packages32.txt
+        fi
+        if [[ "${BUILD_BLUEALSA:-}" == "y" ]]; then
+            read_package_list bluetooth_needed_packages.txt
+        fi
+    } | sha256sum | cut -d' ' -f1
+}
+
+dev_package_signature() {
+    read_package_list needed_dev_packages.txt | sha256sum | cut -d' ' -f1
+}
+
+# ── AND WHAT TO THROW AWAY WHEN THEY CHANGE ──────────────────────────────────
+#
+# Only the checkpoints that could have decided a package question, and no others.
+#
+#   finalization      is cleanup_filesystem.sh, which reinstalls the runtime list --
+#                     and, far more to the point, it is the stage that writes the
+#                     rootfs into the image.  A package installed into a build root
+#                     and never written out is a package that is still not on the card.
+#   image, complete   both describe the contents of that image.
+#   userspace         is the gate around the component loop; without clearing it the
+#                     loop is never entered and the component stamp below is never even
+#                     looked at.  Only the dev list needs this.
+#   component-build_deps  is the install of the dev list itself.  build_sdl2 keeps its
+#                     own stamp and is still skipped, so this costs one apt transaction
+#                     and not a second SDL build.
+#
+# NOT bootstrap, partition or kernel: none of them reads a package list, and Debian
+# does not need unpacking again to install one more package.
+#
+# THIS RUNS BEFORE THE FINISHED-IMAGE GATE.  That gate exits 0 the moment it finds a
+# verified image beside a finalization stamp, so a check placed after it would never
+# be reached on precisely the builds that need it -- the finished ones.
+discard_stale_package_lists() {
+    local want have
+
+    # ── The runtime list ──
+    #
+    # A MISSING RECORD COUNTS AS A MISMATCH HERE, and that is the point rather than an
+    # oversight: every state directory that exists today was written before this check
+    # did, by a run that read whatever needed_packages.txt said at the time, and the
+    # one that has been looked at demonstrably disagrees with the checkout.  "No record"
+    # is not evidence that the lists matched.  It costs one finalization -- cleanup,
+    # finishing touches, write, verify -- on each machine, once.
+    want="$(runtime_package_signature)"
+    have="$(cat "$STATE_DIR/packages-runtime" 2>/dev/null || true)"
+    if [[ "$have" != "$want" ]]; then
+        if [[ -z "$have" ]]; then
+            log "This checkpoint does not record which runtime packages it was built from"
+        else
+            log "The runtime package list has changed since this checkpoint was written"
+        fi
+        log "Re-running the final image stage; Debian is not unpacked and nothing is recompiled"
+        rm -f "$STATE_DIR"/finalization.done "$STATE_DIR"/image.done \
+              "$STATE_DIR"/complete.done
+        # Written now and not after the stages succeed: a run that fails halfway has
+        # already cleared the stamps, and a resume must not clear them a second time.
+        # The stamps themselves are what record progress.
+        printf '%s\n' "$want" > "$STATE_DIR/packages-runtime"
+    fi
+
+    # ── The build-time list ──
+    #
+    # A MISSING RECORD IS SEEDED AND NOT ACTED ON, which is the opposite rule to the one
+    # above, for the opposite reason: there is no evidence this list has changed, and the
+    # only way to honour a change in it is the expensive path -- pre-final root, full
+    # cleanup afterwards.  Guessing wrong upwards costs two hours to install nothing.
+    # From here on a real edit is caught, which is all this needs to do.
+    want="$(dev_package_signature)"
+    have="$(cat "$STATE_DIR/packages-dev" 2>/dev/null || true)"
+    if [[ -n "$have" && "$have" != "$want" ]]; then
+        log "The build-time package list has changed since this checkpoint was written"
+        log "Re-running the package install and the final image on the pre-final build root"
+        rm -f "$STATE_DIR"/component-build_deps.done "$STATE_DIR"/userspace.done \
+              "$STATE_DIR"/finalization.done "$STATE_DIR"/image.done \
+              "$STATE_DIR"/complete.done
+    fi
+    printf '%s\n' "$want" > "$STATE_DIR/packages-dev"
+}
+
 # What is actually IN the finished image, which is the only evidence that survives the
 # build root being deleted -- and the evidence the last run had in front of it and did
 # not look at: parted printed "2 ... btrfs" and "3 ... fat32" while the resume decided
@@ -811,6 +929,10 @@ discard_foreign_layout
 # sure a mount left by the other profile cannot contaminate this build.
 clear_foreign_rootfs_mount
 clear_legacy_multiarch_root
+# Before the gate below, for the reason spelled out on the function: the gate returns
+# a finished image and exits, and a finished image built from the wrong package list
+# is exactly what this is here to catch.
+discard_stale_package_lists
 
 # ── THE FINISHED-IMAGE GATE COMES FIRST, AND THE ORDER IS THE WHOLE POINT ────
 #

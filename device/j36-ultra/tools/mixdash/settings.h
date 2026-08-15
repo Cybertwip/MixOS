@@ -37,8 +37,20 @@ struct MouseConfig {
      * Pixels per second at full stick deflection.  A speed rather than a
      * per-sample step: the poll interval is a property of Joypad and a user who
      * changes this should not have to know it.
+     *
+     * 200, WHICH IS SLOWER THAN IT SOUNDS AND WAS ARRIVED AT ON THE DEVICE.  560
+     * was picked as "crosses the 640 px panel in about a second", which is the
+     * right instinct for a mouse on a desk and the wrong one for a thumb on a 12 mm
+     * stick with no wrist behind it: the pointer overshot every target on the page
+     * and the correction overshot back.  Three seconds to cross the panel reads as
+     * deliberate rather than sluggish, because the acceleration below still lets a
+     * full push travel while a small one creeps.
+     *
+     * j36-padx has the same number as a fallback, expressed as a fraction of the
+     * screen so a different panel gets a proportionate speed rather than this one.
+     * It prefers what is saved here; this is only what an untouched card does.
      */
-    int pointerSpeed = 560;
+    int pointerSpeed = 200;
 
     /*
      * Per cent applied to the deltas a real USB mouse reports.  Separate from

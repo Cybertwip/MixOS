@@ -1893,6 +1893,22 @@ say() {
     if [ "$splash_on" = 1 ] && [ "$panel_is_console" = 1 ] && [ -c /dev/ttyS0 ]; then
         echo "$@" >/dev/ttyS0
     fi
+    # AND THE SPLASH IS TOLD THAT SOMETHING WAS SAID, which is not the same as
+    # being told what.  mixsplash gives the text console back after ninety seconds
+    # with no message, and until this line the only messages it could hear were
+    # stage, detail and progress -- so a stage that does two minutes of real work
+    # between its headline and the next one looked, from the splash's side,
+    # identical to a boot that had died.  That is the "the picture stops and the
+    # kernel log comes back" failure, and it has now been found three times: on the
+    # sd-root.tar.gz unpack, on the resize, and on the audio modules.  The first
+    # two each grew a forked heartbeat; this is the general answer, and it costs
+    # one builtin redirect per line already being printed.
+    #
+    # `ping' draws nothing and is not logged -- see the protocol note at the top of
+    # tools/mixsplash.c.  A splash too old to know the word would take it as stage
+    # text, which is why splash_on gates it: this initramfs and this binary are
+    # built and installed together.
+    if [ "$splash_on" = 1 ]; then echo "ping" >> "$splash_chan"; fi
     return 0
 }
 
@@ -3868,6 +3884,14 @@ run_audio() {
         if [ "$audio_speaker" = 1 ]; then
             case "$ko" in j36_mt6592_audio.ko) params="speaker=1" ;; esac
         fi
+        # Named on the panel before it is loaded and not after, which is the only
+        # ordering that says anything: a module that takes a long time to probe is
+        # the one whose name should be on the screen while it does.  The audio
+        # stage is the one that has been seen to outrun the splash's fuse -- the
+        # codec probe touches the PMIC, and the input driver loaded at progress 4
+        # is already sampling the AUXADC every 5 ms for the headphone line -- so
+        # this stage in particular should not be a still picture.
+        detail "$ko"
         if insmod "$payload/audio/$ko" $params >/tmp/insmod.log 2>&1; then
             say "audio: loaded $ko $params"
         else
@@ -4602,6 +4626,46 @@ setup_dash() {
     # first paint rather than after a rescan the operator has no way to trigger.
     mount_card
 
+    # ── WHERE MESA KEEPS ITS COMPILED SHADERS, WHICH TWO UNITS HAVE TO AGREE ON ──
+    #
+    # WHAT WAS WRONG, AND IT IS WORTH BEING PRECISE ABOUT IT.  j36-glwarm.service
+    # further down set a cache directory on itself and nothing else did.  So the
+    # shaders it compiled at boot went somewhere no other process on this board
+    # could name, and mixdash -- along with every child it launches: the 3D cube
+    # card, the Diagnostics page, whatever the operator installs -- looked wherever
+    # Mesa's own default landed for it, missed, and compiled the same shaders from
+    # source again.  Every launch.  A warm-up filling a directory nothing reads is
+    # not a warm-up, it is a boot-time cost with no payer.
+    #
+    # WHAT THAT LOOKED LIKE was "EGL applications freeze for a moment before they
+    # appear", and the Diagnostics page is the sharpest example of it: its GPU
+    # render row runs /run/j36/eglprobe -o, which is the same binary, with the same
+    # cube, with the same two shaders the warm-up compiled at boot.  There was never
+    # anything to work out a second time -- the two just had no directory in common.
+    # One shared path is the whole fix, and it makes that row a cache hit.
+    #
+    # ON THE CARD WHEN THERE IS SOMEWHERE TO WRITE, AND A TMPFS WHEN THERE IS NOT.
+    # /run is refilled by the warm-up on every boot, which covers the cube and
+    # nothing else: an emulator the operator installed would pay its first-launch
+    # compile once per boot, forever.  /var/cache is the partition mixdash.conf is
+    # already on, the write is a few hundred kilobytes, once per shader, and the
+    # ceiling below bounds it.  The mkdir is the test and not a formality -- /init
+    # mounts the rootfs read-only on some of the recovery paths in this bring-up,
+    # and there it fails and this falls back.  The one case it does not catch is a
+    # read-only boot where the directory already exists from a writable one: Mesa
+    # then reads what is in it and cannot add to it, which is the right way round
+    # for a recovery boot and is no worse than what happened before any of this.
+    gl_cache=/run/j36/glcache
+    if mkdir -p /newroot/var/cache/mixos/gl 2>/dev/null; then
+        gl_cache=/var/cache/mixos/gl
+    fi
+    # A no-op on the branch above and the whole of the other one.  It has to exist
+    # before anything looks at it: Mesa creates the last component of a cache path
+    # under a parent that is already there and gives up rather than building a tree,
+    # and /run/j36/glcache has no parent until something makes one.
+    mkdir -p "/newroot$gl_cache" 2>/dev/null
+    say "dash: compiled shaders are cached in $gl_cache"
+
     # ── the dashboard's own unit ─────────────────────────────────────────────────
     #
     # The directory is made here and not assumed: setup_gl is the only other thing
@@ -4751,6 +4815,30 @@ RuntimeDirectory=mixdash
 RuntimeDirectoryMode=0700
 Environment="XDG_RUNTIME_DIR=/run/mixdash"
 Environment="LD_LIBRARY_PATH=/run/j36/gl:$mixos_root/qt/lib"
+# ── the shader cache, and the reason it is named here and not left to Mesa ──
+#
+# The directory was chosen in setup_dash and the reasoning is there.  What matters
+# at this end is that these are set on the DASHBOARD, whose own drawing is Qt on
+# linuxfb and touches no GL at all -- they are here because a systemd unit is the
+# only place a value can be put where every child inherits it, and the children
+# are the GL: the cube card, the Diagnostics GPU row, and whatever the operator
+# installs and launches from the grid.  Before this, only the warm-up unit named
+# a directory, so nothing that ran from here could find what it had compiled.
+#
+# BOTH VARIABLES, ON PURPOSE.  Mesa 25 reads MESA_SHADER_CACHE_DIR first and falls
+# back to XDG_CACHE_HOME, and which of the two answers depends on things this file
+# should not have to predict -- whether systemd handed the unit a HOME, what a
+# child cleared out of its environment.  Setting both to one path means the
+# warm-up and the dashboard land in the same place under every one of those paths.
+# The deprecated MESA_GLSL_CACHE_DIR is deliberately NOT set: Mesa prints a
+# deprecation line to stderr when it sees it, and stderr here is journal+console,
+# which is a message drawn across the panel.
+#
+# The ceiling is not caution about disk -- Mesa's own default is measured in
+# gigabytes, and this board has neither the storage nor the shaders to want it.
+Environment="MESA_SHADER_CACHE_DIR=$gl_cache"
+Environment="XDG_CACHE_HOME=$gl_cache"
+Environment="MESA_SHADER_CACHE_MAX_SIZE=32M"
 # nographicsmodeswitch, AND IT IS NOT OPTIONAL ON THIS BOARD.  The bootargs put
 # /dev/console on tty0, so the panel IS the console; Qt's linuxfb plugin otherwise
 # sets KD_GRAPHICS from inside the QApplication constructor, fbcon stops drawing, and
@@ -5114,17 +5202,17 @@ After=mixdash.service
 Type=oneshot
 RemainAfterExit=yes
 Environment="LD_LIBRARY_PATH=/run/j36/gl:$mixos_root/qt/lib"
-# Mesa keeps its compiled shaders under XDG_CACHE_HOME and disables the cache
-# outright when it has nowhere to put them -- which, for a unit running as root
-# with no HOME, is what would happen.  A tmpfs is the right home for it on a
-# machine whose only disk is the card it boots from: the cache is worth having
-# within one boot, which is exactly what this unit is filling it for, and it is
-# not worth a single write to the card.  The ceiling is there because Mesa's
-# own default is measured in gigabytes and this board has neither the RAM nor
-# the shaders to need it.
-Environment="XDG_CACHE_HOME=/run/j36/glcache"
+# THE SAME THREE LINES AS mixdash.service, WORD FOR WORD, AND THAT IS THE POINT.
+# This unit compiles the cube's shaders and the dashboard's children are what run
+# them again later; if the two disagree about where compiled shaders live then the
+# second one starts from source and this unit warmed nothing.  It used to name only
+# XDG_CACHE_HOME, and only here, which is exactly the disagreement described.  The
+# path itself was worked out in setup_dash -- see the block above mixdash.service
+# for why it prefers the card and when it does not get it.
+Environment="MESA_SHADER_CACHE_DIR=$gl_cache"
+Environment="XDG_CACHE_HOME=$gl_cache"
 Environment="MESA_SHADER_CACHE_MAX_SIZE=32M"
-ExecStartPre=-/bin/mkdir -p /run/j36/glcache
+ExecStartPre=-/bin/mkdir -p $gl_cache
 # Leading dash: a probe that could not make a context is a board with no GL, and
 # that is a thing to read in the journal, not a failed unit to restart.
 ExecStart=-/run/j36/eglprobe
@@ -10443,9 +10531,23 @@ under it, lima opens its render node for the first time, and the config table
 is built.  That is most of a second on this SoC, and it is charged to whatever
 the operator just launched.  Running it where nobody is waiting moves the cost
 off them; the probe exits and what it leaves behind is page cache, the lima
-state and a shader cache under /run/j36/glcache.  Under j36.gl=debug the unit
-is not written at all, because mixdash-probe.service has already done it twice
-before the dashboard.
+state and a directory of compiled shaders.  Under j36.gl=debug the unit is not
+written at all, because mixdash-probe.service has already done it twice before
+the dashboard.
+
+That directory is the one thing here that is written rather than mapped, and it
+is shared on purpose.  The initramfs picks it once -- /var/cache/mixos/gl when
+the rootfs can be written to, /run/j36/glcache when it cannot -- and puts it in
+the environment of BOTH this unit and mixdash.service, capped at 32M through
+MESA_SHADER_CACHE_MAX_SIZE.  mixdash draws with Qt on linuxfb and has no use
+for it; its children do, and a systemd unit is the only place a value can be
+set that every one of them inherits.  It is what makes the Diagnostics GPU
+render row instant: that row runs eglprobe -o, the same cube whose shaders this
+unit compiled at boot, so with one directory between them there is nothing left
+to compile.  Before they shared one, the warm-up filled a directory no other
+process could name, and every EGL program on the board rebuilt its shaders from
+source on every launch -- which is what "the diagnostics freeze for a moment
+before they appear" was.
 
 Which APIs come up, and which one does not
 ------------------------------------------
@@ -11538,6 +11640,18 @@ if [ -z "$J36_BROWSER" ]; then
     echo "j36-browser: no browser installed -- the Packages card can add firefox-esr" >&2
     exit 1
 fi
+
+# SAID OUT LOUD, EVERY TIME.  The loop above is a fallback chain and a fallback that
+# is taken silently is a fallback nobody knows they are using: an image that was
+# supposed to carry firefox-esr and does not comes up on netsurf, renders half the
+# web as a blank page, and looks like a broken browser rather than a missing package.
+# stderr here is mixdash's stdout, which is /run/j36/mixdash.log after the first
+# frame, so the answer is one grep away from anyone asking "which browser is this?".
+case "${J36_BROWSER##*/}" in
+    firefox|firefox-esr) ;;
+    *) echo "j36-browser: firefox-esr is not on this card; falling back to ${J36_BROWSER##*/}, which may not run JavaScript" >&2 ;;
+esac
+echo "j36-browser: using $J36_BROWSER" >&2
 export J36_BROWSER
 
 # Everything written at runtime goes here, because the rootfs on this card is shared
@@ -11673,12 +11787,83 @@ fi
 #
 # --fontptsize 10 over the built-in 8: five rows at 10 pt is about 200 px of the
 # 480 this panel has, and 8 pt on a key 55 px wide reads as a smudge in the hand.
+#
+# ── AND --width/--height, WHICH IS THE FIX FOR "THE KEYBOARD CAME UP TINY" ────
+#
+# The keyboard used to be a different size on the first launch after a boot than on
+# every launch after it: thumbnail-sized once, right the next time.  That is not a
+# font cache and it is not the panel, it is a race with this session's own window
+# manager, and it is worth writing down because nothing about the symptom points at
+# it.
+#
+# mb_kbd_ui_resources_create() in matchbox-keyboard-ui.c sizes the window like this:
+# mb_kbd_ui_realize() first works out "how small this keyboard can be" from the font
+# metrics -- that is the tiny one, and it is a real size, not a failure -- and then,
+# only if get_desktop_area() succeeds, stretches it to the width it found.
+# get_desktop_area() is an XGetWindowProperty of _NET_WORKAREA on the root window,
+# and _NET_WORKAREA is published by the WINDOW MANAGER.  So the keyboard's size is
+# decided by whether matchbox-window-manager, started a second earlier up there, has
+# got as far as setting that property yet.  On a warm launch it has.  On the first
+# launch after a boot, with every one of those binaries still being faulted in off
+# an SD card, it has not -- and the keyboard keeps the minimum size for the rest of
+# the session, because realize happens once and --daemon means the window is created
+# at startup whether or not it is ever shown.
+#
+# Waiting for the property would work and would be one more thing to time out on.
+# Asking for a size does not wait for anything: the same function skips the
+# _NET_WORKAREA path entirely when req_width or req_height is set and uses the
+# request instead, so there is no window in which the answer can be wrong.
+#
+# THE NUMBERS COME FROM THE PANEL, NOT FROM HERE.  The width is the panel's, and
+# the height is two fifths of it because mb_kbd_ui_resize() clamps anything taller
+# than dpy_height * 2 / 5 to exactly that -- so this asks for the tallest keyboard
+# it will agree to draw, which on 640x480 is 640x192, and on a panel this session
+# has never seen is still the right shape rather than 192 px of somebody else's.
+# The font scales with the box, so bigger keys really are bigger type.
+#
+# AND THE MEASUREMENT COMES OFF THE FRAMEBUFFER, NOT OUT OF X.  xdpyinfo would be
+# the obvious way to ask and is the wrong one here: it is in x11-utils, which this
+# image does not install and should not start installing for two integers.  The X
+# server in this session is xf86-video-fbdev on /dev/fb0 with no Virtual and no
+# Modes line in xorg.conf -- see the Browser card section above -- so the screen it
+# opens IS the framebuffer's, and /sys/class/graphics/fb0/virtual_size is the same
+# pair of numbers from the other end.  On this panel that reads "640,480".
+#
+# The one case where the two would differ is a driver that pans, where the virtual
+# height is a multiple of the visible one and this would ask for a keyboard several
+# times too tall.  simplefb, which is what /dev/fb0 is on this board, does not pan:
+# it sets xres_virtual and yres_virtual to the visible size and has no
+# FBINFO_HWACCEL_YPAN to offer.  A panel that changes that is the thing to come
+# back to here for.
+#
+# If the file is missing or says something that is not a pair of numbers, KBD_SIZE
+# stays empty and the keyboard goes back to asking the window manager, which is
+# where this started: a card that cannot measure its own screen should get the old
+# behaviour and not no keyboard.
 if [ -x /usr/bin/matchbox-keyboard ]; then
     if [ -r /opt/mixos/share/keyboard/j36-keyboard.xml ]; then
         MB_KBD_CONFIG=/opt/mixos/share/keyboard/j36-keyboard.xml
         export MB_KBD_CONFIG
     fi
-    matchbox-keyboard --daemon --fontptsize 10 >/dev/null 2>&1 &
+
+    KBD_SIZE=""
+    FBDIM=""
+    if [ -r /sys/class/graphics/fb0/virtual_size ]; then
+        read -r FBDIM < /sys/class/graphics/fb0/virtual_size || FBDIM=""
+    fi
+    FBW="${FBDIM%%,*}"
+    FBH="${FBDIM##*,}"
+    case "$FBW" in ''|*[!0-9]*) FBW=0 ;; esac
+    case "$FBH" in ''|*[!0-9]*) FBH=0 ;; esac
+    if [ "$FBW" -gt 10 ] && [ "$FBH" -gt 10 ]; then
+        KBD_SIZE="--width $FBW --height $((FBH * 2 / 5))"
+    else
+        echo "j36-browser: could not measure the screen; the keyboard will size itself" >&2
+    fi
+
+    # Unquoted on purpose: two flags and two integers this script built itself, and
+    # the empty case has to disappear rather than become an empty argument.
+    matchbox-keyboard --daemon --fontptsize 10 $KBD_SIZE >/dev/null 2>&1 &
     KBD=$!
 fi
 

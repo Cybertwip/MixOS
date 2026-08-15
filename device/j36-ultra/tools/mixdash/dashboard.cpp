@@ -1242,7 +1242,12 @@ void Dashboard::onLaunchRequested(const QString &title, const QString &exe,
 {
     if (confirm && m_armedExe != exe) {
         m_armedExe = exe;
-        toast(title + " takes the panel for good.\nPress A again to run it.", 6000);
+        /* The same sentence the cards use, through tr() rather than concatenated
+         * -- this path used to build it by hand, which meant a card opened from
+         * the file browser got the English one in every language. */
+        toast(tr("%1 takes the panel.  Hold FN to come back.\nPress A again to run it.")
+                  .arg(title),
+              6000);
         return;
     }
     m_armedExe.clear();
@@ -2037,12 +2042,18 @@ void Dashboard::activate(const AppEntry &entry)
     }
 
     if (!entry.exe.isEmpty() || entry.internal == InternalNone) {
-        /* Same two-press gate as Power off, and for the same reason: what it does
-         * cannot be undone from here.  The warning has to be shown before the child
-         * starts, because after it starts the panel is no longer ours to draw on. */
+        /*
+         * Same two-press gate as Power off, and it survives the switcher for a
+         * smaller reason than it was written for.  It used to say the launch could
+         * not be undone; it can now -- holding FN brings this back.  What it is
+         * still worth saying is that the panel is about to change hands and how to
+         * change it back, which is the one thing nothing on the glass can tell you
+         * once the child is drawing.  The warning has to be shown before the child
+         * starts, for exactly that reason.
+         */
         if (entry.confirm && m_armedExe != entry.exe) {
             m_armedExe = entry.exe;
-            toast(tr("%1 takes the panel for good.\nPress A again to run it.")
+            toast(tr("%1 takes the panel.  Hold FN to come back.\nPress A again to run it.")
                       .arg(entry.title),
                   6000);
             return;
