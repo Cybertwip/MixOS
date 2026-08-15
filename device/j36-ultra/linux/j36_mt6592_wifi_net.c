@@ -866,7 +866,6 @@ void j36_wlan_on_sta_active(struct j36_wifi *w, const u8 *peer)
 		return;
 	if (!j36_same_mac(peer, wlan->bss.bssid))
 		return;
-	wlan->sta_active = true;
 	wlan->sta_index = J36_STA_RECORD_INDEX;
 }
 
