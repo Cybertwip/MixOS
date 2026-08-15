@@ -10039,28 +10039,321 @@ if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" || -n "$MIXMIRROR_BIN" ]]; then
         log "dash: staged doom into opt/mixos/bin/"
     fi
 
-    # The Browser card's start page.
+    # ── The Browser card ──────────────────────────────────────────────────────
     #
-    # THE CARD IS links2 IN THE DASHBOARD'S OWN TERMINAL, and the long answer to
-    # "why not a real browser" is in buildPages() in dashboard.cpp -- the short one
-    # is that Edge has no armhf build, that Debian's netsurf-fb and links2 are both
-    # built without a framebuffer surface, and that an X server on this board is the
-    # VT switch that the Console card was removed for.  What is left is a text
-    # browser driven by the pad, and text browsers open on a blank screen.
+    # Three files and a binary: an Xorg configuration, a launcher, the session
+    # script the launcher hands to xinit, and j36-padx.  The reasoning for the
+    # whole shape is above build_padx; what follows is what each piece is for.
     #
-    # So the card opens THIS, off the card, with no network needed and nothing typed:
-    # the keys are on it, because links2's are not the pad's and nobody should have to
-    # guess `g' for go-to-URL on an eleven-button device, and there are four links so
-    # that pressing Enter on one is the whole test of "does this thing browse".
+    # THE BINARY IS STAGED ON ITS OWN MERITS, like the mirror.  A card with the
+    # bridge and no dashboard is still a card somebody can run the launcher on from
+    # a shell, and the launcher tells them what is missing rather than dying.
+    if [[ -n "$PADX_BIN" ]]; then
+        cp "$PADX_BIN" "$SDROOT/opt/mixos/bin/j36-padx"
+        chmod 0755 "$SDROOT/opt/mixos/bin/j36-padx"
+        log "dash: staged j36-padx into opt/mixos/bin/"
+    fi
+
+    # The X configuration.
+    #
+    # Deliberately tiny, and every line in it is load-bearing:
+    #
+    #   Driver "fbdev" and Option "fbdev" "/dev/fb0" name the device rather than
+    #   letting X probe.  Probing on this board finds /dev/dri/card0 -- mediatek-drm
+    #   -- and the modesetting driver would then take DRM master and set a mode on
+    #   the panel the LK already lit.  AutoAddGPU and AutoBindGPU off close the same
+    #   door from the other side.
+    #
+    #   ShadowFB "true" makes X render into ordinary memory and blit the damaged
+    #   rectangles out.  On this panel the framebuffer is uncached memory at
+    #   0x82700000 and read-modify-write into it is slower than doing the work in
+    #   RAM and copying once; it is also what gives a software cursor somewhere to
+    #   save and restore from.
+    #
+    #   DefaultDepth 24 matches the panel: x8r8g8b8, 32 bits per pixel with 24 of
+    #   them meaningful, which is what X calls depth 24.  Left out, X starts at
+    #   depth 8 on some fbdev setups and every colour is wrong.
+    #
+    #   DontVTSwitch, because there is nothing to switch to and Ctrl+Alt+Fn on a USB
+    #   keyboard in the dock should not be able to take the panel away from a
+    #   dashboard that is still running behind this.
+    #
+    #   The four zero timeouts turn the screen blanker off.  X's default is ten
+    #   minutes to blank, and on this device blanking means the framebuffer is
+    #   painted black with no way to un-blank it: the pad's events arrive by XTEST,
+    #   and XTEST is exactly the thing the DPMS/screensaver idle timer does not
+    #   count as activity.
+    #
+    # There is no InputDevice section and AutoAddDevices is left on, which is the
+    # point: a USB keyboard or mouse plugged into the dock is picked up by
+    # xserver-xorg-input-libinput and works normally.  The built-in pad is the one
+    # device libinput will not take, and j36-padx has it grabbed anyway.
+    mkdir -p "$SDROOT/opt/mixos/share/xorg"
+    cat > "$SDROOT/opt/mixos/share/xorg/xorg.conf" <<'XORGCONF'
+# Written by device/j36-ultra/build-in-vm.sh for the J36 Ultra's simple-framebuffer.
+# See the Browser card section in that file for why each option is here.
+
+Section "ServerFlags"
+    Option "AutoAddGPU"   "false"
+    Option "AutoBindGPU"  "false"
+    Option "DontVTSwitch" "true"
+    Option "DontZap"      "true"
+    Option "BlankTime"    "0"
+    Option "StandbyTime"  "0"
+    Option "SuspendTime"  "0"
+    Option "OffTime"      "0"
+EndSection
+
+Section "Device"
+    Identifier "j36-simplefb"
+    Driver     "fbdev"
+    Option     "fbdev"    "/dev/fb0"
+    Option     "ShadowFB" "true"
+EndSection
+
+Section "Monitor"
+    Identifier "j36-panel"
+    Option     "DPMS" "false"
+EndSection
+
+Section "Screen"
+    Identifier   "j36-screen"
+    Device       "j36-simplefb"
+    Monitor      "j36-panel"
+    DefaultDepth 24
+EndSection
+
+Section "ServerLayout"
+    Identifier "j36-layout"
+    Screen 0   "j36-screen"
+EndSection
+XORGCONF
+
+    # The launcher.  This is what the dashboard runs, and it does four things: work
+    # out which browser is on the card, work out where the URL comes from, make the
+    # writable directories on tmpfs, and hand the whole lot to xinit.
+    #
+    # THE BROWSER IS CHOSEN AND NOT HARDCODED, because the request was "any armhf
+    # browser" and because the Packages card exists: somebody who installs chromium
+    # or firefox-esr from it should get that browser here without editing anything.
+    # The order is by what this board can actually carry -- NetSurf is 4 MB and its
+    # own engine, and the WebKit and Blink ones are at the end because 1 GB of RAM
+    # and eight A7s make them a swap test rather than a browser.  netsurf-gtk is
+    # what the image installs, so the first name normally wins.
+    #
+    # POSIX sh and not bash: this is a script the user may end up running by hand
+    # from the initramfs shell, and it has nothing in it that needs more.
+    cat > "$SDROOT/opt/mixos/bin/j36-browser" <<'BROWSERLAUNCH'
+#!/bin/sh
+# j36-browser -- a graphical browser on the J36 Ultra's panel.
+#
+# Usage: j36-browser [URL]
+#
+# Brings up an X server on /dev/fb0 with xinit, runs a window manager, an
+# on-screen keyboard and a browser inside it, and translates the game pad into a
+# pointer with j36-padx.  Written by device/j36-ultra/build-in-vm.sh; the reasoning
+# is in that file, in the Browser card section.
+set -u
+
+START=/opt/mixos/share/browser/start.html
+XCONF=/opt/mixos/share/xorg/xorg.conf
+SESSION=/opt/mixos/bin/j36-browser-session
+
+URL="${1:-}"
+if [ -z "$URL" ]; then
+    if [ -f "$START" ]; then URL="file://$START"; else URL="https://duckduckgo.com/"; fi
+fi
+
+# The X server binary.  Debian puts the real one in /usr/lib/xorg and symlinks
+# /usr/bin/Xorg at it, except on a system with xserver-xorg-legacy installed, where
+# /usr/bin/Xorg is the setuid wrapper instead.  Either works, because this runs as
+# root; the list is only about which of them exists.
+XORG=""
+for c in /usr/bin/Xorg /usr/lib/xorg/Xorg /usr/bin/X; do
+    [ -x "$c" ] && { XORG="$c"; break; }
+done
+if [ -z "$XORG" ] || [ ! -x /usr/bin/xinit ]; then
+    echo "j36-browser: no X server on this card (needs xserver-xorg-core and xinit)" >&2
+    exit 1
+fi
+
+# Any of these, first one wins.  See the comment above this heredoc for the order.
+J36_BROWSER=""
+for b in netsurf-gtk netsurf surf dillo badwolf luakit midori epiphany-browser \
+         falkon qutebrowser firefox-esr firefox chromium chromium-browser; do
+    if [ -x "/usr/bin/$b" ]; then J36_BROWSER="/usr/bin/$b"; break; fi
+done
+if [ -z "$J36_BROWSER" ]; then
+    echo "j36-browser: no browser installed -- the Packages card can add netsurf-gtk" >&2
+    exit 1
+fi
+export J36_BROWSER
+
+# Everything written at runtime goes here, because the rootfs on this card is shared
+# with whatever else boots it and nothing in this image writes to it.  /run is tmpfs.
+mkdir -p /run/j36 /run/j36/xdg 2>/dev/null
+chmod 0700 /run/j36/xdg 2>/dev/null
+
+[ -f "$XCONF" ] || { echo "j36-browser: $XCONF is missing" >&2; exit 1; }
+[ -x "$SESSION" ] || { echo "j36-browser: $SESSION is missing" >&2; exit 1; }
+
+# -sharevts -novtswitch -keeptty vt1: mixdash is still running behind this and holds
+# /dev/tty0 in KD_GRAPHICS.  Those three make Xorg leave the VT entirely alone -- no
+# VT_SETMODE, no VT_ACTIVATE, no KDSETMODE -- and vt1 is named explicitly so it does
+# not go looking for a free one with VT_OPENQRY either.
+#
+# -logfile under /run for the reason above.  It is the first thing to read when the
+# panel stays black: the fbdev driver names the device it opened and the mode it
+# found, and a refusal to start is a line in there and not a message on the console,
+# which by this point nothing is drawing on.
+exec /usr/bin/xinit "$SESSION" "$URL" -- \
+    "$XORG" :0 vt1 \
+    -config "$XCONF" \
+    -logfile /run/j36/xorg.log \
+    -nolisten tcp -novtswitch -sharevts -keeptty
+BROWSERLAUNCH
+    chmod 0755 "$SDROOT/opt/mixos/bin/j36-browser"
+
+    # The session: what xinit runs once the server is up, and what ends the session
+    # when it returns.
+    #
+    # THE ORDER MATTERS.  The window manager starts first because matchbox maps
+    # windows fullscreen and a browser that appears before the WM does gets whatever
+    # geometry it asked for -- NetSurf asks for 1000x700 on a 640x480 panel.  The
+    # keyboard starts before the browser so its pid is known when the bridge starts.
+    #
+    # j36-padx IS THE FOREGROUND PROCESS, and that is the whole control flow: it
+    # watches the browser's pid, so the session ends when the browser is closed from
+    # inside; it takes Menu-held, so the session ends when the pad asks; and it
+    # returns when the X server dies, so the session ends when anything kills this
+    # from outside.  When it returns, everything else is torn down and xinit takes
+    # the server down with the client.
+    cat > "$SDROOT/opt/mixos/bin/j36-browser-session" <<'BROWSERSESSION'
+#!/bin/sh
+# j36-browser-session -- the X client xinit runs.  $1 is the URL.
+# Not meant to be run by hand; j36-browser sets up the server it needs.
+set -u
+
+URL="${1:-about:blank}"
+BROWSER="${J36_BROWSER:-/usr/bin/netsurf-gtk}"
+
+# HOME IS THE DATA PARTITION AND NOT ROOT'S.  Downloads, cookies, the browser's
+# profile and its cache all land under it, and /home/virtua is the one filesystem on
+# this card meant to be written -- and the one the Sharing card exports over SMB, so
+# a file saved out of the browser turns up on the laptop.  The XDG variables are set
+# explicitly rather than left to default off HOME, because a browser that finds them
+# unset falls back to compiled-in paths on at least two of the engines below.
+export HOME=/home/virtua
+[ -d "$HOME" ] || HOME=/root
+export XDG_CONFIG_HOME="$HOME/.config"
+export XDG_CACHE_HOME="$HOME/.cache"
+export XDG_DATA_HOME="$HOME/.local/share"
+export XDG_RUNTIME_DIR=/run/j36/xdg
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" 2>/dev/null
+
+# NO_AT_BRIDGE stops GTK spending its startup waiting for an accessibility bus that
+# is not running -- there is no session D-Bus here at all.  GDK_BACKEND is pinned
+# because GTK4 prefers Wayland and would find none.
+export NO_AT_BRIDGE=1
+export GDK_BACKEND=x11
+export GTK_OVERLAY_SCROLLING=0
+export GDK_CORE_DEVICE_EVENTS=1
+
+WM=""; KBD=""; PAGE=""
+
+# matchbox: a kiosk window manager, 340 kB, no panel and no desktop.  It exists here
+# for one reason -- something has to give the browser input focus, and without a WM
+# an X server hands focus to PointerRoot and every key press from the on-screen
+# keyboard goes to whatever the pointer happens to be over.  No titlebar: 640x480 is
+# too little to spend nineteen rows of it on a close button the pad already has.
+if [ -x /usr/bin/matchbox-window-manager ]; then
+    matchbox-window-manager -use_titlebar no -use_cursor yes >/dev/null 2>&1 &
+    WM=$!
+    # Give it the moment it needs to own the root window before the browser maps.
+    sleep 1
+fi
+
+# The on-screen keyboard, started hidden.  --daemon means it maps nothing until it
+# is sent SIGUSR1, and every SIGUSR1 after that toggles it; Select on the pad is
+# wired to exactly that in j36-padx.  It types with XTEST through libfakekey, so it
+# never takes focus away from the browser it is typing into.
+if [ -x /usr/bin/matchbox-keyboard ]; then
+    matchbox-keyboard --daemon >/dev/null 2>&1 &
+    KBD=$!
+fi
+
+# Per-engine flags, and only where the default is unusable:
+#
+#   chromium refuses to start as root without --no-sandbox, and its GPU process has
+#   nothing to talk to here, so it is told not to look.  --disable-dev-shm-usage
+#   because /dev/shm on this image is small and a renderer that fills it crashes.
+#
+#   firefox gets --no-remote so a second launch opens its own instance instead of
+#   quietly handing the URL to a dead one.
+#
+#   Everything else takes a URL and nothing more, which is the whole reason the list
+#   in j36-browser can be as long as it is.
+case "${BROWSER##*/}" in
+    chromium|chromium-browser)
+        "$BROWSER" --no-sandbox --disable-gpu --disable-dev-shm-usage \
+                   --password-store=basic --window-size=640,480 \
+                   --window-position=0,0 "$URL" &
+        ;;
+    firefox|firefox-esr)
+        "$BROWSER" --no-remote "$URL" &
+        ;;
+    *)
+        "$BROWSER" "$URL" &
+        ;;
+esac
+PAGE=$!
+
+# The bridge, in the foreground: it is what decides when this session is over.
+# --no-grab is NOT passed -- mixdash is still reading the pad behind this and both
+# of them acting on the same press is the bug the grab exists for.
+if [ -x /opt/mixos/bin/j36-padx ]; then
+    /opt/mixos/bin/j36-padx --watch "$PAGE" ${KBD:+--keyboard "$KBD"}
+else
+    echo "j36-browser-session: no j36-padx, so the pad cannot drive this" >&2
+    wait "$PAGE"
+fi
+
+# SIGTERM and then three seconds, because a browser asked to quit writes its session
+# and its cookie jar out, and this card's whole point is that the file is still there
+# next time.  SIGKILL only for one that did not.
+kill "$PAGE" 2>/dev/null
+i=0
+while kill -0 "$PAGE" 2>/dev/null && [ "$i" -lt 30 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+kill -9 "$PAGE" 2>/dev/null
+[ -n "$KBD" ] && kill "$KBD" 2>/dev/null
+[ -n "$WM" ] && kill "$WM" 2>/dev/null
+exit 0
+BROWSERSESSION
+    chmod 0755 "$SDROOT/opt/mixos/bin/j36-browser-session"
+    log "dash: staged the browser session into opt/mixos/bin/ and opt/mixos/share/xorg/"
+
+    # The start page.
+    #
+    # OPENED BECAUSE A BROWSER OPENS ON NOTHING.  Every browser here starts on a
+    # blank page, and a blank page on a device with no keyboard is a dead end: the
+    # first thing that has to happen is a link somebody can press without typing a
+    # URL on eleven buttons.  So the card carries its own, it works with no network,
+    # and the pad's bindings are written on it because they are not any browser's.
     #
     # Written here and not in mixdash, because a page is a file and dashboard.cpp
     # would have to escape every quote in it into a C++ string literal to say the
     # same thing.  dashboard.cpp holds the path and falls back to a search engine
     # when this file is not on the card.
     #
-    # No CSS and no JavaScript: links2's text mode reads neither, and a start page
-    # that renders differently in the browser it ships for is a start page that was
-    # written for a different browser.
+    # A LITTLE CSS AND NO JAVASCRIPT.  The CSS is there because this page is now read
+    # by a graphical browser on a 640x480 panel and the default 16px serif with no
+    # margins is not readable at that size; it is kept to what NetSurf's own CSS
+    # engine handles, so the page looks the same in the browser the image ships as it
+    # does in whatever gets installed later.  No JavaScript, because links2 is still
+    # the fallback when there is no X on the card and it would read none of it.
     mkdir -p "$SDROOT/opt/mixos/share/browser"
     cat > "$SDROOT/opt/mixos/share/browser/start.html" <<'BROWSERSTART'
 <!DOCTYPE html>
