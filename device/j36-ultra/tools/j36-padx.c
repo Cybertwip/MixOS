@@ -476,8 +476,20 @@ static int scan_pads(int grab)
             continue;
         }
         name[0] = '\0';
-        if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) < 0)
-            snprintf(name, sizeof(name), "%s", path);
+        if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) < 0) {
+            /*
+             * The node has no name of its own, so it is called after its path.
+             *
+             * The precision is what keeps -Wformat-truncation quiet, and it is not
+             * only to keep it quiet: path is 320 bytes and name is 128, so gcc is
+             * right that the copy can be cut short.  Saying where it is cut makes
+             * the truncation the one this code chose rather than the one snprintf
+             * happened to do, and a driverless pad is named "/dev/input/eventN"
+             * either way -- the case that would actually overflow is a d_name two
+             * hundred characters long, which /dev/input does not have.
+             */
+            snprintf(name, sizeof(name), "%.*s", (int)sizeof(name) - 1, path);
+        }
         name[sizeof(name) - 1] = '\0';
 
         if (!looks_like_pad(fd, name)) {

@@ -8586,11 +8586,63 @@ systemd.journald.forward_to_console=1, gone
     line if you want the running commentary; it is a diagnostic, not a default.
 
 j36.log=1
-    Default ON, and the only j36 word that is.  Twenty seconds into the boot, and
-    again at seventy-five, and once more on a clean shutdown, /init's staged
-    j36-logdump.service mounts this partition read-write, writes mixos-log.txt at
-    the top of it and unmounts again.  See "The log on this partition" below.
-    j36.log=0 turns it off.
+    Default ON, and one of the two j36 words that are.  Twenty seconds into the
+    boot, and again at seventy-five, and once more on a clean shutdown, /init's
+    staged j36-logdump.service mounts this partition read-write, writes
+    mixos-log.txt at the top of it and unmounts again.  See "The log on this
+    partition" below.  j36.log=0 turns it off.
+
+j36.zram=auto
+    The other one, and it is on by default for the same reason: it loads nothing.
+    zram is built into this kernel, so the block device already exists when /init
+    starts -- there is no module that could refuse to insmod, no register window
+    that could hang the bus, and no partition that has to be found first.  All
+    /init does is size it, mkswap it and swapon it, before it has even looked for
+    the rootfs.
+
+    This board has 946 MB of usable memory and, until this word existed, no swap
+    at all: the answer to running out was the OOM killer, immediately and every
+    time.  There is nowhere on the card to put a swap file -- the rootfs is shared
+    with the R36S and is never written to, the other partition is somebody's data,
+    and swapping to the medium you booted from is both slow and the fastest way
+    known to wear a microSD card out.  So the swap is in RAM: zram compresses
+    what is written to it with lz4 and keeps it there.  It is not free memory, it
+    is CPU traded for capacity, and this board has eight Cortex-A7 cores that are
+    idle exactly when it is short of memory.
+
+    auto makes the device 80% of MemTotal -- 768 MB here -- and caps what it may
+    physically consume at 35%, which is 331 MB.  Those are two different limits on
+    purpose.  The first says how much can be swapped out; the second is what stops
+    the spiral where badly-compressing pages make zram eat the memory that the
+    swapping was meant to free.  Past it zram refuses the write, the page stays
+    where it was, and the board degrades to how it behaved before this word rather
+    than falling over.  At the ~2:1 lz4 gets on browser heap the cap is never
+    reached and the machine behaves like one with about 1.3 GB.
+
+    /init also sets vm.swappiness=150, vm.page-cluster=0 and
+    vm.watermark_scale_factor=100, all three of which are properties of THIS swap
+    device rather than of the rootfs -- which is why they are written from here
+    and not from a sysctl.d file on a partition an R36S also boots.  Section 7 of
+    mixos-log.txt reads all of them back, along with zram's own mm_stat, which is
+    the only place the compression ratio it is actually getting is visible.
+
+    j36.zram=0 -- or `noswap' -- turns the whole thing off, including the three
+    sysctls, so that a board can be measured with it and without it and the
+    comparison means something.  j36.zram=384 or any other number is a size in MB
+    instead of the 80%, including sizes larger than RAM; the cap above is what
+    makes trying one safe.
+
+    If Firefox still runs out, the lever to pull is the algorithm, and it does not
+    need a rebuild -- zstd is compiled in and gets nearer 3:1, at four or five
+    times the CPU per page:
+
+      swapoff /dev/zram0
+      echo zstd > /sys/block/zram0/comp_algorithm
+      mkswap /dev/zram0 && swapon /dev/zram0
+
+    lz4 is the default because swap-in latency is what a person feels as the
+    window not coming back, and on an A7 with no crypto extensions zstd's
+    decompression is slow enough to be that.
 
 systemd.mask=firstboot.service
     MixOS's first-boot script is written for the RK3326 image and this

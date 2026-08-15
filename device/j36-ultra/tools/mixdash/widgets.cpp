@@ -3192,10 +3192,32 @@ void InfoPage::refresh()
                                 humanBytes((qulonglong)total * 1024)));
     else
         add(tr("RAM"), tr("no /proc/meminfo"));
-    add(tr("Swap"), swapTotal > 0 ? tr("%1 free of %2")
-                                        .arg(humanBytes((qulonglong)swapFree * 1024),
-                                             humanBytes((qulonglong)swapTotal * 1024))
-                                  : tr("none"));
+    /*
+     * The Swap row names the compressor, and the name is not translated because it
+     * is the algorithm's own.  Swap on this board is zram and can be nothing else
+     * -- there is nowhere on the card to put a swap file, so /init makes a
+     * compressed block device in RAM instead -- and the whole bet is that lz4 gets
+     * about 2:1 on what gets swapped out.  "768.0 MB free of 768.0 MB" on its own
+     * is the one reading that cannot tell a working setup from a kernel that fell
+     * back to lzo-rle, so the two lines that fetch it are worth having.
+     *
+     * comp_algorithm lists everything this kernel can do and brackets the one in
+     * use -- "lzo lzo-rle [lz4] zstd" -- so the bracketed word is the answer and
+     * the rest of the line is the menu.  No brackets means no zram0, which is what
+     * a j36.zram=0 boot looks like, and then the row is just the sizes.
+     */
+    QString swapRow = tr("none");
+    if (swapTotal > 0) {
+        swapRow = tr("%1 free of %2")
+                      .arg(humanBytes((qulonglong)swapFree * 1024),
+                           humanBytes((qulonglong)swapTotal * 1024));
+        const QString comp = readTrimmed("/sys/block/zram0/comp_algorithm");
+        const int lb = comp.indexOf('[');
+        const int rb = comp.indexOf(']');
+        if (lb >= 0 && rb > lb + 1)
+            swapRow += QString(" (%1)").arg(comp.mid(lb + 1, rb - lb - 1));
+    }
+    add(tr("Swap"), swapRow);
 
     /* ── Display ─────────────────────────────────────────────────────────── */
     addHeader(tr("Display"));
