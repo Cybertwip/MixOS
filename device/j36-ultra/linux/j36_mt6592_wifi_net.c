@@ -123,8 +123,8 @@
  * submitted, credited and abandoned on their own deadlines over three minutes,
  * with not one message from the driver to say so.
  */
-#define J36_WLAN_SILENCE_RECOVER	2
-#define J36_WLAN_RECOVER_LIMIT		2
+#define J36_WLAN_SILENCE_RECOVER	2u
+#define J36_WLAN_RECOVER_LIMIT		2u
 
 /* 1..13.  Channel 14 is 802.11b-only and Japan-only; the firmware's own domain
  * table stops at 13 and so does this. */
@@ -1139,17 +1139,24 @@ static bool j36_wlan_is_eapol(const struct sk_buff *skb)
  * is very often the one an EAPOL exchange is waiting on and TCP is not the only
  * thing that would notice it going missing.
  *
- * AND IT DOES NOT WAIT FOR A PAGE, which is the whole point of the may_wait
- * argument below.  Waiting here is waiting with w->lock held, and the lock is
- * what the event pump needs -- so the sixteen frames of a busy poll could spend
- * six seconds between them not sending, during which no TX_DONE came back to
- * credit the pages being waited on, no beacon or scan result was read out of a
- * receive FIFO that was filling, and .scan and .connect sat on the mutex.  That
- * is the shape of "the link drops when I run apt update": nothing was lost on
- * the air, the driver simply stopped servicing the chip under its own load.
- * Refused now means requeued now, and the next tick is a jiffy away.
+ * FROM THE POLL WORKER IT DOES NOT WAIT FOR A PAGE, which is what may_wait is
+ * for.  Waiting there is waiting with w->lock held, and the lock is what the
+ * event pump needs -- so the sixteen frames of a busy poll could spend six
+ * seconds between them not sending, during which no TX_DONE came back to credit
+ * the pages being waited on, no beacon or scan result was read out of a receive
+ * FIFO that was filling, and .scan and .connect sat on the mutex.  That is the
+ * shape of "the link drops when I run apt update": nothing was lost on the air,
+ * the driver simply stopped servicing the chip under its own load.  Refused there
+ * means requeued there, and the next tick is a jiffy away.
+ *
+ * .add_key is the one caller that DOES wait, and it has to.  It drains so that
+ * message 4 of the handshake is in the firmware's hands before the pairwise key
+ * command goes in behind it -- j36_wlan_cmd_install_key() then waits on that
+ * frame's own transmit status.  A frame left in this queue instead is a frame
+ * that will be sent encrypted with the key it is the acknowledgement for, and
+ * there is nothing behind .add_key that a couple of hundred milliseconds hurts.
  */
-static unsigned int j36_wlan_drain_tx(struct j36_wlan *wlan)
+static unsigned int j36_wlan_drain_tx(struct j36_wlan *wlan, bool may_wait)
 {
 	struct j36_wifi *w = wlan->w;
 	unsigned int sent = 0;
@@ -1165,7 +1172,7 @@ static unsigned int j36_wlan_drain_tx(struct j36_wlan *wlan)
 		int ret;
 
 		ret = j36_wlan_cmd_tx_ethernet(w, skb->data, len,
-					       wlan->sta_index, is_1x, false);
+					       wlan->sta_index, is_1x, may_wait);
 		if (ret == -EBUSY) {
 			const ktime_t now = ktime_get();
 
@@ -1386,7 +1393,7 @@ static void j36_wlan_poll_work(struct work_struct *work)
 	}
 
 	handled = j36_wlan_cmd_pump(w);
-	handled += j36_wlan_drain_tx(wlan);
+	handled += j36_wlan_drain_tx(wlan, false);
 	j36_wlan_check_deadlines(wlan);
 
 	/* The pump clears firmware_alive when the FIFO pair reports abnormal,
@@ -1696,7 +1703,8 @@ static int j36_wlan_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 	 */
 	peer = pairwise ? (mac_addr ? mac_addr : wlan->bss.bssid)
 			: j36_wlan_group_addr;
-	j36_wlan_drain_tx(wlan);
+	/* Waiting, unlike the poll worker's drain: see j36_wlan_drain_tx(). */
+	j36_wlan_drain_tx(wlan, true);
 	ret = j36_wlan_cmd_install_key(w, peer, key_index, pairwise,
 				       params->key);
 	if (ret)

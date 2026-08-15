@@ -322,10 +322,49 @@ struct fb_fix_screeninfo {
  * it is a bus no version of this software will ever draw to. */
 #define DISPLAYLINK_VENDOR "17e9"
 
+/*
+ * ── THE TARGET IS "NOT THIS BOARD'S OWN", NOT "udl" ────────────────────────────
+ *
+ * The allow-list used to be the single string "udl", and the paragraph at the top of
+ * this file argued for it: a name is stabler than a minor number.  That half is still
+ * true.  What was wrong was making the name a WHITELIST OF ONE, because it asks the
+ * question backwards.  This program does not care which chip is on the far end of the
+ * cable -- it cares that the node has a CRTC it can modeset and that the node is not
+ * the panel it is copying FROM.  Written as a whitelist, every USB display part that
+ * is not DisplayLink -- Fresco Logic FL2000, Silicon Motion SM76x, MCT/Trigger, and
+ * whatever binds next -- is refused by this program even when the kernel has already
+ * bound it and put a working card node in /dev/dri.  That is a rebuild standing
+ * between the user and a screen that is already lit.
+ *
+ * So it is a DENY-list of the two drivers this board brings up itself:
+ *
+ *   lima        the GPU.  It has no CRTC and no connector at all -- render-only --
+ *               so modesetting it would fail anyway, but it is named here because it
+ *               is card0 on this board and the loop must not stop at it.
+ *   mediatek    the panel.  It IS the source; mirroring it onto itself is a loop.
+ *
+ * Anything else in /dev/dri got there because a device was plugged in, and a plugged
+ * in device with a DRM node is what this program exists to draw on.  -n still forces
+ * one exact name for when that judgement is wrong.
+ */
+static const char *const board_drivers[] = {
+    "lima", "mediatek", "mediatek-drm", "mtk-drm", NULL
+};
+
 static volatile sig_atomic_t stop_requested;
 static int verbose;
 static int publishing = 1;
-static const char *allow_name = "udl";
+static const char *allow_name;      /* -n: exact match, and nothing else */
+
+static int is_board_driver(const char *name)
+{
+    int i;
+
+    for (i = 0; board_drivers[i]; ++i)
+        if (strcmp(name, board_drivers[i]) == 0)
+            return 1;
+    return 0;
+}
 
 static void on_signal(int sig)
 {
@@ -650,6 +689,7 @@ static int open_mirror_node(char *path, size_t pathsz, char *seen, size_t seensz
         char candidate[sizeof(e->d_name) + 32], name[32], desc[64];
         struct drm_version v;
         int fd;
+        int versioned;
 
         if (strncmp(e->d_name, "card", 4) != 0)
             continue;
@@ -669,11 +709,15 @@ static int open_mirror_node(char *path, size_t pathsz, char *seen, size_t seensz
         v.desc_len = sizeof(desc) - 1;
         v.desc = desc;
 
+        versioned = 1;
         if (ioctl(fd, DRM_IOCTL_VERSION, &v) < 0) {
             /* No version ioctl means this is not a DRM node we understand, and a
-             * node we do not understand is one we do not modeset. */
+             * node we do not understand is one we do not modeset.  Under a deny-list
+             * that has to be tracked explicitly: "?" is not a board driver, so
+             * without this flag an unreadable node would pass the test. */
             chat("mirror: %s answers no DRM_IOCTL_VERSION -- left alone", candidate);
             snprintf(name, sizeof(name), "?");
+            versioned = 0;
         }
 
         /* Recorded before the allow-list refuses it, because "what IS in /dev/dri"
@@ -683,9 +727,11 @@ static int open_mirror_node(char *path, size_t pathsz, char *seen, size_t seensz
         if (used >= seensz)
             used = seensz;      /* full; snprintf has already stopped writing */
 
-        if (strcmp(name, allow_name) != 0) {
-            chat("mirror: %s is \"%s\" -- not \"%s\", left alone", candidate, name,
-                 allow_name);
+        if (!versioned ||
+            (allow_name ? strcmp(name, allow_name) != 0 : is_board_driver(name))) {
+            chat("mirror: %s is \"%s\" -- %s, left alone", candidate, name,
+                 allow_name ? "not the driver -n asked for"
+                            : "one of this board's own displays");
             close(fd);
             continue;
         }
