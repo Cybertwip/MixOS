@@ -905,6 +905,106 @@ for symbol in USB_GADGET USB_EHCI_HCD USB_OHCI_HCD USB_XHCI_HCD \
     config_n "$symbol"
 done
 
+# ── Swap, and the only device this board can put it on ────────────────────────
+#
+# 946 MiB of usable RAM, one microSD card, and a browser whose smallest useful
+# footprint is most of a Firefox.  Until this section existed there was no swap at
+# all: CONFIG_SWAP arrives =y from multi_v7_defconfig and nothing ever called
+# swapon, so this board's entire answer to running out of memory was the OOM
+# killer, every time, with no warning and no degraded mode in between.
+#
+# WHY NOT A SWAP FILE ON THE CARD.  It is the obvious answer and it is wrong here
+# three times over.  The rootfs is shared with the R36S and NOTHING ON IT IS
+# WRITTEN -- that is the invariant this whole card is built on -- and a swap file
+# is a written file.  The only other partition is 300 MiB of somebody's data.  And
+# a random 4 KiB read off this card costs a few hundred microseconds against the
+# few microseconds an lz4 page costs, on flash with a finite erase count that swap
+# is the single most effective way to spend.  A handheld that swaps to its own boot
+# medium is slower than one that does not swap at all, and it wears the card out
+# doing it.
+#
+# So the swap device is RAM.  zram is a block device that compresses what is
+# written to it and keeps it in memory, which is not a way of getting memory out of
+# nothing -- it is trading CPU for capacity, and this board has eight Cortex-A7
+# cores that are doing nothing whenever it is short of memory.  At the ~2:1 lz4
+# gets on browser heap, 768 MiB of swap costs about 380 MiB of RAM and gives back
+# 768, so the machine behaves roughly like one with 1.3 GiB.  /init sizes it from
+# MemTotal and caps what it may physically eat -- see setup_zram.
+#
+# =y AND NOT =m, which is the opposite of the rule every driver in this file
+# follows.  There is no modprobe on this rootfs: modules are staged into
+# /opt/mixos/j36/<word>/ and busybox-insmodded by /init behind a cmdline word, off
+# a partition /init has to find first.  Swap wants to exist before anything has
+# allocated, which is before that search has even started, so the one payload that
+# cannot be a payload is this one.  zram and zsmalloc together are on the order of
+# 30 KiB of text.
+config_y SWAP
+config_y ZRAM
+config_y ZSMALLOC
+
+# THE COMPRESSOR, AND WHY TWO SPELLINGS ARE ASKED FOR AND THREE ARE BUILT.
+#
+# Linux 6.12 replaced zram's crypto-API dependency with backends of its own, so the
+# symbol that turns lz4 on is ZRAM_BACKEND_LZ4 here and was CRYPTO_LZ4 before it.
+# Both spellings are set, because scripts/config does not validate a symbol against
+# Kconfig -- it writes the line, and olddefconfig drops the one this tree does not
+# have.  The assertion after olddefconfig reads the one thing that exists in both
+# schemes: ZRAM_DEF_COMP, a string, which is the algorithm name zram actually
+# initialises with, so it proves the backend was selected AND that it is the
+# default rather than merely available.
+#
+# lz4 IS THE DEFAULT AND NOT zstd, and on a faster machine it would be the other
+# way round.  zstd gets close to 3:1 against lz4's 2:1, which over 768 MiB of swap
+# is 260 MiB of RAM instead of 380.  But every page swapped back IN is decompressed
+# on the core that faulted, and on a 1.4 GHz Cortex-A7 with no crypto extensions
+# that is roughly 25 us for lz4 against something over 100 for zstd.  Swap-in
+# latency is what a person experiences as the window not coming back, and reclaim
+# runs in kswapd where a slow compressor turns into a stall on every allocation.
+# The fast one wins the default on this SoC.
+#
+# zstd is built anyway, and it is the reason this block is three lines longer than
+# it needs to be: it is the one lever left if Firefox still runs out on this board,
+# and pulling it is
+#
+#     swapoff /dev/zram0
+#     echo zstd > /sys/block/zram0/comp_algorithm
+#     mkswap /dev/zram0 && swapon /dev/zram0
+#
+# rather than a kernel rebuild in a VM.  It costs on the order of 100 KiB in a boot
+# partition with about two and a half megabytes of slack, and if that slack ever
+# runs out this is the first line in this file to delete.
+config_y ZRAM_BACKEND_LZ4
+config_y ZRAM_BACKEND_LZO
+config_y ZRAM_BACKEND_ZSTD
+config_y CRYPTO_LZ4
+config_y CRYPTO_ZSTD
+config_n ZRAM_DEF_COMP_LZORLE
+config_y ZRAM_DEF_COMP_LZ4
+
+# Named refusals, one line of reasoning each:
+#
+#   ZSWAP           a compressed cache in FRONT of a swap device, which is this
+#                   same idea one layer up.  With zram as the device underneath it
+#                   would compress a page into a zpool and then compress it again
+#                   on the way out -- two allocators, two ratios, one page saved.
+#                   zswap is for a machine with a real disk behind it to write back
+#                   to; this one has nowhere to write back to at all.
+#   ZRAM_WRITEBACK  the other half of that, from zram's side: it hands idle or
+#                   incompressible pages to a backing block device, and the only
+#                   block device on this board is the SD card the section above
+#                   refuses to swap to.
+#   ZRAM_MULTI_COMP recompress idle pages with a second, slower algorithm.  A real
+#                   feature, and it needs a userspace daemon marking pages idle
+#                   which this image does not have; without one it is dead code.
+#   ZRAM_MEMORY_    a debugfs table of every stored page.  It selects
+#   TRACKING        ZRAM_TRACK_ENTRY_ACTIME, which puts a timestamp in every
+#                   entry's metadata -- a per-page cost, on the board with the
+#                   least memory, for a file nothing on it reads.
+for symbol in ZSWAP ZRAM_WRITEBACK ZRAM_MULTI_COMP ZRAM_MEMORY_TRACKING \
+    ZRAM_TRACK_ENTRY_ACTIME; do
+    config_n "$symbol"
+done
+
 # ── The power supply class, for the PMIC ──────────────────────────────────────
 #
 # =y and not =m, which is the opposite of the rule everything else in this file

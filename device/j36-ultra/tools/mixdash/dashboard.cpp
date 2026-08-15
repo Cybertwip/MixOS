@@ -316,6 +316,14 @@ Dashboard::Dashboard(QWidget *parent)
     connect(m_apps, &CardGrid::orderChanged, this, [](const QStringList &keys) {
         Settings::instance().setCardOrder(keys);
     });
+    connect(m_apps, &CardGrid::ejectRequested, this, &Dashboard::onEjectRequested);
+    /*
+     * A stick arriving or leaving rebuilds the grid.  It is a rebuild rather than an
+     * insert because the grid's order is a saved list of keys and only buildPages()
+     * knows how to apply it; the cost is a handful of AppEntry copies once per plug.
+     */
+    connect(&Volumes::instance(), &Volumes::changed,
+            this, &Dashboard::onVolumesChanged);
     connect(m_files, &FilesPage::openRequested, this, &Dashboard::onOpenRequested);
     connect(m_settings, &SettingsPage::openRequested, this, &Dashboard::onSettingsOpen);
     connect(m_packages, &PackagesPage::terminalRequested,
