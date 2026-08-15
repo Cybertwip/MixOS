@@ -152,13 +152,21 @@
  * fed from VBAT cannot put more on that net than VBAT, and a charger always does.
  * See the thresholds at J36_VCHR_ABSENT_MV.
  *
- * THE VETO DOES NOT REACH j36_charger_arm().  It moves the report, the plug edge,
- * the gauge and the ladder; the arm still gets the raw CHRDET.  So the worst a
- * wrong veto can cost is a wrong line on a screen, and the charging behaviour of
- * this driver is bit-for-bit what it was before this paragraph existed.  That
- * asymmetry is the whole safety argument, and it is why this is a fix rather than
- * a trade: the failure that must never happen again is a board that does not
- * charge, and no path added here can produce one.
+ * THE VETO REACHES j36_charger_arm() IN ONE STATE AND NO OTHER.  It moves the
+ * report, the plug edge, the gauge and the ladder unconditionally; it takes the
+ * charge path down only when the pad is up AND the input measures at the pack,
+ * which is the one arrangement where arming the charger does something actively
+ * harmful rather than merely useless.  CHRIN is the port's own net, so a charger
+ * enabled against our own DRVVBUS is a CSDAC sinking up to CS_VTH out of the 5 V
+ * the port is sourcing -- pack, through the load switch, into the charger, back
+ * into the pack.  It charges nothing and it takes the port's whole current
+ * headroom with it, which a mouse survives and a hub does not.
+ *
+ * Everywhere else the arm still gets the raw CHRDET, so the failure that must
+ * never happen again -- a board that does not charge -- needs a real charger to
+ * measure below the pack on channel 4 before it can occur, and vchr_veto=0 is
+ * still the one-line way out of it.  See the arm call site for the full
+ * argument.
  */
 
 #include <linux/bitops.h>
@@ -247,12 +255,13 @@ MODULE_PARM_DESC(chrin_shared,
  * instrument with its own divider constants, and if those are wrong for this board
  * it will read low on a charger that is really there.
  *
- * WHAT THAT COSTS IS NOW ONLY THE DISPLAY.  The veto does not reach
- * j36_charger_arm(), which takes the raw bit, so a wrong veto shows Discharging on
- * a board that is charging perfectly well and the pack still fills.  That is worth
- * saying plainly, because it changes what this parameter is for: it is no longer a
- * safety valve on the charge path, it is a way to answer "the gauge is lying"
- * without a rebuild.
+ * WHAT THAT COSTS IS THE DISPLAY, AND -- WHILE DRVVBUS IS UP -- THE CHARGE PATH.
+ * A wrong veto with the pad down still only shows Discharging on a board that is
+ * charging perfectly well, because the arm takes the raw bit there.  With the pad
+ * up the arm is held off too, because that is the state where arming against our
+ * own 5 V sinks the port; so on this board a divider constant that reads low
+ * would stop the pack filling, and that makes this parameter a safety valve again
+ * as well as a way to answer "the gauge is lying" without a rebuild.
  *
  * So, 0644.  A console that reports Discharging with a charger in it, with
  * "treating the cable as out" in dmesg and a millivolt figure that does not match a
@@ -264,8 +273,10 @@ static bool vchr_veto = true;
 module_param(vchr_veto, bool, 0644);
 MODULE_PARM_DESC(vchr_veto,
 		 "let a measured charger input below the bar overrule a CHRDET that "
-		 "claims a cable (default 1; affects the report only, never the "
-		 "charger -- set 0 if the ADC scaling on this board reads low)");
+		 "claims a cable (default 1; moves the report always, and the charge "
+		 "path only while DRVVBUS is up, where a charger armed against our "
+		 "own 5 V would sink the port -- set 0 if the ADC scaling on this "
+		 "board reads low)");
 
 static bool poweroff = true;
 module_param(poweroff, bool, 0444);
