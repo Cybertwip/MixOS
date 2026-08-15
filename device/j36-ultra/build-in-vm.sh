@@ -4354,6 +4354,235 @@ UNITASOUND
     return 0
 }
 
+# ── the rest of the card, given to the DATA partition ─────────────────────────
+#
+# WHAT IS WRONG.  The image is a fixed 4.6 GB and the card is whatever the operator
+# bought.  p3 -- DATA, ext2, mounted at /home/virtua -- ends where the image ended,
+# so a 64 GB card carries 59 GB that nothing can reach and no page can show.  On
+# this board that is not an inconvenience: there is no keyboard, the dashboard is
+# the only shell, and gparted on a PC means taking the card out, which is the exact
+# thing a share and a Files page exist to stop being necessary.
+#
+# WHY NOT firstboot.service, WHICH ALREADY EXISTS.  Because it is the RK3326
+# script, it is masked in this board's bootargs, and the reasons are written out
+# under "systemd.mask=firstboot.service" in the README this file generates: it
+# expands in two stages with a reboot in the middle, it MKFS'S p3 -- deleting
+# whatever is on it -- and it then untars /roms.tar and /tempthemes, neither of
+# which a GUI-mode build ships, spinning 15000 subshells apiece before giving up.
+# Unmasking it would grow the card by destroying the partition being grown.
+#
+# WHY IT IS A UNIT AND NOT INITRAMFS CODE.  Growing an ext2 needs resize2fs and
+# e2fsck, and BusyBox has neither -- there is no ext2 resize applet at all.  Both
+# are on the rootfs, so the work has to happen after switch_root, which means a
+# unit.  It is written into the /run tmpfs like every other unit here, so nothing
+# of it is on the card and deleting the boot image takes the whole feature out.
+#
+# ORDERED BEFORE THE MOUNT, WHICH IS THE LOAD-BEARING LINE.  ext2 has no online
+# resize -- that is an ext4 feature and this filesystem is deliberately ext2 -- so
+# the partition has to be unmounted, and the one moment in the boot when it is
+# both present and unmounted is between udev finding it and systemd mounting it.
+# `Before=home-virtua.mount' is what buys that moment.  The name is spelt out
+# because systemd-escape is not something this initramfs can run, and /home/virtua
+# is the mount point this tree's own fstab writes -- and the script checks
+# /proc/mounts anyway, so an fstab that said something else costs the feature and
+# not the filesystem.
+#
+# AND THERE IS NO STAMP FILE.  No /boot/doneit, no /etc/mixos/expanded.  "Does the
+# partition already reach the end of the card" is answerable from two files in
+# sysfs on every boot, so there is no state to be wrong, nothing to clear when a
+# card is re-flashed, and no way for this to run twice or refuse to run once.
+setup_expand() {
+    if [ -z "$rootdev" ]; then
+        say "expand: no rootfs was found, so there is nothing to run the resize"
+        return 1
+    fi
+    if ! ensure_run_tmpfs; then
+        say "expand: no writable /run on the rootfs, so the resize unit is not written"
+        return 1
+    fi
+
+    mkdir -p /newroot/run/j36/bin
+    mkdir -p /newroot/run/systemd/system/local-fs.target.wants
+
+    # QUOTED HEREDOC.  Every $ below belongs to the script, not to this shell.
+    cat > /newroot/run/j36/bin/j36-expand-data <<'EXPANDSH'
+#!/bin/sh
+# j36-expand-data -- give the rest of the card to the DATA partition.
+#
+# Written into a tmpfs by the J36 Ultra initramfs and gone at the next power cut.
+# Runs once per boot, before /home/virtua is mounted, and does nothing at all on
+# every boot after the first because by then there is nothing left to give.
+say() { echo "expand: $*"; }
+
+# The splash is still up -- /dev came across switch_root with the root, so this is
+# the same channel /init has been writing to -- and the two commands below can take
+# minutes on a big slow card.  A progress bar that stops moving for three minutes is
+# indistinguishable from a boot that has hung.
+chan=/dev/.mixsplash
+tell() { [ -e "$chan" ] && echo "$1" >> "$chan"; return 0; }
+
+# ── FIND IT, AND WAIT FOR IT ─────────────────────────────────────────────────
+#
+# By label, because that is what the fstab this partition is mounted from uses and
+# it is the only name that survives the card being moved between readers.  Waited
+# for rather than assumed present: this unit is ordered before the mount, which is
+# early enough that udev may still be working through the coldplug.
+part=""
+n=0
+while [ "$n" -lt 40 ]; do
+    part=$(blkid -L DATA 2>/dev/null) || part=""
+    if [ -n "$part" ] && [ -b "$part" ]; then break; fi
+    part=""
+    n=$((n + 1))
+    sleep 0.25
+done
+if [ -z "$part" ]; then
+    say "no partition labelled DATA on this machine; nothing to grow"
+    exit 0
+fi
+
+# ── WHICH DISK, AND WHICH NUMBER ON IT ───────────────────────────────────────
+#
+# Out of sysfs and not out of the device name.  Stripping a trailing number works
+# for sda3 and is wrong for mmcblk0p3 and for nvme0n1p3; sysfs already knows both
+# answers and cannot be wrong about either.
+name=${part#/dev/}
+sysdir=/sys/class/block/$name
+if [ ! -r "$sysdir/partition" ]; then
+    say "$part is a whole disk and not a partition; nothing to grow"
+    exit 0
+fi
+pno=$(cat "$sysdir/partition")
+diskname=$(basename "$(readlink -f "$sysdir/..")")
+disk=/dev/$diskname
+if [ ! -b "$disk" ]; then
+    say "cannot find the disk $part is a partition of; nothing to grow"
+    exit 0
+fi
+
+# ── IS THERE ANYTHING TO DO?  ────────────────────────────────────────────────
+#
+# sysfs sizes are in 512-byte sectors regardless of the device's own block size,
+# so these three numbers are directly comparable and no unit conversion is needed.
+# The margin is 8 MiB: an MBR keeps its last sector to itself, an SD controller
+# may round the reported capacity, and re-writing the partition table to recover
+# four megabytes is a write to the one structure on the card worth not writing to.
+start=$(cat "$sysdir/start" 2>/dev/null || echo 0)
+size=$(cat "$sysdir/size" 2>/dev/null || echo 0)
+whole=$(cat "/sys/class/block/$diskname/size" 2>/dev/null || echo 0)
+slack=$((whole - start - size))
+
+if [ "$slack" -gt 16384 ]; then
+    say "$part ends $((slack / 2048)) MiB before the end of $disk; growing it"
+    tell "stage:Expanding storage"
+    tell "detail:$((slack / 2048)) MiB of the card was unused"
+
+    # ", +" is sfdisk's whole vocabulary for this: keep the start, take everything
+    # left.  -N names the one partition to touch, so the other three entries are
+    # rewritten byte for byte as they were.  Nothing in the filesystem is read or
+    # written by this -- it is four bytes of a partition entry.
+    if ! echo ", +" | sfdisk -N "$pno" --force "$disk" >/dev/null 2>&1; then
+        say "sfdisk would not extend partition $pno of $disk; leaving it alone"
+        exit 0
+    fi
+    sync
+
+    # The kernel is still using the table it read at boot, and it will refuse to
+    # re-read the whole thing while p1 and p2 are mounted -- which they are, one of
+    # them being the root filesystem.  partx resizes the single entry through BLKPG
+    # instead, which is allowed for the last partition on the disk precisely because
+    # nothing before it moves.  Both spellings, because util-linux has changed which
+    # one of them is a no-op more than once.
+    partx -u --nr "$pno" "$disk" >/dev/null 2>&1 || \
+        partx -u "$disk" >/dev/null 2>&1 || true
+
+    newsize=$(cat "$sysdir/size" 2>/dev/null || echo "$size")
+    if [ "$newsize" = "$size" ]; then
+        # Not an error and not a retry: the table on the card is correct now, the
+        # kernel simply has not taken it, and the next boot reads it from scratch.
+        say "the partition table now reaches the end of $disk but this kernel is"
+        say "       still using the old one; the filesystem grows on the next boot"
+        exit 0
+    fi
+else
+    say "$part already reaches the end of $disk"
+fi
+
+# ── AND THE FILESYSTEM INSIDE IT ─────────────────────────────────────────────
+#
+# Reached on every boot, not only the one that moved the partition: a card whose
+# table was extended by a PC, or by the paragraph above on a boot that then lost
+# power, has a partition bigger than the ext2 in it.  resize2fs with no size is a
+# no-op when there is nothing to grow into, so this costs one exec.
+if grep -q "^$part " /proc/mounts 2>/dev/null; then
+    say "$part is mounted already, and ext2 cannot be resized while it is."
+    say "       Something is ordered before this unit that should not be."
+    exit 0
+fi
+
+tell "detail:checking the filesystem"
+# resize2fs refuses a filesystem it has not seen checked, so this is not optional.
+# -p fixes what can be fixed without asking, because there is nobody to ask; status
+# 1 means it corrected something and the filesystem is now good, which is a success
+# here.  Anything above that is a filesystem to leave alone and report.
+e2fsck -fp "$part" >/dev/null 2>&1
+rc=$?
+if [ "$rc" -gt 1 ]; then
+    say "e2fsck says $part needs attention (status $rc), so it was not grown"
+    exit 0
+fi
+
+tell "detail:growing the filesystem"
+if resize2fs "$part" >/dev/null 2>&1; then
+    say "$part now fills the card"
+else
+    say "resize2fs could not grow $part"
+fi
+exit 0
+EXPANDSH
+    chmod 0755 /newroot/run/j36/bin/j36-expand-data
+
+    cat > /newroot/run/systemd/system/j36-expand-data.service <<'UNITEXPAND'
+# Written by the J36 Ultra initramfs, into a tmpfs.  Not on the card.
+[Unit]
+Description=Give the rest of the card to the MixOS DATA partition
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+# The one that matters.  ext2 has no online resize, so this has to finish before
+# anything mounts the partition -- and a mount unit is only ordered against what
+# names it.  local-fs.target is not enough on its own: the fstab mount is Before
+# that target too, which orders neither of them against the other.
+Before=home-virtua.mount local-fs.target
+After=systemd-remount-fs.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Leading dash: a resize that failed is a smaller partition, not a failed boot,
+# and the script says why on the journal either way.
+ExecStart=-/bin/sh /run/j36/bin/j36-expand-data
+# journal and NOT journal+console.  The splash owns the panel at this point in the
+# boot and gets told what is happening through its own channel; console output here
+# would be text drawn over the picture, which is the thing console.h in the
+# dashboard exists to prevent and the same argument applies one stage earlier.
+StandardOutput=journal
+StandardError=journal
+# e2fsck and resize2fs on a 128 GB card in a slow reader are minutes, and this is
+# the one boot in the life of the device where that is the right thing to wait for.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=local-fs.target
+UNITEXPAND
+
+    ln -sf ../j36-expand-data.service \
+           /newroot/run/systemd/system/local-fs.target.wants/j36-expand-data.service
+
+    say "expand: DATA grows to fill the card before systemd mounts it"
+    return 0
+}
+
 # ── the name the machine calls itself ─────────────────────────────────────────
 #
 # WHAT IS WRONG.  Every line of the journal on this board opens with `rg351mp'.  So
@@ -5270,6 +5499,10 @@ fi
 # is, and a boot with j36.dash=0 and no audio still answers to it on the network.
 if [ -n "$rootdev" ]; then
     setup_hostname
+    # Gated on a rootfs and on nothing else, for the same reason the name above is:
+    # this is not a feature a boot word turns on, it is the card being the size it
+    # is.  It writes a unit; the work happens after switch_root, before the mount.
+    setup_expand
 fi
 
 if [ -n "$rootdev" ] && [ "$want_log" = 1 ]; then
