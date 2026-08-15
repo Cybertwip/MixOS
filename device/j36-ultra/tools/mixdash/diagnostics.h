@@ -105,6 +105,12 @@ private:
     void probeInput(QVector<Finding> &out);
     void probeAudio(QVector<Finding> &out);
     void probeUsb(QVector<Finding> &out);
+    /* The USB-HDMI dock, split out of probeUsb only because it is long: it reads
+     * what j36-mixmirror published, and works out for itself what the mirror
+     * would have said when the mirror is not running to say it.  `displaylink' is
+     * probeUsb's own answer to "was there a 17e9 on the bus", passed in rather
+     * than walked a second time. */
+    void probeDock(QVector<Finding> &out, bool displaylink);
     void probePower(QVector<Finding> &out);
     void probeSystem(QVector<Finding> &out);
 

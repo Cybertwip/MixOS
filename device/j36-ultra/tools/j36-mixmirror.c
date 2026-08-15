@@ -93,12 +93,14 @@
  *   no mode              connected, and the EDID has not been read yet.
  *   mirroring            with the mode, the scale and the offsets.
  *
- * The same line goes into /run/j36/mirror.status, one line, overwritten on every
- * change, because the dashboard's Diagnostics page reads it: the person this matters
- * to is holding the handheld and has no journal in front of them.  It is a tmpfs the
- * initramfs already makes and NOTHING here writes to the shared rootfs.  -s and -o
- * deliberately do not publish, so running this by hand to look at something cannot
- * overwrite what the running service is reporting.
+ * The same line goes into /run/j36/mirror.status, overwritten whole on every change,
+ * because the dashboard's Diagnostics page reads it: the person this matters to is
+ * holding the handheld and has no journal in front of them.  Two lines -- a keyword
+ * for the dashboard to take a colour from, then the sentence for the person to read
+ * -- so that rewording the sentence, which will happen, never breaks the colour.  It
+ * is a tmpfs the initramfs already makes and NOTHING here writes to the shared
+ * rootfs.  -s and -o deliberately do not publish, so running this by hand to look at
+ * something cannot overwrite what the running service is reporting.
  *
  * ── what it costs on the wire ────────────────────────────────────────────────────
  *
@@ -383,14 +385,42 @@ enum stage {
     STAGE_NO_OUTPUT,
     STAGE_NO_MODE,
     STAGE_MIRRORING,
+    STAGE_STOPPED,
 };
 
 static enum stage stage_now = STAGE_START;
 static char stage_line[512];
 
-static void publish(const char *line)
+/* The first line of the status file, and the only part of it any other program is
+ * allowed to depend on.  The sentence underneath is written for a person and will be
+ * reworded whenever a better wording turns up; this will not, so the dashboard can
+ * pick a colour from it without pattern-matching English.  Kept deliberately short
+ * and lower-case: it is a token, not a label. */
+static const char *stage_word(enum stage s)
 {
-    int fd;
+    switch (s) {
+    case STAGE_NO_DRI:      return "no-drm";
+    case STAGE_NO_UDL:      return "no-adapter";
+    case STAGE_NO_OUTPUT:   return "no-screen";
+    case STAGE_NO_MODE:     return "no-mode";
+    case STAGE_MIRRORING:   return "mirroring";
+    case STAGE_STOPPED:     return "stopped";
+    case STAGE_START:       break;
+    }
+    return "starting";
+}
+
+/*
+ * Two lines, always: the keyword, then the sentence.  A reader that wants a colour
+ * takes the first; a reader that wants to know what happened takes the rest.  The
+ * file is truncated and rewritten whole on every change, so a torn read is a short
+ * read of the previous state rather than a mixture of two -- and every state here is
+ * re-asserted within SCAN_INTERVAL_MS anyway.
+ */
+static void publish(enum stage s, const char *line)
+{
+    char buf[sizeof(stage_line) + 64];
+    int n, fd;
 
     if (!publishing)
         return;
@@ -402,11 +432,10 @@ static void publish(const char *line)
     fd = open(STATUS_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0)
         return;
-    if (write(fd, line, strlen(line)) < 0) {
+    n = snprintf(buf, sizeof(buf), "%s\n%s\n", stage_word(s), line);
+    if (n > 0 && write(fd, buf, (size_t)n) < 0) {
         /* Nothing useful to do: this is the reporting path, so failing to report
          * that reporting failed is where it has to stop. */
-    }
-    if (write(fd, "\n", 1) < 0) {
     }
     close(fd);
 }
@@ -424,7 +453,7 @@ static void report(enum stage s, const char *fmt, ...)
         return;
     stage_now = s;
     snprintf(stage_line, sizeof(stage_line), "%s", line);
-    publish(line);
+    publish(s, line);
     note("%s", line);
 }
 
@@ -1358,10 +1387,12 @@ static void usage(void)
 "\n"
 "With no options it runs forever: it polls /dev/dri, mirrors while an adapter is\n"
 "there, and goes back to polling when it is unplugged.  Started that way by\n"
-"j36-mixmirror.service.  In that mode it writes its current state -- the same one\n"
-"line it puts in the journal -- to " STATUS_PATH ", which is where the\n"
-"dashboard's Diagnostics page reads it from.  -s and -o do not write it, so\n"
-"running this by hand cannot overwrite what the service is reporting.\n");
+"j36-mixmirror.service.  In that mode it writes its current state to\n"
+STATUS_PATH ", which is where the dashboard's Diagnostics page reads it\n"
+"from: one keyword on the first line -- starting, no-drm, no-adapter, no-screen,\n"
+"no-mode, mirroring, stopped -- and then the same sentence it put in the\n"
+"journal.  -s and -o do not write it, so running this by hand cannot overwrite\n"
+"what the service is reporting.\n");
 }
 
 int main(int argc, char **argv)
@@ -1442,6 +1473,13 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Said before the first scan so that the status file exists from the moment the
+     * service does.  Without it there is a window -- short, but real, and longer on
+     * a board that is still loading modules -- in which a running mirror has published
+     * nothing, and the dashboard reads a missing file as a mirror that never started.
+     * That is the exact confusion this whole mechanism was added to end. */
+    report(STAGE_START, "mirror: started, looking for a DisplayLink adapter");
+
     while (!stop_requested) {
         char node[288], seen[256];
         int fd = open_mirror_node(node, sizeof(node), seen, sizeof(seen));
@@ -1480,6 +1518,9 @@ int main(int argc, char **argv)
         nap(SCAN_INTERVAL_MS);
     }
 
-    note("mirror: stopping");
+    /* Said through report() rather than note() so the status file stops claiming a
+     * state that is no longer true: a stale `mirroring' left behind by a systemctl
+     * stop would put a green row on the Diagnostics page with nothing behind it. */
+    report(STAGE_STOPPED, "mirror: stopped on a signal -- nothing is being mirrored");
     return 0;
 }

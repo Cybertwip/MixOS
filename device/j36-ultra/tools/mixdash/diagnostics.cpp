@@ -394,6 +394,7 @@ void DiagnosticsPage::probeUsb(QVector<Finding> &out)
         QStringList() << "[0-9]*-[0-9]*", QDir::Dirs);
     int attached = 0;
     int requestedMa = 0;
+    bool displaylink = false;
     QStringList lines;
     for (const QString &d : devices) {
         if (d.contains(':'))
@@ -402,6 +403,11 @@ void DiagnosticsPage::probeUsb(QVector<Finding> &out)
         const QString product = SysInfo::readTrimmed(base + "/product");
         const QString maxPower = SysInfo::readTrimmed(base + "/bMaxPower");
         const QString speed = SysInfo::readTrimmed(base + "/speed");
+        /* Kept for the dock row below: DisplayLink's vendor ID is the one fact that
+         * decides whether an HDMI socket on this bus can ever carry a picture. */
+        if (SysInfo::readTrimmed(base + "/idVendor").compare(QLatin1String("17e9"),
+                                                             Qt::CaseInsensitive) == 0)
+            displaylink = true;
         ++attached;
         requestedMa += maxPower.left(maxPower.indexOf("mA")).trimmed().toInt();
         lines << tr("%1 (%2, %3 Mb/s)")
@@ -447,6 +453,101 @@ void DiagnosticsPage::probeUsb(QVector<Finding> &out)
         vbus.colour = Theme::green();
     }
     out.append(vbus);
+
+    probeDock(out, displaylink);
+}
+
+/*
+ * ── THE DOCK, AND WHY IT NEEDED A ROW OF ITS OWN ─────────────────────────────
+ *
+ * j36-mixmirror runs from boot and copies the panel onto a DisplayLink adapter
+ * whenever one turns up.  Its steady state is silence, which is right for a
+ * journal and was exactly wrong for the person holding the handheld: "the mirror
+ * never runs" and "the mirror is running and there is nothing to mirror onto"
+ * looked identical from here -- a black television either way, and no way to
+ * tell them apart without a serial console.
+ *
+ * So the mirror now publishes one keyword and one sentence to
+ * /run/j36/mirror.status on every state change, and the first half of this shows
+ * it.  The colour comes from the keyword, never from the sentence, so the
+ * sentence can be reworded without this file caring.
+ *
+ * The second half is for when the file is not there at all, which means the
+ * mirror is not running -- and that is worth saying plainly rather than papering
+ * over with an empty row.  In that case the same three facts the mirror would
+ * have measured are read here directly: is udl.ko loaded, is there a card node
+ * bound to udl, and is there anything with DisplayLink's vendor ID on the bus.
+ * Pure sysfs, no ioctl, nothing opened that could take a modeset away from
+ * something else.
+ */
+void DiagnosticsPage::probeDock(QVector<Finding> &out, bool displaylink)
+{
+    Finding dock;
+    dock.name = tr("USB-HDMI dock");
+
+    const QString status = SysInfo::readTrimmed("/run/j36/mirror.status");
+    if (!status.isEmpty()) {
+        const int nl = status.indexOf('\n');
+        const QString word = nl < 0 ? status : status.left(nl);
+        const QString said = nl < 0 ? QString() : status.mid(nl + 1).trimmed();
+
+        dock.detail = said.isEmpty() ? word : said;
+        if (word == QLatin1String("mirroring")) {
+            dock.badge = tr("on");
+            dock.colour = Theme::green();
+        } else if (word == QLatin1String("no-screen") || word == QLatin1String("no-mode")) {
+            dock.badge = tr("no tv");
+            dock.colour = Theme::orange();
+        } else if (word == QLatin1String("no-adapter")) {
+            /* Not a fault: this is what an undocked handheld says, all day. */
+            dock.badge = tr("none");
+            dock.colour = Theme::ink3();
+        } else if (word == QLatin1String("no-drm") || word == QLatin1String("stopped")) {
+            dock.badge = word == QLatin1String("stopped") ? tr("stopped") : tr("no drm");
+            dock.colour = Theme::red();
+        } else {
+            dock.badge = tr("wait");
+            dock.colour = Theme::ink3();
+        }
+        out.append(dock);
+        return;
+    }
+
+    /* No status file, so the mirror is not running.  Work out what it would have
+     * found, and say which of the two things went wrong. */
+    QStringList cards;
+    QString udlCard;
+    const QStringList nodes = QDir("/sys/class/drm").entryList(QStringList() << "card*",
+                                                               QDir::Dirs);
+    for (const QString &c : nodes) {
+        if (c.contains('-'))
+            continue;   /* card0-DSI-1 and friends are connectors, not cards */
+        const QString drv = linkTarget("/sys/class/drm/" + c + "/device/driver");
+        cards << c + "=" + (drv.isEmpty() ? QStringLiteral("?") : drv);
+        if (drv == QLatin1String("udl"))
+            udlCard = c;
+    }
+
+    QStringList why;
+    why << tr("j36-mixmirror is not reporting: %1 is absent, so the\n"
+              "service is not running.  systemctl status j36-mixmirror says why.")
+               .arg("/run/j36/mirror.status");
+    why << tr("udl.ko: %1").arg(moduleLoaded("udl") ? tr("loaded") : tr("not loaded"));
+    why << tr("/dev/dri: %1").arg(cards.isEmpty() ? tr("no cards at all") : cards.join(", "));
+    if (!udlCard.isEmpty())
+        why << tr("%1 is a DisplayLink display and nothing is driving it.").arg(udlCard);
+    else if (displaylink)
+        why << tr("A DisplayLink device is on the bus and udl did not claim it.\n"
+                  "Mainline udl speaks the USB 2.0 DL-1x0/DL-1x5 protocol only.");
+    else
+        why << tr("Nothing on the bus is DisplayLink (vendor 17e9).  A USB-C hub\n"
+                  "whose HDMI is DisplayPort Alt Mode cannot work here -- MT6592\n"
+                  "has no DisplayPort.");
+
+    dock.detail = why.join("\n");
+    dock.badge = tr("off");
+    dock.colour = Theme::red();
+    out.append(dock);
 }
 
 void DiagnosticsPage::probePower(QVector<Finding> &out)

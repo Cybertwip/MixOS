@@ -2387,11 +2387,14 @@ run_audio() {
 # that ungates it.
 #
 # SKIP WHAT IS ALREADY LOADED, which none of the other payloads has to do.  udl
-# is a DRM driver, so it depends on drm_kms_helper and drm_shmem_helper -- the
-# same two modules the mtkdrm payload stages in its own directory.  A boot that
-# asks for both words would otherwise reach the second copy and insmod would fail
-# with EEXIST, which reads in the log exactly like a broken module.  /sys/module
-# names have underscores where filenames have hyphens, hence the tr.
+# is a DRM driver, so it pulls in drm_kms_helper -- and so does mtk_drm, which
+# means the mtkdrm payload stages its own copy of the same module.  (Only that
+# one: udl's other helper, drm_shmem_helper, is udl's alone.  mtk_drm implements
+# its GEM object itself and asks for the DMA helper only when fbdev emulation is
+# on, and this build turns fbdev emulation off.)  A boot that asks for both words
+# would otherwise reach the second copy and insmod would fail with EEXIST, which
+# reads in the log exactly like a broken module.  /sys/module names have
+# underscores where filenames have hyphens, hence the tr.
 run_usb() {
     if ! find_payload; then return 1; fi
     if [ ! -f "$payload/usb/load.order" ]; then
@@ -4523,6 +4526,13 @@ dump() {
     run ls -l /sys/bus/usb/devices
     showall "what is plugged in, as the devices describe themselves" \
         /sys/bus/usb/devices/*/product /sys/bus/usb/devices/*/manufacturer
+    # The IDs as well as the names, because a driver matches on these and not on
+    # what the device calls itself -- and one of them decides section 5's dock
+    # question outright: 17e9 is DisplayLink, and it is the only vendor mainline
+    # udl will bind to.  No 17e9 anywhere here means no HDMI mirror is possible on
+    # this board no matter what the hub's box says.
+    showall "and the IDs their drivers actually match on" \
+        /sys/bus/usb/devices/*/idVendor /sys/bus/usb/devices/*/idProduct
     kgrep "USB, the PHY and MUSB" 'usb|musb|phy|xhci|ehci|hub |otg|vbus'
 
     printf '\n\n########## 5.  THE PANEL, THE SPLASH AND THE DASHBOARD ##########\n'
@@ -4552,8 +4562,47 @@ dump() {
     else
         printf '(absent -- no first frame yet, so it is still on the console)\n'
     fi
+    # ── THE USB-HDMI DOCK ─────────────────────────────────────────────────────
+    #
+    # The other thing on this board that can put a picture somewhere, and the one
+    # whose failure leaves no trace anywhere else.  j36-mixmirror runs from boot
+    # and is SILENT BY DESIGN while there is nothing docked -- so its absence from
+    # the journal proves nothing, and "the service never started" and "it started
+    # and nothing it can draw to was ever plugged in" read identically without
+    # these lines.  That is exactly how the mirror got reported as never running.
+    #
+    # mirror.status is the mirror's own answer: one keyword, then one sentence,
+    # rewritten on every state change.  Absent means the service is not running,
+    # which systemctl above will then say why of.
+    run systemctl --no-pager status j36-mixmirror
+    show /run/j36/mirror.status
+    # And the same question asked of the kernel rather than of the mirror: which
+    # driver is behind each card node.  A DisplayLink adapter appears as a card
+    # bound to udl and NOTHING ELSE DOES, so mediatek-drm alone here means nothing
+    # on the port was DisplayLink -- a USB-C hub whose HDMI is DisplayPort Alt Mode
+    # cannot appear at all, because MT6592 has no DisplayPort to alt-mode onto.
+    # The dash test drops card0-DSI-1 and friends: those are connectors, not cards.
+    sec "which driver owns each /sys/class/drm card"
+    _anycard=0
+    for _c in /sys/class/drm/card[0-9]*; do
+        [ -d "$_c" ] || continue
+        _b="${_c##*/}"
+        case "$_b" in *-*) continue ;; esac
+        _anycard=1
+        # Plain readlink, not -f: the link's own text ends in the driver's name,
+        # and readlink of something that is not a symlink prints nothing and
+        # exits non-zero, which is the distinction wanted here.  `-f' would
+        # canonicalise a path whose last component does not exist and print a
+        # driver name for a card that has no driver bound.
+        _drv="$(readlink "$_c/device/driver" 2>/dev/null)"
+        _drv="${_drv##*/}"
+        [ -n "$_drv" ] || _drv="(nothing bound to it)"
+        printf -- '--- %s: %s\n' "$_b" "$_drv"
+    done
+    [ "$_anycard" = 1 ] || printf '(no card nodes -- no DRM driver registered one)\n'
     run systemctl --no-pager status batt_led
     kgrep "the display stack" 'fb0|fbcon|drm|mtkfb|mtkdrm|lima|mali|backlight|fbmem|j36fb'
+    kgrep "the USB-HDMI mirror" 'udl|displaylink|17e9|mixmirror'
 
     printf '\n\n########## 6.  MODULES ##########\n'
     show /proc/modules
@@ -4803,12 +4852,11 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_gl" = 1 ] || \
     # is not finished when this script ends -- it is a message to systemd, and
     # systemd has not started yet.
     # USB after mtkdrm and before the GL front end, and the position is not
-    # arbitrary: udl depends on drm_kms_helper and drm_shmem_helper, which the
-    # mtkdrm payload also carries, so letting mtkdrm go first means the shared
-    # pair is loaded once from the directory that has always owned it and run_usb
-    # skips its own copies.  The other way round works too -- run_mtkdrm has no
-    # such skip -- but it would print two module-load failures on a boot that is
-    # working correctly.
+    # arbitrary: udl and mtk_drm both pull in drm_kms_helper, so both payload
+    # directories carry a copy of it.  Letting mtkdrm go first means it is loaded
+    # once from the directory that has always owned it and run_usb skips its own.
+    # The other way round works too -- run_mtkdrm has no such skip -- but it would
+    # print a module-load failure on a boot that is working correctly.
     #
     # The progress numbers are not evenly spaced and should not be: they are
     # roughly where each of these lands in the wall-clock of a working boot, so
@@ -6734,9 +6782,11 @@ fi
 # carries on.
 #
 # The overlap with j36/mtkdrm/ is deliberate and not a mistake to clean up: udl
-# needs drm_kms_helper and drm_shmem_helper, so both directories carry a copy.
-# Two copies of a 200 KB pair is cheaper than a load order that spans payloads,
-# and run_usb skips whichever of them mtkdrm already loaded.
+# and mtk_drm both need drm_kms_helper, so both directories carry a copy of it.
+# (udl's drm_shmem_helper is not shared -- it comes in through udl's own
+# dependency walk and mtk_drm never asks for it.)  A second copy of one helper is
+# cheaper than a load order that spans payloads, and run_usb skips it when the
+# mtkdrm payload has already loaded it.
 if (( ${#USB_MODULE_ORDER[@]} > 0 )); then
     mkdir -p "$PAYDIR/usb"
     : > "$PAYDIR/usb/load.order"
@@ -7552,6 +7602,31 @@ j36.usb and HDMI
     It is started by j36-mixmirror.service, which /init writes into /run only when the
     binary is on the card.  Delete opt/mixos/bin/j36-mixmirror and the feature is gone
     with nothing left behind to fail.
+
+    WHERE IT SAYS WHAT IT IS DOING, which took a bug to get right.  A mirror with
+    nothing to mirror onto should not fill a journal, so every "not yet" branch used
+    to be quiet -- and quiet is indistinguishable from a service that never started.
+    A board with a dock plugged into it and a black television wrote nothing at all
+    for its whole uptime, and that is how this feature came to be reported as never
+    running.  So it now says every state CHANGE, in the journal and in one file:
+
+      /run/j36/mirror.status    a keyword -- starting, no-drm, no-adapter, no-screen,
+                                no-mode, mirroring, stopped -- and under it the same
+                                sentence it put in the journal.  Rewritten on every
+                                change, silent between them, and on tmpfs: nothing on
+                                the shared rootfs is written.
+
+    The dashboard's Diagnostics page shows that line under "USB-HDMI dock", because
+    the person this matters to is holding the handheld and has no journal in front of
+    them.  When the file is absent the dashboard says so and reads the three facts
+    itself -- is udl.ko loaded, is a card node bound to udl, is there a 17e9 on the
+    bus -- so "the mirror is not running" and "there is nothing to mirror onto" are
+    different rows and not the same silence.  j36-logdump section 5 carries all of it.
+
+    The keyword exists so that the sentence can be reworded without breaking anything
+    that reads the file; nothing outside this program should parse the sentence.
+    j36-mixmirror -s and -o deliberately do NOT write the file, so looking at a dock
+    by hand cannot overwrite what the running service is reporting.
 
 j36.power=1
     The MT6592 PMIC: the battery gauge, the charger and a poweroff that actually
