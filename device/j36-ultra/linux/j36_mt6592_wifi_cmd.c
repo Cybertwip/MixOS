@@ -751,7 +751,7 @@ int j36_wlan_cmd_auth(struct j36_wifi *w, const struct j36_wlan_bss *bss)
 	j36_put_le16(frame + 26, 1);		/* transaction 1	*/
 	j36_put_le16(frame + 28, 0);		/* status		*/
 	return j36_wlan_frame(w, frame, sizeof(frame), J36_HIF_PACKET_TYPE_MGMT,
-			      J36_STA_RECORD_INDEX, true, false, true, NULL);
+			      J36_STA_RECORD_INDEX, true, false, true, true, NULL);
 }
 
 /*
@@ -774,7 +774,7 @@ int j36_wlan_cmd_deauth(struct j36_wifi *w, const struct j36_wlan_bss *bss,
 	memcpy(frame + 16, bss->bssid, ETH_ALEN);
 	j36_put_le16(frame + 24, reason);
 	return j36_wlan_frame(w, frame, sizeof(frame), J36_HIF_PACKET_TYPE_MGMT,
-			      J36_STA_RECORD_INDEX, true, false, true, NULL);
+			      J36_STA_RECORD_INDEX, true, false, true, true, NULL);
 }
 
 /*
@@ -850,7 +850,7 @@ int j36_wlan_cmd_assoc(struct j36_wifi *w, const struct j36_wlan_bss *bss,
 	}
 
 	return j36_wlan_frame(w, frame, length, J36_HIF_PACKET_TYPE_MGMT,
-			      J36_STA_RECORD_INDEX, true, false, true, NULL);
+			      J36_STA_RECORD_INDEX, true, false, true, true, NULL);
 }
 
 /*
