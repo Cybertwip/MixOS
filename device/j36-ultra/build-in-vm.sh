@@ -9000,7 +9000,8 @@ systemd.mask=firstboot.service
     switch_root.  ext2 has no online resize, so it has to happen while the
     filesystem is unmounted, and that is the only moment in the boot when the
     root filesystem is not in use.  It extends ROOTFS to the end of the disk with
-    sfdisk, e2fsck's it and then resize2fs's the ext2 inside it, and it does none
+    sfdisk, checks the ext2 inside it if it needs it and then resize2fs's it, and
+    it does none
     of that once there is nothing left to take.  It never mkfs's anything, which
     is the whole reason it is not the script above.
 
@@ -9011,6 +9012,26 @@ systemd.mask=firstboot.service
     /sys/block measured against what growing an ext2 by this many block groups
     has to write.  The console gets a line at every tenth of the way through, so
     a serial log tells the same story afterwards.
+
+    THE CHECK IS SKIPPED ON A FILESYSTEM THAT SAYS IT IS CLEAN, and that is most
+    of those minutes.  resize2fs will not touch a filesystem whose last check is
+    older than its last mount, which is why e2fsck was there at all -- but there
+    are two ways to answer that and the superblock already answers it: the ext2
+    driver marks the filesystem clean when it is unmounted, and the thing that
+    unmounted it a second earlier was this step.  So when the superblock says
+    clean, resize2fs is given -f, which drops that one test and leaves the test
+    that matters -- it still refuses a filesystem the superblock does not call
+    valid, force or no force.  A card that was pulled mid-write, or left half-
+    grown by an older build, does not say clean, and gets the full check.
+
+    It is skipped because the check is not free in the way that counts on this
+    board: it is the first sustained read of the card in the whole boot, it runs
+    with the root filesystem unmounted, and it runs before anything has started
+    that could carry the board through it.  Minutes spent there buy a guarantee
+    that a freshly written card did not need.  j36.expand=fsck in the bootargs
+    runs it anyway, for the card where that turns out to have been the wrong
+    call; the log says so if a grow fails on a filesystem that called itself
+    clean.
 
     AND IT HAS AN OFF SWITCH, WHICH NOTHING ELSE IN /init NEEDED ONE FOR.  Put
     j36.expand=0 in the bootargs in mvii/boot.conf and this step does not happen
