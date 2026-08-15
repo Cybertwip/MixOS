@@ -2827,14 +2827,19 @@ expand_root() {
     # The count lives on the ext2 partition and a Mac cannot reach it, so
     # `j36.expand=retry' in mvii/boot.conf clears it from the FAT one -- the same place
     # `j36.expand=0' is typed, for the same reason.
+    # `:>' and not `rm', here and at the bottom, and it is not a style choice: this
+    # initramfs has no rm applet -- INIT_APPLETS is the whole of what /bin holds, and
+    # the scan channel a few hundred lines up is emptied the same way for the same
+    # reason.  An empty file reads as an empty string, which the guard below turns into
+    # zero, so a truncated count and a deleted one mean the same thing here.
     ex_tries_file=/newroot/var/lib/mixos/expand-tries
     ex_tries=0
     if [ "$want_expand" = retry ]; then
-        if [ -f "$ex_tries_file" ]; then
+        if [ -s "$ex_tries_file" ]; then
             say "expand: j36.expand=retry, so the ${ex_tries_file#/newroot} count starts again"
-            rm -f "$ex_tries_file" 2>/dev/null
+            : > "$ex_tries_file" 2>/dev/null
         fi
-    elif [ -f "$ex_tries_file" ]; then
+    elif [ -s "$ex_tries_file" ]; then
         read -r ex_tries < "$ex_tries_file" 2>/dev/null || ex_tries=0
         case "$ex_tries" in
             ''|*[!0-9]*) ex_tries=0 ;;
@@ -2842,7 +2847,7 @@ expand_root() {
     fi
     if [ "$ex_tries" -ge 3 ]; then
         expand_note "the grow has been started $ex_tries times and the board went off before it finished each time, so it is not being started again -- the card keeps the size it has and the boot carries on"
-        expand_note "put j36.expand=retry in the bootargs in mvii/boot.conf to try once more, or delete ${ex_tries_file#/newroot} from the OS partition"
+        expand_note "put j36.expand=retry in the bootargs in mvii/boot.conf to try once more, or empty ${ex_tries_file#/newroot} on the OS partition"
         return 0
     fi
     # ── THE TOOLS, TAKEN BEFORE THE FILESYSTEM GOES AWAY ─────────────────────
@@ -3215,7 +3220,12 @@ expand_root() {
         # have their own sentences in this log and are their own problems; charging
         # them to a counter meant for resets would trip it after three boots that each
         # behaved exactly as designed.
-        rm -f "$ex_tries_file" 2>/dev/null
+        #
+        # Allowed to fail, and the one way it can is the one way it should: the paths
+        # above that could only get /newroot back READ-ONLY are paths on which the card
+        # has a real problem, and leaving the count standing on those is the answer that
+        # errs towards booting the device.
+        : > "$ex_tries_file" 2>/dev/null
     else
         expand_note "the resize did not report a result after ${ex_waited}s; the card is as the check above left it (attempt $ex_tries of 3 before this step stands down)"
     fi
