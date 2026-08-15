@@ -1523,12 +1523,17 @@ def generate(sources: dict[str, str]) -> str:
 \t * and output value directly, three register reads a second, and publishes the
 \t * answer as usb/vbus_sourcing.
 \t *
-\t * IT DOES NOT DECIDE CHARGING, and it used to. This handheld has two
-\t * connectors -- a DC inlet, which charges and has no data lines, and the OTG
-\t * port, which this pad switches -- so CHRDET can never be this board's own
-\t * 5 V. The driver was written believing they were one socket and held the
-\t * charger off for as long as the pad was up, which on this board is always;
-\t * chrin_shared=1 restores that for a board where the belief is true.
+\t * IT DOES NOT DECIDE CHARGING, and it used to. The driver held the charger
+\t * off for as long as the pad was up, which on this board is the whole uptime,
+\t * so nothing charged; chrin_shared=1 restores that for a board whose only
+\t * socket is the USB one. What the pad decides now is how hard to DOUBT
+\t * CHRDET. This handheld has two connectors -- a DC inlet with no data lines,
+\t * and the OTG port this pad switches -- but CHRIN is one pin and it is on the
+\t * OTG net, which is MVII's LK saying its charger block "only ever saw the OTG
+\t * port". So with the pad up, a comparator that reports a supply is reporting
+\t * OURS, and the PMIC makes the measured input clear the pack before it will
+\t * call it a charger. That is what fixed "it says charging even when
+\t * unplugged", and it never reaches the arm, so it cannot stop a charge.
 \t *
 \t * poll-interval-ms is the gauge cadence. A second is slow enough that the
 \t * AUXADC work is invisible and fast enough that the coulomb integrator, which

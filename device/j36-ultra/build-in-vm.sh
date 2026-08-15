@@ -7886,17 +7886,40 @@ j36.power=1
     PMIC seeing a charger were the same net, and the driver held the charger off
     whenever the pad was up.
 
-    IT HAS TWO. A DC inlet, which charges and has no data lines, and an OTG port,
-    which carries the data and sources 5 V the whole time the board is on. CHRDET
-    is the inlet, this pad is the port, and they do not meet. The second zero is
-    therefore gone: online is CHRDET and nothing else, and the pad being up -- which
-    here is always -- says nothing about whether a charger is attached.
+    IT HAS TWO SOCKETS AND ONE SENSE PIN, which is not the same thing. A DC inlet,
+    which charges and has no data lines, and an OTG port, which carries the data and
+    sources 5 V the whole time the board is on -- but CHRIN is a single pin and it
+    is on the OTG net. MVII's LK says so outright: its charger block "only ever saw
+    the OTG port". So holding the charger off whenever the pad was up was the wrong
+    RESPONSE, and it cost the board its charge; the premise behind it was right.
 
-    What vbus_sourcing publishes now is just the port: 1 means the board is feeding
-    it, which is what makes a bus-powered stick or a mouse work, 0 means it is not,
-    and -1 is a device tree with no j36,drvvbus-pad. Diagnostics -> Power puts it
-    next to online and the cell current in one row, and section 2 of mixos-log.txt
-    dumps it beside chrin_shared so a log says which of the two stories it is from.
+    That is what "it says charging all the time, even if it's unplugged" was. The
+    pad is up for the whole uptime, the pin is therefore above the detect threshold
+    for the whole uptime, and CHRDET was never lying -- it was reporting our own
+    5 V. The PMIC now measures the same pin on AUXADC channel 4 every poll and,
+    while the pad is up, requires the input to clear the PACK before it will call it
+    a charger: a switch fed from VBAT cannot exceed VBAT and a charger is 4.4 V at
+    worst. The result moves the report, the plug edge and the gauge, and never
+    reaches the arm -- so a wrong answer costs a wrong icon and cannot stop a charge.
+
+    What vbus_sourcing publishes is the port: 1 means the board is feeding it, which
+    is what makes a bus-powered stick or a mouse work AND is what puts a supply on
+    the pin CHRDET watches, 0 means it is not, and -1 is a device tree with no
+    j36,drvvbus-pad. Read beside battery/status it is what separates "charging" from
+    "driving its own input". Diagnostics -> Power puts it next to online and the
+    cell current in one row, and section 2 of mixos-log.txt dumps it beside
+    chrin_shared so a log says which of the two stories it is from.
+
+    IF THE PORT'S 5 V IS A BOOST RATHER THAN A SWITCH the measurement cannot help,
+    because both read about 5 V, and the port has to stand down instead of being
+    assumed -- j36.usb=automeasure. The dmesg line that answers which board this is
+    prints every twenty seconds without turning anything on:
+
+        pmic: charging: VBUS=0 CHRDET=1 src=1 VCHR 4050 mV ... VBAT 4020 mV
+
+    With the cable OUT and src=1: VCHR sitting on VBAT is a switch and the bar above
+    has already fixed it; VCHR a volt clear of VBAT is a boost, and automeasure is
+    the lever.
 
     THE ONE FACT THAT EXPLAINS THE REST: this board has no power-path FET, so
     VBAT is the system node rather than a battery-only rail.  Every live ADC

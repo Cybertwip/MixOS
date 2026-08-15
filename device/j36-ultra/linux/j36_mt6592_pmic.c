@@ -416,6 +416,9 @@ MODULE_PARM_DESC(chgreboot,
  */
 #define J36_VCHR_ABSENT_MV		3000
 #define J36_VCHR_OVER_VBAT_MV		300
+/* Asymmetric on purpose: added to the bar only while the veto is already holding,
+ * so leaving it takes more than entering it did.  See the poll. */
+#define J36_VCHR_VETO_HYST_MV		100
 
 /* Five, from stock, and a median rather than a mean: the only failure this ADC
  * actually shows is a single bad conversion, which a median rejects completely
@@ -2487,7 +2490,18 @@ static void j36_pmic_poll(struct work_struct *work)
 		    bat_now_mv + J36_VCHR_OVER_VBAT_MV > bar)
 			bar = bat_now_mv + J36_VCHR_OVER_VBAT_MV;
 
-		if (vchr_mv < bar) {
+		/*
+		 * Hysteresis, and it is on the way OUT of the veto rather than
+		 * into it.  The two populations this separates are nearly a volt
+		 * apart, so nothing sane sits on the line -- but a tired charger
+		 * sagging under load can, and a decision that flapped once a
+		 * second would not merely flicker the icon.  Each flap is a plug
+		 * edge, and a plug edge forgets all three median rings and re-runs
+		 * BC1.2, so the current reading would never survive long enough to
+		 * mean anything.  One margin's worth of stickiness costs a second
+		 * of latency on a genuine plug and removes the failure entirely.
+		 */
+		if (vchr_mv < bar + (p->vchr_vetoed ? J36_VCHR_VETO_HYST_MV : 0)) {
 			online = 0;
 			if (!p->vchr_vetoed) {
 				p->vchr_vetoed = true;
