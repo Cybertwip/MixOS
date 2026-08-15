@@ -88,19 +88,27 @@
  * hundred milliseconds a USB module is loading.
  *
  *
- * ── AND THE VBUS INTERLOCK ──
+ * ── AND THE VBUS INTERLOCK, WHICH WAS SOLVING A PROBLEM THIS BOARD DOES NOT HAVE ──
  *
- * This board sources its own 5 V on the port: DRVVBUS is GPIO pad 15, driven high
- * by j36_mt6592_usb_phy on power_on, and it is a boost off VBAT.  That 5 V lands
- * on the same net the PMIC's CHRIN pin senses, so a board in USB host mode looks
- * to CHRDET exactly like a board with a charger plugged in -- and arming the
- * charger against that would be the battery charging itself through a boost.
+ * THERE ARE TWO CONNECTORS ON A J36 ULTRA.  A DC inlet, which charges and has no
+ * data lines in it at all, and an OTG port, which carries the data and sources 5 V
+ * whenever the board is on.  They are separate sockets on separate nets: CHRIN
+ * comes off the DC inlet, and DRVVBUS -- GPIO pad 15, driven high by
+ * j36_mt6592_usb_phy, a load switch off VBAT -- goes to the OTG port and nowhere
+ * near CHRIN.
  *
- * The interlock is a live read of the pad rather than a call into the other
- * driver: mode == GPIO, direction == out, DOUT == 1 is precisely the state
- * j36_usb_phy_vbus(true) leaves behind, and reading it costs three register reads
- * per poll and creates no dependency in either direction.  While it reads
- * asserted the charger is disarmed and the supply reports offline.
+ * This driver was written against the opposite premise, that there was one socket
+ * doing both jobs, and it held the charger off for as long as the pad was up.  On
+ * this board the pad is up the entire time the board is on, so the charger was
+ * held off the entire time the board was on: CAPACITY falling, CURRENT_NOW at
+ * -35 mA, STATUS Discharging, with a charger in the DC inlet.  And not merely
+ * mis-reported -- j36_charger_arm() takes the same value, so nothing was charging.
+ *
+ * So the interlock is off by default and lives behind chrin_shared, for the board
+ * where the premise is true.  Where it is false the pad is still read, still
+ * published through usb/vbus_sourcing, and still said once in the log when both
+ * are up at the same time -- which here is the ordinary state of a console
+ * charging with a stick plugged in, and no longer a reason to refuse.
  */
 
 #include <linux/bitops.h>
@@ -131,9 +139,9 @@
 
 /* ── module parameters ───────────────────────────────────────────────────────
  *
- * All four exist to be turned OFF from an insmod line, because /init loads this
- * from the vfat BOOT partition and a card that has been made unbootable by one of
- * them is fixed by editing boot.conf on any machine that reads SD cards.  A
+ * Most of these exist to be turned OFF from an insmod line, because /init loads
+ * this from the vfat BOOT partition and a card that has been made unbootable by one
+ * of them is fixed by editing boot.conf on any machine that reads SD cards.  A
  * kernel-cmdline `modname.param=' would not do: that only reaches modules built
  * into the image, and this one is loadable.
  */
@@ -148,6 +156,30 @@ MODULE_PARM_DESC(charge, "arm the charger (0 = read-only gauge, no charger write
 static bool bc11 = true;
 module_param(bc11, bool, 0444);
 MODULE_PARM_DESC(bc11, "classify the cable with BC1.2 (0 = assume the 450 mA default)");
+
+/*
+ * The one parameter here that is off rather than on, and the only one whose
+ * default is a statement about the board's wiring rather than about this driver.
+ *
+ * A J36 Ultra has two connectors: a DC inlet with no data lines, which is what
+ * CHRIN senses, and an OTG port, which is what DRVVBUS switches.  They do not
+ * meet, so CHRDET can never be this board's own 5 V and there is nothing to
+ * interlock against -- while the interlock was on, the OTG port being up (which
+ * is all the time) held the charger off for the whole uptime.
+ *
+ * chrin_shared=1 restores it, for the single-socket boards this driver was first
+ * written against, where the two really are one net and arming the charger against
+ * our own boost would be the cell charging itself through two conversions.  Set it
+ * on a board that reports a charger the instant USB comes up and loses it the
+ * instant USB goes down: that is what one net looks like from here.  0644, and the
+ * poll re-reads it, so it can be answered without a reload.
+ */
+static bool chrin_shared;
+module_param(chrin_shared, bool, 0644);
+MODULE_PARM_DESC(chrin_shared,
+		 "the charger input and the USB port are one connector, so hold the "
+		 "charger off while DRVVBUS is up (default 0: this board has a "
+		 "separate DC inlet and CHRDET is always a real charger)");
 
 static bool poweroff = true;
 module_param(poweroff, bool, 0444);
@@ -427,8 +459,8 @@ MODULE_PARM_DESC(chgreboot,
  * already on.  The USB PHY driver makes exactly the same write and says the same
  * thing about it.
  *
- * The GPIO offsets are j36_mt6592_usb_phy's, used read-only here for the DRVVBUS
- * interlock.
+ * The GPIO offsets are j36_mt6592_usb_phy's, used read-only here to see whether
+ * the OTG port is being fed from this board.
  */
 #define J36_PERI_PDN0_CLR		0x0010
 #define J36_PERI_PDN0_STA		0x0018
@@ -524,7 +556,7 @@ struct j36_pmic {
 	void __iomem *pwrap;
 	void __iomem *pericfg;	/* optional: the PERI clock gate */
 	void __iomem *usbphy;	/* optional: the BC1.2 mux bit */
-	void __iomem *gpio;	/* optional: the DRVVBUS interlock */
+	void __iomem *gpio;	/* optional: reading the OTG port's DRVVBUS pad */
 	int vbus_pin;		/* < 0 when the tree did not say */
 
 	spinlock_t lock;
@@ -548,7 +580,9 @@ struct j36_pmic {
 	int bc11_limit_ma;	/* what the PORT licenses, from BC1.2 */
 	int charge_step_ma;	/* what CHR_CON4 is really set to; -1 unread */
 	bool bc11_done;
-	bool vbus_warned;
+	bool vbus_warned;	/* the DRVVBUS line in j36_charger_online() is said
+				 * once per run of the state that provokes it, and
+				 * chrin_shared picks which line that is */
 	unsigned int poll_kicks;	/* rate-limits j36_charging_line() */
 
 	/* When an operator's CV write stops the re-arm stamping 4200 back over
@@ -972,21 +1006,26 @@ static void j36_hw_ocv_prime(struct j36_pmic *p)
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
- * THE DRVVBUS INTERLOCK
+ * READING DRVVBUS
  * ══════════════════════════════════════════════════════════════════════════ */
 
 /*
- * True when this board is itself sourcing 5 V on the port.
+ * True when this board is itself sourcing 5 V on the OTG port.
  *
  * mode == GPIO, direction == out, DOUT == 1 is exactly the state
  * j36_usb_phy_vbus(true) leaves the pad in, and reading it is cheaper and more
  * honest than asking the other driver: the pad IS the ground truth, a stale
  * answer is impossible, and neither module has to know the other exists.
  *
+ * What the answer is FOR has changed, and it is worth being clear about it here
+ * rather than only at the call site.  This used to be a veto over CHRDET.  It is
+ * now an observation: it feeds usb/vbus_sourcing, it feeds one log line, and it
+ * vetoes nothing unless chrin_shared says the two connectors are one.  The DC
+ * inlet this board charges from is not on this pad's net.
+ *
  * Any of the three not matching means the pad is not ours to interpret -- the LK
  * may have left it in a peripheral mode, a future board may not wire it at all --
- * and the safe reading of "I cannot tell" here is "not sourcing", because the
- * alternative is refusing to charge on every board that does not have this pad.
+ * and the safe reading of "I cannot tell" here is "not sourcing".
  */
 static bool j36_drvvbus_asserted(struct j36_pmic *p)
 {
@@ -1977,36 +2016,63 @@ static int j36_gauge_status(struct j36_pmic *p, bool online, int ma, bool ma_val
  * THE POLL
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/* CHRDET is a live comparator on the CHRIN pin: no arming, no settling, one pwrap
- * read.  The DRVVBUS interlock overrides it, because this board's own boost lands
- * on the same net and would otherwise read as a charger. */
+/*
+ * CHRDET is a live comparator on the CHRIN pin: no arming, no settling, one pwrap
+ * read.  On this board CHRIN is the DC inlet, which has no data lines and does
+ * nothing but charge, so CHRDET means a charger and there is no second reading of
+ * it to rule out.
+ *
+ * The answer matters twice over, and the second time is the one that bit: the poll
+ * feeds it straight into j36_charger_arm(), so a zero here is not a display
+ * decision.  It disarms the charger.  Everything this function returns 0 for is a
+ * board that does not charge.
+ *
+ * DRVVBUS is still read, because the pad still says something worth saying -- just
+ * not this.  See chrin_shared for the board where it does.
+ */
 static int j36_charger_online(struct j36_pmic *p)
 {
+	bool sourcing = j36_drvvbus_asserted(p);
 	u32 con0;
+	int online;
 
-	if (j36_drvvbus_asserted(p)) {
+	if (chrin_shared && sourcing) {
 		if (!p->vbus_warned) {
 			p->vbus_warned = true;
 			/*
-			 * Not a fault and no longer a dead end: j36_mt6592_usb_phy
-			 * drops this pad and re-measures the port whenever what is
-			 * on it has not become a USB device, so a charger that
-			 * arrived while the port was hosting is found within about
-			 * ten seconds and this line is followed by the pad going
-			 * low.  A line that is NOT followed by one means something
-			 * on the port did enumerate, and the port is a host on
-			 * purpose.  See attach_grace_polls in that driver.
+			 * j36_mt6592_usb_phy drops this pad and re-measures the
+			 * port whenever what is on it has not become a USB device,
+			 * so on a one-connector board a charger that arrived while
+			 * the port was hosting is found within about ten seconds
+			 * and this line is followed by the pad going low.  See
+			 * attach_grace_polls in that driver.
 			 */
 			dev_info(p->dev,
-				 "DRVVBUS is asserted: the port is sourcing 5 V, so CHRDET is this board's own boost -- charger held off until the port stands down\n");
+				 "chrin_shared is set and DRVVBUS is asserted: CHRDET is being read as this board's own boost -- charger held off until the port stands down\n");
 		}
 		return 0;
 	}
-	p->vbus_warned = false;
 
 	if (j36_pmic_read(p, J36_CHR_CON0, &con0))
 		return -1;
-	return (con0 & J36_CHR_CON0_CHRDET) ? 1 : 0;
+	online = (con0 & J36_CHR_CON0_CHRDET) ? 1 : 0;
+
+	/*
+	 * Said once, and only because the old behaviour was to refuse here: a
+	 * reader who knows this driver's history should be able to see in the log
+	 * that the two-at-once case happened and was charged through.  The flag is
+	 * the same one the branch above uses -- chrin_shared decides which of the
+	 * two lines it can ever carry, so they never contend for it.
+	 */
+	if (!sourcing || !online) {
+		p->vbus_warned = false;
+	} else if (!p->vbus_warned) {
+		p->vbus_warned = true;
+		dev_info(p->dev,
+			 "the OTG port is sourcing 5 V and CHRDET sees a charger on the DC inlet: two connectors, so both at once is ordinary and the charger is armed\n");
+	}
+
+	return online;
 }
 
 /* Twenty polls, which at the one-second default is one line per twenty seconds
@@ -2373,33 +2439,35 @@ static const struct power_supply_desc j36_battery_desc = {
 };
 
 /* ══════════════════════════════════════════════════════════════════════════
- * usb/vbus_sourcing -- WHY `online' IS ZERO
+ * usb/vbus_sourcing -- WHICH PORT IS DOING WHAT
  * ══════════════════════════════════════════════════════════════════════════ */
 
 /*
- * ONE BIT, AND IT IS THE DIFFERENCE BETWEEN A BUG AND A BOARD.
+ * THE PAD, PUBLISHED, AND NOTHING READ INTO IT.
  *
- * `online' has two ways of being zero and they mean opposite things.  Either
- * CHRDET is clear, which is "nothing is plugged in", or j36_charger_online()
- * short-circuited on the DRVVBUS interlock, which is "something IS plugged in and
- * this board is the thing feeding it".  From userspace those are the same zero, and
- * the second one on a board with a charger in it reads as a driver that cannot see
- * a cable -- which is exactly the report this attribute exists to answer.
+ * This attribute was added when `online' had two ways of being zero that meant
+ * opposite things: CHRDET clear, which is "nothing is plugged in", or
+ * j36_charger_online() short-circuiting on the DRVVBUS interlock, which was
+ * "something IS plugged in and this board is feeding it".  From userspace those
+ * were the same zero, and the second one on a board with a charger in it read as a
+ * driver that could not see a cable.
  *
- * There is one connector on this handheld: it is the charge port and it is the host
- * port and it cannot be both at once.  When the USB PHY has decided the port is a
- * host it raises the pad, the boost puts 5 V on the connector, and that 5 V lands on
- * the PMIC's CHRIN net -- so CHRDET would read this board's own supply as a charger
- * and the charger would try to charge the cell from the cell.  Holding it off is
- * correct.  Being unable to SAY that is what was wrong.
+ * The second zero is gone.  A J36 Ultra has two connectors -- a DC inlet, which is
+ * what CHRIN senses, and an OTG port, which is what this pad switches -- so the
+ * board sourcing 5 V says nothing whatever about whether a charger is attached,
+ * and the two are read independently now.  `online' is CHRDET and nothing else
+ * unless chrin_shared is set.
+ *
+ * What is left is still worth publishing, just as a different fact: 1 means the
+ * OTG port is being fed from this board, which is what makes a bus-powered stick
+ * or a mouse work, and a dashboard row that wants to say so has one place to look.
  *
  * Read live rather than cached: the pad is the ground truth, the read is three
  * register reads with no side effects, and a cached copy could only ever be a poll
  * interval out of date in the direction that matters.
  *
  * -1 means the question does not apply -- no j36,gpio-controller or no
- * j36,drvvbus-pad in the device tree, so this driver has no pad to interpret and
- * `online' is CHRDET and nothing else.
+ * j36,drvvbus-pad in the device tree, so this driver has no pad to interpret.
  */
 static ssize_t vbus_sourcing_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
@@ -2690,8 +2758,10 @@ static int j36_pmic_probe(struct platform_device *pdev)
 	 * the bus until the watchdog resets the board.  Either one missing means
 	 * neither is used and the charger runs at the conservative default.
 	 *
-	 * gpio + drvvbus-pad are the VBUS interlock.  Without them a board in USB
-	 * host mode reads its own boost as a charger.
+	 * gpio + drvvbus-pad are how the OTG port's 5 V is read.  Without them
+	 * usb/vbus_sourcing answers -1 and chrin_shared has nothing to act on --
+	 * which on this board costs a dashboard row and nothing else, because
+	 * CHRDET is the DC inlet and decides charging on its own.
 	 */
 	base = j36_iomap_phandle(dev, "j36,pericfg-controller");
 	if (!IS_ERR(base))
@@ -2712,14 +2782,14 @@ static int j36_pmic_probe(struct platform_device *pdev)
 		p->gpio = base;
 	if (p->gpio && !of_property_read_u32(dev->of_node, "j36,drvvbus-pad", &value)) {
 		if (value > J36_GPIO_PIN_MAX)
-			dev_warn(dev, "j36,drvvbus-pad %u is out of range; the VBUS interlock is off\n",
+			dev_warn(dev, "j36,drvvbus-pad %u is out of range; usb/vbus_sourcing will answer -1\n",
 				 value);
 		else
 			p->vbus_pin = value;
 	}
 	if (p->vbus_pin < 0)
 		dev_info(dev,
-			 "no DRVVBUS pad: if this port ever sources 5 V, CHRDET will read it as a charger\n");
+			 "no DRVVBUS pad: usb/vbus_sourcing answers -1 and chrin_shared can do nothing\n");
 
 	p->poll_ms = J36_POLL_MS_DEFAULT;
 	if (!of_property_read_u32(dev->of_node, "poll-interval-ms", &value))
@@ -2770,10 +2840,14 @@ static int j36_pmic_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	dev_info(dev, "MT6592 PMIC: %ums poll, charger %s, BC1.2 %s%s\n",
+	/* The charger source is named because it is the thing that was wrong for
+	 * an entire release: "DC inlet" is a board with two connectors, where
+	 * CHRDET decides charging by itself, and it is what a J36 Ultra is. */
+	dev_info(dev, "MT6592 PMIC: %ums poll, charger %s, BC1.2 %s, charging off the %s%s\n",
 		 p->poll_ms, charge ? "on" : "OFF (read-only gauge)",
 		 (bc11 && p->usbphy) ? "on" : "off",
-		 p->vbus_pin >= 0 ? ", VBUS interlock on" : "");
+		 chrin_shared ? "one shared connector (chrin_shared=1)" : "DC inlet",
+		 p->vbus_pin >= 0 ? ", DRVVBUS readable" : "");
 
 	/* Not scheduled at zero: the LK has just been through its own charging
 	 * path and pwrap wants a moment, and nothing is waiting on the first

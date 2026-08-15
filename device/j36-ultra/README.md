@@ -682,9 +682,18 @@ asked for host means the role override did not take. `INTRUSB`, `INTRTX` and
 `INTRRX` are deliberately not among them — they clear on read, and reading them
 from here would swallow a connect interrupt before `musb_core` saw it.
 
-Two things about the port itself, neither of them software:
+Three things about the port itself, none of them software:
 
-- **The 5 V is a boost off VBAT, and VBAT on this PMIC is the system node.**
+- **It is not the connector the board charges from.** A J36 Ultra has two: a DC
+  inlet, which charges and carries no data lines at all, and this OTG port, which
+  carries the data and holds its 5 V up the whole time the board is on. The
+  PMIC's `CHRDET` hangs off the inlet and `DRVVBUS` hangs off the port; they are
+  separate nets. Both drivers here were written believing there was one socket
+  doing both jobs, which cost the console its charging — see `chrin_shared` in
+  `j36_mt6592_pmic.c` and `vbus` in `j36_mt6592_usb_phy.c`, and pass
+  `j36.usb=automeasure` plus `chrin_shared=1` on a board where the old belief is
+  true.
+- **The 5 V is a switch off VBAT, and VBAT on this PMIC is the system node.**
   `j36,drvvbus-pad = <15>` drives it, transcribed from the stock
   `mt_usb_set_vbus()`. A bus-powered hub on a board with no cell fitted is the
   same class of load that pulls VBAT under the undervoltage lockout. Use a

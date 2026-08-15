@@ -859,21 +859,44 @@ bool GlVideo::bind()
 }
 
 /*
- * The scanout's row 0 is the top of the panel and GL's row 0 is the bottom, so
- * every y here is mirrored on the way in.  eglprobe's -z does the same thing by
- * negating a row of its projection matrix; there is no matrix in this shader, so
- * it happens in these four expressions instead, once per frame, on the CPU.
+ * Panel rectangle in, clip coordinates out -- and the sign of y here was the
+ * whole of "the film comes out upside down".
+ *
+ * What used to be here mirrored every y, and the reasoning behind it was right
+ * about the panel and wrong about the framebuffer.  It IS true that the
+ * scanout's row 0 is the top of the glass, and true that GL calls its own
+ * origin the bottom left.  Those two facts do not compose into a flip, because
+ * this is a USER FBO and not a window-system surface.  The winsys surface is
+ * where that flip lives: its first row in memory is the top of the screen, GL
+ * wants y to grow upward, so Mesa turns the buffer over on the way through.  An
+ * FBO gets no such treatment.  Its window coordinate (0,0) is the first pixel
+ * in memory, which here is the first pixel of the carveout, which is the top
+ * left of the panel.
+ *
+ * So in this context GL's y grows DOWN the glass, panel row and clip y run the
+ * same way, and mapping one to the other needs no mirror at all -- just the
+ * ordinary [0,h] -> [-1,+1].  Mirroring anyway is what stood the picture on its
+ * head.
+ *
+ * eglprobe -z never caught it because a spinning cube is plausible either way
+ * up.  The first thing ever drawn through here that had a top and a bottom to
+ * it was a film.
  */
 static inline void quad(float *v, const QRect &r, const QSize &fb)
 {
     const float w = (float)fb.width(), h = (float)fb.height();
     const float x0 = 2.0f * (float)r.left() / w - 1.0f;
     const float x1 = 2.0f * (float)(r.left() + r.width()) / w - 1.0f;
-    const float y0 = 1.0f - 2.0f * (float)r.top() / h;            /* top edge */
-    const float y1 = 1.0f - 2.0f * (float)(r.top() + r.height()) / h;
+    const float y0 = 2.0f * (float)r.top() / h - 1.0f;            /* top edge */
+    const float y1 = 2.0f * (float)(r.top() + r.height()) / h - 1.0f;
 
     /* A strip: top-left, top-right, bottom-left, bottom-right.  Texture t runs
-     * with the image, 0 at the top, which is why t pairs with y0 and not y1. */
+     * with the image, 0 at its top row, and y0 is the top edge -- so they pair,
+     * and they pair exactly as they did before.  What changed is which end of
+     * the panel y0 lands on, not which end of the image t=0 is.
+     *
+     * The strip now winds the other way round, which costs nothing: culling is
+     * disabled once in programs() and these are the only triangles drawn. */
     v[0]  = x0; v[1]  = y0; v[2]  = 0.0f; v[3]  = 0.0f;
     v[4]  = x1; v[5]  = y0; v[6]  = 1.0f; v[7]  = 0.0f;
     v[8]  = x0; v[9]  = y1; v[10] = 0.0f; v[11] = 1.0f;
@@ -945,8 +968,12 @@ bool GlVideo::drawFrame(const unsigned char *y, int ystride,
      */
     if (at != into) {
         d->glEnable(GL_SCISSOR_TEST);
-        d->glScissor(into.left(), m_size.height() - (into.top() + into.height()),
-                     into.width(), into.height());
+        /* Panel row straight through, for the reason quad() gives at length: an
+         * FBO's window origin is the first pixel in memory and that is the top
+         * left of the panel.  Subtracting from the height, which is what this
+         * used to do, cleared a band mirrored about the panel's middle -- so the
+         * letterbox bars were painted somewhere other than where the film was. */
+        d->glScissor(into.left(), into.top(), into.width(), into.height());
         d->glClearColor(8.0f / 255.0f, 9.0f / 255.0f, 14.0f / 255.0f, 1.0f);
         d->glClear(GL_COLOR_BUFFER_BIT);
         d->glDisable(GL_SCISSOR_TEST);
@@ -1080,8 +1107,11 @@ bool GlVideo::fill(const QRect &r, unsigned int argb)
         return false;
 
     d->glEnable(GL_SCISSOR_TEST);
-    d->glScissor(r.left(), m_size.height() - (r.top() + r.height()),
-                 r.width(), r.height());
+    /* Same origin as quad() and as the scissor in drawFrame: the panel row goes
+     * straight in.  This is the call that clears the film's rectangle on the way
+     * out of a film, so while it was mirrored it left a band of the last frame
+     * on the glass and wiped a band that had the dashboard in it. */
+    d->glScissor(r.left(), r.top(), r.width(), r.height());
     d->glClearColor((float)((argb >> 16) & 0xff) / 255.0f,
                     (float)((argb >> 8) & 0xff) / 255.0f,
                     (float)(argb & 0xff) / 255.0f, 1.0f);

@@ -1515,16 +1515,20 @@ def generate(sources: dict[str, str]) -> str:
 \t * entirely if it was not given the means to. The cost of skipping it is one
 \t * conservative input limit, not a dead port.
 \t *
-\t * j36,gpio-controller with j36,drvvbus-pad is the host-mode interlock, and it
-\t * is the same pad 15 as on usb_phy above, deliberately duplicated rather than
-\t * shared through a driver-to-driver call. When the port is a host, that pad
-\t * drives our own 5 V onto VBUS, and CHRDET inside the PMIC cannot tell our
-\t * boost from a charger -- it would arm the charger against a rail we are
-\t * sourcing. So the PMIC reads the pad's mode, direction and output value
-\t * directly, three register reads a second, and while it is asserted the
-\t * charger stays disarmed and the supply reports offline. Reading a pad costs
-\t * nothing and creates no ordering between the two modules; a symbol
-\t * dependency would.
+\t * j36,gpio-controller with j36,drvvbus-pad lets the PMIC see whether the OTG
+\t * port is being fed from this board. It is the same pad 15 as on usb_phy
+\t * above, deliberately duplicated rather than shared through a driver-to-driver
+\t * call: reading a pad costs nothing and creates no ordering between the two
+\t * modules, and a symbol dependency would. The PMIC reads its mode, direction
+\t * and output value directly, three register reads a second, and publishes the
+\t * answer as usb/vbus_sourcing.
+\t *
+\t * IT DOES NOT DECIDE CHARGING, and it used to. This handheld has two
+\t * connectors -- a DC inlet, which charges and has no data lines, and the OTG
+\t * port, which this pad switches -- so CHRDET can never be this board's own
+\t * 5 V. The driver was written believing they were one socket and held the
+\t * charger off for as long as the pad was up, which on this board is always;
+\t * chrin_shared=1 restores that for a board where the belief is true.
 \t *
 \t * poll-interval-ms is the gauge cadence. A second is slow enough that the
 \t * AUXADC work is invisible and fast enough that the coulomb integrator, which

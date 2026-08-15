@@ -706,7 +706,9 @@ done
 # VBUS is sourced, which is new.  It is a GPIO on this board and not the MT6322
 # boost the MVII note assumed: the stock Android kernel's mt_usb_set_vbus() sets
 # pad 15 to mode 0 and drives it high, and j36_mt6592_usb_phy.ko now does the
-# same off j36,drvvbus-pad.  So a bus-powered hub enumerates.  The cost is that
+# same off j36,drvvbus-pad, and holds it there -- the port has no reason to stand
+# down, because charging arrives on a separate DC inlet with no data lines in it.
+# So a bus-powered hub enumerates.  The cost is that
 # the 5 V is a boost off VBAT, which on this PMIC is the system node -- with no
 # cell fitted that is the rail the class-D amp already proved can be pulled under
 # the undervoltage lockout, so j36.usb=novbus exists and a self-powered hub is
@@ -1604,9 +1606,11 @@ want_dash=0
 want_audio=0
 audio_speaker=0
 want_usb=0
-# auto, 1 or 0, passed straight through to the PHY's vbus= parameter as -1, 1 or
-# 0.  auto is the default because the port can be measured: see run_usb.
-usb_vbus=auto
+# 1, 0 or auto, passed straight through to the PHY's vbus= parameter as 1, 0 or
+# -1.  1 is the default because this handheld has two connectors: the DC inlet
+# charges and the OTG port carries data, so the port never has to give up its 5 V
+# for a charger and there is nothing to measure.  See run_usb.
+usb_vbus=1
 want_power=0
 power_charge=1
 want_wifi=0
@@ -1663,25 +1667,33 @@ for arg in $(cat /proc/cmdline); do
         # the undervoltage lockout.  So: use this word with a self-powered hub,
         # which brings its own 5 V and does not want the port's, and use it on a
         # board with no cell fitted, where a bus-powered device is a load VBAT
-        # cannot carry.  The port is still measured and the role still follows
-        # what is plugged in -- charging a device still works -- but the pad is
-        # never driven, so nothing bus-powered will come up.
+        # cannot carry.  The pad is never driven, so nothing bus-powered will come
+        # up; charging is unaffected either way, because the charger comes in on
+        # the DC inlet and not on this port.
         j36.usb=novbus)
             want_usb=1
             usb_vbus=0
             ;;
-        # The other end of the same choice: never measure, always be a host, hold
-        # DRVVBUS high for the whole uptime.  This is what the port did before the
-        # role became automatic, and the reason to keep the word is that the
-        # measurement costs a 60 ms VBUS gap on every poll where the port is idle,
-        # which a device that latches its own power-up could in principle dislike.
-        # It also permanently blinds the charger: the PMIC senses CHRDET on the
-        # same pin this sources into and refuses to charge into our own boost, so
-        # with this word the diagnostics page will say No cable forever and mean
-        # it.  Reach for it only if the automatic role picks wrong.
+        # The default, spelled out.  Always a host, DRVVBUS high for the whole
+        # uptime, and that is right here: the DC inlet charges and this port
+        # carries the data, so the port has nothing to arbitrate and every reason
+        # to hold still.  The word is kept so a boot.conf can say what it means
+        # rather than rely on a default staying put.
         j36.usb=vbus)
             want_usb=1
             usb_vbus=1
+            ;;
+        # The old behaviour, for a board where the charger and the port really are
+        # ONE socket -- which is what this bring-up believed for a long time and
+        # what a J36 Ultra is not.  The PHY drops DRVVBUS, reads DEVCTL's VBUS
+        # comparator and follows it: fed means be a device and let the charger in,
+        # unfed means be a host and source 5 V.  What it costs is the drop: about a
+        # tenth of a second with no 5 V on the port, every fifteen seconds, for the
+        # life of the board.  Pair it with chrin_shared=1 on the PMIC, or the two
+        # halves disagree about which net is which.
+        j36.usb=automeasure)
+            want_usb=1
+            usb_vbus=auto
             ;;
         # The PMIC: the battery gauge, the charger and a poweroff that actually
         # cuts the rail.  Behind a word like the rest, and for the sharpest
@@ -2411,15 +2423,20 @@ run_usb() {
         # The one module here that takes an argument, and it has to be passed on
         # the insmod line rather than in bootargs: a kernel-cmdline
         # `modname.param=' only reaches modules built into the image, and every
-        # one of these is loadable.  So j36.usb=novbus and j36.usb=vbus are
-        # translated here.  The default is neither: vbus=-1 is the module's own
-        # default, so nothing is passed and the driver measures the port.
+        # one of these is loadable.  So the three j36.usb words that pick a VBUS
+        # policy are translated here.
+        #
+        # Always passed, even when it matches the module's own default: the insmod
+        # line is echoed by the say below, so a boot log states the policy outright
+        # instead of leaving a reader to know what the default was on that build.
+        # That default has changed once already, which is why this is worth a line.
         args=""
         case "$ko" in
             j36_mt6592_usb_phy.ko)
                 case "$usb_vbus" in
                     0) args="vbus=0" ;;
-                    1) args="vbus=1" ;;
+                    auto) args="vbus=-1" ;;
+                    *) args="vbus=1" ;;
                 esac
                 ;;
         esac
@@ -2470,29 +2487,26 @@ run_usb() {
     # the pad it drove; this says which of the three arrangements the card asked
     # for, in the words the operator would have to change.
     #
-    # It USED to be an either/or, and these lines used to say so.  There is one
-    # connector and the PMIC senses the charger on the same pin the port sources
-    # into, so a board driving DRVVBUS looks to the charger exactly like a board
-    # being charged; the PMIC resolves that by reading the pad and refusing to
-    # charge into what it can prove is our own boost.  All of that is still true.
-    # What changed is that the choice is no longer made once at boot: the PHY
-    # drops DRVVBUS, releases the force_* overrides and reads the VBUS
-    # comparator in DEVCTL every few seconds, so a charger makes it a device and
-    # an empty port makes it a host, and neither half has to be picked on a card
-    # in another machine.  The two words below still pin it, for a board whose
-    # port the measurement gets wrong.
+    # These lines used to describe an either/or, and it was the wrong picture of
+    # the board.  A J36 Ultra has TWO connectors: a DC inlet, which charges and has
+    # no data lines, and this OTG port, which carries the data.  CHRDET is the
+    # inlet, DRVVBUS is the port, and neither can be mistaken for the other -- so
+    # sourcing 5 V here costs nothing at the charger, the port never has to stand
+    # down, and the measurement that used to arbitrate between them had nothing to
+    # arbitrate.  It is still in the driver for boards that do share one socket:
+    # j36.usb=automeasure, and set chrin_shared=1 on the PMIC to match.
     case "$usb_vbus" in
-        1)
-            say "usb: VBUS pinned high by j36.usb=vbus -- always a host, fit a cell"
-            say "usb: while it sources, the charger cannot see a cable -- drop the word to charge"
-            ;;
         0)
             say "usb: VBUS held off by j36.usb=novbus -- a bus-powered device will not come up"
-            say "usb: the role is still measured, so a charger on this port still charges"
+            say "usb: charging is unaffected: it comes in on the DC inlet, not this port"
+            ;;
+        auto)
+            say "usb: VBUS follows the port (j36.usb=automeasure) -- for a board with ONE socket"
+            say "usb: this drops 5 V on the port for ~0.1 s every 15 s; drop the word to stop that"
             ;;
         *)
-            say "usb: VBUS follows the port -- 5 V for a stick or a hub, off for a charger"
-            say "usb: pin it with j36.usb=vbus (always source) or j36.usb=novbus (never source)"
+            say "usb: VBUS held high -- always a host, so a stick, a mouse or a hub comes up"
+            say "usb: fit a cell: the 5 V is a switch off VBAT, which on this PMIC is the system rail"
             ;;
     esac
     return 0
@@ -2507,15 +2521,15 @@ run_usb() {
 # with the rail still up -- the board sits there warm until the cell runs out or
 # somebody holds the power button.
 #
-# LOAD IT AFTER USB, not before, and the ordering is real rather than tidiness.
-# The PMIC reads GPIO pad 15 every poll to find out whether this port is
-# sourcing 5 V, because CHRDET cannot tell our own boost from a charger and
-# arming the charger against a rail we are driving is the one genuinely bad
-# outcome available here.  Loading the PHY first means the pad is already in
-# whatever state the boot asked for by the time the first poll looks at it,
-# rather than the driver seeing the LK's state once and reporting a charger that
-# is not there.  It recovers either way -- the interlock is re-read every second
-# -- but the first second of log is worth getting right.
+# LOAD IT AFTER USB, not before.  The ordering is worth less than it used to be
+# and is kept anyway.  The PMIC reads GPIO pad 15 every poll to find out whether
+# the OTG port is sourcing 5 V, and it used to hold the charger off while that
+# read high -- on the belief that this handheld had one connector doing both
+# jobs.  It has two: a DC inlet, which is what CHRDET senses, and the OTG port,
+# which is what the pad switches.  So the read is an observation now and decides
+# nothing unless chrin_shared says otherwise, and the worst a bad order can cost
+# is one misleading log line rather than a boot that never charges.  Loading the
+# PHY first still means the pad is settled before the first poll looks at it.
 #
 # j36.power=nocharge becomes charge=0 on the insmod line, for the same reason
 # j36.usb=novbus becomes vbus=0: a kernel-cmdline `modname.param=' only reaches
@@ -4497,17 +4511,24 @@ dump() {
     # THE ONE BIT THAT SAYS WHY usb/online IS ZERO, and without it the two cases
     # are indistinguishable from userspace -- which is how "the charger is plugged
     # in and the dashboard says no cable" gets reported as a driver that cannot
-    # see a cable.  There is a single connector on this handheld: it is the charge
-    # port and it is the host port, so when the USB PHY decides the port is a host
-    # it raises DRVVBUS, the boost puts this board's own 5 V on the connector, and
-    # that 5 V lands on the net CHRDET watches.  The PMIC holds the charger off
-    # rather than charge the cell from the cell, and online goes to 0 with a cable
-    # very much in.  1 here means that is what happened and the question is why
-    # the PHY chose host; 0 means CHRDET genuinely sees nothing and the question
-    # is the cable or the port; -1 means no j36,drvvbus-pad in the device tree, so
-    # online is CHRDET and nothing else.
-    showall "the DRVVBUS interlock -- is this board feeding the port itself?" \
+    # see a cable.  THERE ARE TWO CONNECTORS ON A J36 ULTRA: a DC inlet, which
+    # charges and has no data lines, and an OTG port, which carries the data and
+    # sources 5 V the whole time the board is on.  CHRDET is the inlet; this pad
+    # is the port; they do not meet.  So 1 here is the ordinary state of a running
+    # console and says nothing at all about whether a charger is attached -- read
+    # online for that, and current_now to find out whether it is doing anything.
+    # -1 means no j36,drvvbus-pad in the device tree.
+    #
+    # The driver used to hold the charger off whenever this read 1, on the belief
+    # that the two were one socket.  They are not, this reads 1 always, and the
+    # console spent a release discharging on the mains.  chrin_shared restores
+    # that behaviour for a board where the belief is true; on this one it is 0 and
+    # is dumped below so a log says which of the two stories it is from.
+    showall "is this board feeding the OTG port itself?" \
         /sys/class/power_supply/*/vbus_sourcing
+    showall "and is the single-connector interlock on? (0/N is right here)" \
+        /sys/module/j36_mt6592_pmic/parameters/chrin_shared \
+        /sys/module/j36_mt6592_usb_phy/parameters/vbus
 
     kgrep "the PMIC, the gauge and the ADC" \
         'pmic|mt6323|battery|charger|auxadc|adc|power_supply|vchr|vbat|drvvbus'
@@ -4885,10 +4906,11 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_gl" = 1 ] || \
         progress 68; run_usb
     fi
     # After USB, and one module, so it costs almost nothing in the bar.  The
-    # order against run_usb is the interlock described on run_power: the PMIC
-    # samples the DRVVBUS pad to decide whether the 5 V on the port is ours, and
-    # letting the PHY set that pad first means the very first poll sees the
-    # truth instead of the LK's leftovers.
+    # order against run_usb is the one described on run_power: the PMIC samples
+    # the DRVVBUS pad every poll, and letting the PHY set that pad first means the
+    # very first poll sees the truth instead of the LK's leftovers.  It buys a
+    # tidy first second of log rather than a working charger now -- the pad no
+    # longer decides charging -- but there is no reason to give it up.
     if [ "$want_power" = 1 ]; then
         stage "Starting power management"; detail "MT6323 gauge, charger, poweroff"
         progress 71; run_power
@@ -6937,7 +6959,8 @@ initrd=initrd.img
 #
 # j36.audio=speaker powers the class-D amp off VBAT, the system node: if the board
 # cuts out in playback, `amixer -c0 set "Speaker Amp" off' -- no reboot needed.
-# j36.usb=1 sources 5 V off that same rail: j36.usb=novbus with no cell.
+# j36.usb=1 sources 5 V on the OTG port off that same rail: j36.usb=novbus with no
+# cell.  It is not the connector that charges -- that is the DC inlet beside it.
 # j36.gl=debug adds Mesa's EGL trace; a diagnostic, not a default.
 # j36.splash=0 with loglevel=7 boots to text, which is the pair
 # ./build-j36-ultra.sh --no-splash writes here.
@@ -7459,41 +7482,53 @@ j36.usb=1
     load as the class-D amp, which MVII measured pulling VBAT under the
     undervoltage lockout.
 
-    THE ROLE IS MEASURED, every few seconds, and this is the part that took a log
-    to work out.  There is one connector: it is the charge port and it is the host
-    port, and the PMIC senses CHRDET on the same net the port sources into, so
-    sourcing and charging are mutually exclusive in the hardware and no amount of
-    software picks both.  What software CAN do is ask which one is wanted, and the
-    port answers.  With DRVVBUS low and the PHY's force_* overrides released for
-    the stock 800 us settle, DEVCTL's VBUS field is a live comparator on the pin:
-    above AValid means something outside is feeding the bus -- a charger, a host
-    PC -- and the answer is to be a device and let the PMIC charge; below it means
-    nothing is out there and the answer is to be a host and source 5 V so a stick,
-    an SSD, a mouse or a hub can come up.  The question is re-asked every 3 s, and
-    skipped whenever something is attached, so nothing already enumerated ever
-    sees the 60 ms gap the measurement needs.
+    THE ROLE IS NOT MEASURED, AND THAT IS A CORRECTION.  Everything this text used
+    to say about measuring it rested on one belief -- that a J36 Ultra has a single
+    connector doing both jobs, so sourcing 5 V and sensing a charger were mutually
+    exclusive in the hardware and software had to keep asking which one was wanted.
 
-    WHAT "ATTACHED" HAS TO MEAN, AND THE BUG IT USED TO BE.  DEVCTL's FSDEV/LSDEV
-    is a pull-up on D+ or D-, and it was taken as "a device is here".  A
-    divider-type charger presents the same pull-up -- an Apple 2.4 A brick holds D+
-    near 2.7 V, the Samsung scheme holds both near 1.2 V -- so plugging a charger
-    into an idle console latched the port to host, held DRVVBUS high, and left the
-    PMIC's interlock refusing to charge for the whole uptime.  The dashboard said
-    No cable with a cable in it, and it was not only the display that was wrong:
-    the board really was not charging, and the interlock was right to refuse,
-    because charging off our own boost means charging the cell from the cell
-    through two conversions.
+    THERE ARE TWO CONNECTORS.  A DC inlet, which charges and has no data lines in
+    it at all, and the OTG port, which carries the data.  CHRDET hangs off the
+    inlet; DRVVBUS hangs off the port; they are separate sockets on separate nets
+    and neither can be mistaken for the other.  So there is nothing to arbitrate:
+    the port is a host, it sources 5 V, and it keeps doing so.  vbus defaults to 1
+    now, which pins exactly that.
 
-    The distinction is not in any register on this board, and it does not have to
-    be: a device answers a bus reset and is given an address, a charger answers
+    WHAT THE BELIEF COST.  The PMIC held the charger off for as long as DRVVBUS
+    was up, and on this board DRVVBUS is up the whole time the board is on.  So
+    online read 0 with a charger in the inlet, and -- because that same value is
+    what arms the charger -- nothing charged.  CAPACITY falling, CURRENT_NOW at
+    -35 mA, STATUS Discharging, plugged into the wall.  The PMIC reads CHRDET on
+    its own now; chrin_shared=1 restores the interlock for a board where the belief
+    is true, and it is 0 here.
+
+    AND WHAT THE MEASUREMENT ITSELF COST, which is the other half.  Measuring means
+    dropping DRVVBUS, and dropping DRVVBUS on the port that IS the data port is a
+    hundred-millisecond power cut to whatever is plugged into it, every fifteen
+    seconds, for the life of the board.  With a dedicated charge inlet there was
+    never anything to learn from it.
+
+    THE MEASUREMENT IS STILL IN THE DRIVER, under vbus=-1, because some boards do
+    share the socket.  With DRVVBUS low and the PHY's force_* overrides released
+    for the stock 800 us settle, DEVCTL's VBUS field is a live comparator on the
+    pin: above AValid means something outside is feeding the bus -- a charger, a
+    host PC -- and the answer is to be a device and let the PMIC charge; below it
+    means nothing is out there and the answer is to be a host.  It is re-asked
+    every 3 s and skipped whenever something that has enumerated is attached.
+
+    WHAT "ATTACHED" HAS TO MEAN, for that path.  DEVCTL's FSDEV/LSDEV is a pull-up
+    on D+ or D-, and it was once taken as "a device is here".  A divider-type
+    charger presents the same pull-up -- an Apple 2.4 A brick holds D+ near 2.7 V,
+    the Samsung scheme holds both near 1.2 V -- so on a shared-socket board,
+    plugging a charger in latched the port to host and held DRVVBUS high for the
+    whole uptime.  The distinction is not in any register and does not have to be:
+    a device answers a bus reset and is given an address, a charger answers
     nothing.  So the PHY asks usbcore -- usb_for_each_dev(), root hubs skipped --
-    and the latch now holds only while something on the bus HAS an address.
-    Something that holds the lines high without ever becoming a device gets
-    measured after attach_grace_polls (default 3, so about ten seconds), finds the
-    charger, drops DRVVBUS and charges.  A stick, a mouse or a hub is never
-    power-cycled by this, because it enumerates and is exempt from the moment it
-    does.  The measurement happens once per plug, so a genuinely broken device
-    costs one retry rather than a loop.
+    and the latch holds only while something on the bus HAS an address.  Something
+    that holds the lines high without ever becoming a device is measured after
+    attach_grace_polls (default 3, about ten seconds).  A stick, a mouse or a hub
+    is never power-cycled by it, because it enumerates and is exempt from the
+    moment it does.
 
     Which is why "DEVCTL bits 3 and 4 report whether VBUS is valid" -- what this
     text used to say -- is a trap rather than a fact.  Those bits are only a
@@ -7504,15 +7539,17 @@ j36.usb=1
     the whole uptime, which is exactly what a forced register does and nothing a
     real rail would ever do.
 
-    The role decides two other things with it.  DEVCTL.SESSION is set going into
-    host and cleared coming out, because musb_start() runs once on this board --
-    from musb_hub_control's USB_PORT_FEAT_POWER at boot, and nothing calls it again
-    -- so a port that went to device and came back would otherwise be a host with
-    no session.  And the PMIC's own interlock, which refuses to charge into a pad
-    it can see we are driving, now releases by itself: plug a charger, the port
-    measures externally fed, DRVVBUS goes low, and the diagnostics page stops
-    saying No cable.  That interlock was never wrong.  It was answering honestly
-    about a pad that was pinned high for the wrong reason.
+    The role still sets DEVCTL.SESSION going into host and clears it coming out,
+    because musb_start() runs once on this board -- from musb_hub_control's
+    USB_PORT_FEAT_POWER at boot, and nothing calls it again -- so a port that went
+    to device and came back would otherwise be a host with no session.  At the
+    default it goes in once at power-on and stays.
+
+    THE DIAGNOSTICS PAGE HAS A ROW FOR ALL OF THIS, under Power: "Connectors" puts
+    the DC inlet (CHRDET), the OTG port (the DRVVBUS pad) and the sign of the cell
+    current on three lines side by side, and colours itself on whether the charger
+    is actually putting anything in.  A charger attached with the current still
+    negative is the old bug coming back, and it names chrin_shared on the spot.
 
 j36.usb=novbus
     The same stack with the pad never driven -- /init passes vbus=0 to the PHY
@@ -7658,17 +7695,23 @@ j36.power=1
     BC1.2 handshake decided the wall will actually give us.
 
     It also reports one attribute that is not a standard power_supply property,
-    vbus_sourcing, and it is there because online has two ways of being zero that
-    mean opposite things. This handheld has ONE connector: it is the charge port
-    and it is the host port and it cannot be both. When the USB PHY decides the
-    port is a host it raises DRVVBUS, the boost puts this board's own 5 V on the
-    connector, and that 5 V arrives on the same net the charger detects a supply
-    on -- so the PMIC holds the charger off rather than charge the cell from the
-    cell, and online goes to 0 with a cable very much in it. vbus_sourcing reads
-    the pad directly: 1 is that case, 0 is the plain one where CHRDET sees
-    nothing, and -1 is a device tree with no j36,drvvbus-pad, where online is
-    CHRDET and nothing else. Diagnostics -> Power prints which, and so does
-    section 2 of mixos-log.txt.
+    vbus_sourcing, and what it is for has changed. It was added because online had
+    two ways of being zero that meant opposite things, on the belief that this
+    handheld had ONE connector doing both jobs -- so the port sourcing 5 V and the
+    PMIC seeing a charger were the same net, and the driver held the charger off
+    whenever the pad was up.
+
+    IT HAS TWO. A DC inlet, which charges and has no data lines, and an OTG port,
+    which carries the data and sources 5 V the whole time the board is on. CHRDET
+    is the inlet, this pad is the port, and they do not meet. The second zero is
+    therefore gone: online is CHRDET and nothing else, and the pad being up -- which
+    here is always -- says nothing about whether a charger is attached.
+
+    What vbus_sourcing publishes now is just the port: 1 means the board is feeding
+    it, which is what makes a bus-powered stick or a mouse work, 0 means it is not,
+    and -1 is a device tree with no j36,drvvbus-pad. Diagnostics -> Power puts it
+    next to online and the cell current in one row, and section 2 of mixos-log.txt
+    dumps it beside chrin_shared so a log says which of the two stories it is from.
 
     THE ONE FACT THAT EXPLAINS THE REST: this board has no power-path FET, so
     VBAT is the system node rather than a battery-only rail.  Every live ADC
@@ -7701,17 +7744,21 @@ j36.power=1
     device tree it cannot run BC1.2 at all and falls back to a conservative
     limit; that is a working charger, just a slow one.
 
-    While the USB port is sourcing 5 V the charger is disarmed and the supply
-    reports offline, because CHRDET inside the PMIC cannot tell our own boost from
-    a wall charger.  The driver reads GPIO pad 15 directly to find out, three
-    registers per poll, which is why it loads after the PHY rather than before.
+    THE CHARGER USED TO BE DISARMED WHILE THE USB PORT WAS SOURCING 5 V, and that
+    is the single biggest thing corrected here.  The driver was written believing
+    CHRDET and the port's own boost were one net, so it read GPIO pad 15 every poll
+    and held the charger off whenever the pad was up.  On this board the pad is up
+    the whole time the board is on, and the value it zeroed is the same one that
+    arms the charger -- so nothing charged, for the whole uptime, on every boot.
+    CAPACITY falling with a charger in the wall is what that looked like.
 
-    That interlock used to be permanent, and it is why a charging board reported
-    No cable for a whole uptime: the PHY raised DRVVBUS at power-on and never
-    lowered it.  It is now self-releasing, because the PHY measures the port
-    instead of assuming it -- see j36.usb=1 -- so plugging a charger drops the pad
-    within one poll and the supply comes back online on its own.  j36.usb=vbus
-    puts the old permanent version back, deliberately, for a board that needs it.
+    There are two connectors.  CHRDET is the DC inlet, the pad is the OTG port, and
+    CHRDET decides charging by itself now.  chrin_shared=1 puts the interlock back
+    for a board where the two really are one socket -- it is writable at runtime and
+    the poll picks it up -- and it is 0 here and should stay 0.  The pad is still
+    read every poll, still published through vbus_sourcing, and now says once in the
+    log when a charger and a sourcing port are up together, which on this handheld
+    is simply a console charging with a stick plugged in.
 
 j36.power=nocharge
     Everything above except CHR_CON.  The gauge samples, the supplies appear, the
@@ -9054,15 +9101,17 @@ SD cards.
                        powers the class-D amp, which hangs off VBAT and so needs a
                        cell fitted.  Nothing detects a plug: "Speaker Amp" and
                        "Headphone" are mixer switches, both may be on at once.
-  j36/usb              the host stack for the one MUSB port: the PHY, musb and its
-                       glue, usbhid, udl for a DisplayLink dock's HDMI, and the
-                       disk set -- scsi_mod, sd_mod, usb-storage and ntfs3 -- which
-                       is what makes an external drive appear and automount under
-                       /media.  The PHY measures the port and drives DRVVBUS when
-                       nothing else is feeding it, so it sources 5 V off VBAT and a
-                       cell should be fitted; j36.usb=novbus never sources and
-                       j36.usb=vbus always does.  Two modules here also live in
-                       j36/mtkdrm; whichever loaded first wins.  j36.usb=1
+  j36/usb              the host stack for the MUSB OTG port -- the data connector,
+                       which is not the DC inlet the board charges from: the PHY,
+                       musb and its glue, usbhid, udl for a DisplayLink dock's
+                       HDMI, and the disk set -- scsi_mod, sd_mod, usb-storage and
+                       ntfs3 -- which is what makes an external drive appear and
+                       automount under /media.  The PHY holds DRVVBUS high, so the
+                       port sources 5 V off VBAT and a cell should be fitted;
+                       j36.usb=novbus never sources, and j36.usb=automeasure is the
+                       old measured role, for a board with one shared socket.  Two
+                       modules here also live in j36/mtkdrm; whichever loaded first
+                       wins.  j36.usb=1
   j36/power            the MT6592 PMIC -- battery gauge, charger and a poweroff
                        that cuts the rail -- and the panel backlight.  j36.power=1;
                        j36.power=nocharge keeps the charger as the LK set it.

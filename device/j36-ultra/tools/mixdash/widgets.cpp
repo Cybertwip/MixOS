@@ -3003,36 +3003,39 @@ void InfoPage::refresh()
         const bool plugged = readTrimmed(usb + "/online") == QLatin1String("1");
         if (!plugged) {
             /*
-             * OFFLINE IS TWO ANSWERS AND THIS ROW HAS TO SAY WHICH ONE.
+             * OFFLINE MEANS OFFLINE NOW, AND THAT IS THE WHOLE OF THE CHANGE.
              *
-             * There is one connector on this handheld.  It is the charge port and
-             * it is the host port and it cannot be both, so when the USB PHY
-             * decides the port is a host the board puts its own 5 V on the pins --
-             * and that 5 V lands on the same net the charger detects a supply on.
-             * The PMIC holds the charger off rather than charge the cell from the
-             * cell, and `online' goes to 0 with a cable very much in.
+             * This row used to have to disambiguate two zeroes.  A J36 Ultra has
+             * two connectors -- a DC inlet, which charges and carries no data, and
+             * an OTG port, which carries the data and sources 5 V the whole time
+             * the board is on -- but the driver was written believing there was
+             * one socket doing both jobs, so it held the charger off whenever the
+             * port was sourcing.  The port is always sourcing.  `online' was
+             * therefore 0 for the entire uptime with a charger in the inlet, and
+             * this row printed a sentence explaining why that was fine.  It was
+             * not fine: the same zero disarmed the charger, so the console really
+             * was running the battery down on the mains.
              *
-             * vbus_sourcing is the pad itself, published by j36_mt6592_pmic for
-             * exactly this row: 1 is "the interlock is what you are looking at",
-             * anything else -- 0, -1, or the file not being there on an older
-             * kernel -- is the plain reading, which is that nothing is plugged in.
-             *
-             * "FOR A USB DEVICE" IS NOW A CLAIM AND NOT A HOPE.  This row was
-             * written when the PHY latched the port to host as soon as anything
-             * held D+ or D- high, which a divider-type charger does -- so this
-             * line could appear with a charger in the socket and nothing charging.
-             * The PHY asks usbcore now, and only keeps sourcing when something on
-             * the bus actually has an address; anything else is measured and
-             * stands down within about ten seconds.  So if this row is up, there
-             * really is a device on the port.  See attach_grace_polls in
-             * device/j36-ultra/linux/j36_mt6592_usb_phy.c.
+             * The PMIC reads CHRDET on its own now, and CHRDET is the inlet.  So a
+             * zero here is the plain reading -- nothing is plugged into the DC
+             * inlet -- and there is nothing left to explain away.  chrin_shared in
+             * device/j36-ultra/linux/j36_mt6592_pmic.c restores the old behaviour
+             * for a board that really does share the socket; the sentence that
+             * used to be unconditional is kept for that case and reached only when
+             * the driver says the pad is what is being looked at.
              */
             const QString sourcing = readTrimmed(usb + "/vbus_sourcing");
-            if (sourcing == QLatin1String("1"))
+            /* A bool module parameter reads back as Y or N, but the file is
+             * writable, so accept the 1 someone who has just echoed one in would
+             * expect to see as well. */
+            const QString shared =
+                readTrimmed("/sys/module/j36_mt6592_pmic/parameters/chrin_shared");
+            if (sourcing == QLatin1String("1") &&
+                (shared == QLatin1String("Y") || shared == QLatin1String("1")))
                 add(tr("Charger"),
                     tr("held off -- the port is sourcing 5 V for a USB device"));
             else
-                add(tr("Charger"), tr("no cable"));
+                add(tr("Charger"), tr("no cable in the DC inlet"));
         } else {
             const QString mv = milliUnits(usb + "/voltage_now", "mV");
             const QString ma = milliUnits(usb + "/current_max", "mA");

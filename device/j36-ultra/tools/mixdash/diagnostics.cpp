@@ -579,6 +579,68 @@ void DiagnosticsPage::probePower(QVector<Finding> &out)
     }
     out.append(battery);
 
+    /*
+     * ── WHICH SOCKET IS DOING WHAT ───────────────────────────────────────────
+     *
+     * There are two of them on a J36 Ultra and telling them apart from the
+     * outside is the whole difficulty.  The DC inlet charges and has no data
+     * lines; the OTG port carries data and sources 5 V the whole time the board
+     * is on.  The driver was written believing they were one socket, so it held
+     * the charger off whenever the port was sourcing -- which is always -- and
+     * the console ran its battery down on the mains for a whole release while
+     * every reading involved said something true and unhelpful.
+     *
+     * So this row puts the two side by side and names them.  `online' is CHRDET,
+     * which is the inlet; vbus_sourcing is the DRVVBUS pad, which is the OTG
+     * port; and the sign of current_now is the only one of the three that says
+     * whether any of it is working.  A charger in the inlet with the current
+     * still negative is the bug coming back, and this is the row it shows up on.
+     */
+    const QString usbSupply = QStringLiteral("/sys/class/power_supply/usb");
+    if (QDir(usbSupply).exists()) {
+        Finding ports;
+        ports.name = tr("Connectors");
+        const bool online = SysInfo::readTrimmed(usbSupply + "/online")
+                            == QLatin1String("1");
+        const QString sourcing = SysInfo::readTrimmed(usbSupply + "/vbus_sourcing");
+        const int ua = SysInfo::readTrimmed(
+                           "/sys/class/power_supply/battery/current_now").toInt();
+
+        QStringList lines;
+        lines << tr("DC inlet: %1 (CHRDET)")
+                     .arg(online ? tr("a charger is attached") : tr("nothing attached"));
+        lines << tr("OTG port: %1 (DRVVBUS pad)")
+                     .arg(sourcing == QLatin1String("1")
+                              ? tr("sourcing 5 V, so bus-powered devices work")
+                              : sourcing == QLatin1String("0")
+                                    ? tr("not sourcing")
+                                    : tr("no pad in the device tree"));
+        lines << tr("Cell: %1 mA").arg(ua / 1000);
+
+        if (online && ua > 0) {
+            ports.badge = tr("charging");
+            ports.colour = Theme::green();
+        } else if (online) {
+            /* A charger in and nothing going into the cell.  Full is the benign
+             * reading and the gauge says which. */
+            const bool full = SysInfo::readTrimmed(
+                                  "/sys/class/power_supply/battery/status")
+                              == QLatin1String("Full");
+            lines << (full ? tr("The cell is full, so nothing is being taken in.")
+                           : tr("A charger is attached and the cell is not taking\n"
+                                "current in.  chrin_shared in j36_mt6592_pmic holds\n"
+                                "the charger off while the OTG port is up; it is 0\n"
+                                "on this board and should stay 0."));
+            ports.badge = full ? tr("full") : tr("check");
+            ports.colour = full ? Theme::green() : Theme::orange();
+        } else {
+            ports.badge = tr("battery");
+            ports.colour = Theme::ink3();
+        }
+        ports.detail = lines.join("\n");
+        out.append(ports);
+    }
+
     Finding thermal;
     thermal.name = tr("Temperature");
     const QStringList zones = QDir("/sys/class/thermal").entryList(QStringList() << "thermal_zone*",

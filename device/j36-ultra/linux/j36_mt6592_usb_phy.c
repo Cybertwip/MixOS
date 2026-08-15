@@ -103,22 +103,30 @@
  * enough while the role was fixed at boot and is not enough now. See
  * j36_musb_session().
  *
- * ── WHICH ROLE, THOUGH ────────────────────────────────────────────────────────
+ * ── WHICH ROLE, THOUGH, AND WHY THE ANSWER STOPPED BEING A MEASUREMENT ────────
  *
- * There is one connector. It is the charge port and it is the host port, and
- * the PMIC senses the charger on the same net this port sources into, so the
- * two are mutually exclusive in hardware and no device-tree constant can pick
- * between them -- dr_mode is fixed at build time and says nothing about what is
- * on the cable right now. Pinning it to host, which is what this driver did, is
- * also what made j36_mt6592_pmic's DRVVBUS interlock hold the charger off for
- * the entire uptime: a board that always sources 5 V always looks to itself
- * like a board sourcing 5 V, so CHRDET is never believable and the dashboard
- * says No cable with a charger plugged into it.
+ * THIS BOARD HAS TWO CONNECTORS. A DC inlet, which charges and has no data lines
+ * in it, and this port, which carries the data. CHRIN hangs off the inlet;
+ * DRVVBUS hangs off this port; they are separate sockets on separate nets and
+ * neither one can be mistaken for the other.
  *
- * So the role FOLLOWS THE PORT. With DRVVBUS low, DEVCTL's VBUS field is a live
- * comparator on the pin (recover() enables it: that is what R1A bit 4 is), and
- * the force_* overrides are the only thing that hides it -- release them for
- * the 800 us the stock sequences settle for and the reading is real:
+ * Everything below was written against the opposite belief -- one socket doing
+ * both jobs, mutually exclusive in hardware, so the role had to be measured on
+ * every poll because no device-tree constant could pick between two things one
+ * cable might be. On a board with a dedicated inlet there is nothing to pick.
+ * The data port is a host, it sources 5 V, and the charger arrives somewhere
+ * else entirely. So the default is now vbus=1, and what that buys is the thing
+ * the measurement was costing: the port holds still. Measuring means dropping
+ * DRVVBUS, and dropping DRVVBUS on the port that IS the data port is a hundred
+ * millisecond power cut to whatever is plugged into it, every role_probe_every
+ * polls, for the life of the board.
+ *
+ * THE MEASUREMENT IS STILL HERE, under vbus=-1, because the belief is true of
+ * some boards and this driver should still work on them. With DRVVBUS low,
+ * DEVCTL's VBUS field is a live comparator on the pin (recover() enables it:
+ * that is what R1A bit 4 is), and the force_* overrides are the only thing that
+ * hides it -- release them for the 800 us the stock sequences settle for and the
+ * reading is real:
  *
  *   above AValid   somebody outside this board is driving the bus. A charger,
  *                  or a PC. Be a device, leave DRVVBUS low, let the PMIC see
@@ -126,28 +134,28 @@
  *   below AValid   nothing is feeding the port. Be a host and source 5 V, and a
  *                  bus-powered stick, SSD, mouse or hub comes up.
  *
- * Re-asked every role_poll_ms, because plugging a charger into a running
- * console is the normal case. The measurement needs our own boost off, so the
- * poll drops DRVVBUS for J36_VBUS_FALL_MS before reading -- and skips the whole
- * thing whenever DEVCTL reports FSDEV or LSDEV, which is the core's own
- * pre-enumeration attach flag. Nothing that is plugged in ever sees the gap.
+ * Re-asked every role_poll_ms, because on such a board plugging a charger into a
+ * running console is the normal case. The measurement needs our own boost off, so
+ * the poll drops DRVVBUS for J36_VBUS_FALL_MS before reading -- and skips the
+ * whole thing whenever DEVCTL reports FSDEV or LSDEV, which is the core's own
+ * pre-enumeration attach flag.
  *
- * That last sentence was too strong for one case, and the case is the charger.
+ * That last skip was too broad for one case, and the case is the charger.
  * FSDEV/LSDEV is a pull-up on D+ or D-, and a divider-type charger presents one
  * -- so it read as attached, the probe stayed suspended, DRVVBUS stayed high and
- * the PMIC's interlock refused to charge for the whole uptime, which is the bug
- * "the charger says no cable" actually was. A charger is not a device and never
- * becomes one: it answers no reset and is given no address. So the latch now asks
- * usbcore whether anything on the bus has an address, and only holds when
- * something has. Nothing that enumerates is ever power-cycled by this poll;
- * something that holds the lines high and never enumerates gets measured once,
- * after attach_grace_polls, which is how a charger is found. See
- * j36_usb_devices() and j36_usb_phy_decide_role().
+ * the PMIC's interlock refused to charge for the whole uptime. A charger is not a
+ * device and never becomes one: it answers no reset and is given no address. So
+ * the latch asks usbcore whether anything on the bus has an address, and only
+ * holds when something has. Nothing that enumerates is ever power-cycled by the
+ * poll; something that holds the lines high and never enumerates gets measured
+ * once, after attach_grace_polls. See j36_usb_devices() and
+ * j36_usb_phy_decide_role().
  *
- * vbus= pins it, both ways and for the cases where the measurement is not
- * wanted: vbus=1 is the old always-host-always-source behaviour, vbus=0 forbids
- * sourcing without forbidding host (which is the self-powered-hub case, and the
- * no-cell case), and the default vbus=-1 is the measurement above.
+ * vbus= is therefore the whole choice: vbus=1 (default) is host always and
+ * sourcing always, which is what a board with its own charge inlet wants;
+ * vbus=-1 is the measurement above, for a board where the two are one socket;
+ * vbus=0 forbids sourcing without forbidding host, which is the self-powered-hub
+ * case and the no-cell case, and it measures too.
  *
  * .set_mode still picks between the two sequences for anything that asks, but
  * in auto it answers a host request without acting on it: mediatek.c calls it
@@ -458,19 +466,24 @@ MODULE_PARM_DESC(scan_delay_ms,
 		 "delay before the first GICD_ISPENDR sample (the second is at "
 		 "three times this, to catch a connect that happens late)");
 
-static int vbus = -1;
+static int vbus = 1;
 module_param(vbus, int, 0644);
 MODULE_PARM_DESC(vbus,
-		 "who drives the 5 V on the one connector this board has. "
-		 "-1 (default) measures it: with the DRVVBUS pad named by "
+		 "who drives the 5 V on the OTG port. "
+		 "1 (default) is host always and sourcing always, which is what a "
+		 "board with a separate DC charge inlet wants: the inlet has no "
+		 "data lines, CHRDET is never this port's 5 V, and the data port "
+		 "can simply stay up so a stick, an SSD, a mouse or a bus-powered "
+		 "hub keeps working. "
+		 "-1 measures it instead, for a board where the charger and the "
+		 "port are one socket: with the DRVVBUS pad named by "
 		 "j36,drvvbus-pad held low, DEVCTL's VBUS field says whether "
 		 "anything outside is feeding the port, and the role follows -- "
 		 "fed means a charger or a PC, so be a device and let the PMIC "
-		 "charge; unfed means be a host and source 5 V so a stick, an SSD, "
-		 "a mouse or a bus-powered hub comes up. "
-		 "vbus=1 pins the old behaviour: host always, sourcing always, and "
-		 "the charger held off for the whole uptime because the PMIC reads "
-		 "this same pad and cannot tell our own boost from a charger. "
+		 "charge; unfed means be a host and source 5 V. The cost is that "
+		 "measuring drops the pad, so the port loses 5 V for about a tenth "
+		 "of a second every role_probe_every polls -- see that parameter, "
+		 "and see chrin_shared in j36_mt6592_pmic for the other half. "
 		 "vbus=0 forbids SOURCING without pinning the role -- the port is "
 		 "still measured, it just never drives the pad -- and it drives "
 		 "the pad LOW rather than leaving it as found. Two cases want it: "
@@ -497,7 +510,8 @@ MODULE_PARM_DESC(role_poll_ms,
 static unsigned int role_probe_every = 5;
 module_param(role_probe_every, uint, 0644);
 MODULE_PARM_DESC(role_probe_every,
-		 "how many role polls to let pass between two DRVVBUS drops while "
+		 "vbus=-1 only, and dead at the default. How many role polls to let "
+		 "pass between two DRVVBUS drops while "
 		 "the port is a host and idle (default 5, so one probe every 15 s "
 		 "at the 3000 ms poll; 1 probes every poll, 0 probes once at "
 		 "power-on and never again). Only the host answer costs anything "
@@ -511,15 +525,17 @@ MODULE_PARM_DESC(role_probe_every,
 static unsigned int attach_grace_polls = 3;
 module_param(attach_grace_polls, uint, 0644);
 MODULE_PARM_DESC(attach_grace_polls,
-		 "how many role polls something may hold D+ or D- high without "
+		 "vbus=-1 only, and dead at the default. How many role polls "
+		 "something may hold D+ or D- high without "
 		 "getting a USB address before the port is measured anyway "
 		 "(default 3, so about nine to twelve seconds at the 3000 ms "
-		 "poll; 0 measures on the first poll of every attach). This is "
-		 "what makes a divider-type charger charge: it drives the same "
+		 "poll; 0 measures on the first poll of every attach). On a "
+		 "shared-socket board this is what makes a divider-type charger "
+		 "charge: it drives the same "
 		 "line a device's pull-up does, so DEVCTL calls it attached and "
 		 "the attach latch used to hold DRVVBUS high for the whole "
-		 "uptime, which is exactly the state the PMIC refuses to charge "
-		 "in. Anything that enumerates is exempt for as long as it stays "
+		 "uptime, which is exactly the state such a board's PMIC refuses "
+		 "to charge in. Anything that enumerates is exempt for as long as it stays "
 		 "on the bus, so a stick, a mouse or a hub is never power-cycled "
 		 "by this however low it is set; raise it if some device on this "
 		 "board takes longer than that to get an address.");
@@ -678,12 +694,12 @@ static void j36_usb_phy_vbus(struct j36_usb_phy *p, bool on)
 	 * and that distinction is the whole of this hunk. The early return used to
 	 * cover both directions, so j36.usb=novbus left the pad exactly as the LK
 	 * handed it over -- and if the LK handed it over high, the port went on
-	 * sourcing 5 V that nothing in Linux had asked for, while
-	 * j36_mt6592_pmic's DRVVBUS interlock read that same pad, concluded the
-	 * 5 V on CHRIN was this board's own boost, and held the charger off for
-	 * the rest of the boot. "No cable" on a device with a cable in it, out of
-	 * the parameter whose name says the opposite. Off is driven now, not
-	 * assumed.
+	 * sourcing 5 V that nothing in Linux had asked for, out of the parameter
+	 * whose name says the opposite. On a board where CHRIN and this port share
+	 * a net that also cost the whole boot's charging, because the PMIC read
+	 * this same pad and concluded the 5 V on CHRIN was its own boost. Off is
+	 * driven now, not assumed, which is right either way: a pad this driver
+	 * has been told not to raise should not be found high.
 	 */
 	if (on && vbus == 0)
 		return;
@@ -941,9 +957,15 @@ static void j36_musb_probe_busctl(struct j36_usb_phy *p)
 
 /* ── which way the port is being driven, and therefore which role ────────────
  *
- * One connector, one CHRIN net, one DRVVBUS pad. The port cannot source and
- * sink at the same time and no device-tree constant knows which is wanted right
- * now, so this measures it. See the header for the whole argument.
+ * None of this runs at the default. A J36 Ultra charges through a DC inlet with
+ * no data lines in it, so this port is a host and holds its 5 V and there is
+ * nothing to measure -- vbus=1, and everything below sits idle.
+ *
+ * It is kept for the board this driver was first written against, where one
+ * connector carries both and the CHRIN net is the net this pad sources into: a
+ * port cannot source and sink at once, no device-tree constant knows which is
+ * wanted right now, so it gets measured. vbus=-1 turns it back on. See the
+ * header for the whole argument.
  */
 
 /*
@@ -1072,7 +1094,10 @@ static void j36_musb_session(struct j36_usb_phy *p, bool on)
 }
 
 /*
- * True while the role is the measurement's to decide.
+ * True while the role is the measurement's to decide, which on this board is
+ * false: vbus defaults to 1 because the charger has an inlet of its own and this
+ * port never has to give up 5 V for one. Everything below is what happens on a
+ * board that shares the socket and asks for vbus=-1.
  *
  * vbus=0 is in here and not excluded from it, which is worth a line: forbidding
  * the port to SOURCE 5 V is not the same question as which role it should be,
@@ -1113,7 +1138,7 @@ static void j36_usb_phy_decide_role(struct j36_usb_phy *p)
 	if (!j36_role_is_auto(p)) {
 		host = true;
 		why = vbus > 0
-			? "vbus=1 pins it"
+			? "vbus=1, which is the default here: charging comes in on the DC inlet, so this port has nothing to arbitrate and never has to stand down"
 			: "there is no j36,musb-controller to measure the port with";
 		goto apply;
 	}
@@ -1122,17 +1147,21 @@ static void j36_usb_phy_decide_role(struct j36_usb_phy *p)
 		/*
 		 * ── THE ATTACH LATCH, AND WHERE THE CHARGER USED TO GO MISSING ──
 		 *
+		 * None of this runs at the default, which is vbus=1: it is the
+		 * shared-socket board's problem, kept because that board still has
+		 * it.  Here the charger is on its own inlet and never touches D+/D-.
+		 *
 		 * FSDEV/LSDEV means "D+ or D- is being held high", and that is not
 		 * quite the same claim as "a device is here".  A divider-type
 		 * charger -- the Apple 2.4 A brick holds D+ near 2.7 V, and the
 		 * Samsung scheme holds both near 1.2 V -- drives the same line a
 		 * device's pull-up does.  So it read as attached, the probe was
 		 * suspended for as long as it stayed plugged in, DRVVBUS never came
-		 * back down, and the PMIC's interlock reported no cable at the very
-		 * moment there was one.  Which is not only a display fault: the
-		 * interlock is right to refuse, because a board charging off its own
-		 * boost is charging the cell from the cell through two conversions.
-		 * Nothing was charging.
+		 * back down, and on a board where CHRIN shares this net the PMIC's
+		 * interlock reported no cable at the very moment there was one.
+		 * Which is not only a display fault: on such a board the interlock
+		 * is right to refuse, because charging off its own boost is charging
+		 * the cell from the cell through two conversions.  Nothing charged.
 		 *
 		 * This file used to say the distinction could not be made from here,
 		 * and left the latch alone rather than guess.  The distinction can be
@@ -1304,7 +1333,7 @@ apply:
 			 why);
 	else
 		dev_info(p->dev,
-			 "port is a DEVICE: %s, so DRVVBUS stays low and the PMIC can see its own CHRDET and charge\n",
+			 "port is a DEVICE: %s, so DRVVBUS stays low -- and on a board where CHRIN shares this net, that is what lets the PMIC see a charger\n",
 			 why);
 }
 
