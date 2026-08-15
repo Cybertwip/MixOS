@@ -387,7 +387,7 @@ Dashboard::Dashboard(QWidget *parent)
     connect(m_pad, &Joypad::devicesChanged, this, &Dashboard::refreshInputSummary);
     connect(m_pad, &Joypad::headphoneJack, this, &Dashboard::onHeadphoneJack);
 
-    /* Stats every candidate executable and IWAD on the card. */
+    /* Stats every candidate executable on the card. */
     Trace::step("buildPages -- looks for the apps on disk");
     buildPages();
 
@@ -443,51 +443,6 @@ QString Dashboard::firstExisting(const QStringList &candidates)
 }
 
 /*
- * doomgeneric identifies an IWAD by its filename before it opens it -- d_iwad.c
- * matches against a fixed iwads[] table -- so this looks for those names and not
- * for *.wad.  The order is the order that table has them in.
- */
-QString Dashboard::firstWad()
-{
-    const QStringList names = QStringList()
-        << "freedoom1.wad" << "freedoom2.wad" << "freedm.wad"
-        << "doom.wad" << "doom1.wad" << "doom2.wad"
-        << "plutonia.wad" << "tnt.wad" << "chex.wad" << "hacx.wad";
-    /*
-     * NAMED, and it has to be.  Written inline --
-     *
-     *     for (const QString &dir : QStringList() << "/opt/mixos/share/doom" << ...)
-     *
-     * -- this loop iterates freed memory, and it is the bad_alloc that killed the
-     * dashboard in the phase that builds it.
-     * QStringList::operator<< returns a REFERENCE to the temporary, so what the
-     * range-for binds is `auto &&__range = <QStringList&>' -- a reference
-     * initialised from another reference.  The lifetime-extension rule only fires
-     * when the temporary is bound to the reference DIRECTLY, so it does not fire
-     * here: the QStringList is destroyed at the semicolon, before the first
-     * iteration, and begin()/end() then walk a released QArrayData.  Constructing
-     * a QString from that garbage asks qMallocAligned for whatever the freed
-     * header now says the length is, and Q_CHECK_PTR turns the null into a
-     * std::bad_alloc thrown from inside libQt5Core -- no size, no frame, no
-     * operator new involved, which is exactly the console this board printed.
-     *
-     * g++ said so, in the only terms it has for a dead object: two
-     * `-Wuninitialized' hits on this line, in a build that otherwise had none.
-     *
-     * A named list is bound directly and lives to the end of the function.  C++23
-     * extends the inline form's lifetime too (P2718R0), but this is built as
-     * gnu++17.
-     */
-    const QStringList dirs = QStringList()
-        << "/opt/mixos/share/doom" << "/roms/doom";
-    for (const QString &dir : dirs)
-        for (const QString &n : names)
-            if (QFileInfo(dir + "/" + n).isFile())
-                return dir + "/" + n;
-    return QString();
-}
-
-/*
  * EVERYTHING IS ON THIS GRID NOW, AND THAT IS THE POINT.
  *
  * Media and Settings used to be dock tabs, and for a while they each had a card
@@ -518,34 +473,10 @@ void Dashboard::buildPages()
     QVector<AppEntry> apps;
 
     /*
-     * Doom, and it is first because it is the one thing on this card already proved
-     * to put a moving picture on this panel: doomgeneric writes 32-bit pixels into
-     * /dev/fb0 and reads the pad through evdev, which is exactly the layer this
-     * dashboard draws in.  No EGL, no GBM, no mode set -- so it hands the panel back
-     * when it exits, which nothing that sets a mode on this board does.
-     */
-    AppEntry doom;
-    doom.key = QStringLiteral("doom");
-    doom.title = tr("Doom");
-    doom.accent = Theme::blue();
-    doom.glyph = GlyphGames;
-    doom.exe = firstExisting(QStringList() << "/opt/mixos/bin/doom");
-    const QString wad = firstWad();
-    if (!doom.exe.isEmpty() && !wad.isEmpty())
-        doom.args = QStringList() << "-iwad" << wad;
-    doom.available = !doom.exe.isEmpty() && !wad.isEmpty();
-    /* Said when the card is pressed, not printed under it: see AppEntry. */
-    if (doom.exe.isEmpty())
-        doom.reason = tr("Not installed. Build with J36_DOOM=1 to put it in /opt/mixos.");
-    else if (wad.isEmpty())
-        doom.reason = tr("No IWAD in /opt/mixos/share/doom.");
-    apps.append(doom);
-
-    /*
-     * A web browser, next to Doom because that is where it was asked for, and a
-     * real graphical one: a window with a URL bar, images, CSS, and a pointer the
-     * D-pad drives.  It gets there the same way Doom does -- an external process
-     * that owns the framebuffer while it runs and hands it back when it exits --
+     * A web browser, and a real graphical one: a window with a URL bar, images,
+     * CSS, and a pointer the D-pad drives.  It gets there the way every card here
+     * launches -- an external process that owns the framebuffer while it runs and
+     * hands it back when it exits --
      * and the details are in build-in-vm.sh and in tools/j36-padx.c, where they
      * belong.  What is worth having HERE is why the answer is that and not
      * something smaller, because two of the three things that decide it look like
@@ -569,8 +500,8 @@ void Dashboard::buildPages()
      *      VT switch costs here: the kernel's console driver was never bound to this
      *      simplefb, so a shell moved to another VT is a shell nobody can see.  An X
      *      server needs none of that.  xf86-video-fbdev mmaps /dev/fb0 and draws its
-     *      own pixels into it, exactly as this dashboard's linuxfb plugin and fbdoom
-     *      already do, and it asks the console layer for nothing because there are no
+     *      own pixels into it, exactly as this dashboard's linuxfb plugin already
+     *      does, and it asks the console layer for nothing because there are no
      *      kernel-rendered glyphs anywhere in the picture.  The VT dance is separate
      *      and optional: `-sharevts -novtswitch -keeptty vt1' is Xorg's own way of
      *      being told the VT belongs to somebody else, and with those it issues no
@@ -1440,7 +1371,7 @@ void Dashboard::toast(const QString &text, int ms)
  * ── A LAUNCH DOES NOT STOP THE EVENT LOOP ANY MORE ───────────────────────────
  *
  * This was QProcess::execute, which is start() plus a blocking wait, and the wait
- * was the whole problem.  For as long as Doom was up, mixdash was a process
+ * was the whole problem.  For as long as the child was up, mixdash was a process
  * sitting in waitpid(): no timers, so the console guard never ran and a unit
  * started behind the child could put fbcon back over it with nothing here to
  * notice; no signal delivery through the event loop; and -- the reason this came

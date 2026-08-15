@@ -40,13 +40,6 @@ KERNEL_OUT="$WORK/kernel-build"
 BUSYBOX_URL="${J36_BUSYBOX_URL:-https://git.busybox.net/busybox}"
 BUSYBOX_BRANCH="${J36_BUSYBOX_BRANCH:-1_36_stable}"
 BUSYBOX_SRC="$WORK/busybox"
-# fbdoom: the first thing that drew a moving picture on this panel, and off by
-# default now that the dashboard draws on it -- J36_DOOM=1 stages it again.
-# Pinned to a commit rather than a branch because the build recipe below derives
-# its source list from the layout of that tree -- see the fbdoom section for why.
-DOOM_URL="${J36_DOOM_URL:-https://github.com/ozkl/doomgeneric}"
-DOOM_COMMIT="${J36_DOOM_COMMIT:-dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284}"
-DOOM_SRC="$WORK/doomgeneric"
 MODULE_SRC="$WORK/module-src"
 DTB_OUT="$WORK/dtb"
 INITROOT="$WORK/initramfs-root"
@@ -576,7 +569,7 @@ done
 # hand-off to Linux.  Reading an unpowered MTK subsystem stalls the AXI bus, so a
 # built-in lima would probe during boot and take the board into a watchdog reset
 # with nothing in any log to say why -- and it would do that on every boot,
-# destroying the serial console, the input bring-up and the fbdoom test with it.
+# destroying the serial console and the input bring-up with it.
 # As a module it is loaded from /init only after tools/mfgpower.c has powered the
 # domain and read back the GP and PP product IDs, and only when the command line
 # asks for it.  A default boot is byte-identical to the one before this section.
@@ -1769,7 +1762,7 @@ cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 # have been working, which is the worst possible failure mode.  Forty kilobytes of
 # baseline JPEG decoder costs nothing and cannot do that.
 #
-# Non-fatal, like fbdoom and mfgpower: a splash is decoration, and the boot has
+# Non-fatal, like mfgpower: a splash is decoration, and the boot has
 # to survive its absence.  /init tests for both files before running anything.
 SPLASH_SRC="$ROOT/device/j36-ultra/tools/mixsplash.c"
 SPLASH_JPEG="$ROOT/device/j36-ultra/resources/MixOS.jpg"
@@ -3009,7 +3002,13 @@ expand_root() {
         # before.  ONE READ, and it has to be here -- after the partition grew and before
         # the filesystem does, which is the only moment the old block count is still the
         # filesystem's own answer.
-        ex_bs=0; ex_isz=0; ex_ipg=0; ex_bpg=0; ex_blocks=0
+        # `Filesystem state:' comes out of the same read and is not for the bar; it is
+        # what decides whether the check below runs at all.  ONLY the bare word counts:
+        # a filesystem with something wrong with it says `clean with errors', which is
+        # the same first word and the opposite answer, so the fourth field has to be
+        # empty as well.  Left at 0 when dumpe2fs is missing, which is the safe way
+        # round -- no answer means the check runs, exactly as it always did.
+        ex_bs=0; ex_isz=0; ex_ipg=0; ex_bpg=0; ex_blocks=0; ex_fsclean=0
         if [ -x "$EXPAND_BIN/dumpe2fs" ]; then
             "$EXPAND_BIN/dumpe2fs" -h "$rootdev" > /dev/.expand-fsinfo 2>/dev/null
             while read -r ex_k1 ex_k2 ex_k3 ex_k4; do
@@ -3019,14 +3018,47 @@ expand_root() {
                     "Block count: "*|"Block count:")    ex_blocks="$ex_k3" ;;
                     "Inodes per group:")               ex_ipg="$ex_k4" ;;
                     "Blocks per group:")               ex_bpg="$ex_k4" ;;
+                    "Filesystem state: clean")
+                        if [ -z "$ex_k4" ]; then ex_fsclean=1; fi ;;
                 esac
             done < /dev/.expand-fsinfo
         fi
 
-        # resize2fs refuses a filesystem it has not seen checked, so this is not
-        # optional.  -p fixes what can be fixed without asking, because there is nobody
-        # to ask; status 1 means it corrected something and the filesystem is now good,
-        # which is a success here.  Anything above that is a filesystem to leave alone.
+        # ── THE CHECK, AND WHEN IT IS NOT WORTH ITS OWN RISK ─────────────────
+        #
+        # resize2fs will not touch a filesystem whose last check is older than its last
+        # mount, and this filesystem was mounted about a second ago, so something has to
+        # answer that.  There are two ways to answer it and this used to know only one.
+        #
+        # THE CHECK ITSELF IS NOT FREE, and on this board it is not free in the way that
+        # matters: it is the FIRST sustained read of the card in the whole boot, it runs
+        # with the root filesystem unmounted, and it runs before anything has started
+        # that could make the board survive it.  A board that goes off in the middle of
+        # `checking the filesystem' has spent that time buying a guarantee it did not
+        # need -- because the other way of answering resize2fs is to observe that the
+        # superblock already says `clean', which is a statement the ext2 driver wrote
+        # there when this very function unmounted the partition eleven lines up.
+        #
+        # So: clean means skip, and `-f' on resize2fs below is what makes the skip legal.
+        # That flag turns off exactly one test, the last-checked-versus-last-mounted one,
+        # and leaves the test that matters -- resize2fs still refuses a filesystem whose
+        # superblock is not marked valid, force or no force.  The card is not being taken
+        # on trust; it is being taken on the one bit that is the whole of what a check
+        # would have confirmed for a filesystem nothing has touched since it was written.
+        #
+        # NOT clean is the interesting case and it still runs the full check: a card
+        # pulled mid-write, a card from a board that was switched off in the dashboard,
+        # a card an older build left half-grown.  Those are the cards a check is for.
+        #
+        # `j36.expand=fsck' forces it anyway, and it exists for the same reason
+        # `j36.expand=retry' does: if a grow ever fails on a filesystem that says it is
+        # clean, the operator needs a way to make the check happen that does not involve
+        # mounting an ext2 partition on a Mac.  It is a word in the FAT partition's
+        # boot.conf, and it is per-boot like every other j36. word.
+        #
+        # -p fixes what can be fixed without asking, because there is nobody to ask;
+        # status 1 means it corrected something and the filesystem is now good, which is
+        # a success here.  Anything above that is a filesystem to leave alone.
         #
         # -C 1 IS WHAT MAKES IT COUNTABLE.  With a file descriptor given, e2fsck stops
         # drawing a bar for a terminal and writes one line per tick -- "pass cur max
@@ -3035,43 +3067,49 @@ expand_root() {
         # It runs in a grandchild so that this loop can read that file while it works;
         # the exit status comes back through a file because BusyBox ash has no
         # PIPESTATUS and no way to poll a background job.
-        ex_step "checking the filesystem"
-        ex_pct 4
-        : > /dev/.expand-fsck
-        : > /dev/.expand-fsck-rc
-        ( "$EXPAND_BIN/e2fsck" -fp -C 1 "$rootdev" > /dev/.expand-fsck 2>/dev/null
-          echo $? > /dev/.expand-fsck-rc ) &
-        while [ ! -s /dev/.expand-fsck-rc ]; do
-            if [ -s /dev/.expand-fsck ]; then
-                # Through a one-line file rather than a command substitution, because
-                # `$(tail ...)' forks a subshell every second for the length of a check
-                # that can run for minutes, and this shell has to stay responsive to the
-                # only other thing it does -- notice that the grandchild has finished.
-                ex_p=0; ex_c=0; ex_m=0
-                tail -n 1 /dev/.expand-fsck > /dev/.expand-fsck.last 2>/dev/null
-                read -r ex_p ex_c ex_m ex_rest < /dev/.expand-fsck.last 2>/dev/null
-                case "$ex_p" in
-                    1|2|3|4|5)
-                        # A pass's own share of the check is one fifth of it, which is
-                        # rough and is monotonic, and monotonic is the property that
-                        # matters on a bar somebody is watching.  The divide is turned
-                        # round when max is large because this arithmetic is 32-bit and
-                        # cur*100 on a 64 GB filesystem is not.
-                        if [ "$ex_m" -gt 100000 ] 2>/dev/null; then
-                            ex_in=$(( ex_c / (ex_m / 100) ))
-                        elif [ "$ex_m" -gt 0 ] 2>/dev/null; then
-                            ex_in=$(( ex_c * 100 / ex_m ))
-                        else
-                            ex_in=0
-                        fi
-                        if [ "$ex_in" -gt 100 ]; then ex_in=100; fi
-                        ex_pct $(( 4 + ((ex_p - 1) * 100 + ex_in) * 26 / 500 ))
-                        ;;
-                esac
-            fi
-            sleep 1
-        done
-        read -r ex_rc < /dev/.expand-fsck-rc
+        ex_rc=0
+        if [ "$ex_fsclean" = 1 ] && [ "$want_expand" != fsck ]; then
+            ex_step "the filesystem is clean"
+            ex_pct 29
+        else
+            ex_step "checking the filesystem"
+            ex_pct 4
+            : > /dev/.expand-fsck
+            : > /dev/.expand-fsck-rc
+            ( "$EXPAND_BIN/e2fsck" -fp -C 1 "$rootdev" > /dev/.expand-fsck 2>/dev/null
+              echo $? > /dev/.expand-fsck-rc ) &
+            while [ ! -s /dev/.expand-fsck-rc ]; do
+                if [ -s /dev/.expand-fsck ]; then
+                    # Through a one-line file rather than a command substitution, because
+                    # `$(tail ...)' forks a subshell every second for the length of a check
+                    # that can run for minutes, and this shell has to stay responsive to the
+                    # only other thing it does -- notice that the grandchild has finished.
+                    ex_p=0; ex_c=0; ex_m=0
+                    tail -n 1 /dev/.expand-fsck > /dev/.expand-fsck.last 2>/dev/null
+                    read -r ex_p ex_c ex_m ex_rest < /dev/.expand-fsck.last 2>/dev/null
+                    case "$ex_p" in
+                        1|2|3|4|5)
+                            # A pass's own share of the check is one fifth of it, which is
+                            # rough and is monotonic, and monotonic is the property that
+                            # matters on a bar somebody is watching.  The divide is turned
+                            # round when max is large because this arithmetic is 32-bit and
+                            # cur*100 on a 64 GB filesystem is not.
+                            if [ "$ex_m" -gt 100000 ] 2>/dev/null; then
+                                ex_in=$(( ex_c / (ex_m / 100) ))
+                            elif [ "$ex_m" -gt 0 ] 2>/dev/null; then
+                                ex_in=$(( ex_c * 100 / ex_m ))
+                            else
+                                ex_in=0
+                            fi
+                            if [ "$ex_in" -gt 100 ]; then ex_in=100; fi
+                            ex_pct $(( 4 + ((ex_p - 1) * 100 + ex_in) * 26 / 500 ))
+                            ;;
+                    esac
+                fi
+                sleep 1
+            done
+            read -r ex_rc < /dev/.expand-fsck-rc
+        fi
         if [ "$ex_rc" -gt 1 ]; then
             ex_done "e2fsck says $rootdev needs attention (status $ex_rc), so it was not grown"
             mount -t "$rootfs_type" "$rootdev" /newroot 2>/dev/null
@@ -3080,6 +3118,12 @@ expand_root() {
 
         # No size argument: resize2fs with none grows the filesystem to fill whatever
         # the partition now is, which is exactly the question that was just answered.
+        #
+        # -f, and the block above is where it is explained: it drops the
+        # last-checked-versus-last-mounted test and nothing else.  Passed unconditionally
+        # rather than only on the skipped path, because on the path where the check DID
+        # run it turns off a test that had just been satisfied -- a flag that changes
+        # nothing is better here than a second spelling of this line to keep in step.
         #
         # The estimate assembled above becomes a percentage here.  Field 7 of a disk's
         # /sys/block/<name>/stat is sectors written since boot, and nothing else on this
@@ -3107,7 +3151,7 @@ expand_root() {
         read -r ex_f1 ex_f2 ex_f3 ex_f4 ex_f5 ex_f6 ex_w0 ex_rest \
             < "/sys/block/$ex_disk/stat" 2>/dev/null
         : > /dev/.expand-resize-rc
-        ( "$EXPAND_BIN/resize2fs" "$rootdev" >/dev/null 2>&1
+        ( "$EXPAND_BIN/resize2fs" -f "$rootdev" >/dev/null 2>&1
           echo $? > /dev/.expand-resize-rc ) &
         while [ ! -s /dev/.expand-resize-rc ]; do
             if [ "$ex_est" -gt 0 ]; then
@@ -3539,13 +3583,14 @@ stage_from_boot() {
     return 0
 }
 
-# Doom used to run from here, off the BOOT partition, before the dashboard existed.
-# It does not any more and there is no j36.doom word.  A 26 MiB IWAD was the first
-# thing that obviously did not belong on a 100 MB vfat launcher partition shared with
-# an R36S card's own boot files, and moving it is what started the layout the rest of
-# the payload now follows.  A J36_DOOM=1 build puts doomgeneric and its IWAD in
-# /opt/mixos on the ext2 OS partition, where the dashboard's Doom card launches them
-# -- after the boot, from a shell, rather than in the middle of an initramfs.
+# A game used to run from here, off the BOOT partition, before the dashboard existed:
+# a framebuffer Doom, staged as boot payload and started by /init.  It is gone, and
+# what it left behind is the layout the rest of the payload follows.  A 26 MiB IWAD
+# was the first thing that obviously did not belong on a 100 MB vfat launcher
+# partition shared with an R36S card's own boot files, and moving userland software
+# off BOOT and into /opt/mixos on the ext2 OS partition is the rule everything staged
+# below now obeys.  MixOS ships a base operating system; games are something the
+# operator installs, from the dashboard's Packages page or by hand.
 
 # ── The Mali-450, if the command line asks ───────────────────────────────────
 #
@@ -4537,8 +4582,8 @@ RestartPreventExitStatus=3 4
 # immortal; it moves it a few hundred points down a 0..1000 scale, which is enough
 # to put anything with a real appetite ahead of it.
 #
-# CHILDREN INHERIT THIS, and that is deliberate for the cube, Doom and the
-# emulators -- they are the thing the user is looking at, and the dashboard behind
+# CHILDREN INHERIT THIS, and that is deliberate for the cube and for whatever the
+# operator installs -- they are the thing the user is looking at, and the dashboard behind
 # them is redrawable. It is NOT right for the browser, which is the one child here
 # that can eat the whole board on its own, so j36-browser-session raises its own
 # score back above zero on the way in. That pair is the whole policy: the browser
@@ -6830,198 +6875,6 @@ python3 "$ROOT/device/j36-ultra/create_boot_image.py" \
 # RECOVERY.
 fits_in "$ARTIFACTS/boot.img" $((0x00900000)) "the BOOTIMG payload"
 
-# ── fbdoom: the first moving picture on this panel ────────────────────────────
-#
-# Everything above proves the machine boots.  Nothing above proves the panel can
-# be driven by a program, which is the next question, and the cheapest honest
-# answer to it is Doom writing 32-bit pixels into /dev/fb0 and reading the pad
-# from /dev/input/event0.
-#
-# NOTHING ON THE ROOTFS COULD DO THIS.  The shared armhf rootfs already carries
-# gzdoom and lzdoom.  SDL2 has no fbdev backend -- KMSDRM, X11, Wayland, offscreen
-# and dummy are the whole list -- so both need either DRM/KMS, which this kernel
-# has no driver for yet, or a GL stack, and the GL stack on that card is the
-# RK3326's Mali-G31 Bifrost blob for a SoC whose GPU is a Mali-450.  doomgeneric
-# needs none of it: no SDL, no X11, no GL, no DRM.
-#
-# WHERE IT LIVES, AND WHY NOT IN THE INITRAMFS OR ON BOOT.  The initramfs goes
-# into both payloads, and boot.img is capped at the 9 MiB BOOTIMG slot asserted
-# just above.  A static ARM Doom is around 2 MiB and the IWAD is 24 MiB more, so
-# putting either there would push the eMMC payload into RECOVERY.  It used to go
-# on the FAT BOOT partition and /init used to run it before the hand-over; both
-# have changed, because BOOT is a small vfat partition shared with an R36S's own
-# boot files and 26 MiB of game is not boot payload.  Doom is userland software
-# now: it ships in the second partition's /opt/mixos tree beside the dashboard,
-# and the dashboard launches it.  That is a better fit than it sounds -- fbdoom
-# writes 32-bit pixels into /dev/fb0 and reads evdev, which is exactly the layer
-# mixdash draws in, so it is the one thing on this card guaranteed to be able to
-# take the panel and hand it back.
-#
-# THE SOURCE LIST IS CHECKED, NOT WRITTEN.  doomgeneric's own Makefile is a
-# hand-maintained object list for its X11 front end.  Deriving ours from the tree
-# by exclusion -- every .c except the other front ends and the SDL/Allegro sound
-# and GUS/icon/MIDI files -- and then diffing it against that list means an
-# upstream file this recipe does not know about is a build failure here rather
-# than a link error against a library this board has not got.  That check is only
-# meaningful because DOOM_COMMIT is pinned; overriding it is what should trip it.
-#
-# NONE OF IT IS FATAL.  A game must never cost the user the kernel artifacts, so
-# the build runs with errexit suspended and a failure only means the payload is
-# not staged.  That matters most on the first build on a new machine, where this
-# is the one step whose compiler has never been exercised here.
-FBDOOM_SRC="$ROOT/device/j36-ultra/fbdoom/doomgeneric_j36.c"
-DOOM_BIN=""
-DOOM_WAD=""
-
-build_fbdoom() {
-    local dir stamp want expected actual
-    local -a srcs
-
-    [[ -f "$FBDOOM_SRC" ]] || { log "fbdoom: $FBDOOM_SRC is missing"; return 1; }
-
-    if [[ ! -d "$DOOM_SRC/.git" ]]; then
-        log "Cloning doomgeneric once for the framebuffer Doom payload"
-        # Not --depth=1: the pinned commit has to be in the clone.
-        git clone "$DOOM_URL" "$DOOM_SRC" || return 1
-    fi
-    git -C "$DOOM_SRC" checkout -q "$DOOM_COMMIT" 2>/dev/null || {
-        git -C "$DOOM_SRC" fetch -q origin || return 1
-        git -C "$DOOM_SRC" checkout -q "$DOOM_COMMIT" || return 1
-    }
-
-    dir="$DOOM_SRC/doomgeneric"
-    [[ -d "$dir" ]] || { log "fbdoom: $dir is not in that checkout"; return 1; }
-    cp "$FBDOOM_SRC" "$dir/" || return 1
-
-    mapfile -t srcs < <(cd "$dir" && ls ./*.c | sed 's|^\./||' |
-        grep -vE '^(doomgeneric_|i_sdl|i_allegro|gusconf\.c|icon\.c|mus2mid\.c)') || return 1
-    (( ${#srcs[@]} > 50 )) || { log "fbdoom: only ${#srcs[@]} sources found"; return 1; }
-
-    expected="$(sed -n 's/^SRC_DOOM = //p' "$dir/Makefile" | tr ' ' '\n' |
-        sed 's|\.o$|.c|' | grep -v '^doomgeneric_xlib\.c$' | sort)"
-    actual="$(printf '%s\n' "${srcs[@]}" | sort)"
-    if [[ "$expected" != "$actual" ]]; then
-        log "fbdoom: the derived source list no longer matches doomgeneric's own Makefile:"
-        diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
-        return 1
-    fi
-
-    DOOM_BIN="$dir/doom-j36"
-    stamp="$dir/.j36-built"
-    want="$DOOM_COMMIT $(sha256sum "$FBDOOM_SRC" | awk '{print $1}')"
-    if [[ -x "$DOOM_BIN" && "$(cat "$stamp" 2>/dev/null)" == "$want" ]]; then
-        log "fbdoom: reusing $DOOM_BIN"
-    else
-        # 640x400 is a clean 2x of doom's 320x200 inside the 640x480 panel;
-        # doomgeneric_j36.c explains why 480 would leave garbage on screen.
-        # -std=gnu17 pins the dialect: this is 1997 C, and gcc 14 promoted
-        # implicit declarations and int/pointer mismatches to hard errors.
-        #
-        # THE TWO -Wno- FLAGS, AND WHY SILENCING BEATS PATCHING HERE.  This
-        # engine emits exactly five warnings and every one of them is upstream's,
-        # in a tree pinned to DOOM_COMMIT that this recipe deliberately does not
-        # fork -- the source list a few lines up is checked against upstream's
-        # own Makefile precisely so that this stays a checkout and not a patch
-        # queue.  Both flags are blanket over sixty-odd files, which is the cost.
-        #
-        # -Wno-format-truncation covers four of them: "map%i" and "map0%i" in
-        # p_setup.c, "CWILV%2.2d" and "WIA%d%.2d%.2d" in wi_stuff.c.  The target
-        # is char[9] because a WAD lump name is eight characters and a NUL.  gcc
-        # sees plain ints and has to reason about INT_MIN..INT_MAX; the actual
-        # values are a map number and two loop counters bounded by NUMEPISODES
-        # and NUMMAPS, so the longest name any of them can produce is eight
-        # characters.  There is nothing to fix even in the impossible case:
-        # these are snprintf, which truncates and terminates rather than
-        # overflowing, so the warning describes a wrong lump name -- a missing
-        # graphic -- and not a memory error.  The only way to convince gcc is to
-        # narrow the types in someone else's game engine.
-        #
-        # -Wno-unused-result covers the fifth, m_menu.c ignoring fread's result
-        # while reading the 24-byte description out of each save file.  That one
-        # is a real gap: a truncated save leaves the previous contents of a
-        # static buffer showing as the slot name in the load menu.  It is still
-        # a static buffer and still NUL-terminated, so it is a stale label and
-        # not a crash, and it takes a corrupt save to see it at all.
-        #
-        # If DOOM_COMMIT is ever bumped, drop both flags for one build and read
-        # what comes out before putting them back.
-        log "fbdoom: compiling ${#srcs[@]} sources in one pass for ARMv7"
-        ( cd "$dir" && arm-linux-gnueabihf-gcc \
-            -O2 -std=gnu17 -fcommon -static \
-            -DNORMALUNIX -DLINUX -DSNDSERV -D_DEFAULT_SOURCE \
-            -DDOOMGENERIC_RESX=640 -DDOOMGENERIC_RESY=400 \
-            -Wno-error=implicit-function-declaration \
-            -Wno-format-truncation -Wno-unused-result \
-            -o doom-j36 "${srcs[@]}" doomgeneric_j36.c -lm ) || return 1
-        printf '%s\n' "$want" >"$stamp"
-    fi
-
-    # The same two tests verify_arm_elf makes, spelled out rather than called:
-    # that helper reports through die(), and a failure here must not take the
-    # kernel artifacts down with it.  Static on purpose -- this runs from the
-    # initramfs, before switch_root, so there is no ld.so and no /lib.
-    local header
-    header="$(readelf -hd "$DOOM_BIN" 2>/dev/null)" || return 1
-    grep -q 'Class:.*ELF32' <<<"$header" || { log "fbdoom: not a 32-bit ELF"; return 1; }
-    grep -q 'Machine:.*ARM' <<<"$header" || { log "fbdoom: not an ARM ELF"; return 1; }
-    if grep -q 'NEEDED' <<<"$header"; then
-        log "fbdoom: the binary wants shared libraries and the initramfs has none"
-        return 1
-    fi
-
-    log "fbdoom: $(stat -c %s "$DOOM_BIN") bytes, static ARM"
-    return 0
-}
-
-fetch_fbdoom_wad() {
-    local name
-    if [[ -n "${J36_DOOM_WAD:-}" ]]; then
-        [[ -f "$J36_DOOM_WAD" ]] || { log "fbdoom: J36_DOOM_WAD=$J36_DOOM_WAD is not a file"; return 1; }
-        name="$(basename "$J36_DOOM_WAD")"
-        # d_iwad.c identifies an IWAD by filename before it opens it, so a WAD
-        # under a name its iwads[] table does not carry is refused by the engine.
-        case "$name" in
-            doom.wad|doom1.wad|doom2.wad|plutonia.wad|tnt.wad|chex.wad|hacx.wad|\
-            freedm.wad|freedoom1.wad|freedoom2.wad) ;;
-            *) log "fbdoom: $name is not a name doomgeneric's iwads[] table knows; it will be refused" ;;
-        esac
-        DOOM_WAD="$J36_DOOM_WAD"
-        return 0
-    fi
-    python3 "$ROOT/device/j36-ultra/fetch_freedoom.py" \
-        --cache "$CACHE" --out "$CACHE/freedoom1.wad" || return 1
-    DOOM_WAD="$CACHE/freedoom1.wad"
-    return 0
-}
-
-# Off by default, and the default is about the download rather than about the game:
-# J36_DOOM=1 clones doomgeneric and fetches a 26 MiB Freedoom IWAD, which is not
-# something a kernel build should do unasked.  What it no longer costs is the BOOT
-# partition -- with J36_DOOM=1 the binary and the IWAD go into the second partition's
-# /opt/mixos tree, and the dashboard grows a Doom card that runs them.  With
-# J36_DOOM=0 that card says so and everything else is unchanged.
-if [[ "${J36_DOOM:-0}" == 1 ]]; then
-    set +e
-    build_fbdoom
-    doom_rc=$?
-    set -e
-    if (( doom_rc != 0 )); then
-        DOOM_BIN=""
-        log "fbdoom: not staged, see the error above -- the kernel payload is unaffected"
-    else
-        set +e
-        fetch_fbdoom_wad
-        wad_rc=$?
-        set -e
-        if (( wad_rc != 0 )); then
-            DOOM_WAD=""
-            log "fbdoom: no IWAD, so the binary ships without one; drop a doom.wad into j36/ on the card"
-        fi
-    fi
-else
-    log "fbdoom: J36_DOOM=0, skipping the Doom payload"
-fi
-
 # ── The lima payload: one helper and the module set it gates ──────────────────
 #
 # CONFIG_DRM_LIMA is =m, so the driver is not in the kernel and not in the
@@ -7042,7 +6895,7 @@ fi
 # error: it means that symbol's owner is built into vmlinux, which is exactly what
 # DRM=y produces for the drm core itself.
 #
-# Non-fatal, like fbdoom: the GPU must never cost the user the kernel artifacts.
+# Non-fatal, like the splash: the GPU must never cost the user the kernel artifacts.
 MFGPOWER_SRC="$ROOT/device/j36-ultra/tools/mfgpower.c"
 MFGPOWER_BIN=""
 LIMA_MODULE_PATHS=()
@@ -7644,7 +7497,7 @@ collect_gl_payload() {
 # armhf gcc names the interpreter in DT_NEEDED as well as in PT_INTERP, so
 # ld-linux-armhf.so.3 is expected there and is not a dependency this has to ship.
 #
-# Non-fatal, like fbdoom and mfgpower: a diagnostic must never cost the user the
+# Non-fatal, like mfgpower: a diagnostic must never cost the user the
 # kernel artifacts.  Hence the local readelf tests instead of verify_arm_elf,
 # which dies.
 EGLPROBE_SRC="$ROOT/device/j36-ultra/tools/j36-eglprobe.c"
@@ -7702,7 +7555,7 @@ build_eglprobe() {
 # initramfs shell, where there is no ld.so and no /lib, which is the shell somebody
 # ends up in when the dock is the thing that is not working.
 #
-# Non-fatal, like eglprobe, fbdoom and mfgpower.  A board with no dongle plugged into
+# Non-fatal, like eglprobe and mfgpower.  A board with no dongle plugged into
 # it must not lose its kernel artifacts because a 700-line accessory failed to build.
 MIXMIRROR_SRC="$ROOT/device/j36-ultra/tools/j36-mixmirror.c"
 MIXMIRROR_BIN=""
@@ -8386,7 +8239,7 @@ QTCONF
 #   and nothing appeared.  That is still true and nothing here changes it.
 #
 #   AN X SERVER DRAWS ITS OWN PIXELS.  xf86-video-fbdev mmaps /dev/fb0 and writes
-#   into it exactly the way mixdash's linuxfb plugin and fbdoom already do.  It asks
+#   into it exactly the way mixdash's linuxfb plugin already does.  It asks
 #   the console layer for nothing, because the only glyphs on the screen are ones it
 #   rendered itself.  The VT dance is separate from that and is entirely optional:
 #   `-sharevts -novtswitch -keeptty vt1' is Xorg's own way of saying "this VT
@@ -8644,10 +8497,9 @@ cp "$ARTIFACTS/initramfs-j36-ultra.cpio.xz" "$SDBOOT/initrd.img"
 # about.  Delete a directory under it on the card and the boot is exactly what it was
 # before -- /init says so and carries on.
 #
-# Doom and its IWAD are in the same partition, under opt/mixos/bin and
-# opt/mixos/share; see the /opt/mixos section below.  They were on BOOT once, and 26 MiB
-# of game on the launcher partition is what started the move that this whole layout
-# finished.
+# Userland software lives in the other partition, under opt/mixos; see the /opt/mixos
+# section below.  A game was on BOOT once, and 26 MiB of it on the launcher partition
+# is what started the move that this whole layout finished.
 
 # Remove j36/mfgpower or j36/modules and j36.lima=1 finds nothing, says so, and the
 # boot continues.  load.order is written from the walk above, one module per line in
@@ -8942,7 +8794,6 @@ changes nothing else:
                            the chime the dashboard plays once, on the frame it
                            first paints.  Delete it and the dashboard is silent
                            at boot and otherwise unchanged.
-  opt/mixos/bin/doom       framebuffer Doom, and share/doom/ its IWAD
   opt/mixos/bin/j36-mixmirror
                            copies /dev/fb0 onto a USB-HDMI (DisplayLink) adapter
                            whenever one is plugged in, tile-diffed so a still
@@ -9273,13 +9124,12 @@ rdinit=/init root=/dev/mmcblk0p2 rw rootwait
     See above: /init does the mounting, so root= cannot panic the kernel.
 
 j36.doom=1
-    Gone.  /init does not read this word any more and there is nothing on BOOT for
-    it to run: a J36_DOOM=1 build stages doomgeneric and its IWAD as
-    /opt/mixos/bin/doom and /opt/mixos/share/doom on the OS partition, and the
-    dashboard's Doom card launches them -- after the boot, from a shell, rather than
-    in the middle of an initramfs.  It is still the quickest thing to reach for when
-    the GL path breaks: Doom needs no DRM and no GL, so if Doom draws and the cube
-    does not, the panel is fine and the fault is above it.
+    Gone, and so is what it started.  A framebuffer Doom was this card's first proof
+    that a program could drive the panel, and /init ran it off BOOT before the
+    dashboard existed.  MixOS ships a base operating system now: no game is built,
+    fetched or staged, and nothing on the card carries an IWAD.  The word is refused
+    the way every unknown word is -- silently -- and the dashboard's Packages page is
+    where a game comes from if one is wanted.
 
 j36.lima=1
     Power the Mali-450 and load the DRM lima driver, in that order and only in
@@ -10055,54 +9905,30 @@ j36.splash=1
     this file on the card by hand does exactly the same thing, so a card built with
     the splash does not have to be rebuilt to lose it.
 
-Doom, what it was for, and why it is no longer on the card
-----------------------------------------------------------
+Doom, what it was for, and why the card no longer carries it
+------------------------------------------------------------
 
 It answered a question the boot itself does not: whether a program can drive this
-panel and read this pad.  It did, the answer was yes, and the dashboard now
-answers the same question every boot -- so J36_DOOM defaults to 0 and neither
-j36/doom nor an IWAD is written to this partition.  Everything below is what a
-J36_DOOM=1 build stages, kept because /init still runs it and because it is the
-fastest way to split "the panel is broken" from "GL is broken".
+panel and read this pad.  Nothing else on the card could ask it at the time --
+SDL2 here has no fbdev backend, so anything SDL-based needs DRM/KMS or GL, this
+kernel had no DRM driver bound yet, and the GL stack in the shared rootfs is the
+RK3326's Mali-G31 blob for a GPU this SoC has not got.  A framebuffer Doom needed
+none of that: it wrote 32-bit pixels into /dev/fb0, which is the framebuffer the
+MVII LK was already scanning out when it jumped to the kernel, and read
+/dev/input/event0 from j36_mt6592_input.ko.
 
-Nothing else on the card could ask it at the time -- SDL2 here has no fbdev
-backend, so anything SDL-based needs DRM/KMS or GL, this kernel had no DRM driver
-bound yet, and the GL stack in the shared rootfs is the RK3326's Mali-G31 blob for
-a GPU this SoC has not got.  doomgeneric needs none of that: it writes 32-bit
-pixels into /dev/fb0, which is the framebuffer the MVII LK was already scanning out
-when it jumped to the kernel, and reads /dev/input/event0 from
-j36_mt6592_input.ko.
+It did that, the answer was yes, and the dashboard has answered the same question
+on every boot since -- it draws through the same linuxfb path and reads the same
+evdev nodes.  So the game is gone: nothing is cloned, nothing is compiled, no
+26 MiB IWAD is fetched, and neither /opt/mixos/bin/doom nor /opt/mixos/share/doom
+is written to this partition.  MixOS is a base operating system, and a game is
+not part of one.
 
-It runs from the initramfs, before switch_root, so it touches nothing on the
-shared rootfs and competes with no systemd unit for the panel.  It takes the VT
-into KD_GRAPHICS while it runs, which is what stops kernel messages painting
-over the frame, and puts it back on the way out -- including out through a
-signal, so a crash cannot leave the panel frozen on the last frame.
-
-  D-pad, left stick   turn and walk        640x400 centred in the 640x480 panel,
-  A                   fire                 which is a clean 2x of Doom's 320x200
-  B                   use, open doors      with 40 black lines top and bottom
-  X                   run
-  Y                   automap
-  L1, R1              strafe left, right
-  L2, R2              weapons 3 and 4
-  stick clicks        weapons 1 and 2
-  START               enter (menu select)
-  SELECT              escape (menu)
-  VOL-, VOL+          smaller, larger view
-  MENU                quit, and the boot continues
-
-The WAD is Freedoom 0.13.0, which is freely redistributable; the engine has no
-game data of its own.  Any IWAD works in its place, as long as the filename is
-one doomgeneric's d_iwad.c recognises -- doom.wad, doom1.wad, doom2.wad,
-freedoom1.wad, freedoom2.wad, freedm.wad, plutonia.wad, tnt.wad, chex.wad or
-hacx.wad.  /init takes the first of those it finds in j36/.
-
-There is no sound from Doom: doomgeneric is built with sound compiled out.  That
-was honest about the kernel when it was written -- nothing drove the MT6592 audio
-path at all -- and it is now merely a build option that was never revisited.  The
-audio path is j36.audio=1 above, and it goes through ALSA, which this build of
-doomgeneric was not linked against.
+What replaced it as a diagnostic is the dashboard itself, plus j36-eglprobe for
+the GL half: if the dashboard paints, the panel and the input path are fine and a
+GL fault is above them.  What replaced it as a way to have Doom is the Packages
+page, which installs Debian's own -- chocolate-doom, prboom-plus and freedoom are
+in the archive this rootfs points at.
 
 The Mali-450, and why a helper runs before the driver
 -----------------------------------------------------
@@ -10991,8 +10817,6 @@ Their own terms:
                             with Qt's own exceptions, and GPL/LGPL/MIT/others for
                             the libraries it needs
     qt/fonts                DejaVu Sans, under the Bitstream Vera licence
-    bin/doom, share/doom    doomgeneric and Doom's engine source, id Software's
-                            under the GPL, as Debian and doomgeneric ship them
     the rootfs on ROOTFS    Debian.  Per-package terms are in
                             /usr/share/doc/*/copyright on the running device.
 
@@ -11000,7 +10824,7 @@ SOURCE.  This is the written offer both licences ask for, and it is a short one
 because everything here is built from public source.  Linux 6.12 LTS comes from
 kernel.org with the two patches in the MixOS repository under
 device/j36-ultra/linux/; the seven MixOS modules are in the same directory; and
-busybox, Mesa, Qt, the fonts and doomgeneric are as Debian packages them.  The
+busybox, Mesa, Qt and the fonts are as Debian packages them.  The
 dual-licensed MixOS work is in the same repository: the dashboard in
 device/j36-ultra/tools/mixdash, and eglprobe, mfgpower and j36-mixmirror beside
 it.  The MixOS build script that assembled this card is
@@ -11077,7 +10901,7 @@ done
 # own units, and never looks in /opt.
 #
 # WHY IT IS A TARBALL AS WELL AS A TREE.  The SONAME aliases in qt/lib are symlinks and
-# mfgpower, eglprobe, mixdash, j36-mixmirror and doom have to stay executable.  A tarball is the copy
+# mfgpower, eglprobe, mixdash and j36-mixmirror have to stay executable.  A tarball is the copy
 # that cannot lose either -- or the ownership -- whatever machine does the copying, and
 # the reason it is not simply a directory to drag across in a file manager.
 #
@@ -11092,10 +10916,10 @@ done
 # SDROOT was declared and cleared up beside SDBOOT, because the j36/ payload above is
 # staged into it.  So this section adds to a tree that may already have files in it,
 # and the tarball below is written whenever ANY of them are there -- not only when the
-# dashboard is.  With J36_MIXDASH=0 and no Doom, opt/mixos/j36 is still the modules,
-# mfgpower and the probe, and a build that silently shipped no tarball for them would
-# leave a card that boots to a dashboard-less console with no GPU either.
-if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
+# dashboard is.  With J36_MIXDASH=0, opt/mixos/j36 is still the modules, mfgpower and
+# the probe, and a build that silently shipped no tarball for them would leave a card
+# that boots to a dashboard-less console with no GPU either.
+if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
     mkdir -p "$SDROOT/opt/mixos/bin"
 
     if [[ -n "$MIXDASH_BIN" && -n "$QT_PAYLOAD" ]]; then
@@ -11116,13 +10940,13 @@ if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BI
 
     # The startup chime.
     #
-    # STAGED LIKE THE IWAD AND NOT LIKE THE SPLASH, and the difference is worth
+    # STAGED AS A PAYLOAD ASSET AND NOT LIKE THE SPLASH, and the difference is worth
     # naming because both are files in resources/.  MixOS.jpg is decoded by
     # tools/jpeg2raw.py at build time into /splash.mixspl in the INITRAMFS, because
     # it has to be on the glass before any partition is mounted.  This is played by
     # the dashboard, seconds later, off a filesystem that is by then mounted -- so
-    # it is an ordinary payload asset under share/, in the same shape as Doom's
-    # IWAD, and mixdash looks for it at exactly this path.
+    # it is an ordinary file under share/, and mixdash looks for it at exactly this
+    # path.
     #
     # Guarded on the dashboard being staged: nothing else on this card can play it,
     # and half a megabyte of mp3 that no binary will ever open is half a megabyte of
@@ -11135,17 +10959,6 @@ if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BI
         log "dash: staged the startup chime into opt/mixos/share/mixdash/"
     fi
 
-    # Doom, and the IWAD under the name doomgeneric's iwads[] table knows it by --
-    # d_iwad.c matches the filename before it opens the file.
-    if [[ -n "$DOOM_BIN" ]]; then
-        cp "$DOOM_BIN" "$SDROOT/opt/mixos/bin/doom"
-        chmod 0755 "$SDROOT/opt/mixos/bin/doom"
-        if [[ -n "$DOOM_WAD" ]]; then
-            mkdir -p "$SDROOT/opt/mixos/share/doom"
-            cp "$DOOM_WAD" "$SDROOT/opt/mixos/share/doom/$(basename "$DOOM_WAD")"
-        fi
-        log "dash: staged doom into opt/mixos/bin/"
-    fi
 
     # ── The Browser card ──────────────────────────────────────────────────────
     #
@@ -11788,8 +11601,6 @@ The dashboard and the games:
                        directory.  /init points FONTCONFIG_FILE at it when it is
                        there, which is what keeps the dashboard's font phase off a
                        whole-rootfs fontconfig scan.
-  bin/doom             framebuffer Doom (doomgeneric), if the build staged it.
-  share/doom           its IWAD.
   share/mixdash        startup.mp3, played once when the dashboard's first frame
                        reaches the glass.  Optional: the dashboard checks that the
                        file is readable and stays quiet if it is not.
@@ -11852,8 +11663,7 @@ full texts are in LICENSE.txt on the BOOT partition.  Qt, its dependencies and t
 fonts are Debian's packages under their own terms (LGPL-3 with Qt's exceptions for Qt
 itself; see /usr/share/doc on a Debian machine).  The kernel modules under j36/ are
 GPL-2.0, from the Linux tree they were built from.  Mesa in j36/gl is under the MIT
-licence.  doomgeneric and Doom's engine source are id Software's under the GPL, as
-Debian and doomgeneric ship them.  The operating system underneath is Debian, and
+licence.  The operating system underneath is Debian, and
 MixOS is a device port on top of it; the build scripts descend from dArkOS, which
 continues ArkOS, and nothing else here does.  MixOS supports the MediaTek line of
 processors.
@@ -11909,9 +11719,6 @@ fi
           sd-boot/zImage sd-boot/mvii/boot.conf)
     if [[ -f sd-root/opt/mixos/bin/mixdash ]]; then
         sums+=(sd-root/opt/mixos/bin/mixdash)
-    fi
-    if [[ -f sd-root/opt/mixos/bin/doom ]]; then
-        sums+=(sd-root/opt/mixos/bin/doom)
     fi
     # The tarball is what actually gets copied to the card, so it is what a reader
     # wants to check before unpacking it.  The files under sd-root/ below are summed
@@ -12002,18 +11809,6 @@ fi
             echo "shell_nodash=without j36.dash=1 nothing is staged at all and /init says so, naming the word to add -- this rootfs enables no shell of its own, so the alternative is a board that boots to nothing and explains nothing"
             echo "shell_render=Qt5 raster into /dev/fb0, which is simplefb's window onto the framebuffer the LK lit -- no EGL, no GBM, no DRM master, no modeset"
             echo "shell_input=evdev directly, QT_QPA_FB_DISABLE_INPUT=1 (gpio-keys plus the keypad, per the device tree)"
-            if [[ -f sd-root/opt/mixos/bin/doom ]]; then
-                echo "fbdoom=sd-root/opt/mixos/bin/doom ($(stat -c %s sd-root/opt/mixos/bin/doom) bytes, static ARMv7, 640x400 in 640x480)"
-                echo "fbdoom_commit=$DOOM_COMMIT"
-                if [[ -n "$DOOM_WAD" ]]; then
-                    echo "fbdoom_iwad=opt/mixos/share/doom/$(basename "$DOOM_WAD")"
-                else
-                    echo "fbdoom_iwad=none (drop one into /opt/mixos/share/doom on the card)"
-                fi
-                echo "fbdoom_start=the dashboard's Doom card; there is no j36.doom word any more"
-            else
-                echo "fbdoom=not staged (J36_DOOM=1 builds it into the second partition)"
-            fi
         else
             echo "shell=not staged; /init says so on the console, and there is no fallback shell in this build to start instead"
         fi

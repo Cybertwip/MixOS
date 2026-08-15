@@ -300,9 +300,6 @@ multipass exec "$VM_NAME" -- env \
     J36_BUSYBOX_URL="${J36_BUSYBOX_URL:-https://git.busybox.net/busybox}" \
     J36_BUSYBOX_BRANCH="${J36_BUSYBOX_BRANCH:-1_36_stable}" \
     J36_REBUILD_BUSYBOX="${J36_REBUILD_BUSYBOX:-0}" \
-    J36_DOOM="${J36_DOOM:-1}" \
-    J36_DOOM_URL="${J36_DOOM_URL:-https://github.com/ozkl/doomgeneric}" \
-    J36_DOOM_COMMIT="${J36_DOOM_COMMIT:-dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284}" \
     J36_LIMA="${J36_LIMA:-1}" \
     J36_MTKDRM="${J36_MTKDRM:-1}" \
     J36_AUDIO="${J36_AUDIO:-1}" \
