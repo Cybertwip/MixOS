@@ -832,7 +832,11 @@ void SharingPage::start()
                             << QStringLiteral("start") << QString::fromLatin1(kNmbd),
               4000);
 
-    m_active = unitActive(QString::fromLatin1(kSmbd));
+    /* One query, three answers wanted out of it: up, still moving, or settled and
+     * not up.  Asked as the state rather than as unitActive() because the second
+     * of those is the one the old code could not see. */
+    const QString state = activeState(QString::fromLatin1(kSmbd));
+    m_active = (state == QLatin1String("active"));
     if (m_active) {
         const QStringList ips = addresses();
         m_note = ips.isEmpty()
@@ -856,7 +860,7 @@ void SharingPage::start()
      * The same is true when systemctl DID return and the unit is still activating:
      * a Type=notify unit can be perfectly healthy and not yet ready.
      */
-    if (rc < 0 || stateIsTransient(activeState(QString::fromLatin1(kSmbd)))) {
+    if (rc < 0 || stateIsTransient(state)) {
         beginWatch();
         return;
     }
