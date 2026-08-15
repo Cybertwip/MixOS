@@ -122,6 +122,14 @@
  * live, which this driver has now watched happen -- eighteen consecutive scans
  * submitted, credited and abandoned on their own deadlines over three minutes,
  * with not one message from the driver to say so.
+ *
+ * "In a row" is the load-bearing half, and it means IN A ROW WITH NOTHING OFF THE
+ * AIR IN BETWEEN.  Every path that receives something the radio had to be working
+ * to produce -- a beacon, a scan result, a channel grant, a SCAN_DONE, a data
+ * frame -- clears the count, so a chip that is answering cannot accumulate one.
+ * Bare events do not clear it: transmit-done keeps arriving from a firmware whose
+ * station network has stopped scanning, and counting that as life is how the
+ * eighteen scans above went unnoticed in the first place.
  */
 #define J36_WLAN_SILENCE_RECOVER	2u
 #define J36_WLAN_RECOVER_LIMIT		2u
@@ -1103,6 +1111,15 @@ void j36_wlan_on_ethernet(struct j36_wifi *w, const u8 *frame, u32 frame_len)
 	 */
 	if (!wlan || wlan->state != J36_WLAN_CONNECTED)
 		return;
+	/*
+	 * A frame off the air is the same proof the radio works that a beacon or
+	 * a scan result is, and it has to count for the same reason -- see
+	 * j36_wlan_recover().  Without this, a link busy enough to be worth
+	 * keeping could still be torn down by two slow sweeps in a row, because
+	 * nothing else on the connected path touches the count: opening the Wi-Fi
+	 * page runs scans, and a running ping stopped dead when it did.
+	 */
+	wlan->silence = 0;
 	if (frame_len < ETH_HLEN || frame_len > wlan->ndev->mtu + ETH_HLEN) {
 		wlan->ndev->stats.rx_length_errors++;
 		return;

@@ -234,6 +234,7 @@ private:
     bool m_managerUp = false;   /* NetworkManager answered at all */
     bool m_radioOn = true;      /* nmcli radio wifi */
     int m_deviceState = -1;     /* NMDeviceState, numeric: 100 is activated */
+    bool m_entryScanPending = false;  /* onEnter asked; applyDevice decides */
     QString m_ssid;             /* what NetworkManager says we are on */
     QString m_address;          /* IP4.ADDRESS[1], with its prefix */
     QString m_gateway;

@@ -237,9 +237,22 @@ void WifiPage::onEnter()
     /* A rescan on entry, because the first thing anybody wants from this page is
      * the list.  It is asynchronous twice over -- it goes on the queue behind the
      * status queries, and NetworkManager then sweeps in its own time and a later
-     * poll reads what it found. */
-    enqueue(QueryRescan);
-    m_scanAge.restart();
+     * poll reads what it found.
+     *
+     * Not on a live link, though, for the reason poll() gives at length before the
+     * rule it applies there: a sweep is thirteen channels with the antenna away
+     * from the AP, and this one was opening a hole in whatever was going through
+     * it -- a ping running in the terminal stopped the moment this page came up.
+     * The listing below is served from NetworkManager's own record either way, and
+     * Scan again is on the page for somebody who wants the air read afresh.
+     *
+     * Which is why the decision is not taken here: m_deviceState at this instant is
+     * whatever the last visit left behind, and on the first entry of a session
+     * there has not been one -- exactly the case where the radio associated on its
+     * own at boot and somebody is already using the link.  refreshStatus() above
+     * has a device query in flight; applyDevice() reads this flag once its answer
+     * has landed and asks for the sweep only if there is nothing to interrupt. */
+    m_entryScanPending = true;
 
     pumpQueries();
     rebuild();
@@ -714,6 +727,19 @@ void WifiPage::applyDevice(int exitCode, const QString &show)
     if (m_deviceState == StateActivated && !m_badKeySsid.isEmpty()
         && m_ssid == m_badKeySsid)
         m_badKeySsid.clear();
+
+    /* The sweep onEnter() deferred until the state was actually known.  It fires
+     * once per visit and only onto a radio with nothing to lose by it; a device
+     * query that failed leaves the flag set for the next answer, which is right,
+     * because a daemon that is not up yet has not told us anything either way. */
+    if (m_entryScanPending) {
+        m_entryScanPending = false;
+        if (m_managerUp && m_radioOn && !isActivating(m_deviceState)
+            && m_deviceState != StateActivated) {
+            enqueue(QueryRescan);
+            m_scanAge.restart();
+        }
+    }
 }
 
 void WifiPage::refreshProfiles()

@@ -429,7 +429,18 @@ enum stage {
 };
 
 static enum stage stage_now = STAGE_START;
-static char stage_line[512];
+
+/*
+ * 512 was too small and it failed silently, which is the worst way for a diagnostic
+ * to fail: the no-adapter explanation came out of a board cut at 511 bytes, mid-word,
+ * one sentence short of the sentence that carried the verdict.  Every line here is a
+ * whole explanation by design -- the tool is usually read once, from a log, by
+ * somebody who cannot ask it a follow-up question -- so the buffer is sized for the
+ * longest of them with room to grow rather than for a typical one.  The verdict also
+ * goes FIRST in each message now, so that a future overrun costs detail and not the
+ * answer.
+ */
+static char stage_line[2048];
 
 /* The first line of the status file, and the only part of it any other program is
  * allowed to depend on.  The sentence underneath is written for a person and will be
@@ -531,11 +542,63 @@ static int udl_loaded(void)
 }
 
 /*
- * Every USB device on the bus as "vvvv:pppp" in one line, root hubs included because
- * their absence is itself an answer.  Returns 1 if any of them is DisplayLink, 0 if
- * none is, -1 if there is no /sys/bus/usb/devices at all -- which means usbcore is
- * not loaded and the question is a different one.  An empty `out' with a 0 return is
- * a bus with a controller and nothing on it.
+ * How many devices sit on this one's downstream ports.  Only a hub has any, and the
+ * count is what turns "there is a hub on the bus" into "there is a hub on the bus
+ * with three empty ports" -- which is the whole difference between a video chip that
+ * failed to bind and a video chip that was never plugged in.  Without it the reader
+ * has to run lsusb, and lsusb is not on this rootfs.
+ *
+ * sysfs names a hub's children after the hub, so "1-1" holds "1-1.1".."1-1.4".  A
+ * root hub is the exception -- it is named "usb1" while its children are "1-1".."1-N"
+ * -- so the prefix is derived from the name rather than assumed to be it.
+ */
+static int count_children(const char *dir, const char *parent)
+{
+    char prefix[64];
+    DIR *d;
+    struct dirent *e;
+    size_t plen;
+    int n = 0;
+
+    if (sscanf(parent, "usb%31[0-9]", prefix) == 1)
+        strncat(prefix, "-", sizeof(prefix) - strlen(prefix) - 1);
+    else
+        snprintf(prefix, sizeof(prefix), "%s.", parent);
+    plen = strlen(prefix);
+
+    d = opendir(dir);
+    if (!d)
+        return -1;
+    while ((e = readdir(d)) != NULL) {
+        const char *tail;
+
+        if (strncmp(e->d_name, prefix, plen) != 0)
+            continue;
+        tail = e->d_name + plen;
+        /* a grandchild ("1-1.2.3") is the child's, not ours, and an interface
+         * ("1-1:1.0") is not a device at all */
+        if (!*tail || strchr(tail, '.') || strchr(tail, ':'))
+            continue;
+        ++n;
+    }
+    closedir(d);
+    return n;
+}
+
+/*
+ * Every USB device on the bus in one line, root hubs included because their absence
+ * is itself an answer.  Returns 1 if any of them is DisplayLink, 0 if none is, -1 if
+ * there is no /sys/bus/usb/devices at all -- which means usbcore is not loaded and
+ * the question is a different one.  An empty `out' with a 0 return is a bus with a
+ * controller and nothing on it.
+ *
+ * "vvvv:pppp" alone was not enough to close the argument, because the interesting
+ * case looks identical to the boring one: a bus holding a hub and a mouse reads the
+ * same whether the hub's video chip failed to enumerate or the hub never had one.
+ * So each entry also carries what it IS (hub or not), what it calls itself, and --
+ * for a hub -- how many downstream ports it has against how many are occupied.  A
+ * hub reporting 4 ports with 1 used has three empty sockets and no hidden device
+ * behind them, and that single line is the end of the question.
  */
 static int usb_inventory(char *out, size_t outsz)
 {
@@ -552,6 +615,8 @@ static int usb_inventory(char *out, size_t outsz)
 
     while ((e = readdir(d)) != NULL) {
         char path[sizeof(e->d_name) + 64], vid[16], pid[16];
+        char cls[8] = "", prod[40] = "", pwr[16] = "", ports[32] = "", one[160];
+        int hub;
 
         if (e->d_name[0] == '.')
             continue;
@@ -570,8 +635,30 @@ static int usb_inventory(char *out, size_t outsz)
 
         if (strcmp(vid, DISPLAYLINK_VENDOR) == 0)
             displaylink = 1;
+
+        snprintf(path, sizeof(path), "%s/%s/bDeviceClass", dir, e->d_name);
+        read_line_file(path, cls, sizeof(cls));
+        snprintf(path, sizeof(path), "%s/%s/product", dir, e->d_name);
+        read_line_file(path, prod, sizeof(prod));
+        snprintf(path, sizeof(path), "%s/%s/bMaxPower", dir, e->d_name);
+        read_line_file(path, pwr, sizeof(pwr));
+
+        hub = strcmp(cls, "09") == 0;
+        if (hub) {
+            char maxchild[8] = "";
+
+            snprintf(path, sizeof(path), "%s/%s/maxchild", dir, e->d_name);
+            if (read_line_file(path, maxchild, sizeof(maxchild)) == 0)
+                snprintf(ports, sizeof(ports), " %s ports %d used",
+                         maxchild, count_children(dir, e->d_name));
+        }
+
+        snprintf(one, sizeof(one), "%s:%s %s%s%s%s%s%s%s", vid, pid,
+                 hub ? "hub" : "dev",
+                 prod[0] ? " \"" : "", prod, prod[0] ? "\"" : "",
+                 ports, pwr[0] ? " " : "", pwr);
         used += (size_t)snprintf(out + used, used < outsz ? outsz - used : 0,
-                                 "%s%s:%s", used ? " " : "", vid, pid);
+                                 "%s%s", used ? "; " : "", one);
         if (used >= outsz)
             break;          /* truncated, and snprintf already stopped writing */
     }
@@ -606,7 +693,7 @@ static int usb_inventory(char *out, size_t outsz)
  */
 static void explain_no_node(const char *seen)
 {
-    char bus[256];
+    char bus[768];      /* each entry now names itself; three devices is ~200 bytes */
     int dl = usb_inventory(bus, sizeof(bus));
 
     if (!udl_loaded()) {
@@ -642,16 +729,18 @@ static void explain_no_node(const char *seen)
          * the list and the answer is in one line.
          */
         report(STAGE_NO_UDL,
-               "mirror: nothing on the bus registered a display.  The bus has %s and "
-               "/dev/dri holds %s -- this program takes ANY card that is not lima or "
-               "mediatek, so a bound adapter of any make would already be mirroring.  "
-               "An HDMI socket reaches a screen here only via a USB graphics chip "
-               "that enumerates separately from the hub (DisplayLink %s, and only "
-               "DL-1x0/DL-1x5 has an in-tree driver; FL2000 1d5c, SM76x 090c and "
-               "Trigger 0711 do not).  If the listing is a hub and its downstream "
-               "devices with no such chip among them, the socket is DisplayPort Alt "
-               "Mode -- the video never travels over USB and MT6592 has no "
-               "DisplayPort to put on those pins.",
+               "mirror: there is no display device on the USB bus to mirror ONTO -- "
+               "not one that failed to bind, one that is not there.  Bus: %s.  "
+               "/dev/dri holds %s.  This program takes ANY card that is not lima or "
+               "mediatek, so an adapter of any make that had bound would already be "
+               "mirroring, and no enumeration failed on the way here.  An HDMI socket "
+               "reaches a screen only via a USB graphics chip that enumerates as its "
+               "own device ALONGSIDE the hub -- DisplayLink %s (and only DL-1x0/DL-1x5 "
+               "has an in-tree driver), FL2000 1d5c, SM76x 090c, Trigger 0711.  A "
+               "listing of a hub with empty ports and no such chip means the socket is "
+               "DisplayPort Alt Mode: the video never travels over USB at all, it is "
+               "DisplayPort lanes on the connector's side pins, and MT6592 has neither "
+               "a DisplayPort transmitter nor any other external video output.",
                bus[0] ? bus : "nothing on it",
                seen[0] ? seen : "no cards at all", DISPLAYLINK_VENDOR);
         return;

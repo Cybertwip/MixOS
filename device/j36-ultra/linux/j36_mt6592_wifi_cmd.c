@@ -393,7 +393,9 @@ int j36_wlan_cmd_sta_remove(struct j36_wifi *w, const struct j36_wlan_bss *bss)
  * CMD_SET_BSS_INFO, 80 bytes: a 64-byte body with a 16-byte RLM parameter block
  * welded onto the end.  The fields worth naming:
  *
- *   1  ucConnectionState	CONNECTED 1, DISCONNECTED 0
+ *   1  ucConnectionState	CONNECTED 0, DISCONNECTED 1.  That way round, and
+ *				this driver had it backwards for a long time --
+ *				see the block below the field list.
  *   51 ucNonHTBasicPhyType	PHY_TYPE_ERP_INDEX = 1, which is every 2.4 GHz
  *				g/n AP; the OFDM and HR_DSSS arms are 5 GHz and
  *				b-only
@@ -412,6 +414,32 @@ int j36_wlan_cmd_sta_remove(struct j36_wifi *w, const struct j36_wlan_bss *bss)
  * zero deliberately: this driver associates as a 20 MHz non-QoS station and the
  * settings that pair with that are all-zero.  They cost throughput near legacy
  * traffic; they cannot cost the association.
+ *
+ * ── ucConnectionState IS NDIS-ORDERED, SO CONNECTED IS ZERO ──────────────────
+ *
+ * ENUM_PARAM_MEDIA_STATE_T (wlan_oid.h:373) is declared with no initialisers and
+ * PARAM_MEDIA_STATE_CONNECTED first, so CONNECTED is 0 and DISCONNECTED is 1 --
+ * NDIS's ordering, inherited whole, and the opposite of what a byte called
+ * "connection state" reads as.  nicUpdateBss() casts the enumerator straight into
+ * this field with no translation.
+ *
+ * This driver sent 1 at join and 0 at teardown: exactly inverted, on both halves.
+ * Neither half refuses, and the join keeps working, because the peer is addressed
+ * through the station record and UPDATE_STA_RECORD is a separate command that was
+ * always right.  What the BSS's connection state governs is the firmware's own
+ * supervision of the link -- syncing to the AP's TBTT, counting its beacons,
+ * forwarding them up -- and for a BSS it has been told is DISCONNECTED it does
+ * none of that.  The link therefore ran with the firmware never once hearing the
+ * AP it was associated to, at -49 dBm, until its beacon-lost counter ran out and
+ * it reported EVENT_BSS_BEACON_TIMEOUT about two minutes into a faultless
+ * association.  The zero in the driver's own "this AP's beacons" counter was the
+ * same fact seen from the host side.
+ *
+ * The teardown half cost the other symptom.  j36_wlan_cmd_bss_disconnect() sent
+ * 0, which announced the BSS as newly CONNECTED at the precise moment the station
+ * record was being removed and the network deactivated underneath it -- and a
+ * firmware left supervising a BSS whose every part has been withdrawn is a
+ * firmware that accepts the next join's commands and answers none of them.
  *
  * ── ucEncStatus IS THE CIPHER, NOT THE STATE OF THE HANDSHAKE ────────────────
  *
@@ -439,8 +467,8 @@ int j36_wlan_cmd_bss_info(struct j36_wifi *w, const struct j36_wlan_bss *bss,
 	u8 command[80] = {};
 
 	command[0] = J36_NETWORK_TYPE_AIS;
-	command[1] = 1;			/* CONNECTED		*/
-	command[2] = 0;			/* INFRASTRUCTURE	*/
+	command[1] = 0;			/* PARAM_MEDIA_STATE_CONNECTED	*/
+	command[2] = 0;			/* OP_MODE_INFRASTRUCTURE	*/
 	command[3] = bss->ssid_len;
 	memcpy(command + 4, bss->ssid, min_t(u8, bss->ssid_len,
 					     IEEE80211_MAX_SSID_LEN));
@@ -481,8 +509,8 @@ int j36_wlan_cmd_bss_disconnect(struct j36_wifi *w,
 	u8 command[80] = {};
 
 	command[0] = J36_NETWORK_TYPE_AIS;
-	command[1] = 0;			/* DISCONNECTED		*/
-	command[2] = 0;			/* INFRASTRUCTURE	*/
+	command[1] = 1;			/* PARAM_MEDIA_STATE_DISCONNECTED */
+	command[2] = 0;			/* OP_MODE_INFRASTRUCTURE	*/
 	memcpy(command + 36, bss->bssid, ETH_ALEN);
 	command[48] = J36_STA_INDEX_NOT_FOUND;
 	memcpy(command + 55, w->mac, ETH_ALEN);
