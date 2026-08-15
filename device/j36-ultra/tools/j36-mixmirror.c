@@ -624,14 +624,35 @@ static void explain_no_node(const char *seen)
         return;
     }
     if (dl == 0) {
+        /*
+         * This program will mirror onto ANY card node that is not the board's own,
+         * so the message must not claim otherwise -- what it can say is that no
+         * device on the bus produced one, and what a device has to BE to produce one.
+         *
+         * An HDMI socket on a hub is not one thing.  It is a USB GRAPHICS CHIP that
+         * enumerates as a device of its own alongside the hub -- DisplayLink 17e9,
+         * Fresco Logic FL2000 1d5c, Silicon Motion SM76x 090c, MCT/Trigger 0711 --
+         * and only the first of those has an in-tree driver.  Or it is a USB-C
+         * DisplayPort Alt Mode passthrough, which enumerates NOTHING for the video
+         * because the video never travels over USB at all: it is DisplayPort lanes
+         * on the connector's side pins, and MT6592 has no DisplayPort transmitter to
+         * put on them.  A bus listing that shows a hub and nothing else is the second
+         * kind, and no driver can change that.  Compare the vendor IDs below against
+         * the list and the answer is in one line.
+         */
         report(STAGE_NO_UDL,
-               "mirror: udl.ko is loaded and waiting; nothing on the port is "
-               "DisplayLink (vendor %s).  The bus has %s and /dev/dri holds %s.  "
-               "A USB-C hub whose HDMI is DisplayPort Alt Mode cannot work here -- "
-               "MT6592 has no DisplayPort.  Only a DisplayLink DL-1x0/DL-1x5 "
-               "adapter drives a screen on this board.",
-               DISPLAYLINK_VENDOR, bus[0] ? bus : "nothing on it",
-               seen[0] ? seen : "no cards at all");
+               "mirror: nothing on the bus registered a display.  The bus has %s and "
+               "/dev/dri holds %s -- this program takes ANY card that is not lima or "
+               "mediatek, so a bound adapter of any make would already be mirroring.  "
+               "An HDMI socket reaches a screen here only via a USB graphics chip "
+               "that enumerates separately from the hub (DisplayLink %s, and only "
+               "DL-1x0/DL-1x5 has an in-tree driver; FL2000 1d5c, SM76x 090c and "
+               "Trigger 0711 do not).  If the listing is a hub and its downstream "
+               "devices with no such chip among them, the socket is DisplayPort Alt "
+               "Mode -- the video never travels over USB and MT6592 has no "
+               "DisplayPort to put on those pins.",
+               bus[0] ? bus : "nothing on it",
+               seen[0] ? seen : "no cards at all", DISPLAYLINK_VENDOR);
         return;
     }
     report(STAGE_NO_UDL,
@@ -1420,11 +1441,12 @@ out:
 static void usage(void)
 {
     printf(
-"j36-mixmirror -- mirror /dev/fb0 onto a USB-HDMI (DisplayLink) adapter.\n"
+"j36-mixmirror -- mirror /dev/fb0 onto a USB-attached display adapter.\n"
 "\n"
 "  -f PATH   source framebuffer (default /dev/fb0)\n"
-"  -n NAME   DRM driver name to accept (default udl).  This is the safety\n"
-"            interlock -- a node with any other name is never modeset.\n"
+"  -n NAME   accept ONLY this DRM driver name.  Without it, any card that is\n"
+"            not one of the board's own (lima, mediatek) is accepted -- the\n"
+"            interlock is that the panel and the GPU are never modeset.\n"
 "  -1        do not scale; centre the panel at 1:1 whatever the mode allows\n"
 "  -o        mirror one frame and exit, for testing\n"
 "  -s        scan, report what was found, and exit without touching anything\n"
