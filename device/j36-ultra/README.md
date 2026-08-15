@@ -12,8 +12,8 @@ Build from the repository root:
 ./build-j36-ultra-dtb.sh
 ```
 
-No PowerEngine checkout is required. The five MVII board files the generator
-parses are vendored here, and they are the only ones it opens:
+Nothing outside this checkout is required. The five MVII board files the
+generator parses live here, and they are the only ones it opens:
 
 ```text
 device/j36-ultra/mvii-board/mt6592_board_j36.h

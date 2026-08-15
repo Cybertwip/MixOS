@@ -11,10 +11,9 @@
 # gitignored. The default used to be device/j36-ultra/generated, and three build
 # products in the middle of the source tree is what that cost.
 #
-# This needs no PowerEngine checkout. The five files the generator parses are
-# committed here, refreshed by device/j36-ultra/sync-mvii-board.sh when the MVII
-# drivers move; point J36_DRIVERS_DIR at a live Drivers tree to build against it
-# directly without vendoring first.
+# The five files the generator parses are committed here and are the source of
+# truth for the board; point J36_DRIVERS_DIR at another directory holding the same
+# five names to build against that instead.
 
 set -Eeuo pipefail
 
@@ -41,8 +40,7 @@ done
 
 [[ -d "$DRIVERS" ]] || {
     echo "error: J36 Ultra board sources not found: $DRIVERS" >&2
-    echo "these are committed; run device/j36-ultra/sync-mvii-board.sh to restore" >&2
-    echo "them from a PowerEngine checkout, or set J36_DRIVERS_DIR" >&2
+    echo "these are committed; restore them from git, or set J36_DRIVERS_DIR" >&2
     exit 1
 }
 
