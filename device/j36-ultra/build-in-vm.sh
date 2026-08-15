@@ -2029,6 +2029,277 @@ find_root() {
     return 1
 }
 
+# ── the rest of the card, given to the OS partition ───────────────────────────
+#
+# WHAT IS WRONG.  The image is a fixed 4.2 GB and the card is whatever the operator
+# bought.  ROOTFS ends where the image ended, so a 64 GB card carries 60 GB that
+# nothing can reach and no page can show.  On this board that is not an inconvenience:
+# there is no keyboard, the dashboard is the only shell, and gparted on a PC means
+# taking the card out, which is the exact thing a share and a Files page exist to stop
+# being necessary.
+#
+# THIS USED TO GROW A DIFFERENT PARTITION.  There was a p3 -- ext2, labelled DATA,
+# mounted at /home/virtua -- and it was the last one on the disk, so it was the one
+# that could be grown.  It is gone; /home/virtua is a directory on the rootfs now, the
+# OS partition is last, and the space at the end of the card belongs to it.
+#
+# WHY IT IS INITRAMFS CODE AND NOT A UNIT, WHICH IS THE OPPOSITE OF WHAT IT WAS.  ext2
+# has no online resize -- that is an ext4 feature and this filesystem is deliberately
+# ext2 -- so the partition has to be unmounted while it grows.  For p3 the one moment
+# it was present and unmounted was between udev finding it and systemd mounting it,
+# which is a moment a unit can be ordered into.  For the ROOT filesystem there is no
+# such moment after switch_root: it is mounted for as long as the system is up.  The
+# only window in the whole boot is here, before /newroot is handed over, and it is a
+# better window than the old one besides -- nothing else on the disk is mounted either,
+# so sfdisk's own BLKRRPART is accepted and no partx dance is needed.
+#
+# AND THE TOOLS COME OFF THE CARD.  BusyBox has no ext2 resize applet and no sfdisk,
+# which is precisely why this was a unit before.  So the three binaries are copied out
+# of the rootfs into this initramfs, with the loader and the handful of libraries they
+# name, WHILE IT IS STILL MOUNTED -- and then it is unmounted and they are run against
+# the bare partition.  They are checked by running them first: a missing library makes
+# the loader exit 127, which is the difference between "cannot grow the card" and
+# "unmounted the root filesystem and then could not put it back".
+#
+# NOTHING IS WRITTEN TO THE CARD TO REMEMBER THIS.  No stamp, no /etc/mixos/expanded.
+# "Does the partition already reach the end of the disk" is answerable from three files
+# in sysfs on every boot, so there is no state to be wrong, nothing to clear when a card
+# is re-flashed, and no way for this to run twice or refuse to run once.
+
+# The loader's path is compiled into every binary copied below, so the copies have to
+# land at the paths their PT_INTERP and DT_NEEDED name.  /lib is that path on Debian
+# armhf and it does not exist in this initramfs until here.
+EXPAND_BIN=/lib/mixexpand
+EXPAND_LIBS="ld-linux-armhf.so.3 ld-linux.so.3 libc.so.6 libm.so.6 libdl.so.2
+             libpthread.so.0 librt.so.1 libgcc_s.so.1 libcrypt.so.1
+             libext2fs.so.2 libcom_err.so.2 libe2p.so.2 libss.so.2
+             libblkid.so.1 libuuid.so.1 libmount.so.1
+             libfdisk.so.1 libsmartcols.so.1
+             libselinux.so.1 libpcre2-8.so.0 libz.so.1 libtinfo.so.6"
+
+# Copy one file out of the mounted rootfs, trying each place Debian might keep it.
+# `cp' without -a follows the symlink, which is what is wanted: /lib/ld-linux-armhf.so.3
+# points into the multiarch directory and this initramfs has no such directory.
+expand_take() {
+    take_name="$1"
+    take_to="$2"
+    for take_dir in /newroot/lib /newroot/usr/lib /newroot/sbin /newroot/usr/sbin \
+                    /newroot/bin /newroot/usr/bin \
+                    /newroot/lib/arm-linux-gnueabihf /newroot/usr/lib/arm-linux-gnueabihf; do
+        if [ -e "$take_dir/$take_name" ]; then
+            if cp "$take_dir/$take_name" "$take_to/$take_name" 2>/dev/null; then
+                chmod 0755 "$take_to/$take_name" 2>/dev/null
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+# Runs a copied tool with a harmless argument.  127 is the shell's "not found" and the
+# loader's "a library it needs is not here"; either way the tool cannot be used, and
+# finding that out now is what keeps the umount below from being a one-way trip.
+expand_works() {
+    "$EXPAND_BIN/$1" "$2" >/dev/null 2>&1
+    [ "$?" != 127 ]
+}
+
+expand_root() {
+    if [ -z "$rootdev" ] || [ -z "$rootfs_type" ]; then return 0; fi
+    case "$rootfs_type" in
+        ext2|ext3|ext4) : ;;
+        *)  say "expand: $rootfs_type is not an ext filesystem, so it is left alone"
+            return 0 ;;
+    esac
+
+    # ── WHICH DISK, AND WHICH NUMBER ON IT ───────────────────────────────────
+    #
+    # Out of sysfs and not out of the device name.  Stripping a trailing number works
+    # for sda2 and is wrong for mmcblk0p2 and for nvme0n1p2.  readlink is not in this
+    # busybox either, so the parent is found by looking for the one /sys/block entry
+    # that has this partition inside it -- which is the same answer readlink would
+    # have given, spelt with a glob.
+    ex_name=${rootdev#/dev/}
+    ex_sys=/sys/class/block/$ex_name
+    if [ ! -r "$ex_sys/partition" ]; then
+        say "expand: $rootdev is a whole disk and not a partition; nothing to grow"
+        return 0
+    fi
+    read -r ex_pno < "$ex_sys/partition"
+    ex_disk=""
+    for ex_cand in /sys/block/*/"$ex_name"; do
+        if [ ! -d "$ex_cand" ]; then continue; fi
+        ex_cand=${ex_cand%/$ex_name}
+        ex_disk=${ex_cand#/sys/block/}
+    done
+    if [ -z "$ex_disk" ] || [ ! -b "/dev/$ex_disk" ]; then
+        say "expand: cannot find the disk $rootdev is a partition of; nothing to grow"
+        return 0
+    fi
+
+    # ── IS THERE ANYTHING TO DO?  ────────────────────────────────────────────
+    #
+    # sysfs sizes are in 512-byte sectors regardless of the device's own block size, so
+    # these three numbers are directly comparable and no unit conversion is needed.  The
+    # margin is 8 MiB: an MBR keeps its last sector to itself, an SD controller may round
+    # the reported capacity, and rewriting the partition table to recover four megabytes
+    # is a write to the one structure on the card worth not writing to.
+    read -r ex_start < "$ex_sys/start"
+    read -r ex_size  < "$ex_sys/size"
+    read -r ex_whole < "/sys/block/$ex_disk/size"
+    ex_slack=$((ex_whole - ex_start - ex_size))
+    if [ "$ex_slack" -le 16384 ]; then
+        say "expand: $rootdev already reaches the end of /dev/$ex_disk"
+        return 0
+    fi
+
+    # ── THE TOOLS, TAKEN BEFORE THE FILESYSTEM GOES AWAY ─────────────────────
+    say "expand: $((ex_slack / 2048)) MiB of /dev/$ex_disk is unused; taking the tools"
+    stage "Growing the MixOS partition"
+    detail "$((ex_slack / 2048)) MiB of the card was unused"
+    mkdir -p /lib "$EXPAND_BIN"
+    for ex_lib in $EXPAND_LIBS; do
+        expand_take "$ex_lib" /lib
+    done
+    ex_missing=""
+    for ex_tool in sfdisk e2fsck resize2fs; do
+        if ! expand_take "$ex_tool" "$EXPAND_BIN"; then ex_missing="$ex_missing $ex_tool"; fi
+    done
+    if [ -n "$ex_missing" ]; then
+        say "expand: the rootfs has no$ex_missing, so the card keeps the size it has"
+        return 0
+    fi
+    # LD_LIBRARY_PATH as well as the copies being in /lib: the default search path is a
+    # property of how glibc was configured, and this costs one environment variable.
+    export LD_LIBRARY_PATH=/lib
+    for ex_tool in sfdisk:--version e2fsck:-V resize2fs:-h; do
+        if ! expand_works "${ex_tool%%:*}" "${ex_tool#*:}"; then
+            say "expand: ${ex_tool%%:*} will not run in the initramfs -- a library it"
+            say "        needs is not in EXPAND_LIBS.  The card keeps the size it has,"
+            say "        and the root filesystem was never unmounted."
+            return 0
+        fi
+    done
+
+    # ── THE WORK, IN A CHILD, WITH THE PANEL STILL TALKING ───────────────────
+    #
+    # e2fsck and resize2fs on a big slow card are minutes, and mixsplash gives the text
+    # console back when nothing has spoken to it for ninety seconds.  So this is forked
+    # for the same reason the card scan above is, and by the same means: the child says
+    # what it is doing in a file and answers in another one, and the loop below is what
+    # keeps the picture moving.  fork does not unshare the mount namespace, so the
+    # child's umount and mount are the parent's as well.
+    : > /dev/.expand-status
+    : > /dev/.expand-result
+    (
+        ex_step() { echo "$1" > /dev/.expand-status 2>/dev/null; }
+        ex_done() { echo "$1" > /dev/.expand-result 2>/dev/null; }
+
+        ex_step "unmounting the OS partition"
+        sync
+        if ! umount /newroot 2>/dev/null; then
+            ex_done "the root filesystem would not unmount, so it was left as it is"
+            exit 0
+        fi
+
+        # ", +" is sfdisk's whole vocabulary for this: keep the start, take everything
+        # left.  -N names the one partition to touch, so the other entry is rewritten
+        # byte for byte as it was.  Nothing in the filesystem is read or written by it --
+        # it is four bytes of a partition entry -- and because no partition of this disk
+        # is mounted at this point in the boot, the kernel accepts the re-read that
+        # follows instead of leaving the new table for the next power-on.
+        ex_step "rewriting the partition table"
+        if echo ", +" | "$EXPAND_BIN/sfdisk" -N "$ex_pno" --force "/dev/$ex_disk" >/dev/null 2>&1; then
+            sync
+        else
+            ex_done "sfdisk would not extend partition $ex_pno; the filesystem is unchanged"
+            mount -t "$rootfs_type" "$rootdev" /newroot 2>/dev/null
+            exit 0
+        fi
+
+        # The node goes away and comes back when the kernel re-reads the table, so wait
+        # for it rather than racing it.  Twenty seconds is far past anything real; a card
+        # that has not come back by then has a problem the resize is not going to fix.
+        ex_step "waiting for the partition to come back"
+        ex_n=0
+        while [ ! -b "$rootdev" ] && [ "$ex_n" -lt 80 ]; do
+            ex_n=$((ex_n + 1))
+            sleep 0.25
+        done
+        if [ ! -b "$rootdev" ]; then
+            ex_done "$rootdev did not come back after the table was rewritten"
+            exit 0
+        fi
+
+        # resize2fs refuses a filesystem it has not seen checked, so this is not
+        # optional.  -p fixes what can be fixed without asking, because there is nobody
+        # to ask; status 1 means it corrected something and the filesystem is now good,
+        # which is a success here.  Anything above that is a filesystem to leave alone.
+        ex_step "checking the filesystem"
+        "$EXPAND_BIN/e2fsck" -fp "$rootdev" >/dev/null 2>&1
+        ex_rc=$?
+        if [ "$ex_rc" -gt 1 ]; then
+            ex_done "e2fsck says $rootdev needs attention (status $ex_rc), so it was not grown"
+            mount -t "$rootfs_type" "$rootdev" /newroot 2>/dev/null
+            exit 0
+        fi
+
+        # No size argument: resize2fs with none grows the filesystem to fill whatever
+        # the partition now is, which is exactly the question that was just answered.
+        ex_step "growing the filesystem"
+        if "$EXPAND_BIN/resize2fs" "$rootdev" >/dev/null 2>&1; then
+            ex_result="$rootdev now fills /dev/$ex_disk"
+        else
+            ex_result="resize2fs could not grow $rootdev; the partition is bigger than the filesystem"
+        fi
+
+        # ── AND PUT IT BACK, WHICH IS THE PART THAT CANNOT BE ALLOWED TO FAIL ──
+        #
+        # Everything above this point is optional and every failure returns the card
+        # unchanged.  This is not optional: the parent is about to switch_root into
+        # /newroot.  So it is tried the way try_root does it and then again read-only,
+        # because a root that is mounted read-only boots to a shell somebody can fix it
+        # from, and a root that is not mounted at all boots to the initramfs.
+        ex_step "remounting the OS partition"
+        if mount -t "$rootfs_type" "$rootdev" /newroot 2>/dev/null; then
+            ex_done "$ex_result"
+        elif mount -t "$rootfs_type" -o ro "$rootdev" /newroot 2>/dev/null; then
+            ex_done "$ex_result, but it would only remount READ-ONLY"
+        else
+            ex_done "$rootdev WOULD NOT REMOUNT after the resize"
+        fi
+    ) &
+
+    # 1800 seconds.  e2fsck and resize2fs on a 512 GB card in a slow reader are the one
+    # boot in the life of this device where half an hour is the right thing to wait for,
+    # and the bound exists because the alternative to a bound is a board that counts
+    # upwards forever.
+    ex_waited=0
+    while [ ! -s /dev/.expand-result ]; do
+        if [ "$ex_waited" -ge 1800 ]; then
+            say "expand: the resize has not answered in ${ex_waited}s; carrying on"
+            break
+        fi
+        ex_what=""
+        if [ -s /dev/.expand-status ]; then read -r ex_what < /dev/.expand-status; fi
+        if [ -z "$ex_what" ]; then ex_what="growing the OS partition"; fi
+        detail "$ex_what -- ${ex_waited}s"
+        ex_waited=$((ex_waited + 1))
+        sleep 1
+    done
+    if [ -s /dev/.expand-result ]; then
+        read -r ex_said < /dev/.expand-result
+        say "expand: $ex_said"
+    fi
+    : > /dev/.expand-status
+    : > /dev/.expand-result
+
+    # Whatever happened, the panel goes back to saying what the boot is doing.
+    stage "Mounting the MixOS partition"
+    detail "$rootdev  $rootfs_type"
+    return 0
+}
+
 # Waiting is this script's job.  `rootwait' on the command line is honoured by
 # the kernel's own root mount, and rdinit= runs instead of that -- so a single
 # scan here races the card: MSDC1 runs card identification on a workqueue, and
