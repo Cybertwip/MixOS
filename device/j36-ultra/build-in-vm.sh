@@ -2509,10 +2509,17 @@ find_root() {
 # the loader exit 127, which is the difference between "cannot grow the card" and
 # "unmounted the root filesystem and then could not put it back".
 #
-# NOTHING IS WRITTEN TO THE CARD TO REMEMBER THIS.  No stamp, no /etc/mixos/expanded.
-# "Does the partition already reach the end of the disk" is answerable from three files
-# in sysfs on every boot, so there is no state to be wrong, nothing to clear when a card
-# is re-flashed, and no way for this to run twice or refuse to run once.
+# NO STAMP IS KEPT TO REMEMBER WHETHER THIS HAS RUN.  No /etc/mixos/expanded, no flag in
+# the bootargs.  Both halves of "is there anything left to grow" are read off the card
+# itself on every boot -- the partition's end out of sysfs, the filesystem's end out of
+# its own superblock -- so there is no state to be wrong, nothing to clear when a card is
+# re-flashed, and no way for this to run twice or refuse to run once.  It asked only the
+# first of those two for a while, and expand_root has the note on what that cost.
+#
+# What IS written to the card is one line of prose per boot, in /var/log/mixos-expand.log,
+# and that is a log and not state: nothing reads it to make a decision.  It exists because
+# the console on this device goes nowhere a person can read afterwards, and "it just
+# skipped" was the only account of this step anybody could give.
 
 # The loader's path is compiled into every binary copied below, so the copies have to
 # land at the paths their PT_INTERP and DT_NEEDED name.  /lib is that path on Debian
@@ -2552,11 +2559,86 @@ expand_works() {
     [ "$?" != 127 ]
 }
 
+# ── ONE LINE THAT SURVIVES THE BOOT ──────────────────────────────────────────
+#
+# say() reaches the console, and on this device the console is a panel the splash
+# owns and a serial port with nothing plugged into it.  There is no journal to fall
+# back on either: cleanup_filesystem.sh deletes /var/log/journal, so journald keeps
+# this boot in /run and it dies with the power.  So every answer this step has ever
+# given has been unreadable by the time anybody wanted it, and the only report it
+# could produce was "it just skipped".
+#
+# The OS partition is right here and mounted, so the line goes on it.  It is readable
+# afterwards over the share, in the dashboard's Files page, and from any Linux PC with
+# the card in it -- and the dashboard's Diagnostics page reads the last line of it.
+expand_note() {
+    say "expand: $1"
+    if grep -q " /newroot " /proc/mounts 2>/dev/null; then
+        mkdir -p /newroot/var/log 2>/dev/null
+        # Uptime, not a date.  This board has no RTC, so the clock in the initramfs
+        # is 1970 on every boot and a timestamp would be a lie that sorts wrong.
+        ex_up=""
+        read -r ex_up ex_uprest < /proc/uptime 2>/dev/null
+        echo "[+${ex_up}s] $1" >> /newroot/var/log/mixos-expand.log 2>/dev/null
+    fi
+    return 0
+}
+
+# ── HOW BIG THE FILESYSTEM ITSELF THINKS IT IS ───────────────────────────────
+#
+# Out of the superblock, with hexdump, and BEFORE anything is copied or unmounted.
+# That ordering is the whole point: this answer decides whether there is any work to
+# do, and dumpe2fs -- which would answer it more comfortably -- is one of the things
+# that only gets copied once the answer is yes.
+#
+# The layout is fixed and has been since ext2: the superblock starts 1024 bytes into
+# the partition, s_blocks_count_lo is 4 bytes in, s_log_block_size is 24 bytes in and
+# s_magic (0xef53) is 56 bytes in.  hexdump -x prints two-byte units in host order,
+# which on this SoC is the little-endian order the fields are stored in, so the two
+# halves of a 32-bit field are simply the two words in the order they are printed.
+# -v because without it hexdump collapses repeated lines to a `*' and the field
+# positions would shift.
+#
+# Read while the filesystem is MOUNTED, which is safe for these three fields
+# specifically: none of them changes for the life of a filesystem except when
+# resize2fs changes it, and resize2fs is the one thing not running yet.
+expand_fs_blocks=0
+expand_fs_bs=0
+expand_read_superblock() {
+    expand_fs_blocks=0
+    expand_fs_bs=0
+    if ! hexdump -v -s 1024 -n 64 -x "$rootdev" > /dev/.expand-sb 2>/dev/null; then
+        return 1
+    fi
+    {
+        read -r ex_o1 ex_w0 ex_w1 ex_w2 ex_w3 ex_w4 ex_w5 ex_w6 ex_w7
+        read -r ex_o2 ex_w8 ex_w9 ex_w10 ex_w11 ex_w12 ex_w13 ex_w14 ex_w15
+        read -r ex_o3 ex_w16 ex_w17 ex_w18 ex_w19 ex_w20 ex_w21 ex_w22 ex_w23
+        read -r ex_o4 ex_w24 ex_w25 ex_w26 ex_w27 ex_w28 ex_w29 ex_w30 ex_w31
+    } < /dev/.expand-sb
+    # Four hex words are used and all four are checked, because ash arithmetic on
+    # `0x' followed by nothing is a syntax error inside $(( )) -- which in this shell
+    # is fatal to the whole script and not to the expression.
+    case "$ex_w2$ex_w3$ex_w12$ex_w28" in
+        ''|*[!0-9a-fA-F]*) return 1 ;;
+    esac
+    if [ "$((0x$ex_w28))" != 61267 ]; then       # 0xef53, and nothing else is an ext
+        return 1
+    fi
+    ex_log=$((0x$ex_w12))
+    # ext2 allows 1, 2 and 4 KiB; anything past 64 KiB is a superblock this is not
+    # reading correctly, and a wrong shift here would produce a confident wrong size.
+    if [ "$ex_log" -lt 0 ] || [ "$ex_log" -gt 6 ]; then return 1; fi
+    expand_fs_bs=$((1024 << ex_log))
+    expand_fs_blocks=$(( $((0x$ex_w3)) * 65536 + $((0x$ex_w2)) ))
+    [ "$expand_fs_blocks" -gt 0 ]
+}
+
 expand_root() {
     if [ -z "$rootdev" ] || [ -z "$rootfs_type" ]; then return 0; fi
     case "$rootfs_type" in
         ext2|ext3|ext4) : ;;
-        *)  say "expand: $rootfs_type is not an ext filesystem, so it is left alone"
+        *)  expand_note "$rootfs_type is not an ext filesystem, so it is left alone"
             return 0 ;;
     esac
 
@@ -2570,7 +2652,7 @@ expand_root() {
     ex_name=${rootdev#/dev/}
     ex_sys=/sys/class/block/$ex_name
     if [ ! -r "$ex_sys/partition" ]; then
-        say "expand: $rootdev is a whole disk and not a partition; nothing to grow"
+        expand_note "$rootdev is a whole disk and not a partition; nothing to grow"
         return 0
     fi
     read -r ex_pno < "$ex_sys/partition"
@@ -2581,11 +2663,11 @@ expand_root() {
         ex_disk=${ex_cand#/sys/block/}
     done
     if [ -z "$ex_disk" ] || [ ! -b "/dev/$ex_disk" ]; then
-        say "expand: cannot find the disk $rootdev is a partition of; nothing to grow"
+        expand_note "cannot find the disk $rootdev is a partition of; nothing to grow"
         return 0
     fi
 
-    # ── IS THERE ANYTHING TO DO?  ────────────────────────────────────────────
+    # ── IS THERE ANYTHING TO DO?  IT IS TWO QUESTIONS, AND IT USED TO BE ONE ──
     #
     # sysfs sizes are in 512-byte sectors regardless of the device's own block size, so
     # these three numbers are directly comparable and no unit conversion is needed.  The
@@ -2596,15 +2678,56 @@ expand_root() {
     read -r ex_size  < "$ex_sys/size"
     read -r ex_whole < "/sys/block/$ex_disk/size"
     ex_slack=$((ex_whole - ex_start - ex_size))
-    if [ "$ex_slack" -le 16384 ]; then
-        say "expand: $rootdev already reaches the end of /dev/$ex_disk"
+
+    # ── AND THE ONE THIS DID NOT ASK, WHICH IS THE BUG ───────────────────────
+    #
+    # This step is two operations: sfdisk moves the END OF THE PARTITION, and resize2fs
+    # moves the END OF THE FILESYSTEM.  The block above answers "is the partition short"
+    # and nothing else -- so once sfdisk had run, this function was satisfied for ever
+    # after, whatever became of the filesystem inside it.
+    #
+    # That is not a hypothetical ordering.  sfdisk is four bytes of a partition entry and
+    # takes an instant; e2fsck and resize2fs on a cold card are minutes.  A power cut in
+    # between them, an e2fsck that returns 2, a resize2fs the 1800-second bound outlived
+    # -- any of those leaves the card with a full-size partition and a 4 GB filesystem in
+    # it, and from that boot onwards this function said "already reaches the end of the
+    # disk" and returned.  Every later boot said it too.  Nothing on the device would
+    # ever have grown that filesystem again, which is exactly the report this came from:
+    # a 32 GB card showing a 4 GB rootfs with 500 MB free and no sign the step had run.
+    #
+    # So the filesystem's own size is asked for as well, out of its superblock, and the
+    # work happens when EITHER end is short.  The comment above about there being no
+    # state to get wrong still holds -- both numbers are read off the card on every boot
+    # -- but there are two of them now, because there are two things to be wrong.
+    ex_fs_slack=0
+    if expand_read_superblock; then
+        ex_spb=$((expand_fs_bs / 512))
+        if [ "$ex_spb" -gt 0 ]; then
+            ex_fs_slack=$((ex_size - expand_fs_blocks * ex_spb))
+            if [ "$ex_fs_slack" -lt 0 ]; then ex_fs_slack=0; fi
+        fi
+    else
+        # No answer is not "no work": the tools below can still be asked, and resize2fs
+        # on a filesystem that already fills its partition is a no-op that says so.  What
+        # is lost is only the ability to start the work on the strength of this alone.
+        say "expand: could not read the superblock of $rootdev; going by the partition only"
+    fi
+
+    if [ "$ex_slack" -le 16384 ] && [ "$ex_fs_slack" -le 16384 ]; then
+        expand_note "$rootdev fills /dev/$ex_disk and the filesystem fills $rootdev; nothing to grow"
         return 0
     fi
 
     # ── THE TOOLS, TAKEN BEFORE THE FILESYSTEM GOES AWAY ─────────────────────
-    say "expand: $((ex_slack / 2048)) MiB of /dev/$ex_disk is unused; taking the tools"
+    #
+    # The two slacks are added because they are end-to-end: unused card beyond the
+    # partition, plus unused partition beyond the filesystem, is what the filesystem
+    # stands to gain.  On the ordinary first boot the second is zero; on the boot that
+    # picks up an interrupted resize the first one is.
+    ex_gain=$(( (ex_slack + ex_fs_slack) / 2048 ))
+    say "expand: ${ex_gain} MiB is unused (${ex_slack} + ${ex_fs_slack} sectors); taking the tools"
     stage "Growing the MixOS partition"
-    detail "$((ex_slack / 2048)) MiB of the card was unused"
+    detail "${ex_gain} MiB of the card was unused"
     mkdir -p /lib "$EXPAND_BIN"
     for ex_lib in $EXPAND_LIBS; do
         expand_take "$ex_lib" /lib
@@ -2614,7 +2737,7 @@ expand_root() {
         if ! expand_take "$ex_tool" "$EXPAND_BIN"; then ex_missing="$ex_missing $ex_tool"; fi
     done
     if [ -n "$ex_missing" ]; then
-        say "expand: the rootfs has no$ex_missing, so the card keeps the size it has"
+        expand_note "the rootfs has no$ex_missing, so the card keeps the size it has"
         return 0
     fi
     # A fourth one, and the only optional one: dumpe2fs is not part of doing the work,
@@ -2629,9 +2752,7 @@ expand_root() {
     export LD_LIBRARY_PATH=/lib
     for ex_tool in sfdisk:--version e2fsck:-V resize2fs:-h; do
         if ! expand_works "${ex_tool%%:*}" "${ex_tool#*:}"; then
-            say "expand: ${ex_tool%%:*} will not run in the initramfs -- a library it"
-            say "        needs is not in EXPAND_LIBS.  The card keeps the size it has,"
-            say "        and the root filesystem was never unmounted."
+            expand_note "${ex_tool%%:*} will not run in the initramfs -- a library it needs is not in EXPAND_LIBS, so the card keeps the size it has and the root filesystem was never unmounted"
             return 0
         fi
     done
@@ -2672,31 +2793,41 @@ expand_root() {
         # it is four bytes of a partition entry -- and because no partition of this disk
         # is mounted at this point in the boot, the kernel accepts the re-read that
         # follows instead of leaving the new table for the next power-on.
-        ex_step "rewriting the partition table"
-        ex_pct 2
-        if echo ", +" | "$EXPAND_BIN/sfdisk" -N "$ex_pno" --force "/dev/$ex_disk" >/dev/null 2>&1; then
-            sync
-        else
-            ex_done "sfdisk would not extend partition $ex_pno; the filesystem is unchanged"
-            mount -t "$rootfs_type" "$rootdev" /newroot 2>/dev/null
-            exit 0
-        fi
+        #
+        # SKIPPED WHEN THE PARTITION IS ALREADY RIGHT, which is the whole of the second
+        # case above: an earlier boot got this far and did not get further.  Rewriting an
+        # unchanged partition table would be a write to the one structure on the card
+        # worth not writing to, in service of changing nothing.
+        if [ "$ex_slack" -gt 16384 ]; then
+            ex_step "rewriting the partition table"
+            ex_pct 2
+            if echo ", +" | "$EXPAND_BIN/sfdisk" -N "$ex_pno" --force "/dev/$ex_disk" >/dev/null 2>&1; then
+                sync
+            else
+                ex_done "sfdisk would not extend partition $ex_pno; the filesystem is unchanged"
+                mount -t "$rootfs_type" "$rootdev" /newroot 2>/dev/null
+                exit 0
+            fi
 
-        # The node goes away and comes back when the kernel re-reads the table, so wait
-        # for it rather than racing it.  Twenty seconds is far past anything real; a card
-        # that has not come back by then has a problem the resize is not going to fix.
-        # Whole seconds because fractional sleep is a BusyBox build option and this
-        # build's applet list is the one at the top of the script, not a guess.
-        ex_step "waiting for the partition to come back"
-        ex_pct 3
-        ex_n=0
-        while [ ! -b "$rootdev" ] && [ "$ex_n" -lt 20 ]; do
-            ex_n=$((ex_n + 1))
-            sleep 1
-        done
-        if [ ! -b "$rootdev" ]; then
-            ex_done "$rootdev did not come back after the table was rewritten"
-            exit 0
+            # The node goes away and comes back when the kernel re-reads the table, so wait
+            # for it rather than racing it.  Twenty seconds is far past anything real; a card
+            # that has not come back by then has a problem the resize is not going to fix.
+            # Whole seconds because fractional sleep is a BusyBox build option and this
+            # build's applet list is the one at the top of the script, not a guess.
+            ex_step "waiting for the partition to come back"
+            ex_pct 3
+            ex_n=0
+            while [ ! -b "$rootdev" ] && [ "$ex_n" -lt 20 ]; do
+                ex_n=$((ex_n + 1))
+                sleep 1
+            done
+            if [ ! -b "$rootdev" ]; then
+                ex_done "$rootdev did not come back after the table was rewritten"
+                exit 0
+            fi
+        else
+            ex_step "the partition is already full size"
+            ex_pct 3
         fi
 
         # ── HOW MUCH resize2fs IS ABOUT TO WRITE, ASKED BEFORE IT STARTS ─────
@@ -2894,9 +3025,9 @@ expand_root() {
         ex_waited=$((ex_waited + 1))
         sleep 1
     done
+    ex_said=""
     if [ -s /dev/.expand-result ]; then
         read -r ex_said < /dev/.expand-result
-        say "expand: $ex_said"
     fi
     : > /dev/.expand-status
     : > /dev/.expand-result
@@ -2914,6 +3045,16 @@ expand_root() {
         mount -t "$rootfs_type" "$rootdev" /newroot 2>/dev/null ||
         mount -t "$rootfs_type" -o ro "$rootdev" /newroot 2>/dev/null ||
         say "expand: AND IT WOULD NOT MOUNT.  The hand-over below is going to fail."
+    fi
+
+    # AFTER the remount and not before it, which is the only order that works: the line
+    # is written onto the OS partition, and the paths that end here with something worth
+    # recording -- the child killed, the wait outlived, the resize refused -- are exactly
+    # the paths on which the partition may have been unmounted when the child stopped.
+    if [ -n "$ex_said" ]; then
+        expand_note "$ex_said"
+    else
+        expand_note "the resize did not report a result; the card is as the check above left it"
     fi
 
     # Whatever happened, the panel goes back to saying what the boot is doing, and the

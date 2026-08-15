@@ -126,10 +126,48 @@
  * not move and nothing said.  Both writers check now -- the config and the password
  * file -- and configIsOurs() no longer accepts a file that has this page's marker
  * on line one and nothing after it.
+ *
+ * ── AND IT STILL DID, SO: FOUR, FIVE AND SIX ─────────────────────────────────
+ *
+ * The report came back unchanged after all of the above -- "it does not share, it
+ * just turns off every time I enable it" -- and with no reason quoted, which is
+ * itself the finding.  Three of the four things wrong were about that.
+ *
+ * FOUR: THE REASON WAS WRITTEN WHERE NOBODY COULD READ IT.  m_note is one line of
+ * twelve-point text in an eighteen-pixel strip on a 640 px panel, drawn with
+ * drawText and no elide, and most of the sentences above are longer than that.  So
+ * the half of the diagnosis that says WHY was painted past the right edge of the
+ * card and thrown away by the clip.  The strip takes two lines now when it needs
+ * them and elides the last one, which is the difference between a diagnosis and a
+ * fragment of one.
+ *
+ * FIVE: AND IT DID NOT SURVIVE THE PAGE BEING LEFT.  onEnter() clears m_note --
+ * rightly, a stale complaint is worse than none -- so the moment the operator
+ * backed out to look at the Wi-Fi page the only record of the failure on the whole
+ * device was gone.  There is no journal to fall back on: cleanup_filesystem.sh
+ * deletes /var/log/journal, so journald keeps the boot's log in /run and it dies
+ * with the power.  Every failed start now writes what it knows to
+ * /boot/mixos-sharing.txt -- p1, vfat, the one filesystem on this card that the PC
+ * the operator is standing at can read -- and there is a row that writes the same
+ * report on demand.  That report carries what nothing on the glass could: smbd's
+ * own journal lines, systemd's Result and ConditionResult, testparm's complaint,
+ * and the smb.conf that produced them.
+ *
+ * SIX: THE START BLOCKED THE PANEL FOR FIFTEEN SECONDS TO LEARN NOTHING.  The wait
+ * existed so that the state read after it would be the final one, and on this board
+ * it never was -- that is bug ONE, and the watch that fixed it made the wait
+ * pointless rather than merely slow.  It is `--no-block' now: systemd takes the
+ * job, the page starts watching immediately, and the fifteen seconds in which the
+ * dashboard could not repaint or read the pad are gone.  nmbd moved with it -- it
+ * is started only once smbd is actually up, because smbd.service carries
+ * `After=nmb.service' and a queued nmbd job is therefore something a queued smbd
+ * job can be made to wait for.  The share does not need the NetBIOS name; it needs
+ * smbd.
  */
 #ifndef MIXDASH_SHARING_H
 #define MIXDASH_SHARING_H
 
+#include <QMap>
 #include <QString>
 #include <QStringList>
 
@@ -167,7 +205,8 @@ private:
         IdAtBoot,         /* systemctl enable/disable */
         IdNewPassword,
         IdRewrite,        /* put smb.conf back the way this page writes it */
-        IdShowPassword
+        IdShowPassword,
+        IdDiagnose        /* everything this page knows, onto the BOOT partition */
     };
 
     /* ── the pieces underneath ── */
@@ -198,6 +237,23 @@ private:
      * it has none.  Forked only on the failure path -- it is another cold load of
      * the whole samba library stack, which is not a thing to do on the way in. */
     static QString configComplaint();
+    /*
+     * Several `systemctl show' properties out of ONE fork, as a key=value map.
+     * One fork rather than one per property, because the failure path asks for
+     * half a dozen of them and every fork on this board is a cold dynamic link.
+     */
+    static QMap<QString, QString> unitProperties(const QString &unit,
+                                                 const QStringList &props);
+    /*
+     * The last `lines' the journal holds for the unit, oldest first.
+     *
+     * THIS BOOT ONLY, and that is not a limitation here.  cleanup_filesystem.sh
+     * deletes /var/log/journal from the shared rootfs, so journald keeps its ring
+     * in /run and the whole log dies with the power -- but the window that matters
+     * is the ten seconds after a start that has just refused, and in that window
+     * this is the only place on the device that holds smbd's own words.
+     */
+    static QString journalTail(const QString &unit, int lines);
     /* enable or disable, VERIFIED -- and with the .wants symlink written by hand
      * when systemctl could not.  Empty on success, the reason otherwise. */
     static QString setEnabled(const QString &unit, bool on);
@@ -229,6 +285,37 @@ private:
     void start();
     void stop();
     void rebuild();
+    /* Geometry, which is not constant: the note under the title takes one line or
+     * two depending on how much there is to say, and a page that reserved two
+     * permanently would give a row of the list away to a line that is usually
+     * short.  Called from resizeEvent and from the top of rebuild(). */
+    void layOut();
+    /* What the note strip shows -- m_note when there is one, and the standing
+     * description of the state otherwise.  Never empty. */
+    QString noteLine() const;
+    int noteLines() const;
+
+    /*
+     * ── THE PART THAT SURVIVES THE PAGE BEING LEFT ───────────────────────────
+     *
+     * Every failure this page can describe was, until now, described into m_note
+     * -- which onEnter() clears.  So a start that refused while nobody was looking
+     * left nothing behind, and "it just turns itself off" is the only report that
+     * could be made about it.  There is no journal to go back to either: this image
+     * runs journald in /run.
+     *
+     * So the diagnosis is written to a FILE, and to the one filesystem on this
+     * device that a PC can read without any of this working -- p1, vfat, mounted at
+     * /boot.  It is the same answer build-in-vm.sh gives for the boot log and for
+     * the same reason: the panel is 640x480 and the alternative is photographing it.
+     */
+    QString collectReport(const QString &reason) const;
+    /* collectReport() onto the card.  Returns where it landed, empty when nothing
+     * would take it. */
+    QString writeReport(const QString &reason);
+    /* Remember why, and put it on the card.  Every path that decides a start did
+     * not take goes through here. */
+    void noteFailure(const QString &reason);
 
     /* The start did not finish inside start()'s budget, so the page is now
      * watching for it.  Sets the note, speeds the poll up and opens the grace. */
@@ -251,6 +338,14 @@ private:
      * ends the wait long before it runs out. */
     bool m_starting = false;
     int m_startGraceMs = 0;
+
+    /* Why the last start did not take, kept for the life of the page -- m_note is
+     * cleared on every entry and this is not, so the diagnosis row still has
+     * something to say about it two visits later. */
+    QString m_lastFailure;
+    /* Where the last diagnosis was written, so the row can say so instead of
+     * making the operator guess at a path. */
+    QString m_reportPath;
 };
 
 #endif /* MIXDASH_SHARING_H */

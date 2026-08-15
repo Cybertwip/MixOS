@@ -274,7 +274,8 @@ void FilesPage::rebuildPlaces()
     root.glyph = GlyphSettings;
     m_places.append(root);
 
-    for (const Disk &v : Disks::instance().list()) {
+    const QVector<Disk> disks = Disks::instance().list();
+    for (const Disk &v : disks) {
         Place p;
         p.label = v.name();
         p.path = v.mountPoint;
@@ -282,6 +283,40 @@ void FilesPage::rebuildPlaces()
         p.volume = true;
         p.readOnly = v.readOnly;
         m_places.append(p);
+    }
+
+    /*
+     * ── THE BACKSTOP, FOR WHEN THE DISK IS THERE AND WE DID NOT SEE IT ───────
+     *
+     * Everything above this line depends on Disks recognising the volume, and
+     * Disks is a reader of two reports -- the mounter's state files and
+     * /proc/self/mountinfo.  Both of them can be silent about a filesystem that is
+     * genuinely mounted: a card whose payload predates the automount units writes
+     * no state file, and a mount performed in another namespace is not in the
+     * mountinfo this process opened.  The symptom is exact and was reported as
+     * such -- a stick that the Terminal card can `ls' and this page cannot show.
+     *
+     * So when nothing was recognised and /media has something in it anyway, the
+     * directory itself goes on the panel.  It is one row and it is not a volume:
+     * no eject, no read-only badge, nothing claimed about it that a stat of a
+     * directory cannot support.  Browsing into it lists the mount points, which is
+     * the whole of what was missing.
+     *
+     * Only when the list is empty, deliberately.  A "Media" row NEXT TO the disks
+     * it contains is two ways to the same files and a question about which one is
+     * right; this is a fallback, and a fallback that shows up while the real thing
+     * is working is just clutter.
+     */
+    if (disks.isEmpty()) {
+        const QDir media(QStringLiteral("/media"));
+        if (media.exists()
+            && !media.entryList(QDir::Dirs | QDir::NoDotAndDotDot).isEmpty()) {
+            Place p;
+            p.label = tr("Media");
+            p.path = media.absolutePath();
+            p.glyph = GlyphDrive;
+            m_places.append(p);
+        }
     }
 
     m_place = qBound(0, m_place, qMax(0, m_places.size() - 1));

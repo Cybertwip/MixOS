@@ -8,9 +8,11 @@
  */
 #include "sharing.h"
 
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QFontMetrics>
 #include <QPainter>
 #include <QProcess>
 #include <QResizeEvent>
@@ -110,6 +112,82 @@ QString testparmPath()
     return found;
 }
 
+QString journalctlPath()
+{
+    static const QStringList paths = QStringList()
+        << QStringLiteral("/usr/bin/journalctl") << QStringLiteral("/bin/journalctl");
+    static const QString found = firstExecutable(paths);
+    return found;
+}
+
+/*
+ * ── WHERE A DIAGNOSIS GOES SO THAT SOMEBODY CAN READ IT ──────────────────────
+ *
+ * /boot first, and it is the whole point: p1 is vfat, the rootfs mounts it there
+ * (`LABEL=BOOT /boot vfat defaults 0 0'), and it is the ONE filesystem on this card
+ * that the machine the operator will take it to can open.  p2 is ext2, which is the
+ * filesystem that made "send me the log" unanswerable on this board in the first
+ * place -- see the boot-log note in build-in-vm.sh, which reaches the same
+ * conclusion for the same reason.
+ *
+ * /var/log second, for a system booted with no BOOT partition mounted -- an NFS
+ * root, a card mounted by hand -- where the file is at least fetchable over ssh.
+ */
+const char kReportName[] = "mixos-sharing.txt";
+
+QStringList reportDirs()
+{
+    return QStringList() << QStringLiteral("/boot") << QStringLiteral("/var/log");
+}
+
+/*
+ * Two lines at most, wrapped on a space, and the last one ELIDED rather than
+ * clipped.
+ *
+ * drawText into a rectangle CLIPS, which is what the note strip did: the reason a
+ * start failed is a sentence, sentences are longer than 640 pixels of twelve-point
+ * text, and the part that got thrown away was reliably the part that named the
+ * cause.  A clipped diagnosis reads as no diagnosis, which is exactly the report
+ * this page keeps coming back with.
+ */
+int fitPrefix(const QFontMetrics &fm, const QString &s, int width)
+{
+    int lo = 0;
+    int hi = s.size();
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) / 2;
+        if (fm.horizontalAdvance(s.left(mid)) <= width)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    if (lo >= s.size())
+        return s.size();
+    /* On a space where there is one: a break in the middle of a word reads as a
+     * typo, and half the words here are paths. */
+    const int space = s.lastIndexOf(QLatin1Char(' '), lo);
+    return space > 0 ? space : qMax(1, lo);
+}
+
+void paintNote(QPainter &p, const QRect &box, const QString &text, int rows)
+{
+    const QFontMetrics fm(p.font());
+    const int lh = box.height() / qMax(1, rows);
+    QString rest = text;
+
+    for (int i = 0; i < rows; ++i) {
+        const QRect line(box.x(), box.y() + i * lh, box.width(), lh);
+        if (i == rows - 1 || fm.horizontalAdvance(rest) <= box.width()) {
+            p.drawText(line, Qt::AlignLeft | Qt::AlignVCenter,
+                       fm.elidedText(rest, Qt::ElideRight, box.width()));
+            return;
+        }
+        const int cut = fitPrefix(fm, rest, box.width());
+        p.drawText(line, Qt::AlignLeft | Qt::AlignVCenter, rest.left(cut).trimmed());
+        rest = rest.mid(cut).trimmed();
+    }
+}
+
 /*
  * How long the page keeps watching a start that has not finished.
  *
@@ -124,6 +202,16 @@ const int kStartGraceMs = 90000;
  * appearing or a stick being plugged in; a start wants to be seen landing. */
 const int kPollIdleMs = 4000;
 const int kPollWatchMs = 1500;
+
+/* How long a watched start has to have been watched before an inactive unit counts
+ * as a refusal rather than as a job PID 1 has not begun yet.  See poll(). */
+const int kSettleMs = 3000;
+
+/* The note strip under the title: one line's worth, and how many of them there can
+ * be.  Two, because the sentences that say WHY a start refused are about that long
+ * and the third line would come out of the list. */
+const int kNoteRowH = 18;
+const int kNoteMaxRows = 2;
 
 } /* namespace */
 
@@ -206,6 +294,61 @@ QString SharingPage::unitProperty(const QString &unit, const QString &prop)
                                    << (QStringLiteral("--property=") + prop)
                                    << QStringLiteral("--value") << unit,
                      4000);
+}
+
+QMap<QString, QString> SharingPage::unitProperties(const QString &unit,
+                                                   const QStringList &props)
+{
+    QMap<QString, QString> out;
+    if (props.isEmpty())
+        return out;
+
+    QStringList args;
+    args << QStringLiteral("show");
+    for (const QString &p : props)
+        args << (QStringLiteral("--property=") + p);
+    args << unit;
+
+    /* No --value here, deliberately: the answer has to carry the names, because
+     * systemd omits a property it has nothing for and a positional read would then
+     * quietly shift every value up by one. */
+    const QString text = systemctl(args, 5000);
+    const QStringList lines = text.split(QLatin1Char('\n'));
+    for (const QString &line : lines) {
+        const int eq = line.indexOf(QLatin1Char('='));
+        if (eq <= 0)
+            continue;
+        out.insert(line.left(eq), line.mid(eq + 1).trimmed());
+    }
+    return out;
+}
+
+QString SharingPage::journalTail(const QString &unit, int lines)
+{
+    if (journalctlPath().isEmpty())
+        return QString();
+
+    QProcess p;
+    p.setProcessChannelMode(QProcess::MergedChannels);
+    /* -o cat is the message and nothing else -- no timestamp, no hostname, no unit
+     * name repeated on every line.  On a panel and in a file that a human is going
+     * to read on a phone, the twenty characters of preamble are the difference
+     * between a readable line and a wrapped one.  -b is this boot: journald has no
+     * persistent store on this image, but saying so costs nothing and makes the
+     * report honest about what it is showing. */
+    p.start(journalctlPath(),
+            QStringList() << QStringLiteral("--no-pager") << QStringLiteral("-b")
+                          << QStringLiteral("-u") << unit
+                          << QStringLiteral("-n") << QString::number(lines)
+                          << QStringLiteral("-o") << QStringLiteral("cat"));
+    if (!Shell::waitForStarted(p, 2000))
+        return QString();
+    if (!Shell::waitForFinished(p, 8000)) {
+        p.kill();
+        Shell::waitForFinished(p, 500);
+        return QString();
+    }
+    return QString::fromUtf8(p.readAll()).trimmed();
 }
 
 bool SharingPage::unitEnabled(const QString &unit)
@@ -794,11 +937,11 @@ QString SharingPage::ensureConfigured()
 void SharingPage::start()
 {
     if (!sambaInstalled()) {
-        m_note = tr("samba is not installed on this card");
+        noteFailure(tr("samba is not installed on this card"));
         return;
     }
     if (systemctlPath().isEmpty()) {
-        m_note = tr("there is no systemctl on this card, so nothing can start smbd");
+        noteFailure(tr("there is no systemctl on this card, so nothing can start smbd"));
         return;
     }
 
@@ -806,31 +949,31 @@ void SharingPage::start()
      * serve the guest-readable shares for the life of this boot. */
     const QString err = ensureConfigured();
     if (!err.isEmpty()) {
-        m_note = err;
+        noteFailure(err);
         return;
     }
 
-    int rc = -1;
-    const QString out = systemctl(QStringList() << QStringLiteral("start")
-                                                << QString::fromLatin1(kSmbd),
-                                  15000, &rc);
-
     /*
-     * nmbd second, and --no-block, and BOTH of those matter.
+     * --no-block, WHICH IS THE WHOLE OF BUG SIX.
      *
-     * --no-block because its result is explicitly not consulted -- see the note on
-     * kNmbd -- so the eight seconds this used to wait were eight seconds of a dead
-     * panel bought for nothing.  systemd runs the job either way.
+     * This used to wait fifteen seconds for `systemctl start smbd' and then read the
+     * unit's state once.  Both halves of that were wrong.  The wait was fifteen
+     * seconds in which the dashboard did not repaint and did not read the pad -- and
+     * on a Type=notify unit that runs testparm three times off a cold card, it was
+     * reliably too short anyway, so the answer it bought was `activating', which is
+     * not an answer.  The watch below is what actually settles the question, and
+     * once there is a watch the wait is pure cost.
      *
-     * Second because smbd.service carries `After=nmb.service', and After= binds two
-     * units that are in the same job transaction.  Queue nmbd first and smbd is
-     * made to wait for it, which is nmbd's whole startup added to the one wait on
-     * this page that anybody is watching.  Queued after, there is nothing for the
-     * ordering to apply to.
+     * So the job is queued and the page carries on.  rc still means something: a
+     * non-zero exit here is systemd REFUSING THE JOB -- no such unit, no D-Bus, a
+     * masked unit -- which is a real answer and comes with a message.  rc == 0 is
+     * only "queued", which is why it leads to the watch and not to a verdict.
      */
-    systemctl(QStringList() << QStringLiteral("--no-block")
-                            << QStringLiteral("start") << QString::fromLatin1(kNmbd),
-              4000);
+    int rc = -1;
+    const QString out = systemctl(QStringList() << QStringLiteral("--no-block")
+                                                << QStringLiteral("start")
+                                                << QString::fromLatin1(kSmbd),
+                                  8000, &rc);
 
     /* One query, three answers wanted out of it: up, still moving, or settled and
      * not up.  Asked as the state rather than as unitActive() because the second
@@ -838,38 +981,46 @@ void SharingPage::start()
     const QString state = activeState(QString::fromLatin1(kSmbd));
     m_active = (state == QLatin1String("active"));
     if (m_active) {
+        /* nmbd only now, and only here and in endWatch(true).  smbd.service carries
+         * `After=nmb.service', so queueing nmbd while an smbd job is in flight makes
+         * smbd wait for the whole of nmbd's startup -- the one wait on this page
+         * anybody is watching, lengthened by a daemon whose result this page does
+         * not even consult.  Once smbd is up there is no job left for the ordering
+         * to apply to.  --no-block for the same reason: see the note on kNmbd. */
+        systemctl(QStringList() << QStringLiteral("--no-block")
+                                << QStringLiteral("start")
+                                << QString::fromLatin1(kNmbd),
+                  4000);
         const QStringList ips = addresses();
         m_note = ips.isEmpty()
                      ? tr("sharing is on, but this device has no network address yet")
                      : tr("sharing is on at %1").arg(ips.first());
         m_reveal = true;
+        /* The standing complaint goes when the thing it complained about works.
+         * The file on the card stays -- it is dated, and it is the only history
+         * this device keeps of a start that did not. */
+        m_lastFailure.clear();
         return;
     }
 
     /*
-     * NOT RUNNING YET IS NOT THE SAME AS REFUSED, and telling the two apart is the
-     * whole point of this rewrite.
+     * QUEUED IS NOT REFUSED, and telling the two apart is the whole point.
      *
-     * rc is -1 when systemctl never finished -- which here means the fifteen-second
-     * budget ran out and the client was killed.  Killing the client does not cancel
-     * anything: the job belongs to PID 1 and smbd carries on coming up behind it.
-     * On this board that is the ordinary case for a first start, not an unusual
-     * one, because the unit runs testparm three times off a cold SD card before
-     * smbd is even exec'd.  So the page starts watching instead of lying.
-     *
-     * The same is true when systemctl DID return and the unit is still activating:
-     * a Type=notify unit can be perfectly healthy and not yet ready.
+     * rc == 0 means PID 1 took the job and nothing about what it will do with it;
+     * rc < 0 means systemctl itself never finished, and killing the client cancels
+     * nothing, because the job belongs to PID 1 either way.  In both cases smbd is
+     * coming up behind this function and the page has to watch rather than guess.
      */
-    if (rc < 0 || stateIsTransient(state)) {
+    if (rc <= 0 || stateIsTransient(state)) {
         beginWatch();
         return;
     }
 
-    /* It really did stop trying.  systemd's own line if it left one -- it does for
-     * a failure and does not for a skip -- and otherwise the reason dug out of the
-     * unit, which is never empty. */
-    m_note = out.isEmpty() ? startFailureReason(QString::fromLatin1(kSmbd))
-                           : out.section('\n', 0, 0);
+    /* systemd said no to the job itself, which it does with a message.  Its own
+     * line where there is one, and otherwise the reason dug out of the unit --
+     * which is never empty. */
+    noteFailure(out.isEmpty() ? startFailureReason(QString::fromLatin1(kSmbd))
+                              : out.section('\n', 0, 0));
 }
 
 void SharingPage::stop()
@@ -921,6 +1072,11 @@ void SharingPage::endWatch(bool ok)
     m_timer->setInterval(kPollIdleMs);
 
     if (ok) {
+        /* The other half of the nmbd move -- see start().  smbd is up, so its job
+         * is done and `After=nmb.service' has nothing left to hold back. */
+        systemctl(QStringList() << QStringLiteral("--no-block")
+                                << QStringLiteral("start") << QString::fromLatin1(kNmbd),
+                  4000);
         const QStringList ips = addresses();
         m_note = ips.isEmpty()
                      ? tr("sharing is on, but this device has no network address yet")
@@ -928,10 +1084,218 @@ void SharingPage::endWatch(bool ok)
         /* Shown on the way up and only on the way up.  It is the one moment the
          * password is certain to be wanted, and onEnter() masks it again. */
         m_reveal = true;
+        m_lastFailure.clear();
         emit toastRequested(tr("Sharing is on"), 2500);
         return;
     }
-    m_note = startFailureReason(QString::fromLatin1(kSmbd));
+    noteFailure(startFailureReason(QString::fromLatin1(kSmbd)));
+}
+
+/* ── the diagnosis ───────────────────────────────────────────────────────── */
+
+namespace {
+
+/* The head of a text file, bounded twice -- by lines and by bytes.  Both bounds
+ * matter: this goes onto a small vfat partition, and smb.conf is only smb.conf on
+ * a card where nothing has gone wrong, which is not the card this runs on. */
+QString fileHead(const QString &path, int maxLines, int maxBytes)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return QStringLiteral("  (cannot read it)");
+
+    QStringList lines;
+    int bytes = 0;
+    while (lines.size() < maxLines && bytes < maxBytes && !f.atEnd()) {
+        const QByteArray raw = f.readLine(512);
+        bytes += raw.size();
+        lines << QString::fromUtf8(raw).remove(QLatin1Char('\n')).remove(QLatin1Char('\r'));
+    }
+    if (!f.atEnd())
+        lines << QStringLiteral("  ... (truncated)");
+    return lines.join(QLatin1Char('\n'));
+}
+
+/* Seconds since boot.  Written beside the wall clock because this board has no
+ * RTC that survives a battery pull: the timestamp above it can be 1970 and the
+ * uptime still tells you which start went with which report. */
+QString uptimeSeconds()
+{
+    QFile f(QStringLiteral("/proc/uptime"));
+    if (!f.open(QIODevice::ReadOnly))
+        return QString();
+    return QString::fromLatin1(f.readLine(64)).section(QLatin1Char(' '), 0, 0);
+}
+
+} /* namespace */
+
+/*
+ * EVERYTHING THIS PAGE CAN FIND OUT, IN ONE FILE.
+ *
+ * Not a summary: the whole of it, because the reader is somebody standing at a PC
+ * with the card in it and no way to ask a follow-up question.  systemd's own
+ * account of both units, smbd's journal for this boot, samba's opinion of the
+ * configuration, and the configuration itself -- the four things that between them
+ * name every cause this page has ever had to explain.
+ *
+ * THE PASSWORD IS NOT IN IT, deliberately, and that is not an oversight to be
+ * "fixed" later.  This file lands on the vfat partition, which is the one part of
+ * the card that any machine can read without a password of its own; a share
+ * credential written there would be a share credential written in the clear to
+ * whoever picks the device up.  Whether one EXISTS is in the report, because that
+ * is the part that can be wrong.
+ */
+QString SharingPage::collectReport(const QString &reason) const
+{
+    static const QStringList props = QStringList()
+        << QStringLiteral("LoadState") << QStringLiteral("ActiveState")
+        << QStringLiteral("SubState") << QStringLiteral("UnitFileState")
+        << QStringLiteral("Result") << QStringLiteral("ConditionResult")
+        << QStringLiteral("AssertResult") << QStringLiteral("ExecMainStatus")
+        << QStringLiteral("ExecMainCode") << QStringLiteral("StatusText")
+        << QStringLiteral("NRestarts") << QStringLiteral("FragmentPath");
+
+    QStringList o;
+    o << QStringLiteral("================================================================");
+    o << QStringLiteral("MixOS sharing diagnosis");
+    o << QStringLiteral("  written    %1")
+             .arg(QDateTime::currentDateTime().toString(Qt::ISODate));
+    const QString up = uptimeSeconds();
+    if (!up.isEmpty())
+        o << QStringLiteral("  uptime     %1 s  (trust this over the clock above -- "
+                            "there is no RTC)").arg(up);
+    o << QStringLiteral("  reason     %1").arg(reason);
+    o << QString();
+
+    o << QStringLiteral("-- this device --");
+    o << QStringLiteral("  host       %1").arg(hostName());
+    const QStringList ips = addresses();
+    o << QStringLiteral("  addresses  %1")
+             .arg(ips.isEmpty() ? QStringLiteral("(none -- not on a network)")
+                                : ips.join(QStringLiteral(", ")));
+    const QStringList vols = mountedVolumes();
+    o << QStringLiteral("  volumes    %1")
+             .arg(vols.isEmpty() ? QStringLiteral("(nothing mounted under /media)")
+                                 : vols.join(QStringLiteral(", ")));
+    o << QStringLiteral("  samba      %1")
+             .arg(sambaInstalled() ? QStringLiteral("installed")
+                                   : QStringLiteral("NOT INSTALLED"));
+    o << QStringLiteral("  systemctl  %1")
+             .arg(systemctlPath().isEmpty() ? QStringLiteral("(not on this card)")
+                                            : systemctlPath());
+    o << QStringLiteral("  testparm   %1")
+             .arg(testparmPath().isEmpty() ? QStringLiteral("(not on this card)")
+                                           : testparmPath());
+    o << QStringLiteral("  journalctl %1")
+             .arg(journalctlPath().isEmpty() ? QStringLiteral("(not on this card)")
+                                             : journalctlPath());
+    o << QString();
+
+    o << QStringLiteral("-- configuration --");
+    const QFileInfo cfg((QString::fromLatin1(kConfig)));
+    o << QStringLiteral("  %1  %2, %3 bytes")
+             .arg(QString::fromLatin1(kConfig),
+                  cfg.exists() ? QStringLiteral("present") : QStringLiteral("MISSING"),
+                  QString::number(cfg.size()));
+    o << QStringLiteral("  written by this page   %1")
+             .arg(configIsOurs() ? QStringLiteral("yes")
+                                 : QStringLiteral("NO -- it is the image's own file"));
+    /* Whether, not what.  See the block above this function. */
+    o << QStringLiteral("  share password stored  %1")
+             .arg(storedPassword().isEmpty() ? QStringLiteral("NO")
+                                             : QStringLiteral("yes (not printed here)"));
+    const QString complaint = configComplaint();
+    o << QStringLiteral("  testparm says          %1")
+             .arg(complaint.isEmpty() ? QStringLiteral("nothing -- it accepts the file")
+                                      : complaint);
+    o << QString();
+
+    const char *units[] = { kSmbd, kNmbd };
+    for (const char *name : units) {
+        const QString unit = QString::fromLatin1(name);
+        o << QStringLiteral("-- %1 --").arg(unit);
+        const QMap<QString, QString> p = unitProperties(unit, props);
+        if (p.isEmpty()) {
+            o << QStringLiteral("  systemd did not answer about it");
+        } else {
+            /* In the order asked for rather than the map's, because Result= beside
+             * ConditionResult= is the pair that names the cause and a report sorted
+             * alphabetically puts them at opposite ends. */
+            for (const QString &key : props) {
+                if (p.contains(key))
+                    o << QStringLiteral("  %1=%2").arg(key, p.value(key));
+            }
+        }
+        const QString tail = journalTail(unit, 40);
+        o << QStringLiteral("  -- journal, this boot --");
+        o << (tail.isEmpty() ? QStringLiteral("  (nothing there)") : tail);
+        o << QString();
+    }
+
+    o << QStringLiteral("-- %1 --").arg(QString::fromLatin1(kConfig));
+    o << fileHead(QString::fromLatin1(kConfig), 120, 8192);
+    o << QString();
+
+    return o.join(QLatin1Char('\n'));
+}
+
+QString SharingPage::writeReport(const QString &reason)
+{
+    /* CRLF, and only here.  The report exists to be opened on the PC the operator
+     * is standing at, and that is the one place in this tree where the DOS line
+     * ending is the correct one rather than an accident. */
+    QString text = collectReport(reason);
+    text.replace(QLatin1String("\n"), QLatin1String("\r\n"));
+
+    const QStringList dirs = reportDirs();
+    for (const QString &dir : dirs) {
+        if (!QFileInfo(dir).isDir())
+            continue;
+
+        const QString path =
+            dir + QLatin1Char('/') + QString::fromLatin1(kReportName);
+
+        /*
+         * APPENDED, AND CAPPED.  Appended because the second failure is usually the
+         * one that explains the first, and a file that overwrote itself would lose
+         * the comparison the moment somebody tried again.  Capped because /boot is a
+         * small vfat partition and this page has a button on it: past the cap the
+         * file starts over rather than filling the partition the device boots from.
+         */
+        const bool fresh = QFileInfo(path).size() >= 96 * 1024;
+        QFile f(path);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Text
+                    | (fresh ? QIODevice::Truncate : QIODevice::Append)))
+            continue;
+
+        QTextStream s(&f);
+        s << text << "\r\n";
+        s.flush();
+        const bool streamOk = (s.status() == QTextStream::Ok);
+        f.close();
+        /* Checked for the same reason writeConfig()'s write is -- a card with no
+         * room left is one of the things this report is written to diagnose, and a
+         * report that silently did not land would be the worst of both. */
+        if (!streamOk || f.error() != QFile::NoError)
+            continue;
+        return path;
+    }
+    return QString();
+}
+
+void SharingPage::noteFailure(const QString &reason)
+{
+    m_lastFailure = reason;
+
+    const QString path = writeReport(reason);
+    if (!path.isEmpty())
+        m_reportPath = path;
+
+    /* The reason first and the path second: the strip takes two lines now, but if
+     * only one of them survives the elide it has to be the half that says why. */
+    m_note = m_reportPath.isEmpty()
+                 ? reason
+                 : tr("%1  --  written to %2").arg(reason, m_reportPath);
 }
 
 /* ── the page ────────────────────────────────────────────────────────────── */
@@ -954,12 +1318,60 @@ SharingPage::SharingPage(QWidget *parent)
     connect(m_timer, &QTimer::timeout, this, &SharingPage::poll);
 }
 
-void SharingPage::resizeEvent(QResizeEvent *event)
+/*
+ * ── THE NOTE STRIP, AND WHY IT IS NOT A FIXED HEIGHT ─────────────────────────
+ *
+ * It was one line of eighteen pixels, unconditionally, and drawText CLIPS: so
+ * "samba will not read /etc/samba/smb.conf: Unknown parameter encountered ..." was
+ * painted as far as the right edge of the card and the rest was thrown away.  The
+ * half that got thrown away is the half that names the cause, every time, because
+ * the cause is always at the end of the sentence.  That is bug FOUR, and it is why
+ * three fixed bugs still produced the same report: the page HAD the reason and had
+ * nowhere to put it.
+ *
+ * Two lines when two are needed and one otherwise, with the list moving down to
+ * make room.  Not two permanently -- on the ordinary "sharing is off" the second
+ * line would be blank and a row of the list would have been given away for it.
+ */
+QString SharingPage::noteLine() const
+{
+    if (!m_note.isEmpty())
+        return m_note;
+    if (!sambaInstalled())
+        return tr("Samba is not on this card");
+    if (m_active)
+        return tr("Home and any plugged-in disk are on the network");
+    if (m_starting)
+        return tr("Starting -- smbd has not answered yet");
+    /* Survives onEnter(), which m_note deliberately does not.  A failure the
+     * operator walked away from and came back to is the case this page was
+     * reported for, and saying nothing about it is how it stayed unexplained. */
+    if (!m_lastFailure.isEmpty())
+        return tr("Last try: %1").arg(m_lastFailure);
+    return tr("Switch it on to reach this device's files from a PC");
+}
+
+int SharingPage::noteLines() const
+{
+    const QFontMetrics fm(Theme::font(12));
+    const int box = qMax(1, width() - 2 * Theme::Margin - 26);
+    return fm.horizontalAdvance(noteLine()) > box ? kNoteMaxRows : 1;
+}
+
+void SharingPage::layOut()
 {
     const QRect card(Theme::Margin, Theme::Margin,
                      width() - 2 * Theme::Margin, height() - 2 * Theme::Margin);
-    m_list->setGeometry(card.x() + 6, card.y() + 36 + 20, card.width() - 12,
-                        card.height() - 36 - 26);
+    /* 36 + 20 down from the top of the card and 26 up from the bottom is where this
+     * list has always sat; the extra is the second note line pushing it down. */
+    const int extra = (noteLines() - 1) * kNoteRowH;
+    m_list->setGeometry(card.x() + 6, card.y() + 36 + 20 + extra, card.width() - 12,
+                        card.height() - 36 - 26 - extra);
+}
+
+void SharingPage::resizeEvent(QResizeEvent *event)
+{
+    layOut();
     QWidget::resizeEvent(event);
 }
 
@@ -994,16 +1406,27 @@ void SharingPage::poll()
     m_enabled = unitEnabled(QString::fromLatin1(kSmbd));
 
     if (m_starting) {
+        m_startGraceMs -= m_timer->interval();
+        const int watched = kStartGraceMs - m_startGraceMs;
+
         if (m_active) {
             endWatch(true);
-        } else if (!stateIsTransient(state)) {
-            /* It has stopped moving and it is not up.  Waiting out the rest of the
-             * grace would only make the page slower to say so. */
+        } else if (!stateIsTransient(state) && watched >= kSettleMs) {
+            /*
+             * It has stopped moving and it is not up.  Waiting out the rest of the
+             * grace would only make the page slower to say so.
+             *
+             * BUT NOT ON THE FIRST TICK, and that guard arrived with --no-block.  A
+             * queued job that PID 1 has not picked up yet leaves the unit sitting at
+             * `inactive', which is a settled state and is indistinguishable from one
+             * that ran and refused.  Three seconds is longer than systemd takes to
+             * begin a job it has already accepted and far shorter than anything this
+             * page would otherwise wait, so it costs nothing and stops the page
+             * reporting a failure that has not happened.
+             */
             endWatch(false);
-        } else {
-            m_startGraceMs -= m_timer->interval();
-            if (m_startGraceMs <= 0)
-                endWatch(false);
+        } else if (m_startGraceMs <= 0) {
+            endWatch(false);
         }
     }
 
@@ -1017,6 +1440,10 @@ void SharingPage::poll()
 
 void SharingPage::rebuild()
 {
+    /* First, because the note that is about to be drawn may have just become two
+     * lines long, and the list has to have moved out of its way before the paint. */
+    layOut();
+
     const int keep = m_list->current();
     QVector<ListRow> rows;
 
@@ -1219,6 +1646,24 @@ void SharingPage::rebuild()
     r.id = IdRewrite;
     rows << r;
 
+    /*
+     * ALWAYS PRESENT, not only after a failure.  The report this row writes is the
+     * one thing on this device that can answer "why did it not share" from the other
+     * side of a card reader, and the moment somebody wants it is not necessarily a
+     * moment this page happens to be in a failed state -- "it shares but the PC
+     * cannot see it" is the same question with none of the same symptoms.
+     */
+    r = ListRow();
+    r.kind = ListRow::Action;
+    r.text = tr("Write a diagnosis");
+    r.detail = m_reportPath.isEmpty()
+                   ? tr("Everything this page knows about smbd, onto the BOOT "
+                        "partition -- readable on a PC with the card in it")
+                   : tr("Written to %1 -- press to write it again").arg(m_reportPath);
+    r.accent = Theme::blue();
+    r.id = IdDiagnose;
+    rows << r;
+
     m_list->setRows(rows);
     if (keep >= 0 && keep < rows.size())
         m_list->setCurrent(keep);
@@ -1313,6 +1758,27 @@ void SharingPage::onActivated(int index)
         break;
     }
 
+    case IdDiagnose: {
+        /* Seconds, not milliseconds: this forks journalctl twice and testparm once,
+         * and testparm is a cold load of the whole samba library stack off the card.
+         * It blocks the page for as long as that takes, which is the right trade for
+         * a row somebody pressed on purpose -- and Shell's waits keep the console
+         * from being taken while it happens. */
+        const QString reason = m_lastFailure.isEmpty()
+                                   ? tr("asked for from the Sharing page")
+                                   : m_lastFailure;
+        const QString path = writeReport(reason);
+        if (path.isEmpty()) {
+            m_note = tr("could not write the diagnosis -- is the card full, or "
+                        "mounted read-only?");
+        } else {
+            m_reportPath = path;
+            m_note = tr("diagnosis written to %1").arg(path);
+            emit toastRequested(tr("Diagnosis written"), 2500);
+        }
+        break;
+    }
+
     default:
         return;
     }
@@ -1363,18 +1829,13 @@ void SharingPage::paintEvent(QPaintEvent *)
     const QRectF body = paintSheet(p, card, tr("Sharing"), right);
 
     /* The same one line wifi.cpp puts here, for the same reason: what just
-     * happened, above the list rather than in a toast that has already gone. */
-    QString line = m_note;
-    if (line.isEmpty()) {
-        if (!sambaInstalled())
-            line = tr("Samba is not on this card");
-        else if (m_active)
-            line = tr("Home and any plugged-in disk are on the network");
-        else
-            line = tr("Switch it on to reach this device's files from a PC");
-    }
+     * happened, above the list rather than in a toast that has already gone --
+     * except that here it is allowed to be two, and it elides instead of being
+     * clipped.  See noteLine() for why that mattered. */
     p.setFont(Theme::font(12));
     p.setPen(m_active ? Theme::green() : m_starting ? Theme::yellow() : Theme::ink2());
-    p.drawText(QRectF(body.x() + 12, body.y() + 2, body.width() - 24, 18),
-               Qt::AlignLeft | Qt::AlignVCenter, line);
+    const int rows = noteLines();
+    const QRect box(int(body.x()) + 12, int(body.y()) + 2,
+                    int(body.width()) - 24, rows * kNoteRowH);
+    paintNote(p, box, noteLine(), rows);
 }

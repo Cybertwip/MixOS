@@ -200,6 +200,9 @@ protected:
 private slots:
     void onActivated(int index);
     void onValueChanged(int index, int value);
+    /* A volume was mounted or pulled.  Repopulates whatever is on screen, because
+     * three separate things about it can have gone stale -- see media.cpp. */
+    void onDisksChanged();
     void readFrames();
     /*
      * ── WHERE THE PICTURE IS KEPT LEVEL WITH THE SOUND ──
@@ -264,7 +267,12 @@ private slots:
     void commitSeek();
 
 private:
-    enum Kind { KindDir = 0, KindAudio, KindVideo, KindImage, KindOther, KindUp };
+    /* KindPlace is a ROOT -- the device itself or a mounted volume -- and it only
+     * ever appears on the places level, which is the one listing on this page that
+     * is not a directory.  See populatePlaces() in media.cpp. */
+    enum Kind {
+        KindDir = 0, KindAudio, KindVideo, KindImage, KindOther, KindUp, KindPlace
+    };
     enum View { ViewBrowse = 0, ViewImage, ViewVideo, ViewPlayer };
     enum RepeatMode { RepeatOff = 0, RepeatAll, RepeatOne };
 
@@ -314,6 +322,9 @@ private:
      * press.
      */
     void populate(QString dir);
+    /* The list of roots -- "Device" and every mounted volume -- which is what `..'
+     * shows when you are standing on one.  Leaves m_dir alone: see media.cpp. */
+    void populatePlaces();
     void open(Entry entry);
     /* Cursor onto the row showing this path; false if this listing has none. */
     bool selectPath(const QString &path);
@@ -518,6 +529,11 @@ private:
 
     ListPane *m_list = nullptr;
     QString m_dir;
+    /* The places level is up, and m_entries is roots rather than files.  m_dir
+     * still names the last real directory while this is true -- it is where `..'
+     * came from and where the page goes back to -- so nothing that reads m_dir has
+     * to know this level exists. */
+    bool m_places = false;
     QVector<Entry> m_entries;
 
     int m_view = ViewBrowse;

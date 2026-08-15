@@ -22,6 +22,7 @@
 
 #include <signal.h>
 
+#include "disks.h"
 #include "glvideo.h"
 #include "joypad.h"
 #include "settings.h"
@@ -169,33 +170,115 @@ QString defaultMediaRoot()
  * lost in a directory of device nodes with nothing on screen to explain how you
  * got there, on a handheld with no path bar to type your way back from.
  *
- * So there is a ceiling and this is it.  It is not a security boundary -- the
- * Files page still browses the whole disk, and that page is the one whose job
- * that is -- it is a browser that stays inside what it browses.
+ * So there is a ceiling.  It is not a security boundary -- the Files page still
+ * browses the whole disk, and that page is the one whose job that is -- it is a
+ * browser that stays inside what it browses.
  *
- * mediaCeiling() is defaultMediaRoot() and not the remembered directory: the
- * remembered one is where you WERE, which is somewhere under the ceiling, not
- * the ceiling itself.
+ * ── AND WHY THERE IS NOW MORE THAN ONE ───────────────────────────────────────
+ *
+ * The ceiling was a single directory, and a single directory is wrong the moment
+ * a USB stick is plugged in: the stick mounts under /media, /media is not beneath
+ * /home/virtua, and clampToCeiling() therefore threw away every path that named
+ * it.  Music on a stick was unreachable on the music page -- not hidden behind an
+ * awkward walk, unreachable, because the one row that could have walked there was
+ * the `..' row and `..' stopped at /home/virtua by construction.
+ *
+ * So the ceiling is a LIST.  The device's own media directory is always the first
+ * root, and every mounted volume Disks knows about is a root alongside it.  Being
+ * "inside the tree" means being under ANY of them, which is the only change the
+ * clamp needed; the rest of the page is unchanged, because a root behaves exactly
+ * the way the old ceiling did once you are inside one.
+ *
+ * Above the roots is the PLACES level -- the list of roots themselves, which is
+ * what `..' shows when you are standing on one.  See populatePlaces().
  */
+struct MediaRoot {
+    QString path;
+    QString name;      /* empty for the device, which the page names itself */
+    bool removable = false;
+};
+
 QString mediaCeiling()
 {
     return QDir::cleanPath(defaultMediaRoot());
 }
 
-/* True if `dir' is the ceiling or anything beneath it.  Compared with a trailing
- * separator so that /home/virtua-old is not mistaken for a child of
- * /home/virtua, which a bare startsWith() would do. */
-bool underCeiling(const QString &dir)
+/*
+ * The device first, then whatever is mounted, in the order Disks lists it.
+ *
+ * Built fresh on every call rather than cached, and that is deliberate: a stick
+ * can be pulled between two frames, and a cached root would leave the clamp
+ * admitting paths on a filesystem that is no longer there.  The list is one entry
+ * plus however many volumes are mounted, which on this board is never more than a
+ * couple, so there is nothing here worth keeping.
+ */
+QVector<MediaRoot> mediaRoots()
 {
-    const QString top = mediaCeiling();
-    const QString d = QDir::cleanPath(dir);
+    QVector<MediaRoot> roots;
 
-    if (d == top)
-        return true;
-    return d.startsWith(top.endsWith(QLatin1Char('/')) ? top : top + QLatin1Char('/'));
+    MediaRoot self;
+    self.path = mediaCeiling();
+    roots.append(self);
+
+    for (const Disk &d : Disks::instance().list()) {
+        if (d.mountPoint.isEmpty())
+            continue;
+        const QString p = QDir::cleanPath(d.mountPoint);
+        if (!QFileInfo(p).isDir())
+            continue;
+
+        bool known = false;
+        for (const MediaRoot &r : roots) {
+            if (r.path == p) {
+                known = true;
+                break;
+            }
+        }
+        if (known)
+            continue;
+
+        MediaRoot r;
+        r.path = p;
+        r.name = d.name();
+        r.removable = true;
+        roots.append(r);
+    }
+    return roots;
 }
 
-/* Whatever was asked for if it is inside the tree, the ceiling if it is not.
+/*
+ * The root `dir' is inside, or empty when it is inside none of them.
+ *
+ * Compared with a trailing separator so that /home/virtua-old is not mistaken for
+ * a child of /home/virtua, which a bare startsWith() would do.  The LONGEST match
+ * wins, for the case where one root is mounted underneath another -- /media is a
+ * directory on the rootfs, so a volume mounted at /media/STICK while the device
+ * root happened to be /media would otherwise resolve to the wrong one and `..'
+ * would climb out of the volume without saying so.
+ */
+QString rootOf(const QString &dir)
+{
+    const QString d = QDir::cleanPath(dir);
+    QString best;
+
+    for (const MediaRoot &r : mediaRoots()) {
+        const QString withSep = r.path.endsWith(QLatin1Char('/')) ? r.path
+                                                                  : r.path + QLatin1Char('/');
+        if (d != r.path && !d.startsWith(withSep))
+            continue;
+        if (r.path.size() > best.size())
+            best = r.path;
+    }
+    return best;
+}
+
+/* True if `dir' is a root or anything beneath one. */
+bool underCeiling(const QString &dir)
+{
+    return !rootOf(dir).isEmpty();
+}
+
+/* Whatever was asked for if it is inside the tree, the device root if it is not.
  * Every path that reaches m_dir goes through here, so there is one place that
  * decides and no way round it. */
 QString clampToCeiling(const QString &dir)
@@ -263,6 +346,12 @@ MediaPage::MediaPage(QWidget *parent)
     m_repeat = Settings::instance().mediaRepeat();
     m_shuffle = Settings::instance().mediaShuffle();
 
+    /* A stick plugged in while this page is up changes what the tree contains, so
+     * the listing has to be told.  Disks is already running by the time any page
+     * is built -- main.cpp starts it before the dashboard -- so this is only ever
+     * about later changes. */
+    connect(&Disks::instance(), &Disks::changed, this, &MediaPage::onDisksChanged);
+
     m_dir = mediaStartDir();
 }
 
@@ -327,7 +416,13 @@ void MediaPage::onEnter()
         m_view = ViewBrowse;
     m_list->setVisible(true);
 
-    populate(m_dir);
+    /* Left at the places level, come back to it -- unless the volume that made it
+     * worth having has been pulled in the meantime, in which case there is one
+     * root left and the list of it is not a level worth standing on. */
+    if (m_places && mediaRoots().size() > 1)
+        populatePlaces();
+    else
+        populate(m_dir);
     m_ui->start();
 }
 
@@ -449,6 +544,7 @@ void MediaPage::populate(QString dir)
     QDir d(clampToCeiling(dir));
     m_dir = d.absolutePath();
     m_entries.clear();
+    m_places = false;
 
     if (!d.exists()) {
         rebuild();
@@ -457,18 +553,34 @@ void MediaPage::populate(QString dir)
     }
 
     /*
-     * `..' only while there is somewhere above to go that is still inside the
-     * tree.  The test used to be !d.isRoot(), which meant the row was on every
-     * directory but / and was the way out of the media tree entirely.  Dropping
-     * the row rather than leaving it and refusing the press is deliberate: a row
-     * that is on the list and does nothing reads as a bug, and the absence of the
-     * row is itself the message that this is the top.
+     * `..' only while there is somewhere above to go.  The test used to be
+     * !d.isRoot(), which meant the row was on every directory but / and was the
+     * way out of the media tree entirely.  Dropping the row rather than leaving
+     * it and refusing the press is deliberate: a row that is on the list and does
+     * nothing reads as a bug, and the absence of the row is itself the message
+     * that this is the top.
+     *
+     * There are two kinds of "above" now.  Inside a root, it is the parent
+     * directory.  ON a root it is the places list -- and that row is only offered
+     * when there is more than one root, because a places list with a single entry
+     * on it is a level whose only row takes you straight back where you came
+     * from.  Plug a stick in and the row appears, on this listing, without the
+     * page being left: see onDisksChanged().
      */
-    if (m_dir != mediaCeiling() && underCeiling(QFileInfo(m_dir).absolutePath())) {
+    const QString root = rootOf(m_dir);
+    if (!root.isEmpty() && m_dir != root) {
         Entry up;
         up.kind = KindUp;
         up.name = QStringLiteral("..");
         up.path = QFileInfo(m_dir).absolutePath();
+        m_entries.append(up);
+    } else if (mediaRoots().size() > 1) {
+        /* An empty path is what open() reads as "go to the places list".  It
+         * cannot be confused with a directory: every other path in m_entries came
+         * out of QFileInfo::absoluteFilePath(). */
+        Entry up;
+        up.kind = KindUp;
+        up.name = QStringLiteral("..");
         m_entries.append(up);
     }
 
@@ -495,6 +607,91 @@ void MediaPage::populate(QString dir)
 
     rebuild();
     emit titleChanged();
+}
+
+/*
+ * ── THE LEVEL ABOVE THE ROOTS ────────────────────────────────────────────────
+ *
+ * One row per root: the device itself, then every mounted volume.  It is the only
+ * thing on this page that is not a directory listing, and it exists because a USB
+ * stick has no parent inside the tree -- /media/STICK's parent is /media, which is
+ * a directory on the rootfs with nothing in it but mount points, and browsing
+ * there would show the volumes as ordinary folders with no way to tell a mounted
+ * disk from a leftover empty directory.
+ *
+ * m_dir IS NOT TOUCHED HERE.  It still names the last real directory, so leaving
+ * the page and coming back to it does not have to decide what "the places level"
+ * means to Settings::mediaRoot -- and nothing that reads m_dir (the queue, the
+ * heading, `..') has to learn about a path that is not a path.  m_places is the
+ * whole of the state, and populate() clears it.
+ */
+void MediaPage::populatePlaces()
+{
+    m_places = true;
+    m_entries.clear();
+
+    for (const MediaRoot &r : mediaRoots()) {
+        Entry e;
+        e.kind = KindPlace;
+        e.path = r.path;
+        e.name = r.removable ? r.name : tr("Device");
+        if (e.name.isEmpty())
+            e.name = QFileInfo(r.path).fileName();
+        m_entries.append(e);
+    }
+
+    rebuild();
+    emit titleChanged();
+}
+
+/*
+ * A volume was mounted or pulled while this page existed.
+ *
+ * Three things can be stale afterwards and all three are fixed by repopulating:
+ * the places list itself, the `..' row on a root -- which is offered only while
+ * there is more than one root, so plugging a stick in has to make it appear --
+ * and the directory being browsed, if it was ON the stick that just went away.
+ *
+ * That last case is why the clamp is asked rather than trusted: m_dir was legal
+ * when it was set and is not any more, and populate() would list a directory that
+ * no longer exists.  clampToCeiling() sends it back to the device root, which is
+ * the one root that cannot be pulled.
+ *
+ * NOTHING IS STOPPED.  A track playing off a stick that has been yanked will die
+ * on its own and say so through the note strip, and that is a better answer than
+ * this page killing it on the strength of a mount table -- the volume may have
+ * been remounted somewhere else in the same event.
+ */
+void MediaPage::onDisksChanged()
+{
+    if (m_view != ViewBrowse)
+        return;
+
+    if (m_places) {
+        populatePlaces();
+        /* Down to the one root that is left: a places list of one is a level whose
+         * only row goes where you already were. */
+        if (m_entries.size() < 2)
+            populate(mediaCeiling());
+        m_list->setCurrent(0);
+        return;
+    }
+
+    /* The cursor is kept by the path it was on and not by its index: the `..' row
+     * appearing or disappearing shifts every index below it by one, which is
+     * exactly what a stick being plugged in does. */
+    QString cursor;
+    {
+        const QVector<ListRow> &rows = m_list->rows();
+        const int at = m_list->current();
+        if (at >= 0 && at < rows.size())
+            cursor = rows[at].key;
+    }
+
+    const QString was = m_dir;
+    populate(QFileInfo(was).isDir() ? clampToCeiling(was) : mediaCeiling());
+    if (cursor.isEmpty() || !selectPath(cursor))
+        m_list->setCurrent(0);
 }
 
 bool MediaPage::openPath(const QString &path)
@@ -593,7 +790,18 @@ void MediaPage::buildBrowseRows(QVector<ListRow> &rows) const
         case KindUp:
             r.glyph = GlyphBack;
             r.accent = Theme::ink3();
-            r.detail = tr("up one level");
+            /* Two destinations, one row, and the detail is the only thing that
+             * says which -- see populate() for why the empty path means the
+             * places list. */
+            r.detail = e.path.isEmpty() ? tr("all devices") : tr("up one level");
+            break;
+        case KindPlace:
+            r.glyph = GlyphDrive;
+            /* The device is not a disk you can pull, and it is the one row on this
+             * list that is always there; the colour says so before the label is
+             * read. */
+            r.accent = e.path == mediaCeiling() ? Theme::teal() : Theme::yellow();
+            r.detail = e.path;
             break;
         case KindDir:
             r.glyph = GlyphFiles;
@@ -943,13 +1151,24 @@ void MediaPage::open(Entry entry)
          * directory puts the selection back on `..' -- the row at index 0 of the
          * parent -- and the very next press climbs again, so one press too many
          * walks you to the top of the tree instead of one level up.
+         *
+         * The same applies one level higher: `..' from a root shows the places
+         * list with the root you just left under the cursor, which is what makes
+         * a wrong turn into one press back rather than a hunt.
          */
         const QString child = m_dir;
-        populate(entry.path);
+        if (entry.path.isEmpty())
+            populatePlaces();
+        else
+            populate(entry.path);
         if (!selectPath(child))
             m_list->setCurrent(0);
         return;
     }
+    case KindPlace:
+        populate(entry.path);
+        m_list->setCurrent(0);
+        return;
     case KindDir:
         populate(entry.path);
         m_list->setCurrent(0);
@@ -3480,6 +3699,9 @@ void MediaPage::paintEvent(QPaintEvent *)
             right = QString("%1 / %2").arg(m_orderAt + 1).arg(m_order.size());
         if (m_shuffle)
             right += "   " + tr("shuffled");
+    } else if (m_places) {
+        right = m_entries.size() == 1 ? tr("1 device")
+                                      : tr("%1 devices").arg(m_entries.size());
     } else {
         right = m_dir;
         const QString home = QDir::homePath();

@@ -16,6 +16,7 @@
 #include <QTimer>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -122,6 +123,75 @@ QVector<MountRow> liveMounts()
     return rows;
 }
 
+/*
+ * ── AND A THIRD SOURCE, WHICH ASKS THE ONE QUESTION THAT CANNOT BE PARSED WRONG ──
+ *
+ * A mount point is a directory whose device number differs from its parent's.
+ * That is not a heuristic, it is the definition -- st_dev is what tells one
+ * filesystem from another, and it is what `mountpoint(1)' itself compares.
+ *
+ * It is here because the two sources above are both READINGS OF A REPORT and this
+ * one is a reading of the filesystem.  A state file that was never written, a
+ * mountinfo line whose optional fields moved the columns, a mount made in another
+ * namespace and propagated here, a card whose automounter predates the state
+ * directory: all of those are cases where /media plainly HAS a disk in it and
+ * neither report says so.  The dashboard listing nothing while the disk is sitting
+ * there in the file manager is the bug this closes, and the cost is one stat() per
+ * directory in /media.
+ *
+ * What it cannot give is the device node, the filesystem type or the read-only
+ * flag -- none of those are visible from a stat of the mount point -- so it runs
+ * LAST and only fills in volumes the reports missed entirely.  A disk both sources
+ * know about keeps the richer answer.
+ *
+ * /run/media is searched one level deeper as well, because the udisks convention
+ * there is /run/media/<user>/<label> and the <user> level is a directory on the
+ * same tmpfs as its parent.
+ */
+void mountedChildren(const QString &parent, int depth, QVector<QString> *out)
+{
+    struct stat top;
+    if (::stat(QFile::encodeName(parent).constData(), &top) != 0)
+        return;
+
+    const QDir dir(parent);
+    const QStringList names = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &n : names) {
+        const QString path = dir.filePath(n);
+        struct stat st;
+        /* stat() and not lstat(): a symlink into a volume is not a mount, and
+         * following it would list the target twice under two names. */
+        if (::stat(QFile::encodeName(path).constData(), &st) != 0)
+            continue;
+        if (!S_ISDIR(st.st_mode))
+            continue;
+        if (st.st_dev != top.st_dev) {
+            out->append(path);
+            continue;
+        }
+        /* Same filesystem, so not a mount -- but it may be the <user> level. */
+        if (depth > 0)
+            mountedChildren(path, depth - 1, out);
+    }
+}
+
+QVector<QString> mountedDirs()
+{
+    QVector<QString> out;
+    mountedChildren(QStringLiteral("/media"), 0, &out);
+    mountedChildren(QStringLiteral("/run/media"), 1, &out);
+    return out;
+}
+
+/*
+ * Asked of BOTH sources, and true if either says yes.
+ *
+ * This is what eject() checks afterwards to decide whether it worked, so a source
+ * that cannot see the volume must not be able to report success by omission: a
+ * disk that only the st_dev test ever found would otherwise look unmounted the
+ * instant it was asked about, and the button would say "ejected" over a filesystem
+ * it had not touched.
+ */
 bool isMounted(const QString &point)
 {
     const QVector<MountRow> rows = liveMounts();
@@ -129,6 +199,13 @@ bool isMounted(const QString &point)
         if (r.point == point)
             return true;
     }
+
+    struct stat self;
+    struct stat parent;
+    const QString up = QFileInfo(point).absolutePath();
+    if (::stat(QFile::encodeName(point).constData(), &self) == 0
+        && ::stat(QFile::encodeName(up).constData(), &parent) == 0)
+        return self.st_dev != parent.st_dev;
     return false;
 }
 
@@ -353,6 +430,34 @@ QVector<Disk> Disks::scan() const
         v.device = r.source;
         if (r.source.startsWith(QLatin1String("/dev/")))
             v.kernel = r.source.mid(5);
+        out.append(v);
+    }
+
+    /*
+     * And last, the filesystem's own answer -- see mountedChildren() above.  Only
+     * for volumes neither report mentioned: a disk that got this far has no device
+     * node and no fstype to show, and overwriting a full entry with a bare one to
+     * satisfy a tidier loop would be a downgrade.
+     *
+     * eject() still works on these.  It has no kernel name so the systemctl rung is
+     * skipped, and it falls through to the automount script and then to a plain
+     * umount, both of which take the mount point.
+     */
+    for (const QString &point : mountedDirs()) {
+        bool known = false;
+        for (const Disk &v : out) {
+            if (v.mountPoint == point) {
+                known = true;
+                break;
+            }
+        }
+        if (known)
+            continue;
+        Disk v;
+        v.mountPoint = point;
+        /* Not readOnly: a volume this driver cannot ask about is presented as
+         * writable and lets the write fail with the kernel's own message, rather
+         * than greying out a disk that is perfectly writable. */
         out.append(v);
     }
 
