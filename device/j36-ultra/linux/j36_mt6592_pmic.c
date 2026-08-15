@@ -766,6 +766,9 @@ struct j36_pmic {
 				 * chrin_shared picks which line that is */
 	bool vchr_vetoed;	/* CHRDET says a cable and the ADC says otherwise;
 				 * held so the line is one per run of the state */
+	bool chr_held_off;	/* the charge path is disabled because the only
+				 * thing on CHRIN is this board's own DRVVBUS;
+				 * held so the line is one per run of the state */
 	unsigned int poll_kicks;	/* rate-limits j36_charging_line() */
 
 	/* When an operator's CV write stops the re-arm stamping 4200 back over
@@ -2637,11 +2640,53 @@ static void j36_pmic_poll(struct work_struct *work)
 	pub.usb_type = p->bc11_type;
 	pub.input_limit_ua = p->bc11_limit_ma > 0 ? p->bc11_limit_ma * 1000 : -1;
 
-	/* `chrdet' and not `online': see where it was taken, above.  The veto
-	 * moves what this board says about the cable and never what it does about
-	 * it, so an arm that was happening before this driver learned to doubt
-	 * CHRDET is still happening now. */
-	j36_charger_arm(p, chrdet);
+	/*
+	 * ══ AND THE ONE CASE WHERE THE VETO MUST REACH THE ARM ══
+	 *
+	 * `chrdet' and not `online' everywhere else: the veto moves what this
+	 * board SAYS about the cable and not what it does about it, and the
+	 * paragraph at the top of this file is the safety argument for that.
+	 *
+	 * There is exactly one state it has to give ground on, and it is not a
+	 * cosmetic one.  CHRIN is on the OTG port's net.  When DRVVBUS is up and
+	 * the input measures at the pack rather than above it, the supply the
+	 * charger is arming against IS THE PORT'S OWN 5 V -- so CHR_EN and
+	 * CSDAC_EN put the CSDAC on the far end of our own load switch and it
+	 * pulls current back out of the net the port is supposed to be sourcing,
+	 * up to CS_VTH, for the whole uptime.  That is a loop out of the pack,
+	 * through the switch, into the charger and back into the pack: it
+	 * charges nothing, and what it costs is the port's entire current
+	 * headroom.
+	 *
+	 * WHICH IS WHY HUBS STOPPED WORKING AND A MOUSE DID NOT.  A low-speed
+	 * mouse asks for tens of milliamps and fits in what is left.  A hub has
+	 * to bring up its own regulator and the bulk capacitance behind every
+	 * downstream socket, against a rail already clamped at VBAT by a current
+	 * sink that will pull it lower rather than give way -- so it never
+	 * reaches its UVLO and never turns on.  Before this driver started
+	 * arming off the raw bit, the port sourced into nothing else and the
+	 * same hubs came up.
+	 *
+	 * So the arm is held off, and ONLY here: the pad is up, CHRDET is set,
+	 * and the measurement says the thing on the pin is not above the pack.
+	 * A real charger clears the pack by a volt and a half and is armed
+	 * exactly as before; with the pad down or no drvvbus-pad in the DT
+	 * nothing on this path can fire at all; and vchr_veto=0 still takes the
+	 * whole mechanism out, which now restores the charging behaviour as well
+	 * as the report.  That is a narrower door than "a board that will not
+	 * charge" -- but it is a door, where before there was none, and it is
+	 * open only while this board is feeding its own charger input.
+	 */
+	held_off = chrdet && sourcing && p->vchr_vetoed;
+	if (p->chr_held_off != held_off) {
+		p->chr_held_off = held_off;
+		dev_info(p->dev,
+			 held_off
+			 ? "charge path off: the only supply on CHRIN is this port's own DRVVBUS, and a charger armed against it would sink the 5 V the port is sourcing -- a hub cannot start into that\n"
+			 : "charge path on: the input cleared the pack, so there is a real supply on CHRIN to charge from\n");
+	}
+
+	j36_charger_arm(p, chrdet && !held_off);
 
 	/* AFTER the arm, not before: charge_step_ma is read back out of CHR_CON4
 	 * inside it, so sampling it above would publish the previous second's
