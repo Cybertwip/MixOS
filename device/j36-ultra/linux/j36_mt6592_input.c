@@ -120,6 +120,108 @@
 
 #define J36_AXIS_FULL_SCALE           4096
 
+/*
+ * ── THE HEADPHONE JACK, AND WHY IT IS HERE OF ALL PLACES ────────────────────
+ *
+ * It is here because this is the only driver on the board that already has both
+ * instruments a plug can be noticed with: the SoC AUXADC, which it converts four
+ * channels of every five milliseconds for the sticks, and the GPIO block, with
+ * the pull-up arming and the driven read the buttons needed. A detect line is
+ * either a pad that changes level or a divider that changes voltage, and both of
+ * those are a few lines on top of a loop that is already running.
+ *
+ * It is NOT in the audio driver, which is where it belongs on paper. That driver
+ * has no ADC and no GPIO, so it would have to reach one of them through an
+ * exported symbol -- and an exported symbol is a modprobe dependency, which on
+ * this image means j36.audio would drag in whichever module owned the detect,
+ * and the rule the whole payload is built on is that each command-line word can
+ * be deleted without touching anything else. So the kernel NOTICES here and
+ * userspace ACTS: this reports SW_HEADPHONE_INSERT on the gamepad's own input
+ * device, and the dashboard -- which already owns "Speaker Amp" and "Headphone"
+ * and shows both on Settings > Sound -- is what turns the speaker off. That also
+ * keeps those two switches honest, which a kernel muting them behind the
+ * dashboard's back would not.
+ *
+ * ── AND WHERE THE LINE IS, WHICH NOTHING IN THIS TREE KNOWS ─────────────────
+ *
+ * Every file that could have said has been asked and none of them says. The MVII
+ * board header describes eighteen buttons, four ADC axes, the panel, the LED and
+ * the charger pin, and it has no audio in it at all. Its keypad driver has no
+ * jack. The vendor HAL drives the MT6592's ACCDET block, but through an ioctl on
+ * /dev/accdet -- a kernel driver's interface, not a register map -- so there is
+ * no base address to program even if the block is wired.
+ *
+ * So the wiring is a MEASUREMENT and this driver takes it. jack_scan=<ms> prints
+ * every AUXADC channel and every GPIO input bank on a timer; plug the headphones
+ * in and out a few times with dmesg -w running, and whichever number moves is the
+ * line. Then jack_adc= or jack_gpio= on the insmod line pins it down, and the
+ * detect starts working with no code change. If nothing moves, the board truly
+ * brings no detect out, the scan says so in the only way that settles it, and the
+ * two switches stay what they have always been.
+ */
+#define J36_JACK_NONE                 0
+#define J36_JACK_ADC                  1
+#define J36_JACK_GPIO                 2
+#define J36_JACK_SCAN_MIN_MS          200
+#define J36_JACK_DEBOUNCE_MS          120
+/*
+ * The window that means "plugged", in raw 12-bit counts, and the default is the
+ * bottom sixth of the range for one reason: a jack's detect contact is a switch
+ * to ground in every wiring anybody uses, so the plugged state is the LOW one and
+ * the open state is wherever the pull-up sits. It is a window and not a threshold
+ * because a four-pole headset puts the microphone's own resistance in the divider
+ * and lands in the middle, which is a plug and not an open circuit -- widening
+ * the top of this is how that board is handled without new code.
+ */
+#define J36_JACK_ADC_LOW              0
+#define J36_JACK_ADC_HIGH             600
+
+static int jack_adc = -1;
+module_param(jack_adc, int, 0444);
+MODULE_PARM_DESC(jack_adc,
+		 "AUXADC channel carrying the headphone-detect line, or -1 for "
+		 "none. Overrides the j36,jack-adc device-tree property. Find it "
+		 "with jack_scan.");
+
+static int jack_gpio = -1;
+module_param(jack_gpio, int, 0444);
+MODULE_PARM_DESC(jack_gpio,
+		 "GPIO pad carrying the headphone-detect line, or -1 for none. "
+		 "Overrides j36,jack-gpio. Takes precedence over jack_adc.");
+
+static bool jack_gpio_active_low = true;
+module_param(jack_gpio_active_low, bool, 0444);
+MODULE_PARM_DESC(jack_gpio_active_low,
+		 "the jack GPIO reads 0 with a plug in it (the usual wiring)");
+
+static int jack_adc_low = J36_JACK_ADC_LOW;
+module_param(jack_adc_low, int, 0644);
+MODULE_PARM_DESC(jack_adc_low,
+		 "bottom of the raw AUXADC window that means a plug is in");
+
+static int jack_adc_high = J36_JACK_ADC_HIGH;
+module_param(jack_adc_high, int, 0644);
+MODULE_PARM_DESC(jack_adc_high,
+		 "top of the raw AUXADC window that means a plug is in");
+
+static int jack_debounce_ms = J36_JACK_DEBOUNCE_MS;
+module_param(jack_debounce_ms, int, 0644);
+MODULE_PARM_DESC(jack_debounce_ms,
+		 "how long a new jack reading has to hold before it is believed");
+
+/*
+ * Writable, and the only one of these that is, because it is the instrument and
+ * not the setting: echo 500 into it, work the jack, read dmesg, echo 0 back.
+ * The others are 0444 because the capability this driver advertises on its input
+ * device is decided at probe -- a switch that appears halfway through the life of
+ * an open evdev node is not something userspace has any way to notice.
+ */
+static int jack_scan;
+module_param(jack_scan, int, 0644);
+MODULE_PARM_DESC(jack_scan,
+		 "print every AUXADC channel and GPIO input bank this often in ms "
+		 "(0 off, 200 minimum): the way to find which line the jack is on");
+
 struct j36_key_map {
 	u32 source;
 	u32 code;
@@ -167,6 +269,16 @@ struct j36_input {
 	u32 raw_max;
 	u32 fallback_center;
 	u32 deadzone;
+
+	/* The jack. jack_source is J36_JACK_NONE unless a line was named, and
+	 * everything below it is dead weight when it is. */
+	unsigned int jack_source;
+	u32 jack_line;			/* AUXADC channel, or GPIO pad */
+	bool jack_active_low;
+	bool jack_reported;		/* what SW_HEADPHONE_INSERT last said */
+	bool jack_raw;			/* the last sample, undebounced */
+	unsigned long jack_settled_at;	/* when jack_raw last changed */
+	unsigned long jack_scan_at;
 };
 
 static void __iomem *j36_iomap_phandle(struct device *dev, const char *property)
@@ -690,6 +802,102 @@ static int j36_scale_axis(struct j36_input *j36,
 	return delta < 0 ? -value : value;
 }
 
+/*
+ * One jack sample, undebounced, false if it could not be taken.
+ *
+ * The GPIO arm at probe is what makes the pad case mean anything: an unconnected
+ * detect pin with no pull is an antenna, and this is the same pull-up the buttons
+ * get for the same reason.
+ */
+static bool j36_jack_sample(struct j36_input *j36, bool *plugged)
+{
+	u32 raw;
+
+	switch (j36->jack_source) {
+	case J36_JACK_ADC:
+		if (j36_auxadc_read(j36, j36->jack_line, &raw))
+			return false;
+		*plugged = (int)raw >= jack_adc_low && (int)raw <= jack_adc_high;
+		return true;
+	case J36_JACK_GPIO:
+		raw = j36_gpio_read_bit(j36, J36_GPIO_DIN_BASE, j36->jack_line);
+		*plugged = j36->jack_active_low ? !raw : !!raw;
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
+ * A plug is a mechanical contact wiped across a springy one, so it bounces for
+ * as long as the hand takes -- tens of milliseconds of make and break, and every
+ * one of them would otherwise be an output switch thrown. The debounce is
+ * therefore on the SAMPLE and not on the report: the clock restarts on every
+ * change of the raw reading, and only a reading that has held still for the whole
+ * window is allowed to become the state.
+ */
+static bool j36_jack_update(struct j36_input *j36)
+{
+	bool plugged;
+
+	if (!j36_jack_sample(j36, &plugged))
+		return false;
+
+	if (plugged != j36->jack_raw) {
+		j36->jack_raw = plugged;
+		j36->jack_settled_at = jiffies;
+		return false;
+	}
+	if (plugged == j36->jack_reported)
+		return false;
+	if (time_before(jiffies, j36->jack_settled_at +
+				 msecs_to_jiffies(max(jack_debounce_ms, 0))))
+		return false;
+
+	j36->jack_reported = plugged;
+	input_report_switch(j36->input, SW_HEADPHONE_INSERT, plugged);
+	dev_info(j36->dev, "headphone jack: %s\n",
+		 plugged ? "plugged in" : "empty");
+	return true;
+}
+
+/*
+ * The instrument. Sixteen conversions and eleven register reads, on a timer the
+ * operator sets, printed as two lines so a scrollback of them can be read down a
+ * column. A channel the converter will not answer for prints ---- rather than a
+ * number, because a nought there would read as a measurement.
+ *
+ * It costs about a millisecond per pass and it is off by default, so the price of
+ * having it is nothing and the price of not having it was that nobody could find
+ * the line at all.
+ */
+static void j36_jack_scan_once(struct j36_input *j36)
+{
+	char adc[J36_AUXADC_CHANNELS * 5 + 1];
+	char din[16 * 6 + 1];
+	unsigned int banks = J36_GPIO_MAX / J36_GPIO_PINS_PER_BANK + 1;
+	unsigned int i;
+	int n = 0;
+	u32 raw;
+
+	for (i = 0; i < J36_AUXADC_CHANNELS; ++i) {
+		if (j36_auxadc_read(j36, i, &raw))
+			n += scnprintf(adc + n, sizeof(adc) - n, " ----");
+		else
+			n += scnprintf(adc + n, sizeof(adc) - n, " %4u", raw);
+	}
+	dev_info(j36->dev, "jack scan: adc%s\n", adc);
+
+	n = 0;
+	if (banks > 16)
+		banks = 16;
+	for (i = 0; i < banks; ++i)
+		n += scnprintf(din + n, sizeof(din) - n, " %04x",
+			       readl(j36->gpio + J36_GPIO_DIN_BASE +
+				     i * J36_GPIO_BANK_STRIDE) & 0xffff);
+	dev_info(j36->dev, "jack scan: din%s\n", din);
+}
+
 static void j36_poll(struct work_struct *work)
 {
 	struct j36_input *j36 = container_of(to_delayed_work(work),
@@ -732,10 +940,86 @@ static void j36_poll(struct work_struct *work)
 		changed = true;
 	}
 
+	/* After the axes, because on the ADC path it is a conversion on the same
+	 * converter and taking it last keeps the sticks' timing exactly as it
+	 * was. */
+	if (j36_jack_update(j36))
+		changed = true;
+
 	if (changed)
 		input_sync(j36->input);
+
+	/* Outside the change accounting entirely: this reports nothing, it only
+	 * prints. Its own clock, so turning it on does not disturb the poll. */
+	if (jack_scan > 0 &&
+	    time_after_eq(jiffies, j36->jack_scan_at)) {
+		j36_jack_scan_once(j36);
+		j36->jack_scan_at = jiffies +
+			msecs_to_jiffies(max(jack_scan, J36_JACK_SCAN_MIN_MS));
+	}
+
 	schedule_delayed_work(&j36->poll_work,
 			      msecs_to_jiffies(j36->poll_ms));
+}
+
+/*
+ * Which line, from the device tree first and the insmod line second.
+ *
+ * That order round, and not the other, because the module parameter is the one a
+ * person can change without regenerating a DTB and reflashing a card -- which is
+ * exactly the position anybody is in while they are still finding the line. Once
+ * it is found, j36,jack-adc in the tree makes it the board's own fact and the
+ * insmod line goes back to being empty.
+ *
+ * A GPIO beats an ADC channel when both are named: a level is a cheaper and more
+ * certain answer than a window, so if the board turns out to have one, that is
+ * the one to use.
+ */
+static void j36_jack_configure(struct j36_input *j36)
+{
+	struct device *dev = j36->dev;
+	u32 cells[3];
+
+	if (!of_property_read_u32_array(dev->of_node, "j36,jack-adc", cells, 3)) {
+		j36->jack_source = J36_JACK_ADC;
+		j36->jack_line = cells[0];
+		jack_adc_low = (int)cells[1];
+		jack_adc_high = (int)cells[2];
+	}
+	if (!of_property_read_u32_array(dev->of_node, "j36,jack-gpio", cells, 2)) {
+		j36->jack_source = J36_JACK_GPIO;
+		j36->jack_line = cells[0];
+		j36->jack_active_low = !!cells[1];
+	}
+	if (jack_adc >= 0) {
+		j36->jack_source = J36_JACK_ADC;
+		j36->jack_line = (u32)jack_adc;
+	}
+	if (jack_gpio >= 0) {
+		j36->jack_source = J36_JACK_GPIO;
+		j36->jack_line = (u32)jack_gpio;
+		j36->jack_active_low = jack_gpio_active_low;
+	}
+
+	if (j36->jack_source == J36_JACK_ADC &&
+	    j36->jack_line >= J36_AUXADC_CHANNELS) {
+		dev_warn(dev, "jack: AUXADC channel %u does not exist; detection off\n",
+			 j36->jack_line);
+		j36->jack_source = J36_JACK_NONE;
+	}
+	if (j36->jack_source == J36_JACK_GPIO && j36->jack_line > J36_GPIO_MAX) {
+		dev_warn(dev, "jack: pad %u does not exist; detection off\n",
+			 j36->jack_line);
+		j36->jack_source = J36_JACK_NONE;
+	}
+	/* A pad the keypad block owns is not available to be read as a level, and
+	 * finding that out here is better than a detect that quietly tracks a
+	 * column strobe. */
+	if (j36->jack_source == J36_JACK_GPIO && j36_pad_is_owned(j36, j36->jack_line)) {
+		dev_warn(dev, "jack: pad %u belongs to the keypad block; detection off\n",
+			 j36->jack_line);
+		j36->jack_source = J36_JACK_NONE;
+	}
 }
 
 static void j36_cancel_poll(void *data)
@@ -798,6 +1082,22 @@ static int j36_input_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "read axis map\n");
 
+	/*
+	 * Before the input device and not after it, which is a change of order
+	 * from what this used to do and is the jack's fault. The pad pass is what
+	 * fills owned_pads, the jack cannot be allowed to sit on a pad the keypad
+	 * block owns, and whether the jack exists decides one capability bit on a
+	 * device that must be fully described before it is registered -- an evdev
+	 * node's capabilities are read once, at open, and userspace has no way to
+	 * be told they grew. It still runs before the clock ungate and KP_EN, so
+	 * the MVII order this was matched against -- pads, clock, enable -- is
+	 * intact; input_register_device between them touches no hardware.
+	 */
+	ret = j36_setup_pads(j36);
+	if (ret)
+		return dev_err_probe(dev, ret, "apply keypad pads\n");
+	j36_jack_configure(j36);
+
 	input = devm_input_allocate_device(dev);
 	if (!input)
 		return -ENOMEM;
@@ -817,6 +1117,12 @@ static int j36_input_probe(struct platform_device *pdev)
 		input_set_abs_params(input, j36->axes[i].code,
 				     -J36_AXIS_FULL_SCALE, J36_AXIS_FULL_SCALE,
 				     16, 0);
+	/* Only when there is something behind it. A switch that is advertised and
+	 * never moves is worse than an absent one: it reads as a board that has
+	 * detection and has nothing plugged in, which is the wrong half of the
+	 * two things a reader needs to tell apart. */
+	if (j36->jack_source != J36_JACK_NONE)
+		input_set_capability(input, EV_SW, SW_HEADPHONE_INSERT);
 
 	ret = input_register_device(input);
 	if (ret)
@@ -825,12 +1131,9 @@ static int j36_input_probe(struct platform_device *pdev)
 	/*
 	 * Match the validated MVII initialization order: pads, then clock, then
 	 * KPD_EN, and ungate the AUXADC peripheral clock without touching DSI. The
-	 * pad pass has to come before the scanner is enabled -- that is the one
-	 * window in which writing a pad the block owns is legitimate.
+	 * pad pass ran above and has to be before the scanner is enabled -- that
+	 * is the one window in which writing a pad the block owns is legitimate.
 	 */
-	ret = j36_setup_pads(j36);
-	if (ret)
-		return dev_err_probe(dev, ret, "apply keypad pads\n");
 	j36_kpd_clock_ungate(j36);
 	writew(J36_KPD_DEBOUNCE_DEFAULT & J36_KPD_DEBOUNCE_MASK,
 	       j36->keypad + J36_KPD_DEBOUNCE);
@@ -843,17 +1146,37 @@ static int j36_input_probe(struct platform_device *pdev)
 	writel(J36_PERI_PDN0_AUXADC_BITS,
 	       j36->pericfg + J36_PERI_PDN0_CLR);
 	j36_probe_idle_pads(j36);
+	/* The same pull-up the buttons get, for the same reason: an open detect
+	 * contact with nothing holding it is an antenna, and a level read off one
+	 * is a reading of the room. */
+	if (j36->jack_source == J36_JACK_GPIO)
+		j36_gpio_arm_pullup(j36, j36->jack_line);
 
 	INIT_DELAYED_WORK(&j36->poll_work, j36_poll);
 	ret = devm_add_action_or_reset(dev, j36_cancel_poll, j36);
 	if (ret)
 		return ret;
 	platform_set_drvdata(pdev, j36);
+	j36->jack_settled_at = jiffies;
+	j36->jack_scan_at = jiffies;
 	schedule_delayed_work(&j36->poll_work, msecs_to_jiffies(100));
 
 	dev_info(dev, "polling %u GPIO keys, %u matrix keys and %u axes every %u ms\n",
 		 j36->direct_count, j36->matrix_count, j36->axis_count,
 		 j36->poll_ms);
+	switch (j36->jack_source) {
+	case J36_JACK_ADC:
+		dev_info(dev, "headphone jack: AUXADC channel %u, plugged when the raw count is %d..%d\n",
+			 j36->jack_line, jack_adc_low, jack_adc_high);
+		break;
+	case J36_JACK_GPIO:
+		dev_info(dev, "headphone jack: pad %u, plugged when it reads %u\n",
+			 j36->jack_line, j36->jack_active_low ? 0 : 1);
+		break;
+	default:
+		dev_info(dev, "headphone jack: no detect line is configured -- nothing here notices a plug. Set jack_scan=500 and work the jack to find one\n");
+		break;
+	}
 	return 0;
 }
 
