@@ -2460,6 +2460,7 @@ static void j36_pmic_poll(struct work_struct *work)
 	int bat_mv = -1, ocv_mv = -1, ma = 0, vchr_mv = -1, bat_now_mv = -1;
 	bool ma_valid = false;
 	bool vchr_valid, bat_valid, pair_valid, sourcing;
+	bool held_off;
 	bool changed;
 	u32 con0 = 0;
 
