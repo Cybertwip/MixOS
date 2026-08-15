@@ -2154,9 +2154,13 @@ static void j36_ladder_advance(struct j36_pmic *p, bool online, int bat_mv,
 	if (++p->full_count >= J36_FULL_CHECK_TIMES) {
 		p->full_count = 0;
 		p->charge_full = true;
-		dev_info(p->dev, "battery full (six samples %s past top-off)\n",
-			 saturated ? "with a pack's worth of charge delivered"
-				   : "within 150 mA of zero");
+		if (saturated)
+			dev_info(p->dev,
+				 "battery full (six samples past top-off with a whole pack's worth of charge delivered)\n");
+		else
+			dev_info(p->dev,
+				 "battery full (six samples within %d mA of zero past top-off)\n",
+				 J36_CHARGING_FULL_CURRENT_MA);
 	}
 }
 
