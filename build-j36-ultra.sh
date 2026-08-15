@@ -19,9 +19,9 @@
 # is made in the VM, under its own work directory, and arrives here only as an
 # artifact under MixOS-Artifacts, next to the checkout.
 #
-# It is self-contained: no PowerEngine checkout is needed.  The five MVII board
-# files the DTB generator parses are committed at device/j36-ultra/mvii-board and
-# refreshed by device/j36-ultra/sync-mvii-board.sh, which is run by hand.
+# It is self-contained.  The five MVII board files the DTB generator parses are
+# committed at device/j36-ultra/mvii-board and maintained there; nothing in this
+# build reaches outside the checkout for them.
 #
 # The R36 base build is checkpointed, so resuming a finished one costs seconds.
 # Set J36_RESUME_R36=0 to skip it and build the J36 layer against whatever base
@@ -78,13 +78,10 @@ VM_CPUS="${DARKOS_VM_CPUS:-8}"
 VM_MEMORY="${DARKOS_VM_MEMORY:-16G}"
 VM_DISK="${DARKOS_VM_DISK:-160G}"
 UBUNTU_IMAGE="${DARKOS_UBUNTU_IMAGE:-24.04}"
-# The MVII board sources are vendored at device/j36-ultra/mvii-board and ride
-# into the VM with the checkout, so this build needs no PowerEngine tree.
-# POWERENGINE_ROOT is still honoured, but only to notice that the vendored copies
-# have drifted -- see the check below -- never as a build input.
+# The MVII board sources live at device/j36-ultra/mvii-board and ride into the VM
+# with the checkout.  They are the source of truth: this build has no upstream to
+# compare them against and does not look for one.
 BOARD_SRC="$ROOT/device/j36-ultra/mvii-board"
-POWERENGINE_ROOT="${POWERENGINE_ROOT:-$(dirname "$ROOT")/PowerEngineV3/PowerEngine}"
-DRIVERS_HOST="${J36_DRIVERS_DIR:-$POWERENGINE_ROOT/OS/MVII/Kernel/ARM/MediaTek/J36Ultra/Drivers}"
 # Where build-r36-ultra.sh puts the image and latest-image.txt.  Derived the same way it
 # derives it -- same helper, same two overrides -- because the payload-carrying image has
 # to land there and nowhere else; see the hand-over at the bottom.
