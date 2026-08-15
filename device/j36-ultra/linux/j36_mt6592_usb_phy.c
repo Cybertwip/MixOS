@@ -1024,7 +1024,12 @@ static void j36_phy_clock_off(struct j36_usb_phy *p)
  * from a role written 800 us before it -- once by phy_set_mode(), which mediatek.c
  * calls immediately before musb_start(), and once per host kick. So the rewrite
  * is skipped when there is nothing to rewrite, and paid for with a real settle
- * when there is.
+ * when there is. With both, power_on came up DEVCTL 3d: session, HM, VBUS valid
+ * and LSDEV -- host mode, with a low-speed mouse already powered on the wire.
+ *
+ * The skip is right for every caller except the one that needs the ID line to
+ * MOVE rather than to read correctly, and that one does not come through here:
+ * see j36_phy_rearm_host(), which is what the host kick calls and why.
  */
 static bool j36_phy_role_is(struct j36_usb_phy *p, u8 set, u8 clr)
 {
@@ -1061,6 +1066,55 @@ static void j36_phy_force_host(struct j36_usb_phy *p)
 	j36_phy_clock_on(p);
 	if (j36_phy_role_is(p, J36_PHY_R6C_HOST_SET, J36_PHY_R6C_HOST_CLR))
 		return;
+	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_HOST_CLR);
+	j36_phy_set(p, J36_PHY_R6C, J36_PHY_R6C_HOST_SET);
+	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_ALL);
+	usleep_range(J36_PHY_SETTLE_US, J36_PHY_SETTLE_US * 2);
+	msleep(J36_PHY_ROLE_SETTLE_MS);
+}
+
+/*
+ * ── RE-DRIVE THE ID INPUT, RATHER THAN ASSERT IT ─────────────────────────────
+ *
+ * force_host() above is idempotent by design and skips itself when the PHY is
+ * already host-forced, which is right everywhere except here. The core does not
+ * read ID; it SAMPLES it, and what it samples on is the ID line moving. Rewrite
+ * U2PHYDTM1 with the values it already holds and not one bit changes, so there
+ * is nothing for the core to sample and a session started afterwards is latched
+ * against whatever the core last decided.
+ *
+ * Which is exactly the shape of the boot in front of me. power_on's sequence ran
+ * with the PHY still device-forced from recover(), so force_host() drove IDDIG
+ * 1 -> 0 for real, and the core came up as it should: DEVCTL 3d -- session, HM,
+ * VBUS valid, LSDEV, a low-speed mouse already on the wire and powered. Then
+ * musb_core's own bring-up ran, musb_generic_disable() wrote DEVCTL = 0, and
+ * musb_start() set SESSION again from the hub thread a few milliseconds later.
+ * By then the PHY had been host-forced for a quarter of a second and held
+ * perfectly still, so there was no edge, the core arbitrated from a state
+ * machine that had just been reset, and it came back a B-device: DEVCTL 99.
+ * Every session bounce after that read 99 as well, because bouncing SESSION
+ * asks the core to arbitrate again without giving it anything new to arbitrate
+ * on.
+ *
+ * So this puts the PHY through device and back to host: IDDIG genuinely high,
+ * settle, then genuinely low, which is the same 1 -> 0 the working power_on
+ * sequence produced. It is the whole of the difference between the two, and it
+ * is unconditional -- the skip in force_host() is what has to be bypassed.
+ *
+ * Safe to run with 5 V up and SESSION down, which is how the caller leaves it:
+ * the core has no session to be a peripheral of, so the device half is fifty
+ * milliseconds of a line held high and nothing acting on it.
+ */
+static void j36_phy_rearm_host(struct j36_usb_phy *p)
+{
+	j36_phy_clock_on(p);
+
+	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_DEV_CLR);
+	j36_phy_set(p, J36_PHY_R6C, J36_PHY_R6C_DEV_SET);
+	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_ALL);
+	usleep_range(J36_PHY_SETTLE_US, J36_PHY_SETTLE_US * 2);
+	msleep(J36_PHY_ROLE_SETTLE_MS);
+
 	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_HOST_CLR);
 	j36_phy_set(p, J36_PHY_R6C, J36_PHY_R6C_HOST_SET);
 	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_ALL);
@@ -1509,8 +1563,17 @@ static u8 j36_musb_settle(struct j36_usb_phy *p)
  *
  * HM is set by the core, not by anything here, and it is the only bit that says
  * the role change actually happened rather than merely being asked for. So the
- * poll checks it, and if a port that asked for host is running a session it never
- * became the host of, it bounces the session again.
+ * poll checks it, and if a port that asked for host is not the host, it re-drives
+ * the ID line and restarts the session.
+ *
+ * THIS IS THE ONLY PLACE THAT CAN FIX IT, and that is a fact about ordering
+ * rather than a design choice. power_on() runs inside musb_platform_init(), which
+ * is the first thing musb_init_controller() does; whatever session it leaves
+ * behind is wiped a moment later by musb_generic_disable()'s DEVCTL = 0, and the
+ * session the port actually runs on is the one musb_start() begins from the hub
+ * thread, after the root hub exists. The poll is the first thing this driver runs
+ * after all of that, so it is the first opportunity to hand the core an ID edge
+ * it will still have when the enumeration depends on it.
  *
  * WHAT KEEPS THIS FROM BEING A LOOP, in order:
  *
@@ -1534,8 +1597,6 @@ static void j36_musb_host_kick(struct j36_usb_phy *p)
 	devctl = readb(p->musb + J36_MUSB_DEVCTL);
 	if (devctl & J36_MUSB_DEVCTL_HM)
 		return;				/* the core is the host: done */
-	if (!(devctl & J36_MUSB_DEVCTL_SESSION))
-		return;				/* no session to be host of yet */
 	if (j36_usb_devices())
 		return;				/* something works; leave it alone */
 
@@ -1548,17 +1609,30 @@ static void j36_musb_host_kick(struct j36_usb_phy *p)
 	}
 
 	p->hm_kicks++;
+	/*
+	 * A/B is read out rather than asserted. This line used to say "A-device"
+	 * whatever DEVCTL held, and it said it over a 99 -- BDEVICE set -- in three
+	 * consecutive boots, which hid the whole of the fault: the core had not
+	 * merely failed to finish becoming the host, it had arbitrated the other
+	 * way round and settled there.
+	 */
 	dev_info(p->dev,
-		 "DEVCTL %02x: session up, A-device, HM clear -- restarting the session so the core arbitrates the role again (attempt %u of %u)\n",
-		 devctl, p->hm_kicks, J36_MUSB_HM_KICKS);
+		 "DEVCTL %02x: the core is a %s with %s and HM clear -- re-driving ID and restarting the session so it arbitrates the role again (attempt %u of %u)\n",
+		 devctl,
+		 devctl & J36_MUSB_DEVCTL_BDEVICE ? "B-device" : "A-device",
+		 devctl & J36_MUSB_DEVCTL_SESSION ? "a session" : "no session",
+		 p->hm_kicks, J36_MUSB_HM_KICKS);
 
 	j36_musb_stand_down(p);
-	j36_phy_force_host(p);
+	/*
+	 * The whole point of the kick, and the only thing it has that a bare
+	 * session bounce did not: an ID line that MOVES. See j36_phy_rearm_host().
+	 */
+	j36_phy_rearm_host(p);
 	/*
 	 * Same gap decide_role() leaves between the role and the edge. There it is
 	 * nominally VBUS rise time; here VBUS never dropped, so it is purely the
-	 * settle -- and it is the one thing the boot that latched A-device had and
-	 * every boot that latched B-device did not.
+	 * settle the core needs between sampling ID and being asked to act on it.
 	 */
 	msleep(J36_VBUS_RISE_MS);
 	j36_musb_session(p, true);
