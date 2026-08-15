@@ -47,18 +47,79 @@
 namespace {
 
 /*
- * The browser, in the two places that have to agree about it: the card's greyed-
- * out test and the line typed into the terminal.  buildPages() has the long
- * version of why a web browser on this board is a text browser in a pty.
+ * The browser, in the places that have to agree about it: the card's greyed-out
+ * test, the process the card starts, and the line typed into the terminal when
+ * there is no graphical session on the card.  buildPages() has the long version.
+ *
+ * kBrowserSession is a shell script the build stages beside the dashboard.  It
+ * brings an X server up on /dev/fb0, runs a window manager, an on-screen keyboard
+ * and whichever browser is installed inside it, and translates the pad into a
+ * pointer with j36-padx.  Everything about that lives in the script and in
+ * build-in-vm.sh, which is the point: none of it belongs in a Qt program that is
+ * not running when it happens.
+ *
+ * kBrowserExe is the fallback for a card with no X on it -- links2 in the
+ * dashboard's own terminal, which is what this card used to be and is still the
+ * only thing that works with nothing but a pty.
  *
  * The start page is shipped in the payload rather than pointed at a search engine
  * because the first thing a browser has to do here is prove it works without
  * anybody typing a URL on an eleven-button keyboard, and because a card that
  * opens a page held on the card itself still opens with no network at all.
  */
+const char kBrowserSession[] = "/opt/mixos/bin/j36-browser";
 const char kBrowserExe[]   = "/usr/bin/links2";
 const char kBrowserStart[] = "/opt/mixos/share/browser/start.html";
 const char kBrowserFallbackUrl[] = "https://duckduckgo.com/";
+
+/*
+ * The graphical session's path if this card can actually run one, and an empty
+ * string if it cannot.
+ *
+ * ALL THREE PIECES ARE TESTED and not just the script, because the script is in
+ * the /opt/mixos payload and the other two come from Debian packages on the rootfs
+ * -- so an image built with this feature and a rootfs built without the packages is
+ * a real combination, and it must grey the card down to links2 rather than start
+ * something that exits immediately.  The browser list is the same one the script
+ * searches, in the same order, for the same reason: whichever browser the Packages
+ * card installed later is the one that runs.
+ *
+ * QFileInfo::isExecutable and not exists(): a package that was removed can leave
+ * its directory entries behind, and the failure this is guarding against is a card
+ * that looks available and starts nothing.
+ */
+QString graphicalBrowserSession()
+{
+    static const char *const kServers[] = {
+        "/usr/bin/Xorg", "/usr/lib/xorg/Xorg", "/usr/bin/X"
+    };
+    static const char *const kBrowsers[] = {
+        "netsurf-gtk", "netsurf", "surf", "dillo", "badwolf", "luakit", "midori",
+        "epiphany-browser", "falkon", "qutebrowser", "firefox-esr", "firefox",
+        "chromium", "chromium-browser"
+    };
+
+    if (!QFileInfo(QString::fromLatin1(kBrowserSession)).isExecutable())
+        return QString();
+    if (!QFileInfo(QStringLiteral("/usr/bin/xinit")).isExecutable())
+        return QString();
+
+    bool haveServer = false;
+    for (const char *const s : kServers) {
+        if (QFileInfo(QString::fromLatin1(s)).isExecutable()) {
+            haveServer = true;
+            break;
+        }
+    }
+    if (!haveServer)
+        return QString();
+
+    for (const char *const b : kBrowsers) {
+        if (QFileInfo(QStringLiteral("/usr/bin/") + QLatin1String(b)).isExecutable())
+            return QString::fromLatin1(kBrowserSession);
+    }
+    return QString();
+}
 
 /*
  * Quote a path for /bin/sh.  Inside single quotes everything is literal except a
@@ -634,68 +695,85 @@ void Dashboard::buildPages()
     apps.append(doom);
 
     /*
-     * A web browser, next to Doom because that is where it was asked for -- and it
-     * is the Terminal page with links2 in it rather than a window with a URL bar.
-     * That is not modesty about what this board can do; it is the only shape a
-     * browser can have here, and the three things that decide it are worth having
-     * written down, because every one of them looks like an oversight until it is.
+     * A web browser, next to Doom because that is where it was asked for, and a
+     * real graphical one: a window with a URL bar, images, CSS, and a pointer the
+     * D-pad drives.  It gets there the same way Doom does -- an external process
+     * that owns the framebuffer while it runs and hands it back when it exits --
+     * and the details are in build-in-vm.sh and in tools/j36-padx.c, where they
+     * belong.  What is worth having HERE is why the answer is that and not
+     * something smaller, because two of the three things that decide it look like
+     * oversights until they are written down.
      *
-     *   1. THERE IS NO EDGE FOR THIS MACHINE, and there would be no point if there
-     *      were.  Microsoft ships Edge for Linux on amd64 and arm64; there has
-     *      never been an armhf build.  The engine underneath it is the real
-     *      objection though: Chromium on a 1 GHz Cortex-A7 with 946 MB of usable
-     *      RAM and no GPU driver for its compositor does not run slowly, it swaps.
-     *      Debian trixie/armhf does carry chromium, falkon, qutebrowser and
-     *      morph-browser, and all four are that same engine wearing hats.
-     *
-     *   2. NOTHING GRAPHICAL IN THE ARCHIVE CAN REACH THIS PANEL.  netsurf-fb is
-     *      the obvious candidate and does not work: Debian's copy of libnsfb is
-     *      built with the sdl, xcb, vnc and wayland surfaces and WITHOUT the linux
-     *      one, so it has no way to open /dev/fb0 -- the binary contains no
-     *      /dev/fb, no FBIOGET and no fb0 -- and its sdl surface goes through
+     *   1. NOTHING GRAPHICAL IN THE ARCHIVE CAN REACH THIS PANEL BY ITSELF.
+     *      netsurf-fb is the obvious candidate and does not work: Debian's copy of
+     *      libnsfb is built with the sdl, xcb, vnc and wayland surfaces and WITHOUT
+     *      the linux one, so it has no way to open /dev/fb0 -- the binary contains
+     *      no /dev/fb, no FBIOGET and no fb0 -- and its sdl surface goes through
      *      libsdl1.2debian, which in trixie is sdl12-compat over SDL2, and SDL2
      *      dropped the fbcon driver years ago.  links2's OWN framebuffer driver
      *      would have been ideal, and the Debian build leaves it out too: -driver
      *      fb is listed in its help text, but the binary carries neither /dev/fb0
      *      nor FRAMEBUFFER nor KDSETMODE, only the X driver.  Everything else
-     *      graphical wants an X server or a Wayland compositor.
+     *      graphical wants an X server or a Wayland compositor.  All of that was
+     *      checked against the binaries and all of it still holds.
      *
-     *   3. AN X SERVER HERE WOULD BE THE CONSOLE CARD AGAIN.  Xorg wants a VT of
-     *      its own, and the note further down -- where the Console card used to be
-     *      built -- is the record of what asking for one costs on this board: the
-     *      kernel's console driver was never bound to this simplefb, the switch
-     *      does not take, and then nothing is drawn by anybody.  And X would have
-     *      nothing to drive a browser with.  This device has eleven buttons and no
-     *      touchscreen; the cursor on the glass is drawn by pointer.cpp and the
-     *      keyboard by keyboard.cpp, and neither of them exists outside this
-     *      process.
+     *   2. SO THERE IS AN X SERVER, and it is NOT the Console card again.  The note
+     *      further down, where that card used to be built, is the record of what a
+     *      VT switch costs here: the kernel's console driver was never bound to this
+     *      simplefb, so a shell moved to another VT is a shell nobody can see.  An X
+     *      server needs none of that.  xf86-video-fbdev mmaps /dev/fb0 and draws its
+     *      own pixels into it, exactly as this dashboard's linuxfb plugin and fbdoom
+     *      already do, and it asks the console layer for nothing because there are no
+     *      kernel-rendered glyphs anywhere in the picture.  The VT dance is separate
+     *      and optional: `-sharevts -novtswitch -keeptty vt1' is Xorg's own way of
+     *      being told the VT belongs to somebody else, and with those it issues no
+     *      VT_SETMODE, no VT_ACTIVATE and no KDSETMODE -- which matters, because this
+     *      process is still holding /dev/tty0 in KD_GRAPHICS while that runs.
      *
-     * Which leaves the one place on this card that already owns the panel, a
-     * pointer and a keyboard: this dashboard.  TerminalPage is a real pty drawn
-     * into the same framebuffer, the pad walks it, Menu raises the on-screen
-     * keyboard, and links2 in text mode is a browser driven entirely by the arrow
-     * keys and Enter -- ESC for its menu bar, `g' for go-to-URL.  It does tables,
-     * frames, forms, cookies and TLS through OpenSSL 3, which is the part that
-     * decides whether a browser is usable in 2026 at all: it can reach a modern
-     * site.  What it does not do is JavaScript.
+     *   3. X STILL HAD NOTHING TO DRIVE A BROWSER WITH, and that was the real gap.
+     *      This device has eleven buttons and no touchscreen; pointer.cpp and
+     *      keyboard.cpp draw a cursor and a keyboard that exist only inside this
+     *      process.  Handing the pad to X does not work either -- udev tags it
+     *      ID_INPUT_JOYSTICK, which libinput refuses by design, and BTN_A is evdev
+     *      0x130, past the 255 an X keycode can hold, so the older evdev driver
+     *      cannot map it.  tools/j36-padx.c closes that gap: it grabs the pad,
+     *      connects to the server and synthesises motion, clicks and keys with
+     *      XTEST, so the D-pad is a pointer and A is a click.  matchbox-keyboard is
+     *      the on-screen keyboard inside the session, on Select.
      *
-     * HOME IS THE DATA PARTITION AND NOT ROOT'S.  links2 keeps its bookmarks,
-     * cookie jar and cache in ~/.links2 and saves downloads into the working
-     * directory; /home/virtua is the one partition on this card that is meant to
-     * be written and the one the Sharing page exports, so a file saved out of the
-     * browser is a file that turns up on the laptop over SMB.  Pointed at both
-     * with one `cd' and one HOME rather than at links2 options, because -download-
-     * dir would have covered half of it and left the cookie jar on the rootfs.
+     * WHICH BROWSER IS NOT DECIDED HERE.  The image installs netsurf-gtk -- its own
+     * engine, 4 MB, real CSS and TLS, no JavaScript -- because that is what 1 GB of
+     * RAM and eight A7s with no GPU driver can carry.  But the session script takes
+     * whichever of a dozen browsers is on the card, chromium and firefox-esr
+     * included, so a browser installed from the Packages page later is the one this
+     * card runs.  Nothing in this file has to change for that.
+     *
+     * AND THE OLD CARD IS STILL HERE, one branch down, for a card with no X on it:
+     * links2 in this dashboard's own terminal, driven by the arrow keys and Enter.
+     * It needs nothing but a pty, so it is the honest answer for a rootfs that never
+     * got the X packages -- and it is why this card is greyed out only when there is
+     * neither.  HOME is pointed at /home/virtua in both, which is the one partition
+     * on this card meant to be written and the one the Sharing page exports, so a
+     * file saved out of the browser turns up on the laptop over SMB.
      */
     AppEntry browser;
     browser.key = QStringLiteral("browser");
     browser.title = tr("Browser");
     browser.accent = Theme::teal();
     browser.glyph = GlyphGlobe;
+    /*
+     * Both are set.  A non-empty exe makes activate() take the launch() path and
+     * never reach the switch; an empty one falls through to InternalBrowser and the
+     * terminal.  The card is one card either way, so the arrangement a user saved
+     * survives a rootfs that gains or loses the X packages.
+     */
     browser.internal = InternalBrowser;
-    browser.available = !firstExisting(QStringList() << kBrowserExe).isEmpty();
+    browser.exe = graphicalBrowserSession();
+    browser.available = !browser.exe.isEmpty()
+                        || !firstExisting(QStringList() << kBrowserExe).isEmpty();
     if (!browser.available)
-        browser.reason = tr("links2 is not installed. The Packages page can add it.");
+        browser.reason = tr("No browser on this card. The Packages page can add "
+                            "netsurf-gtk, or links2 for a text one.");
     apps.append(browser);
 
     /*
@@ -1584,6 +1662,11 @@ void Dashboard::activate(const AppEntry &entry)
         break;
     case InternalBrowser: {
         /*
+         * ONLY REACHED WITHOUT X.  buildPages() sets browser.exe when the card
+         * carries the graphical session, and activate() launches an entry with an
+         * exe before it ever looks at `internal'.  So everything below is the
+         * fallback: a card whose rootfs has links2 and no X server.
+         *
          * The same door the Packages page uses for `apt install': open the
          * Terminal and type a line into the shell that is already running in it.
          * Nothing here launches a process -- the pty does, which is what keeps the

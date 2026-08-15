@@ -9987,7 +9987,7 @@ done
 # dashboard is.  With J36_MIXDASH=0 and no Doom, opt/mixos/j36 is still the modules,
 # mfgpower and the probe, and a build that silently shipped no tarball for them would
 # leave a card that boots to a dashboard-less console with no GPU either.
-if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" || -n "$MIXMIRROR_BIN" ]]; then
+if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
     mkdir -p "$SDROOT/opt/mixos/bin"
 
     if [[ -n "$MIXDASH_BIN" && -n "$QT_PAYLOAD" ]]; then
@@ -10361,30 +10361,50 @@ BROWSERSESSION
 <head>
 <meta charset="utf-8">
 <title>MixOS</title>
+<style type="text/css">
+body { font-family: sans-serif; font-size: 13px; margin: 6px; }
+h1 { font-size: 19px; margin: 2px 0 6px 0; }
+h2 { font-size: 15px; margin: 12px 0 4px 0; }
+p, li { line-height: 1.35; }
+ul { margin: 4px 0 4px 18px; padding: 0; }
+table { border-spacing: 0; }
+td { padding: 1px 10px 1px 0; vertical-align: top; }
+td.k { font-weight: bold; white-space: nowrap; }
+a { text-decoration: underline; }
+</style>
 </head>
 <body>
 
 <h1>MixOS</h1>
 
-<p>This is links2, running in the dashboard's terminal. It renders tables,
-frames, forms and cookies, and it speaks TLS. It does not run JavaScript.</p>
+<p>A graphical browser, on the panel, driven by the pad. The D-pad moves the
+pointer &mdash; it starts slow and speeds up while you hold it &mdash; and
+<b>A</b> clicks whatever it is over.</p>
 
-<h2>Driving it</h2>
+<h2>The pad</h2>
 
 <table>
-<tr><td>Up, Down</td><td>move between links</td></tr>
-<tr><td>Enter</td><td>follow the link under the cursor</td></tr>
-<tr><td>Left</td><td>back one page</td></tr>
-<tr><td>ESC</td><td>the menu bar: File, View, Link, Downloads, Setup, Help</td></tr>
-<tr><td>g</td><td>go to a URL</td></tr>
-<tr><td>s</td><td>bookmarks</td></tr>
-<tr><td>q</td><td>quit, back to the shell</td></tr>
+<tr><td class="k">D-pad</td><td>move the pointer</td></tr>
+<tr><td class="k">A</td><td>click</td></tr>
+<tr><td class="k">B</td><td>back one page</td></tr>
+<tr><td class="k">X</td><td>Enter &mdash; submits the box you are typing in</td></tr>
+<tr><td class="k">Y</td><td>Escape &mdash; stops loading</td></tr>
+<tr><td class="k">L1, R1</td><td>scroll up and down; hold to keep scrolling</td></tr>
+<tr><td class="k">L2, R2</td><td>a whole page up and down</td></tr>
+<tr><td class="k">L3, R3</td><td>middle click, right click</td></tr>
+<tr><td class="k">Select</td><td>show or hide the on-screen keyboard</td></tr>
+<tr><td class="k">Start</td><td>jump to the address bar</td></tr>
+<tr><td class="k">Vol&minus;, Vol+</td><td>zoom out, zoom in</td></tr>
+<tr><td class="k">Menu</td><td><b>hold</b> to close the browser</td></tr>
 </table>
 
-<p>The Menu button raises the dashboard's on-screen keyboard, which is how a URL
-gets typed on a device with no keyboard. B leaves the terminal and returns to the
-cards. Downloads and links2's own bookmarks land in /home/virtua, which is the
-directory the Sharing card exports over SMB.</p>
+<p>To type a URL: <b>Start</b>, then <b>Select</b> for the keyboard, then tap the
+keys with <b>A</b>, then <b>X</b> for Enter. A USB keyboard or mouse in the dock
+works too, and is much faster.</p>
+
+<p>Downloads, bookmarks and cookies land in <b>/home/virtua</b>, which is the
+directory the Sharing card exports over SMB &mdash; so a file saved here turns up
+on the laptop.</p>
 
 <h2>Somewhere to start</h2>
 
@@ -10397,9 +10417,20 @@ no-script version, which is the one that works here</li>
 &mdash; what the Packages card installs from</li>
 </ul>
 
+<h2>What it can and cannot do</h2>
+
+<p>The browser this image ships is <b>NetSurf</b>: its own engine, real CSS,
+images, and TLS. It does not run JavaScript, so a site that renders nothing
+without it will render nothing here. The Packages card can install another one
+&mdash; <b>dillo</b>, <b>epiphany-browser</b>, <b>falkon</b>, <b>firefox-esr</b>
+or <b>chromium</b> are all built for this machine &mdash; and this card picks up
+whichever is installed. Be honest about the hardware first: this is eight
+1&nbsp;GHz cores and 1&nbsp;GB of RAM with no GPU driver, so the big two will
+start, and then they will swap.</p>
+
 <h2>If nothing loads</h2>
 
-<p>The Wi-Fi card joins a network; this page is on the card itself and opens
+<p>The Wi-Fi card joins a network; this page is on the SD card itself and opens
 whether or not one has been joined. Once Wi-Fi is up, any of the links above is
 the test.</p>
 
