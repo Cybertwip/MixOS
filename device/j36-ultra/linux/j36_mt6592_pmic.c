@@ -491,7 +491,7 @@ MODULE_PARM_DESC(chgreboot,
  * only goes back UP after this many consecutive polls have all seen a real
  * charger on the pin.
  */
-#define J36_CHR_HOLDOFF_POLLS		5
+#define J36_CHR_HOLDOFF_POLLS		5u
 
 /* Five, from stock, and a median rather than a mean: the only failure this ADC
  * actually shows is a single bad conversion, which a median rejects completely
@@ -2662,7 +2662,7 @@ static void j36_pmic_poll(struct work_struct *work)
 					 "CHRDET says a charger but the input measures %d mV against a %d mV bar%s: treating the cable as out (CHR_CON0=%04x ldo=%d chrdet=%d lv=%d hv=%d); with the pad up this also takes the charge path down, so it cannot sink the port -- if a meter disagrees set vchr_veto=0\n",
 					 vchr_mv, bar,
 					 bar > J36_VCHR_ABSENT_MV
-					 ? " raised to the pack because DRVVBUS is up and this board can be feeding its own charger input"
+					 ? " raised to the charger class because DRVVBUS is up and this board can be feeding its own charger input"
 					 : "",
 					 con0,
 					 !!(con0 & J36_CHR_CON0_LDO_DET),
@@ -2673,6 +2673,28 @@ static void j36_pmic_poll(struct work_struct *work)
 		} else {
 			p->vchr_vetoed = false;
 		}
+	} else if (vchr_veto && online == 1 && sourcing) {
+		/*
+		 * ── A CONVERSION THAT DID NOT HAPPEN IS NOT A MEASUREMENT ──
+		 *
+		 * The arm below does a different amount of pwrap traffic in its
+		 * two states, and VCHR is the first channel converted on the next
+		 * poll.  So the poll after the charge path moves is the poll most
+		 * likely to lose its conversion -- and falling into the `else'
+		 * for a lost conversion CLEARED the veto, which armed the path,
+		 * which made the poll after that the likely one to lose its
+		 * conversion.  That is the whole oscillator, and it needed no
+		 * millivolts to run: an ADC that answers every other poll is
+		 * enough on its own.
+		 *
+		 * With the pad up, the previous verdict is the only evidence
+		 * there is about a pin this board is itself driving, so it is
+		 * held rather than discarded.  With the pad down the branch does
+		 * not apply and a missing sample still means "believe CHRDET",
+		 * which is the conservative direction there.
+		 */
+		if (p->vchr_vetoed)
+			online = 0;
 	} else {
 		p->vchr_vetoed = false;
 	}
