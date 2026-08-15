@@ -1504,10 +1504,11 @@ verify_arm_elf "$AUDIO_MODULE" "the audio module"
 USB_PHY_MODULE="$MODULE_SRC/j36_mt6592_usb_phy.ko"
 [[ -s "$USB_PHY_MODULE" ]] || die "USB PHY module was not produced"
 verify_arm_elf "$USB_PHY_MODULE" "the USB PHY module"
-# And the PMIC, staged as its own power payload.  It is the only module here that
-# writes registers which outlive a reboot -- the MT6323 charger bank keeps its
-# settings across a warm reset -- which is why it lives behind its own j36.power
-# word rather than in the initramfs, and why it is worth failing the build over a
+# And the PMIC, staged as its own power payload AND into the initramfs -- the only
+# module in this build that goes to two places, for a reason set out at the cp
+# below.  It writes registers which outlive a reboot -- the MT6323 charger bank
+# keeps its settings across a warm reset -- which is why it stays behind its own
+# j36.power word on both paths, and why it is worth failing the build over a
 # missing .ko rather than discovering it as a silent absence of
 # /sys/class/power_supply/battery on a board that then never reports a charge.
 PMIC_MODULE="$MODULE_SRC/j36_mt6592_pmic.ko"
@@ -1745,6 +1746,23 @@ for applet in "${INIT_APPLETS[@]}"; do
     ln -sf busybox "$INITROOT/bin/$applet"
 done
 cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
+# And the PMIC, which is ALSO staged into j36/power/ on the card and is the only
+# module in this build that is deliberately in two places.  The payload copy is the
+# one that owns the gauge, the backlight ordering and the poweroff handler; this
+# copy exists because of a four-second timer.  CHR_CON13's charger watchdog is
+# armed by the preloader and kicked by LK, nothing kicks it across the hand-over,
+# and when it expires the charge stops -- on a PMIC family with no power-path FET,
+# where VBAT is VSYS, that is the whole machine running off the cell for the rest
+# of the boot.  /init loads this one before the card scan so the driver's poll is
+# feeding the timer, and UVLO is at its widest ride-through, BEFORE expand_root
+# spends minutes drawing the heaviest sustained current in the boot.  run_power
+# skips the payload copy when it finds this one already in /sys/module.
+#
+# It is not free: it is the second-largest thing in the initramfs after BusyBox,
+# and `fits_in ... 0x00900000 "the BOOTIMG payload"' below is what says so if it
+# ever stops fitting.  Worth it -- the alternative is a board that goes dark in
+# the middle of a resize2fs and comes back to a half-grown filesystem.
+cp "$PMIC_MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 
 # ── the boot splash ───────────────────────────────────────────────────────────
 #
@@ -2241,6 +2259,56 @@ if [ "$want_wifi" = 1 ] && [ "$want_power" != 1 ]; then
     want_power=1
     say "wifi: j36.wifi needs the PMIC for the MT6323 rails, so j36.power is implied"
     say "      (add j36.power=nocharge as well to leave the charger as the LK set it)"
+fi
+
+# ── THE PMIC, HERE, BECAUSE THE CHARGER IS ALREADY ON A TIMER ────────────────
+#
+# This is a second copy of j36_mt6592_pmic.ko, the same module j36/power/ stages,
+# loaded from the initramfs before anything else in this boot does any work.  It
+# is here for one reason and it is not the battery gauge.
+#
+# THE CHARGER WATCHDOG IS RUNNING RIGHT NOW.  CHR_CON13 holds a four-second timer
+# which the preloader arms whenever it charges, and which LK kicks for as long as
+# LK is the thing running.  Nothing kicks it across the hand-over.  Four seconds
+# after the kernel takes the machine the window closes, the PMIC stops the charge,
+# and from that moment the board is running off the cell alone -- with no
+# power-path FET on this PMIC family, so VBAT *is* VSYS and "the cell alone" means
+# the whole machine.  j36_charger_watchdog_kick() is what feeds it, it runs on the
+# driver's one-second poll, and the poll does not start until the module is in.
+#
+# AND UVLO IS STILL AT THE LOADER'S SETTING UNTIL THE SAME MOMENT.  CHR_CON16's
+# UVLO_VTHL latches the PMIC off below its threshold; j36_charger_arm() moves it to
+# the lowest code for the widest dip the board will ride, because on a board whose
+# VBAT is its VSYS a UVLO trip is not a warning about a brownout, it is the
+# brownout.  It presents to somebody holding the device as a spontaneous restart.
+#
+# WHICH IS WHY IT MOVED IN FRONT OF expand_root.  Loaded from j36/power/ the module
+# arrives after the card scan, after the grow and after the payload mounts -- and
+# the grow is minutes of the heaviest sustained current this boot ever draws, run
+# with the charger switched off since the fourth second and UVLO at whatever the
+# loader chose.  A board that goes dark in the middle of a resize2fs looks exactly
+# like a board with a corrupt card, which is what it becomes on the next boot, and
+# no message the resize can print will reach anyone: the power is gone.
+#
+# STILL BEHIND j36.power, which is the whole of what that word ever promised.  The
+# module writes MT6323 charger registers that survive a warm reset, so it stays
+# rulable-out from a card reader -- take the word out of the bootargs in
+# mvii/boot.conf and the register bank is left exactly as the LK set it, on this
+# path the same as on the old one.  j36.power=nocharge is passed through here too,
+# and means here what it means there: the gauge and the poweroff handler, no
+# CHR_CON writes.  Nothing is skipped by loading it early; it is only earlier.
+#
+# NON-FATAL, like every other insmod in this file.  A boot that cannot load it is
+# the boot every board had before this block existed, and it still reaches j36/power/
+# later -- which is why the failure is worth one line rather than a stop.
+if [ "$want_power" = 1 ]; then
+    pmic_args=""
+    [ "$power_charge" = 1 ] || pmic_args="charge=0"
+    if insmod /lib/modules/*/extra/j36_mt6592_pmic.ko $pmic_args 2>/dev/null; then
+        say "power: PMIC loaded early${pmic_args:+ ($pmic_args)} -- the charger watchdog is being kicked before the card work starts"
+    else
+        say "power: the initramfs PMIC would not load; the charger stays as the LK left it until j36/power/ is reached"
+    fi
 fi
 
 # ── Swap, in RAM, before anything has allocated ──────────────────────────────
@@ -2854,6 +2922,15 @@ expand_root() {
     if [ "$ex_tries" -ge 3 ]; then
         expand_note "the grow has been started $ex_tries times and the board went off before it finished each time, so it is not being started again -- the card keeps the size it has and the boot carries on"
         expand_note "put j36.expand=retry in the bootargs in mvii/boot.conf to try once more, or empty ${ex_tries_file#/newroot} on the OS partition"
+        # Three interrupted grows is not three failed grows.  Each of them stopped with
+        # the partition unmounted and resize2fs partway through moving blocks, so the
+        # thing this is standing down from has already been done to this card three
+        # times, and the filesystem it is standing down to protect is the one that was
+        # underneath all three.  The board boots, which is what the stand-down is for;
+        # the honest instruction is still the one on the panel.
+        stage "Reflash MixOS into the installation media"
+        detail "the grow was interrupted $ex_tries times"
+        sleep 5
         return 0
     fi
     # ── THE TOOLS, TAKEN BEFORE THE FILESYSTEM GOES AWAY ─────────────────────
@@ -3062,6 +3139,16 @@ expand_root() {
         # pulled mid-write, a card from a board that was switched off in the dashboard,
         # a card an older build left half-grown.  Those are the cards a check is for.
         #
+        # AND ONLY ON THE FIRST ATTEMPT, which is the clause that keeps the skip honest.
+        # resize2fs writes the superblock LAST: a grow that is cut off partway has
+        # already moved blocks and written group metadata, and the superblock still on
+        # the card is the one from before it started -- which says clean, because when
+        # it was written it was.  So `clean' means "nothing has been done to this" only
+        # when nothing had been started.  ex_tries is the count of boots that began this
+        # and did not finish it, incremented just before the fork, so 1 is this boot's
+        # own and anything above 1 is a filesystem that has been half-grown at least
+        # once.  Those get the full check, which is the case a check exists for.
+        #
         # `j36.expand=fsck' forces it anyway, and it exists for the same reason
         # `j36.expand=retry' does: if a grow ever fails on a filesystem that says it is
         # clean, the operator needs a way to make the check happen that does not involve
@@ -3080,9 +3167,11 @@ expand_root() {
         # the exit status comes back through a file because BusyBox ash has no
         # PIPESTATUS and no way to poll a background job.
         ex_rc=0
-        if [ "$ex_fsclean" = 1 ] && [ "$want_expand" != fsck ]; then
+        ex_skipped=0
+        if [ "$ex_fsclean" = 1 ] && [ "$want_expand" != fsck ] && [ "$ex_tries" -le 1 ]; then
             ex_step "the filesystem is clean"
             ex_pct 29
+            ex_skipped=1
         else
             ex_step "checking the filesystem"
             ex_pct 4
@@ -3179,7 +3268,7 @@ expand_root() {
         read -r ex_rrc < /dev/.expand-resize-rc
         if [ "$ex_rrc" = 0 ]; then
             ex_result="$rootdev now fills /dev/$ex_disk"
-        elif [ "$ex_rc" = 0 ] && [ "$ex_fsclean" = 1 ] && [ "$want_expand" != fsck ]; then
+        elif [ "$ex_skipped" = 1 ]; then
             # The one failure the skip above could have caused, said as such so nobody
             # has to guess.  Every other resize2fs failure gets the plain sentence.
             ex_result="resize2fs could not grow $rootdev, and the check was skipped because the superblock said clean; put j36.expand=fsck in the bootargs to run it"
@@ -3214,6 +3303,22 @@ expand_root() {
     # where this happens at all, it is minutes and everything else in the boot is
     # seconds, so a bar measuring the boot would sit still for the whole of the only part
     # anybody is waiting through.  It is handed back at the bottom of this function.
+    # ── AND THE HEADLINE FOR THE WHOLE OF IT ─────────────────────────────────
+    #
+    # Not the name of the step: the step is in the line underneath, moving, and this is
+    # the one thing on the panel that has to be READ.  Every other stretch of this boot
+    # survives the power button -- turn it off, turn it on, nothing is different.  This
+    # one does not, and that is not a matter of degree: the partition is unmounted, its
+    # table has already been rewritten, and resize2fs writes the superblock last, so a
+    # board switched off in the middle comes back to a filesystem that has been
+    # half-grown and does not say so.  There is no way to word that in the log that
+    # reaches somebody holding the device, so it goes in the biggest text the splash has.
+    #
+    # SENT ONCE, HERE, and not from the loop below: `stage:' clears the detail line in
+    # mixsplash, and the loop rewrites the detail every second.  Twenty-six characters at
+    # scale 2 is 310 px of a 640 px panel, well inside the splash's own truncation.
+    stage "Do not turn the device off"
+
     ex_waited=0
     ex_shown=-1
     while [ ! -s /dev/.expand-result ]; do
@@ -3274,6 +3379,28 @@ expand_root() {
     # the paths on which the partition may have been unmounted when the child stopped.
     if [ -n "$ex_said" ]; then
         expand_note "$ex_said"
+
+        # ── AND WHEN THE ANSWER MEANS THE CARD IS NOT WORTH FIXING ───────────
+        #
+        # Three of the sentences the child can leave here are not "the grow did not
+        # happen", they are "what is on this card is damaged": a filesystem e2fsck would
+        # not preen, a root that would only come back READ-ONLY, and a root that would
+        # not come back at all.  The boot carries on from it either way -- a read-only
+        # root boots to something a person can look at, which is the whole reason that
+        # fallback exists -- but from here the device is going to behave like a device
+        # with a fault, and the answer is not a fault to chase.  It is a reflash.
+        #
+        # ON THE SPLASH and not only in the log, because the log lives on the partition
+        # this sentence is about.  Five seconds is long enough to read seven words and
+        # short enough that it is not a delay anybody has to have an opinion about.
+        case "$ex_said" in
+            *"needs attention"*|*"READ-ONLY"*|*"WOULD NOT REMOUNT"*)
+                stage "Reflash MixOS into the installation media"
+                detail "$ex_said"
+                sleep 5
+                ;;
+        esac
+
         # AND THE COUNT COMES OFF, on any answer at all and not only on a good one.
         # What it counts is boots that ended in the middle, and a child that reached
         # its last line did not end in the middle -- whether it grew the card, refused
@@ -3927,6 +4054,19 @@ run_power() {
     fi
     while IFS= read -r ko; do
         case "$ko" in ''|'#'*) continue ;; esac
+        # SKIP WHAT IS ALREADY IN, the same test run_usb makes and for a closer
+        # reason: the PMIC is loaded from the initramfs before the card is even
+        # scanned, because the charger watchdog cannot wait for a payload mount.
+        # This copy is the one that used to be the only one, and reaching it with
+        # the module already in would fail with EEXIST -- which reads in the log
+        # exactly like a broken module and would send somebody after the wrong
+        # thing.  The backlight beside it is untouched by any of that and still
+        # loads here, which is why the test is per-module and not around the loop.
+        mod=$(printf '%s' "${ko%.ko}" | tr '-' '_')
+        if [ -d "/sys/module/$mod" ]; then
+            say "power: $ko is already loaded"
+            continue
+        fi
         args=""
         case "$ko" in
             j36_mt6592_pmic.ko)
@@ -9072,15 +9212,39 @@ systemd.mask=firstboot.service
     a Linux machine, or from the dashboard once the board is up, deleting that file
     does the same thing.
 
-    IF THE BOARD RESTARTS HERE, THIS IS THE FIRST THING TO CHECK: put it on the
-    charger and start it again.  The grow is the only stretch of the boot that
-    holds the card at full write current for minutes, and it runs early -- before
-    the OS is up and before anything has taken charge of the battery.  A pack that
-    carries a thirty-second boot to the desktop will not necessarily carry ten
-    minutes of this.  It is not the kernel restarting the board: this build sets
-    no panic timeout, so a kernel panic here halts and stays halted, and the TOPRGU
-    watchdog is disarmed by its driver at probe.  A restart during the grow is the
-    power, not the software.
+    IF THE BOARD RESTARTS HERE, IT WAS THE CHARGER, AND IT IS FIXED -- but the
+    fix is in the initramfs, so a card whose boot/ has not been updated still has
+    it.  It was never the resize and it was never the card, which is why reflashing
+    did not help and why the crash simply moved when the filesystem check was made
+    conditional: the step was not causing the fault, it was the only step long
+    enough to show it.
+
+    What was actually happening is a four-second timer.  CHR_CON13 in the MT6323
+    holds the charger watchdog; the preloader arms it whenever it charges and LK
+    kicks it, and nothing kicked it once Linux had the machine, because the driver
+    that does was loaded from j36/power/ -- after the card scan, after the grow.
+    Four seconds into every boot the window closed and the charge stopped.  This
+    PMIC family has no power-path FET, so VBAT is VSYS: from that moment the whole
+    board was running off the cell.  CHR_CON16's UVLO threshold was still the
+    loader's for the same stretch, and below it the PMIC latches off -- which on a
+    board whose VBAT is its VSYS is not a brownout warning, it is the brownout.
+    Then the grow arrives: minutes of the heaviest sustained card current in the
+    boot, on a rail that has had nothing feeding it since the fourth second.
+
+    So j36_mt6592_pmic.ko is now in the initramfs as well as on the card, and /init
+    loads it before it looks for the card at all.  The driver polls every second and
+    feeds the four-second timer from j36_charger_arm(), and it moves UVLO to the
+    lowest code -- the widest dip the PMIC will ride -- before any of this runs.
+    j36.power in the bootargs still gates all of it, on this path exactly as on the
+    old one.
+
+    Putting the board on the charger is still worth doing and is still the first
+    thing to try on a card that predates this, but it was never a whole answer on
+    its own: with the watchdog expired, a charger is a cable feeding a charge path
+    that has been switched off.  It is not the kernel restarting the board either.
+    This build sets no panic timeout, so a kernel panic here halts and stays halted,
+    and the TOPRGU watchdog is disarmed by its driver at probe.  A restart during
+    the grow is the power, not the software.
 
 batt_led.service, no longer masked
     The RK3326 battery LED daemon, and the first unit the forwarded log caught:
@@ -9610,6 +9774,37 @@ j36.power=1
     seen from the other end.  Two modules, j36/power/j36_mt6592_pmic.ko and
     j36/power/j36_mt6592_backlight.ko, loaded after the USB payload.
 
+    THE PMIC HALF DOES NOT WAIT THAT LONG ANY MORE, and it is the one thing in
+    this file worth reading if a board has been going dark partway through its
+    first boot.  There is a four-second charger watchdog in CHR_CON13.  The
+    preloader arms it, LK kicks it, and nothing kicked it once the kernel had the
+    machine -- so on every boot the charge stopped four seconds in, and this PMIC
+    family has no power-path FET, which means VBAT is VSYS and the board ran the
+    rest of its boot off the cell.  CHR_CON16's UVLO threshold stayed at the
+    loader's setting for the same stretch, and below that threshold the PMIC
+    latches off; on a board whose VBAT is its VSYS that is not a warning about a
+    brownout, it is the brownout, and it looks to whoever is holding the device
+    like a spontaneous restart.
+
+    Where that landed was the resize.  Growing the OS partition is minutes of the
+    heaviest sustained card current in the whole boot, it used to run long before
+    anything touched the charger, and a board that goes off in the middle of it
+    comes back to a filesystem that has been half-grown.  So a copy of
+    j36_mt6592_pmic.ko is now in the initramfs as well as in j36/power/, and /init
+    loads it before it has even looked for the card: the driver's one-second poll
+    feeds the four-second timer, and the charger is armed with the widest UVLO
+    ride-through the PMIC offers, before any of the work starts.  The copy in
+    j36/power/ is skipped when the early one is already in -- the log says
+    `power: j36_mt6592_pmic.ko is already loaded' and that line is the normal case,
+    not a fault.
+
+    None of that escapes this word.  Take j36.power out of the bootargs and
+    neither copy loads, the MT6323 charger bank keeps whatever the LK set, and the
+    boot is the one it was before -- which is the point of the word, because those
+    registers survive a warm reset and a card reader is the only tool that can
+    still reach them once a board will not come up.  j36.power=nocharge is passed
+    through to the early copy too, and means there what it means below.
+
     The backlight half registers /sys/class/backlight/j36-backlight, with a
     max_brightness of 1023 -- the 10-bit duty of the BLS block at 0x1400a000,
     which is what the LK programs and what the TPS61161 in front of the LED
@@ -9729,6 +9924,16 @@ j36.power=nocharge
     with no cell fitted, and any session where the question is whether a change
     in charging behaviour came from this driver.  /init translates it to charge=0
     on the insmod line, the same mechanism and the same reason as j36.usb=novbus.
+
+    KNOW WHAT IT COSTS ON THE FIRST BOOT.  Leaving CHR_CON alone means leaving the
+    charger watchdog alone, and that timer is already running when Linux takes the
+    machine -- see the restart paragraph under j36.expand above.  So this word puts
+    a board back in exactly the state that made the partition grow fall over: the
+    charge stops four seconds in and UVLO stays where the loader put it, through
+    the longest and heaviest step of the boot.  That is the word working as
+    written, not a fault in it.  On a card that has not been grown yet, grow it
+    first and add this afterwards, or put j36.expand=0 beside it and grow the card
+    on a boot that is allowed to charge.
 
     Deleting j36/power/ from the card is the harder version of the same thing and
     works from any machine that reads SD cards.  It is worth knowing that this is
@@ -11815,7 +12020,8 @@ fi
         echo "card_expand_fsck=the check is skipped when dumpe2fs says 'Filesystem state: clean', which on a card this same function unmounted a second earlier is the normal case.  resize2fs is given -f, which drops only the last-checked-versus-last-mounted test and still refuses a filesystem the superblock does not call valid.  That check is the first sustained read of the card in the boot, it runs with the root unmounted and before anything that could carry the board through it, and on a big card it is most of the minutes this step costs.  j36.expand=fsck in the bootargs runs it anyway"
         echo "card_expand_off=j36.expand=0 in the bootargs in mvii/boot.conf skips the whole step -- no unmount, no partition table write, no e2fsck, no resize2fs.  It is the only destructive thing /init does and the only one that is still working after an operator has decided the board is dead, so it is the one step that has to be rulable-out from a card reader alone.  Nothing remembers the word: take it out and the next boot grows the card"
         echo "card_expand_trip=three boots that start the grow and do not finish it stand the step down for good: the count is /var/lib/mixos/expand-tries on the OS partition, written just before the unmount and removed the moment the resize answers anything at all, so it counts resets and not outcomes.  It exists because a board that goes off partway leaves the card in the state that makes the next boot start the same work, which is a boot loop and not a failed resize.  j36.expand=retry starts the count again from the FAT partition; deleting the file does it from the OS"
-        echo "card_expand_reset=a restart during the grow is power and not software: CONFIG_PANIC_TIMEOUT=0, so a panic here halts rather than reboots, and mtk_wdt disarms the TOPRGU at probe.  The grow is the only stretch of the boot that holds the card at full write current for minutes, and it runs before the OS or anything that manages the battery, so a marginal pack is the thing to rule out first"
+        echo "card_expand_reset=a restart during the grow is power and not software: CONFIG_PANIC_TIMEOUT=0, so a panic here halts rather than reboots, and mtk_wdt disarms the TOPRGU at probe.  The grow is the only stretch of the boot that holds the card at full write current for minutes, which is what made it the step that showed the fault; what the fault was is card_expand_power"
+        echo "card_expand_power=CHR_CON13's charger watchdog is a four-second window the preloader arms and LK kicks, and nothing kicked it across the hand-over to Linux -- so the charge stopped four seconds into every boot, and with no power-path FET on this PMIC family VBAT is VSYS and the whole machine ran off the cell from there.  CHR_CON16's UVLO stayed at the loader's threshold for just as long, and a UVLO trip on this board is not a warning about a brownout, it is the power cut.  j36_mt6592_pmic.ko is now staged into the initramfs as well as into j36/power/ and /init loads it before the card scan, so the driver's one-second poll is feeding the timer and UVLO is at its widest ride-through before expand_root draws anything.  Still behind j36.power, and j36.power=nocharge is passed through; run_power skips the payload copy when it finds this one in /sys/module"
         echo "card_expand_libs=EXPAND_LIBS in /init names the shared libraries those tools are copied with, and this build checked it against the DT_NEEDED closure of sfdisk, e2fsck, resize2fs and dumpe2fs in the armhf chroot -- see verify_expand_libs.  A name missing from that list is not a build failure by itself, it is a loader exiting 127 on the device and a card that silently keeps the size it was flashed at, so the build fails on it instead"
         echo "card_expand_reaches_a_flashed_card=yes, through --mix-only: expand_root lives in /init, /init is inside initrd.img, and initrd.img is in boot/.  Copying boot/ onto the BOOT partition is the whole update; nothing about the resize comes from the rootfs except the four tools it borrows"
         echo "card_expand_progress=the splash bar and detail line show a real percentage for the whole operation: e2fsck reports through -C 1, and resize2fs (which reports nothing) is measured as write_sectors in /sys/block/<disk>/stat against the inode tables and bitmaps that the added block groups cost.  dumpe2fs is copied out too, optionally, because that estimate needs the filesystem's own inode size and inodes-per-group; without it the phase falls back to naming itself"

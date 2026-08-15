@@ -172,6 +172,31 @@ phrase table.
 
 ## Fixed in 1.1.3
 
+**The board went dark partway through the first boot's partition grow.** The charge stopped
+four seconds into *every* boot, and the resize was simply the first thing long enough to
+notice. `CHR_CON13` holds a four-second charger watchdog: the preloader arms it, LK kicks it,
+and nothing kicked it once Linux had the machine, because the driver that does was loaded
+from `j36/power/` — after the card scan and after the grow. This PMIC family has no
+power-path FET, so `VBAT` *is* `VSYS`, and past that fourth second the whole board was
+running off the cell with `CHR_CON16`'s UVLO threshold still set to whatever the loader
+chose. Below that threshold the PMIC latches off, which on this board is not a warning about
+a brownout — it is the brownout, and it reads to whoever is holding the device as a
+spontaneous restart. `expand_root` then arrives with minutes of the heaviest sustained card
+current in the boot.
+
+`j36_mt6592_pmic.ko` is now staged into the initramfs as well as into `j36/power/`, and
+`/init` loads it before it looks for the card at all — so the driver's one-second poll is
+feeding the four-second timer and UVLO is at its widest ride-through before any of the work
+starts. `j36.power` still gates it and `j36.power=nocharge` is still honoured; `run_power`
+skips the payload copy when the early one is already in `/sys/module`. Reflashing never
+helped because the card was never at fault.
+
+Alongside it, three things the grow now does for the case where power *is* lost anyway: the
+filesystem check is skipped when the superblock already says `clean` (and forced back on with
+`j36.expand=fsck`), roughly halving the window; the splash carries **Do not turn the device
+off** for the duration; and a card left damaged by an interrupted grow says **Reflash MixOS
+into the installation media** rather than presenting as an intermittent fault.
+
 **The battery collapsed to 0% after a full charge.** Three defects in the gauge, all in
 `j36_mt6592_pmic.c`:
 
