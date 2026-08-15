@@ -107,7 +107,8 @@ there is no reachable 2D engine on this board.
 
 **Dashboard.** Cards for every destination, arranged by the operator and remembered. Card
 art is cached per card and blitted at integer offsets, so a placement no longer repaints
-every card between the two slots on every frame.
+every card between the two slots on every frame. A startup sound plays once, on the first
+frame that is worth showing.
 
 **Files.** Four panes — an editable address bar, a search box, a Places list, and the
 listing — with a right-hand info panel (name, kind, size, modified, access; deliberately
@@ -137,8 +138,9 @@ card out.
 **Packages.** Debian's archive from the handheld, `apt` behind a search box. This is the
 page that makes the device a computer rather than an appliance.
 
-**Diagnostics.** What the "3D cube" card grew into: EGL/GLES2, the display pipe, audio, USB,
-the PMIC and the connectivity subsystem, each probed and reported.
+**Diagnostics.** What the "3D cube" card grew into: seven sections — Display, Graphics,
+Input, Audio, USB, Power and System — each probed and reported with the reason, plus the
+EGL and mirror tests as things you can run from the page.
 
 **Settings.** A hub with volume and mute, over three pages: Mouse, Display (backlight), and
 **Region & Language** — one world map that sets the time zone and the interface language
