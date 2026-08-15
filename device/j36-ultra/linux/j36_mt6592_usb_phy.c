@@ -132,6 +132,18 @@
  * thing whenever DEVCTL reports FSDEV or LSDEV, which is the core's own
  * pre-enumeration attach flag. Nothing that is plugged in ever sees the gap.
  *
+ * That last sentence was too strong for one case, and the case is the charger.
+ * FSDEV/LSDEV is a pull-up on D+ or D-, and a divider-type charger presents one
+ * -- so it read as attached, the probe stayed suspended, DRVVBUS stayed high and
+ * the PMIC's interlock refused to charge for the whole uptime, which is the bug
+ * "the charger says no cable" actually was. A charger is not a device and never
+ * becomes one: it answers no reset and is given no address. So the latch now asks
+ * usbcore whether anything on the bus has an address, and only holds when
+ * something has. Nothing that enumerates is ever power-cycled by this poll;
+ * something that holds the lines high and never enumerates gets measured once,
+ * after attach_grace_polls, which is how a charger is found. See
+ * j36_usb_devices() and j36_usb_phy_decide_role().
+ *
  * vbus= pins it, both ways and for the cases where the measurement is not
  * wanted: vbus=1 is the old always-host-always-source behaviour, vbus=0 forbids
  * sourcing without forbidding host (which is the self-powered-hub case, and the
@@ -227,6 +239,15 @@
 #include <linux/of_address.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+/*
+ * usbcore, for usb_for_each_dev() alone -- see j36_usb_devices().  It is the
+ * only question this driver cannot answer from a register: "did the thing on the
+ * port ever get a USB address", which is what separates a device from a charger
+ * that holds the same line high.  usbcore is already this module's one `modinfo
+ * -F depends' edge and already loads ahead of it, so this costs no new module and
+ * no change to load.order.
+ */
+#include <linux/usb.h>
 #include <linux/workqueue.h>
 
 /* PERI clock gates. PDN_CLR clears power-down bits, i.e. turns clocks ON.
@@ -466,10 +487,12 @@ MODULE_PARM_DESC(role_poll_ms,
 		 "power-on measurement decided). Plugging a charger into a running "
 		 "console is the normal case and there is no interrupt for it on "
 		 "this board, so it is a poll. It is skipped entirely whenever "
-		 "anything is attached to the port, and while the port is an "
-		 "idle host only every role_probe_every'th poll pays for the "
-		 "DRVVBUS drop -- see that parameter for why the drop is not "
-		 "something to do twenty times a minute.");
+		 "something that has enumerated is attached to the port, and "
+		 "while the port is an idle host only every role_probe_every'th "
+		 "poll pays for the DRVVBUS drop -- see that parameter for why "
+		 "the drop is not something to do twenty times a minute, and "
+		 "attach_grace_polls for what happens when the thing on the port "
+		 "holds the lines high without ever becoming a device.");
 
 static unsigned int role_probe_every = 5;
 module_param(role_probe_every, uint, 0644);
@@ -484,6 +507,22 @@ MODULE_PARM_DESC(role_probe_every,
 		 "longer done every three seconds -- a device plugged in during "
 		 "the gap loses an attach attempt, and a port that gives one up "
 		 "twenty times a minute is a port nothing settles on.");
+
+static unsigned int attach_grace_polls = 3;
+module_param(attach_grace_polls, uint, 0644);
+MODULE_PARM_DESC(attach_grace_polls,
+		 "how many role polls something may hold D+ or D- high without "
+		 "getting a USB address before the port is measured anyway "
+		 "(default 3, so about nine to twelve seconds at the 3000 ms "
+		 "poll; 0 measures on the first poll of every attach). This is "
+		 "what makes a divider-type charger charge: it drives the same "
+		 "line a device's pull-up does, so DEVCTL calls it attached and "
+		 "the attach latch used to hold DRVVBUS high for the whole "
+		 "uptime, which is exactly the state the PMIC refuses to charge "
+		 "in. Anything that enumerates is exempt for as long as it stays "
+		 "on the bus, so a stick, a mouse or a hub is never power-cycled "
+		 "by this however low it is set; raise it if some device on this "
+		 "board takes longer than that to get an address.");
 
 static bool musb_session = true;
 module_param(musb_session, bool, 0644);
@@ -541,6 +580,15 @@ struct j36_usb_phy {
 	 * for the life of the board is a line nobody reads; this makes it a line
 	 * per plug instead.  Nothing branches on it. */
 	bool attach_logged;
+	/* Polls this run of "something is holding D+ or D- high" has lasted
+	 * without anything appearing on the USB bus.  Reset the moment the port
+	 * reads clear, or the moment a device does enumerate. */
+	unsigned int attach_polls;
+	/* One measurement per attached run, and this is what makes it one: a
+	 * thing that held the lines high, never enumerated and then measured as
+	 * NOT feeding the port is a device after all, and re-measuring it every
+	 * grace period would power-cycle it forever. */
+	bool attach_probed;
 	struct delayed_work role_work;
 	/* The role poll runs off a workqueue and .set_mode / .power_on /
 	 * .power_off run off musb's probe and remove. The generic PHY framework
@@ -917,6 +965,45 @@ static bool j36_port_attached(struct j36_usb_phy *p)
 }
 
 /*
+ * ── DID THE THING ON THE PORT EVER BECOME A USB DEVICE? ──────────────────────
+ *
+ * The one question about this port that no register on this board can answer,
+ * and the one that separates the two things FSDEV/LSDEV cannot tell apart.
+ *
+ * A device pulls D+ or D- up, gets a bus reset, answers it, and is given an
+ * address; a divider-type charger pulls the same line up with a resistor and
+ * answers nothing, because there is nothing in it to answer with.  The pull-up is
+ * all DEVCTL sees, so DEVCTL calls both of them attached.  Enumeration is the
+ * difference, and enumeration lives in usbcore.
+ *
+ * Root hubs are skipped because there is always exactly one and it is this
+ * board's own controller, not something somebody plugged in.  Everything else on
+ * the bus got its address from a reset it answered.
+ *
+ * ONE CONTROLLER, which is why this does not filter by bus: musb is the only USB
+ * host on this SoC and this PHY is its PHY, so any usb_device that exists at all
+ * came in through this connector.  A board with a second controller would want
+ * udev->bus compared against musb's, and would have a second connector to decide
+ * about as well.
+ */
+static int j36_usb_dev_seen(struct usb_device *udev, void *data)
+{
+	unsigned int *n = data;
+
+	if (udev->parent)
+		++*n;
+	return 0;
+}
+
+static unsigned int j36_usb_devices(void)
+{
+	unsigned int n = 0;
+
+	usb_for_each_dev(&n, j36_usb_dev_seen);
+	return n;
+}
+
+/*
  * Is something OUTSIDE this board holding the port at 5 V?
  *
  * Only meaningful with DRVVBUS low and the force_* overrides released, and both
@@ -1016,6 +1103,7 @@ static bool j36_role_is_auto(struct j36_usb_phy *p)
  */
 static void j36_usb_phy_decide_role(struct j36_usb_phy *p)
 {
+	bool measure_now = false;
 	bool released = false;
 	const char *why;
 	bool changed;
@@ -1032,40 +1120,76 @@ static void j36_usb_phy_decide_role(struct j36_usb_phy *p)
 
 	if (p->role_host == 1 && j36_port_attached(p)) {
 		/*
-		 * SAY IT ONCE, BECAUSE THIS IS WHERE THE CHARGER GOES MISSING.
+		 * ── THE ATTACH LATCH, AND WHERE THE CHARGER USED TO GO MISSING ──
 		 *
 		 * FSDEV/LSDEV means "D+ or D- is being held high", and that is not
 		 * quite the same claim as "a device is here".  A divider-type
 		 * charger -- the Apple 2.4 A brick holds D+ near 2.7 V, and the
 		 * Samsung scheme holds both near 1.2 V -- drives the same line a
-		 * device's pull-up does, so it reads as attached, the probe is
-		 * suspended for as long as it stays plugged in, DRVVBUS never comes
-		 * back down, and the PMIC's interlock reports no cable at the very
-		 * moment there is one.  The dashboard's Charger row says exactly
-		 * that now; this is the other half of the same answer, and the two
-		 * of them together are the difference between "which of the two
-		 * suspects is it" and one boot log.
+		 * device's pull-up does.  So it read as attached, the probe was
+		 * suspended for as long as it stayed plugged in, DRVVBUS never came
+		 * back down, and the PMIC's interlock reported no cable at the very
+		 * moment there was one.  Which is not only a display fault: the
+		 * interlock is right to refuse, because a board charging off its own
+		 * boost is charging the cell from the cell through two conversions.
+		 * Nothing was charging.
 		 *
-		 * The latch itself is deliberately left alone.  It is what keeps a
-		 * mounted USB stick from being power-cycled every fifteen seconds,
-		 * and nothing readable from this driver separates a charger that
-		 * holds D+ high from a device that does -- so the fix, if this line
-		 * turns out to be the one printing, belongs where that distinction
-		 * can actually be made and not in a guess here.
+		 * This file used to say the distinction could not be made from here,
+		 * and left the latch alone rather than guess.  The distinction can be
+		 * made -- it is just not in a register.  A device answers a bus reset
+		 * and is given an address; a charger answers nothing, because there
+		 * is nothing in it to answer with.  So:
+		 *
+		 *   something on the bus   a device really is here and is in use.
+		 *                          Latch, exactly as before, for as long as
+		 *                          it stays.  Nothing that enumerates is ever
+		 *                          power-cycled by this.
+		 *   nothing, but not yet   enumeration takes a reset, a descriptor
+		 *                          read and an address, and the attach flag
+		 *                          beats all three.  Wait attach_grace_polls.
+		 *   nothing, still         it held the line high for ten seconds and
+		 *                          never became a device.  Measure.
+		 *
+		 * ONE measurement per attached run, which is what attach_probed is
+		 * for: a broken device that never enumerates would otherwise be
+		 * power-cycled every grace period for the whole uptime.  It gets one,
+		 * which is a retry rather than a loop, and then the latch holds.
 		 */
-		if (!p->attach_logged) {
-			p->attach_logged = true;
-			dev_info(p->dev,
-				 "port reads attached (DEVCTL FSDEV/LSDEV): the role probe is suspended and DRVVBUS stays high, so the PMIC will report no cable until this comes out\n");
+		if (j36_usb_devices()) {
+			if (!p->attach_logged) {
+				p->attach_logged = true;
+				dev_info(p->dev,
+					 "port is in use: something enumerated, so the role is settled and DRVVBUS stays up until it comes out\n");
+			}
+			p->attach_polls = 0;
+			p->attach_probed = false;
+			/* Busy; ask again next poll -- and do not let the
+			 * interval toward the next probe run down while the port
+			 * is in use, or the first idle poll after a stick is
+			 * unplugged spends its whole budget at once. */
+			p->polls_since_probe = 0;
+			return;
 		}
-		/* Busy; ask again next poll -- and do not let the interval
-		 * toward the next probe run down while the port is in use, or
-		 * the first idle poll after a stick is unplugged spends its
-		 * whole budget at once. */
-		p->polls_since_probe = 0;
-		return;
+
+		if (p->attach_probed) {
+			p->polls_since_probe = 0;
+			return;
+		}
+		if (++p->attach_polls < attach_grace_polls) {
+			p->polls_since_probe = 0;
+			return;
+		}
+
+		p->attach_probed = true;
+		measure_now = true;
+		dev_info(p->dev,
+			 "something has held D+/D- high for %u polls and never got a USB address: measuring the port, because a charger looks exactly like this\n",
+			 p->attach_polls);
+	} else {
+		p->attach_logged = false;
+		p->attach_polls = 0;
+		p->attach_probed = false;
 	}
-	p->attach_logged = false;
 
 	/*
 	 * ── HOW OFTEN THE EXPENSIVE ANSWER IS RE-ASKED ──
@@ -1085,9 +1209,13 @@ static void j36_usb_phy_decide_role(struct j36_usb_phy *p)
 	 * enough for a device to come up on it.
 	 *
 	 * p->role_host < 0 is the power-on case and is never skipped: there is
-	 * no answer yet to keep.
+	 * no answer yet to keep.  Neither is measure_now, which is the branch
+	 * above having already decided this is worth a power cycle: making it
+	 * queue behind an interval whose whole purpose is to protect a device
+	 * that has just been shown not to exist would only add ten seconds to
+	 * the time a charger spends not charging.
 	 */
-	if (p->role_host == 1) {
+	if (p->role_host == 1 && !measure_now) {
 		if (role_probe_every == 0)
 			return;			/* pinned by the first probe */
 		if (++p->polls_since_probe < role_probe_every)

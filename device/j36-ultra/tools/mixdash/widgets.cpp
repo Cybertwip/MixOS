@@ -3016,6 +3016,16 @@ void InfoPage::refresh()
              * exactly this row: 1 is "the interlock is what you are looking at",
              * anything else -- 0, -1, or the file not being there on an older
              * kernel -- is the plain reading, which is that nothing is plugged in.
+             *
+             * "FOR A USB DEVICE" IS NOW A CLAIM AND NOT A HOPE.  This row was
+             * written when the PHY latched the port to host as soon as anything
+             * held D+ or D- high, which a divider-type charger does -- so this
+             * line could appear with a charger in the socket and nothing charging.
+             * The PHY asks usbcore now, and only keeps sourcing when something on
+             * the bus actually has an address; anything else is measured and
+             * stands down within about ten seconds.  So if this row is up, there
+             * really is a device on the port.  See attach_grace_polls in
+             * device/j36-ultra/linux/j36_mt6592_usb_phy.c.
              */
             const QString sourcing = readTrimmed(usb + "/vbus_sourcing");
             if (sourcing == QLatin1String("1"))

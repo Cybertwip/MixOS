@@ -1987,8 +1987,18 @@ static int j36_charger_online(struct j36_pmic *p)
 	if (j36_drvvbus_asserted(p)) {
 		if (!p->vbus_warned) {
 			p->vbus_warned = true;
+			/*
+			 * Not a fault and no longer a dead end: j36_mt6592_usb_phy
+			 * drops this pad and re-measures the port whenever what is
+			 * on it has not become a USB device, so a charger that
+			 * arrived while the port was hosting is found within about
+			 * ten seconds and this line is followed by the pad going
+			 * low.  A line that is NOT followed by one means something
+			 * on the port did enumerate, and the port is a host on
+			 * purpose.  See attach_grace_polls in that driver.
+			 */
 			dev_info(p->dev,
-				 "DRVVBUS is asserted: the port is sourcing 5 V, so CHRDET is this board's own boost -- charger held off\n");
+				 "DRVVBUS is asserted: the port is sourcing 5 V, so CHRDET is this board's own boost -- charger held off until the port stands down\n");
 		}
 		return 0;
 	}

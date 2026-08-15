@@ -1150,11 +1150,13 @@ verify_arm_elf "$PANEL_MODULE" "the panel module"
 AUDIO_MODULE="$MODULE_SRC/j36_mt6592_audio.ko"
 [[ -s "$AUDIO_MODULE" ]] || die "audio module was not produced"
 verify_arm_elf "$AUDIO_MODULE" "the audio module"
-# And the USB PHY, staged with the usb payload.  It is the first module of the
-# USB chain to load, because it is the only hook that runs before musb_hdrc
-# touches 0x11200000 -- and an APB read of that window while PERI still gates it
-# hangs the bus rather than faulting.  A missing .ko here would put musb_hdrc
-# first in load.order, so check it at build time.
+# And the USB PHY, staged with the usb payload.  It loads before musb_hdrc,
+# because it is the only hook that runs before musb touches 0x11200000 -- and an
+# APB read of that window while PERI still gates it hangs the bus rather than
+# faulting.  A missing .ko here would put musb_hdrc first in load.order, so check
+# it at build time.  usbcore now sorts ahead of both (the PHY calls
+# usb_for_each_dev to tell a charger from a device), which changes nothing: the
+# window belongs to musb and usbcore does not touch it.
 USB_PHY_MODULE="$MODULE_SRC/j36_mt6592_usb_phy.ko"
 [[ -s "$USB_PHY_MODULE" ]] || die "USB PHY module was not produced"
 verify_arm_elf "$USB_PHY_MODULE" "the USB PHY module"
@@ -5570,9 +5572,14 @@ fi
 # The roots, and why each one is a root rather than something the walk finds:
 #
 #   j36_mt6592_usb_phy  out-of-tree, so nothing in the kernel tree names it, and
-#                       it MUST be first in the load order -- it is the driver
-#                       that ungates the PERI clock, and the walk puts it first
-#                       for free because usbcore is the only thing under it.
+#                       it MUST load before musb_hdrc -- it is the driver that
+#                       ungates the PERI clock.  The walk gets that for free:
+#                       usbcore is the one thing under it, so the dependency-first
+#                       emit puts usbcore, then the PHY, then musb_hdrc.  usbcore
+#                       is a real edge and not an accident of the layout -- the
+#                       PHY calls usb_for_each_dev() to ask whether the thing on
+#                       the port ever got an address, which is what separates a
+#                       device from a charger holding the same line high.
 #   mediatek            drivers/usb/musb/mediatek.ko, the glue.  A root because
 #                       the relationship to musb_hdrc runs the other way: musb
 #                       exports the symbols, the glue is what binds the node.
@@ -7413,8 +7420,30 @@ j36.usb=1
     PC -- and the answer is to be a device and let the PMIC charge; below it means
     nothing is out there and the answer is to be a host and source 5 V so a stick,
     an SSD, a mouse or a hub can come up.  The question is re-asked every 3 s, and
-    skipped entirely whenever DEVCTL reports FSDEV or LSDEV, so nothing already
-    enumerated ever sees the 60 ms gap the measurement needs.
+    skipped whenever something is attached, so nothing already enumerated ever
+    sees the 60 ms gap the measurement needs.
+
+    WHAT "ATTACHED" HAS TO MEAN, AND THE BUG IT USED TO BE.  DEVCTL's FSDEV/LSDEV
+    is a pull-up on D+ or D-, and it was taken as "a device is here".  A
+    divider-type charger presents the same pull-up -- an Apple 2.4 A brick holds D+
+    near 2.7 V, the Samsung scheme holds both near 1.2 V -- so plugging a charger
+    into an idle console latched the port to host, held DRVVBUS high, and left the
+    PMIC's interlock refusing to charge for the whole uptime.  The dashboard said
+    No cable with a cable in it, and it was not only the display that was wrong:
+    the board really was not charging, and the interlock was right to refuse,
+    because charging off our own boost means charging the cell from the cell
+    through two conversions.
+
+    The distinction is not in any register on this board, and it does not have to
+    be: a device answers a bus reset and is given an address, a charger answers
+    nothing.  So the PHY asks usbcore -- usb_for_each_dev(), root hubs skipped --
+    and the latch now holds only while something on the bus HAS an address.
+    Something that holds the lines high without ever becoming a device gets
+    measured after attach_grace_polls (default 3, so about ten seconds), finds the
+    charger, drops DRVVBUS and charges.  A stick, a mouse or a hub is never
+    power-cycled by this, because it enumerates and is exempt from the moment it
+    does.  The measurement happens once per plug, so a genuinely broken device
+    costs one retry rather than a loop.
 
     Which is why "DEVCTL bits 3 and 4 report whether VBUS is valid" -- what this
     text used to say -- is a trap rather than a fact.  Those bits are only a
