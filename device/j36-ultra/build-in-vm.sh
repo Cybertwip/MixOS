@@ -4499,6 +4499,12 @@ export PATH
 SYSTEMD_PAGER=
 SYSTEMD_COLORS=0
 export SYSTEMD_PAGER SYSTEMD_COLORS
+# And English, for everything below.  nmcli, systemctl and ip all translate their
+# own words, and a log is read by whoever is debugging the board rather than by
+# whoever is holding it -- a Portuguese handheld should still produce a log that
+# the same grep finds something in.
+LC_ALL=C
+export LC_ALL
 
 MNT=/run/j36/bootmnt
 NAME=mixos-log.txt
@@ -4605,7 +4611,42 @@ dump() {
     run ip addr
     run iw dev
     run rfkill list
+
+    # ── who owns wlan0, and what it did with it ──────────────────────────────
+    #
+    # NetworkManager manages this radio in full -- "managed-type: 'full'" in its
+    # own log -- which means it is the thing that associates, runs DHCP, sets the
+    # route, writes the resolver and remembers the network for next time.  All
+    # five of those jobs are dumped here, because a log that had only `ip addr'
+    # could not tell "the AP never answered" from "the AP answered and nothing
+    # ever asked it for an address", and those are different bugs with the same
+    # symptom.
+    #
+    # THE DHCP4.OPTION LINES IN `device show' ARE THE LEASE ITSELF.  An address in
+    # 169.254.0.0/16 with no DHCP4 lines beside it is not a network with a strange
+    # mask -- it is IPv4LL, the address a DHCP client invents for itself after it
+    # has given up on the router, and seeing the two together in one dump is the
+    # whole of that bug on one screen.
+    run systemctl --no-pager status NetworkManager
+    run nmcli general status
+    run nmcli radio all
+    run nmcli device status
+    run nmcli device show
+    run nmcli connection show
+    run ip -4 route
+    show /etc/resolv.conf
+    # NAMES AND DATES ONLY, DELIBERATELY.  Every file in that directory has a
+    # Wi-Fi passphrase in it in plain text, and this log is written to the FAT
+    # partition that anybody can read on any PC.  `ls' answers what is actually
+    # being asked -- is the network saved at all, and did the save survive the
+    # reboot -- and `cat' would answer it by publishing the key.
+    run ls -l /etc/NetworkManager/system-connections
+    showall "NetworkManager's own configuration" \
+        /etc/NetworkManager/NetworkManager.conf /etc/NetworkManager/conf.d/*.conf
+    # Started by NetworkManager over D-Bus here, not by a unit of its own, so an
+    # inactive unit on this line is the normal state and not a finding.
     run systemctl --no-pager status wpa_supplicant
+
     showall "the CONSYS/WMT nodes, if the driver made any" \
         /sys/class/misc/wmtdetect/uevent /dev/wmtWifi /dev/stpwmt
     kgrep "Wi-Fi and the connectivity MCU" \
