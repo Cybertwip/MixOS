@@ -83,6 +83,26 @@
 #define J36_WLAN_MAX_TX_PER_POLL	16
 #define J36_WLAN_IDLE_POLL_MS		50
 
+/*
+ * How many polls in a row the frame at the head of the queue may be refused a
+ * transmit page before it is dropped instead of retried.
+ *
+ * Putting a refused frame back at the head and stopping is the right answer to a
+ * SHORTAGE: the page comes back a moment later and the queue keeps its order,
+ * which is what TCP and an EAPOL exchange both want.  It is the wrong answer to a
+ * class that will never be credited at all, and this driver spent three boots
+ * proving it -- a single broadcast frame sent to a traffic class the firmware
+ * does not service in station mode took that class's only page, and every other
+ * frame on the interface queued behind it for ever.  Nothing above could tell:
+ * ndo_start_xmit kept returning NETDEV_TX_OK, the carrier stayed up, and the
+ * counters showed a queue that never drained and no errors at all.
+ *
+ * Each acquire already polls for a page for J36_HIF_TX_POLL_ROUNDS *
+ * J36_HIF_TX_POLL_INTERVAL_US, which is 200 ms, so eight of them is a page that
+ * has not come back in a second and a half.  That is not a shortage any more.
+ */
+#define J36_WLAN_TX_STALL_LIMIT		8
+
 /* 1..13.  Channel 14 is 802.11b-only and Japan-only; the firmware's own domain
  * table stops at 13 and so does this. */
 #define J36_WLAN_CHANNELS		13
@@ -160,6 +180,12 @@ struct j36_wlan {
 	u32 link_losses;
 	u32 tx_backpressure;
 	u32 tx_deferred;
+	/* Consecutive polls the head of the queue has been refused a page.  Reset
+	 * by anything at all going out, so it counts a stall and not traffic. */
+	u32 tx_stalls;
+	/* And how many times that ran out and a frame was dropped for it, which
+	 * is cumulative and is the one of the two worth printing. */
+	u32 tx_starved;
 };
 
 /* ── the wiphy's fixed tables ────────────────────────────────────────────────*/
@@ -527,6 +553,7 @@ static void j36_wlan_drop_link(struct j36_wlan *wlan, bool send_deauth,
 	wlan->pm_sent = false;
 	wlan->aid = 0;
 	wlan->resp_ies_len = 0;
+	wlan->tx_stalls = 0;
 	w->pending_1x = 0;
 	j36_wlan_flush_tx(wlan);
 }
@@ -975,11 +1002,25 @@ static unsigned int j36_wlan_drain_tx(struct j36_wlan *wlan)
 
 		ret = j36_wlan_cmd_tx_ethernet(w, skb->data, len,
 					       wlan->sta_index, is_1x);
-		if (ret == -EBUSY) {
+		if (ret == -EBUSY && ++wlan->tx_stalls < J36_WLAN_TX_STALL_LIMIT) {
 			skb_queue_head(&wlan->tx_queue, skb);
 			wlan->tx_deferred++;
 			break;
 		}
+		if (ret == -EBUSY) {
+			/* Rate limited because the point of getting here is that
+			 * there are a lot of frames behind this one and every one
+			 * of them is about to say the same thing. */
+			dev_warn_ratelimited(w->dev,
+					     "%s: no transmit page after %u polls; dropping the frame at the head of the queue rather than stalling the interface behind it\n",
+					     wlan->ndev->name, wlan->tx_stalls);
+			wlan->tx_starved++;
+		}
+
+		/* Past the retry, so the head of the queue is moving again --
+		 * whether it moved onto the air or into the bin. */
+		wlan->tx_stalls = 0;
+
 		if (ret) {
 			wlan->ndev->stats.tx_errors++;
 			wlan->ndev->stats.tx_dropped++;
@@ -1286,6 +1327,7 @@ static int j36_wlan_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 	wlan->key_ready = false;
 	wlan->pm_sent = false;
 	wlan->aid = 0;
+	wlan->tx_stalls = 0;
 
 	/*
 	 * ONE command starts the join, and it is not the station record.  The
@@ -1699,10 +1741,11 @@ void j36_wlan_net_trace(struct j36_wifi *w)
 	if (!wlan)
 		return;
 	dev_info(w->dev,
-		 "wlan: %u scans, %u BSS known, %u joins, %u refused, %u links lost; tx %u frames %u deferred %u stalls; rx %u events %u mgmt %u data\n",
+		 "wlan: %u scans, %u BSS known, %u joins, %u refused, %u links lost; tx %u frames %u deferred %u backpressure %u starved (%u deep now); rx %u events %u mgmt %u data\n",
 		 wlan->scans, wlan->result_count, wlan->joins,
 		 wlan->join_failures, wlan->link_losses,
 		 w->hif_stats.tx_frames, wlan->tx_deferred,
-		 wlan->tx_backpressure, w->hif_stats.rx_events,
+		 wlan->tx_backpressure, wlan->tx_starved,
+		 skb_queue_len(&wlan->tx_queue), w->hif_stats.rx_events,
 		 w->hif_stats.rx_management, w->hif_stats.rx_data);
 }

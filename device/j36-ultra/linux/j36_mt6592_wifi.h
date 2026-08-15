@@ -723,6 +723,11 @@ struct j36_hif_stats {
 #define J36_STA_STATE_3			2
 #define J36_STA_RECORD_INDEX		0
 #define J36_STA_INDEX_NOT_FOUND		0xfe
+/* Deliberately defined and deliberately never used.  BMCAST is the record an
+ * ACCESS POINT transmits group-addressed frames under, and a station in an
+ * infrastructure BSS has no such frames: its broadcasts go to the AP as unicast,
+ * under the AP's record and the pairwise key.  Sending them here instead is what
+ * used to break DHCP -- see j36_wlan_frame(). */
 #define J36_STA_INDEX_BMCAST		0xff
 
 /* CMD_SCAN_REQ_T, nic_cmd_event.h:1434-1449.  110 bytes with no IEs, which is
