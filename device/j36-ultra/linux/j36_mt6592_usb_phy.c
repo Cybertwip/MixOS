@@ -1662,9 +1662,44 @@ static void j36_musb_stand_down(struct j36_usb_phy *p)
 }
 
 /*
+ * ── WHAT "IT TOOK" ACTUALLY LOOKS LIKE, AND WHY IT IS NOT HM ─────────────────
+ *
+ * DEVCTL.HOSTMODE is set by the core when it is ACTING as a host, and an
+ * A-device holding a session over an EMPTY socket is not acting as anything
+ * yet: there is no connect to answer, no reset to drive, no SOF to send. HM
+ * appears with the CONNECT interrupt, which needs a device pulling D+ up, which
+ * needs the session -- so a driver that tears the session down because HM is
+ * clear has removed the only thing that could ever set it. That loop is exactly
+ * what the log reads as "attempt 1 of 4 ... 4 of 4 ... the core will not take
+ * host mode", and the port it leaves behind has no session at all (DEVCTL 98),
+ * which is why nothing enumerates and nothing is powered.
+ *
+ * The vendor driver this file is transcribed from never reads HM anywhere.
+ * musb_id_pin_work() sets the role, calls musb_start(), and then says
+ * MUSB_HST_MODE(musb) -- a software variable. Mainline does the same, from the
+ * CONNECT and SESSREQ interrupt handlers.
+ *
+ * So the test is the state a host is ARMED in, all of which the core sets
+ * itself and all of which the log has been printing as a failure: A-device
+ * (arbitration went our way), SESSION held, VBUS comparators at or above
+ * AValid. HM is accepted too -- a port with a device on it is obviously fine --
+ * but it is not required, and requiring it is the bug.
+ */
+static bool j36_musb_host_armed(u8 devctl)
+{
+	if (devctl & J36_MUSB_DEVCTL_HM)
+		return true;
+
+	return !(devctl & J36_MUSB_DEVCTL_BDEVICE) &&
+	       (devctl & J36_MUSB_DEVCTL_SESSION) &&
+	       ((devctl & J36_MUSB_DEVCTL_VBUS) >> J36_MUSB_DEVCTL_VBUS_SHIFT) >=
+	       J36_MUSB_VBUS_AVALID;
+}
+
+/*
  * Wait for the core to answer, up to J36_MUSB_SETTLE_MS, and hand back whatever
- * DEVCTL says at the end of it. Returns as soon as HM appears, so the cost on a
- * port that works is one register read.
+ * DEVCTL says at the end of it. Returns as soon as the port is armed, so the
+ * cost on a port that works is one register read.
  *
  * Nothing here writes. It exists because HM and BDEVICE are not set by the store
  * that sets SESSION -- they are set by the core once it has sampled ID and the
@@ -1678,7 +1713,7 @@ static u8 j36_musb_settle(struct j36_usb_phy *p)
 
 	for (;;) {
 		devctl = readb(p->musb + J36_MUSB_DEVCTL);
-		if (devctl & J36_MUSB_DEVCTL_HM)
+		if (j36_musb_host_armed(devctl))
 			return devctl;
 		if (waited >= J36_MUSB_SETTLE_MS)
 			return devctl;
@@ -1800,16 +1835,38 @@ static void j36_musb_host_kick(struct j36_usb_phy *p)
 		return;
 
 	devctl = readb(p->musb + J36_MUSB_DEVCTL);
-	if (devctl & J36_MUSB_DEVCTL_HM)
-		return;				/* the core is the host: done */
+	if (j36_musb_host_armed(devctl))
+		return;				/* armed as a host: done */
 	if (j36_usb_devices())
 		return;				/* something works; leave it alone */
 
 	if (p->hm_kicks >= J36_MUSB_HM_KICKS) {
 		p->hm_gave_up = true;
+
+		/*
+		 * GIVING UP IS NOT THE SAME AS WALKING AWAY. Whatever the last
+		 * attempt was, the state it left is the state the port then has
+		 * to live in for the rest of the uptime -- and a measured
+		 * attempt leaves it with no session at all. Put the port back
+		 * into the best shape this driver knows how to give it before
+		 * saying anything: valids forced, session held, A-device. A
+		 * socket in that state powers a device and answers a connect
+		 * even if HM never appears, which is the whole point.
+		 */
+		j36_phy_force_host(p);
+		if (!(readb(p->musb + J36_MUSB_DEVCTL) &
+		      J36_MUSB_DEVCTL_SESSION))
+			j36_musb_session(p, true);
+		devctl = j36_musb_settle(p);
+
 		dev_warn(p->dev,
-			 "the port asked for host %u times and DEVCTL still reads %02x with HM clear: the core will not take host mode, so its root port cannot scan and nothing plugged in here will enumerate\n",
-			 p->hm_kicks + 1, devctl);
+			 "the port asked for host %u times and DEVCTL settles at %02x [%s, %s, VBUS %s]: leaving it forced and holding a session, which is as close to a host as this core will come without a device on the socket\n",
+			 p->hm_kicks + 1, devctl,
+			 devctl & J36_MUSB_DEVCTL_BDEVICE ? "B-device"
+							  : "A-device",
+			 devctl & J36_MUSB_DEVCTL_SESSION ? "session held"
+							  : "NO SESSION",
+			 j36_musb_vbus_str(devctl));
 		return;
 	}
 
@@ -1846,9 +1903,9 @@ static void j36_musb_host_kick(struct j36_usb_phy *p)
 		 devctl,
 		 devctl & J36_MUSB_DEVCTL_BDEVICE ? "B-device" : "A-device",
 		 j36_musb_vbus_str(devctl),
-		 devctl & J36_MUSB_DEVCTL_HM
-			? "the HOST -- the root port can scan now"
-			: "still not the host, after being given the full settle window");
+		 j36_musb_host_armed(devctl)
+			? "armed as a host -- the root port can scan now"
+			: "still not armed, after being given the full settle window");
 
 	/*
 	 * And the one reading the sensed arm exists for. With the value forces
@@ -1856,7 +1913,7 @@ static void j36_musb_host_kick(struct j36_usb_phy *p)
 	 * here is not a role problem at all: DRVVBUS is high, this driver believes
 	 * it is sourcing 5 V, and the PHY cannot see it.
 	 */
-	if (sensed && !(devctl & J36_MUSB_DEVCTL_HM) &&
+	if (sensed && !j36_musb_host_armed(devctl) &&
 	    ((devctl & J36_MUSB_DEVCTL_VBUS) >> J36_MUSB_DEVCTL_VBUS_SHIFT) <
 	    J36_MUSB_VBUS_AVALID)
 		dev_warn(p->dev,
@@ -1885,11 +1942,32 @@ static void j36_musb_host_kick(struct j36_usb_phy *p)
 	 * Forcing them back is three writes and a settle, and both sequences are
 	 * idempotent: HOST_SET is AVALID|BVALID|VBUSVALID and HOST_CLR is
 	 * IDDIG|SESSEND, which is what a working A-device session already has, so
-	 * this asserts the state the bus is in rather than changing it. The
-	 * session is not touched.
+	 * this asserts the state the bus is in rather than changing it.
+	 *
+	 * THE SESSION IS NOT SAFE, THOUGH, and that is what this used to miss. A
+	 * measured arm on a port whose comparator reads nothing does not merely
+	 * report "VBUS below SessionEnd" -- the core ENDS THE SESSION on it, in
+	 * hardware, because that is what SessionEnd means, and DEVCTL comes back
+	 * 80 and then 98: no session, either way. Restoring the valids afterwards
+	 * puts the voltage back and leaves the port sitting there with nothing
+	 * running on it, which is a dead socket that powers nothing and scans
+	 * nothing. So put the session back too, and re-read, so the caller's next
+	 * poll sees what it actually left behind.
 	 */
-	if (sensed)
+	if (sensed) {
 		j36_phy_force_host(p);
+		if (!(readb(p->musb + J36_MUSB_DEVCTL) &
+		      J36_MUSB_DEVCTL_SESSION)) {
+			j36_musb_session(p, true);
+			devctl = j36_musb_settle(p);
+			dev_info(p->dev,
+				 "the measurement ended the session, as a comparator that reads nothing must; restarted it against the forced valids, DEVCTL %02x [%s, VBUS %s]\n",
+				 devctl,
+				 devctl & J36_MUSB_DEVCTL_BDEVICE ? "B-device"
+								  : "A-device",
+				 j36_musb_vbus_str(devctl));
+		}
+	}
 }
 
 /*
