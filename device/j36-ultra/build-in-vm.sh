@@ -715,9 +715,15 @@ done
 # VBUS is sourced, which is new.  It is a GPIO on this board and not the MT6322
 # boost the MVII note assumed: the stock Android kernel's mt_usb_set_vbus() sets
 # pad 15 to mode 0 and drives it high, and j36_mt6592_usb_phy.ko now does the
-# same off j36,drvvbus-pad, and holds it there -- the port has no reason to stand
-# down, because charging arrives on a separate DC inlet with no data lines in it.
-# So a bus-powered hub enumerates.  The cost is that
+# same off j36,drvvbus-pad, and holds it there -- charging arrives on a separate
+# DC inlet with no data lines in it, so the port has nothing to arbitrate.
+# So a bus-powered hub enumerates.  It is NOT free, and the cost landed on the
+# gauge rather than on the port: CHRIN is one pin and it is on this net, so a pad
+# held up for the whole uptime holds the PMIC's charger comparator up with it and
+# an unplug is invisible.  j36_mt6592_pmic.ko answers that by measuring the pin
+# instead of trusting the bit -- see the vbus_sourcing note in the help text, and
+# j36.usb=automeasure for the board where measuring is not enough.  The other cost
+# is that
 # the 5 V is a boost off VBAT, which on this PMIC is the system node -- with no
 # cell fitted that is the rail the class-D amp already proved can be pulled under
 # the undervoltage lockout, so j36.usb=novbus exists and a self-powered hub is
