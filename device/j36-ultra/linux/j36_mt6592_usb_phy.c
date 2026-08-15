@@ -1691,7 +1691,7 @@ static u8 j36_musb_settle(struct j36_usb_phy *p)
  * ── THE HOST ARM, IN MEDIATEK'S ORDER ────────────────────────────────────────
  *
  * Every path in this file that wants host mode goes through here, and the order
- * of the six steps is the whole point -- see the file header for the stock
+ * of the steps is the whole point -- see the file header for the stock
  * musb_id_pin_work() it is transcribed from and the comment in it that explains
  * why ("for no VBUS sensing IP").
  *
@@ -1764,17 +1764,20 @@ static u8 j36_musb_host_arm(struct j36_usb_phy *p, bool sensed)
  *
  * HM is set by the core, not by anything here, and it is the only bit that says
  * the role change actually happened rather than merely being asked for. So the
- * poll checks it, and if a port that asked for host is not the host, it re-drives
- * the ID line and restarts the session.
+ * poll checks it, and if a port that asked for host is not the host, it runs the
+ * stock arm again -- VBUS down inside the PHY, session restarted against the dead
+ * bus, VBUS back up inside the session.
  *
  * THIS IS THE ONLY PLACE THAT CAN FIX IT, and that is a fact about ordering
  * rather than a design choice. power_on() runs inside musb_platform_init(), which
  * is the first thing musb_init_controller() does; whatever session it leaves
  * behind is wiped a moment later by musb_generic_disable()'s DEVCTL = 0, and the
  * session the port actually runs on is the one musb_start() begins from the hub
- * thread, after the root hub exists. The poll is the first thing this driver runs
- * after all of that, so it is the first opportunity to hand the core an ID edge
- * it will still have when the enumeration depends on it.
+ * thread, after the root hub exists -- and musb_start() folds `devctl &= ~SESSION'
+ * and `devctl |= SESSION' into a single write, so it produces no edge of its own
+ * and arbitrates against whatever the PHY happens to be holding. The poll is the
+ * first thing this driver runs after all of that, so it is the first opportunity
+ * to give the core a VBUS rise it will still have when enumeration depends on it.
  *
  * WHAT KEEPS THIS FROM BEING A LOOP, in order:
  *
