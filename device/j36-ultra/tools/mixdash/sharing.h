@@ -11,13 +11,19 @@
  * Wi-Fi: /home/virtua for the things the dashboard itself reads -- media, ROMs,
  * IWADs -- and /media for whatever is plugged into the port.
  *
- * /home/virtua IS THE DATA PARTITION, and that is the reason it is the share
- * rather than one directory inside it.  p3 on the card is ext2, labelled DATA,
- * and the rootfs fstab mounts it rw at /home/virtua -- so exporting that path
- * exports the whole of the partition the card is carrying for the user, roms/
- * and all, and nothing of the rootfs.  It is also the one partition the image
- * writer is told never to overwrite, which makes it the only place on the card
- * where dropping a file from a PC is a decision that survives a reflash.
+ * /home/virtua IS THE USER'S HALF OF THE CARD, and that is the reason it is the
+ * share rather than one directory inside it.  Exporting that path exports
+ * everything the dashboard reads on the operator's behalf -- media, roms/, IWADs
+ * -- and nothing of the rootfs around it.
+ *
+ * IT USED TO BE A PARTITION.  There was a p3, ext2, labelled DATA, mounted rw at
+ * /home/virtua, and it was the one partition the image writer was told never to
+ * overwrite.  It is gone: ROOTFS is the last partition on the disk now so that
+ * the initramfs can grow it to the end of the card, and /home/virtua is an
+ * ordinary directory on it.  What that costs is the reflash guarantee -- a
+ * dropped file no longer survives one -- and what it buys is the whole card
+ * instead of a fixed slice of it.  Nothing about this share changes either way;
+ * it exports a path and never cared what was mounted under it.
  *
  * WHY /media AS ONE SHARE AND NOT A SHARE PER VOLUME.  Because the volumes are
  * not known when the configuration is written.  setup_automount's udev rule
