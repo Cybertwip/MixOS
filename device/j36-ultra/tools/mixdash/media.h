@@ -115,8 +115,10 @@
 
 #include "widgets.h"
 
+class GlVideo;
 class ListPane;
 class QFileInfo;
+class QPainter;
 class QProcess;
 class QTimer;
 
@@ -150,6 +152,22 @@ private slots:
     void onActivated(int index);
     void onValueChanged(int index, int value);
     void readFrames();
+    /*
+     * Put the newest frame back on the panel through the GPU.  Called from
+     * readFrames() for every frame, and queued from paintEvent() whenever Qt has
+     * repainted over the picture -- a toast, the console guard timer, anything
+     * that asked the whole page to redraw.  Queued rather than immediate in that
+     * case, because linuxfb copies its backing store into /dev/fb0 AFTER
+     * paintEvent returns, so drawing during the paint would be overwritten by it.
+     */
+    void present();
+    /*
+     * The GPU path failed under a film that is already playing.  Both halves of
+     * the chain have to come down and go up again, because ffmpeg is emitting
+     * yuv420p that the software painter cannot use -- so this is a seek to where
+     * the film had got to, with the GPU permanently off.
+     */
+    void restartWithoutGl();
     void onDecoderFinished();
     void onMusicFinished(int code);
     /* Whatever the playing chain wrote to stderr, straight onto the glass.  It is
@@ -261,6 +279,41 @@ private:
     /* Video and pictures only.  Music has its own, because the two have opposite
      * lifetimes: see the header comment. */
     void stopVideo();
+    /*
+     * Let go of the picture -- the QImage, the planes the GPU was drawing from,
+     * and the strip texture.  NOT part of stopVideo(), and that is the point: a
+     * seek is stopVideo() followed by openVideo(), and the frame that is already
+     * on the glass should stay there while the new ffmpeg loads libavcodec.  This
+     * is for leaving the film behind, not for restarting it.
+     */
+    void dropFrame();
+    /*
+     * The strip along the foot: the name on the left, the clock and the dropped
+     * count on the right, and the note above it when there is one.  Painted in
+     * widget coordinates so the software path can call it straight from
+     * paintEvent, and rendered into an image for the GPU path.
+     */
+    void paintChrome(QPainter &p) const;
+    QString chromeRight() const;
+    QRect chromeRect() const;
+    /* Re-render the strip and hand it to the GPU, but only when its text has
+     * changed since last time.  `into' is the page's rectangle on the
+     * framebuffer, because the strip's position is given in those coordinates. */
+    void refreshChrome(const QRect &into);
+    /*
+     * True while the GPU owns this page: a film is up, it came up on GL, and at
+     * least one frame has landed.  In that state Qt must not paint -- its backing
+     * store has never seen the picture, so anything it presents is a hole.
+     */
+    bool glOwnsScreen() const { return m_view == ViewVideo && m_gl && m_glShown; }
+    /*
+     * update() for a page that may not be Qt's to update.  Every "something
+     * changed, show it" in this file goes through here, because the same line has
+     * to mean "repaint the widget" on the software path and "re-present the frame
+     * with a fresh strip" on the GPU one.  Calling update() in the second case
+     * memcpy's a stale backing store over a film.
+     */
+    void refresh();
     void togglePause();
     void seekTo(double seconds);
     void seekBy(int seconds);
@@ -329,6 +382,35 @@ private:
     int m_frameH = 0;
     int m_framesShown = 0;
     int m_framesDropped = 0;
+
+    /* ── the film on the GPU ──────────────────────────────────────────────── */
+    /*
+     * Non-null only while a film is being presented through GlVideo, which is a
+     * decision taken once per film in openVideo() and never changed under it:
+     * the two paths want different pixel formats out of ffmpeg, so switching
+     * halfway means restarting the decoder.  Null is the software path, and
+     * everything below is inert.
+     */
+    GlVideo *m_gl = nullptr;
+    /* The newest whole frame, still yuv420p, kept rather than dropped after it
+     * is drawn.  A paused film and a repaint forced from outside both need the
+     * picture put back, and there is nothing else to put back from -- the GPU
+     * drew into scanout memory that Qt is about to overwrite. */
+    QByteArray m_planes;
+    /* A frame has actually landed on the panel through the GPU.  Until it has,
+     * paintEvent still paints the background and "decoding...", because nothing
+     * else would. */
+    bool m_glShown = false;
+    /* The GPU path was tried and gave up mid-film.  Sticky for the life of the
+     * page, so a driver that has stopped answering is not asked again twice a
+     * second for the rest of the session. */
+    bool m_glOff = false;
+    /* The strip's text as it was last rendered.  QPainter runs over the strip
+     * only when this changes, which is once a second for the clock rather than
+     * twenty-five times a second for the frames. */
+    QString m_chromeKey;
+    /* Where restartWithoutGl() should pick the film up. */
+    double m_glRestartAt = 0.0;
     double m_videoDuration = 0.0;
     /* Probed with the duration and kept for the same lifetime, so a seek does not
      * pay for it again.  Nothing false about a stale value: a new film opens at 0

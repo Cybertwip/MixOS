@@ -8466,6 +8466,60 @@ geometry into a struct, and J36FB_IOC_EXPORT returns a dma-buf fd.  The characte
 device also mmaps, write-combined, for a client that wants the CPU view without
 going through /dev/fb0.
 
+Films on the GPU, which is -z with a film in place of the cube
+--------------------------------------------------------------
+
+-z proved a zero-copy path and then stopped, because a cube is not the thing
+anybody was waiting on.  The media player uses the same path now:
+tools/mixdash/glvideo.cpp is -z's import, FBO and absence of a modeset, with three
+planes and a colour-conversion shader where the cube was.
+
+What it deletes is worth counting, because none of it was ever the decode.  A
+640x480 frame used to be moved six times: swscale turned the decoder's yuv420p
+into bgra (reads 460 KB, writes 1.2 MB), ffmpeg wrote that down a pipe, mixdash
+read it back, QImage::copy took it out of the ring buffer, QPainter::drawImage put
+it in Qt's backing store, and linuxfb memcpy'd that into /dev/fb0.  Seven and a
+half megabytes per frame at 25 fps, on a Cortex-A7 with LPDDR2.  On the GPU path
+ffmpeg emits yuv420p -- the form the decoder already produced -- so the pipe
+carries 460 KB instead of 1.2 MB, and everything after it is one upload and a GPU
+pass into the memory the DDP is scanning.
+
+The transport strip along the foot is drawn by the GPU too, which looks like scope
+creep and is not.  Qt's linuxfb backend presents by memcpy'ing the dirty rectangle
+of its backing store into /dev/fb0, and that backing store has never heard of a
+frame lima put there, so any Qt repaint over the picture erases it -- and the clock
+in that strip changes once a second.  So while a film is up the page belongs to the
+GPU: mixdash re-renders the strip only when its TEXT changes, hands it over as an
+ARGB image, and the same pass blends it over the picture.  MediaPage::paintEvent
+draws nothing at all in that state.
+
+Nothing else in the dashboard changes.  Every other page is still rasterised by Qt
+into /dev/fb0, which is the right trade for a UI that repaints when something
+happens and the wrong one only for a surface that repaints 25 times a second.
+
+It fails soft, in three places and all the way to the old path:
+
+  - no libEGL, no libgbm, no render node, no /dev/j36fb, no
+    EGL_EXT_image_dma_buf_import, or a shader that will not link -- the player
+    asks ffmpeg for bgra as before and nothing is different but the frame rate
+  - the window is not the whole framebuffer (the HDMI mirror is a separate
+    process, so this is a guard rather than a limitation)
+  - the driver stops answering mid-film, in which case ffmpeg is restarted from
+    the position it had reached, on the software path, with a note saying so
+
+Mesa is dlopen'd and never linked, exactly as eglprobe does it, so mixdash still
+has no GL in its DT_NEEDED and still starts on a card with no GL payload staged,
+with j36.gl=0, or on a board where lima refused to bind.  The reason -- which step
+came up or which one refused -- goes into the MixOS log the first time anything
+asks, and is the "GL video" row on the Diagnostics page.  Building it is what
+answers the question, so opening that page is what puts the line in the log; it
+draws nothing and cannot disturb what is on the screen.
+
+What this does NOT fix is the decode itself.  MT6592 has no mainline hardware
+video decoder -- mtk-vcodec starts at MT8173 -- so libavcodec is on the CPU
+whatever the GPU does here, and a 1080p source is still a 1080p source.  What
+changed is that the cost is now the decode and not the plumbing around it.
+
 Reading the dashboard's startup trace
 -------------------------------------
 

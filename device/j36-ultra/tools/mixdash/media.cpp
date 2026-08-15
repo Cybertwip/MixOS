@@ -20,6 +20,7 @@
 
 #include <signal.h>
 
+#include "glvideo.h"
 #include "joypad.h"
 #include "settings.h"
 #include "shell.h"
@@ -254,7 +255,7 @@ void MediaPage::onLeave()
      */
     if (m_view == ViewVideo || m_view == ViewImage) {
         stopVideo();
-        m_frame = QImage();
+        dropFrame();
         setView(ViewBrowse);
     }
 }
@@ -301,7 +302,7 @@ void MediaPage::setView(int view)
     }
 
     emit titleChanged();
-    update();
+    refresh();
 }
 
 /* ── the browser ─────────────────────────────────────────────────────────── */
@@ -449,7 +450,7 @@ void MediaPage::rebuild()
     if (keep >= 0 && keep < rows.size())
         m_list->setCurrent(keep);
     layOutList();
-    update();
+    refresh();
 }
 
 void MediaPage::buildBrowseRows(QVector<ListRow> &rows) const
@@ -869,11 +870,15 @@ void MediaPage::openImage(const Entry &entry)
      * the sound card.
      */
     stopVideo();
+    /* A picture is the software path always, so whatever the GPU was holding for
+     * a film goes now -- and it has to go before m_frame is set, because that is
+     * the one thing dropFrame() clears which is about to be wanted. */
+    dropFrame();
     m_frame = image;
     m_showing = entry;
     m_note.clear();
     setView(ViewImage);
-    update();
+    refresh();
 }
 
 void MediaPage::stepImage(int delta)
@@ -1236,6 +1241,7 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
 
     /* Even dimensions: several of the scalers and every yuv420 path want them, and
      * an odd width is a whole class of "ffmpeg exited 1" that is not worth having. */
+    const int wasW = m_frameW, wasH = m_frameH;
     m_frameW = (width() / 2) * 2;
     m_frameH = (height() / 2) * 2;
     if (m_frameW < 16 || m_frameH < 16) {
@@ -1243,9 +1249,42 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
         m_frameH = 480;
     }
 
+    /*
+     * stopVideo() deliberately keeps the last frame so that a seek does not blank
+     * the screen while ffmpeg loads libavcodec.  That only holds while the frame
+     * still describes itself: m_planes carries no dimensions of its own, and a
+     * geometry that has changed under it would be read with the new strides and
+     * come out as a diagonal smear.  Cheaper to lose one frame than to show that.
+     */
+    if (m_frameW != wasW || m_frameH != wasH) {
+        m_planes.clear();
+        m_glShown = false;
+    }
+
+    /*
+     * ── WHICH OF THE TWO PATHS THIS FILM TAKES, decided here and not changed ──
+     *
+     * With the GPU: ffmpeg hands over the planar frame the decoder already
+     * produced, lima does the colour conversion in a fragment shader and writes
+     * the result straight into the memory the panel is scanning.  Without it:
+     * swscale converts to bgra on the CPU and the frame is copied four more times
+     * on its way to /dev/fb0.  The difference per frame at 640x480 is 460 KB
+     * against seven and a half megabytes -- see tools/mixdash/glvideo.h.
+     *
+     * The window has to be the whole framebuffer, because the GPU is given
+     * framebuffer coordinates and there is no compositor here to translate them.
+     * That is the normal case on this board and the HDMI mirror is a separate
+     * process, so this is a guard rather than a limitation.
+     */
+    m_gl = nullptr;
+    if (!m_glOff && window() && window()->size() == GlVideo::instance()->size() &&
+        GlVideo::instance()->available())
+        m_gl = GlVideo::instance();
+
     const QString filter = QString("scale=w=%1:h=%2:force_original_aspect_ratio=decrease,"
-                                   "pad=%1:%2:(ow-iw)/2:(oh-ih)/2,format=bgra")
-                               .arg(m_frameW).arg(m_frameH);
+                                   "pad=%1:%2:(ow-iw)/2:(oh-ih)/2,format=%3")
+                               .arg(m_frameW).arg(m_frameH)
+                               .arg(m_gl ? "yuv420p" : "bgra");
 
     QStringList args;
     args << "-nostdin" << "-hide_banner" << "-loglevel" << "error" << "-re";
@@ -1254,7 +1293,7 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
     args << "-i" << item.path
          << "-map" << "0:v:0"
          << "-vf" << filter
-         << "-f" << "rawvideo" << "-pix_fmt" << "bgra"
+         << "-f" << "rawvideo" << "-pix_fmt" << (m_gl ? "yuv420p" : "bgra")
          << "-an" << "pipe:1";
 
     /*
@@ -1342,7 +1381,7 @@ void MediaPage::openVideo(const Entry &entry, double startAt)
     m_clock.restart();
     m_pausedAt = (qint64)(startAt * 1000.0);
     setView(ViewVideo);
-    update();
+    refresh();
 }
 
 void MediaPage::readFrames()
@@ -1350,7 +1389,14 @@ void MediaPage::readFrames()
     if (!m_decoder)
         return;
 
-    const int frameBytes = m_frameW * m_frameH * 4;
+    /*
+     * yuv420p is twelve bits a pixel, bgra is thirty-two.  That ratio is most of
+     * what the GPU path buys before a single instruction runs on the GPU: it is
+     * the size of every write ffmpeg makes into a 64 KiB pipe and of every read
+     * this slot makes out of it.
+     */
+    const int frameBytes = m_gl ? (m_frameW * m_frameH * 3) / 2
+                                : m_frameW * m_frameH * 4;
     if (frameBytes <= 0)
         return;
 
@@ -1370,6 +1416,18 @@ void MediaPage::readFrames()
         m_framesDropped += whole - 1;
 
     const int offset = (whole - 1) * frameBytes;
+
+    if (m_gl) {
+        /* Kept rather than consumed: a paused film and a repaint forced from
+         * outside both have to put this same frame back, and there is nowhere
+         * else to get it from once the GPU has drawn it into scanout memory. */
+        m_planes = m_buffer.mid(offset, frameBytes);
+        m_buffer.remove(0, whole * frameBytes);
+        ++m_framesShown;
+        present();
+        return;
+    }
+
     m_frame = QImage((const uchar *)m_buffer.constData() + offset,
                      m_frameW, m_frameH, m_frameW * 4, QImage::Format_RGB32).copy();
     m_buffer.remove(0, whole * frameBytes);
@@ -1377,6 +1435,77 @@ void MediaPage::readFrames()
 
     if (isVisible())
         update();
+}
+
+void MediaPage::refresh()
+{
+    /*
+     * The GPU path repaints by re-presenting: the same frame goes back up with
+     * whatever the strip says now, which is how the clock ticks and the note
+     * appears without Qt ever touching the film.  Everywhere else this is the
+     * update() it replaced.
+     */
+    if (glOwnsScreen())
+        present();
+    else
+        update();
+}
+
+void MediaPage::present()
+{
+    if (!m_gl || m_view != ViewVideo || !isVisible() || m_planes.isEmpty())
+        return;
+
+    const int w = m_frameW, h = m_frameH;
+    const int ysize = w * h;
+    const int csize = (w / 2) * (h / 2);
+    if (w <= 0 || h <= 0 || m_planes.size() < ysize + 2 * csize)
+        return;
+
+    /*
+     * Framebuffer coordinates, taken fresh every frame rather than cached.  This
+     * page moves: it is inset below the status bar while the browser is up and
+     * takes the whole screen when a film starts, and applyChrome() does that to it
+     * from outside.  A cached rectangle would put the film in the wrong place for
+     * exactly one frame after every one of those, which is the kind of thing that
+     * shows as a flicker nobody can reproduce.
+     */
+    const QRect into(mapToGlobal(QPoint(0, 0)), size());
+    if (!QRect(QPoint(0, 0), m_gl->size()).contains(into))
+        return;
+
+    refreshChrome(into);
+
+    const uchar *const p = (const uchar *)m_planes.constData();
+    if (m_gl->drawFrame(p, w,
+                        p + ysize, w / 2,
+                        p + ysize + csize, w / 2,
+                        w, h, into)) {
+        m_glShown = true;
+        return;
+    }
+
+    /*
+     * The driver gave up.  ffmpeg is emitting planes the software painter has no
+     * use for, so there is nothing to fall back TO without restarting it -- and
+     * that cannot happen from inside a readyRead slot on the very process it would
+     * be killing.  Queued, with the position it had reached.
+     */
+    m_glOff = true;
+    m_glShown = false;
+    m_glRestartAt = position();
+    QTimer::singleShot(0, this, &MediaPage::restartWithoutGl);
+}
+
+void MediaPage::restartWithoutGl()
+{
+    if (m_view != ViewVideo || m_showing.path.isEmpty())
+        return;
+    openVideo(m_showing, m_glRestartAt);
+    /* After, not before: openVideo() clears the note and then writes its own
+     * account of the sound into it, and that one matters more than this one. */
+    if (m_note.isEmpty())
+        m_note = tr("the GPU stopped answering -- back on the software path");
 }
 
 void MediaPage::onDecoderFinished()
@@ -1397,7 +1526,7 @@ void MediaPage::onDecoderFinished()
     /* The picture stays on the glass with the note under it, rather than dropping
      * back to the list -- which is what the old card did, and why the only thing
      * anybody ever saw of a failure was a toast that said "exited 1". */
-    update();
+    refresh();
 }
 
 /* ── the queue ───────────────────────────────────────────────────────────── */
@@ -1682,7 +1811,23 @@ void MediaPage::stopVideo()
      * opening from the beginning -- so clearing it here would put an ffprobe of the
      * whole container in front of every ten-second nudge of the D-pad.  A stale
      * value cannot leak into the next film: that one opens at 0 and re-probes.
+     *
+     * NOR IS THE PICTURE DROPPED, for the same reason: the frame already on the
+     * glass -- m_frame on the software path, m_planes on the GPU one -- stays
+     * there while the new ffmpeg loads libavcodec, which on this CPU is a visible
+     * fraction of a second.  dropFrame() is for leaving a film, not restarting it.
      */
+}
+
+void MediaPage::dropFrame()
+{
+    m_frame = QImage();
+    m_planes.clear();
+    m_chromeKey.clear();
+    m_glShown = false;
+    if (m_gl)
+        m_gl->clearOverlay();
+    m_gl = nullptr;
 }
 
 /* ── the transport ───────────────────────────────────────────────────────── */
@@ -1715,7 +1860,7 @@ void MediaPage::togglePause()
     m_paused = !m_paused;
 
     rebuild();
-    update();
+    refresh();
 }
 
 double MediaPage::position() const
@@ -1748,7 +1893,7 @@ void MediaPage::seekTo(double seconds)
     m_seekTimer->start();
 
     if (m_view == ViewVideo)
-        update();
+        refresh();
 }
 
 void MediaPage::seekBy(int seconds)
@@ -1872,13 +2017,13 @@ void MediaPage::onChildStderr()
     m_childSaid = tidyChildError(text);
     m_note = m_childSaid;
     layOutList();
-    update();
+    refresh();
 }
 
 void MediaPage::tick()
 {
     if (m_view == ViewVideo) {
-        update();
+        refresh();
         return;
     }
 
@@ -1934,7 +2079,7 @@ bool MediaPage::handleNav(int action)
         case Joypad::NavRight: stepImage(1); return true;
         case Joypad::NavBack:
         case Joypad::NavOk:
-            m_frame = QImage();
+            dropFrame();
             setView(ViewBrowse);
             return true;
         default:
@@ -1954,7 +2099,7 @@ bool MediaPage::handleNav(int action)
         case Joypad::NavDown:  seekBy(-60); return true;
         case Joypad::NavBack:
             stopVideo();
-            m_frame = QImage();
+            dropFrame();
             m_note.clear();
             setView(ViewBrowse);
             return true;
@@ -2024,8 +2169,132 @@ bool MediaPage::handleNav(int action)
 
 /* ── painting ────────────────────────────────────────────────────────────── */
 
+QString MediaPage::chromeRight() const
+{
+    if (m_view == ViewVideo) {
+        QString right = humanTime((int)position());
+        if (m_videoDuration > 0.0)
+            right += " / " + humanTime((int)m_videoDuration);
+        if (m_paused)
+            right = tr("paused") + "  " + right;
+        if (m_framesDropped > 0)
+            right += "  " + tr("%1 dropped").arg(m_framesDropped);
+        return right;
+    }
+
+    int at = 0;
+    int of = 0;
+    for (int i = 0; i < m_entries.size(); ++i) {
+        if (m_entries[i].kind != KindImage)
+            continue;
+        ++of;
+        if (m_entries[i].path == m_showing.path)
+            at = of;
+    }
+    return QString("%1 / %2   %3x%4").arg(at).arg(of)
+               .arg(m_frame.width()).arg(m_frame.height());
+}
+
+QRect MediaPage::chromeRect() const
+{
+    const int barH = 34;
+    const int noteH = m_note.isEmpty() ? 0 : 22;
+    return QRect(0, height() - barH - noteH, width(), barH + noteH);
+}
+
+void MediaPage::paintChrome(QPainter &p) const
+{
+    /* A strip along the foot with the name, the clock and any complaint. */
+    const int barH = 34;
+    const QRect bar(0, height() - barH, width(), barH);
+    p.fillRect(bar, QColor(8, 9, 14, 205));
+
+    p.setFont(Theme::font(12));
+    p.setPen(Theme::ink());
+    p.drawText(bar.adjusted(10, 0, -10, 0), Qt::AlignLeft | Qt::AlignVCenter,
+               m_showing.name);
+
+    p.setPen(Theme::ink3());
+    p.drawText(bar.adjusted(10, 0, -10, 0), Qt::AlignRight | Qt::AlignVCenter,
+               chromeRight());
+
+    if (!m_note.isEmpty()) {
+        const QRect noteRect(0, bar.top() - 22, width(), 22);
+        p.fillRect(noteRect, QColor(8, 9, 14, 180));
+        p.setFont(Theme::font(11));
+        p.setPen(Theme::orange());
+        p.drawText(noteRect.adjusted(10, 0, -10, 0),
+                   Qt::AlignLeft | Qt::AlignVCenter, m_note);
+    }
+}
+
+void MediaPage::refreshChrome(const QRect &into)
+{
+    if (!m_gl)
+        return;
+
+    const QRect cr = chromeRect();
+    if (cr.isEmpty()) {
+        m_gl->clearOverlay();
+        m_chromeKey.clear();
+        return;
+    }
+
+    /*
+     * The whole reason there is a key at all.  Rendering this strip is QPainter
+     * laying out three runs of text with antialiasing, which is not free on a
+     * Cortex-A7 -- and its content changes once a second, when the clock ticks.
+     * Doing it per frame would put back a good part of what the GPU path just
+     * saved.  Everything the strip draws goes into the key, geometry included,
+     * so a resize cannot leave a stale texture behind.
+     */
+    const QString key = m_showing.name + QChar(0x1f) + chromeRight() + QChar(0x1f) +
+                        m_note + QChar(0x1f) + QString::number(cr.width()) + "x" +
+                        QString::number(cr.height());
+    if (key == m_chromeKey)
+        return;
+    m_chromeKey = key;
+
+    /*
+     * Premultiplied because that is QPainter's own working format -- painting into
+     * plain ARGB32 makes Qt convert every span twice.  setOverlay() un-multiplies
+     * on the way to the GPU, where fixed-function blending wants straight alpha.
+     */
+    QImage strip(cr.size(), QImage::Format_ARGB32_Premultiplied);
+    strip.fill(Qt::transparent);
+    {
+        QPainter sp(&strip);
+        sp.setRenderHint(QPainter::Antialiasing, true);
+        /* paintChrome() works in widget coordinates, so the image is shifted
+         * under it rather than the other way about.  One translate here is the
+         * price of the software path and this one sharing a painter. */
+        sp.translate(-cr.topLeft());
+        paintChrome(sp);
+    }
+    m_gl->setOverlay(strip, cr.translated(into.topLeft()));
+}
+
 void MediaPage::paintEvent(QPaintEvent *)
 {
+    /*
+     * ── WHILE THE GPU HAS THE FILM, THIS DRAWS NOTHING AT ALL ──
+     *
+     * Qt's linuxfb backend presents by memcpy'ing the dirty rectangle of its
+     * backing store into /dev/fb0, and that backing store has never heard of the
+     * frame lima put there.  So anything painted here would not go over the film,
+     * it would go INSTEAD of it.
+     *
+     * The one thing worth doing is undoing: if this repaint was forced from
+     * outside -- a toast, the console guard timer, a resize -- Qt is about to copy
+     * stale pixels over the picture, so the picture is drawn again straight
+     * afterwards.  Queued and not immediate, because that copy happens after this
+     * returns.
+     */
+    if (glOwnsScreen()) {
+        QTimer::singleShot(0, this, &MediaPage::present);
+        return;
+    }
+
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
 
@@ -2047,49 +2316,7 @@ void MediaPage::paintEvent(QPaintEvent *)
             p.drawText(rect(), Qt::AlignCenter, tr("decoding..."));
         }
 
-        /* A strip along the foot with the name, the clock and any complaint. */
-        const int barH = 34;
-        const QRect bar(0, height() - barH, width(), barH);
-        p.fillRect(bar, QColor(8, 9, 14, 205));
-
-        p.setFont(Theme::font(12));
-        p.setPen(Theme::ink());
-        p.drawText(bar.adjusted(10, 0, -10, 0), Qt::AlignLeft | Qt::AlignVCenter,
-                   m_showing.name);
-
-        QString right;
-        if (m_view == ViewVideo) {
-            right = humanTime((int)position());
-            if (m_videoDuration > 0.0)
-                right += " / " + humanTime((int)m_videoDuration);
-            if (m_paused)
-                right = tr("paused") + "  " + right;
-            if (m_framesDropped > 0)
-                right += "  " + tr("%1 dropped").arg(m_framesDropped);
-        } else {
-            int at = 0;
-            int of = 0;
-            for (int i = 0; i < m_entries.size(); ++i) {
-                if (m_entries[i].kind != KindImage)
-                    continue;
-                ++of;
-                if (m_entries[i].path == m_showing.path)
-                    at = of;
-            }
-            right = QString("%1 / %2   %3x%4").arg(at).arg(of)
-                        .arg(m_frame.width()).arg(m_frame.height());
-        }
-        p.setPen(Theme::ink3());
-        p.drawText(bar.adjusted(10, 0, -10, 0), Qt::AlignRight | Qt::AlignVCenter, right);
-
-        if (!m_note.isEmpty()) {
-            const QRect noteRect(0, bar.top() - 22, width(), 22);
-            p.fillRect(noteRect, QColor(8, 9, 14, 180));
-            p.setFont(Theme::font(11));
-            p.setPen(Theme::orange());
-            p.drawText(noteRect.adjusted(10, 0, -10, 0),
-                       Qt::AlignLeft | Qt::AlignVCenter, m_note);
-        }
+        paintChrome(p);
         return;
     }
 

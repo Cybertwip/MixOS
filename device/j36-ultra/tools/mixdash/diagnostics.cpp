@@ -16,6 +16,7 @@
 #include <math.h>
 #include <sys/statvfs.h>
 
+#include "glvideo.h"
 #include "joypad.h"
 #include "theme.h"
 
@@ -254,11 +255,38 @@ void DiagnosticsPage::probeGpu(QVector<Finding> &out)
         probe.badge = tr("absent");
         probe.colour = Theme::ink3();
     } else {
-        probe.detail = exe + "\n" + tr("It will fail at display_node() while KMS is absent.");
+        probe.detail = exe + "\n" + tr("-o and -z answer \"does the GPU draw\" without taking the panel.");
         probe.badge = tr("present");
         probe.colour = Theme::orange();
     }
     out.append(probe);
+
+    /*
+     * THE ROW THAT SAYS WHETHER A FILM WILL BE DRAWN BY THE GPU.  The media page
+     * asks GlVideo for the same thing and quietly falls back to the software
+     * painter when the answer is no, which is right for a person watching a film
+     * and useless for one asking why it is slow.  So the reason is printed here,
+     * and asking for it is what builds the path: dlopen libEGL, import the LK's
+     * carveout from /dev/j36fb, link the shaders.  No modeset, nothing drawn --
+     * opening this page cannot disturb what is on the screen.
+     */
+    Finding glv;
+    glv.name = tr("GL video");
+    if (GlVideo::instance()->available()) {
+        const QSize s = GlVideo::instance()->size();
+        glv.detail = GlVideo::instance()->reason() + "\n"
+                     + tr("Films go up as three planes and a shader, not as %1 KB of "
+                          "converted pixels per frame.")
+                           .arg((s.width() * s.height() * 4) / 1024);
+        glv.badge = tr("on");
+        glv.colour = Theme::green();
+    } else {
+        glv.detail = GlVideo::instance()->reason() + "\n"
+                     + tr("Films still play; the CPU converts and copies every frame.");
+        glv.badge = tr("off");
+        glv.colour = Theme::orange();
+    }
+    out.append(glv);
 }
 
 void DiagnosticsPage::probeInput(QVector<Finding> &out)

@@ -8,7 +8,10 @@
 #
 # QT does NOT include opengl, and that is the point of the whole exercise: the
 # platform plugin this runs on is linuxfb, which writes into the framebuffer the
-# LK is already scanning out.
+# LK is already scanning out.  glvideo.cpp does talk to EGL, but it dlopen's it
+# rather than linking it -- see the top of glvideo.h for why that is not
+# negotiable -- so there is still no GL anywhere in this binary's DT_NEEDED, and
+# qtbase5-dev's opengl module is still not a build dependency.
 
 QT += core gui widgets
 CONFIG += c++11 release
@@ -35,6 +38,12 @@ QMAKE_LFLAGS += -rdynamic
 # glibc as the rootfs's own libc.so.6.
 LIBS += -lutil
 
+# dlopen(3), for glvideo.cpp.  Same story as libutil above: from glibc 2.34 it is
+# in libc proper and libdl.a is empty, so this costs nothing on the Debian this
+# builds against and keeps the link working on anything older.  It is dlopen and
+# NOT -lEGL on purpose.
+LIBS += -ldl
+
 SOURCES += \
     main.cpp \
     trace.cpp \
@@ -54,6 +63,7 @@ SOURCES += \
     sharing.cpp \
     terminal.cpp \
     media.cpp \
+    glvideo.cpp \
     diagnostics.cpp \
     packages.cpp
 
@@ -75,5 +85,6 @@ HEADERS += \
     sharing.h \
     terminal.h \
     media.h \
+    glvideo.h \
     diagnostics.h \
     packages.h
