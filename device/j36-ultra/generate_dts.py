@@ -449,6 +449,67 @@ def generate(sources: dict[str, str]) -> str:
 \t\tcpu@103 {{ device_type = \"cpu\"; compatible = \"arm,cortex-a7\"; reg = <0x103>; clock-frequency = <840000000>; }};
 \t}};
 
+\t/*
+\t * The per-CPU timer, and the reason two lines appear eight times each in every
+\t * boot log this board has ever produced:
+\t *
+\t *   Clockevents: could not switch to one-shot mode: dummy_timer is not functional.
+\t *   Could not switch to high resolution mode on CPU 0 .. CPU 7
+\t *
+\t * NEITHER OF THOSE IS ABOUT THE CORES. They are printed once per online CPU, so
+\t * eight of each is in fact the proof that all eight cores came up -- the SMP
+\t * patch and the enable-method above are doing their job. What the messages say
+\t * is that no CPU has a clock event device of its own.
+\t *
+\t * The GPT below is a single global timer. tick_check_new_device() will not make
+\t * a device whose cpumask is every CPU into anybody's per-CPU tick, so it becomes
+\t * the broadcast device and each CPU is given dummy_timer instead --
+\t * tick_device_is_functional() is `not CLOCK_EVT_FEAT_DUMMY', so the switch to
+\t * one-shot fails, and hrtimer_switch_to_hres() gives up after it. The cost is
+\t * not cosmetic: every timer on this machine is rounded to a jiffy, and HZ is 100
+\t * here, so a 5 ms sleep is a 10 ms sleep and a frame deadline can only ever land
+\t * on a 10 ms boundary. Audio and video pacing, input latency and every poll
+\t * timeout in the shell are all paying that.
+\t *
+\t * Cortex-A7 implements the ARM Generic Timer, so there IS a per-CPU timer on
+\t * this SoC; the vendor kernel simply did not use it and neither did this profile
+\t * until now. PPI 13/14/11/10 are the architected assignments and are not board
+\t * specific; the 0xff00 half of the flags is GIC_CPU_MASK_SIMPLE(8) for the eight
+\t * cores, and 8 is IRQ_TYPE_LEVEL_LOW, matching every other node here.
+\t *
+\t * arm,cpu-registers-not-fw-configured IS THE LOAD-BEARING PROPERTY. The LK sets
+\t * up no timer register before it jumps: CNTFRQ is whatever reset left, and
+\t * CNTVOFF -- which only secure code can write -- is not initialised either. The
+\t * property tells arm_arch_timer both things at once: take the rate from
+\t * clock-frequency rather than from CNTFRQ, and use the PHYSICAL timer on the
+\t * secure PPI rather than the virtual one, because the virtual counter is
+\t * physical minus an offset nobody set. Without it the driver would prefer the
+\t * virtual timer on ARM and read a counter with garbage in the top of it.
+\t *
+\t * 13 MHz is the architected timer input on this family -- the 26 MHz crystal
+\t * halved -- and it is the one number here that is worth checking on the board
+\t * rather than trusting: `dmesg | grep arch_timer' prints the rate it settled on,
+\t * and a rate that is wrong by a ratio shows up as a clock that runs fast or slow
+\t * by exactly that ratio, which `date' after a minute of uptime will show.
+\t *
+\t * THIS NODE IS ADDITIVE AND FALLS BACK. The GPT node stays exactly as it was, so
+\t * if the architected timer does not probe -- no PPIs delivered, rate refused --
+\t * the board keeps the clockevent it has always had and boots as it does today.
+\t * Rating 450 against the GPT's 300 is what makes the architected timer win when
+\t * it does work. If it turns out to be worse, delete this node; nothing else in
+\t * the tree or the kernel config refers to it.
+\t */
+\tarch_timer: timer {{
+\t\tcompatible = \"arm,armv7-timer\";
+\t\tinterrupt-parent = <&gic>;
+\t\tinterrupts = <1 13 0xff08>, /* secure physical  PPI 13 */
+\t\t\t     <1 14 0xff08>, /* non-secure phys  PPI 14 */
+\t\t\t     <1 11 0xff08>, /* virtual          PPI 11 */
+\t\t\t     <1 10 0xff08>; /* hypervisor       PPI 10 */
+\t\tclock-frequency = <13000000>;
+\t\tarm,cpu-registers-not-fw-configured;
+\t}};
+
 \tsoc {{
 \t\t#address-cells = <1>;
 \t\t#size-cells = <1>;

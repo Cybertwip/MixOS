@@ -298,6 +298,35 @@ config_s LOCALVERSION "-j36"
 # reported as a Wi-Fi failure with nothing about a CRC in it.
 config_y CRC32
 
+# ── The per-CPU timer ─────────────────────────────────────────────────────────
+#
+# Every boot log this board has produced carries these, once per online CPU:
+#
+#   Clockevents: could not switch to one-shot mode: dummy_timer is not functional.
+#   Could not switch to high resolution mode on CPU 0 .. CPU 7
+#
+# Eight of each is the proof that all eight cores are up, not evidence that they
+# are not -- they are printed by the CPU that could not switch, and there are
+# eight of them. What they mean is that the only clockevent this profile had was
+# the global MediaTek GPT, which cannot be anybody's per-CPU tick, so each CPU got
+# dummy_timer and hrtimers stayed at jiffy resolution with HZ=100. A 5 ms sleep
+# was a 10 ms sleep, and every frame deadline in the media player landed on a
+# 10 ms boundary.
+#
+# generate_dts.py now emits an arm,armv7-timer node -- Cortex-A7 has the Generic
+# Timer, the vendor kernel simply never used it -- and that comment carries the
+# PPI numbers, the 13 MHz rate and the reason for the
+# arm,cpu-registers-not-fw-configured property. These are the config symbols the
+# node needs; ARM_ARCH_TIMER is what builds the driver, and the two timer options
+# are asked for by name rather than assumed from multi_v7_defconfig because they
+# are the whole point of adding the node.
+#
+# All three are harmless if the timer does not probe: the GPT node stays in the
+# tree and keeps working exactly as it does today.
+for symbol in ARM_ARCH_TIMER HIGH_RES_TIMERS NO_HZ_IDLE; do
+    config_y "$symbol"
+done
+
 # ── The black screen between the LK's logo and the MixOS splash ───────────────
 #
 # simplefb hands this kernel the framebuffer the LK was already drawing into,
