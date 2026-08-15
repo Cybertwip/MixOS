@@ -157,15 +157,28 @@ void Keyboard::buildLayout()
             /* The short row gets the two edits, so backspace is never more than
              * two presses from wherever the cursor is. */
             Cap shift;
-            /* The label names what the NEXT press gives, which is the rule the
-             * two-state version already followed and the only one that survives
-             * a third state.  It is also the only thing on the glass that tells
-             * one-shot upper from locked upper, since both draw the same caps. */
-            shift.label = m_layer != 1     ? tr("SHIFT")   /* -> one-shot upper */
-                        : m_shiftLatched   ? tr("CAPS")    /* -> locked         */
-                                           : tr("shift");  /* -> lower          */
+            /*
+             * The label names the state the keyboard is IN, and it used to name the
+             * state the next press would put it in.  That was reported as "caps does
+             * not lock", and the report was fair: locked upper drew the cap as
+             * "shift" in lower case and one-shot upper drew it as "CAPS", so the one
+             * state that does lock looked like the one that is off, and the state
+             * that drops after a single letter looked like the lock.  Anyone who
+             * tapped once, read "CAPS", typed a letter and watched it go back to
+             * lower case had every reason to call it a bug.
+             *
+             * Every keyboard anyone has used names the current state on this key --
+             * outlined arrow off, filled arrow for one shot, barred arrow for the
+             * lock -- so this one does too, in the three words it has room for, and
+             * `lit' puts the two engaged states in the accent colour so the lock is
+             * visible without reading the cap at all.
+             */
+            shift.label = m_layer != 1     ? tr("shift")   /* off               */
+                        : m_shiftLatched   ? tr("SHIFT")   /* on, one character */
+                                           : tr("CAPS");   /* locked            */
             shift.special = KeyShift;
             shift.span = 1.5;
+            shift.lit = (m_layer == 1);
             row.prepend(shift);
 
             Cap back;
@@ -284,6 +297,31 @@ void Keyboard::backspace()
         return;
     m_text.remove(m_caret - 1, 1);
     --m_caret;
+    update();
+}
+
+/*
+ * The lock, set from somewhere that is not the shift cap -- which for now is a real
+ * keyboard's Caps Lock key.  It goes through the same two variables the cap uses
+ * rather than adding a third, so the on-screen shift lights up when the physical key
+ * is pressed and the two can never disagree about what case the next letter is.
+ *
+ * Turning it off returns to lower case rather than to one-shot upper: the symbols
+ * layer is somewhere Caps Lock has no opinion about, so it is left alone.
+ */
+void Keyboard::setCapsLocked(bool on)
+{
+    if (capsLocked() == on)
+        return;
+    if (on) {
+        m_layer = 1;
+        m_shiftLatched = false;
+    } else if (m_layer == 1) {
+        m_layer = 0;
+        m_shiftLatched = false;
+    }
+    buildLayout();
+    relayout();
     update();
 }
 
@@ -454,13 +492,32 @@ void Keyboard::keyPressed(int code, bool pressed, int modifiers)
         m_caret = m_text.size();
         update();
         return;
+    case KEY_CAPSLOCK:
+        /* It did nothing at all before this: the modifier set joypad.cpp tracks is
+         * shift, control and alt, and KeyMap::character() reads only the first of
+         * them, so a USB keyboard's Caps Lock typed lower case for ever.  Toggling
+         * the on-screen lock is the whole fix, because the case is applied below
+         * from that state rather than from a modifier bit. */
+        setCapsLocked(!capsLocked());
+        return;
     default:
         break;
     }
 
-    const QString s = KeyMap::character(code, modifiers);
-    if (!s.isEmpty())
-        insert(s);
+    QString s = KeyMap::character(code, modifiers);
+    if (s.isEmpty())
+        return;
+
+    /*
+     * Caps Lock is LETTERS ONLY, which is the one thing about it everybody knows and
+     * the reason it cannot be implemented as a permanently held shift: locked caps
+     * plus 1 is 1, not an exclamation mark.  isLetter() is the test, and shift while
+     * the lock is on inverts rather than adds, exactly as it does on a real keyboard.
+     */
+    if (capsLocked() && s.size() == 1 && s.at(0).isLetter())
+        s = (modifiers & Joypad::ModShift) ? s.toLower() : s.toUpper();
+
+    insert(s);
 }
 
 int Keyboard::capAt(const QPoint &p) const
@@ -575,8 +632,13 @@ void Keyboard::paintEvent(QPaintEvent *)
             const bool down = (m_pressed == r * 100 + c);
             const bool accent = (cap.special == KeyAccept);
 
-            QColor top = accent ? Theme::blue() : Theme::card();
-            QColor bottom = accent ? Theme::blueLow() : Theme::cardLow();
+            /* An engaged modifier is drawn like the accept key so that "the shift
+             * is on" is a colour rather than a word -- and teal rather than blue so
+             * it is not mistaken for the one cap that ends the typing. */
+            QColor top = accent ? Theme::blue() : cap.lit ? Theme::teal() : Theme::card();
+            QColor bottom = accent ? Theme::blueLow()
+                          : cap.lit ? Theme::teal().darker(130)
+                                    : Theme::cardLow();
             if (down) {
                 top = top.darker(120);
                 bottom = bottom.darker(120);

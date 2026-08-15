@@ -87,6 +87,10 @@ private:
         int special = KeyChar;
         qreal span = 1.0;
         QRectF rect;
+        /* A modifier that is currently ENGAGED, drawn in the accent colour.  Only
+         * shift uses it, and it is the difference between a caps lock the user can
+         * see and one they have to deduce from the letters on the other caps. */
+        bool lit = false;
     };
 
     void buildLayout();
@@ -94,6 +98,10 @@ private:
     void pressCap(const Cap &cap);
     void insert(const QString &s);
     void backspace();
+    /* Upper case that stays until it is turned off, as against the one-shot upper
+     * a single tap of shift gives.  The two differ only in m_shiftLatched. */
+    bool capsLocked() const { return m_layer == 1 && !m_shiftLatched; }
+    void setCapsLocked(bool on);
     int capAt(const QPoint &p) const;
     QRectF fieldRect() const;
 
