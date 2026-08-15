@@ -79,13 +79,23 @@
  * the charger runs at the 450 mA CS_VTH default, which is what stock LK does and
  * never changes; it charges, just not fast.
  *
- * The other half of that interaction runs the other way: j36_mt6592_usb_phy's
- * recover()/savecurrent() sequences clear the same mux bit as part of dropping
- * the ROM's UART-over-USB overrides.  A phy_init() landing inside a BC1.2 run
- * would therefore cut the probe short.  The cost is a misclassification, the
- * fallback is the conservative limit, and the fix is not worth cross-module
- * locking for an event that needs a cable to be plugged in during the same
- * hundred milliseconds a USB module is loading.
+ * The other half of that interaction runs the other way, and THAT half is not
+ * cosmetic.  This file used to worry only about a phy_init() landing inside a
+ * BC1.2 run and cutting the probe short -- a misclassification, worth nothing.
+ * The direction that matters is the reverse: a BC1.2 run landing on a LIVE USB
+ * SESSION.  hw_bc11_init sets the mux bit and the classification then holds
+ * D+/D- for some six hundred milliseconds, driving pull-ups, pull-downs and a
+ * voltage source onto them.  There is no version of that a device survives.  On
+ * this board the OTG port is a host for the whole uptime, so plugging the DC
+ * charger in did exactly that: online went 0 -> 1, the classifier took the data
+ * lines away from the link, and every enumerated device fell off the bus.
+ *
+ * So the run is gated on `sourcing' -- the DRVVBUS pad, read below.  With the
+ * pad up the port is hosting and the lines are not ours to borrow; the charger
+ * runs at the 450 mA CS_VTH default instead, which is what it already does
+ * whenever the phandles are absent.  What that costs is a slower charge on a
+ * board whose charger comes in on its own inlet anyway, and what it buys is a
+ * USB port that survives a charger being plugged into the other socket.
  *
  *
  * ── AND THE VBUS INTERLOCK, WHICH WAS SOLVING THE RIGHT PROBLEM THE WRONG WAY ──
@@ -2086,8 +2096,27 @@ static int j36_gauge_percent(struct j36_pmic *p, bool online, int bat_mv,
 	 * Only once there IS a level to walk down.  A first-ever sample this low
 	 * is not a ramp, it is a seed, and the seed below already reads ~0% off
 	 * the curve for any OCV under the table's bottom row.
+	 *
+	 * ── AND ONLY WHILE THE PACK IS LOSING CHARGE, WHICH IS THE BUG ──
+	 *
+	 * This branch used to run on the voltage alone, and below the floor it
+	 * ends the charge run and returns before the integrator further down can
+	 * be reached.  So a pack sitting AT 3400 mV WITH A CHARGER IN walked to
+	 * zero at one percent per poll -- J36_LADDER_INTERVAL_US is a second and
+	 * so is the poll -- and then stayed at zero for as long as the terminal
+	 * voltage stayed under the floor, however many coulombs went in.  On this
+	 * board that is not a corner case: VBAT is the system node, the OTG port
+	 * sources 5 V off it for the whole uptime, and a tired pack under that
+	 * load sits below 3450 mV while it is genuinely filling.  The meter read
+	 * 0% always, which is what it was asked to do.
+	 *
+	 * A terminal voltage under the floor with current going IN is not a pack
+	 * about to die, it is a flat pack being rescued, and the coulombs are the
+	 * better authority.  So the ramp is now the DISCHARGE floor it was always
+	 * described as, and a charging sample falls through to the integrator.
 	 */
-	if (bat_mv <= J36_V_0PERCENT_TRACKING_MV && p->soc_dep >= 0) {
+	if (bat_mv <= J36_V_0PERCENT_TRACKING_MV && p->soc_dep >= 0 &&
+	    !(ma_valid && ma > 0)) {
 		if (!p->soc_slew ||
 		    ktime_us_delta(now, p->soc_slew) >= J36_LADDER_INTERVAL_US) {
 			if (p->soc_dep < 100)
@@ -2342,8 +2371,8 @@ static void j36_charging_line(struct j36_pmic *p, int online, int chrdet,
 			      bool sourcing, int vchr_mv, int ma, bool ma_valid,
 			      int bat_mv)
 {
-	char pack_buf[16], vbat_buf[16], vchr_buf[16];
-	const char *pack, *vbat, *vchr;
+	char pack_buf[16], vbat_buf[16], vchr_buf[16], level_buf[16];
+	const char *pack, *vbat, *vchr, *level;
 	u32 con2;
 	int cs_det;
 
@@ -2374,6 +2403,14 @@ static void j36_charging_line(struct j36_pmic *p, int online, int chrdet,
 		vchr = "(no sample)";
 	}
 
+	if (p->soc_dep >= 0) {
+		scnprintf(level_buf, sizeof(level_buf), "%d%%",
+			  100 - p->soc_dep);
+		level = level_buf;
+	} else {
+		level = "(unseeded)";
+	}
+
 	/*
 	 * VBUS is what this driver concluded; CHRDET is the raw bit and what the
 	 * charger was armed on.  They differ exactly when the veto is holding, and
@@ -2387,10 +2424,17 @@ static void j36_charging_line(struct j36_pmic *p, int online, int chrdet,
 	 * can tell that from a charger, and the port has to stand down instead --
 	 * j36_mt6592_usb_phy vbus=-1.  Cable IN, either way, VCHR is the charger.
 	 */
+	/*
+	 * The level is on this line because the line is the only place the three
+	 * numbers that produce it appear together.  A gauge reading 0% is one of
+	 * two quite different faults -- a pack the driver believes is empty, or a
+	 * VBAT it is reading wrong -- and "level 0% VBAT 3400 mV" separates them
+	 * from "level 0% VBAT 3800 mV" without any further instrumentation.
+	 */
 	dev_info(p->dev,
-		 "charging: VBUS=%d CHRDET=%d src=%d VCHR %s CS_DET=%s pack %s VBAT %s\n",
+		 "charging: VBUS=%d CHRDET=%d src=%d VCHR %s CS_DET=%s pack %s VBAT %s level %s\n",
 		 online ? 1 : 0, chrdet ? 1 : 0, sourcing ? 1 : 0, vchr,
-		 cs_det < 0 ? "?" : (cs_det ? "1" : "0"), pack, vbat);
+		 cs_det < 0 ? "?" : (cs_det ? "1" : "0"), pack, vbat, level);
 }
 
 /*
@@ -2547,8 +2591,12 @@ static void j36_pmic_poll(struct work_struct *work)
 		j36_ring_forget(&p->vchr);
 		j36_ring_forget(&p->delta);
 		j36_bc11_forget(p);
-		if (online && bc11 && p->usbphy && p->pericfg)
+		if (online && bc11 && p->usbphy && p->pericfg && !sourcing)
 			j36_bc11_run(p);
+		else if (online && sourcing)
+			dev_info(p->dev,
+				 "BC1.2 not run: the OTG port is a host and D+/D- belong to it, so the charger runs at the %u mA default\n",
+				 j36_cs_vth_ma[J36_CHR_CON4_CS_VTH_DEFAULT]);
 		else if (online)
 			dev_info_once(p->dev,
 				      "BC1.2 skipped; the charger runs at the %u mA default\n",
