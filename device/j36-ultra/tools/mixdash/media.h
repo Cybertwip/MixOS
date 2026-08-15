@@ -404,6 +404,9 @@ private:
     QRect barRect() const;
     QVector<Button> buttons() const;
     void paintTransport(QPainter &p) const;
+    /* One button's glyph, centred in `box'.  Static because it holds nothing and
+     * a member only because the ids it switches on are private to this class. */
+    static void drawGlyph(QPainter &p, int id, const QRect &box, bool paused, bool on);
     /* Which control is under a widget-coordinate point, CtlNone for none. */
     int controlAt(const QPoint &at) const;
     void pressControl(int id);

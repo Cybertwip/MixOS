@@ -12,7 +12,9 @@
 #include <QFileInfo>
 #include <QFontMetrics>
 #include <QImageReader>
+#include <QMouseEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QProcess>
 #include <QRandomGenerator>
 #include <QResizeEvent>
@@ -232,6 +234,18 @@ MediaPage::MediaPage(QWidget *parent)
     m_pace->setTimerType(Qt::PreciseTimer);
     connect(m_pace, &QTimer::timeout, this, &MediaPage::pump);
 
+    /* The only thing that takes the transport off a playing film.  Two and a half
+     * seconds: long enough to read the title and reach a button, short enough that
+     * a film watched to the end is not watched through a scrim. */
+    m_transportTimer = new QTimer(this);
+    m_transportTimer->setSingleShot(true);
+    m_transportTimer->setInterval(2600);
+    connect(m_transportTimer, &QTimer::timeout, this, &MediaPage::hideTransport);
+
+    /* Without this Qt delivers a move only while a button is down, and the
+     * transport's whole show-on-motion behaviour would need a click first. */
+    setMouseTracking(true);
+
     /* Both remembered, because a handheld that forgets it was shuffling is a
      * handheld you set up again every boot. */
     m_repeat = Settings::instance().mediaRepeat();
@@ -360,6 +374,12 @@ void MediaPage::setView(int view)
             m_list->setCurrent(i);
             break;
         }
+    } else if (view == ViewVideo) {
+        /* A film opens with its controls showing and they go two and a half
+         * seconds later, which is how anybody finds out there are any. */
+        m_hover = CtlNone;
+        m_scrubbing = false;
+        nudgeTransport();
     }
 
     emit titleChanged();
@@ -2204,6 +2224,10 @@ void MediaPage::advance(int delta, bool automatic)
 
 void MediaPage::stopMusic()
 {
+    /* As in stopVideo(): a track abandoned while its ffprobe was still running
+     * must not leave the shell's ring turning over whatever comes next. */
+    setLoading(false);
+
     m_stopping = true;
     endProcess(m_music);
     endProcess(m_aplay);
@@ -2229,6 +2253,12 @@ void MediaPage::stopMusic()
 
 void MediaPage::stopVideo()
 {
+    /* Whatever this film was waiting for, it is not waiting for it any more.  The
+     * spinner belongs to the shell and nothing else here would take it down -- a
+     * film abandoned between the probe and the first frame would have left a ring
+     * turning on the card grid. */
+    setLoading(false);
+
     endProcess(m_decoder);
     endProcess(m_videoAudio);
     endProcess(m_videoAplay);
@@ -2567,6 +2597,11 @@ bool MediaPage::handleNav(int action)
     }
 
     if (m_view == ViewVideo) {
+        /* Any press at all is somebody who is there, which is the whole of the
+         * show-the-controls rule.  Before the switch, so that the transport is
+         * already up when a press changes something it displays. */
+        nudgeTransport();
+
         switch (action) {
         case Joypad::NavOk:
         case Joypad::NavMenu:
@@ -2576,6 +2611,16 @@ bool MediaPage::handleNav(int action)
         case Joypad::NavRight: seekBy(10); return true;
         case Joypad::NavUp:    seekBy(60); return true;
         case Joypad::NavDown:  seekBy(-60); return true;
+        /*
+         * THE SHOULDERS REACH THE TWO TOGGLES.  They are free here -- the dock
+         * they used to switch tabs on is gone -- and without them loop and
+         * fullscreen would be buttons only a mouse could press, on a device that
+         * usually has no mouse plugged into it.  Which is which is not something
+         * anybody has to remember: pressing one lights its icon in the strip that
+         * the press has just brought up.
+         */
+        case Joypad::NavPrevPage: pressControl(CtlLoop); return true;
+        case Joypad::NavNextPage: pressControl(CtlZoom); return true;
         case Joypad::NavBack:
             stopVideo();
             dropFrame();
@@ -2688,6 +2733,10 @@ QString MediaPage::chromeRight() const
 
 QRect MediaPage::chromeRect() const
 {
+    /* A film has the transport instead of the strip, and it comes and goes. */
+    if (m_view == ViewVideo)
+        return transportUp() ? transportRect() : QRect();
+
     const int barH = 34;
     const int noteH = noteText().isEmpty() ? 0 : 22;
     return QRect(0, height() - barH - noteH, width(), barH + noteH);
@@ -2695,6 +2744,11 @@ QRect MediaPage::chromeRect() const
 
 void MediaPage::paintChrome(QPainter &p) const
 {
+    if (m_view == ViewVideo) {
+        paintTransport(p);
+        return;
+    }
+
     /* A strip along the foot with the name, the clock and any complaint. */
     const int barH = 34;
     const QRect bar(0, height() - barH, width(), barH);
@@ -2720,6 +2774,473 @@ void MediaPage::paintChrome(QPainter &p) const
     }
 }
 
+/* ── the transport ───────────────────────────────────────────────────────── */
+
+/*
+ * ── WHY THE CONTROLS ARE PAINTED AND NOT BUILT ──────────────────────────────
+ *
+ * Every other page in this dashboard is made of widgets, and this one cannot be.
+ * While a film is up the pixels on the glass came from lima writing into the
+ * scanout, not from Qt's backing store, so a QPushButton over the picture is not
+ * a button over a picture: it is a memcpy of a rectangle Qt believes is empty,
+ * landing on top of the film, and being painted over again 25 times a second.  It
+ * also DIRTIES that rectangle, which is the bug that used to drag a grey square
+ * about behind the mouse.  See the layer note in glvideo.h.
+ *
+ * So the transport is a picture -- rendered once whenever its content changes,
+ * uploaded as the chrome texture, and blended by the pass that owns the pixels.
+ * The cost of that is the hit test below, which is thirty lines and cannot get out
+ * of step with the drawing because both are built from the same buttons() list.
+ *
+ * WHAT IT REPLACED was the word "decoding..." in the middle of a black screen and
+ * a strip along the foot with a clock in it.  There was no way to pause with a
+ * mouse, no way to see how far through the film you were without reading a
+ * timestamp, and nothing at all said whether the thing was going to loop.
+ */
+namespace {
+
+/* All of the geometry, in one place, because the drawing and the hit test both
+ * read it and a number that appeared twice would eventually appear differently. */
+const int TrPad = 16;      /* left and right margin inside the panel */
+const int TrNoteH = 20;    /* the complaint line, when there is one */
+const int TrTitleY = 6;    /* everything below is from the panel top, past the note */
+const int TrTitleH = 20;
+const int TrBarY = 32;
+const int TrBarH = 5;
+const int TrKnob = 7;
+const int TrTimesY = 40;
+const int TrTimesH = 15;
+const int TrBtnY = 60;
+const int TrBtnW = 42;
+const int TrBtnH = 34;
+const int TrBtnGap = 6;
+const int TrPanelH = TrBtnY + TrBtnH + 8;
+
+}
+
+/* The glyphs, drawn rather than shipped: a 20 px icon font would be another file
+ * to stage on the card, and there are six of these.  A member, and not the file
+ * static it started as, only because the ids it switches on are this class's. */
+void MediaPage::drawGlyph(QPainter &p, int id, const QRect &box, bool paused, bool on)
+{
+    const QRect g(box.center().x() - 9, box.center().y() - 9, 19, 19);
+    const QColor ink = on ? Theme::blue() : Theme::ink();
+
+    p.setPen(Qt::NoPen);
+    p.setBrush(ink);
+
+    switch (id) {
+    case CtlPlay:
+        if (paused) {
+            QPainterPath tri;
+            tri.moveTo(g.left() + 3, g.top());
+            tri.lineTo(g.left() + 3, g.bottom() + 1);
+            tri.lineTo(g.right() + 1, g.center().y() + 0.5);
+            tri.closeSubpath();
+            p.drawPath(tri);
+        } else {
+            p.drawRect(QRect(g.left() + 3, g.top(), 5, g.height() + 1));
+            p.drawRect(QRect(g.right() - 7, g.top(), 5, g.height() + 1));
+        }
+        break;
+
+    case CtlBack:
+    case CtlForward: {
+        /* Two chevrons, and the direction is the sign of the step.  The 10 under
+         * them is what makes it a jump rather than a scan -- there is no scan on
+         * this player, because a pipe cannot be run backwards. */
+        const bool back = (id == CtlBack);
+        for (int i = 0; i < 2; ++i) {
+            const int x = g.left() + i * 9;
+            QPainterPath tri;
+            if (back) {
+                tri.moveTo(x + 8, g.top() + 1);
+                tri.lineTo(x + 8, g.bottom() - 4);
+                tri.lineTo(x, (g.top() + g.bottom() - 3) / 2.0);
+            } else {
+                tri.moveTo(x, g.top() + 1);
+                tri.lineTo(x, g.bottom() - 4);
+                tri.lineTo(x + 8, (g.top() + g.bottom() - 3) / 2.0);
+            }
+            tri.closeSubpath();
+            p.drawPath(tri);
+        }
+        p.setPen(ink);
+        p.setFont(Theme::font(9));
+        p.drawText(QRect(g.left(), g.bottom() - 5, g.width(), 7),
+                   Qt::AlignHCenter | Qt::AlignTop, "10");
+        break;
+    }
+
+    case CtlLoop: {
+        /* A track running round with an arrowhead on it.  Lit when it is on, which
+         * is the only way a toggle painted into a texture can say so. */
+        QPen pen(ink, 2);
+        pen.setJoinStyle(Qt::RoundJoin);
+        p.setPen(pen);
+        p.setBrush(Qt::NoBrush);
+        const QRectF ring(g.left() + 1, g.top() + 3, g.width() - 2, g.height() - 7);
+        QPainterPath path;
+        path.addRoundedRect(ring, 5, 5);
+        p.drawPath(path);
+        p.setPen(Qt::NoPen);
+        p.setBrush(ink);
+        QPainterPath head;
+        head.moveTo(ring.right() - 4, ring.top() - 4);
+        head.lineTo(ring.right() + 1, ring.top());
+        head.lineTo(ring.right() - 4, ring.top() + 4);
+        head.closeSubpath();
+        p.drawPath(head);
+        break;
+    }
+
+    case CtlZoom: {
+        /* Four corners, pointing out to fill and in to come back. */
+        QPen pen(ink, 2);
+        pen.setCapStyle(Qt::FlatCap);
+        p.setPen(pen);
+        p.setBrush(Qt::NoBrush);
+        const int a = on ? 7 : 0;         /* inset of the corner itself */
+        const int len = 6;
+        const int L = g.left() + a, R = g.right() - a;
+        const int T = g.top() + a, B = g.bottom() - a;
+        const int s = on ? -1 : 1;
+        p.drawLine(L, T, L + len * s, T);
+        p.drawLine(L, T, L, T + len * s);
+        p.drawLine(R, T, R - len * s, T);
+        p.drawLine(R, T, R, T + len * s);
+        p.drawLine(L, B, L + len * s, B);
+        p.drawLine(L, B, L, B - len * s);
+        p.drawLine(R, B, R - len * s, B);
+        p.drawLine(R, B, R, B - len * s);
+        break;
+    }
+
+    case CtlClose: {
+        QPen pen(ink, 2);
+        pen.setCapStyle(Qt::RoundCap);
+        p.setPen(pen);
+        p.drawLine(g.topLeft() + QPoint(2, 2), g.bottomRight() - QPoint(2, 2));
+        p.drawLine(g.topRight() + QPoint(-2, 2), g.bottomLeft() + QPoint(2, -2));
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+QRect MediaPage::transportRect() const
+{
+    const int noteH = noteText().isEmpty() ? 0 : TrNoteH;
+    const int h = TrPanelH + noteH;
+    return QRect(0, qMax(0, height() - h), width(), qMin(h, height()));
+}
+
+QRect MediaPage::barRect() const
+{
+    const QRect panel = transportRect();
+    const int noteH = noteText().isEmpty() ? 0 : TrNoteH;
+    return QRect(panel.left() + TrPad, panel.top() + noteH + TrBarY,
+                 qMax(1, panel.width() - 2 * TrPad), TrBarH);
+}
+
+QVector<MediaPage::Button> MediaPage::buttons() const
+{
+    QVector<Button> out;
+    const QRect panel = transportRect();
+    const int noteH = noteText().isEmpty() ? 0 : TrNoteH;
+    const int y = panel.top() + noteH + TrBtnY;
+
+    /* Transport on the left, the two toggles and the way out on the right.  Both
+     * groups are anchored to their own edge so a wider panel spreads them apart
+     * rather than moving them together. */
+    const int leftIds[] = { CtlBack, CtlPlay, CtlForward };
+    int x = panel.left() + TrPad;
+    for (int i = 0; i < 3; ++i) {
+        Button b;
+        b.id = leftIds[i];
+        b.where = QRect(x, y, TrBtnW, TrBtnH);
+        out.append(b);
+        x += TrBtnW + TrBtnGap;
+    }
+
+    const int rightIds[] = { CtlLoop, CtlZoom, CtlClose };
+    x = panel.right() + 1 - TrPad - (3 * TrBtnW + 2 * TrBtnGap);
+    for (int i = 0; i < 3; ++i) {
+        Button b;
+        b.id = rightIds[i];
+        b.where = QRect(x, y, TrBtnW, TrBtnH);
+        out.append(b);
+        x += TrBtnW + TrBtnGap;
+    }
+    return out;
+}
+
+bool MediaPage::transportUp() const
+{
+    /*
+     * The two and a half seconds are for a film that is PLAYING and being watched.
+     * Everything else here is a state in which the controls are the only thing on
+     * the screen worth looking at -- nothing has decoded yet, it is paused, the
+     * decoder has gone, or a thumb is on the bar -- and hiding them there would be
+     * hiding the only way out of a black screen.
+     */
+    if (m_paused || m_scrubbing || m_loading || !videoLive())
+        return true;
+    return m_transportShown;
+}
+
+void MediaPage::nudgeTransport()
+{
+    const bool was = transportUp();
+    m_transportShown = true;
+    if (m_transportTimer)
+        m_transportTimer->start();
+    if (!was)
+        refresh();
+}
+
+void MediaPage::hideTransport()
+{
+    if (!m_transportShown)
+        return;
+    m_transportShown = false;
+    m_hover = CtlNone;
+    if (m_view == ViewVideo)
+        refresh();
+}
+
+int MediaPage::controlAt(const QPoint &at) const
+{
+    if (m_view != ViewVideo || !transportUp())
+        return CtlNone;
+
+    /* Generous: these are 42x34 targets being hit with a stick-driven arrow on a
+     * 640x480 panel, and a miss costs a press of something else. */
+    const QVector<Button> bs = buttons();
+    for (int i = 0; i < bs.size(); ++i) {
+        if (bs[i].where.adjusted(-3, -6, 3, 6).contains(at))
+            return bs[i].id;
+    }
+    const QRect bar = barRect();
+    if (bar.adjusted(-4, -11, 4, 11).contains(at))
+        return CtlBar;
+    return CtlNone;
+}
+
+void MediaPage::pressControl(int id)
+{
+    switch (id) {
+    case CtlPlay:
+        togglePause();
+        break;
+    case CtlBack:
+        seekBy(-10);
+        break;
+    case CtlForward:
+        seekBy(10);
+        break;
+    case CtlLoop:
+        m_loopVideo = !m_loopVideo;
+        emit toastRequested(m_loopVideo ? tr("repeat on") : tr("repeat off"), 1400);
+        break;
+    case CtlZoom:
+        /* The scale is ffmpeg's, so this is the seek path with the same start
+         * time -- see the filter note in openVideoNow(). */
+        m_fill = !m_fill;
+        if (!m_showing.path.isEmpty())
+            openVideo(m_showing, qMax(0.0, position()));
+        break;
+    case CtlClose:
+        stopVideo();
+        dropFrame();
+        m_note.clear();
+        setView(ViewBrowse);
+        return;
+    default:
+        return;
+    }
+
+    nudgeTransport();
+    refresh();
+}
+
+void MediaPage::paintTransport(QPainter &p) const
+{
+    if (!transportUp())
+        return;
+
+    const QRect panel = transportRect();
+    const int noteH = noteText().isEmpty() ? 0 : TrNoteH;
+
+    /*
+     * A scrim rather than a slab: it fades in from nothing at the top edge, so the
+     * bottom of the picture is dimmed into the controls instead of being cut off
+     * by a line across it.  Nearly opaque at the foot, because white text on a
+     * bright scene is text nobody can read.
+     */
+    QLinearGradient scrim(panel.topLeft(), panel.bottomLeft());
+    scrim.setColorAt(0.0, QColor(6, 7, 11, 0));
+    scrim.setColorAt(0.35, QColor(6, 7, 11, 170));
+    scrim.setColorAt(1.0, QColor(6, 7, 11, 232));
+    p.setPen(Qt::NoPen);
+    p.setBrush(scrim);
+    p.drawRect(panel);
+
+    const QString note = noteText();
+    if (!note.isEmpty()) {
+        p.setFont(Theme::font(11));
+        p.setPen(Theme::orange());
+        p.drawText(QRect(panel.left() + TrPad, panel.top() + 3,
+                         panel.width() - 2 * TrPad, TrNoteH),
+                   Qt::AlignLeft | Qt::AlignVCenter, note);
+    }
+
+    /* The name of the thing, which is the tags' title if the container had one and
+     * the file name without its extension otherwise -- never "decoding...". */
+    const QString title = m_trackTitle.isEmpty() ? m_showing.name : m_trackTitle;
+    const QRect titleRect(panel.left() + TrPad, panel.top() + noteH + TrTitleY,
+                          panel.width() - 2 * TrPad, TrTitleH);
+    p.setFont(Theme::font(13));
+    p.setPen(Theme::ink());
+    QString shown = title;
+    {
+        const QFontMetrics fm(p.font());
+        const int room = titleRect.width() - 90;
+        if (room > 40)
+            shown = fm.elidedText(title, Qt::ElideRight, room);
+    }
+    p.drawText(titleRect, Qt::AlignLeft | Qt::AlignVCenter, shown);
+
+    if (m_framesDropped > 0) {
+        p.setFont(Theme::font(10));
+        p.setPen(Theme::ink3());
+        p.drawText(titleRect, Qt::AlignRight | Qt::AlignVCenter,
+                   tr("%1 dropped").arg(m_framesDropped));
+    }
+
+    /* ── the timebar ─────────────────────────────────────────────────────── */
+    const QRect bar = barRect();
+    const double total = m_videoDuration;
+    const double at = qBound(0.0, position(), total > 0.0 ? total : position());
+    const double frac = total > 0.0 ? at / total : 0.0;
+
+    p.setPen(Qt::NoPen);
+    p.setBrush(QColor(255, 255, 255, 58));
+    p.drawRoundedRect(bar, TrBarH / 2.0, TrBarH / 2.0);
+
+    if (total > 0.0) {
+        QRect done = bar;
+        done.setWidth(qMax(1, (int)(bar.width() * frac)));
+        p.setBrush(Theme::blue());
+        p.drawRoundedRect(done, TrBarH / 2.0, TrBarH / 2.0);
+
+        /* The knob is bigger while it is being dragged, which is the only feedback
+         * a scrub gets on a panel with no cursor of its own. */
+        const int r = m_scrubbing ? TrKnob + 2 : TrKnob;
+        p.setBrush(Theme::ink());
+        p.drawEllipse(QPointF(bar.left() + bar.width() * frac, bar.center().y() + 0.5),
+                      r, r);
+    }
+
+    p.setFont(Theme::font(11));
+    p.setPen(Theme::ink2());
+    const QRect times(panel.left() + TrPad, panel.top() + noteH + TrTimesY,
+                      panel.width() - 2 * TrPad, TrTimesH);
+    p.drawText(times, Qt::AlignLeft | Qt::AlignVCenter, humanTime((int)at));
+    p.drawText(times, Qt::AlignRight | Qt::AlignVCenter,
+               total > 0.0 ? humanTime((int)total) : QString("--:--"));
+
+    /* ── the buttons ─────────────────────────────────────────────────────── */
+    const QVector<Button> bs = buttons();
+    for (int i = 0; i < bs.size(); ++i) {
+        const Button &b = bs[i];
+        if (m_hover == b.id) {
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(255, 255, 255, 34));
+            p.drawRoundedRect(b.where, 8, 8);
+        }
+        const bool lit = (b.id == CtlLoop && m_loopVideo) ||
+                         (b.id == CtlZoom && m_fill);
+        drawGlyph(p, b.id, b.where, m_paused, lit);
+    }
+}
+
+void MediaPage::mousePressEvent(QMouseEvent *event)
+{
+    if (m_view != ViewVideo) {
+        PageWidget::mousePressEvent(event);
+        return;
+    }
+
+    /* THE FIRST CLICK ONLY WAKES IT.  Pressing a button that was not on the screen
+     * when the press started is how a hidden transport turns into a film that
+     * pauses itself for no reason anybody can see. */
+    const bool was = transportUp();
+    nudgeTransport();
+    if (!was) {
+        refresh();
+        return;
+    }
+
+    const int id = controlAt(event->pos());
+    if (id == CtlBar) {
+        if (m_videoDuration > 0.0) {
+            m_scrubbing = true;
+            const QRect bar = barRect();
+            const double frac = qBound(0.0, (event->pos().x() - (double)bar.left()) /
+                                                qMax(1, bar.width()), 1.0);
+            seekTo(frac * m_videoDuration);
+        }
+        return;
+    }
+    if (id != CtlNone)
+        pressControl(id);
+}
+
+void MediaPage::mouseMoveEvent(QMouseEvent *event)
+{
+    if (m_view != ViewVideo) {
+        PageWidget::mouseMoveEvent(event);
+        return;
+    }
+
+    /* Moving the mouse is asking for the controls, on every player ever written. */
+    nudgeTransport();
+
+    if (m_scrubbing && m_videoDuration > 0.0) {
+        const QRect bar = barRect();
+        const double frac = qBound(0.0, (event->pos().x() - (double)bar.left()) /
+                                            qMax(1, bar.width()), 1.0);
+        /* seekTo() moves the clock now and restarts ffmpeg a third of a second
+         * after the last one of these, so a drag costs one decoder and not one per
+         * pixel.  That debounce was written for the D-pad's autorepeat and it is
+         * exactly what a drag needs. */
+        seekTo(frac * m_videoDuration);
+        return;
+    }
+
+    const int id = controlAt(event->pos());
+    if (id == m_hover)
+        return;
+    m_hover = id;
+    refresh();
+}
+
+void MediaPage::mouseReleaseEvent(QMouseEvent *event)
+{
+    if (m_view != ViewVideo) {
+        PageWidget::mouseReleaseEvent(event);
+        return;
+    }
+    if (!m_scrubbing)
+        return;
+    m_scrubbing = false;
+    nudgeTransport();
+    refresh();
+}
+
 void MediaPage::refreshChrome(const QRect &into)
 {
     if (!m_gl)
@@ -2740,9 +3261,21 @@ void MediaPage::refreshChrome(const QRect &into)
      * saved.  Everything the strip draws goes into the key, geometry included,
      * so a resize cannot leave a stale texture behind.
      */
-    const QString key = m_showing.name + QChar(0x1f) + chromeRight() + QChar(0x1f) +
-                        noteText() + QChar(0x1f) + QString::number(cr.width()) + "x" +
-                        QString::number(cr.height());
+    QString key = m_showing.name + QChar(0x1f) + chromeRight() + QChar(0x1f) +
+                  noteText() + QChar(0x1f) + QString::number(cr.width()) + "x" +
+                  QString::number(cr.height());
+    /*
+     * EVERYTHING THE TRANSPORT DRAWS HAS TO BE IN HERE, or the strip is not
+     * re-rendered when it changes and the panel keeps a texture of the old one.
+     * chromeRight() already carries the clock, the pause and the dropped count;
+     * these are the rest of it -- what is under the mouse, which way the two
+     * toggles are set, and the title, which arrives late because it comes out of
+     * ffprobe.
+     */
+    if (m_view == ViewVideo)
+        key += QChar(0x1f) + m_trackTitle + QChar(0x1f) +
+               QString::number(m_hover) + (m_loopVideo ? "L" : "-") +
+               (m_fill ? "F" : "-") + (m_scrubbing ? "S" : "-");
     if (key == m_chromeKey)
         return;
     m_chromeKey = key;
@@ -2848,11 +3381,14 @@ void MediaPage::paintEvent(QPaintEvent *)
             /* No smooth transform: bilinear on a full 640x480 frame costs more than
              * the decode does on this CPU, and ffmpeg already scaled the video. */
             p.drawImage(at, m_frame);
-        } else if (m_view == ViewVideo) {
-            p.setPen(Theme::ink2());
-            p.setFont(Theme::font(14));
-            p.drawText(rect(), Qt::AlignCenter, tr("decoding..."));
         }
+        /*
+         * NOTHING WHERE "decoding..." USED TO BE.  A film that has not produced a
+         * frame yet is a film something is still being done about, and what says so
+         * is the shell's spinner -- one ring, over whatever page is up, turning,
+         * which is the one thing a line of static text could never do.  See
+         * setLoading() and busyRequested().
+         */
 
         paintChrome(p);
         return;
