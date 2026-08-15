@@ -190,7 +190,6 @@ private:
     /* The blocking one.  Only the forget path uses it, because that path has to
      * know the current profiles before it can delete the right ones. */
     void syncProfiles();
-    QString ssidOfProfile(const QString &uuid);
     void rebuild();
 
     /*

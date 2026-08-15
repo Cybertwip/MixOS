@@ -871,38 +871,6 @@ void WifiPage::syncProfiles()
     matchProfiles();
 }
 
-/*
- * The profile's name is usually its SSID and is not required to be, so the SSID
- * is asked for -- once per profile, and then remembered.  Nothing on a timer calls
- * this any more; applySsid() fills the same cache from the query pump.
- */
-QString WifiPage::ssidOfProfile(const QString &uuid)
-{
-    QHash<QString, QString>::const_iterator hit = m_ssidCache.constFind(uuid);
-    if (hit != m_ssidCache.constEnd())
-        return hit.value();
-
-    int rc = -1;
-    const QString out = nmcli(QStringList() << "-t" << "-f" << "802-11-wireless.ssid"
-                                            << "connection" << "show" << "uuid" << uuid,
-                              3000, &rc);
-    QString ssid;
-    if (rc == 0) {
-        for (const QString &line : out.split('\n', Qt::SkipEmptyParts)) {
-            const QStringList cols = splitTerse(line);
-            if (cols.size() >= 2 && cols.at(0) == QLatin1String("802-11-wireless.ssid")) {
-                ssid = cols.mid(1).join(QChar(':')).trimmed();
-                break;
-            }
-        }
-    }
-    if (ssid == QLatin1String("--"))
-        ssid.clear();
-
-    m_ssidCache.insert(uuid, ssid);
-    return ssid;
-}
-
 /* nmcli reports signal strength as a percentage already, which is the number
  * every other status bar on every other device shows.  There is no dBm column in
  * `device wifi list', and inventing one back out of the percentage would be
