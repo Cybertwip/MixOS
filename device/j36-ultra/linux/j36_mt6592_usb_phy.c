@@ -1337,6 +1337,41 @@ static const char *j36_musb_vbus_str(u8 devctl)
 	return level[(devctl & J36_MUSB_DEVCTL_VBUS) >> J36_MUSB_DEVCTL_VBUS_SHIFT];
 }
 
+/*
+ * ── WHAT "IT TOOK" ACTUALLY LOOKS LIKE, AND WHY IT IS NOT HM ─────────────────
+ *
+ * DEVCTL.HOSTMODE is set by the core when it is ACTING as a host, and an
+ * A-device holding a session over an EMPTY socket is not acting as anything
+ * yet: there is no connect to answer, no reset to drive, no SOF to send. HM
+ * appears with the CONNECT interrupt, which needs a device pulling D+ up, which
+ * needs the session -- so a driver that tears the session down because HM is
+ * clear has removed the only thing that could ever set it. That loop is exactly
+ * what the log reads as "attempt 1 of 4 ... 4 of 4 ... the core will not take
+ * host mode", and the port it leaves behind has no session at all (DEVCTL 98),
+ * which is why nothing enumerates and nothing is powered.
+ *
+ * The vendor driver this file is transcribed from never reads HM anywhere.
+ * musb_id_pin_work() sets the role, calls musb_start(), and then says
+ * MUSB_HST_MODE(musb) -- a software variable. Mainline does the same, from the
+ * CONNECT and SESSREQ interrupt handlers, and never gates anything on the bit.
+ *
+ * So the test is the state a host is ARMED in, all of which the core sets
+ * itself and all of which this driver has been printing as a failure: A-device
+ * (arbitration went our way), SESSION held, and the VBUS comparators at or
+ * above AValid. HM is accepted too -- a port with a device on it is obviously
+ * fine -- but it is not required, and requiring it is the bug.
+ */
+static bool j36_musb_host_armed(u8 devctl)
+{
+	if (devctl & J36_MUSB_DEVCTL_HM)
+		return true;
+
+	return !(devctl & J36_MUSB_DEVCTL_BDEVICE) &&
+	       (devctl & J36_MUSB_DEVCTL_SESSION) &&
+	       ((devctl & J36_MUSB_DEVCTL_VBUS) >> J36_MUSB_DEVCTL_VBUS_SHIFT) >=
+	       J36_MUSB_VBUS_AVALID;
+}
+
 static void j36_musb_dump(struct j36_usb_phy *p, const char *when)
 {
 	u8 faddr, power, devctl, epinfo, raminfo;
@@ -1375,16 +1410,23 @@ static void j36_musb_dump(struct j36_usb_phy *p, const char *when)
 
 	/*
 	 * And the one sentence a reader should not have to decode the hex for.
-	 * A session running as an A-device with HM clear is the exact shape of the
-	 * bug this file's session bounce exists to prevent, and it is worth saying
-	 * out loud every time it is seen rather than leaving it in the bit list.
+	 *
+	 * This used to warn about an A-device holding a session with HM clear,
+	 * which is what an armed host over an empty socket looks like -- so it
+	 * cried wolf on the one state the port is supposed to reach, in every
+	 * dump, for several boots. The states actually worth a warning are the
+	 * two that cannot host anything: no session at all, and a session that
+	 * arbitrated the wrong way round.
 	 */
-	if ((devctl & J36_MUSB_DEVCTL_SESSION) &&
-	    !(devctl & J36_MUSB_DEVCTL_BDEVICE) &&
-	    !(devctl & J36_MUSB_DEVCTL_HM))
+	if (!j36_musb_host_armed(devctl))
 		dev_warn(p->dev,
-			 "MUSB %s: this is an A-device holding a session it never became the host of -- the root hub will not scan its port and nothing can enumerate\n",
-			 when);
+			 "MUSB %s: not armed as a host -- %s, so the root hub will not scan its port and nothing plugged in can enumerate\n",
+			 when,
+			 !(devctl & J36_MUSB_DEVCTL_SESSION)
+				? "there is no session on the bus"
+				: (devctl & J36_MUSB_DEVCTL_BDEVICE
+					? "the core arbitrated itself into the B-device role"
+					: "VBUS never came up inside the session"));
 
 	/* EPINFO is TX count in [3:0] and RX count in [7:4], neither counting
 	 * ep0; RAMINFO is the FIFO RAM address width in [3:0] and the DMA
@@ -1659,41 +1701,6 @@ static void j36_musb_stand_down(struct j36_usb_phy *p)
 	}
 
 	msleep(J36_MUSB_SESSION_GAP_MS);
-}
-
-/*
- * ── WHAT "IT TOOK" ACTUALLY LOOKS LIKE, AND WHY IT IS NOT HM ─────────────────
- *
- * DEVCTL.HOSTMODE is set by the core when it is ACTING as a host, and an
- * A-device holding a session over an EMPTY socket is not acting as anything
- * yet: there is no connect to answer, no reset to drive, no SOF to send. HM
- * appears with the CONNECT interrupt, which needs a device pulling D+ up, which
- * needs the session -- so a driver that tears the session down because HM is
- * clear has removed the only thing that could ever set it. That loop is exactly
- * what the log reads as "attempt 1 of 4 ... 4 of 4 ... the core will not take
- * host mode", and the port it leaves behind has no session at all (DEVCTL 98),
- * which is why nothing enumerates and nothing is powered.
- *
- * The vendor driver this file is transcribed from never reads HM anywhere.
- * musb_id_pin_work() sets the role, calls musb_start(), and then says
- * MUSB_HST_MODE(musb) -- a software variable. Mainline does the same, from the
- * CONNECT and SESSREQ interrupt handlers.
- *
- * So the test is the state a host is ARMED in, all of which the core sets
- * itself and all of which the log has been printing as a failure: A-device
- * (arbitration went our way), SESSION held, VBUS comparators at or above
- * AValid. HM is accepted too -- a port with a device on it is obviously fine --
- * but it is not required, and requiring it is the bug.
- */
-static bool j36_musb_host_armed(u8 devctl)
-{
-	if (devctl & J36_MUSB_DEVCTL_HM)
-		return true;
-
-	return !(devctl & J36_MUSB_DEVCTL_BDEVICE) &&
-	       (devctl & J36_MUSB_DEVCTL_SESSION) &&
-	       ((devctl & J36_MUSB_DEVCTL_VBUS) >> J36_MUSB_DEVCTL_VBUS_SHIFT) >=
-	       J36_MUSB_VBUS_AVALID;
 }
 
 /*
@@ -2217,9 +2224,9 @@ apply:
 			dev_info(p->dev,
 				 "session started as an A-device: DEVCTL %02x [VBUS %s], the core is %s\n",
 				 devctl, j36_musb_vbus_str(devctl),
-				 devctl & J36_MUSB_DEVCTL_HM
-					? "the HOST -- the root port can scan now"
-					: "NOT the host yet; musb_start() has not run, so the poll arms it again once it has");
+				 j36_musb_host_armed(devctl)
+					? "armed as a host -- the root port can scan now"
+					: "NOT armed yet; musb_start() has not run, so the poll arms it again once it has");
 	} else {
 		/* VBUS first. A B-device that went on driving 5 V would be
 		 * fighting whatever just plugged in, and on this board the
