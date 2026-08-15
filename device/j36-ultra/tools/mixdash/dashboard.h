@@ -48,6 +48,7 @@
 class Busy;
 class DiagnosticsPage;
 class DisplayPage;
+class FilesPage;
 class Joypad;
 class Keyboard;
 class RegionPage;
@@ -55,9 +56,7 @@ class MediaPage;
 class MousePage;
 class PackagesPage;
 class Pointer;
-class QFileSystemModel;
 class QLabel;
-class QListView;
 class QProcess;
 class QTimer;
 class SettingsPage;
@@ -67,45 +66,14 @@ class VolumeOverlay;
 class WifiPage;
 
 /*
- * The file browser.  QFileSystemModel and QListView do the work; what is written
- * here is the D-pad contract -- up and down move, A descends or opens, B climbs
- * and then falls through, which is how the shell knows to pop the page.
+ * THE FILE BROWSER USED TO BE DECLARED HERE and is now files.h.
  *
- * IT IS THE ONE PAGE THAT USES A MODEL AND A VIEW.  Everything else in this
- * dashboard paints its own rows through ListPane, because eight settings do not
- * need a model.  A directory on an SD card can have four thousand entries in it,
- * and that is exactly what QFileSystemModel and QListView are for.
+ * It was one QListView and a title bar while there was one filesystem to look at.
+ * There is not: a USB stick appears under /media without anybody asking, gets a
+ * card on the grid, and opens a browser confined to itself -- which needs a places
+ * panel, an address bar, a search box, an info panel and a scope, and none of that
+ * belongs in the shell's own header.
  */
-class FilesPage : public PageWidget
-{
-    Q_OBJECT
-
-public:
-    explicit FilesPage(QWidget *parent = nullptr);
-
-    QString title() const override;
-    bool handleNav(int action) override;
-
-    QString rootPath() const { return m_root; }
-
-signals:
-    void openRequested(const QString &path);
-
-protected:
-    void paintEvent(QPaintEvent *event) override;
-
-private:
-    void setRoot(const QString &path);
-    void step(int delta);
-    void enter();
-    /* False when there is nowhere further up, which the shell reads as "pop me". */
-    bool leave();
-
-    QFileSystemModel *m_model = nullptr;
-    QListView *m_view = nullptr;
-    QString m_root;
-    QString m_base;
-};
 
 class Dashboard : public QWidget
 {
@@ -150,7 +118,11 @@ public:
         InternalSettings,
         InternalInfo,
         InternalPoweroff,
-        InternalBrowser
+        InternalBrowser,
+        /* A mounted USB volume.  The card carries no path -- the key is the handle,
+         * and Volumes::byKey turns it back into a mount point at the moment it is
+         * pressed, which is the only moment the answer is known to be current. */
+        InternalVolume
     };
 
     explicit Dashboard(QWidget *parent = nullptr);
@@ -181,6 +153,17 @@ protected:
 private slots:
     void onAppActivated(int index);
     void onOpenRequested(const QString &path);
+
+    /*
+     * A disk was plugged in or pulled out, so the grid has a card more or a card
+     * fewer.  The whole grid is rebuilt rather than one card being inserted: the
+     * cards are built in one function from one list, and a second path that adds
+     * one card would be a second place for the arrangement to be applied.
+     */
+    void onVolumesChanged();
+    /* Eject was chosen from a card's long-press menu.  The unmount is bounded and
+     * blocking -- see Volumes::eject -- so this puts the spinner up first. */
+    void onEjectRequested(int index);
 
     /* From any page, through PageWidget's signals. */
     void onToastRequested(const QString &text, int ms);

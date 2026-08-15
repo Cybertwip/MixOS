@@ -7,6 +7,7 @@
 
 #include "busy.h"
 #include "diagnostics.h"
+#include "files.h"
 #include "joypad.h"
 #include "keyboard.h"
 #include "media.h"
@@ -20,23 +21,21 @@
 #include "theme.h"
 #include "trace.h"
 #include "volume.h"
+#include "volumes.h"
 #include "wifi.h"
 
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
-#include <QFileSystemModel>
 #include <QFontMetrics>
 #include <QKeyEvent>
 #include <QLabel>
-#include <QListView>
 #include <QPainter>
 #include <QPainterPath>
 #include <QProcess>
 #include <QRadialGradient>
 #include <QResizeEvent>
 #include <QTimer>
-#include <QVBoxLayout>
 
 /*
  * There is no <linux/vt.h>, <linux/kd.h>, <sys/ioctl.h>, <sys/wait.h>, <signal.h>,
@@ -172,231 +171,6 @@ int navForKey(int qtKey)
 }
 
 } /* namespace */
-
-/* ── FilesPage ───────────────────────────────────────────────────────────── */
-
-/*
- * ANNOUNCED STEP BY STEP, and here more than anywhere else in this file.  This page
- * is the only one that hands a Qt class a path off the SD card and lets it go and
- * look: QFileSystemModel does its work on a thread of its own (QFileInfoGatherer),
- * so a throw inside it aborts the process while the main thread is still building
- * widgets, and the last thing printed is the only evidence of where that was.  Every
- * other page is arithmetic and QPainter calls.
- */
-FilesPage::FilesPage(QWidget *parent)
-    : PageWidget(parent)
-{
-    /*
-     * /run/j36/card first: that is the card's data partition, mounted read-only by
-     * the initramfs because there is no keyboard on this board and no other way to
-     * reach it.  It is also the only directory here whose contents the operator put
-     * there, which makes it the useful place to open on.  The home directories are
-     * the fallback for a boot without that mount, and / for a rootfs with neither.
-     * /home/virtua is the login user's home and the DATA partition's mount point;
-     * /home/ark is what a card written before the rename calls the same directory.
-     */
-    Trace::step("FilesPage: choosing a base directory");
-    m_base = QFileInfo::exists("/run/j36/card") ? QString("/run/j36/card")
-           : QFileInfo::exists("/home/virtua")  ? QString("/home/virtua")
-           : QFileInfo::exists("/home/ark")     ? QString("/home/ark")
-           : QFileInfo::exists("/root")         ? QString("/root")
-                                                : QString("/");
-
-    Trace::step("FilesPage: QFileSystemModel");
-    m_model = new QFileSystemModel(this);
-    m_model->setFilter(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden);
-
-    /* Starts the gatherer thread walking the card. */
-    Trace::step("FilesPage: setRootPath -- starts the gatherer thread on the card");
-    m_model->setRootPath(m_base);
-
-    Trace::step("FilesPage: QListView");
-    m_view = new QListView(this);
-    m_view->setModel(m_model);
-    m_view->setFrameShape(QFrame::NoFrame);
-    m_view->setUniformItemSizes(true);
-    m_view->setSelectionMode(QAbstractItemView::SingleSelection);
-    m_view->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    m_view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    m_view->setVerticalScrollMode(QAbstractItemView::ScrollPerItem);
-    m_view->viewport()->setAutoFillBackground(false);
-
-    /*
-     * :!active is not optional.  The dashboard drives this view from evdev rather
-     * than through Qt's focus, so the window may never be "active" as Qt counts it,
-     * and without that selector the selection is drawn in the inactive palette --
-     * grey on grey, which reads as nothing being selected at all.
-     */
-    Trace::step("FilesPage: stylesheet");
-    m_view->setStyleSheet(
-        "QListView { background: transparent; border: none; color: #E8EAF2;"
-        "            font-size: 13px; outline: none; }"
-        "QListView::item { height: 24px; padding-left: 6px; border-radius: 6px; }"
-        "QListView::item:selected, QListView::item:selected:!active {"
-        "            background: #0A84FF; color: #FFFFFF; }"
-        "QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }"
-        "QScrollBar::handle:vertical { background: #5C606C; border-radius: 3px;"
-        "            min-height: 24px; }"
-        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
-        "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {"
-        "            background: transparent; }");
-
-    Trace::step("FilesPage: layout");
-    QVBoxLayout *layout = new QVBoxLayout(this);
-    layout->setContentsMargins(Theme::Margin + 12, Theme::Margin + 42,
-                               Theme::Margin + 12, Theme::Margin + 10);
-    layout->addWidget(m_view);
-
-    /*
-     * QFileSystemModel populates on a worker thread, so the row count is zero for
-     * a moment after every setRootPath and selecting row 0 straight away selects
-     * nothing.  This puts the cursor on the first entry as soon as the directory
-     * actually arrives.
-     */
-    connect(m_model, &QFileSystemModel::directoryLoaded, this, [this](const QString &path) {
-        if (QDir::cleanPath(path) != m_root)
-            return;
-        if (!m_view->currentIndex().isValid()) {
-            const QModelIndex root = m_model->index(m_root);
-            if (m_model->rowCount(root) > 0)
-                m_view->setCurrentIndex(m_model->index(0, 0, root));
-        }
-        update();
-    });
-
-    Trace::step("FilesPage: setRoot -- reads the directory");
-    setRoot(m_base);
-}
-
-QString FilesPage::title() const
-{
-    return m_root.isEmpty() ? tr("Files") : m_root;
-}
-
-void FilesPage::setRoot(const QString &path)
-{
-    m_root = QDir::cleanPath(path);
-    m_model->setRootPath(m_root);
-    const QModelIndex root = m_model->index(m_root);
-    m_view->setRootIndex(root);
-    m_view->setCurrentIndex(m_model->index(0, 0, root));
-    emit titleChanged();
-    update();
-}
-
-void FilesPage::step(int delta)
-{
-    const QModelIndex root = m_model->index(m_root);
-    const int rows = m_model->rowCount(root);
-    if (rows <= 0)
-        return;
-
-    const QModelIndex current = m_view->currentIndex();
-    int row = current.isValid() ? current.row() + delta : 0;
-    row = qBound(0, row, rows - 1);
-    const QModelIndex next = m_model->index(row, 0, root);
-    m_view->setCurrentIndex(next);
-    m_view->scrollTo(next);
-}
-
-void FilesPage::enter()
-{
-    const QModelIndex current = m_view->currentIndex();
-    if (!current.isValid())
-        return;
-    const QString path = m_model->filePath(current);
-    if (m_model->isDir(current))
-        setRoot(path);
-    else
-        emit openRequested(path);
-}
-
-bool FilesPage::leave()
-{
-    if (m_root == "/")
-        return false;
-    QDir dir(m_root);
-    if (!dir.cdUp())
-        return false;
-    const QString child = m_root;
-    setRoot(dir.absolutePath());
-    /* Come back to the directory we just left, not to the top of its parent. */
-    const QModelIndex idx = m_model->index(child);
-    if (idx.isValid()) {
-        m_view->setCurrentIndex(idx);
-        m_view->scrollTo(idx);
-    }
-    return true;
-}
-
-bool FilesPage::handleNav(int action)
-{
-    switch (action) {
-    case Joypad::NavUp:
-        step(-1);
-        return true;
-    case Joypad::NavDown:
-        step(1);
-        return true;
-    case Joypad::NavRight:
-    case Joypad::NavOk:
-        enter();
-        return true;
-    case Joypad::NavLeft:
-        /* Up a directory.  This is the ONLY thing that goes up now -- see B
-         * below -- and it is the mirror of Right, which goes down. */
-        return leave();
-    case Joypad::NavBack:
-        /*
-         * B leaves the page, from any depth, and never changes directory.
-         *
-         * It used to climb one directory per press and only pop the page once it
-         * reached the top, so the number of presses it took to get back to the
-         * dashboard was however deep the browsing had gone -- and every press on
-         * the way redrew a directory nobody was looking at.  One button doing two
-         * jobs also meant a press could not be predicted without knowing where in
-         * the tree you were.
-         *
-         * m_root is a member and nothing here resets it, so the directory is
-         * remembered across leaving and re-entering the page.
-         */
-        return false;
-    default:
-        return false;
-    }
-}
-
-void FilesPage::paintEvent(QPaintEvent *)
-{
-    QPainter p(this);
-    p.setRenderHint(QPainter::Antialiasing, true);
-
-    const QRectF card(Theme::Margin, Theme::Margin,
-                      width() - 2.0 * Theme::Margin, height() - 2.0 * Theme::Margin);
-    Theme::softShadow(p, card, Theme::Radius, 6, 24);
-    Theme::vgrad(p, card, Theme::window(), Theme::window().darker(112), Theme::Radius);
-    p.setBrush(Qt::NoBrush);
-    p.setPen(QPen(Theme::border(), 1.0));
-    p.drawRoundedRect(card.adjusted(0.5, 0.5, -0.5, -0.5), Theme::Radius, Theme::Radius);
-
-    QPainterPath clip;
-    clip.addRoundedRect(card, Theme::Radius, Theme::Radius);
-    p.save();
-    p.setClipPath(clip);
-    const QRectF head(card.x(), card.y(), card.width(), 34);
-    Theme::vgrad(p, head, Theme::titlebar(), Theme::titlebarLow());
-    p.setPen(QPen(Theme::separator(), 1.0));
-    p.drawLine(QPointF(head.x(), head.bottom() - 0.5), QPointF(head.right(), head.bottom() - 0.5));
-    p.restore();
-
-    const QFont f = Theme::font(13, true);
-    const QFontMetrics fm(f);
-    p.setFont(f);
-    p.setPen(Theme::ink());
-    const QRectF text = head.adjusted(14, 0, -14, 0);
-    p.drawText(text, Qt::AlignLeft | Qt::AlignVCenter,
-               fm.elidedText(m_root, Qt::ElideMiddle, (int)text.width()));
-}
 
 /* ── Dashboard ───────────────────────────────────────────────────────────── */
 
