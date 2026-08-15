@@ -48,9 +48,10 @@
  * a black screen with no way back.  So the node is never guessed and never taken from
  * the command line by default:
  *
- *     DRM_IOCTL_VERSION is asked for the driver's NAME, and unless that name is on the
- *     allow-list -- "udl", and nothing else without -n -- the node is closed again
- *     without another ioctl being sent to it.
+ *     DRM_IOCTL_VERSION is asked for the driver's NAME, and unless that name is one
+ *     this board did NOT bring up itself -- never "lima", never "mediatek"; see the
+ *     deny-list at board_drivers[] and the paragraph over it -- the node is closed
+ *     again without another ioctl being sent to it.
  *
  * That is a stronger test than "card1 and not card0".  Minor numbers here are assigned
  * in probe order and this board has up to three DRM drivers in play (lima, mediatek,
