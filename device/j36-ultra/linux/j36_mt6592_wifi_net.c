@@ -197,6 +197,19 @@ static const u32 j36_wlan_cipher_suites[] = {
 };
 
 /*
+ * The address a GROUP key is filed under in CMD_802_11_KEY.
+ *
+ * It is the broadcast address and not the AP's, because what the firmware matches
+ * it against is the destination of a group-addressed frame.  cfg80211 says the
+ * same thing by omission -- .add_key gets a mac_addr for a pairwise key and NULL
+ * for a group one -- and reading that NULL as "no peer, use the BSSID" is what
+ * used to make every broadcast the AP sent undecryptable.  See .add_key.
+ */
+static const u8 j36_wlan_group_addr[ETH_ALEN] = {
+	0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+};
+
+/*
  * WPA2-PSK and nothing else, said out loud rather than left for a connect to
  * discover.  The key command this driver sends carries CIPHER_SUITE_CCMP and a
  * sixteen-byte key, so TKIP and WEP are not near-misses that might work -- and
@@ -1336,7 +1349,32 @@ static int j36_wlan_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 		goto out;
 	}
 
-	peer = mac_addr ? mac_addr : wlan->bss.bssid;
+	/*
+	 * ── THE ADDRESS A GROUP KEY IS FILED UNDER, AND THE BUG THAT WAS HERE ──
+	 *
+	 * A group key names the BROADCAST address.  Not the AP's.  The comment over
+	 * j36_wlan_cmd_install_key() has said so since it was written -- "a pairwise
+	 * key names the AP and sets both flags, a group key names the broadcast
+	 * address and sets neither" -- and this line used to fall back to the BSSID
+	 * for both, because cfg80211 passes mac_addr for a pairwise key and NULL for
+	 * a group one and NULL was read as "no peer given" rather than as the peer it
+	 * actually is.
+	 *
+	 * Filed under the BSSID the GTK is a key the firmware never matches, because
+	 * what it matches a group-addressed frame against is ff:ff:ff:ff:ff:ff.  So
+	 * every broadcast and multicast frame the AP sent was undecryptable and
+	 * silently dropped, and NOTHING ABOVE COULD SEE IT: association completed,
+	 * the four-way handshake completed, unicast worked, the link showed as up.
+	 *
+	 * What died was DHCP.  A DHCP server answers a station that has no address
+	 * yet by broadcasting, and so does every ARP request on the segment, so the
+	 * board sat in ip-config until whatever was asking gave up -- dhcpcd falling
+	 * back to 169.254.x.x when this page ran its own client, and
+	 * "Timeout expired" once NetworkManager's did.  One wrong address in one
+	 * command, and it looked like a radio that could not reach the internet.
+	 */
+	peer = pairwise ? (mac_addr ? mac_addr : wlan->bss.bssid)
+			: j36_wlan_group_addr;
 	j36_wlan_drain_tx(wlan);
 	ret = j36_wlan_cmd_install_key(w, peer, key_index, pairwise,
 				       params->key);
@@ -1371,7 +1409,13 @@ static int j36_wlan_cfg_del_key(struct wiphy *wiphy, struct net_device *ndev,
 		ret = 0;
 		goto out;
 	}
-	ret = j36_wlan_cmd_remove_key(w, mac_addr ? mac_addr : wlan->bss.bssid,
+	/* Same address rule as .add_key, and it has to be the same or the remove
+	 * names a key that was never installed: the firmware finds the entry by the
+	 * address it went in under. */
+	ret = j36_wlan_cmd_remove_key(w,
+				      pairwise ? (mac_addr ? mac_addr
+							   : wlan->bss.bssid)
+					       : j36_wlan_group_addr,
 				      key_index, pairwise);
 out:
 	mutex_unlock(&w->lock);
