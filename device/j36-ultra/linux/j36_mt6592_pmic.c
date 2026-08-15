@@ -1997,25 +1997,59 @@ static void j36_charger_arm(struct j36_pmic *p, bool online)
 
 /*
  * The termination ladder.  Full is a sequence, not a threshold: six consecutive
- * samples within 150 mA of zero, and only after the node has been seen at or
- * above the top-off voltage at least once in this charge run.  Once full, only
- * dropping below the recharge voltage clears it.
+ * samples that say the pack has stopped taking charge -- either within 150 mA of
+ * zero, or with the coulomb integrator saturated -- and only after the node has
+ * been seen at or above the top-off voltage at least once in this charge run.
+ *
+ * Once full, ONE thing clears it, and it is a fact about the cell: the pack
+ * relaxing under the recharge voltage for the same six samples.  Not the cable
+ * coming out, and emphatically not `online' going false, which on this board is
+ * a comparator on a pin the board itself drives.
  */
 static void j36_ladder_advance(struct j36_pmic *p, bool online, int bat_mv,
 			       int ma, bool ma_valid)
 {
-	if (!online) {
-		/* Unplugged: nothing about full is meaningful, and the next plug
-		 * must re-earn top-off from scratch. */
-		p->full_count = 0;
-		p->recharge_count = 0;
-		p->topoff_seen = false;
-		p->charge_full = false;
-		return;
-	}
+	bool saturated;
 
-	if (bat_mv >= J36_V_CC2TOPOFF_MV)
+	/*
+	 * ── AN UNPLUG ENDS THE CHARGE RUN.  IT DOES NOT EMPTY THE PACK ──
+	 *
+	 * AND THIS IS THE "0% AFTER A FULL CHARGE" REPORT.  This branch used to
+	 * clear charge_full as well, on the reading that "nothing about full is
+	 * meaningful once the cable is out".  That reading is wrong twice over.
+	 *
+	 * It is wrong on its own terms: full is a statement about the PACK, and a
+	 * pack that was full one second ago is still full the next.  What un-fulls
+	 * it is the cell relaxing under the recharge line, which the block below
+	 * already tests, six samples deep, and which is just as true unplugged.
+	 *
+	 * And it is wrong about `online' ON THIS BOARD IN PARTICULAR.  The file's
+	 * header comment says it: the veto "moves the report, the plug edge, the
+	 * gauge and the ladder unconditionally", because CHRIN sits on the OTG
+	 * port's own 5 V net and a comparator on a pin this board drives cannot be
+	 * taken at face value.  So `online' goes false here for reasons that have
+	 * nothing whatever to do with the cell -- one lost VCHR conversion, one
+	 * charger sagging under load past the bar, the pad coming up.  Every one of
+	 * those used to throw the full latch away.
+	 *
+	 * Losing it is not cosmetic, because charge_full is what PINS the level in
+	 * j36_gauge_percent().  The moment it goes, a full pack is handed to the
+	 * two paths that can only walk downward -- the empty ramp at one percent
+	 * per second and the slew at one per thirty -- with a target computed from
+	 * a system node that this board's own OTG port is loading.  A hundred
+	 * seconds down one, fifty minutes down the other: "a few minutes/hours of
+	 * charge", and then 0%.
+	 *
+	 * What an unplug DOES end is the run.  full_count and topoff_seen are the
+	 * run's state, so the next cable in has to earn top-off and its six samples
+	 * from scratch; that part was right and is kept.
+	 */
+	if (!online) {
+		p->full_count = 0;
+		p->topoff_seen = false;
+	} else if (bat_mv >= J36_V_CC2TOPOFF_MV) {
 		p->topoff_seen = true;
+	}
 
 	if (p->charge_full) {
 		/*
@@ -2050,11 +2084,46 @@ static void j36_ladder_advance(struct j36_pmic *p, bool online, int bat_mv,
 	}
 	p->recharge_count = 0;
 
-	if (!p->topoff_seen)
+	/* Earning full needs a charger.  Losing it, above, does not. */
+	if (!online || !p->topoff_seen)
 		return;
 
+	/*
+	 * ── THE OTHER WAY TO BE FULL: THE INTEGRATOR HAS SATURATED ──
+	 *
+	 * MVII's ladder has this rung and this one did not, and on this board it is
+	 * the rung that matters, because the shunt this driver reads carries the
+	 * NET current -- charger in, minus everything the system is taking out of
+	 * VBAT, including the 5 V the OTG port sources for the whole uptime.  A
+	 * charger still sourcing several hundred milliamps into a pack that is
+	 * taking none of it therefore never shows up here as a small current, and
+	 * the six-in-a-row below never completes.  That leaves the level held at
+	 * the 99% cap in j36_gauge_percent() with no way out of it, which is what
+	 * stock spends MAX_CV_CHARGING_TIME waiting for and what this ladder was
+	 * meant to replace.
+	 *
+	 * Having delivered a whole pack's worth of coulombs with the node at or
+	 * past top-off IS the full condition; there is no more capacity to give and
+	 * nothing above 100% to show.  A live run that started depleted and has
+	 * reached soc_dep == 0 is exactly that statement, and the saturation in the
+	 * charging branch of j36_gauge_percent() is what makes it stick rather than
+	 * drift on past.
+	 *
+	 * Either way it is still SIX CONSECUTIVE samples, so neither one noisy
+	 * saturated reading nor a brief current dip latches full on its own.
+	 *
+	 * `> 0' AND NOT MVII'S `>= 0', DELIBERATELY.  A run that began at 100% has
+	 * delivered nothing, so its soc_dep == 0 is where it started and not where
+	 * the coulombs put it -- and this driver can start there without evidence.
+	 * Boot with a cable in and an unreadable OCV latch and the seed is taken
+	 * off the rail, which with no power-path FET is the charger's setpoint
+	 * whatever the pack holds; top-off is then "seen" off that same rail.  MVII
+	 * parks for a few seconds and never meets that case.  This runs for days.
+	 */
+	saturated = p->soc_car_base > 0 && p->soc_dep == 0;
+
 	/* An unknown current is not a small current. */
-	if (!ma_valid) {
+	if (!saturated && !ma_valid) {
 		p->full_count = 0;
 		return;
 	}
@@ -2076,15 +2145,18 @@ static void j36_ladder_advance(struct j36_pmic *p, bool online, int bat_mv,
 	 * carry the system and the pack is being drained.  Both are the same
 	 * question about magnitude, so one threshold answers both ends of it.
 	 */
-	if (ma > J36_CHARGING_FULL_CURRENT_MA || ma < -J36_CHARGING_FULL_CURRENT_MA) {
+	if (!saturated &&
+	    (ma > J36_CHARGING_FULL_CURRENT_MA ||
+	     ma < -J36_CHARGING_FULL_CURRENT_MA)) {
 		p->full_count = 0;
 		return;
 	}
 	if (++p->full_count >= J36_FULL_CHECK_TIMES) {
 		p->full_count = 0;
 		p->charge_full = true;
-		dev_info(p->dev, "battery full (six samples within %d mA of zero past top-off)\n",
-			 J36_CHARGING_FULL_CURRENT_MA);
+		dev_info(p->dev, "battery full (six samples %s past top-off)\n",
+			 saturated ? "with a pack's worth of charge delivered"
+				   : "within 150 mA of zero");
 	}
 }
 
@@ -2182,8 +2254,25 @@ static int j36_gauge_percent(struct j36_pmic *p, bool online, int bat_mv,
 	 * about to die, it is a flat pack being rescued, and the coulombs are the
 	 * better authority.  So the ramp is now the DISCHARGE floor it was always
 	 * described as, and a charging sample falls through to the integrator.
+	 *
+	 * ── AND IT IS THE CELL THAT HAS TO BE AT THE FLOOR, NOT THE RAIL ──
+	 *
+	 * The test was on bat_mv, which is stock's: BMT_status.bat_vol is a terminal
+	 * voltage and mt_battery_0Percent_tracking_check() compares it raw.  Stock is
+	 * entitled to.  ON A BOARD WHOSE VBAT IS THE SYSTEM NODE AND WHOSE OTG PORT
+	 * SOURCES 5 V OFF IT FOR THE WHOLE UPTIME, THIS DRIVER IS NOT.  Half an amp
+	 * across a couple of hundred milliohms is over a hundred millivolts of sag,
+	 * so a pack with real charge in it crosses 3450 mV at the connector while the
+	 * cell behind it is nowhere near empty -- and the ramp then costs a percent
+	 * per second, which is a hundred seconds from full to zero.
+	 *
+	 * The IR-compensated number two lines up is the cell.  That is the whole
+	 * reason it is computed, it is what target_dep below is already taken from,
+	 * and under a load it is the HIGHER of the two -- so this only ever declines
+	 * to ramp, never starts one that bat_mv would not have.  A cell genuinely at
+	 * the floor still ramps: at rest the two numbers are the same one.
 	 */
-	if (bat_mv <= J36_V_0PERCENT_TRACKING_MV && p->soc_dep >= 0 &&
+	if (ocv <= J36_V_0PERCENT_TRACKING_MV && p->soc_dep >= 0 &&
 	    !(ma_valid && ma > 0)) {
 		if (!p->soc_slew ||
 		    ktime_us_delta(now, p->soc_slew) >= J36_LADDER_INTERVAL_US) {
@@ -2235,6 +2324,26 @@ static int j36_gauge_percent(struct j36_pmic *p, bool online, int bat_mv,
 				      ktime_us_delta(now, p->soc_car_time);
 			moved = (int)div64_s64(p->soc_car, J36_SOC_CAR_PER_PCT);
 			p->soc_dep = p->soc_car_base - moved;
+			/*
+			 * A PACK CANNOT HOLD MORE THAN A PACK.  MVII saturates
+			 * here and this did not.  Left to run, the accumulator
+			 * goes on counting coulombs into a cell that stopped
+			 * taking them -- an hour of trickle past the top is
+			 * whole percents of surplus -- and everything downstream
+			 * then reads a level that is not a level: the clamp at
+			 * the foot of this function is the only thing holding
+			 * the published number at 100, the ladder's new
+			 * saturation rung would never see a settled soc_dep to
+			 * latch full on, and a recharge would re-base from a
+			 * fictional depth.  Winding soc_car back to exactly the
+			 * base makes 0 the value it holds rather than the value
+			 * it is clamped to.
+			 */
+			if (p->soc_dep <= 0) {
+				p->soc_dep = 0;
+				p->soc_car = (s64)p->soc_car_base *
+					     J36_SOC_CAR_PER_PCT;
+			}
 		}
 		p->soc_car_time = now;
 		p->soc_charge_time = now;
@@ -2298,9 +2407,13 @@ static int j36_gauge_percent(struct j36_pmic *p, bool online, int bat_mv,
 	 * looks like a fault.  Ending the coulomb run with it means a recharge
 	 * cycle re-bases from 100 instead of billing this pin to the accumulator.
 	 *
-	 * It cannot flap: charge_full is cleared only by the pack dropping under
-	 * the recharge voltage, or by the cable coming out, so this pins the level
-	 * for exactly as long as the pack is actually full.
+	 * It cannot flap: charge_full is cleared by ONE thing, the pack sitting
+	 * under the recharge voltage for six samples together, so this pins the
+	 * level for exactly as long as the pack is actually full.  The cable is not
+	 * one of the things that clears it -- see the head of j36_ladder_advance()
+	 * -- and that is deliberate, because on this board the cable is a report
+	 * and not a measurement.  A genuine unplug still gets out within six polls:
+	 * a full pack carrying the system drops under 4110 mV in seconds.
 	 */
 	if (p->charge_full) {
 		p->soc_dep = 0;
