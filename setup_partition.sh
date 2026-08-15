@@ -30,84 +30,69 @@ elif [[ "$ROOT_FILESYSTEM_FORMAT" == *"ext"* ]]; then
   ROOT_FILESYSTEM_FORMAT_PARAMETERS="-F -L ROOTFS"
   ROOT_FILESYSTEM_MOUNT_OPTIONS="defaults,noatime"
 fi
-# The third partition -- p3, historically EASYROMS -- is ext2 and labelled DATA now,
-# on the same reasoning as the rootfs and one more besides: it holds a Linux home
-# directory, whose dotfiles, ownership and execute bits vfat cannot express, which is
-# why the old flow formatted it vfat here and had firstboot immediately reformat it to
-# exfat and untar /roms.tar back onto it.  ext2 from the start removes that whole round
-# trip, and this kernel and the R36S's both mount it as they are.
+# ── THERE IS NO THIRD PARTITION ANY MORE ──────────────────────────────────────
 #
-# Kept as its own set of variables and not folded into ROOT_FILESYSTEM_*: the two
-# partitions are allowed to diverge, and a reader looking at p3 should not have to
-# work out whether the rootfs's -b 4096 was meant for it as well.
-DATA_LABEL="DATA"
-DATA_FILESYSTEM_FORMAT="ext2"
-# -b 1024 and not 4096: p3 starts at 300 MB and holds many small files, so the
-# smaller block wastes less in tails.  resize2fs grows it in these blocks on the
-# device just as happily.
-DATA_FILESYSTEM_FORMAT_PARAMETERS="-F -b 1024 -L ${DATA_LABEL}"
-# No umask/uid/gid: those are vfat and exfat options, and mount REFUSES them on ext2
-# -- an fstab line carrying them is a partition that does not come up at all.  ext2
-# stores real ownership instead, so the build chowns the tree to uid/gid 1000 once and
-# the virtua user can write to it from then on.
+# p3 was EASYROMS, then DATA: a separate ext2 partition mounted at /home/virtua, sized
+# 300 MB in the image and grown to the end of the card on the device.  It is gone, and
+# with it every DATA_* variable this file used to export.
 #
-# nofail, which the old /roms line did not have: this partition is now the user's home
-# and not a rom library, and a card whose p3 is missing, unformatted or half-written
-# must still reach a shell.  Without it systemd holds local-fs.target and the boot
-# stops at exactly the point the operator can no longer investigate.
-DATA_MOUNT_OPTIONS="defaults,auto,noatime,nofail"
-# /home/virtua and not /roms.  The mount point IS the login user's home directory, so a
-# shell lands on this partition: it is where bash starts, where the file explorer opens,
-# and the one place on the card meant to be written.  /roms was EmulationStation's name
-# for it, MixOS does not run EmulationStation, and neither the roms/ tree nor the /roms
-# symlink that used to point into it is created any more -- see finishing_touches.sh for
-# what was in there and why none of it had a reader left.  Under /home rather than a
-# top-level /virtua because it is a home directory and nothing else, and $HOME under
-# /home is what every tool on the card assumes.
+# WHY.  Two partitions were being grown into one card and only one of them could have
+# the slack.  ROOTFS was the one that could not -- it is not the last partition when p3
+# is there -- so the image had to carry its own package headroom, which is how
+# STORAGE_SIZE reached 16000 MB and the artifact reached 16.5 GB.  Deleting p3 makes
+# ROOTFS the last partition on the disk, which is the whole precondition for growing it
+# in place: the image ships at the size of what is in it, and the card's real capacity
+# is handed to the OS partition on the first boot instead.
 #
-# The account is named `virtua', uid 1000, after the directory rather than the other way
-# round.  It used to be `ark' with /home/ark a symlink to here, which meant one directory
-# answered to two names in every script that touched it; the scripts now say the one
-# name and the link is gone.  A card written before that still has `ark', which is why
-# the J36's USB mount helper looks the login user up instead of assuming it.
+# WHAT REPLACES IT.  Nothing, at the block layer.  /home/virtua is an ordinary directory
+# on the rootfs -- which is what it always was underneath the mount -- so a login lands
+# on the same tree it did before, on a partition that now has the whole card behind it.
+# The account is still `virtua', uid 1000, named after the directory rather than the
+# other way round; a card written before that still has `ark', which is why the J36's USB
+# mount helper looks the login user up instead of assuming it.
+#
+# DATA_MOUNT_POINT survives as a path and nothing else.  bootstrap_rootfs.sh and
+# finishing_touches.sh write dotfiles into it, and spelling it out in twenty places is
+# how the old `ark'/`virtua' split happened.  It names a directory now, not a mount.
 DATA_MOUNT_POINT="${DATA_MOUNT_POINT:-/home/virtua}"
 
 SYSTEM_SIZE=100      # FAT32 boot partition size in MB
 # The OS partition, and the number that decides how big the shipped image is.
 #
-# HOW 16000 WAS ARRIVED AT.  It used to be "what the rootfs weighs, rounded up to the
-# next whole 1000 MB", which gave 4000 for a build that measures 3384 MB -- and the
-# card that shipped had 240 MB free in p2, of which mkfs.ext2's default 5% reservation
-# claims 200.  One `apt-get update' against trixie/main/armhf does not fit in what is
-# left, never mind installing anything with it, and this image has a Packages page.
+# THE RULE: the rootfs, rounded up to the next whole GiB.  Nothing else.  A build that
+# measures 3384 MB gets 4096, and the shipped image is 4.2 GB end to end.
 #
-# So the rule changed rather than the arithmetic: the partition is sized for the base
-# system PLUS what somebody installs on the device afterwards, which is what a handheld
-# with a package manager on it is for.  16000 MB leaves about 12 GB for that.  The
-# floor is still enforced from below -- write_rootfs.sh refuses to dd a rootfs that
-# would run over the DATA partition and names the value to put here -- and the card has
-# to be 16.5 GB or bigger, DISK_SIZE having become 16417.  The long version, including
-# the debugfs read that produced those numbers, is beside STORAGE_SIZE in
-# device/r36-ultra/build-in-vm.sh.
+# It used to be 16000, and the reasoning behind that number was sound for the layout it
+# was written in: the partition had to carry every package anybody would ever install,
+# because p3 sat immediately after it and there was nowhere for it to grow.  So 12 GB of
+# emptiness was shipped, compressed, downloaded and written to a card by every single
+# person who flashed it, on the chance that some of them would use it.
+#
+# p3 is gone (see above), so ROOTFS is the last partition on the disk and the initramfs
+# grows it to the end of the card on the first boot -- see setup_expand() in
+# device/j36-ultra/build-in-vm.sh.  The headroom now comes from the card the operator
+# actually bought, which is both bigger than 12 GB and free.  What the image has to hold
+# is the base system and a little slack for the first boot before the resize lands, and
+# a whole GiB of rounding is more than enough of that.
+#
+# The floor is still enforced from below: write_rootfs.sh refuses to dd a rootfs that
+# does not fit and prints the exact value to put here.
 #
 # Assigned conditionally so that a caller which already set it wins: this file is
 # sourced by the checkpointed build in device/r36-ultra/build-in-vm.sh, which sets the
 # same geometry for the runs where this stage is skipped.  Two unconditional copies of
 # one number is one number that goes stale, and a build whose partition table and image
-# disagree about where p2 ends writes p2 over p3.
-STORAGE_SIZE="${STORAGE_SIZE:-16000}"   # Root filesystem size in MB
-ROM_PART_SIZE=300    # DATA partition size in MB (ext2, grown by firstboot)
+# disagree about where p2 ends writes a filesystem off the end of the disk.
+STORAGE_SIZE="${STORAGE_SIZE:-4096}"   # Root filesystem size in MB
 BUILD_SIZE=52000     # Initial file system size in MB during the build.  Then will be reduced to the DISK_SIZE or below upon completion
 
 SYSTEM_PART_START=32768
 SYSTEM_PART_END=$(( SYSTEM_PART_START + (SYSTEM_SIZE * 1024 * 1024 / 512) - 1 ))
 STORAGE_PART_START=$(( SYSTEM_PART_END + 1 ))
 STORAGE_PART_END=$(( STORAGE_PART_START + (STORAGE_SIZE * 1024 * 1024 / 512) - 1 ))
-ROM_PART_START=$(( STORAGE_PART_END + 1 ))
-ROM_PART_END=$(( ROM_PART_START + (ROM_PART_SIZE * 1024 * 1024 / 512) - 1 ))
 
 DISK_START_PADDING=$(( (SYSTEM_PART_START + 2048 - 1) / 2048 ))
-DISK_SIZE=$(( DISK_START_PADDING + SYSTEM_SIZE + STORAGE_SIZE + ROM_PART_SIZE + 1 ))
+DISK_SIZE=$(( DISK_START_PADDING + SYSTEM_SIZE + STORAGE_SIZE + 1 ))
 # Device-specific builders may supply a profile-specific filesystem name so a
 # minimal image cannot accidentally reuse a full application build.
 FILESYSTEM="${FILESYSTEM:-MixOS_File_System.img}"

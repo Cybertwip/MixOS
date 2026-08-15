@@ -76,11 +76,27 @@ sudo cp scripts/audiostate.service MixOSBuild/etc/systemd/system/audiostate.serv
 sudo chroot MixOSBuild/ bash -c "systemctl enable audiopath"
 sudo chroot MixOSBuild/ bash -c "systemctl enable audiostate"
 
-# Copy necessary tools for expansion of ROOTFS and convert fat32 games partition to exfat on initial boot
+# ── firstboot: STAGED, AND DELIBERATELY NOT ENABLED ──────────────────────────
+#
+# firstboot.sh grew p3 to the end of the card, MKFS'D it, and untarred /roms.tar back
+# onto what it had just erased, in two stages with a reboot in the middle.  Every part
+# of that describes a layout that no longer exists: there is no p3, /home/virtua is a
+# directory on the rootfs, and roms.tar is not built any more.
+#
+# LEAVING IT ENABLED WOULD BE DESTRUCTIVE, not merely useless.  What sits after p2 on a
+# flashed card is unallocated space, and that space is what the initramfs gives to
+# ROOTFS on the first boot -- the same space firstboot.sh would carve a fresh partition
+# out of, whichever of the two ran first.  So it is disabled here rather than left to
+# the J36's `systemd.mask=firstboot.service' bootarg, which only covers one of the two
+# boards that boot this rootfs.
+#
+# The scripts still go onto the BOOT partition.  They are the recovery path for a card
+# whose table has been damaged, they are readable from any machine that mounts FAT, and
+# neither of them runs unless somebody runs it.
 sudo cp scripts/expandtoexfat.sh.${CHIPSET} ${mountpoint}/expandtoexfat.sh
 sudo cp scripts/firstboot.sh ${mountpoint}/firstboot.sh
 sudo cp scripts/firstboot.service MixOSBuild/etc/systemd/system/firstboot.service
-sudo chroot MixOSBuild/ bash -c "systemctl enable firstboot"
+sudo chroot MixOSBuild/ bash -c "systemctl disable firstboot"
 
 # Add hotkeydaemon service and python script
 sudo cp hotkeydaemon/killer_daemon.service MixOSBuild/etc/systemd/system/killer_daemon.service
@@ -88,21 +104,20 @@ sudo cp hotkeydaemon/killer_daemon.py MixOSBuild/usr/local/bin/killer_daemon.py
 sudo chmod 777 MixOSBuild/usr/local/bin/killer_daemon.py
 sudo chroot MixOSBuild/ bash -c "systemctl disable killer_daemon"
 
-# Generate the fstab firstboot installs after it has grown the partitions.  Still
-# called fstab.exfat because that is the name expandtoexfat.sh copies from /boot, and
-# renaming a file two scripts agree on is not worth the churn -- but nothing about it is
-# exfat any more: p3 is ext2 labelled DATA, mounted with real ownership rather than
-# vfat's umask/uid/gid, which mount would refuse on ext2 outright.
+# The spare copy of the fstab, on the BOOT partition, where a card reader can get at it.
 #
-# It is mounted at ${DATA_MOUNT_POINT} -- /home/virtua, the login user's home directory
-# -- and not at /roms, which no longer exists in any form.
+# Still called fstab.exfat because that is the name expandtoexfat.sh copies from /boot
+# and renaming a file two scripts agree on is not worth the churn -- but nothing about
+# it is exfat any more, and as of this layout nothing about it is a third partition
+# either.  The DATA line went with the partition it mounted (see setup_partition.sh);
+# ${DATA_MOUNT_POINT} is a plain directory on the rootfs now.
 #
-# A fourth line used to sit at the bottom of this file: a bind of
-# ${DATA_MOUNT_POINT}/roms/tools onto /opt/system/Tools.  It went with the roms tree.
-# The one thing that read through it was global/importwifi.sh, which looks for
-# wifikeyfile.txt in /opt/system/Tools and does nothing when it is not there -- so it is
-# inert rather than broken, and its replacement belongs with the network stack this
-# board does not have yet.
+# What it is FOR has changed with it.  firstboot.sh used to install this over /etc/fstab
+# as its last act, after growing p3; that script is disabled a few lines up, because the
+# partition it grew is gone and the initramfs grows ROOTFS instead.  So this file is a
+# recovery copy: two lines, in plain text, on the one partition a Windows or macOS
+# machine will mount, for the boot where /etc/fstab on p2 has been edited into something
+# that does not come up.
 if [ "$ROOT_FILESYSTEM_FORMAT" == "btrfs" ]; then
   ROOT_FILESYSTEM_MOUNT_OPTIONS="${ROOT_FILESYSTEM_MOUNT_OPTIONS},ssd_spread"
 fi
@@ -110,7 +125,6 @@ cat <<EOF | sudo tee ${mountpoint}/fstab.exfat
 LABEL=ROOTFS / ${ROOT_FILESYSTEM_FORMAT} ${ROOT_FILESYSTEM_MOUNT_OPTIONS} 0 0
 
 LABEL=BOOT /boot vfat defaults 0 2
-LABEL=${DATA_LABEL} ${DATA_MOUNT_POINT} ${DATA_FILESYSTEM_FORMAT} ${DATA_MOUNT_OPTIONS} 0 2
 EOF
 
 # Disable getty on tty0 and tty1
@@ -381,125 +395,41 @@ sudo losetup -d ${LOOP_BOOT}
 
 # Format rootfs partition in final image
 #
-# --sizelimit, like the DATA branch below: without it the loop device runs to the end of
-# the image, and mkfs then lays inode tables and group descriptors across the DATA
-# partition as well.  Today that is survivable only because the DATA mkfs.ext2 a few
-# lines down happens afterwards and wipes them; it is not a property worth depending on.
+# --sizelimit is what makes the loop device stop where the partition stops.  Without it
+# it runs to the end of the image file and mkfs sizes the filesystem for all of that,
+# which used to mean inode tables laid across p3.  p3 is gone and the image now ends
+# where p2 does, so the same mistake would be invisible here and would surface on the
+# device -- as a superblock claiming more blocks than the partition has, on the one
+# filesystem the initramfs is about to hand the rest of the card to.
 ROOTFS_PART_OFFSET=$((STORAGE_PART_START * 512))
 ROOTFS_PART_SIZE_BYTES=$(( (STORAGE_PART_END - STORAGE_PART_START + 1) * 512 ))
 LOOP_ROOTFS=$(sudo losetup --find --show --offset ${ROOTFS_PART_OFFSET} --sizelimit ${ROOTFS_PART_SIZE_BYTES} ${DISK})
 sudo mkfs.${ROOT_FILESYSTEM_FORMAT} ${ROOT_FILESYSTEM_FORMAT_PARAMETERS} ${LOOP_ROOTFS}
 sudo losetup -d ${LOOP_ROOTFS}
 
-# Format ROMS partition in final image
-ROM_PART_OFFSET=$((ROM_PART_START * 512))
-ROM_PART_SIZE_BYTES=$(( (ROM_PART_END - ROM_PART_START + 1) * 512 ))
-LOOP_ROM=$(sudo losetup --find --show --offset ${ROM_PART_OFFSET} --sizelimit ${ROM_PART_SIZE_BYTES} ${DISK})
-if [ -z "$LOOP_ROM" ]; then
-  echo "❌ Failed to create loop device for ROMS partition!"
-  echo "ROM_PART_START: $ROM_PART_START"
-  echo "ROM_PART_END: $ROM_PART_END"
-  echo "ROM_PART_OFFSET: $ROM_PART_OFFSET"
-  echo "ROM_PART_SIZE_BYTES: $ROM_PART_SIZE_BYTES"
-  exit 1
-fi
-# ext2 and labelled DATA, not vfat and EASYROMS.  This partition holds Linux content --
-# roms, bios, themes, tools, and whatever is dropped on it from a PC -- and the old flow
-# formatted it vfat here only for firstboot to reformat it exfat on the device and untar
-# /roms.tar back onto it.  Formatting it as its final filesystem here removes that whole
-# round trip.  ${DATA_FILESYSTEM_FORMAT_PARAMETERS} carries the label.
-sudo mkfs.${DATA_FILESYSTEM_FORMAT} ${DATA_FILESYSTEM_FORMAT_PARAMETERS} ${LOOP_ROM}
-# The partition mounts at ${DATA_MOUNT_POINT} -- /home/virtua -- on the device, so its
-# root is a home directory and nothing else.  Here it is mounted at mnt/data, and every
-# line below writes to that directly.
+# ── THE ROMS/DATA PARTITION, AND WHY THERE IS NOTHING HERE ANY MORE ──────────
 #
-# A second variable used to sit beside this one -- fat32_mountpoint, pointing one level
-# deeper at mnt/data/roms -- because the rom library was the only thing this file put on
-# the partition.  It went with the tree it named; see the block just below.
-data_mountpoint=mnt/data
-mkdir -p ${data_mountpoint}
-sudo mount -t ${DATA_FILESYSTEM_FORMAT} ${LOOP_ROM} ${data_mountpoint}
-
-# ── THE roms/ TREE, AND WHY THERE IS NOTHING HERE ANY MORE ───────────────────
+# A hundred and twenty lines stood here.  They attached a loop device to p3, ran
+# mkfs.ext2 on it with the DATA label, mounted it at mnt/data, copied the rootfs's
+# /home/virtua onto it, wrote a .mixos-home stamp at its root for the J36 initramfs to
+# recognise, chowned the lot to 1000:1000, and tarred it up as MixOSBuild/roms.tar for a
+# firstboot that might one day have to recreate it.
 #
-# This is where a roms/ directory was created on the DATA partition, with
-# backup/ bgmusic/ bios/ shutdownimages/ themes/ tools/ inside it, a bye.gif
-# copied into shutdownimages/, and /roms on the rootfs symlinked to the lot.
+# All of it existed to make a separate partition look like the home directory it was
+# mounted over.  The partition is gone -- see setup_partition.sh -- so the home
+# directory is simply the home directory: the tree useradd -m built on the ROOTFS, that
+# every line above this one has been writing dotfiles into, owned by the virtua user by
+# the chroot chown further up and reached by a login with nothing mounted at all.
 #
-# Every one of those is an EmulationStation artefact.  themes/ and bgmusic/ were
-# read by the front end and by nothing else; bios/ was read by emulators; backup/
-# was the front end's save-state copy; tools/ held the /opt/system menu's scripts;
-# shutdownimages/ held one animated GIF that finish.sh and pause.sh played through
-# ffplay on the way down.  There is no front end on this image, no emulator, and
-# no /opt/system menu, so all six were directories that existed to be empty.
+# WHAT WENT WITH IT, so that a reader who greps for these names finds this note:
 #
-# The tree itself came earlier from one directory per line of game_systems.txt --
-# a hundred and some emulator folders, a PortMaster installer, a ThemeMaster
-# unzip, five pico-8 cartridges fetched from lexaloffle and a theme cloned from
-# GitHub.  That went when the emulators did; this is the rest of it.
+#   .mixos-home    the stamp.  It told the initramfs "this partition is the home
+#                  partition, leave it alone for systemd to mount rw".  With one
+#                  filesystem on the card there is nothing to tell apart.
+#   roms.tar       the seed archive, extracted by firstboot after it had reformatted
+#                  p3.  firstboot is disabled now and there is nothing to reformat.
+#   mnt/data       the build-side mount point.  Nothing to mount.
 #
-# THE PARTITION IS UNAFFECTED.  It is the login user's home directory -- it mounts
-# at ${DATA_MOUNT_POINT} -- and it is seeded from the rootfs copy of that home
-# directory just below, exactly as it was.  What is gone is one subdirectory of
-# it and the /roms symlink that pointed at that subdirectory.  A card written by
-# an older build still HAS roms/ in its home directory; nothing here deletes it,
-# and nothing reads it either.
-
-# The home directory itself.  useradd -m in setup_virtua_user built this tree on the ROOTFS,
-# under what is about to become a mount point: the skeleton, .config and the two
-# locale lines in .bashrc.  Once p3 mounts over it none of that is reachable,
-# so the same tree is copied onto the partition and the mounted and unmounted cases look
-# alike.
-if [[ -d "MixOSBuild${DATA_MOUNT_POINT}" ]]; then
-  echo -e "Seeding ${DATA_MOUNT_POINT} on the DATA partition from the rootfs copy\n"
-  sudo cp -a "MixOSBuild${DATA_MOUNT_POINT}/." ${data_mountpoint}/ || \
-    echo "⚠️  Could not copy the whole home tree onto p3 -- ${ROM_PART_SIZE:-300} MB may be too small for what is in it"
-fi
-
-# The stamp the J36's initramfs looks for.  /init has to recognise this partition to
-# leave it alone -- it is the one partition systemd mounts rw, and a read-only mount
-# from the initramfs would make that fstab entry fail with EBUSY -- and it cannot
-# identify it by label, having no blkid.  A file at the partition root is what it can
-# read.  Contents are for whoever finds it with a card reader; only the name matters.
-cat <<EOF | sudo tee ${data_mountpoint}/.mixos-home > /dev/null
-This partition is the MixOS home directory: it mounts at ${DATA_MOUNT_POINT}.
-Label ${DATA_LABEL}, ${DATA_FILESYSTEM_FORMAT}, owned by uid 1000.  It is yours to fill;
-nothing on the image expects any particular directory inside it.
-Do not delete this file: the J36 Ultra initramfs reads it to tell this partition apart
-from a plain data partition, and without it the boot mounts this one read-only.
-EOF
-sync
-
-# Ownership and modes, BEFORE roms.tar is made, so the tar carries them too.
-#
-# chown is new here and vfat never needed it: vfat has no ownership at all, and the old
-# fstab line handed the whole partition to uid 1000 with umask=000.  ext2 does have
-# ownership, so it has to be set once, here, while the partition is a loop device --
-# no mount option will do it afterwards.  1000:1000 is the virtua user, created by
-# setup_virtua_user in bootstrap_rootfs.sh; numeric because this is the host's mount and
-# the host has no such user.  775 so the virtua group can write and everyone can read.
-#
-# The whole partition and not just the rom library: its root is $HOME, and a home
-# directory owned by root is a login that cannot write its own dotfiles.  chmod skips
-# lost+found on purpose -- it is left at whatever mkfs made it.
-sudo chown -R 1000:1000 ${data_mountpoint}
-sudo find ${data_mountpoint} -mindepth 1 -name lost+found -prune -o -print0 | \
-  sudo xargs -0 --no-run-if-empty chmod 775
-sync
-
-# roms.tar, kept for firstboot on a card whose p3 it had to recreate.  With p3 already
-# ext2 there is nothing to restore in the normal case, and firstboot only reaches for
-# this if it repartitioned.  Run as root, so the 1000:1000 set above is what goes into
-# the archive; the matching half is on the extract side, in expandtoexfat.sh, which used
-# to pass --no-same-owner because the destination was exfat and could not hold it.
-#
-# The archive is the whole partition -- the home directory -- rather than a single roms/
-# top level, so firstboot extracts it AT ${DATA_MOUNT_POINT} and not at /.  lost+found is
-# excluded: the recreated filesystem has its own.  The NAME roms.tar is the last trace of
-# the old layout and is kept on purpose: expandtoexfat.sh and firstboot.sh both open it by
-# that name off /boot, and renaming a file three scripts agree on buys nothing.
-sudo tar -C ${data_mountpoint} --exclude=./lost+found -cvf MixOSBuild/roms.tar .
-
-sudo umount ${data_mountpoint}
-sudo losetup -d ${LOOP_ROM}
-sudo rm -rf ${data_mountpoint}
+# The last thing this file used to do to that partition -- chown -R 1000:1000 -- still
+# happens, in the chroot, against ${DATA_MOUNT_POINT} on the rootfs.  It is the one part
+# of the block that was about the home directory rather than about the partition.

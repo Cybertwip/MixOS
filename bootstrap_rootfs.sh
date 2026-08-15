@@ -133,17 +133,16 @@ sudo chroot MixOSBuild/ eatmydata apt-get install -y libdrm-dev libgbm1
 setup_virtua_user
 sleep 10
 echo -e "Generating /etc/fstab"
-# p3 is ext2 labelled DATA, not vfat labelled EASYROMS -- see setup_partition.sh.  No
-# umask/uid/gid on that line: mount refuses them on ext2, so carrying them over would
-# have been a home partition that never comes up.  Ownership is real instead, set once
-# by finishing_touches.sh to the virtua user setup_virtua_user just created.
+# TWO LINES, AND THERE USED TO BE THREE.  The third mounted p3 -- ext2, labelled DATA --
+# at ${DATA_MOUNT_POINT}, and that partition no longer exists: see setup_partition.sh.
 #
-# ${DATA_MOUNT_POINT} is /home/virtua and is that user's home directory, so a login
-# lands on p3.  It carries nofail: the home partition is not worth holding
-# local-fs.target for, and a card whose p3 is missing still has to reach a shell.
+# ${DATA_MOUNT_POINT} is /home/virtua and is still the login user's home directory.  It
+# is a plain directory on the rootfs now, which is what it always was underneath the
+# mount, so a login lands on the same tree -- on a partition that the initramfs has
+# grown to the size of the whole card.  Nothing has to be mounted for a shell to have a
+# home, which also takes away the nofail line and the silent EBUSY it was covering for.
 echo -e "LABEL=ROOTFS / ${ROOT_FILESYSTEM_FORMAT} ${ROOT_FILESYSTEM_MOUNT_OPTIONS} 0 1
-LABEL=BOOT /boot vfat defaults 0 0
-LABEL=${DATA_LABEL} ${DATA_MOUNT_POINT} ${DATA_FILESYSTEM_FORMAT} ${DATA_MOUNT_OPTIONS} 0 2" | sudo tee MixOSBuild/etc/fstab
+LABEL=BOOT /boot vfat defaults 0 0" | sudo tee MixOSBuild/etc/fstab
 echo -e "Generating 10-standard.rules for udev"
 echo -e "# Rules
 KERNEL==\"mali0\", GROUP=\"video\", MODE=\"0660\"
