@@ -993,16 +993,18 @@ QString MediaPage::mixerComplaint() const
 
 bool MediaPage::refreshMixerNote()
 {
-    /*
-     * Stamped BEFORE the derive and not after: mixerComplaint() forks amixer and
-     * Volume::read() calls remember() with the answer, which is itself a move of
-     * the counter the first time it disagrees with what was cached.  Stamping
-     * afterwards would take that move as somebody else's and fork again on the
-     * next tick, and again on the one after -- twice a second, forever.
-     */
-    m_volGeneration = Volume::generation();
     const QString was = m_mixerNote;
     m_mixerNote = mixerComplaint();
+    /*
+     * Stamped AFTER the derive, because the derive can move the counter itself:
+     * mixerComplaint() goes through Volume::read(), which forks amixer and hands
+     * the answer to remember(), and remember() counts an answer that differs from
+     * the cached one as a change -- which, on the first look after somebody else
+     * moved the mixer, it is.  Stamping beforehand would leave that move
+     * outstanding and buy a second fork on the next tick to discover the same
+     * thing.  Reading it here takes both moves at once.
+     */
+    m_volGeneration = Volume::generation();
     return m_mixerNote != was;
 }
 
@@ -2312,6 +2314,11 @@ void MediaPage::refreshChrome(const QRect &into)
         paintChrome(sp);
     }
     m_gl->setOverlay(GlVideo::ChromeLayer, strip, cr.translated(into.topLeft()));
+}
+
+bool MediaPage::glOwnsScreen() const
+{
+    return m_view == ViewVideo && m_gl && m_glShown;
 }
 
 /*

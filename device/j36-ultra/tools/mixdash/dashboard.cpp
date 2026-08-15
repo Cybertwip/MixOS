@@ -400,6 +400,7 @@ Dashboard::Dashboard(QWidget *parent)
      */
     Trace::step("Volume overlay");
     m_volumeBar = new VolumeOverlay(this);
+    connect(m_volumeBar, &VolumeOverlay::changed, this, &Dashboard::syncVolumeOverlay);
 
     Trace::step("Keyboard overlay");
     m_keyboard = new Keyboard(this);
@@ -901,6 +902,36 @@ void Dashboard::resizeEvent(QResizeEvent *event)
     QWidget::resizeEvent(event);
 }
 
+void Dashboard::syncVolumeOverlay()
+{
+    if (!m_volumeBar->isRedirected())
+        return;
+    if (!m_media || !m_media->glOwnsScreen()) {
+        /* The film ended between the press and this signal.  Nothing is drawing
+         * the bar any more, so give it back to Qt -- setRedirected() re-shows it
+         * if its three seconds are still running. */
+        m_volumeBar->setRedirected(false);
+        return;
+    }
+
+    /*
+     * mapToGlobal and not geometry(): the bar's geometry is in this widget's
+     * coordinates, and GlVideo wants the framebuffer's.  They are the same
+     * rectangle today, because the shell is the top level and it is full screen --
+     * which is exactly the kind of "the same today" that stops being true the
+     * first time anything is inset, and comes out as a volume bar drawn somewhere
+     * else entirely.  MediaPage::present() maps its own rectangle the same way.
+     */
+    const QRect at(m_volumeBar->mapToGlobal(QPoint(0, 0)), m_volumeBar->size());
+    m_media->setVolumeOverlay(m_volumeBar->snapshot(), at);
+
+    /* An expired bar hands back a null image, which clears the layer -- and the
+     * film is no longer being drawn over, so the redirect has nothing left to do.
+     * Dropping it here means the next press is decided fresh in onNav(). */
+    if (!m_volumeBar->isUp())
+        m_volumeBar->setRedirected(false);
+}
+
 /* ── the pages talking back ──────────────────────────────────────────────── */
 
 void Dashboard::onToastRequested(const QString &text, int ms)
@@ -1337,10 +1368,16 @@ void Dashboard::onNav(int action, bool repeat)
     if (action == Joypad::NavVolumeUp || action == Joypad::NavVolumeDown) {
         bool muted = false;
         const int level = Volume::nudge(action == Joypad::NavVolumeUp ? 1 : -1, &muted);
+        /* Decided before the flash, so flash() already knows whether it is drawing
+         * or being drawn and never shows a Qt bar over a film for one frame. */
+        m_volumeBar->setRedirected(m_media && m_media->glOwnsScreen());
         m_volumeBar->flash(level, muted);
         /* flash() raised the bar over everything, the cursor included.  The arrow
-         * goes back on top the same way the toast puts it back. */
-        m_pointer->raise();
+         * goes back on top the same way the toast puts it back.  Not while
+         * redirected: nothing was raised, and raising the pointer over a film is
+         * the same memcpy-over-the-GPU problem one layer down. */
+        if (!m_volumeBar->isRedirected())
+            m_pointer->raise();
         return;
     }
 

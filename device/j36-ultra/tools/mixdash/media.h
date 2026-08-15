@@ -144,6 +144,25 @@ public:
      */
     bool openPath(const QString &path);
 
+    /*
+     * ── THE TWO THINGS THE SHELL HAS TO KNOW WHILE A FILM IS UP ──
+     *
+     * True while the GPU owns this page: a film is up, it came up on GL, and at
+     * least one frame has landed.  In that state Qt must not paint -- its backing
+     * store has never seen the picture, so anything it presents is a hole, and
+     * anything it presents OVER the picture is a hole that lasts 40 ms until the
+     * next frame paints the film back over it.
+     *
+     * That is why the volume bar is handed here as pixels instead of drawing
+     * itself: `argb' is blended into the same GPU pass that puts the film up, at
+     * `at' in framebuffer coordinates, and it stays there until it is replaced or
+     * until a null image clears it.  A null image or an empty rectangle is the
+     * clear.  Nothing happens if the GPU path is not up, which is the case where
+     * the bar can simply paint itself and does.
+     */
+    bool glOwnsScreen() const;
+    void setVolumeOverlay(const QImage &argb, const QRect &at);
+
 protected:
     void paintEvent(QPaintEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
@@ -300,12 +319,6 @@ private:
      * changed since last time.  `into' is the page's rectangle on the
      * framebuffer, because the strip's position is given in those coordinates. */
     void refreshChrome(const QRect &into);
-    /*
-     * True while the GPU owns this page: a film is up, it came up on GL, and at
-     * least one frame has landed.  In that state Qt must not paint -- its backing
-     * store has never seen the picture, so anything it presents is a hole.
-     */
-    bool glOwnsScreen() const { return m_view == ViewVideo && m_gl && m_glShown; }
     /*
      * update() for a page that may not be Qt's to update.  Every "something
      * changed, show it" in this file goes through here, because the same line has

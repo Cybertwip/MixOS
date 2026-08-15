@@ -185,6 +185,19 @@ private slots:
     void onKey(int code, bool pressed, int modifiers);
 
     /*
+     * The volume bar changed and something has to draw it.
+     *
+     * WHY THE SHELL AND NOT THE BAR.  While a film is up the bar cannot paint
+     * itself -- see the note on setRedirected() in volume.h -- so the pixels have
+     * to be handed to whoever owns the scanout.  The bar does not know who that
+     * is and must not: it is an overlay, and an overlay that reached into the page
+     * stack to find the current page would be the page stack's problem for the
+     * rest of its life.  The shell owns both ends, so the routing is here, and it
+     * is one function so there is exactly one answer to "where do the pixels go".
+     */
+    void syncVolumeOverlay();
+
+    /*
      * Something was plugged into the port, or pulled out of it.
      *
      * WHY THE SHELL SAYS SO OUT LOUD.  This device has one USB connector and no
