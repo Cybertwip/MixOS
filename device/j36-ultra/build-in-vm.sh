@@ -10912,10 +10912,19 @@ if [ -x /usr/bin/matchbox-window-manager ]; then
     sleep 1
 fi
 
-# The on-screen keyboard, started hidden.  --daemon means it maps nothing until it
-# is sent SIGUSR1, and every SIGUSR1 after that toggles it; Select on the pad is
-# wired to exactly that in j36-padx.  It types with XTEST through libfakekey, so it
-# never takes focus away from the browser it is typing into.
+# The on-screen keyboard, started hidden.  --daemon maps nothing at startup and
+# waits for an X ClientMessage of type _MB_IM_INVOKER_COMMAND to show, hide or
+# toggle it; Select on the pad sends exactly that, from j36-padx, addressed to this
+# process's window.  IT IS NOT SIGUSR1, whatever the matchbox recipes say: nothing
+# in matchbox-keyboard handles that signal, so sending it killed the keyboard on
+# the first press.  See kbd_toggle() in tools/j36-padx.c.
+#
+# The pid is still kept, and only to kill it on the way out: the bridge finds the
+# window by name and needs nothing from here.
+#
+# It types with XTEST through libfakekey, so it never takes focus away from the
+# browser it is typing into -- and it starts AFTER the window manager because
+# daemon mode busy-waits for one before it will realize its window at all.
 if [ -x /usr/bin/matchbox-keyboard ]; then
     matchbox-keyboard --daemon >/dev/null 2>&1 &
     KBD=$!
@@ -11059,7 +11068,7 @@ PAGE=$!
 # --no-grab is NOT passed -- mixdash is still reading the pad behind this and both
 # of them acting on the same press is the bug the grab exists for.
 if [ -x /opt/mixos/bin/j36-padx ]; then
-    /opt/mixos/bin/j36-padx --watch "$PAGE" ${KBD:+--keyboard "$KBD"}
+    /opt/mixos/bin/j36-padx --watch "$PAGE"
 else
     echo "j36-browser-session: no j36-padx, so the pad cannot drive this" >&2
     wait "$PAGE"
