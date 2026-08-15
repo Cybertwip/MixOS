@@ -1006,10 +1006,12 @@ void WifiPage::poll()
     /*
      * NetworkManager scans on its own schedule while it is disconnected, and stops
      * when it associates.  This is only for the page that is left open on the
-     * list -- and it must not happen while a connection is being made.  A sweep is
-     * thirteen channels with the antenna off the AP, and asking for one in the
-     * middle of a four-way handshake or a DHCP exchange is how a network that
-     * would have worked comes back as "Timeout expired".
+     * list -- and it must not happen while a connection is being made, nor once one
+     * has been.  A sweep is thirteen channels with the antenna off the AP: asking
+     * for one in the middle of a four-way handshake or a DHCP exchange is how a
+     * network that would have worked comes back as "Timeout expired", and asking
+     * for one on a live link is a hole in whatever is going through it.  Somebody
+     * who wants the list refreshed while connected presses Scan again.
      */
     if (m_managerUp && m_radioOn && !busy() && !isActivating(m_deviceState)
         && m_deviceState != StateActivated && m_scanAge.elapsed() > 20000) {
