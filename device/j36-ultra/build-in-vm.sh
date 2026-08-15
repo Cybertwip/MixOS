@@ -2242,7 +2242,15 @@ setup_zram() {
     # is allowed to fail without stopping anything.
     echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null || true
     echo "${lim_kb}K" > /sys/block/zram0/mem_limit 2>/dev/null || true
-    if ! echo "${disk_kb}K" > /sys/block/zram0/disksize 2>/dev/null; then
+    echo "${disk_kb}K" > /sys/block/zram0/disksize 2>/dev/null || true
+
+    # Read back rather than trust the exit status.  A sysfs store that returns
+    # -EINVAL fails at write(2) and not at open(2), and whether a shell's `echo'
+    # reports that is a property of the shell -- dash checks ferror, busybox ash
+    # buffers and may not.  disksize reads back as the byte count the kernel
+    # accepted, and 0 is exactly what a refused write leaves behind, so this asks
+    # the device what it did instead of asking the shell what it thinks happened.
+    if [ "$(cat /sys/block/zram0/disksize 2>/dev/null)" = 0 ]; then
         say "zram: the kernel refused a disksize of ${disk_kb} kB; no swap this boot"
         return 1
     fi
