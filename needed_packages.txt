@@ -11,6 +11,7 @@ dialog
 dnsmasq
 dos2unix
 espeak-ng
+evtest
 exfatprogs
 ffmpeg
 firefox-esr
@@ -20,6 +21,7 @@ fonts-noto-cjk
 git
 hostapd
 iw
+joystick
 liba52-0.7.4
 libarchive-zip-perl
 libasound2t64

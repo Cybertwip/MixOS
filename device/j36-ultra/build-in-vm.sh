@@ -851,6 +851,20 @@ config_m HID_GENERIC
 config_y INPUT_JOYSTICK
 config_m JOYSTICK_XPAD
 config_y JOYSTICK_XPAD_FF
+#
+# THE LED CLASSES ARE A DEPENDENCY AND NOT A FEATURE, which is the least obvious
+# line in this section and the one that decides whether it builds at all.  All
+# three HID pad drivers have a hard `depends on' an LED class -- hid-sony and
+# hid-nintendo on LEDS_CLASS, hid-playstation on LEDS_CLASS_MULTICOLOR, because
+# a DualSense's light bar is an RGB device -- and a `depends on' that is not met
+# is not an error, it is a symbol that silently cannot be set.  So without these
+# three lines the config_m below would be dropped by olddefconfig and the whole
+# section would fail at the assertion with a message about pads and nothing about
+# LEDs.  They are the class cores only; no LED driver is turned on by them, and
+# this board has no LED to drive.
+config_y NEW_LEDS
+config_y LEDS_CLASS
+config_y LEDS_CLASS_MULTICOLOR
 config_m HID_SONY
 config_y SONY_FF
 config_m HID_PLAYSTATION
@@ -1003,6 +1017,7 @@ for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 DRM DEVMEM SOUND POWER_SUPPLY BACKLIGHT_CLASS_DEVICE WIRELESS \
                 USB_SUPPORT USB_PHY GENERIC_PHY HID_SUPPORT INPUT_JOYSTICK \
                 INPUT_EVDEV INPUT_JOYDEV \
+                NEW_LEDS LEDS_CLASS LEDS_CLASS_MULTICOLOR \
                 FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER \
                 USB_MUSB_HOST MUSB_PIO_ONLY USB_ANNOUNCE_NEW_DEVICES; do
     grep -q "^CONFIG_${required}=y$" "$CONFIG" || \
