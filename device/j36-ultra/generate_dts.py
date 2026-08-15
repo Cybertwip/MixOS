@@ -6,10 +6,11 @@
 
 The panel timing, power GPIOs, compact 155-record JD9365 command table, keypad
 matrix, keypad pad mux, direct GPIO keys, framebuffer and AUXADC channels are
-parsed from:
-  PowerEngine/OS/MVII/Kernel/ARM/MediaTek/J36Ultra/Drivers
+parsed from the five board sources under:
+  device/j36-ultra/mvii-board
 
-No data is taken from PowerEngine/Reference/J36-ULTRA.
+Those five are the whole input; --drivers points at that directory by way of
+build-j36-ultra-dtb.sh.  See mvii-board/PROVENANCE.txt for where they came from.
 """
 
 from __future__ import annotations
@@ -316,8 +317,8 @@ def generate(sources: dict[str, str]) -> str:
 /*
  * J36 Ultra MT6592 bring-up DTB.
  *
- * GENERATED from PowerEngine OS/MVII J36Ultra/Drivers. Do not hand-edit the
- * generated file; update the MVII driver source or generate_dts.py instead.
+ * GENERATED from the MVII board sources in device/j36-ultra/mvii-board. Do not
+ * hand-edit the generated file; edit those sources or generate_dts.py instead.
  *
  * This describes the hardware and exact panel/input wiring. The compatible
  * strings marked j36,* intentionally require the small Linux adapter drivers;

@@ -28,13 +28,13 @@ That is 244 KB out of a 2.9 MB, 113-file driver tree. From them the generator
 extracts the board constants, the exact compact 155-record JD9365 table, and the
 keypad pad mux, and asserts on all three.
 
-`PROVENANCE.txt` records the upstream commit and a SHA-256 per file.
-`./device/j36-ultra/sync-mvii-board.sh` refreshes the copies from a PowerEngine
-checkout and rewrites that record; it is run **by hand**, never by the build. If
-a PowerEngine tree does happen to sit beside this checkout, `build-j36-ultra.sh`
-re-checks those hashes and warns when they have drifted — a warning and not a
-failure, because a missing or older sibling repository must not be able to stop
-this build.
+`PROVENANCE.txt` records the commit these were taken from and a SHA-256 per file,
+as the redistribution record for vendor material. It is a record of an import,
+not a link to a live tree: these five files are maintained here now, and there is
+no refresh step. A script used to copy them in from a sibling PowerEngine
+checkout and `build-j36-ultra.sh` used to warn when the two had drifted; both are
+gone, because that made this build's output depend on what happened to be in a
+neighbouring directory of a separate project.
 
 The values could have been frozen into a JSON instead, which would be smaller
 again, but that moves the numbers one copy further from the code that drives the
@@ -783,8 +783,7 @@ name is the first thing that failed, not the last thing that was tried, and
 ## Licence and attribution
 
 The original MixOS work here — `build-in-vm.sh`, `generate_dts.py`,
-`create_boot_image.py`, `fetch_freedoom.py`, `sync-mvii-board.sh`,
-`tools/j36-eglprobe.c`, `tools/j36-mixmirror.c`, `tools/mfgpower.c`,
+`create_boot_image.py`, `fetch_freedoom.py`, `tools/j36-eglprobe.c`, `tools/j36-mixmirror.c`, `tools/mfgpower.c`,
 `tools/mixsplash.c`, `tools/mixdash/` and this documentation — is dual-licensed:
 take it under the **Mozilla Public License 2.0** or under the **GNU General Public
 License version 2 or later**, at your option. The reasoning, the exact per-file
