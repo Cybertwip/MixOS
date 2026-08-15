@@ -490,6 +490,10 @@
 /* The stock routines' own settle time, in microseconds. */
 #define J36_PHY_SETTLE_US		800
 
+/* And how long a ROLE change is given on top of it, in milliseconds, before
+ * anything is allowed to put a session edge on DEVCTL. See j36_phy_force_host(). */
+#define J36_PHY_ROLE_SETTLE_MS		20
+
 /* How long the port is given to fall after DRVVBUS is dropped, before DEVCTL's
  * VBUS field is read to find out whether anything ELSE is holding it up. It is
  * an unloaded net with the load switch open, so this is discharging the
@@ -1000,16 +1004,45 @@ static void j36_phy_clock_off(struct j36_usb_phy *p)
 	p->clock_logged = false;
 }
 
+/*
+ * ── IS THE ROLE ALREADY THE ONE BEING ASKED FOR? ─────────────────────────────
+ *
+ * MUSB latches A-or-B from the ID input at the instant DEVCTL.SESSION goes 0->1,
+ * and the ID input is these two registers. Rewriting them with the values they
+ * already hold is not free: the sequence is clr, set, enable, so with the force
+ * bits already live the outputs move twice before they land, and a session edge
+ * placed inside that window is latched against a role that is still settling.
+ *
+ * That is the difference between the boot that reads DEVCTL 19 and the one that
+ * reads 99. The 19 came from a role written 50 ms before the edge; every 99 came
+ * from a role written 800 us before it -- once by phy_set_mode(), which mediatek.c
+ * calls immediately before musb_start(), and once per host kick. So the rewrite
+ * is skipped when there is nothing to rewrite, and paid for with a real settle
+ * when there is.
+ */
+static bool j36_phy_role_is(struct j36_usb_phy *p, u8 set, u8 clr)
+{
+	u8 dtm1 = j36_phy_rd(p, J36_PHY_R6C);
+
+	if ((dtm1 & set) != set || (dtm1 & clr))
+		return false;
+	return (j36_phy_rd(p, J36_PHY_R6D) & J36_PHY_R6D_FORCE_ALL) ==
+		J36_PHY_R6D_FORCE_ALL;
+}
+
 /* Device: B-device, session valid, VBUS present. The low-power resting state and
  * the tail both stock routines end on, so it is also what the PHY sits in after
  * recover(). 0x6c ends at 0x2e and 0x6d at 0x3e, byte for byte as transcribed. */
 static void j36_phy_force_device(struct j36_usb_phy *p)
 {
 	j36_phy_clock_on(p);
+	if (j36_phy_role_is(p, J36_PHY_R6C_DEV_SET, J36_PHY_R6C_DEV_CLR))
+		return;
 	j36_phy_clr(p, J36_PHY_R6C, J36_PHY_R6C_DEV_CLR);
 	j36_phy_set(p, J36_PHY_R6C, J36_PHY_R6C_DEV_SET);
 	j36_phy_set(p, J36_PHY_R6D, J36_PHY_R6D_FORCE_ALL);
 	usleep_range(J36_PHY_SETTLE_US, J36_PHY_SETTLE_US * 2);
+	msleep(J36_PHY_ROLE_SETTLE_MS);
 }
 
 /* Host: A-device, A-session valid, VBUS present, session not ended -- the one
