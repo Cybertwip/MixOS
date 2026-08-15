@@ -2296,6 +2296,20 @@ expand_root() {
     : > /dev/.expand-status
     : > /dev/.expand-result
 
+    # THE ONE THING THAT IS CHECKED TWICE.  Every failure above puts /newroot back and
+    # says so, but "the child was killed", "the wait timed out" and "the node never came
+    # back" are between them a path on which nobody did.  switch_root into an unmounted
+    # /newroot is an empty directory and a kernel panic, so this asks the kernel rather
+    # than trusting the story, and tries once more if the answer is no.  Read-only on
+    # the second attempt for the same reason try_root does it: a root that comes up ro
+    # boots to something a person can look at.
+    if ! grep -q " /newroot " /proc/mounts 2>/dev/null; then
+        say "expand: /newroot is not mounted after the resize; remounting it"
+        mount -t "$rootfs_type" "$rootdev" /newroot 2>/dev/null ||
+        mount -t "$rootfs_type" -o ro "$rootdev" /newroot 2>/dev/null ||
+        say "expand: AND IT WOULD NOT MOUNT.  The hand-over below is going to fail."
+    fi
+
     # Whatever happened, the panel goes back to saying what the boot is doing.
     stage "Mounting the MixOS partition"
     detail "$rootdev  $rootfs_type"
@@ -2393,11 +2407,13 @@ fi
 : > "$scan_status"
 : > "$scan_result"
 
-# Here and not one line lower, and the line is load-bearing.  Everything below this
-# point reads or writes /newroot -- modules, the GL payload, the dashboard staging --
-# and the resize needs /newroot unmounted.  This is the last instant in the boot at
-# which the OS partition is known, mounted (so its tools can be copied out) and not
-# yet being used for anything.  It returns with /newroot mounted either way.
+# Here and not one line lower, and the line is load-bearing in two directions.
+# Everything BELOW reads or writes /newroot -- modules, the GL payload, the dashboard
+# staging -- and the resize needs /newroot unmounted; everything below also mounts BOOT,
+# and a mounted p1 is what makes the kernel refuse to re-read the partition table it was
+# just handed.  This is the last instant in the boot at which the OS partition is known,
+# mounted (so its tools can be copied out of it) and the only thing on the disk that is.
+# It returns with /newroot mounted either way.
 expand_root
 
 # ── Optional payloads: modules, mfgpower, Mesa, the probe ────────────────────
