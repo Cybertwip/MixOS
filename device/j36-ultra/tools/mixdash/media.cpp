@@ -132,8 +132,8 @@ QString tidyChildError(const QString &raw)
  * directory, m_dir took that empty string, and populate() handed it to QDir("")
  * -- which is not "no directory", it is the PROCESS's working directory.  That is
  * WorkingDirectory=/opt/mixos/bin out of mixdash.service, so the media browser
- * opened on the payload directory, next to doom-j36, and every row in it is a
- * binary that rebuild() marks unselectable.  Worse, an empty m_dir has no
+ * opened on the payload directory, next to mixdash itself, and every row in it
+ * is a binary that rebuild() marks unselectable.  Worse, an empty m_dir has no
  * QFileInfo::absolutePath(), so the `..' row's target was empty too and Back's
  * "go up a directory" guard was false from the start: the page had no way out of
  * a directory with nothing in it to open.  Hence "it does not navigate".

@@ -1776,7 +1776,7 @@ build_mixsplash() {
     [[ -f "$SPLASH_JPEG" ]] || { log "splash: $SPLASH_JPEG is missing"; return 1; }
     [[ -f "$SPLASH_TOOL" ]] || { log "splash: $SPLASH_TOOL is missing"; return 1; }
 
-    # -static for the same reason Doom and mfgpower are.  No -lm: the two
+    # -static for the same reason mfgpower is.  No -lm: the two
     # transcendentals it needs are polynomials in the source, so that the boot
     # path carries no link dependency for two calls a frame.
     arm-linux-gnueabihf-gcc -O2 -std=gnu11 -Wall -Wextra -static \
@@ -6921,8 +6921,8 @@ build_mfgpower() {
     local out="$WORK/mfgpower" header
 
     [[ -f "$MFGPOWER_SRC" ]] || { log "lima: $MFGPOWER_SRC is missing"; return 1; }
-    # Static for the same reason Doom is: this runs from the initramfs, before
-    # switch_root, where there is no ld.so and no /lib.
+    # Static for the same reason mixsplash is: this runs from the initramfs,
+    # before switch_root, where there is no ld.so and no /lib.
     arm-linux-gnueabihf-gcc -O2 -std=gnu11 -Wall -Wextra -static \
         -o "$out" "$MFGPOWER_SRC" || return 1
 
@@ -8263,7 +8263,7 @@ QTCONF
 #   VT_SETMODE, no VT_ACTIVATE and no KDSETMODE -- which matters here because mixdash
 #   is still running behind it holding /dev/tty0 in KD_GRAPHICS.
 #
-# So the panel is shared the same way Doom shares it: mixdash stops painting, the
+# So the panel is shared the plain way: mixdash stops painting, the
 # child writes /dev/fb0, and when the child exits the dashboard repaints over it.
 # No DRM, no modeset, no GBM, no EGL, no lima.  The other half of the old note --
 # that netsurf-fb and links2 are both built without a framebuffer surface -- was
@@ -9911,7 +9911,8 @@ j36.splash=1
     for anyone to take -- /dev/fb0 really is the only way to a pixel here.
 
     While it runs it holds the VT in KD_GRAPHICS, which is what stops fbcon
-    painting over it, exactly as Doom above does.  /init still says everything it
+    painting over it, the way any full-screen framebuffer program has to.  /init
+    still says everything it
     ever said; the panel shows the headline and the serial console gets the whole
     text, which is the reverse of the split before this existed.  The console is
     handed back in text mode if the boot fails, so a board that stops somewhere is
@@ -9984,8 +9985,8 @@ the SPM's MTCMOS, and nothing on this boot path un-gates it: the MVII LK can, bu
 only its own kernel ever calls that code, not the hand-off to Linux.  A read into
 an unpowered MTK subsystem does not return garbage -- it stalls the bus, and the
 watchdog reboots the board with nothing in any log.  A lima built into the kernel
-would do that during probe, on every boot, before the console or Doom or anything
-else this card is for.
+would do that during probe, on every boot, before the console or the dashboard or
+anything else this card is for.
 
 So lima is a module and j36/mfgpower is the gate.  It powers the domain through
 the SPM the way the LK does -- PWR_ON, PWR_ON_S, wait for both status bits, drop
@@ -10926,7 +10927,7 @@ done
 # ── The OS-partition payload: /opt/mixos, and the dashboard in it ─────────────
 #
 # The four files on BOOT are the ones something other than Linux has to read.  This is
-# everything else -- the dashboard, its Qt, Doom, and the j36/ tree staged further up --
+# everything else -- the dashboard, its Qt, and the j36/ tree staged further up --
 # and it goes on the ext2 OS partition, where symlinks and execute bits survive and
 # where 50 MB is not competing with an R36S card's own boot files.
 #
@@ -11590,8 +11591,8 @@ fi
 # From here the test is the TREE and not the two binaries.  $SDROOT already holds
 # opt/mixos/j36 -- the lima and mtk_drm modules, mfgpower, the Mesa front end, the
 # probe -- staged about twelve hundred lines up, and that payload ships on its own
-# merits: with J36_MIXDASH=0 and no Doom the old guard fell straight to the else
-# below and wrote no tarball at all, leaving the payload it HAD built unreachable.
+# merits: with J36_MIXDASH=0 the old guard fell straight to the else below and
+# wrote no tarball at all, leaving the payload it HAD built unreachable.
 if [[ -d "$SDROOT/opt" ]]; then
     mkdir -p "$SDROOT/opt/mixos"
     cat > "$SDROOT/opt/mixos/README.txt" <<'MIXOSREADME'
@@ -11749,8 +11750,8 @@ fi
 
 (
     cd "$ARTIFACTS"
-    # The Doom payload is optional, and sha256sum takes a missing operand as an
-    # error, so it is named only when it was staged.
+    # The dashboard payload is optional, and sha256sum takes a missing operand as
+    # an error, so it is named only when it was staged.
     sums=(boot.img zImage zImage-j36-ultra mt6592-j36-ultra.dtb
           j36_mt6592_input.ko initramfs-j36-ultra.cpio.xz
           sd-boot/zImage sd-boot/mvii/boot.conf)
@@ -11835,8 +11836,8 @@ fi
         # The shell, and the payload it lives in.  The ext2 OS partition, not BOOT: the
         # Qt closure is 50 MB of SONAME symlinks, and BOOT is 100 MiB of vfat that holds
         # neither symlinks nor execute bits and is shared with an R36S card's own
-        # launcher.  sd-root.tar.gz carries the whole tree now -- the dashboard, Qt,
-        # Doom and opt/mixos/j36 -- so this one line is what has to reach the card.
+        # launcher.  sd-root.tar.gz carries the whole tree now -- the dashboard, Qt
+        # and opt/mixos/j36 -- so this one line is what has to reach the card.
         if [[ -f sd-root/opt/mixos/bin/mixdash ]]; then
             echo "shell=mixdash ($(stat -c %s sd-root/opt/mixos/bin/mixdash) bytes, Qt5 Widgets on linuxfb)"
             echo "shell_payload=sd-root.tar.gz ($(stat -c %s sd-root.tar.gz) bytes), untarred at the root of the ext2 ROOTFS partition as /opt/mixos"
