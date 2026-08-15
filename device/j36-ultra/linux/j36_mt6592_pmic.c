@@ -2491,13 +2491,13 @@ static void j36_pmic_poll(struct work_struct *work)
 	/*
 	 * WHAT THE ARM GETS, TAKEN BEFORE THE VETO BELOW CAN MOVE `online'.
 	 *
-	 * The veto decides what this board REPORTS about the cable.  It is not
-	 * allowed to decide whether the charger is enabled, and the split is the
-	 * reason the veto can be as aggressive as it needs to be: everything it
-	 * can get wrong is cosmetic, and the one failure this driver must never
-	 * reintroduce -- a board that will not charge -- is not reachable from
-	 * here at all.  j36_charger_arm() sees exactly the bit the hardware set,
-	 * exactly as it did before any of this existed.
+	 * The veto decides what this board REPORTS about the cable, and `chrdet'
+	 * is the raw bit kept aside for everything that acts on it instead.  The
+	 * arm still starts from this copy; the one state where it is allowed to
+	 * be overruled is assembled at the call site and nowhere near here, so
+	 * every other consumer of `chrdet' -- and every path taken with the
+	 * DRVVBUS pad down -- sees exactly the bit the hardware set, exactly as
+	 * it did before any of this existed.
 	 */
 	chrdet = online;
 
@@ -2574,7 +2574,7 @@ static void j36_pmic_poll(struct work_struct *work)
 				 * know there is a way to answer that without a
 				 * rebuild. */
 				dev_warn(p->dev,
-					 "CHRDET says a charger but the input measures %d mV against a %d mV bar%s: treating the cable as out (CHR_CON0=%04x ldo=%d chrdet=%d lv=%d hv=%d); the charger is left armed either way, and if a meter disagrees set vchr_veto=0\n",
+					 "CHRDET says a charger but the input measures %d mV against a %d mV bar%s: treating the cable as out (CHR_CON0=%04x ldo=%d chrdet=%d lv=%d hv=%d); with the pad up this also takes the charge path down, so it cannot sink the port -- if a meter disagrees set vchr_veto=0\n",
 					 vchr_mv, bar,
 					 bar > J36_VCHR_ABSENT_MV
 					 ? " raised to the pack because DRVVBUS is up and this board can be feeding its own charger input"

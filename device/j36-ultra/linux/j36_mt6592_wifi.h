@@ -656,7 +656,7 @@ struct j36_hif_stats {
  *
  * The command IDs and event IDs are MediaTek's own CMD_ID_* / EVENT_ID_* from
  * include/nic_cmd_event.h, confirmed against that header rather than guessed
- * from the disassembly.  Two of them cost MVII a working link to get wrong and
+ * from the disassembly.  Three of them cost MVII a working link to get wrong and
  * are worth naming out loud:
  *
  *   0x17 is UPDATE_STA_RECORD and 0x18 is REMOVE.  Sending the station record
@@ -665,6 +665,14 @@ struct j36_hif_stats {
  *   0x20 CH_PRIVILEGE is a lease, not a request.  A grant that is never released
  *   pins the radio to the operating channel, and every later scan comes back
  *   empty for a reason nothing reports.
+ *   0x1a and 0x1b are a PAIR, and 0x1a is not optional.  SET_BSS_INFO has no
+ *   beacon-interval field -- check nic_cmd_event.h:1322 if that seems unlikely --
+ *   so INDICATE_PM_CONNECTED is the only command in the entire protocol that ever
+ *   tells the firmware how often the AP it is watching transmits.  A link brought
+ *   up without it is supervised against a beacon interval of zero, and the
+ *   firmware declares a beacon timeout roughly a minute later with the AP a metre
+ *   away.  INDICATE_PM_ABORT is its counterpart and stock sends it FIRST on every
+ *   teardown, before the station record goes and before the BSS is deactivated.
  */
 #define J36_CMD_POWER_SAVE_MODE		0x06
 #define J36_CMD_ADD_REMOVE_KEY		0x08
@@ -675,6 +683,7 @@ struct j36_hif_stats {
 #define J36_CMD_UPDATE_STA_RECORD	0x17
 #define J36_CMD_REMOVE_STA_RECORD	0x18
 #define J36_CMD_INDICATE_PM_CONNECTED	0x1a
+#define J36_CMD_INDICATE_PM_ABORT	0x1b
 #define J36_CMD_SCAN_REQ		0x1e
 #define J36_CMD_CH_PRIVILEGE		0x20
 #define J36_CMD_BASIC_CONFIG		0xc1
@@ -745,11 +754,24 @@ struct j36_hif_stats {
 #define J36_WLAN_MAX_IES		384
 
 /* How long each step of a join is given before it is retried or abandoned.  The
- * numbers are MVII's, measured against this radio. */
-#define J36_WLAN_SCAN_TIMEOUT_MS	12000
+ * numbers are MVII's, measured against this radio.
+ *
+ * The scan timeout is short on purpose.  A full 2.4 GHz active sweep takes about
+ * a second and a half of radio time and the firmware reports SCAN_DONE within
+ * two; anything past that is not a slow scan, it is a firmware that has stopped
+ * answering, and the only thing a long timeout buys is a longer wait before the
+ * recovery below gets a turn.  wpa_supplicant's own scan timeout is 10 s and it
+ * starts refusing to queue new triggers once it has one outstanding, so a driver
+ * that sits on a dead scan for 12 s takes the supplicant down with it. */
+#define J36_WLAN_SCAN_TIMEOUT_MS	6000
 #define J36_WLAN_CHANNEL_TIMEOUT_MS	1500
 #define J36_WLAN_AUTH_TIMEOUT_MS	1000
 #define J36_WLAN_ASSOC_TIMEOUT_MS	1500
+/* How long a fresh link waits for a beacon from its own AP before giving up on
+ * learning the real DTIM period and telling the firmware to assume one.  See
+ * j36_wlan_cmd_pm_connected(): the alternative to a fabricated DTIM period is
+ * never sending INDICATE_PM_CONNECTED at all, which is strictly worse. */
+#define J36_WLAN_PM_BEACON_WAIT_MS	1500
 /* The window between "the pairwise key went in" and "no group key is coming".
  * The supplicant installs the GTK immediately after the PTK in every handshake
  * that has one; this only exists so a network that has not got one still opens
@@ -759,7 +781,17 @@ struct j36_hif_stats {
  * firmware's own transmit queue.  Generous for one already-queued frame, and
  * bounded because the alternative to giving up is never installing a key. */
 #define J36_WLAN_1X_DONE_TIMEOUT_MS	100
+/* How hard a transmit waits for a free page before it gives up and lets the
+ * caller decide.  J36_HIF_TX_POLL_ROUNDS is for commands and management frames:
+ * a join has a 1.5 s deadline on every step and dropping an authentication frame
+ * to save a millisecond is a bad trade.  J36_HIF_TX_TRY_ROUNDS is for the data
+ * path, and it is zero because THE POLL WORKER HOLDS w->lock WHILE IT DRAINS.
+ * Sleeping there does not just delay one frame: it stops the event pump for the
+ * duration, so no TX_DONE comes back to credit the very pages being waited on,
+ * the receive FIFO fills, and .scan and .connect block behind the same mutex.
+ * Sixteen frames at 200 ms each is six seconds of a radio that looks hung. */
 #define J36_HIF_TX_POLL_ROUNDS		200
+#define J36_HIF_TX_TRY_ROUNDS		0
 #define J36_HIF_TX_POLL_INTERVAL_US	1000
 
 /*
@@ -960,6 +992,9 @@ void j36_wifi_hif_trace(struct j36_wifi *w);
 int j36_wifi_hif_own(struct j36_wifi *w);
 u32 j36_wifi_hif_status(struct j36_wifi *w, u32 offset);
 int j36_wifi_hif_tx_acquire(struct j36_wifi *w, unsigned int tc);
+/* The same accounting without the sleep.  For callers that hold w->lock and have
+ * somewhere to put the packet back -- see the J36_HIF_TX_TRY_ROUNDS note. */
+int j36_wifi_hif_tx_try(struct j36_wifi *w, unsigned int tc);
 void j36_wifi_hif_tx_credit(struct j36_wifi *w);
 void j36_wifi_hif_submit(struct j36_wifi *w, unsigned int tc, const u8 *packet,
 			 u32 size);
@@ -986,8 +1021,16 @@ int j36_wlan_cmd_bss_info(struct j36_wifi *w, const struct j36_wlan_bss *bss,
 			  bool secure);
 int j36_wlan_cmd_bss_disconnect(struct j36_wifi *w, const struct j36_wlan_bss *bss);
 int j36_wlan_cmd_bss_reactivate(struct j36_wifi *w);
+/* dtim_fallback: send the command with an assumed DTIM period of 1 rather than
+ * refusing when no beacon has supplied the real one.  Fabricating it is safe
+ * ONLY because j36_wlan_cmd_configure() leaves the radio in CAM -- the receiver
+ * never sleeps, so the DTIM period cannot cause a missed multicast; it sets the
+ * cadence the firmware watches for and nothing else. */
 int j36_wlan_cmd_pm_connected(struct j36_wifi *w, const struct j36_wlan_bss *bss,
-			      u16 aid);
+			      u16 aid, bool dtim_fallback);
+/* The teardown half of the pair.  Sent first on every disconnect path, exactly
+ * as stock's aisFsmDisconnect() does (mgmt/ais_fsm.c:3947). */
+int j36_wlan_cmd_pm_abort(struct j36_wifi *w);
 int j36_wlan_cmd_install_key(struct j36_wifi *w, const u8 *peer, u8 key_id,
 			     bool pairwise, const u8 *key);
 int j36_wlan_cmd_remove_key(struct j36_wifi *w, const u8 *peer, u8 key_id,
@@ -1002,8 +1045,10 @@ int j36_wlan_cmd_deauth(struct j36_wifi *w, const struct j36_wlan_bss *bss,
 			u16 reason);
 int j36_wlan_cmd_assoc(struct j36_wifi *w, const struct j36_wlan_bss *bss,
 		       const u8 *ies, u32 ies_len);
+/* may_wait: whether this frame is allowed to sleep waiting for a transmit page.
+ * False from the poll worker's drain, which holds w->lock and can requeue. */
 int j36_wlan_cmd_tx_ethernet(struct j36_wifi *w, const u8 *frame, u32 len,
-			     u8 sta_index, bool is_1x);
+			     u8 sta_index, bool is_1x, bool may_wait);
 unsigned int j36_wlan_cmd_pump(struct j36_wifi *w);
 
 /*
