@@ -1139,6 +1139,22 @@ if grep -q "^CONFIG_MODULE_COMPRESS=y$" "$CONFIG"; then
     die "CONFIG_MODULE_COMPRESS=y came back after olddefconfig; busybox insmod cannot read a compressed .ko and load.order names uncompressed filenames"
 fi
 
+# The zram compressor, asserted through the string rather than through either of
+# the two symbols that could have produced it.  ZRAM_BACKEND_LZ4 is 6.12's spelling
+# and CRYPTO_LZ4 was the one before it; both are set above and only one of them
+# exists in any given tree, so neither can be grepped for on its own.  This is the
+# value zram passes to zcomp_create() at init, it is written by Kconfig from
+# whichever choice member survived, and "lzo-rle" here means the default was left
+# alone and every swapped page is being compressed by the slower-ratio fallback
+# instead of by the algorithm this board was tuned for.
+#
+# ZRAM_BACKEND_ZSTD is deliberately NOT asserted.  It is the runtime escape hatch
+# described in the swap section, not a requirement -- a tree that spells it
+# differently should cost the escape hatch and not the build, and section 7 of
+# mixos-log.txt dumps comp_algorithm so the board says which ones it really has.
+grep -q '^CONFIG_ZRAM_DEF_COMP="lz4"$' "$CONFIG" || \
+    die "CONFIG_ZRAM_DEF_COMP is not \"lz4\" after olddefconfig; zram would come up on lzo-rle, and on a Cortex-A7 the compressor is the whole difference between swap that helps and swap that stalls"
+
 # =m and not =y, and the difference is the whole design: see the GPU section.
 # lima's two tristate helpers are asserted alongside it because they are what
 # `select' produces at module scope, and a lima.ko whose dependencies were built
@@ -1580,9 +1596,17 @@ bb_disable() {
 # so a stale dashboard on the OS partition looked exactly like a current one.  ash
 # has a printf builtin and probably always resolved it; the symlink costs nothing
 # and takes the question away.
+# mkswap and swapon are here for setup_zram, and the reason the swap device is set
+# up from an initramfs rather than from a systemd unit on the rootfs is that the
+# rootfs is shared and nothing may be written to it -- a unit would have to be
+# generated into /run from here anyway, and it would run several seconds later,
+# after systemd, udev and journald have all done their first allocations.  A
+# missing applet here is the quiet kind of failure: `swapon: not found' goes to
+# stderr, setup_zram carries on, /proc/swaps stays empty and the board simply
+# behaves like it did before this feature existed.
 INIT_APPLETS=(sh mount umount mkdir mknod cat cp ln ls tr grep echo sleep dmesg
               insmod hexdump setsid cttyhack switch_root sync poweroff reboot
-              uname chmod rmdir tar gunzip sed printf tail)
+              uname chmod rmdir tar gunzip sed printf tail mkswap swapon)
 
 # Most applets are CONFIG_<applet in caps>; three are not, and guessing would
 # assert a symbol that does not exist, which greps false and dies on a correct

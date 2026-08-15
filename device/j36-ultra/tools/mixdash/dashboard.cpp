@@ -758,6 +758,90 @@ void Dashboard::retranslate()
     update();
 }
 
+/*
+ * A disk was plugged in or pulled out.
+ *
+ * The same shape as retranslate(), and for the same reason: the grid's arrangement
+ * lives in a saved list of keys and only buildPages() knows how to hand the entries
+ * over in an order the grid can re-apply it to.  So the whole grid is rebuilt and the
+ * selection is put back by hand.
+ *
+ * PUT BACK BY KEY, not by index.  A language change cannot move a card, but a disk
+ * arriving can: a new volume card is appended, and if the saved order has it before
+ * whatever was selected, every index after it shifts by one.  Restoring index 4 would
+ * then select the card that moved into slot 4 rather than the one that was there --
+ * which, at the moment a stick is plugged in, would look like the machine wandering
+ * off on its own.
+ */
+void Dashboard::onVolumesChanged()
+{
+    const QVector<AppEntry> before = m_apps->entries();
+    const int was = m_apps->index();
+    const QString key = (was >= 0 && was < before.size()) ? before[was].key : QString();
+
+    buildPages();
+
+    const QVector<AppEntry> now = m_apps->entries();
+    int at = -1;
+    for (int i = 0; i < now.size(); ++i) {
+        if (now[i].key == key) {
+            at = i;
+            break;
+        }
+    }
+    /* The selected card was the disk that just left.  Nothing to go back to, so the
+     * selection stays where the grid put it -- the first card -- rather than landing
+     * on whichever unrelated card inherited the slot. */
+    if (at >= 0)
+        m_apps->setIndex(at);
+
+    update();
+}
+
+/*
+ * Eject, from the long-press menu on a volume's card.
+ *
+ * The work is Volumes::eject(): stop the automounter's unit for that device, and if
+ * that is not enough, sync and umount by hand.  It is seconds rather than instant --
+ * a stick with a gigabyte of dirty pages behind it has to write them all before the
+ * umount returns -- so the ring turns for the whole of it.  Blocking here is
+ * deliberate: an eject that returned immediately and finished later is an eject the
+ * user would answer by pulling the stick out mid-flush.
+ */
+void Dashboard::onEjectRequested(int index)
+{
+    const QVector<AppEntry> apps = m_apps->entries();
+    if (index < 0 || index >= apps.size())
+        return;
+
+    const AppEntry entry = apps[index];
+    const Volume *v = Volumes::instance().byKey(entry.key);
+    if (!v) {
+        toast(tr("%1 is no longer plugged in").arg(entry.title), 3000);
+        return;
+    }
+
+    /* If the browser is standing inside this volume it has to come out first: the
+     * page would otherwise be sitting on a directory that is about to stop being one,
+     * and its own reaction to the volume vanishing would fire while it is on screen. */
+    while (m_stack.contains(m_files))
+        pop();
+
+    m_pointer->sleep();
+    m_busy->setPointerStyle(false);
+    m_busy->start(tr("Ejecting %1").arg(entry.title));
+
+    QString error;
+    const bool ok = Volumes::instance().eject(entry.key, &error);
+
+    m_busy->stop();
+
+    if (ok)
+        toast(tr("%1 can be removed").arg(entry.title), 3000);
+    else
+        toast(error.isEmpty() ? tr("%1 is busy").arg(entry.title) : error, 4000);
+}
+
 /* ── the page stack ──────────────────────────────────────────────────────── */
 
 PageWidget *Dashboard::current() const
