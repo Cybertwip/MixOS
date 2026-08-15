@@ -289,9 +289,9 @@ struct GlVideo::Priv {
      * overlay program: they are drawn one after the other, so the unit is rebound
      * between draws rather than a unit spent per layer -- GLES2 guarantees only
      * eight, and three of those are the film's planes. */
-    unsigned ovtex[GlVideo::LayerCount] = { 0, 0 };
-    int ovw[GlVideo::LayerCount] = { 0, 0 };
-    int ovh[GlVideo::LayerCount] = { 0, 0 };
+    unsigned ovtex[GlVideo::LayerCount] = { 0, 0, 0, 0 };
+    int ovw[GlVideo::LayerCount] = { 0, 0, 0, 0 };
+    int ovh[GlVideo::LayerCount] = { 0, 0, 0, 0 };
     QRect ovat[GlVideo::LayerCount];
     QString renderer;
     QByteArray repack;                  /* only used for a padded plane */

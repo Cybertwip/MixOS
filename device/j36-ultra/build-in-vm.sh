@@ -9689,6 +9689,82 @@ if [[ -n "$MIXDASH_BIN" || -n "$DOOM_BIN" || -n "$MIXMIRROR_BIN" ]]; then
         log "dash: staged doom into opt/mixos/bin/"
     fi
 
+    # The Browser card's start page.
+    #
+    # THE CARD IS links2 IN THE DASHBOARD'S OWN TERMINAL, and the long answer to
+    # "why not a real browser" is in buildPages() in dashboard.cpp -- the short one
+    # is that Edge has no armhf build, that Debian's netsurf-fb and links2 are both
+    # built without a framebuffer surface, and that an X server on this board is the
+    # VT switch that the Console card was removed for.  What is left is a text
+    # browser driven by the pad, and text browsers open on a blank screen.
+    #
+    # So the card opens THIS, off the card, with no network needed and nothing typed:
+    # the keys are on it, because links2's are not the pad's and nobody should have to
+    # guess `g' for go-to-URL on an eleven-button device, and there are four links so
+    # that pressing Enter on one is the whole test of "does this thing browse".
+    #
+    # Written here and not in mixdash, because a page is a file and dashboard.cpp
+    # would have to escape every quote in it into a C++ string literal to say the
+    # same thing.  dashboard.cpp holds the path and falls back to a search engine
+    # when this file is not on the card.
+    #
+    # No CSS and no JavaScript: links2's text mode reads neither, and a start page
+    # that renders differently in the browser it ships for is a start page that was
+    # written for a different browser.
+    mkdir -p "$SDROOT/opt/mixos/share/browser"
+    cat > "$SDROOT/opt/mixos/share/browser/start.html" <<'BROWSERSTART'
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>MixOS</title>
+</head>
+<body>
+
+<h1>MixOS</h1>
+
+<p>This is links2, running in the dashboard's terminal. It renders tables,
+frames, forms and cookies, and it speaks TLS. It does not run JavaScript.</p>
+
+<h2>Driving it</h2>
+
+<table>
+<tr><td>Up, Down</td><td>move between links</td></tr>
+<tr><td>Enter</td><td>follow the link under the cursor</td></tr>
+<tr><td>Left</td><td>back one page</td></tr>
+<tr><td>ESC</td><td>the menu bar: File, View, Link, Downloads, Setup, Help</td></tr>
+<tr><td>g</td><td>go to a URL</td></tr>
+<tr><td>s</td><td>bookmarks</td></tr>
+<tr><td>q</td><td>quit, back to the shell</td></tr>
+</table>
+
+<p>The Menu button raises the dashboard's on-screen keyboard, which is how a URL
+gets typed on a device with no keyboard. B leaves the terminal and returns to the
+cards. Downloads and links2's own bookmarks land in /home/virtua, which is the
+directory the Sharing card exports over SMB.</p>
+
+<h2>Somewhere to start</h2>
+
+<ul>
+<li><a href="https://html.duckduckgo.com/html/">DuckDuckGo</a> &mdash; the
+no-script version, which is the one that works here</li>
+<li><a href="https://en.wikipedia.org/wiki/Main_Page">Wikipedia</a></li>
+<li><a href="https://lite.cnn.com/">CNN Lite</a> &mdash; text-only news</li>
+<li><a href="https://www.debian.org/distrib/packages">Debian packages</a>
+&mdash; what the Packages card installs from</li>
+</ul>
+
+<h2>If nothing loads</h2>
+
+<p>The Wi-Fi card joins a network; this page is on the card itself and opens
+whether or not one has been joined. Once Wi-Fi is up, any of the links above is
+the test.</p>
+
+</body>
+</html>
+BROWSERSTART
+    log "dash: staged the browser start page into opt/mixos/share/browser/"
+
     # The mirror goes beside them and is staged on its own merits -- unlike the
     # dashboard it has no payload it needs next to it, being static, so a build that
     # produced no Qt still ships a working dock.  /init writes its unit only when this

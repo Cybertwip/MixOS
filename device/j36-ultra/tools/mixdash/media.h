@@ -159,9 +159,16 @@ public:
      * until a null image clears it.  A null image or an empty rectangle is the
      * clear.  Nothing happens if the GPU path is not up, which is the case where
      * the bar can simply paint itself and does.
+     *
+     * The mouse cursor arrives the same way and for a sharper version of the same
+     * reason: it is the one widget that MOVES over the picture, so as a Qt child
+     * it dirtied a rectangle of a backing store that holds no picture at all, and
+     * linuxfb copied that grey rectangle onto the film once per motion event.
+     * See the redirected-mode note in pointer.h.
      */
     bool glOwnsScreen() const;
     void setVolumeOverlay(const QImage &argb, const QRect &at);
+    void setPointerOverlay(const QImage &argb, const QRect &at);
 
 protected:
     void paintEvent(QPaintEvent *event) override;

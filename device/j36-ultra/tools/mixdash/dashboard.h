@@ -125,6 +125,14 @@ public:
      * InternalReboot is gone too, for no reason worse than the board having a power
      * button that already does it.  A card that duplicates hardware is a card you
      * can hit by accident.
+     *
+     * InternalBrowser is an odd one out and deliberately so: it is not a page of
+     * its own, it is the Terminal page opened on a command.  buildPages() says why
+     * a web browser on this board can only be that.
+     *
+     * APPENDED, NEVER INSERTED.  These values are compared against m_armed and
+     * passed around as ints; a new one in the middle renumbers every card below it
+     * for no gain.  The order cards appear in is buildPages()' order, not this one.
      */
     enum Internal {
         InternalNone = 0,
@@ -137,7 +145,8 @@ public:
         InternalMedia,
         InternalSettings,
         InternalInfo,
-        InternalPoweroff
+        InternalPoweroff,
+        InternalBrowser
     };
 
     explicit Dashboard(QWidget *parent = nullptr);
@@ -196,6 +205,11 @@ private slots:
      * is one function so there is exactly one answer to "where do the pixels go".
      */
     void syncVolumeOverlay();
+
+    /* The cursor moved, or the thing under it stopped being a Qt page.  Same
+     * routing, same reason, one extra job: this one also decides the mode, because
+     * the cursor is the only thing that knows when it needs deciding. */
+    void syncPointerOverlay();
 
     /*
      * Something was plugged into the port, or pulled out of it.

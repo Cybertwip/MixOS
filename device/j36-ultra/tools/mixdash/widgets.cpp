@@ -366,6 +366,21 @@ void paintGlyph(QPainter &p, const QRectF &box, int glyph, const QColor &ink)
         p.drawEllipse(QPointF(x + w * 0.50, y + h * 0.34), w * 0.045, w * 0.045);
         break;
     }
+    case GlyphGlobe: {
+        /* A globe: the outline, the equator, and ONE meridian drawn as a squashed
+         * ellipse.  Two meridians is what a globe normally has and what does not
+         * survive this size -- at 22 px the second one lands within a pixel of the
+         * vertical diameter and the three curves read as a blot.  One off-centre
+         * meridian is what makes the circle read as a sphere rather than as a
+         * clock face, which is the whole job of this icon. */
+        const QRectF ball(x + w * 0.14, y + h * 0.14, w * 0.72, h * 0.72);
+        p.drawEllipse(ball);
+        p.drawLine(QPointF(ball.left(), ball.center().y()),
+                   QPointF(ball.right(), ball.center().y()));
+        p.drawEllipse(QRectF(ball.center().x() - ball.width() * 0.26, ball.top(),
+                             ball.width() * 0.52, ball.height()));
+        break;
+    }
     default:
         break;
     }

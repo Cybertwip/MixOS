@@ -50,7 +50,8 @@ enum Glyph {
     GlyphMusic,
     GlyphImage,
     GlyphChip,
-    GlyphInfo
+    GlyphInfo,
+    GlyphGlobe
 };
 
 void paintGlyph(QPainter &p, const QRectF &box, int glyph, const QColor &ink);

@@ -85,11 +85,18 @@ void Pointer::wake()
     if (m_opacity != 255) {
         m_opacity = 255;
         update();
+        announce();
     }
     if (!isVisible()) {
         applyPosition();
-        show();
-        raise();
+        /* Redirected, the widget stays hidden for good: showing it is exactly the
+         * memcpy of stale backing store this mode exists to stop.  announce() is
+         * what puts the arrow back on the glass instead. */
+        if (!m_redirected) {
+            show();
+            raise();
+        }
+        announce();
     }
     setAwake(true);
 
@@ -140,7 +147,56 @@ void Pointer::setAwake(bool awake)
     if (m_awake == awake)
         return;
     m_awake = awake;
+    announce();
     emit awakeChanged(awake);
+}
+
+/*
+ * EMITTED IN BOTH MODES, and that is what makes the mode switch possible at all.
+ * The shell cannot know a film has started owning the screen until something asks
+ * it, and the only thing that asks is the cursor moving -- so a changed() that
+ * fired only while redirected could never be the thing that turns the redirect
+ * on.  The dedup below is what keeps that affordable: a still cursor is silent,
+ * whichever mode it is in.
+ */
+void Pointer::announce()
+{
+    /* Asleep is a state with a picture too -- the empty one -- so it goes through
+     * the same comparison rather than being special-cased into a separate signal
+     * that the owner would have to remember to clear the layer from. */
+    const int opacity = m_awake ? m_opacity : 0;
+    if (pos() == m_shownAt && opacity == m_shownOpacity)
+        return;
+    m_shownAt = pos();
+    m_shownOpacity = opacity;
+    emit changed();
+}
+
+void Pointer::setRedirected(bool on)
+{
+    if (m_redirected == on)
+        return;
+    m_redirected = on;
+
+    /* Whichever way this went, what the other side is showing is now wrong: on the
+     * way in there is a Qt-drawn arrow to take down, and on the way out there is
+     * a GPU-drawn one that nothing will refresh again.  -1 makes the announce()
+     * below unconditional, and hide()/show() settle Qt's half. */
+    m_shownOpacity = -1;
+
+    if (on) {
+        if (isVisible())
+            hide();
+        announce();
+        return;
+    }
+
+    if (m_awake) {
+        applyPosition();
+        show();
+        raise();
+        update();
+    }
 }
 
 void Pointer::onIdle()
@@ -170,6 +226,7 @@ void Pointer::onFade()
         return;
     }
     update();
+    announce();
 }
 
 void Pointer::applyPosition()
@@ -194,8 +251,12 @@ void Pointer::applyPosition()
         m_exact.setY(maxY);
 
     const QPoint p(qRound(m_exact.x()), qRound(m_exact.y()));
-    if (p != pos())
+    if (p != pos()) {
         move(p);
+        /* move() on a hidden widget is still where the hot spot is, and while
+         * redirected that is the only thing that carries the arrow. */
+        announce();
+    }
 }
 
 void Pointer::onMove(qreal dx, qreal dy)
@@ -351,12 +412,33 @@ void Pointer::dispatch(QEvent::Type type, Qt::MouseButton button, Qt::MouseButto
     QApplication::sendEvent(w, &ev);
 }
 
+QImage Pointer::snapshot() const
+{
+    if (!m_awake || m_opacity <= 0)
+        return QImage();
+
+    /* Premultiplied, like every other thing handed to GlVideo::setOverlay: the
+     * arrow is antialiased and its shadow is translucent, so the whole rectangle
+     * carries meaningful alpha and the un-multiply happens on the way to the GPU. */
+    QImage img(size(), QImage::Format_ARGB32_Premultiplied);
+    img.fill(Qt::transparent);
+    QPainter p(&img);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    paintBody(p);
+    return img;
+}
+
 void Pointer::paintEvent(QPaintEvent *event)
 {
     Q_UNUSED(event);
 
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
+    paintBody(p);
+}
+
+void Pointer::paintBody(QPainter &p) const
+{
     p.setOpacity(m_opacity / 255.0);
 
     const QPainterPath path = arrowPath();

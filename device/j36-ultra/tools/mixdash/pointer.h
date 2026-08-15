@@ -24,16 +24,37 @@
  * coordinates and screen coordinates are the same numbers.  That is an assumption
  * worth naming: if the dashboard ever runs in a window on a workstation, mapping
  * through mapToGlobal is the change.
+ *
+ * ── AND OVER A FILM IT IS NOT A WIDGET AT ALL ────────────────────────────────
+ *
+ * A cursor is the one widget in this program that moves over whatever happens to
+ * be underneath it, which makes it the one widget that finds every compositing
+ * assumption the underneath is making.  While GlVideo owns the screen, MediaPage
+ * paints nothing -- the pixels on the glass came from the GPU, not from Qt's
+ * backing store -- so a child widget moving across it dirties a rectangle that Qt
+ * then memcpy's from a backing store holding nothing but stale pixels.  What the
+ * user saw was a grey square dragging the arrow around the film.
+ *
+ * raise() cannot fix that, because it is not a stacking-order problem: both things
+ * really are being drawn, into two different buffers, one of which is the scanout.
+ * So setRedirected(true) does what volume.h's does -- the widget hides, stops
+ * being composited by Qt at all, and emits changed() whenever the picture of it
+ * would differ.  Whoever owns the screen calls snapshot(), pairs it with
+ * hotspot(), and blends it in its own pass.  Everything else about the cursor --
+ * where it is, what it is over, what it has grabbed, the idle fade -- carries on
+ * unchanged, because none of that was ever about being visible to Qt.
  */
 #ifndef MIXDASH_POINTER_H
 #define MIXDASH_POINTER_H
 
 #include <QElapsedTimer>
 #include <QEvent>
+#include <QImage>
 #include <QPointF>
 #include <QPointer>
 #include <QWidget>
 
+class QPainter;
 class QTimer;
 
 class Pointer : public QWidget
@@ -55,6 +76,22 @@ public:
      * launched child) calls this so the arrow is not burned into a screenshot. */
     void sleep();
 
+    /*
+     * Hand the drawing over to whoever owns the pixels.  While this is on the
+     * widget stays hidden and every change that would have altered what is drawn
+     * -- a move, the fade, going to sleep -- comes out as changed().
+     */
+    void setRedirected(bool on);
+    bool isRedirected() const { return m_redirected; }
+
+    /*
+     * The arrow as premultiplied ARGB, the size of this widget, with its tip at
+     * 0,0 so that the caller can place it at hotspot() with nothing to adjust.
+     * A null image when there is nothing to draw, which the caller should treat as
+     * "clear the layer" rather than "draw nothing this time".
+     */
+    QImage snapshot() const;
+
 public slots:
     void onMove(qreal dx, qreal dy);
     void onButton(int button, bool pressed);
@@ -64,6 +101,11 @@ signals:
     /* Emitted when the cursor appears or disappears, so the shell can drop the
      * keyboard-focus highlight while a pointer is in use and bring it back after. */
     void awakeChanged(bool awake);
+
+    /* What snapshot() would return, or where it goes, is not what it was.  Emitted
+     * in both modes on purpose -- see the note on announce() in pointer.cpp -- and
+     * not emitted at all while the cursor is still. */
+    void changed();
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -86,6 +128,11 @@ private:
     void updateEnterLeave(const QPoint &hostPos);
     void setAwake(bool awake);
     void applyPosition();
+    /* The arrow itself, into whatever painter is offered -- the widget's, or
+     * snapshot()'s image.  Tip at the painter's origin. */
+    void paintBody(QPainter &p) const;
+    /* changed(), unless nothing about the picture actually moved. */
+    void announce();
 
     QWidget *m_host = nullptr;
     /* Fractional, because a slow stick moves a third of a pixel per tick and
@@ -109,6 +156,15 @@ private:
     QTimer *m_fade = nullptr;
     int m_opacity = 255;
     bool m_awake = false;
+    bool m_redirected = false;
+
+    /* What was last handed to the owner of the pixels.  A stick produces a move
+     * event per poll and several of the calls below wake() as well, so without
+     * this a still cursor would re-render, re-upload and re-composite a film a
+     * hundred times a second to say nothing had changed.  Opacity -1 means
+     * "nothing handed over yet", which is what makes the first one go. */
+    QPoint m_shownAt;
+    int m_shownOpacity = -1;
 };
 
 #endif /* MIXDASH_POINTER_H */

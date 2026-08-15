@@ -61,6 +61,7 @@ libvorbisidec1
 libvpx9
 libxkbcommon0
 libzip5
+links2
 mbrola
 mbrola-us1
 mbrola-us2

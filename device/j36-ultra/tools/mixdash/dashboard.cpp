@@ -46,6 +46,20 @@
 namespace {
 
 /*
+ * The browser, in the two places that have to agree about it: the card's greyed-
+ * out test and the line typed into the terminal.  buildPages() has the long
+ * version of why a web browser on this board is a text browser in a pty.
+ *
+ * The start page is shipped in the payload rather than pointed at a search engine
+ * because the first thing a browser has to do here is prove it works without
+ * anybody typing a URL on an eleven-button keyboard, and because a card that
+ * opens a page held on the card itself still opens with no network at all.
+ */
+const char kBrowserExe[]   = "/usr/bin/links2";
+const char kBrowserStart[] = "/opt/mixos/share/browser/start.html";
+const char kBrowserFallbackUrl[] = "https://duckduckgo.com/";
+
+/*
  * Quote a path for /bin/sh.  Inside single quotes everything is literal except a
  * single quote, which has to leave the quoting to be written: ' -> '\''.  Paths
  * on an SD card come from whoever wrote the card, and a filename with a quote or
@@ -474,6 +488,7 @@ Dashboard::Dashboard(QWidget *parent)
     connect(m_pad, &Joypad::pointerMove, m_pointer, &Pointer::onMove);
     connect(m_pad, &Joypad::pointerButton, m_pointer, &Pointer::onButton);
     connect(m_pad, &Joypad::pointerWheel, m_pointer, &Pointer::onWheel);
+    connect(m_pointer, &Pointer::changed, this, &Dashboard::syncPointerOverlay);
     connect(m_pad, &Joypad::deviceAdded, this, &Dashboard::onInputDeviceAdded);
     connect(m_pad, &Joypad::deviceRemoved, this, &Dashboard::onInputDeviceRemoved);
     connect(m_pad, &Joypad::devicesChanged, this, &Dashboard::refreshInputSummary);
@@ -609,6 +624,71 @@ void Dashboard::buildPages()
     else if (wad.isEmpty())
         doom.reason = tr("No IWAD in /opt/mixos/share/doom.");
     apps.append(doom);
+
+    /*
+     * A web browser, next to Doom because that is where it was asked for -- and it
+     * is the Terminal page with links2 in it rather than a window with a URL bar.
+     * That is not modesty about what this board can do; it is the only shape a
+     * browser can have here, and the three things that decide it are worth having
+     * written down, because every one of them looks like an oversight until it is.
+     *
+     *   1. THERE IS NO EDGE FOR THIS MACHINE, and there would be no point if there
+     *      were.  Microsoft ships Edge for Linux on amd64 and arm64; there has
+     *      never been an armhf build.  The engine underneath it is the real
+     *      objection though: Chromium on a 1 GHz Cortex-A7 with 946 MB of usable
+     *      RAM and no GPU driver for its compositor does not run slowly, it swaps.
+     *      Debian trixie/armhf does carry chromium, falkon, qutebrowser and
+     *      morph-browser, and all four are that same engine wearing hats.
+     *
+     *   2. NOTHING GRAPHICAL IN THE ARCHIVE CAN REACH THIS PANEL.  netsurf-fb is
+     *      the obvious candidate and does not work: Debian's copy of libnsfb is
+     *      built with the sdl, xcb, vnc and wayland surfaces and WITHOUT the linux
+     *      one, so it has no way to open /dev/fb0 -- the binary contains no
+     *      /dev/fb, no FBIOGET and no fb0 -- and its sdl surface goes through
+     *      libsdl1.2debian, which in trixie is sdl12-compat over SDL2, and SDL2
+     *      dropped the fbcon driver years ago.  links2's OWN framebuffer driver
+     *      would have been ideal, and the Debian build leaves it out too: -driver
+     *      fb is listed in its help text, but the binary carries neither /dev/fb0
+     *      nor FRAMEBUFFER nor KDSETMODE, only the X driver.  Everything else
+     *      graphical wants an X server or a Wayland compositor.
+     *
+     *   3. AN X SERVER HERE WOULD BE THE CONSOLE CARD AGAIN.  Xorg wants a VT of
+     *      its own, and the note further down -- where the Console card used to be
+     *      built -- is the record of what asking for one costs on this board: the
+     *      kernel's console driver was never bound to this simplefb, the switch
+     *      does not take, and then nothing is drawn by anybody.  And X would have
+     *      nothing to drive a browser with.  This device has eleven buttons and no
+     *      touchscreen; the cursor on the glass is drawn by pointer.cpp and the
+     *      keyboard by keyboard.cpp, and neither of them exists outside this
+     *      process.
+     *
+     * Which leaves the one place on this card that already owns the panel, a
+     * pointer and a keyboard: this dashboard.  TerminalPage is a real pty drawn
+     * into the same framebuffer, the pad walks it, Menu raises the on-screen
+     * keyboard, and links2 in text mode is a browser driven entirely by the arrow
+     * keys and Enter -- ESC for its menu bar, `g' for go-to-URL.  It does tables,
+     * frames, forms, cookies and TLS through OpenSSL 3, which is the part that
+     * decides whether a browser is usable in 2026 at all: it can reach a modern
+     * site.  What it does not do is JavaScript.
+     *
+     * HOME IS THE DATA PARTITION AND NOT ROOT'S.  links2 keeps its bookmarks,
+     * cookie jar and cache in ~/.links2 and saves downloads into the working
+     * directory; /home/virtua is the one partition on this card that is meant to
+     * be written and the one the Sharing page exports, so a file saved out of the
+     * browser is a file that turns up on the laptop over SMB.  Pointed at both
+     * with one `cd' and one HOME rather than at links2 options, because -download-
+     * dir would have covered half of it and left the cookie jar on the rootfs.
+     */
+    AppEntry browser;
+    browser.key = QStringLiteral("browser");
+    browser.title = tr("Browser");
+    browser.accent = Theme::teal();
+    browser.glyph = GlyphGlobe;
+    browser.internal = InternalBrowser;
+    browser.available = !firstExisting(QStringList() << kBrowserExe).isEmpty();
+    if (!browser.available)
+        browser.reason = tr("links2 is not installed. The Packages page can add it.");
+    apps.append(browser);
 
     /*
      * Second, because after "play a game" the next thing anybody does with a
@@ -877,6 +957,10 @@ void Dashboard::applyChrome()
         m_volumeBar->raise();
     m_pointer->raise();
 
+    /* Leaving a film is the one cursor mode change nothing else notices: the arrow
+     * is not moving, so it will not ask on its own. */
+    syncPointerOverlay();
+
     syncInputMode();
     update();
 }
@@ -945,6 +1029,49 @@ void Dashboard::syncVolumeOverlay()
      * Dropping it here means the next press is decided fresh in onNav(). */
     if (!m_volumeBar->isUp())
         m_volumeBar->setRedirected(false);
+}
+
+/*
+ * THE CURSOR OVER A FILM, and the mode switch that gets it there.
+ *
+ * The volume bar can decide its mode at the moment of the press, because there is
+ * exactly one moment and the shell is standing in it.  A cursor has no such
+ * moment: it moves, and whether the thing underneath it is a GPU-owned film or a
+ * Qt page is a question with a different answer every time.  So Pointer emits
+ * changed() in both modes and this is where the answer is looked up -- once per
+ * actual movement, which is what the dedup in Pointer::announce() buys.
+ *
+ * The film ending is the other direction, and applyChrome() calls this for it:
+ * a cursor left redirected after the picture went away would be a cursor nobody
+ * is drawing.
+ */
+void Dashboard::syncPointerOverlay()
+{
+    const bool overFilm = m_media && m_media->glOwnsScreen();
+
+    if (m_pointer->isRedirected() != overFilm) {
+        /* Take the old drawing down before switching, in whichever buffer it was:
+         * setRedirected() hides or shows the Qt widget, and this clears the GPU
+         * layer, and doing only one of the two leaves an arrow that never moves
+         * again next to the one that does. */
+        if (!overFilm && m_media)
+            m_media->setPointerOverlay(QImage(), QRect());
+        m_pointer->setRedirected(overFilm);
+        /* setRedirected(true) announces, which re-enters here with the modes now
+         * agreeing and hands the picture over; there is nothing left to do. */
+        return;
+    }
+
+    if (!overFilm)
+        return;
+
+    /* mapToGlobal for the same reason the volume bar does it, and with the same
+     * caveat: framebuffer coordinates are what GlVideo wants, and they are only
+     * the shell's own coordinates for as long as the shell is full screen.  The
+     * cursor's hot spot is its top-left corner, so this rectangle needs no
+     * adjustment -- see pointer.h. */
+    const QRect at(m_pointer->mapToGlobal(QPoint(0, 0)), m_pointer->size());
+    m_media->setPointerOverlay(m_pointer->snapshot(), at);
 }
 
 /* ── the pages talking back ──────────────────────────────────────────────── */
@@ -1283,6 +1410,32 @@ void Dashboard::activate(const AppEntry &entry)
     case InternalTerminal:
         push(m_terminal);
         break;
+    case InternalBrowser: {
+        /*
+         * The same door the Packages page uses for `apt install': open the
+         * Terminal and type a line into the shell that is already running in it.
+         * Nothing here launches a process -- the pty does, which is what keeps the
+         * pad, the on-screen keyboard and the framebuffer where they are.
+         *
+         * The start page is the shipped one if the payload is on this card and a
+         * search engine if it is not, so the card still opens something on a card
+         * whose /opt/mixos never got unpacked.
+         *
+         * `cd ... || cd ~' and HOME="$PWD" as a PREFIX: the assignment applies to
+         * links2 and to nothing after it, so the terminal the user backs out into
+         * still has root's HOME.  A bare `HOME=...' would have quietly re-homed
+         * the shell for the rest of the session.
+         */
+        const QString start =
+            QFileInfo(QString::fromLatin1(kBrowserStart)).exists()
+                ? QStringLiteral("file://") + QString::fromLatin1(kBrowserStart)
+                : QString::fromLatin1(kBrowserFallbackUrl);
+        push(m_terminal);
+        m_terminal->runCommand(QStringLiteral("cd /home/virtua 2>/dev/null || cd ~; HOME=\"$PWD\" ")
+                               + QString::fromLatin1(kBrowserExe) + QLatin1Char(' ')
+                               + shellQuote(start));
+        break;
+    }
     case InternalWifi:
         push(m_wifi);
         break;

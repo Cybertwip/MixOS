@@ -131,20 +131,30 @@ public:
      * Alpha is honoured, which is the whole reason these are textures and not
      * fills: the bar over a film is meant to be see-through.
      *
-     * THERE ARE TWO OF THEM, AND THE SECOND ONE IS NOT A CONVENIENCE.  Everything
-     * that has to appear over a film has to be blended by this pass, because this
-     * pass is what is actually in the scanout -- a Qt widget drawn over the film
-     * is a memcpy that the next frame overwrites twenty-five times a second,
-     * which is not a stacking-order problem and cannot be fixed with raise().
-     * The transport strip was the first such thing and the volume bar is the
-     * second; they change on completely different schedules and live in
+     * THERE IS MORE THAN ONE OF THEM, AND THE EXTRA ONES ARE NOT A CONVENIENCE.
+     * Everything that has to appear over a film has to be blended by this pass,
+     * because this pass is what is actually in the scanout -- a Qt widget drawn
+     * over the film is a memcpy that the next frame overwrites twenty-five times a
+     * second, which is not a stacking-order problem and cannot be fixed with
+     * raise().  The transport strip was the first such thing and the volume bar is
+     * the second; they change on completely different schedules and live in
      * completely different rectangles, so folding them into one texture would
      * mean re-rendering the strip every time the volume moved and carrying a
-     * texture the size of both.  Two slots, drawn in order, Volume last because a
-     * volume bar over the clock is right and the clock over the volume bar is
-     * not.
+     * texture the size of both.
+     *
+     * THE OTHER DIRECTION OF THE SAME BUG IS WHY Busy AND Pointer ARE HERE.  A Qt
+     * widget over a GL-owned page does not merely get overwritten -- it also
+     * DIRTIES the page underneath it, and MediaPage::paintEvent draws nothing at
+     * all in that state, so linuxfb memcpy's a rectangle of stale backing store
+     * straight onto the picture.  That is the square that used to follow the mouse
+     * across a film.  A cursor that is a texture in this list has neither problem:
+     * it is composited by the pass that owns the pixels.
+     *
+     * Drawn in the order they are declared, so later is on top: the clock under
+     * the volume bar, the volume bar under the spinner, and the arrow over
+     * everything, which is what an arrow is for.
      */
-    enum Layer { ChromeLayer, VolumeLayer, LayerCount };
+    enum Layer { ChromeLayer, VolumeLayer, BusyLayer, PointerLayer, LayerCount };
     void setOverlay(Layer which, const QImage &argb, const QRect &at);
     void clearOverlay(Layer which);
     /* Both at once, for the way out of a film. */

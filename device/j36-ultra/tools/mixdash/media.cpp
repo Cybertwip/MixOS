@@ -2465,6 +2465,26 @@ void MediaPage::setVolumeOverlay(const QImage &argb, const QRect &at)
     present();
 }
 
+/*
+ * The cursor, on the same terms as the bar above it and with one extra one: this
+ * arrives on every motion event, so a still frame is re-composited at whatever
+ * rate the mouse reports.  That is affordable -- the arrow is 20x28, the film is
+ * already in the scanout, and the pass that re-blends it is the one that was
+ * going to run anyway 25 times a second -- and it is the only thing that makes
+ * the cursor move while a film is PAUSED, which is exactly when somebody reaches
+ * for the mouse.
+ */
+void MediaPage::setPointerOverlay(const QImage &argb, const QRect &at)
+{
+    if (!m_gl)
+        return;
+    if (argb.isNull() || at.isEmpty())
+        m_gl->clearOverlay(GlVideo::PointerLayer);
+    else
+        m_gl->setOverlay(GlVideo::PointerLayer, argb, at);
+    present();
+}
+
 void MediaPage::paintEvent(QPaintEvent *)
 {
     /*
