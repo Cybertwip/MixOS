@@ -1138,6 +1138,54 @@ static int rep_any(void)
     return 0;
 }
 
+/* ── The session's control pipe ──────────────────────────────────────────── */
+
+/*
+ * WHERE `next' GOES WHEN MENU IS TAPPED, and nothing at all when --ctl was not
+ * given.
+ *
+ * The session this bridge belongs to -- /opt/mixos/bin/j36-xsession-main -- holds
+ * a FIFO under /run open for reading and writing and takes one line at a time:
+ * `next', `prev', `quit', or `run' and a command line.  Menu tapped means "show me
+ * the next window", which is the same gesture the dashboard behind this session
+ * uses for the same idea one level up.  The two do not collide: a hold is a
+ * thousand milliseconds and a tap is what a press that ends before then is.
+ *
+ * WHY THE WINDOW MANAGER IS ASKED AND NOT A KEY SYNTHESISED.  matchbox ships
+ * matchbox-remote, which sends the WM the same ClientMessage its own key bindings
+ * do, so there is no keycode to find, no modifier state to get wrong and nothing
+ * to configure.  Through XTEST it would be a key put into whichever window has
+ * focus -- and a browser is perfectly entitled to have bound that key itself.
+ *
+ * O_NONBLOCK ON THE OPEN, ALWAYS.  A FIFO opened for writing blocks until a reader
+ * appears, and the case that has to be survived is a session that died without
+ * removing its pipe: without the flag that is a pad bridge wedged inside a button
+ * handler, still holding the grab, with the pointer frozen and no way back.  With
+ * it the open fails ENXIO and the tap does nothing, which is the right amount of
+ * nothing.  The line is far below PIPE_BUF, so the write is atomic against the
+ * other writers -- mixdash and j36-xrun -- and cannot be interleaved with theirs.
+ */
+static const char *ctl_path;
+
+static void ctl_send(const char *word)
+{
+    char line[64];
+    int fd, n;
+
+    if (!ctl_path)
+        return;
+
+    fd = open(ctl_path, O_WRONLY | O_NONBLOCK);
+    if (fd < 0) {
+        note("no session listening on %s (%s)", ctl_path, strerror(errno));
+        return;
+    }
+    n = snprintf(line, sizeof line, "%s\n", word);
+    if (n > 0 && write(fd, line, (size_t)n) < 0)
+        note("could not ask the session for `%s': %s", word, strerror(errno));
+    close(fd);
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 /* Long enough that it cannot be a fumble, short enough that nobody wonders
@@ -1185,6 +1233,8 @@ static void usage(void)
         "\n"
         "  --watch PID       quit when PID exits; Menu held closes the session,\n"
         "                    or asks $MIXDASH_PID for its task switcher instead\n"
+        "  --ctl PATH        the session's control pipe: Menu TAPPED asks it to\n"
+        "                    page to the next window\n"
         "  --display NAME    which server (default $DISPLAY)\n"
         "  --no-grab         read the pad without taking it from other readers\n"
         "  --list            name the devices that would be used, then exit\n"
@@ -1268,6 +1318,8 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--watch") && i + 1 < argc)
             watch_pid = (pid_t)strtol(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--ctl") && i + 1 < argc)
+            ctl_path = argv[++i];
         else if (!strcmp(argv[i], "--display") && i + 1 < argc)
             display_name = argv[++i];
         else if (!strcmp(argv[i], "--no-grab"))
@@ -1516,7 +1568,28 @@ int main(int argc, char **argv)
                     break;
 
                 case BTN_MODE:
-                    menu_down_at = down ? now : 0;
+                    /*
+                     * ── MENU TAPPED: THE NEXT WINDOW ─────────────────────
+                     *
+                     * A press released before MENU_HOLD_MS is a tap, and the
+                     * hold branch further down has therefore not fired -- it
+                     * clears menu_down_at when it does, so a non-zero value
+                     * here is proof that this release ends a press that was
+                     * still short.  That single test is what keeps the two
+                     * gestures from ever both happening on one press.
+                     *
+                     * With no --ctl there is no session to ask and a tap does
+                     * what it has always done, which is nothing.
+                     */
+                    if (down) {
+                        menu_down_at = now;
+                    } else {
+                        if (menu_down_at && now - menu_down_at < MENU_HOLD_MS) {
+                            note("Menu tapped, asking for the next window");
+                            ctl_send("next");
+                        }
+                        menu_down_at = 0;
+                    }
                     break;
 
                 default:

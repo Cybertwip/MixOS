@@ -584,6 +584,42 @@ void MediaPage::populate(QString dir)
         m_entries.append(up);
     }
 
+    /*
+     * ── AND THE OTHER ROOTS, ON THE LISTING RATHER THAN ABOVE IT ────────────────
+     *
+     * A stick used to arrive on this page as a `..' row silently appearing at the
+     * top of whatever was already listed.  That is not a stick being listed: the
+     * row says "up one level" until you press it, the level above is a places list
+     * nobody has been told exists, and the volume's own name appears nowhere on the
+     * screen the user is actually looking at.  What that produced was the bug as it
+     * was reported -- media that "does not list its directories" until it is reached
+     * the long way round, through the Files page, which has had its volumes
+     * permanently on the glass since the day it was written and for exactly this
+     * reason (see the Places note in files.h).
+     *
+     * So when this listing IS a root, every OTHER root goes on it, by name, at the
+     * top.  One press opens the volume.  The places level is untouched and `..'
+     * still goes there -- this is the same list one level down, where somebody who
+     * has just plugged a disk in is standing.
+     *
+     * Only on a root, deliberately.  Repeating the volumes inside every directory
+     * would put a drive row above the files in every folder on the card, and the
+     * question a listing answers is "what is in here".
+     */
+    if (root.isEmpty() || m_dir == root) {
+        for (const MediaRoot &r : mediaRoots()) {
+            if (QDir::cleanPath(r.path) == m_dir)
+                continue;
+            Entry e;
+            e.kind = KindPlace;
+            e.path = r.path;
+            e.name = r.removable ? r.name : tr("Device");
+            if (e.name.isEmpty())
+                e.name = QFileInfo(r.path).fileName();
+            m_entries.append(e);
+        }
+    }
+
     const QFileInfoList infos = d.entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot,
                                                 QDir::Name | QDir::DirsFirst
                                                     | QDir::IgnoreCase);
@@ -664,8 +700,25 @@ void MediaPage::populatePlaces()
  */
 void MediaPage::onDisksChanged()
 {
-    if (m_view != ViewBrowse)
-        return;
+    /*
+     * NOT `if (m_view != ViewBrowse) return', which is what this used to be and
+     * which lost the event outright.
+     *
+     * Music survives leaving this page -- that is the whole point of the queue --
+     * so the player view is an ordinary place to be standing, and so is a picture
+     * or a film.  A stick plugged in while any of them is up used to be dropped on
+     * the floor: m_entries kept the listing built when there was one root, so it
+     * had no volume rows and no `..', and going back to the browser showed a
+     * directory with no sign of the disk in it.  The only thing that put it right
+     * was leaving the page altogether and coming back, because onEnter() calls
+     * populate() unconditionally.
+     *
+     * So the listing is rebuilt whichever view is up -- populate() and
+     * populatePlaces() both end in rebuild(), which builds rows for the view that
+     * is actually showing -- and only the CURSOR work below is browse-only, because
+     * only the browser has a cursor over m_entries to keep.
+     */
+    const bool browsing = m_view == ViewBrowse;
 
     if (m_places) {
         populatePlaces();
@@ -673,15 +726,18 @@ void MediaPage::onDisksChanged()
          * only row goes where you already were. */
         if (m_entries.size() < 2)
             populate(mediaCeiling());
-        m_list->setCurrent(0);
+        if (browsing)
+            m_list->setCurrent(0);
         return;
     }
 
-    /* The cursor is kept by the path it was on and not by its index: the `..' row
-     * appearing or disappearing shifts every index below it by one, which is
-     * exactly what a stick being plugged in does. */
+    /* The cursor is kept by the path it was on and not by its index: the volume
+     * rows and the `..' row appearing or disappearing shift every index below them,
+     * which is exactly what a stick being plugged in does.  Read before the
+     * repopulate and only when the browser owns the pane -- in the player view the
+     * rows are the transport, and rows[at].key there is not a path. */
     QString cursor;
-    {
+    if (browsing) {
         const QVector<ListRow> &rows = m_list->rows();
         const int at = m_list->current();
         if (at >= 0 && at < rows.size())
@@ -690,7 +746,7 @@ void MediaPage::onDisksChanged()
 
     const QString was = m_dir;
     populate(QFileInfo(was).isDir() ? clampToCeiling(was) : mediaCeiling());
-    if (cursor.isEmpty() || !selectPath(cursor))
+    if (browsing && (cursor.isEmpty() || !selectPath(cursor)))
         m_list->setCurrent(0);
 }
 

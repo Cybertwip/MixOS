@@ -28,6 +28,7 @@
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QFontMetrics>
 #include <QKeyEvent>
@@ -40,18 +41,24 @@
 #include <QResizeEvent>
 #include <QTimer>
 
+#include <fcntl.h>
 #include <signal.h>
 #include <unistd.h>
 
 /*
- * There is no <linux/vt.h>, <linux/kd.h>, <sys/ioctl.h>, <sys/wait.h>, <fcntl.h>,
- * <errno.h> or <string.h> here any more.  They were all for the Console card's
+ * There is no <linux/vt.h>, <linux/kd.h>, <sys/ioctl.h>, <sys/wait.h>, <errno.h>
+ * or <string.h> here any more.  They were all for the Console card's
  * fork-a-shell-onto-a-spare-VT, which is gone.
  *
  * <signal.h> and <unistd.h> ARE back, and for one thing each: kill(-pgid, ...),
  * which is how a task in the background is stopped and continued, and setpgid(),
  * which is what makes there be a -pgid to send it to.  Both are in launch() and
  * setForeground() and nowhere else in this file.
+ *
+ * <fcntl.h> came back with the graphical session, for one flag: O_NONBLOCK on the
+ * open of the session's control FIFO.  QFile cannot ask for it, and without it a
+ * pipe left behind by a session that died is this program blocked in open() -- see
+ * writeSessionControl().
  */
 
 namespace {
@@ -61,12 +68,13 @@ namespace {
  * test, the process the card starts, and the line typed into the terminal when
  * there is no graphical session on the card.  buildPages() has the long version.
  *
- * kBrowserSession is a shell script the build stages beside the dashboard.  It
- * brings an X server up on /dev/fb0, runs a window manager, an on-screen keyboard
- * and whichever browser is installed inside it, and translates the pad into a
- * pointer with j36-padx.  Everything about that lives in the script and in
- * build-in-vm.sh, which is the point: none of it belongs in a Qt program that is
- * not running when it happens.
+ * kBrowserSession is a shell script the build stages beside the dashboard.  IT IS
+ * A WINDOW AND NOT A SESSION ANY MORE, and the name is the last of when it was: it
+ * used to bring an X server up on /dev/fb0 and take it down again when Firefox
+ * closed, and it now works out which browser is installed, writes the profile, and
+ * execs it as one client of the session below.  Which browser, and every preference
+ * it is started with, lives in the script and in build-in-vm.sh, which is the point:
+ * none of it belongs in a Qt program that is not running when it happens.
  *
  * kBrowserExe is the fallback for a card with no X on it -- links2 in the
  * dashboard's own terminal, which is what this card used to be and is still the
@@ -81,6 +89,33 @@ const char kBrowserSession[] = "/opt/mixos/bin/j36-browser";
 const char kBrowserExe[]   = "/usr/bin/links2";
 const char kBrowserStart[] = "/opt/mixos/share/browser/start.html";
 const char kBrowserFallbackUrl[] = "https://duckduckgo.com/";
+
+/*
+ * ── THE GRAPHICAL SESSION ────────────────────────────────────────────────────
+ *
+ * kXSession is the launcher the Desktop card starts, and it is ONE TASK in the
+ * switcher no matter how many windows end up inside it: it is one process group,
+ * one X server and one framebuffer's worth of saved pixels.  Everything about what
+ * runs in there is in the script and in build-in-vm.sh -- this program's whole part
+ * in it is starting it, stopping it with the group, and passing requests down the
+ * pipe below.
+ *
+ * kXSessionCtl is that pipe: a FIFO the session holds open read-write, taking one
+ * line at a time -- `run <command>', `next', `prev', `quit'.  Opened O_WRONLY |
+ * O_NONBLOCK, ALWAYS, and that is not a micro-optimisation: an ordinary open of a
+ * FIFO for writing blocks until a reader appears, and a Qt program that blocks in
+ * an activate() handler is a dashboard that has stopped painting with no way back.
+ * With the flag, a session that died without tidying up its pipe fails ENXIO in
+ * microseconds and the card says so.
+ *
+ * kXSessionWindows is what the session writes its window list into, one
+ * `pid<TAB>title' per line, rewritten by rename so a reader gets the old list or
+ * the new one and never half of either.  It is read when the switcher opens, which
+ * is why it must be a file and not a request-and-wait.
+ */
+const char kXSession[] = "/opt/mixos/bin/j36-xsession";
+const char kXSessionCtl[] = "/run/j36/xsession.ctl";
+const char kXSessionWindows[] = "/run/j36/xsession.windows";
 
 /*
  * The graphical session's path if this card can actually run one, and an empty
@@ -98,30 +133,43 @@ const char kBrowserFallbackUrl[] = "https://duckduckgo.com/";
  * its directory entries behind, and the failure this is guarding against is a card
  * that looks available and starts nothing.
  */
-QString graphicalBrowserSession()
+QString graphicalSession()
 {
     static const char *const kServers[] = {
         "/usr/bin/Xorg", "/usr/lib/xorg/Xorg", "/usr/bin/X"
     };
+
+    if (!QFileInfo(QString::fromLatin1(kXSession)).isExecutable())
+        return QString();
+    if (!QFileInfo(QStringLiteral("/usr/bin/xinit")).isExecutable())
+        return QString();
+
+    for (const char *const s : kServers) {
+        if (QFileInfo(QString::fromLatin1(s)).isExecutable())
+            return QString::fromLatin1(kXSession);
+    }
+    return QString();
+}
+
+/*
+ * The browser CLIENT's path if this card can run one, and empty if it cannot.
+ *
+ * Two things now, where it used to be one: a session to put a window in -- tested
+ * above -- and a browser for the window to be.  The client script is separately
+ * tested because it is a different file in the same payload, and a payload half
+ * unpacked is a real state on a card somebody pulled the power on.
+ */
+QString graphicalBrowserSession()
+{
     static const char *const kBrowsers[] = {
         "firefox-esr", "firefox", "netsurf-gtk", "netsurf", "epiphany-browser",
         "luakit", "surf", "dillo", "falkon", "qutebrowser", "chromium",
         "chromium-browser"
     };
 
+    if (graphicalSession().isEmpty())
+        return QString();
     if (!QFileInfo(QString::fromLatin1(kBrowserSession)).isExecutable())
-        return QString();
-    if (!QFileInfo(QStringLiteral("/usr/bin/xinit")).isExecutable())
-        return QString();
-
-    bool haveServer = false;
-    for (const char *const s : kServers) {
-        if (QFileInfo(QString::fromLatin1(s)).isExecutable()) {
-            haveServer = true;
-            break;
-        }
-    }
-    if (!haveServer)
         return QString();
 
     for (const char *const b : kBrowsers) {
@@ -129,6 +177,56 @@ QString graphicalBrowserSession()
             return QString::fromLatin1(kBrowserSession);
     }
     return QString();
+}
+
+/*
+ * A line into the session's control pipe, or false if nothing is listening.
+ *
+ * O_NONBLOCK is the whole reason this is four lines of POSIX rather than a
+ * QFile::open -- see the note on kXSessionCtl.  QFile would use an ordinary open()
+ * and hang this program on a FIFO whose session has gone.
+ *
+ * O_CLOEXEC because every child this dashboard starts inherits its descriptors and
+ * a write end of the session's pipe held open by a game is a session that cannot
+ * tell when its last window closed.  It is closed immediately anyway; the flag is
+ * for the fork that happens between the open and the close.
+ */
+bool writeSessionControl(const QString &line)
+{
+    const int fd = ::open(kXSessionCtl, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    const QByteArray b = line.toUtf8() + '\n';
+    const qint64 n = ::write(fd, b.constData(), size_t(b.size()));
+    ::close(fd);
+    return n == b.size();
+}
+
+/*
+ * What is open inside the session, by name, for the switcher's detail line.
+ *
+ * Best effort on purpose: the file is written by a shell script and read during a
+ * repaint, so anything unexpected in it costs a detail line and never a frame.  A
+ * missing file is the ordinary case -- there is no session -- and answers empty.
+ */
+QStringList sessionWindowNames()
+{
+    QStringList names;
+    QFile f(QString::fromLatin1(kXSessionWindows));
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return names;
+    /* A window list this long is a list nothing can render anyway, and the file is
+     * on tmpfs written by a loop with a cap of four. */
+    const QByteArray blob = f.read(4096);
+    for (const QByteArray &row : blob.split('\n')) {
+        const int tab = row.indexOf('\t');
+        if (tab < 0)
+            continue;
+        const QString name = QString::fromUtf8(row.mid(tab + 1)).trimmed();
+        if (!name.isEmpty())
+            names.append(name);
+    }
+    return names;
 }
 
 /*
@@ -149,28 +247,33 @@ QString graphicalBrowserSession()
  * were added keeps opening links2 no matter how many board layers are copied onto it,
  * and this sentence is what says so out loud instead of leaving it to be inferred.
  *
- * The order matches graphicalBrowserSession()'s tests, so the sentence names the
- * first thing that failed and not merely something that is also absent.
+ * TWO FUNCTIONS, BECAUSE THERE ARE NOW TWO CARDS THAT CAN BE GREYED OUT and they
+ * fail for overlapping but different reasons.  Desktop needs a session; Browser
+ * needs a session AND a browser to put in it.  Each sentence follows the order of
+ * the test function it belongs to, so it names the first thing that actually
+ * failed and not merely something that is also absent.
  */
-QString graphicalBrowserMissing()
+QString graphicalSessionMissing()
 {
-    if (!QFileInfo(QString::fromLatin1(kBrowserSession)).isExecutable())
+    if (!QFileInfo(QString::fromLatin1(kXSession)).isExecutable())
         return QCoreApplication::translate(
-            "Dashboard", "the /opt/mixos payload has no j36-browser script");
+            "Dashboard", "the /opt/mixos payload has no j36-xsession script");
     if (!QFileInfo(QStringLiteral("/usr/bin/xinit")).isExecutable())
         return QCoreApplication::translate(
             "Dashboard", "this card's rootfs has no xinit");
-
-    static const char *const kServers[] = {
-        "/usr/bin/Xorg", "/usr/lib/xorg/Xorg", "/usr/bin/X"
-    };
-    for (const char *const s : kServers) {
-        if (QFileInfo(QString::fromLatin1(s)).isExecutable())
-            return QCoreApplication::translate(
-                "Dashboard", "this card's rootfs has no graphical browser");
-    }
     return QCoreApplication::translate(
         "Dashboard", "this card's rootfs has no X server");
+}
+
+QString graphicalBrowserMissing()
+{
+    if (graphicalSession().isEmpty())
+        return graphicalSessionMissing();
+    if (!QFileInfo(QString::fromLatin1(kBrowserSession)).isExecutable())
+        return QCoreApplication::translate(
+            "Dashboard", "the /opt/mixos payload has no j36-browser script");
+    return QCoreApplication::translate(
+        "Dashboard", "this card's rootfs has no graphical browser");
 }
 
 /*
@@ -595,12 +698,65 @@ void Dashboard::buildPages()
      */
     browser.internal = InternalBrowser;
     browser.exe = graphicalBrowserSession();
+    /*
+     * A WINDOW AND NOT THE PANEL, which is the one thing about this card that
+     * changed when the session grew up.  It used to BE the session -- pressing it
+     * started an X server whose only client was Firefox, and closing Firefox ended
+     * the server.  Now it is a client: pressing it opens a browser window in the
+     * session if one is up, and starts the session around it if one is not.  Either
+     * way the Terminal, a game and the browser can now be on the glass at once,
+     * which is what a windowing system is for.  launch() below does the dispatch.
+     */
+    browser.launchMode = LaunchWindowed;
     browser.available = !browser.exe.isEmpty()
                         || !firstExisting(QStringList() << kBrowserExe).isEmpty();
     if (!browser.available)
         browser.reason = tr("No browser on this card. The Packages page can add "
                             "firefox-esr, or links2 for a text one.");
     apps.append(browser);
+
+    /*
+     * ── THE DESKTOP CARD ─────────────────────────────────────────────────────
+     *
+     * WHAT IT IS FOR: every X application on this card that is not the browser.
+     *
+     * The Packages page installs Debian armhf packages, and an X application
+     * installed that way used to have nowhere to draw.  This dashboard is linuxfb on
+     * /dev/fb0 and is not an X client; SDL2 on this image is built with the x11 and
+     * kmsdrm backends and no fbdev one, so freedoom started from the Terminal card
+     * found neither a display nor a console it could take, and said so in a line
+     * nobody could act on.  The X server that the Browser card had been quietly
+     * bringing up and taking down again for two releases was the answer sitting
+     * there unused.
+     *
+     * So this card starts that server and nothing else: a window manager with
+     * titlebars, the on-screen keyboard, the pad as a pointer, and an empty root
+     * window waiting to be asked for something.  From there `j36-xrun freedoom' in
+     * the Terminal -- which now has DISPLAY set for exactly this reason -- puts
+     * freedoom on the glass beside whatever else is open, and a tap of Menu pages
+     * between the windows.
+     *
+     * IT IS ONE TASK IN THE SWITCHER however many windows are inside it, and that is
+     * not a simplification: it is one process group, one X server and one
+     * framebuffer's worth of saved pixels, so it stops and continues as one thing
+     * exactly like a game does.  The switcher's detail line names what is in it.
+     *
+     * NOT `confirm'.  The confirm gate is for a child that sets its own mode through
+     * /dev/dri/card0 and never gives the scanout back; this one draws into /dev/fb0
+     * the same way the dashboard does, and holding FN brings the dashboard back from
+     * it the same way it does from anything else.
+     */
+    AppEntry desktop;
+    desktop.key = QStringLiteral("desktop");
+    desktop.title = tr("Desktop");
+    desktop.accent = Theme::blue();
+    desktop.glyph = GlyphDisplay;
+    desktop.exe = graphicalSession();
+    desktop.available = !desktop.exe.isEmpty();
+    if (!desktop.available)
+        desktop.reason = tr("No graphical session on this card: %1.")
+                             .arg(graphicalSessionMissing());
+    apps.append(desktop);
 
     /*
      * Second, because after "play a game" the next thing anybody does with a
@@ -1645,6 +1801,78 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
     child->start(exe, args);
 }
 
+int Dashboard::sessionTask() const
+{
+    for (int i = 0; i < m_tasks.size(); ++i) {
+        if (m_tasks[i].exe == QLatin1String(kXSession))
+            return i;
+    }
+    return -1;
+}
+
+/*
+ * ── A CARD THAT WANTS A WINDOW AND NOT THE PANEL ─────────────────────────────
+ *
+ * Two paths and they are the same idea from either end: there has to be exactly one
+ * graphical session, and this program has to end up inside it.
+ *
+ *   NO SESSION YET.  Start one with this program as its first window.  That is an
+ *   ordinary launch() of j36-xsession, so everything the task machinery already
+ *   does -- the process group, the ceiling, the busy ring, the switcher row, the
+ *   frame kept while it is stopped -- happens exactly as it does for a game.  The
+ *   command line goes down as one --run argument, quoted, because the far end runs
+ *   it with sh -c; it must, since what crosses a pipe is text and not an argv.
+ *
+ *   A SESSION IS UP.  Then starting a second one would be a second X server on one
+ *   framebuffer, which is the bug this whole arrangement exists to prevent.  The
+ *   request goes down the control pipe instead and the session forks the window
+ *   itself, inside its own process group, where mixdash's SIGSTOP still reaches it.
+ *   Then the panel is handed to the session, because a window that opens behind the
+ *   dashboard is a window nobody asked for.
+ *
+ * THE TOAST IS PAINTED BEFORE THE SWITCH, for the same reason launch() paints its
+ * own: the moment setForeground() runs, updates go off and nothing here can draw.
+ * Firefox takes several seconds to map a window on this board and the desktop's old
+ * frame is what is on the glass until it does, so the sentence naming what is being
+ * opened is the last thing this program can say about it.
+ */
+void Dashboard::launchWindowed(const QString &title, const QString &exe,
+                               const QStringList &args)
+{
+    if (exe.isEmpty() || !QFileInfo(exe).isExecutable()) {
+        toast(tr("%1 is not on this card").arg(title));
+        return;
+    }
+
+    QString cmd = shellQuote(exe);
+    for (const QString &a : args)
+        cmd += QLatin1Char(' ') + shellQuote(a);
+
+    const int session = sessionTask();
+    if (session < 0) {
+        launch(tr("Desktop"), QString::fromLatin1(kXSession),
+               QStringList() << QStringLiteral("--run") << cmd);
+        return;
+    }
+
+    if (!writeSessionControl(QStringLiteral("run ") + cmd)) {
+        /*
+         * The session is in the task list but its pipe is not there or nothing is
+         * reading it -- a supervisor that died while its X server lived, which is
+         * not a state anything here can repair from the outside.  Said plainly,
+         * with the one action that fixes it.
+         */
+        toast(tr("The desktop is not answering. Close it in the switcher and "
+                 "open it again."), 5000);
+        return;
+    }
+
+    toast(tr("Opening %1").arg(title), 8000);
+    m_toast->repaint();
+    QCoreApplication::processEvents();
+    setForeground(session);
+}
+
 void Dashboard::childDone(int index, const QString &message)
 {
     if (index < 0 || index >= m_tasks.size())
@@ -1915,6 +2143,43 @@ QVector<Switcher::Entry> Dashboard::switcherRows() const
          * and the highlight already says that.
          */
         e.detail = (i == m_fg || i == m_switcherWas) ? tr("in front") : tr("waiting");
+
+        /*
+         * ── AND WHAT IS INSIDE THE GRAPHICAL SESSION ─────────────────────────
+         *
+         * One row for the session, however many windows are in it, because it is
+         * one process group holding one framebuffer -- but a row saying "Desktop,
+         * waiting" tells a user with a browser and a game open nothing about what
+         * closing it would take with it.  So the row names them.
+         *
+         * READ AT PAINT TIME, off a file the session rewrites by rename.  It is
+         * the only honest moment to ask: windows open and close without this
+         * program being told, and a list cached when the session started would be
+         * wrong by the time anybody looked at it.
+         *
+         * THREE NAMES AND THEN A COUNT.  The detail line is one line on a 640 px
+         * panel; four names of a length nobody controls would be four names
+         * elided into nothing.  The ceiling in the session is four windows, so
+         * "and 1 more" is as long as the tail ever gets.
+         *
+         * NOT tr("%n more"): stringsdb.h has no numerus forms and %n would reach
+         * the glass unsubstituted.  An ordinary %2 and a number, like everywhere
+         * else in this program.
+         */
+        if (m_tasks[i].exe == QLatin1String(kXSession)) {
+            const QStringList windows = sessionWindowNames();
+            QString what;
+            if (windows.isEmpty()) {
+                what = tr("no windows yet");
+            } else if (windows.size() <= 3) {
+                what = windows.join(QStringLiteral(", "));
+            } else {
+                what = tr("%1 and %2 more")
+                           .arg(windows.mid(0, 3).join(QStringLiteral(", ")))
+                           .arg(windows.size() - 3);
+            }
+            e.detail = tr("%1 -- %2").arg(e.detail, what);
+        }
         rows.append(e);
     }
     return rows;
@@ -2059,7 +2324,12 @@ void Dashboard::activate(const AppEntry &entry)
             return;
         }
         m_armedExe.clear();
-        launch(entry.title, entry.exe, entry.args);
+        /* Panel or window.  See LaunchMode in widgets.h for why that is a property
+         * of the card and not something decided here. */
+        if (entry.launchMode == LaunchWindowed)
+            launchWindowed(entry.title, entry.exe, entry.args);
+        else
+            launch(entry.title, entry.exe, entry.args);
         return;
     }
 

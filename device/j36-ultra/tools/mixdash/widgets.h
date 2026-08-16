@@ -59,6 +59,34 @@ enum Glyph {
 void paintGlyph(QPainter &p, const QRectF &box, int glyph, const QColor &ink);
 
 /*
+ * HOW A CARD'S PROGRAM GETS A SCREEN, which on this device is a real question and
+ * not a detail of the launcher.
+ *
+ * LaunchPanel is what every card here has always done and what most of them still
+ * do: the program is started, it takes /dev/fb0 or /dev/dri/card0 for itself, and
+ * the dashboard stops drawing until it exits or the switcher takes the panel back.
+ * That is the right answer for a full-screen emulator or a diagnostics run, which
+ * want the whole panel and every scrap of GPU there is -- native fullscreen on this
+ * board goes through GBM/DRM and gets lima, and that is not a thing to give up.
+ *
+ * LaunchWindowed is for a program that is an X CLIENT.  It does not take the panel;
+ * it is handed to the graphical session -- j36-xsession, which the Desktop card
+ * starts -- and appears as a window inside it, beside whatever else is already
+ * there.  The session is ONE task in the switcher however many windows are in it,
+ * because it is one process group and one framebuffer's worth of pixels; the
+ * windows inside it are cycled with a tap of Menu.
+ *
+ * WHICH ONE A CARD WANTS IS A PROPERTY OF THE PROGRAM AND NOT OF THE LAUNCHER, so
+ * it is written here on the card rather than guessed at by dashboard.cpp.  The
+ * default is LaunchPanel, which means every card that existed before this enum did
+ * behaves exactly as it did.
+ */
+enum LaunchMode {
+    LaunchPanel = 0,
+    LaunchWindowed
+};
+
+/*
  * The window chrome every sheet-shaped page draws: rounded card, hairline border,
  * title bar clipped to the top corners.  Written once here because five pages
  * want it and a sixth will.  Returns the rectangle left for content.
@@ -179,6 +207,9 @@ struct AppEntry {
     int glyph = GlyphGames;
     QString exe;
     QStringList args;
+    /* Panel or window -- see LaunchMode above.  Only means anything when `exe' is
+     * set; an internal card has no program to give a screen to. */
+    int launchMode = LaunchPanel;
     int internal = 0;
     /* Greys the card out and turns activation into an explanation instead of a
      * launch.  `reason' is what that explanation says; it is never painted. */

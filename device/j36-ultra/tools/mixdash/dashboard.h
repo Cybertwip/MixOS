@@ -305,6 +305,19 @@ private:
      */
     void setForeground(int index);
     /*
+     * Open a card's program as a WINDOW rather than giving it the panel.
+     *
+     * With a graphical session already running this is a line down its control
+     * pipe and a switch to it; with none it starts one with this program as its
+     * first window, which is one ordinary launch() of j36-xsession.  Either way
+     * the session is ONE task -- see LaunchMode in widgets.h.
+     */
+    void launchWindowed(const QString &title, const QString &exe,
+                        const QStringList &args);
+    /* Where the graphical session is in m_tasks, or -1 if none is running.  By
+     * exe, because there can only ever be one of it. */
+    int sessionTask() const;
+    /*
      * SIGSTOP whatever is in front and keep its frame, leaving nothing owning the
      * panel.  The half of setForeground() that launch() needs on its own -- it is
      * on its way to a program that does not exist yet.

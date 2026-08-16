@@ -267,9 +267,13 @@ private slots:
     void commitSeek();
 
 private:
-    /* KindPlace is a ROOT -- the device itself or a mounted volume -- and it only
-     * ever appears on the places level, which is the one listing on this page that
-     * is not a directory.  See populatePlaces() in media.cpp. */
+    /*
+     * KindPlace is a ROOT -- the device itself or a mounted volume.  It is what the
+     * places level is built out of (see populatePlaces() in media.cpp), and it is
+     * ALSO what a mounted volume is listed as at the top of a root's own directory
+     * listing, which is how a stick plugged in while this page is open shows up
+     * without anybody going looking for it.  See populate().
+     */
     enum Kind {
         KindDir = 0, KindAudio, KindVideo, KindImage, KindOther, KindUp, KindPlace
     };

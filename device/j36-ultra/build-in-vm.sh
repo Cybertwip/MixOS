@@ -11560,47 +11560,100 @@ XORGCONF
 </keyboard>
 KEYBOARDXML
 
-    # The launcher.  This is what the dashboard runs, and it does four things: work
-    # out which browser is on the card, work out where the URL comes from, make the
-    # writable directories on tmpfs, and hand the whole lot to xinit.
+    # ── THE GRAPHICAL SESSION, AND WHY IT IS NO LONGER "THE BROWSER" ─────────
     #
-    # THE BROWSER IS CHOSEN AND NOT HARDCODED, because the Packages card exists:
-    # somebody who installs chromium or dillo from it should get that browser here
-    # without editing anything.  What the image itself installs is firefox-esr, and
-    # it is first in the list, because the web in 2026 is JavaScript and a browser
-    # that does not run it is a browser that shows a blank page on half the sites
-    # anybody would open.  Debian trixie has a real armhf build --
-    # 140.12.0esr, 253 MB installed -- so this is a genuine Gecko with a JIT and
-    # not a compatibility shim.
+    # This used to be two scripts: j36-browser, which brought up an X server, and
+    # j36-browser-session, which ran a window manager and Firefox inside it and
+    # ended when Firefox did.  One card, one window, one program.
     #
-    # netsurf-gtk is second and is also installed: 4 MB, its own engine, no
-    # JavaScript.  It is there because 946 MB of usable RAM with no swap is not
-    # much to run Firefox in, and the day it will not start is the day something
-    # still has to open a page.  Everything after those two is only reachable by
-    # installing it.
+    # THAT SHAPE WAS THE THING STANDING BETWEEN THIS CARD AND EVERY PACKAGE ON IT.
+    # The Packages page installs Debian armhf packages -- freedoom, chocolate-doom,
+    # an editor, anything -- and an X application installed that way has nowhere to
+    # draw: mixdash is linuxfb on /dev/fb0 and is not an X client, and SDL2 on this
+    # image is built with the x11 and kmsdrm backends and no fbdev one, so a game
+    # started from the Terminal card found neither a display nor a console it could
+    # take.  The X server was there, half an hour of build time went into making it
+    # coexist with the dashboard, and it was reachable by exactly one program.
     #
-    # POSIX sh and not bash: this is a script the user may end up running by hand
-    # from the initramfs shell, and it has nothing in it that needs more.
-    cat > "$SDROOT/opt/mixos/bin/j36-browser" <<'BROWSERLAUNCH'
+    # So the server is now a SESSION and the browser is one of its clients:
+    #
+    #   j36-xsession        the launcher.  Finds Xorg, makes the run directories and
+    #                       execs xinit.  This is what mixdash starts, and it is one
+    #                       task in mixdash's list however many windows are in it.
+    #
+    #   j36-xsession-main   the session.  Window manager, on-screen keyboard, the
+    #                       pad bridge, and a control FIFO that anything on this card
+    #                       can ask for another window through.  It is the foreground
+    #                       process, so it is what decides when the session is over.
+    #
+    #   j36-browser         now a CLIENT: it picks a browser, writes the profile and
+    #                       execs it.  Run outside a session it hands itself to
+    #                       j36-xrun, so the old command line still works.
+    #
+    #   j36-xrun            "open this in the session that is up".  Used by the
+    #                       Terminal card -- `j36-xrun freedoom' -- and by mixdash.
+    #
+    # ONE X SERVER, EVER.  j36-xrun deliberately cannot start a session: a second
+    # server, or a session started outside mixdash's task list, is two programs
+    # scribbling on one framebuffer with nothing arbitrating.  Starting one is the
+    # Desktop card's job and only the Desktop card's job, and everything else asks
+    # the one that is already running.
+    #
+    # THE WHOLE TREE IS STILL ONE PROCESS GROUP, which is what makes mixdash's
+    # switcher work: dashboard.cpp's GroupLeaderProcess puts the launcher in its own
+    # group, nothing below it calls setsid, and every window this session opens is
+    # forked by the control loop -- so kill(-pgid, SIGSTOP) still freezes the server,
+    # the window manager, the keyboard, the bridge and all four windows as one thing.
+    #
+    # POSIX sh and not bash, for all four: these are scripts the user may end up
+    # running by hand from the initramfs shell, and there is nothing in them that
+    # needs more.
+
+    # A card written by an older build has the two-script version on it and
+    # --mix-only rewrites /opt/mixos over the top.  The old session script is not
+    # referenced by anything here any more, and a stale one left next to the new one
+    # is the file somebody reads when they go looking for why a window did not open.
+    rm -f "$SDROOT/opt/mixos/bin/j36-browser-session" 2>/dev/null || true
+
+    cat > "$SDROOT/opt/mixos/bin/j36-xsession" <<'XSESSIONLAUNCH'
 #!/bin/sh
-# j36-browser -- a graphical browser on the J36 Ultra's panel.
+# j36-xsession -- the J36 Ultra's graphical session.
 #
-# Usage: j36-browser [URL]
+# Usage: j36-xsession [--run COMMAND]
 #
-# Brings up an X server on /dev/fb0 with xinit, runs a window manager, an
-# on-screen keyboard and a browser inside it, and translates the game pad into a
-# pointer with j36-padx.  Written by device/j36-ultra/build-in-vm.sh; the reasoning
-# is in that file, in the Browser card section.
+# Brings an X server up on /dev/fb0 with xinit and hands the panel to
+# j36-xsession-main.  With --run, COMMAND is the first window; without it the
+# session comes up empty and waits to be asked for one.  Written by
+# device/j36-ultra/build-in-vm.sh; the reasoning is in that file, in the graphical
+# session section.
 set -u
 
-START=/opt/mixos/share/browser/start.html
 XCONF=/opt/mixos/share/xorg/xorg.conf
-SESSION=/opt/mixos/bin/j36-browser-session
+MAIN=/opt/mixos/bin/j36-xsession-main
 
-URL="${1:-}"
-if [ -z "$URL" ]; then
-    if [ -f "$START" ]; then URL="file://$START"; else URL="https://duckduckgo.com/"; fi
-fi
+# One optional flag and one argument, which is all mixdash ever sends.  Parsed with
+# case rather than a while/shift loop because `shift' on an empty argument list is
+# an error under set -u in some shells and this has no options to accumulate.
+FIRST=""
+case "${1:-}" in
+    "")
+        ;;
+    --run)
+        if [ "$#" -lt 2 ]; then
+            echo "j36-xsession: --run needs a command" >&2
+            exit 2
+        fi
+        FIRST="$2"
+        ;;
+    -h|--help)
+        echo "usage: j36-xsession [--run COMMAND]"
+        exit 0
+        ;;
+    *)
+        echo "j36-xsession: unknown argument $1" >&2
+        exit 2
+        ;;
+esac
 
 # The X server binary.  Debian puts the real one in /usr/lib/xorg and symlinks
 # /usr/bin/Xorg at it, except on a system with xserver-xorg-legacy installed, where
@@ -11611,56 +11664,17 @@ for c in /usr/bin/Xorg /usr/lib/xorg/Xorg /usr/bin/X; do
     [ -x "$c" ] && { XORG="$c"; break; }
 done
 if [ -z "$XORG" ] || [ ! -x /usr/bin/xinit ]; then
-    echo "j36-browser: no X server on this card (needs xserver-xorg-core and xinit)" >&2
+    echo "j36-xsession: no X server on this card (needs xserver-xorg-core and xinit)" >&2
     exit 1
 fi
-
-# J36_BROWSER already in the environment wins over the search below, so a second
-# installed browser can be reached without uninstalling the first:
-#
-#     J36_BROWSER=/usr/bin/netsurf-gtk j36-browser
-#
-# which is the escape hatch for the day Firefox will not start on a board with
-# 946 MB and no swap.  Checked rather than trusted, because a typo here would
-# otherwise be an X server that comes up on an empty root window.
-J36_BROWSER="${J36_BROWSER:-}"
-if [ -n "$J36_BROWSER" ] && [ ! -x "$J36_BROWSER" ]; then
-    echo "j36-browser: J36_BROWSER=$J36_BROWSER is not an executable" >&2
-    exit 1
-fi
-
-# Any of these, first one wins.  See the comment above this heredoc for the order.
-if [ -z "$J36_BROWSER" ]; then
-    for b in firefox-esr firefox netsurf-gtk netsurf epiphany-browser luakit surf \
-             dillo falkon qutebrowser chromium chromium-browser; do
-        if [ -x "/usr/bin/$b" ]; then J36_BROWSER="/usr/bin/$b"; break; fi
-    done
-fi
-if [ -z "$J36_BROWSER" ]; then
-    echo "j36-browser: no browser installed -- the Packages card can add firefox-esr" >&2
-    exit 1
-fi
-
-# SAID OUT LOUD, EVERY TIME.  The loop above is a fallback chain and a fallback that
-# is taken silently is a fallback nobody knows they are using: an image that was
-# supposed to carry firefox-esr and does not comes up on netsurf, renders half the
-# web as a blank page, and looks like a broken browser rather than a missing package.
-# stderr here is mixdash's stdout, which is /run/j36/mixdash.log after the first
-# frame, so the answer is one grep away from anyone asking "which browser is this?".
-case "${J36_BROWSER##*/}" in
-    firefox|firefox-esr) ;;
-    *) echo "j36-browser: firefox-esr is not on this card; falling back to ${J36_BROWSER##*/}, which may not run JavaScript" >&2 ;;
-esac
-echo "j36-browser: using $J36_BROWSER" >&2
-export J36_BROWSER
 
 # Everything written at runtime goes here, because the rootfs on this card is shared
 # with whatever else boots it and nothing in this image writes to it.  /run is tmpfs.
 mkdir -p /run/j36 /run/j36/xdg 2>/dev/null
 chmod 0700 /run/j36/xdg 2>/dev/null
 
-[ -f "$XCONF" ] || { echo "j36-browser: $XCONF is missing" >&2; exit 1; }
-[ -x "$SESSION" ] || { echo "j36-browser: $SESSION is missing" >&2; exit 1; }
+[ -f "$XCONF" ] || { echo "j36-xsession: $XCONF is missing" >&2; exit 1; }
+[ -x "$MAIN" ]  || { echo "j36-xsession: $MAIN is missing" >&2; exit 1; }
 
 # -sharevts -novtswitch -keeptty vt1: mixdash is still running behind this and holds
 # /dev/tty0 in KD_GRAPHICS.  Those three make Xorg leave the VT entirely alone -- no
@@ -11671,44 +11685,67 @@ chmod 0700 /run/j36/xdg 2>/dev/null
 # panel stays black: the fbdev driver names the device it opened and the mode it
 # found, and a refusal to start is a line in there and not a message on the console,
 # which by this point nothing is drawing on.
-exec /usr/bin/xinit "$SESSION" "$URL" -- \
+#
+# "$FIRST" is passed even when it is empty, and the session treats an empty first
+# argument as "no window yet".  An unquoted conditional here would be a word-splitting
+# bug the day somebody runs --run with a command that has a space in it, which is
+# every command mixdash sends.
+exec /usr/bin/xinit "$MAIN" "$FIRST" -- \
     "$XORG" :0 vt1 \
     -config "$XCONF" \
     -logfile /run/j36/xorg.log \
     -nolisten tcp -novtswitch -sharevts -keeptty
-BROWSERLAUNCH
-    chmod 0755 "$SDROOT/opt/mixos/bin/j36-browser"
+XSESSIONLAUNCH
+    chmod 0755 "$SDROOT/opt/mixos/bin/j36-xsession"
 
-    # The session: what xinit runs once the server is up, and what ends the session
-    # when it returns.
+    # The session itself: what xinit runs once the server is up, and what ends the
+    # session when it returns.
     #
-    # THE ORDER MATTERS.  The window manager starts first because matchbox maps
-    # windows fullscreen and a browser that appears before the WM does gets whatever
-    # geometry it asked for -- which for Firefox is the size of the window it had
-    # last, and for NetSurf is 1000x700, on a 640x480 panel.  The keyboard starts
-    # before the browser so its pid is known when the bridge starts.
+    # THE ORDER MATTERS.  The window manager starts first because matchbox decides
+    # the geometry of every window that maps after it, and a client that appears
+    # before the WM does keeps whatever size it asked for -- which for Firefox is the
+    # size of the window it had last and for NetSurf is 1000x700, on a 640x480 panel.
+    # The keyboard starts before any client so its pid is known.  The FIFO is made
+    # before the first client is started, so a client that immediately asks for a
+    # second window finds somewhere to ask.
     #
-    # j36-padx IS THE FOREGROUND PROCESS, and that is the whole control flow: it
-    # watches the browser's pid, so the session ends when the browser is closed from
-    # inside; it takes Menu-held, so the session ends when the pad asks; and it
-    # returns when the X server dies, so the session ends when anything kills this
-    # from outside.  When it returns, everything else is torn down and xinit takes
-    # the server down with the client.
-    cat > "$SDROOT/opt/mixos/bin/j36-browser-session" <<'BROWSERSESSION'
+    # THE CONTROL LOOP IS THE FOREGROUND PROCESS and j36-padx is not, which is the
+    # one structural change from the old browser session.  It has to be: the session
+    # outlives any single window now, so the thing that decides when it is over
+    # cannot be a bridge that was watching one pid.  The loop ends the session when
+    # the last window closes, when the pad bridge dies (which is how "the X server
+    # went away" is noticed, since the bridge is an X client), or when somebody
+    # writes `quit'.
+    cat > "$SDROOT/opt/mixos/bin/j36-xsession-main" <<'XSESSIONMAIN'
 #!/bin/sh
-# j36-browser-session -- the X client xinit runs.  $1 is the URL.
-# Not meant to be run by hand; j36-browser sets up the server it needs.
+# j36-xsession-main -- the X client xinit runs, and the whole life of the session.
+# $1, when it is not empty, is a shell command line to open the first window with.
+# Not meant to be run by hand; j36-xsession sets up the server it needs.
 set -u
 
-URL="${1:-about:blank}"
-BROWSER="${J36_BROWSER:-/usr/bin/firefox-esr}"
+FIRST="${1:-}"
 
-# HOME IS THE DATA PARTITION AND NOT ROOT'S.  Downloads, cookies, the browser's
-# profile and its cache all land under it, and /home/virtua is the one filesystem on
-# this card meant to be written -- and the one the Sharing card exports over SMB, so
-# a file saved out of the browser turns up on the laptop.  The XDG variables are set
-# explicitly rather than left to default off HOME, because a browser that finds them
-# unset falls back to compiled-in paths on at least two of the engines below.
+RUNDIR=/run/j36
+CTL=$RUNDIR/xsession.ctl
+WINLIST=$RUNDIR/xsession.windows
+PIDFILE=$RUNDIR/xsession.pid
+
+# HOW MANY WINDOWS THIS BOARD WILL HOLD, and it is a real number and not a tidy one.
+# 946 MB of usable RAM with 768 MB of zram behind it, and Firefox on its own is a
+# third of the first figure.  Four is what a user can plausibly want open and about
+# where the OOM killer starts making the decision instead.  Over it, the request is
+# refused OUT LOUD -- see start_client -- because a window that silently never
+# appears is indistinguishable from a program that crashed.
+MAXCLIENTS=4
+
+mkdir -p "$RUNDIR" 2>/dev/null
+
+# HOME IS THE DATA PARTITION AND NOT ROOT'S.  Downloads, cookies, profiles and
+# caches all land under it, and /home/virtua is the one filesystem on this card
+# meant to be written -- and the one the Sharing card exports over SMB, so a file
+# saved out of a window turns up on the laptop.  The XDG variables are set
+# explicitly rather than left to default off HOME, because a program that finds them
+# unset falls back to compiled-in paths.
 export HOME=/home/virtua
 [ -d "$HOME" ] || HOME=/root
 export XDG_CONFIG_HOME="$HOME/.config"
@@ -11717,47 +11754,71 @@ export XDG_DATA_HOME="$HOME/.local/share"
 export XDG_RUNTIME_DIR=/run/j36/xdg
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" 2>/dev/null
 
-# NO_AT_BRIDGE stops GTK spending its startup waiting for an accessibility bus.  The
-# session bus further down is started for the browser's own sake; nothing on this
-# image runs an at-spi registry on it, so the wait would still time out.
+# NO_AT_BRIDGE stops GTK spending its startup waiting for an accessibility bus.
 # GDK_BACKEND is pinned because GTK4 prefers Wayland and would find none.
 export NO_AT_BRIDGE=1
 export GDK_BACKEND=x11
 export GTK_OVERLAY_SCROLLING=0
 export GDK_CORE_DEVICE_EVENTS=1
 
-# THE BROWSER IS THE THING THAT SHOULD DIE FIRST, and this is where that is said.
+# WHAT A CLIENT LOOKS AT TO KNOW IT IS ALREADY INSIDE A SESSION.  j36-browser reads
+# it: with it set it execs a browser, without it it hands itself to j36-xrun.  A
+# variable and not a test on DISPLAY, because the Terminal card exports DISPLAY=:0
+# unconditionally -- a shell that has a display NAME has not necessarily got a
+# server, and that difference is the whole point of j36-xrun.
+export J36_XSESSION=1
+export J36_XSESSION_CTL="$CTL"
+
+# THE SESSION IS THE THING THAT SHOULD DIE FIRST, and this is where that is said.
 #
 # mixdash runs with OOMScoreAdjust=-300 so that a board out of memory does not lose
 # the only shell it has, and oom_score_adj is INHERITED, so without this line the
-# browser would arrive here at -300 as well -- better protected than the dashboard
-# it was launched from, and better protected than everything else on the machine.
-# That is exactly backwards. This session is Firefox, an X server and a pad bridge;
-# it is the largest resident set on the board by a wide margin and it is the one
-# thing here that can be restarted from a card on the dashboard.
+# whole session would arrive here at -300 as well -- better protected than the
+# dashboard it was launched from.  That is exactly backwards.
 #
-# +300 is set on the session and inherited by all of it, so if the killer picks
-# within this tree it picks by size, which is Firefox. Killing the X server instead
-# would end the session too, and that is the same outcome: back to the dashboard.
+# +300 here and +500 on each window (see start_client): if the killer picks inside
+# this tree it picks a WINDOW rather than the X server, so a session that runs out of
+# memory loses the browser and keeps the desktop.  Raising oom_score_adj is always
+# permitted; lowering it below the inherited value needs CAP_SYS_RESOURCE, and this
+# only ever raises.
 #
-# Raising oom_score_adj is always permitted; lowering it below the inherited value
-# needs CAP_SYS_RESOURCE. This only ever raises, so it works whoever runs it, and
-# the redirect is guarded because a kernel without CONFIG_PROC_FS writable here
-# should cost the tuning and not the browser.
-echo 300 > /proc/self/oom_score_adj 2>/dev/null || true
+# THE 2>/dev/null GOES FIRST, which looks wrong and is not: redirections are applied
+# left to right, so with it second the shell opens the file, fails, and prints the
+# complaint on a stderr it has not redirected yet.  A kernel with no writable procfs
+# should cost the tuning and not a line in the log.
+echo 300 2>/dev/null > /proc/self/oom_score_adj || true
 
-WM=""; KBD=""; PAGE=""
+WM=""; KBD=""; PADX=""; TICKER=""
+# Space-separated pids.  The TITLES live in $RUNDIR/win.<pid>, one word per file,
+# rather than in this string: a title comes from a command line the user typed and a
+# space in one would turn a list of two windows into a list of three.
+CLIENTS=""
+STARTED=0
 
-# matchbox: a kiosk window manager, 340 kB, no panel and no desktop.  It exists here
-# for one reason -- something has to give the browser input focus, and without a WM
-# an X server hands focus to PointerRoot and every key press from the on-screen
-# keyboard goes to whatever the pointer happens to be over.  No titlebar: 640x480 is
-# too little to spend nineteen rows of it on a close button the pad already has.
+# matchbox: a kiosk window manager, 340 kB, no panel and no desktop.  Something has
+# to give a client input focus -- without a WM an X server hands focus to PointerRoot
+# and every key from the on-screen keyboard goes to whatever the pointer is over.
+#
+# TITLEBARS ARE ON NOW, and they were off before.  With one window and a pad that
+# closed the session, nineteen rows of a 480 px panel spent on a close button was
+# nineteen rows wasted.  With several windows they are the only thing on the glass
+# that says which one is in front and the only way to close ONE of them without
+# ending the session -- matchbox-remote can page between windows but cannot close
+# one, so the close box on the titlebar is it, and the pad is already a pointer.
 if [ -x /usr/bin/matchbox-window-manager ]; then
-    matchbox-window-manager -use_titlebar no -use_cursor yes >/dev/null 2>&1 &
+    matchbox-window-manager -use_titlebar yes -use_cursor yes >/dev/null 2>&1 &
     WM=$!
-    # Give it the moment it needs to own the root window before the browser maps.
+    # Give it the moment it needs to own the root window before anything maps.
     sleep 1
+fi
+
+# How windows are paged through.  matchbox-remote ships inside
+# matchbox-window-manager, so if the WM above is on this card this is too; the test
+# is here for the card where somebody removed one of them.
+MBREMOTE=""
+[ -x /usr/bin/matchbox-remote ] && MBREMOTE=/usr/bin/matchbox-remote
+if [ -z "$MBREMOTE" ]; then
+    echo "j36-xsession: no matchbox-remote, so Menu cannot page between windows" >&2
 fi
 
 # The on-screen keyboard, started hidden.  --daemon maps nothing at startup and
@@ -11771,12 +11832,12 @@ fi
 # window by name and needs nothing from here.
 #
 # It types with XTEST through libfakekey, so it never takes focus away from the
-# browser it is typing into -- and it starts AFTER the window manager because
+# window it is typing into -- and it starts AFTER the window manager because
 # daemon mode busy-waits for one before it will realize its window at all.
 #
 # MB_KBD_CONFIG IS WHAT MAKES IT THE DASHBOARD'S KEYBOARD AND NOT DEBIAN'S.  The
 # stock layout has no digits and no punctuation whatsoever -- it cannot type
-# ".com" -- so the browser gets the layout the builder stages next to xorg.conf,
+# ".com" -- so the session gets the layout the builder stages next to xorg.conf,
 # with the ?123 symbols button and the locking caps key.  Read config-parser.c's
 # search order backwards and this variable is the first thing it checks: a full
 # path here overrides $HOME/.matchbox/keyboard.xml and the packaged file both,
@@ -11825,9 +11886,9 @@ fi
 # the obvious way to ask and is the wrong one here: it is in x11-utils, which this
 # image does not install and should not start installing for two integers.  The X
 # server in this session is xf86-video-fbdev on /dev/fb0 with no Virtual and no
-# Modes line in xorg.conf -- see the Browser card section above -- so the screen it
-# opens IS the framebuffer's, and /sys/class/graphics/fb0/virtual_size is the same
-# pair of numbers from the other end.  On this panel that reads "640,480".
+# Modes line in xorg.conf -- see the graphical session section above -- so the
+# screen it opens IS the framebuffer's, and /sys/class/graphics/fb0/virtual_size is
+# the same pair of numbers from the other end.  On this panel that reads "640,480".
 #
 # The one case where the two would differ is a driver that pans, where the virtual
 # height is a multiple of the visible one and this would ask for a keyboard several
@@ -11858,7 +11919,7 @@ if [ -x /usr/bin/matchbox-keyboard ]; then
     if [ "$FBW" -gt 10 ] && [ "$FBH" -gt 10 ]; then
         KBD_SIZE="--width $FBW --height $((FBH * 2 / 5))"
     else
-        echo "j36-browser: could not measure the screen; the keyboard will size itself" >&2
+        echo "j36-xsession: could not measure the screen; the keyboard will size itself" >&2
     fi
 
     # Unquoted on purpose: two flags and two integers this script built itself, and
@@ -11866,6 +11927,389 @@ if [ -x /usr/bin/matchbox-keyboard ]; then
     matchbox-keyboard --daemon --fontptsize 10 $KBD_SIZE >/dev/null 2>&1 &
     KBD=$!
 fi
+
+# ── The control FIFO ─────────────────────────────────────────────────────────
+#
+# One named pipe, mode 0600, under /run.  Anything on this card that wants a window
+# writes a line into it: `run <shell command>', `next', `prev' or `quit'.  mixdash
+# writes into it when a card is pressed while this session is already up, j36-padx
+# writes `next' when Menu is tapped, and j36-xrun is the hand-typed door to it.
+#
+# OPENED READ-WRITE BY THIS PROCESS, which is the whole trick and not a typo.  A FIFO
+# opened O_RDONLY returns EOF the instant the last writer closes, so a loop reading
+# one would spin at the speed of the CPU between windows.  Holding a write descriptor
+# of our own means there is always at least one writer and the read simply blocks.
+# It also means a writer's open() never blocks waiting for a reader to appear, which
+# is what lets mixdash use a plain non-blocking open and get ENXIO -- "no session" --
+# instead of hanging.
+rm -f "$CTL" 2>/dev/null
+CTLOK=0
+if mkfifo -m 0600 "$CTL" 2>/dev/null; then
+    if exec 9<>"$CTL"; then
+        CTLOK=1
+    fi
+fi
+if [ "$CTLOK" -eq 0 ]; then
+    echo "j36-xsession: no control pipe at $CTL; this session takes no requests" >&2
+    rm -f "$CTL" 2>/dev/null
+fi
+
+# Who to ask "is the session alive?" without opening the pipe.  j36-xrun reads this
+# before it writes, so a FIFO left behind by a session that was killed outright is a
+# clear message instead of a script that blocks forever on open().
+echo $$ > "$PIDFILE" 2>/dev/null || true
+: > "$WINLIST" 2>/dev/null || true
+
+# A word into the pipe every two seconds, so the blocking read above has a timeout.
+# Without it the loop would notice a window closing only when the next request came
+# in, which for a session with one window and no keyboard is never.  It is a child of
+# this script and so in the same process group, which means mixdash's SIGSTOP freezes
+# the ticker too and a backgrounded session does not spend a wakeup every two seconds.
+if [ "$CTLOK" -eq 1 ]; then
+    ( while :; do sleep 2; echo tick; done ) >&9 2>/dev/null &
+    TICKER=$!
+fi
+
+# The name a window goes into the switcher's row under: the first word of its command
+# line, without its directory and without the j36- that this card's own wrappers
+# carry.  `${1%% *}' rather than word splitting, so a path with a glob character in it
+# is not expanded on the way past.
+client_title() {
+    ct_first="${1%% *}"
+    ct_name="${ct_first##*/}"
+    case "$ct_name" in
+        j36-*) ct_name="${ct_name#j36-}" ;;
+    esac
+    [ -n "$ct_name" ] || ct_name="window"
+    printf '%s' "$ct_name"
+}
+
+# Which windows are still open, written where mixdash can read it.
+#
+# WHY A FILE AND NOT A PIPE BACK.  The reader is a Qt program that must never block:
+# it reads this when the switcher opens, which is a repaint, and a file that is
+# rewritten by rename is a file that is either the old list or the new one and never
+# half of either.
+reap_clients() {
+    rc_live=""
+    for rc_pid in $CLIENTS; do
+        if kill -0 "$rc_pid" 2>/dev/null; then
+            rc_live="$rc_live $rc_pid"
+        else
+            rm -f "$RUNDIR/win.$rc_pid" 2>/dev/null
+        fi
+    done
+    CLIENTS="${rc_live# }"
+
+    : > "$WINLIST.new" 2>/dev/null || return 0
+    for rc_pid in $CLIENTS; do
+        rc_title=""
+        [ -r "$RUNDIR/win.$rc_pid" ] && read -r rc_title < "$RUNDIR/win.$rc_pid"
+        [ -n "$rc_title" ] || rc_title="window"
+        printf '%s\t%s\n' "$rc_pid" "$rc_title" >> "$WINLIST.new"
+    done
+    mv -f "$WINLIST.new" "$WINLIST" 2>/dev/null
+}
+
+# Open a window.
+#
+# `sh -c' because what arrives is a command LINE and not an argv -- it came down a
+# pipe as text, and j36-xrun quoted every argument on the way in so that a filename
+# with a space in it survives the trip.  The subshell exists to raise oom_score_adj
+# before the exec: see the +300/+500 note at the top.
+start_client() {
+    sc_cmd="$1"
+    [ -n "$sc_cmd" ] || return 0
+
+    reap_clients
+    sc_n=0
+    for sc_pid in $CLIENTS; do
+        sc_n=$((sc_n + 1))
+    done
+    if [ "$sc_n" -ge "$MAXCLIENTS" ]; then
+        echo "j36-xsession: $MAXCLIENTS windows is all this board will hold; close one before opening another" >&2
+        return 0
+    fi
+
+    ( echo 500 2>/dev/null > /proc/self/oom_score_adj; exec sh -c "$sc_cmd" ) &
+    sc_pid=$!
+    client_title "$sc_cmd" > "$RUNDIR/win.$sc_pid" 2>/dev/null
+    CLIENTS="$CLIENTS $sc_pid"
+    STARTED=1
+    reap_clients
+    echo "j36-xsession: window $sc_pid is $sc_cmd" >&2
+}
+
+# The bridge: the pad as a pointer, a keyboard and, on a Menu tap, `next' into the
+# pipe above.  --no-grab is NOT passed -- mixdash is still reading the pad behind
+# this and both of them acting on the same press is the bug the grab exists for.
+# --watch is gone: it watched one pid, and a session that outlives any single window
+# has no one pid to watch.
+if [ -x /opt/mixos/bin/j36-padx ]; then
+    if [ "$CTLOK" -eq 1 ]; then
+        /opt/mixos/bin/j36-padx --ctl "$CTL" &
+    else
+        /opt/mixos/bin/j36-padx &
+    fi
+    PADX=$!
+else
+    echo "j36-xsession: no j36-padx, so the pad cannot drive this" >&2
+    if [ -z "$FIRST" ]; then
+        echo "j36-xsession: and no first window either -- there would be nothing to look at" >&2
+        [ -n "$KBD" ] && kill "$KBD" 2>/dev/null
+        [ -n "$WM" ] && kill "$WM" 2>/dev/null
+        rm -f "$CTL" "$WINLIST" "$PIDFILE" 2>/dev/null
+        exit 1
+    fi
+fi
+
+[ -n "$FIRST" ] && start_client "$FIRST"
+
+# ── The control loop, which is this session's life ───────────────────────────
+while :; do
+    if [ "$CTLOK" -eq 1 ]; then
+        read -r line <&9 || line=tick
+    else
+        # No pipe: nothing can ask for a window, so all that is left is to notice
+        # when the ones that are open have gone.
+        sleep 2
+        line=tick
+    fi
+
+    case "$line" in
+        "run "*)
+            start_client "${line#run }"
+            ;;
+        next)
+            [ -n "$MBREMOTE" ] && "$MBREMOTE" -next >/dev/null 2>&1
+            ;;
+        prev)
+            [ -n "$MBREMOTE" ] && "$MBREMOTE" -prev >/dev/null 2>&1
+            ;;
+        quit)
+            echo "j36-xsession: asked to quit" >&2
+            break
+            ;;
+        tick|"")
+            ;;
+        *)
+            echo "j36-xsession: ignoring '$line'" >&2
+            ;;
+    esac
+
+    reap_clients
+
+    # THE SESSION ENDS WHEN ITS LAST WINDOW DOES, and only once it has had one.  A
+    # session started from the Desktop card with no --run has never had a window and
+    # sits here waiting to be asked for one, which is the whole point of that card; a
+    # session started for the browser goes away when the browser is closed, which is
+    # what that card has always done.  One rule, both behaviours.
+    if [ "$STARTED" -eq 1 ] && [ -z "$CLIENTS" ]; then
+        echo "j36-xsession: the last window closed" >&2
+        break
+    fi
+
+    # The bridge is an X client, so it dies when the server does.  That makes it the
+    # cheapest test for "the X server has gone" that does not involve opening a
+    # connection of our own from a shell.
+    if [ -n "$PADX" ] && ! kill -0 "$PADX" 2>/dev/null; then
+        echo "j36-xsession: the pad bridge exited" >&2
+        break
+    fi
+done
+
+# ── Teardown ─────────────────────────────────────────────────────────────────
+#
+# SIGTERM and then three seconds, because a browser asked to quit writes its session
+# and its cookie jar out, and this card's whole point is that the file is still there
+# next time.  SIGKILL only for the ones that did not.
+for p in $CLIENTS; do
+    kill "$p" 2>/dev/null
+done
+i=0
+while [ "$i" -lt 30 ]; do
+    alive=0
+    for p in $CLIENTS; do
+        kill -0 "$p" 2>/dev/null && alive=1
+    done
+    [ "$alive" -eq 1 ] || break
+    sleep 0.1
+    i=$((i + 1))
+done
+for p in $CLIENTS; do
+    kill -9 "$p" 2>/dev/null
+    rm -f "$RUNDIR/win.$p" 2>/dev/null
+done
+
+[ -n "$TICKER" ] && kill "$TICKER" 2>/dev/null
+[ -n "$PADX" ] && kill "$PADX" 2>/dev/null
+[ -n "$KBD" ] && kill "$KBD" 2>/dev/null
+[ -n "$WM" ] && kill "$WM" 2>/dev/null
+rm -f "$CTL" "$WINLIST" "$PIDFILE" 2>/dev/null
+exit 0
+XSESSIONMAIN
+    chmod 0755 "$SDROOT/opt/mixos/bin/j36-xsession-main"
+
+    # j36-xrun: the door into a session that is already up.
+    #
+    # WHAT IT DELIBERATELY DOES NOT DO IS START ONE.  A session started from here
+    # would be an X server outside mixdash's task list -- nothing would stop it when
+    # the switcher took the panel back, and two programs would be drawing into
+    # /dev/fb0 with no arbiter.  The Desktop card is the only thing that starts a
+    # session, and this says so when there is none.
+    #
+    # It is also what makes the Terminal card useful for graphical packages: with
+    # a desktop up, `j36-xrun freedoom' from the shell puts freedoom on the glass.
+    cat > "$SDROOT/opt/mixos/bin/j36-xrun" <<'XRUN'
+#!/bin/sh
+# j36-xrun -- open a window on the J36 Ultra's graphical session.
+#
+# Usage: j36-xrun COMMAND [ARG...]
+#
+# Asks the running session for a window.  It does NOT start one: see the note in
+# device/j36-ultra/build-in-vm.sh.  Start one from the dashboard's Desktop card.
+set -u
+
+RUNDIR=/run/j36
+CTL=$RUNDIR/xsession.ctl
+PIDFILE=$RUNDIR/xsession.pid
+
+if [ "$#" -eq 0 ]; then
+    echo "usage: j36-xrun COMMAND [ARG...]" >&2
+    exit 2
+fi
+
+# Is there a session?  ASKED OF THE PID AND NOT OF THE PIPE, because a FIFO left
+# behind by a session that was killed outright still passes -p, and opening it for
+# writing with no reader on the other end blocks forever with no way to say why.
+alive=0
+if [ -r "$PIDFILE" ]; then
+    spid=""
+    read -r spid < "$PIDFILE" || spid=""
+    case "${spid:-}" in
+        ''|*[!0-9]*) ;;
+        *) kill -0 "$spid" 2>/dev/null && alive=1 ;;
+    esac
+fi
+
+if [ "$alive" -eq 0 ] || [ ! -p "$CTL" ]; then
+    # Left behind by a session that did not get to tidy up.  Removed here rather
+    # than left to confuse the next reader.
+    [ "$alive" -eq 0 ] && rm -f "$CTL" "$PIDFILE" "$RUNDIR/xsession.windows" 2>/dev/null
+    echo "j36-xrun: nothing graphical is running." >&2
+    echo "          Open the Desktop card on the dashboard, then run this again." >&2
+    exit 1
+fi
+
+# EVERY ARGUMENT IS QUOTED, because the far end runs what arrives with `sh -c': it
+# has to, since a pipe carries text and not an argv.  Single quotes make everything
+# literal except a single quote, which leaves the quoting to be written: ' -> '\''.
+# A filename with a space in it is not an attack, it is Tuesday.
+cmd=""
+for a in "$@"; do
+    q=$(printf '%s' "$a" | sed "s/'/'\\\\''/g")
+    cmd="$cmd '$q'"
+done
+cmd="${cmd# }"
+
+printf 'run %s\n' "$cmd" > "$CTL"
+XRUN
+    chmod 0755 "$SDROOT/opt/mixos/bin/j36-xrun"
+
+    # The browser, which is now a CLIENT of the session above and not a session of
+    # its own.  Everything about which browser to run stayed here; everything about
+    # the X server moved out.
+    #
+    # THE BROWSER IS CHOSEN AND NOT HARDCODED, because the Packages card exists:
+    # somebody who installs chromium or dillo from it should get that browser here
+    # without editing anything.  What the image itself installs is firefox-esr, and
+    # it is first in the list, because the web in 2026 is JavaScript and a browser
+    # that does not run it is a browser that shows a blank page on half the sites
+    # anybody would open.  Debian trixie has a real armhf build --
+    # 140.12.0esr, 253 MB installed -- so this is a genuine Gecko with a JIT and
+    # not a compatibility shim.
+    #
+    # netsurf-gtk is second and is also installed: 4 MB, its own engine, no
+    # JavaScript.  It is there because 946 MB of usable RAM is not much to run
+    # Firefox in, and the day it will not start is the day something still has to
+    # open a page.  Everything after those two is only reachable by installing it.
+    cat > "$SDROOT/opt/mixos/bin/j36-browser" <<'BROWSERLAUNCH'
+#!/bin/sh
+# j36-browser -- a graphical browser on the J36 Ultra's panel.
+#
+# Usage: j36-browser [URL]
+#
+# AN X CLIENT, not a session.  Inside a session it picks a browser, writes the
+# profile and execs it; outside one it hands itself to j36-xrun, so the command line
+# that used to bring up a whole X server still opens a browser -- in the session that
+# is already running.  Written by device/j36-ultra/build-in-vm.sh; the reasoning is
+# in that file, in the graphical session section.
+set -u
+
+START=/opt/mixos/share/browser/start.html
+
+URL="${1:-}"
+if [ -z "$URL" ]; then
+    if [ -f "$START" ]; then URL="file://$START"; else URL="https://duckduckgo.com/"; fi
+fi
+
+# NOT INSIDE A SESSION: ask the one that is.  j36-xrun writes this same command line
+# into the session's control pipe, the session runs it with J36_XSESSION set, and it
+# arrives back here one branch further down.  It cannot loop: j36-xrun refuses when
+# there is no session rather than starting one.
+if [ -z "${J36_XSESSION:-}" ]; then
+    exec /opt/mixos/bin/j36-xrun /opt/mixos/bin/j36-browser "$URL"
+fi
+
+# J36_BROWSER already in the environment wins over the search below, so a second
+# installed browser can be reached without uninstalling the first:
+#
+#     J36_BROWSER=/usr/bin/netsurf-gtk j36-browser
+#
+# which is the escape hatch for the day Firefox will not start on a board with
+# 946 MB.  Checked rather than trusted, because a typo here would otherwise be a
+# window that never appears.
+J36_BROWSER="${J36_BROWSER:-}"
+if [ -n "$J36_BROWSER" ] && [ ! -x "$J36_BROWSER" ]; then
+    echo "j36-browser: J36_BROWSER=$J36_BROWSER is not an executable" >&2
+    exit 1
+fi
+
+# Any of these, first one wins.  See the comment above this heredoc for the order.
+if [ -z "$J36_BROWSER" ]; then
+    for b in firefox-esr firefox netsurf-gtk netsurf epiphany-browser luakit surf \
+             dillo falkon qutebrowser chromium chromium-browser; do
+        if [ -x "/usr/bin/$b" ]; then J36_BROWSER="/usr/bin/$b"; break; fi
+    done
+fi
+if [ -z "$J36_BROWSER" ]; then
+    echo "j36-browser: no browser installed -- the Packages card can add firefox-esr" >&2
+    exit 1
+fi
+
+# SAID OUT LOUD, EVERY TIME.  The loop above is a fallback chain and a fallback that
+# is taken silently is a fallback nobody knows they are using: an image that was
+# supposed to carry firefox-esr and does not comes up on netsurf, renders half the
+# web as a blank page, and looks like a broken browser rather than a missing package.
+# stderr here is mixdash's stdout, which is /run/j36/mixdash.log after the first
+# frame, so the answer is one grep away from anyone asking "which browser is this?".
+case "${J36_BROWSER##*/}" in
+    firefox|firefox-esr) ;;
+    *) echo "j36-browser: firefox-esr is not on this card; falling back to ${J36_BROWSER##*/}, which may not run JavaScript" >&2 ;;
+esac
+echo "j36-browser: using $J36_BROWSER" >&2
+
+# The session exports these already; they are repeated here because this script is
+# also reachable by hand from a shell inside the session, where they may not be.
+export HOME="${HOME:-/home/virtua}"
+[ -d "$HOME" ] || HOME=/root
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/j36/xdg}"
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR" 2>/dev/null
+export NO_AT_BRIDGE=1
+export GDK_BACKEND=x11
 
 # ── Firefox on 946 MB of RAM ─────────────────────────────────────────────────
 #
@@ -11887,8 +12331,9 @@ fi
 #   isolation for about 400 MB.  Content is still out of the parent, so a renderer
 #   that dies is a tab that dies.
 #
-#   Software WebRender and no hardware video.  There is no GPU driver for anything
-#   to accelerate with, and asking is a few seconds of probing and a fallback.
+#   Software WebRender and no hardware video.  X here is xf86-video-fbdev with
+#   ShadowFB and no DRI3, so Mesa is swrast whatever anybody asks for, and asking is
+#   a few seconds of probing followed by the fallback.
 #
 #   Small caches and a lazy session store.  The disk cache lives on the SD card and
 #   is worth having but not worth 300 MB of it; the session store's default is to
@@ -11896,9 +12341,9 @@ fi
 #
 #   Crash recovery OFF.  The way Firefox dies on this board is still the OOM
 #   killer -- swap moves that from the first thing that goes wrong to the last, and
-#   the session above deliberately volunteers this process for it -- and a browser
-#   that restores the page that just got it killed is a loop somebody has to
-#   power-cycle out of.
+#   the session deliberately volunteers its windows for it -- and a browser that
+#   restores the page that just got it killed is a loop somebody has to power-cycle
+#   out of.
 #
 #   The telemetry, Pocket and first-run pages off, because none of them can be
 #   dismissed comfortably on a D-pad and the first-run page is what would be on the
@@ -11918,9 +12363,9 @@ firefox_profile() {
     mkdir -p "$prof" 2>/dev/null || return 1
 
     # A profile Firefox did not shut down cleanly keeps its lock, and the next start
-    # is a modal "Firefox is already running" that a D-pad cannot dismiss.  Nothing
-    # else can be holding it: mixdash starts one child at a time and this script is
-    # that child.
+    # is a modal "Firefox is already running" that a D-pad cannot dismiss.  --no-remote
+    # below means a second window is a second instance, so the lock is the only thing
+    # that would refuse it.
     rm -f "$prof/.parentlock" "$prof/lock" 2>/dev/null
 
     # The start page, quoted for a JS string literal.  It is a file:// URL off this
@@ -11929,7 +12374,7 @@ firefox_profile() {
     home_url=$(printf '%s' "$URL" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
 
     cat > "$prof/user.js" <<FFPREFS
-// Written by /opt/mixos/bin/j36-browser-session on every start.  Edits here are
+// Written by /opt/mixos/bin/j36-browser on every start.  Edits here are
 // overwritten; the reasoning is in device/j36-ultra/build-in-vm.sh.
 user_pref("fission.autostart", false);
 user_pref("dom.ipc.processCount", 1);
@@ -11974,59 +12419,37 @@ FFPREFS
 #   Fission is off above.
 #
 #   Everything else takes a URL and nothing more, which is the whole reason the list
-#   in j36-browser can be as long as it is.
+#   above can be as long as it is.
 #
 # dbus-run-session WHEN IT IS THERE.  There is no session bus on this image -- no
-# desktop session ever starts -- and GTK, GIO and Firefox all look for one.  Without
-# it they each time out and carry on, which costs seconds of startup and a column of
-# warnings; with it they find a bus that lives exactly as long as this session does.
+# desktop session ever starts one -- and GTK, GIO and Firefox all look for one.
+# Without it they each time out and carry on, which costs seconds of startup and a
+# column of warnings; with it they find a bus that lives as long as this window does.
 DBUS=""
 [ -x /usr/bin/dbus-run-session ] && DBUS=/usr/bin/dbus-run-session
 
-case "${BROWSER##*/}" in
+# exec, because this IS the window as far as the session is concerned: the pid it
+# recorded has to be the pid of the browser, or the session would think the window
+# had closed the moment this shell did.
+case "${J36_BROWSER##*/}" in
     firefox|firefox-esr)
         firefox_profile
-        ${DBUS:+$DBUS --} "$BROWSER" --no-remote \
-            -profile "$HOME/.mozilla/j36" "$URL" &
+        exec ${DBUS:+$DBUS --} "$J36_BROWSER" --no-remote \
+            -profile "$HOME/.mozilla/j36" "$URL"
         ;;
     chromium|chromium-browser)
-        ${DBUS:+$DBUS --} "$BROWSER" --no-sandbox --disable-gpu \
+        exec ${DBUS:+$DBUS --} "$J36_BROWSER" --no-sandbox --disable-gpu \
             --disable-dev-shm-usage --renderer-process-limit=1 \
             --password-store=basic --window-size=640,480 \
-            --window-position=0,0 "$URL" &
+            --window-position=0,0 "$URL"
         ;;
     *)
-        ${DBUS:+$DBUS --} "$BROWSER" "$URL" &
+        exec ${DBUS:+$DBUS --} "$J36_BROWSER" "$URL"
         ;;
 esac
-PAGE=$!
-
-# The bridge, in the foreground: it is what decides when this session is over.
-# --no-grab is NOT passed -- mixdash is still reading the pad behind this and both
-# of them acting on the same press is the bug the grab exists for.
-if [ -x /opt/mixos/bin/j36-padx ]; then
-    /opt/mixos/bin/j36-padx --watch "$PAGE"
-else
-    echo "j36-browser-session: no j36-padx, so the pad cannot drive this" >&2
-    wait "$PAGE"
-fi
-
-# SIGTERM and then three seconds, because a browser asked to quit writes its session
-# and its cookie jar out, and this card's whole point is that the file is still there
-# next time.  SIGKILL only for one that did not.
-kill "$PAGE" 2>/dev/null
-i=0
-while kill -0 "$PAGE" 2>/dev/null && [ "$i" -lt 30 ]; do
-    sleep 0.1
-    i=$((i + 1))
-done
-kill -9 "$PAGE" 2>/dev/null
-[ -n "$KBD" ] && kill "$KBD" 2>/dev/null
-[ -n "$WM" ] && kill "$WM" 2>/dev/null
-exit 0
-BROWSERSESSION
-    chmod 0755 "$SDROOT/opt/mixos/bin/j36-browser-session"
-    log "dash: staged the browser session into opt/mixos/bin/, opt/mixos/share/xorg/ and opt/mixos/share/keyboard/"
+BROWSERLAUNCH
+    chmod 0755 "$SDROOT/opt/mixos/bin/j36-browser"
+    log "dash: staged the graphical session into opt/mixos/bin/, opt/mixos/share/xorg/ and opt/mixos/share/keyboard/"
 
     # The start page.
     #

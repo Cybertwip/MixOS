@@ -282,6 +282,30 @@ bool TerminalPage::startChild(const QString &command)
         ::unsetenv("QT_QPA_FONTDIR");
         ::unsetenv("LD_PRELOAD");
 
+        /*
+         * ── DISPLAY, SO THAT AN INSTALLED APPLICATION HAS SOMEWHERE TO GO ────
+         *
+         * This is the shell the Packages page installs things from, and until now
+         * anything graphical it installed had nowhere to draw: this dashboard is
+         * linuxfb on /dev/fb0 and is not an X client, and SDL2 on this image is
+         * built with the x11 and kmsdrm backends and no fbdev one, so `freedoom'
+         * typed here died on "no available video device" whatever was installed.
+         *
+         * There is a graphical session now -- the Desktop card starts it -- and it
+         * is always :0, because j36-xsession names the display on Xorg's command
+         * line and only ever runs one server.  With this set, an X program typed
+         * into this shell opens a window in it.
+         *
+         * SET EVEN WHEN NO SESSION IS RUNNING, deliberately.  DISPLAY names a
+         * display; it has never promised a server on the other end, and a variable
+         * written once when the pty is forked cannot track a session that comes and
+         * goes.  A program run with no session gets "cannot open display :0", which
+         * is a sentence with an answer -- open the Desktop card -- where the old
+         * failure was not.  /opt/mixos/bin/j36-xrun is the one that knows for
+         * certain, and it says so in words.
+         */
+        ::setenv("DISPLAY", ":0", 1);
+
         const char *home = ::getenv("HOME");
         if (home && *home)
             (void)::chdir(home);
