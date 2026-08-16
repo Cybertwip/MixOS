@@ -173,7 +173,7 @@ void writeBuild(void)
  * the right thing to look at while Qt did its dynamic linking.  It is not, and the
  * board showed why twice over:
  *
- *   - mixsplash re-takes KD_GRAPHICS once a second for as long as it runs, and that
+ *   - mixsplash re-takes KD_GRAPHICS every frame for as long as it runs, and that
  *     is the ONLY thing holding the console off this panel -- systemd, agetty and
  *     vconsole-setup each reset the VT to KD_TEXT during that same stretch of the
  *     boot.  Kill the splash before the dashboard paints and the next reset wins, so
@@ -243,9 +243,9 @@ void dismissSplash(int giveBackTheConsole)
 /*
  * THE SPLASH GOES FIRST, and that ordering is the whole of why this function is not
  * two lines any more.  Every caller is on the way out and wants the console back so
- * that what it prints next is readable -- but mixsplash re-takes KD_GRAPHICS once a
- * second, so a KDSETMODE with the splash still alive is undone inside a second and
- * the crash report is written to a console nothing is drawing.
+ * that what it prints next is readable -- but mixsplash re-takes KD_GRAPHICS on every
+ * frame it draws, so a KDSETMODE with the splash still alive is undone within 40 ms
+ * and the crash report is written to a console nothing is drawing.
  *
  * And Console::text() is unconditional, where the ioctl it replaced used to be
  * guarded by `if this process set the mode'.  That guard was for the case where Qt's
@@ -792,20 +792,25 @@ int main(int argc, char **argv)
              * mixsplash met the same thing first -- console_hold() in mixsplash.c
              * has the list of suspects and the same answer.
              *
-             * The splash could stop at re-taking the mode because it redraws every
-             * frame anyway.  This program does not, so the two halves are here: hold
-             * whenever it is not ours, and REPAINT THE WHOLE WINDOW when it turns
-             * out not to have been.  update() and not repaint(), because this runs
-             * on the event loop and a full synchronous paint from a timer would be
-             * one frame's worth of jitter for nothing.
+             * So the two halves are here: hold whenever the mode is not ours, and
+             * REPAINT THE WHOLE WINDOW when it turns out not to have been.  fbcon
+             * does not redraw a line when it gets the VT, it redraws the entire
+             * console, so anything short of a full repaint leaves the console text
+             * exactly where it was everywhere the dashboard had nothing dirty.  The
+             * splash was written believing otherwise and spent a release painting a
+             * spinner into a hole in a console screen; console_hold() in mixsplash.c
+             * now does both halves too.  update() and not repaint(), because this
+             * runs on the event loop and a full synchronous paint from a timer would
+             * be one frame's worth of jitter for nothing.
              *
-             * Once a second, which is mixsplash's interval and is chosen the same
-             * way: it costs one ioctl that reads a flag, and the window it leaves is
-             * one second of text on the panel in the rare case rather than text that
-             * stays until something else happens to be redrawn.  A page that blocks
-             * its own event loop waiting for a child gets no ticks at all while it
-             * waits, which is why Console::hold() is public and why SharingPage's
-             * shell-outs call it themselves between slices.
+             * Once a second, and here that is the right interval where in the splash
+             * it was not: this timer is the only thing that would notice, but a
+             * dashboard is a still picture, so a second of console text over it is
+             * one second and then it is gone.  The splash had an animation running
+             * through the same window, which turned the same second into a permanent
+             * hole.  A page that blocks its own event loop waiting for a child gets
+             * no ticks at all while it waits, which is why Console::hold() is public
+             * and why SharingPage's shell-outs call it themselves between slices.
              */
             QTimer *guard = new QTimer(&dash);
             guard->setInterval(1000);

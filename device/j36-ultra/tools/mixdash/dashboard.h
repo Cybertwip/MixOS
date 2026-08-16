@@ -477,6 +477,27 @@ private:
      * is the only time anything can send that signal -- see switcher.h.
      */
     QTimer *m_requestTimer = nullptr;
+
+    /*
+     * ── A LAUNCH IS NOT RE-ENTRANT ───────────────────────────────────────────
+     *
+     * launch() paints its toast and then turns the event loop once, so that the
+     * sentence naming what is starting is on the glass before updates go off.
+     * That one turn delivers timers, and the joypad's is 15 ms: a card press that
+     * is still being held, or an FN that is already down, comes back INTO this
+     * object while a QProcess is half started and m_tasks is being appended to.
+     * Two launches interleaved is a task list mutated under a reference; a
+     * switcher opened from inside a launch is an overlay that the rest of the
+     * launch then covers with a child.
+     *
+     * So the loop is turned with a flag set.  A second launch is refused outright
+     * -- pressing a card twice was always going to open one thing -- and the
+     * switcher is remembered and put up the moment the launch is finished, which
+     * is where it can do its job properly: the task exists, it has a pgid, and
+     * stopping it stops something real.
+     */
+    bool m_launching = false;
+    bool m_switcherPending = false;
 };
 
 #endif /* MIXDASH_DASHBOARD_H */

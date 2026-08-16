@@ -43,30 +43,41 @@
  * because a browser is open is a bug waiting for its bug report.  XTEST reaches
  * exactly one X server and stops existing when that server does.
  *
- * THE PAD IS GRABBED, and that is not an optimisation.  mixdash is still running
+ * ── THE PAD IS NOT GRABBED ANY MORE, AND THAT IS THE FIX FOR A FROZEN DEVICE ──
+ *
+ * It used to be, and the reason was sound at the time: mixdash is still running
  * behind the X server -- it is the process that launched it -- and its own reader
- * has /dev/input/event* open.  Without EVIOCGRAB every press would be delivered
- * twice: once here, and once to a dashboard that would walk its card grid behind
- * the browser and act on whatever it landed on.  EVIOCGRAB makes the kernel
- * deliver this device's events to this fd and nowhere else, so for as long as this
- * runs the whole pad -- sticks included, since they are on the same device -- is
- * X's.  It is released by closing the fd, which happens on every exit path
- * including a signal, so a crash here gives the pad back rather than wedging it.
+ * has /dev/input/event* open, so without EVIOCGRAB every press was delivered
+ * twice, once here and once to a dashboard walking its card grid behind the
+ * browser.  The grab existed to stop that and nothing else.  It has not been
+ * needed since mixdash grew WATCH MODE: while a task owns the panel its Joypad
+ * reads every event and reports exactly two, the FN hold and the headphone
+ * switch, because the buttons belong to the child.  Two readers, one of which is
+ * deliberately deaf, is not a conflict.
  *
- * AND IT IS HANDED BACK FOR THE SWITCHER.  Holding Menu now asks mixdash to show
- * the list of what is running instead of closing this session, and mixdash drives
- * that list with the pad -- which it cannot read while this process has it.  So
- * the grab is given up at that moment and taken again on SIGCONT, when the
- * dashboard lets this session run in front once more.  set_grab() is where both
- * halves are, and the hold in main() says why the order matters.
+ * WHAT IT COST WAS THE WHOLE DEVICE.  A grab belongs to the open descriptor, not
+ * to the process being scheduled: SIGSTOP does not release it.  mixdash stops
+ * this session's process group whenever the panel goes somewhere else -- FN held
+ * during startup, a row chosen in the switcher, a card that opens another
+ * program -- and every one of those left the pad grabbed by a process that could
+ * not run.  From the outside that is a handheld whose buttons have all stopped
+ * working, with no way back except the power button, and the only path that ever
+ * released it in time was this program's own Menu hold.  A single-purpose
+ * mechanism whose failure mode is "the device is dead" is the wrong trade against
+ * a duplicate-event problem that something else already solves.
  *
- * WHAT IS DELIBERATELY NOT GRABBED.  A USB keyboard or mouse in the dock is a
- * real X input device that libinput will pick up and drive properly, and it must
- * keep working.  So the match is narrow -- see looks_like_pad() -- and a device
- * that looks like a keyboard (it has the letter keys) or like a mouse (it has
- * EV_REL) is left alone even if something about it also looks like a pad.
+ * --grab puts it back for anyone running this outside mixdash, where nothing is
+ * listening behind the X server and nothing will be stopped.  set_grab() and the
+ * SIGCONT path below are kept for it, and are no-ops in the default case.
  *
- * A USB PAD IS TAKEN TOO, and on purpose.  An Xbox, PlayStation or Switch pad in
+ * WHAT IS DELIBERATELY NOT READ, which is the same narrow match the grab used and
+ * matters for its own reasons.  A USB keyboard or mouse in the dock is a real X
+ * input device that libinput will pick up and drive properly, and it must keep
+ * working -- so a device that looks like a keyboard (it has the letter keys) or
+ * like a mouse (it has EV_REL) is left alone even if something about it also
+ * looks like a pad.  See looks_like_pad().
+ *
+ * A USB PAD IS READ TOO, and on purpose.  An Xbox, PlayStation or Switch pad in
  * the port matches the same test, so it drives the browser exactly as the built-in
  * one does -- which is the right answer on a console, and it is also why the axis
  * handling below reads each device's real ranges instead of assuming this board's.
@@ -1138,6 +1149,52 @@ static int rep_any(void)
     return 0;
 }
 
+/*
+ * ── COMING BACK FROM A STOP: THROW AWAY EVERYTHING FROM WHILE WE WERE AWAY ──
+ *
+ * This process spends the switcher SIGSTOPped, and the pad does not stop with
+ * it.  evdev keeps a buffer per open descriptor, so every press the user made
+ * driving the dashboard's switcher -- A to choose a row, the D-pad to walk it,
+ * Menu to get there in the first place -- is sitting in this program's queue the
+ * instant it is allowed to run again.  Read them normally and they would be
+ * replayed into the browser through XTEST: a click somewhere on the page, a
+ * Return in whatever had focus, Alt+Left navigating away.  The events were meant
+ * for a different program on a different screen and they are not ours to deliver.
+ *
+ * WHAT THE RESET IS FOR, and it is a separate fault with the same cause.  A
+ * button that was down when the stop landed has a release in that same discarded
+ * batch, so the state this program keeps -- direction bits, stick deflection,
+ * shoulder repeats, and above all menu_down_at -- describes a hand that has since
+ * let go.  menu_down_at is the one that bites: mixdash's own FN hold is 700 ms
+ * and this one is 1000, so the dashboard stops the session while Menu is still
+ * down here.  Left alone, the first tick after SIGCONT sees a hold that has been
+ * running for however long the switcher was up, fires it, and asks for the
+ * switcher again -- the user comes back to the browser and is thrown straight out
+ * of it.  Zeroing the lot is the whole fix, and it costs at most one button that
+ * has to be pressed again.
+ *
+ * The drain is best-effort by design: EAGAIN ends it, anything else means the
+ * device left while we were stopped and the next poll will drop the slot through
+ * the ordinary path.
+ */
+static void forget_pads(void)
+{
+    struct input_event ev;
+    int i, r;
+
+    for (i = 0; i < MAX_PADS; i++) {
+        if (pad_fd[i] < 0)
+            continue;
+        while (read(pad_fd[i], &ev, sizeof ev) == (ssize_t)sizeof ev)
+            ;
+        pad_dirs[i] = 0;
+        for (r = 0; r < AX_N; r++)
+            ax_val[i][r] = 0.0;
+    }
+    rep_clear();
+    menu_down_at = 0;
+}
+
 /* ── The session's control pipe ──────────────────────────────────────────── */
 
 /*
@@ -1211,12 +1268,14 @@ static void on_signal(int sig)
  *
  * mixdash stops the whole process group when the switcher takes the panel, and
  * continues it when the user comes back -- so SIGCONT is the only notification
- * this process gets that it is in front once more, and the one thing it has to do
- * about it is take the pad back.  A flag and nothing else: the re-grab is an
- * ioctl per device and belongs in the loop, not in a handler.
+ * this process gets that it is in front once more.  Two things follow from it:
+ * everything the pad queued while we were away is thrown out (forget_pads, and
+ * the note there is the important one), and with --grab the pad is taken back.
+ * A flag and nothing else: both are work for the loop, not for a handler.
  *
  * Harmless when nothing stopped us.  SIGCONT is delivered to a process that was
- * never stopped as well, and a re-grab of a device already grabbed is a no-op.
+ * never stopped as well; the queue is empty in that case and a re-grab of a
+ * device already grabbed is a no-op.
  */
 static volatile sig_atomic_t cont_asked;
 
@@ -1236,7 +1295,10 @@ static void usage(void)
         "  --ctl PATH        the session's control pipe: Menu TAPPED asks it to\n"
         "                    page to the next window\n"
         "  --display NAME    which server (default $DISPLAY)\n"
-        "  --no-grab         read the pad without taking it from other readers\n"
+        "  --grab            take the pad from every other reader (see the note at\n"
+        "                    the top of this file before using it under mixdash)\n"
+        "  --no-grab         the default: share the pad, which is what lets the\n"
+        "                    dashboard still see FN held\n"
         "  --list            name the devices that would be used, then exit\n"
         "  -v                say what is happening\n"
         "\n"
@@ -1295,7 +1357,7 @@ int main(int argc, char **argv)
 {
     const char *display_name = NULL;
     pid_t watch_pid = 0;
-    int grab = 1, list_only = 0;
+    int grab = 0, list_only = 0;
     /*
      * Whether the pad is grabbed AT THIS MOMENT, as against whether it was asked
      * for on the command line.  The two differ for as long as the switcher is up:
@@ -1322,6 +1384,8 @@ int main(int argc, char **argv)
             ctl_path = argv[++i];
         else if (!strcmp(argv[i], "--display") && i + 1 < argc)
             display_name = argv[++i];
+        else if (!strcmp(argv[i], "--grab"))
+            grab = 1;
         else if (!strcmp(argv[i], "--no-grab"))
             grab = 0;
         else if (!strcmp(argv[i], "--list"))
@@ -1437,6 +1501,28 @@ int main(int argc, char **argv)
             break;
 
         now = now_ms();
+
+        /*
+         * Let run again, and the first thing that happens is the only thing that
+         * can happen safely: nothing the pad said while we were stopped is ours.
+         *
+         * Checked here, ahead of the reads, because after them is too late -- the
+         * queue would already have been replayed into the browser.  The iteration
+         * is then abandoned: the poll that was interrupted by the SIGCONT has
+         * nothing left to report, and the next one round starts from a pad with no
+         * buttons down and no backlog.
+         */
+        if (cont_asked) {
+            cont_asked = 0;
+            forget_pads();
+            move_last = now;
+            if (grab && !grabbing) {
+                note("continued by the dashboard, taking the pad back");
+                set_grab(1);
+                grabbing = 1;
+            }
+            continue;
+        }
 
         for (k = 0; k < nfd && n > 0; k++) {
             struct input_event ev;
@@ -1707,23 +1793,6 @@ int main(int argc, char **argv)
                 if (watch_pid > 0)
                     kill(watch_pid, SIGTERM);
                 break;
-            }
-        }
-
-        /*
-         * Let run again: back in front, so the pad is ours once more.
-         *
-         * Checked after the hold and not before it, so that the two cannot fight
-         * over one trip round the loop -- a SIGCONT that arrived while Menu was
-         * still being held would otherwise re-grab in the same iteration that
-         * gave the pad away.
-         */
-        if (cont_asked) {
-            cont_asked = 0;
-            if (grab && !grabbing) {
-                note("continued by the dashboard, taking the pad back");
-                set_grab(1);
-                grabbing = 1;
             }
         }
 

@@ -3515,12 +3515,14 @@ const char *const kPhrases[][Lang::Count] = {
       "%1 Zeilen zurück  --  Ab kehrt zurück",
       "recuou %1 linhas  --  Baixo regressa",
       "%1 líneas hacia atrás  --  Abajo regresa" },
-    { "%1x%2  --  B leaves, Menu types, A is Enter, FN is Ctrl+C",
-      "%1x%2  --  B quitte, Menu écrit, A vaut Entrée, FN vaut Ctrl+C",
-      "%1x%2  --  B esce, Menu scrive, A è Invio, FN è Ctrl+C",
-      "%1x%2  --  B verlässt, Menü schreibt, A ist Eingabe, FN ist Strg+C",
-      "%1x%2  --  B sai, Menu escreve, A é Enter, FN é Ctrl+C",
-      "%1x%2  --  B sale, Menú escribe, A es Intro, FN es Ctrl+C" },
+    /* Start and Select are silkscreened on this case, so they stay in English in
+     * all six the way A, B and FN do above. */
+    { "%1x%2  --  B leaves, Start types, A is Enter, Select is Ctrl+C",
+      "%1x%2  --  B quitte, Start écrit, A vaut Entrée, Select vaut Ctrl+C",
+      "%1x%2  --  B esce, Start scrive, A è Invio, Select è Ctrl+C",
+      "%1x%2  --  B verlässt, Start schreibt, A ist Eingabe, Select ist Strg+C",
+      "%1x%2  --  B sai, Start escreve, A é Enter, Select é Ctrl+C",
+      "%1x%2  --  B sale, Start escribe, A es Intro, Select es Ctrl+C" },
 
     /* ── keyboard.cpp -- the on-screen keyboard ──────────────────────────── */
     { "shift",

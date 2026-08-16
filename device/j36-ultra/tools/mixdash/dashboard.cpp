@@ -230,6 +230,46 @@ QStringList sessionWindowNames()
 }
 
 /*
+ * The name the session will give a window opened on this program.
+ *
+ * IT IS client_title() FROM j36-xsession-main, IN C++.  The two have to agree or
+ * "is it already open" is answered against names nothing ever writes: basename,
+ * then the j36- prefix off, then whatever is left.  Kept to those two rules for
+ * that reason -- anything cleverer here would be a third opinion.
+ */
+QString windowNameFor(const QString &exe)
+{
+    QString name = exe.section(QLatin1Char('/'), -1);
+    if (name.startsWith(QLatin1String("j36-")))
+        name = name.mid(4);
+    return name;
+}
+
+/*
+ * ── SIGNALLING A TASK: THE GROUP, AND THE LEADER AS THE FALLBACK ─────────────
+ *
+ * Every task is signalled through its process group, because a session is a shell
+ * that runs xinit that runs an X server and stopping only the shell would leave
+ * the server drawing.  -pid is how that is said.
+ *
+ * The fallback is for one window, microseconds wide, at the very start: the group
+ * does not exist until the child has run setupChildProcess(), which happens after
+ * the fork and before the exec.  A gesture that lands inside it -- and FN held
+ * while a card is being pressed lands there -- would get ESRCH from the group and
+ * leave a task marked stopped that was still running, which on this device means a
+ * program drawing over a switcher nobody can see.  The leader is the whole of the
+ * group at that instant, so signalling it directly is not an approximation.
+ */
+bool signalTask(qint64 pgid, int sig)
+{
+    if (pgid <= 0)
+        return false;
+    if (::kill(-(pid_t)pgid, sig) == 0)
+        return true;
+    return ::kill((pid_t)pgid, sig) == 0;
+}
+
+/*
  * WHICH OF THE FOUR PIECES IS NOT ON THIS CARD, in a sentence, for the boot where
  * the answer above is empty.
  *
@@ -314,6 +354,9 @@ int navForKey(int qtKey)
     case Qt::Key_Tab:
     case Qt::Key_PageDown:  return Joypad::NavNextPage;
     case Qt::Key_M:         return Joypad::NavMenu;
+    /* Select, so the Terminal's interrupt key is reachable on a workstation
+     * build too.  Not Ctrl+C: this window has no Ctrl of its own to catch. */
+    case Qt::Key_N:         return Joypad::NavSelect;
     case Qt::Key_Q:         return Joypad::NavQuit;
     /* The two keys on the side of the case, for a workstation that has them.
      * Most desktops grab these before Qt sees them, which costs nothing: the
@@ -1658,6 +1701,11 @@ protected:
  */
 void Dashboard::launch(const QString &title, const QString &exe, const QStringList &args)
 {
+    /* One at a time.  See m_launching in dashboard.h: the toast below turns the
+     * event loop, and what comes back through it can be another press. */
+    if (m_launching)
+        return;
+
     if (exe.isEmpty() || !QFileInfo(exe).isExecutable()) {
         toast(tr("%1 is not on this card").arg(title));
         return;
@@ -1683,6 +1731,8 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
         toast(tr("Too many things are running -- close one first"));
         return;
     }
+
+    m_launching = true;
 
     toast(tr("Starting %1").arg(title), 60000);
     /*
@@ -1769,24 +1819,41 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
     });
 
     connect(child, &QProcess::started, this, [this, child]() {
+        const int i = indexOfTask(child);
+        if (i < 0)
+            return;
+
+        /* Whatever happens next, nothing is loading any more. */
+        m_busy->stop();
+
+        /*
+         * ── IT IS STILL ONLY THE FOREGROUND IF NOTHING MOVED ─────────────────
+         *
+         * started() arrives an event loop turn or more after start(), and that
+         * turn is long enough to hold a gesture: FN held while a browser is
+         * coming up puts the switcher on the glass, and a row chosen off it puts
+         * some other task in front.  Both of them stop this one on the way past,
+         * which is correct and is why m_fg is set at start() time now.
+         *
+         * What must not happen is this slot then asserting the old answer anyway.
+         * It used to: setUpdatesEnabled(false) and m_fg = i, unconditionally --
+         * so the switcher was left on the panel with the dashboard forbidden to
+         * repaint it, driving a list it could no longer draw, over a program that
+         * had been let run again.  That is the "FN does nothing while the browser
+         * is loading, and then everything is wedged" report, and it is one `if'.
+         */
+        if (m_fg != i) {
+            refreshSwitcher();
+            return;
+        }
+
         /*
          * The child is running and every pixel is its business from here.  Updates
          * go off HERE and not straight after start(): between the two calls this
          * dashboard is still the only thing on the glass, and a ring that cannot
          * be painted is a ring that does not turn.
          */
-        m_busy->stop();
         setUpdatesEnabled(false);
-        const int i = indexOfTask(child);
-        if (i < 0)
-            return;
-        /*
-         * The pid is only real once the fork has happened, which is what started()
-         * means.  It is the group id too, because setupChildProcess() made the
-         * child its own leader.
-         */
-        m_tasks[i].pgid = child->processId();
-        m_fg = i;
         /* Something outside this process can ask for the switcher now, and only
          * now.  See switcher.h. */
         m_requestTimer->start();
@@ -1799,6 +1866,35 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
     m_tasks.append(task);
 
     child->start(exe, args);
+
+    /*
+     * ── THE PID AND THE PANEL ARE CLAIMED HERE, NOT IN started() ─────────────
+     *
+     * QProcess::start() has already forked by the time it returns -- started() is
+     * only the notification that the exec on the other side did not fail -- so
+     * processId() is answerable now, and it is the group id because
+     * setupChildProcess() made the child a leader.
+     *
+     * Waiting for started() left a window, several seconds wide on a cold cache,
+     * in which a task was on its way to the panel with pgid 0 and m_fg -1: the
+     * switcher could not stop it, closeTask() could not signal it, and
+     * stopForeground() had nothing to stop.  A program that is being started IS
+     * the foreground -- that is what starting it meant -- and the only thing that
+     * is not yet true is that it can draw.
+     */
+    const int slot = indexOfTask(child);
+    if (slot >= 0) {
+        m_tasks[slot].pgid = child->processId();
+        m_fg = slot;
+    }
+
+    /* The launch is over, so a gesture that arrived in the middle of it can be
+     * acted on now -- against a task that exists and can be stopped. */
+    m_launching = false;
+    if (m_switcherPending) {
+        m_switcherPending = false;
+        showSwitcher();
+    }
 }
 
 int Dashboard::sessionTask() const
@@ -1839,6 +1935,9 @@ int Dashboard::sessionTask() const
 void Dashboard::launchWindowed(const QString &title, const QString &exe,
                                const QStringList &args)
 {
+    if (m_launching)
+        return;
+
     if (exe.isEmpty() || !QFileInfo(exe).isExecutable()) {
         toast(tr("%1 is not on this card").arg(title));
         return;
@@ -1852,6 +1951,29 @@ void Dashboard::launchWindowed(const QString &title, const QString &exe,
     if (session < 0) {
         launch(tr("Desktop"), QString::fromLatin1(kXSession),
                QStringList() << QStringLiteral("--run") << cmd);
+        return;
+    }
+
+    /*
+     * ── THE SAME CARD TWICE IS THE SAME WINDOW ───────────────────────────────
+     *
+     * launch() has this rule already and it matters more here, not less.  A card
+     * pressed a second time while its window is still coming up would put a
+     * SECOND copy in the session -- and the one card anybody presses twice is the
+     * Browser, because Firefox takes long enough on this board to look like
+     * nothing happened.  Two Firefoxes on 946 MB is not a slow device, it is a
+     * device in the out-of-memory killer, and the frame on the glass while that
+     * happens is the desktop's old one, so it reads as a freeze.
+     *
+     * The name is the one the session writes into its window list, which is the
+     * program's own name with the j36- prefix off -- see client_title() in
+     * j36-xsession-main.  Matching on it rather than on the whole command line is
+     * deliberate: j36-browser opened on one URL and then on another is still the
+     * one browser.
+     */
+    if (sessionWindowNames().contains(windowNameFor(exe))) {
+        toast(tr("%1 is already open").arg(title));
+        setForeground(session);
         return;
     }
 
@@ -1996,8 +2118,8 @@ void Dashboard::setForeground(int index)
     Panel::restore(task.frame);
     task.frame.clear();
 
-    if (task.stopped && task.pgid > 0) {
-        ::kill(-(pid_t)task.pgid, SIGCONT);
+    if (task.stopped) {
+        signalTask(task.pgid, SIGCONT);
         task.stopped = false;
     }
 
@@ -2018,8 +2140,7 @@ void Dashboard::stopForeground()
         return;
 
     Task &task = m_tasks[m_fg];
-    if (task.pgid > 0 && !task.stopped) {
-        ::kill(-(pid_t)task.pgid, SIGSTOP);
+    if (!task.stopped && signalTask(task.pgid, SIGSTOP)) {
         task.stopped = true;
         /* AFTER the stop.  panel.h: a program that is still running can be in
          * the middle of a frame, and what is wanted is the last thing the user
@@ -2058,9 +2179,9 @@ void Dashboard::closeTask(int index)
      * would be second-guessing a script that already handles it.  A task that
      * genuinely ignores SIGTERM stays in the list, which is at least honest.
      */
-    ::kill(-(pid_t)task.pgid, SIGCONT);
+    signalTask(task.pgid, SIGCONT);
     task.stopped = false;
-    ::kill(-(pid_t)task.pgid, SIGTERM);
+    signalTask(task.pgid, SIGTERM);
 
     /*
      * The row is not removed here.  finished() is what removes it, through
@@ -2089,10 +2210,27 @@ void Dashboard::showSwitcher()
     if (m_switcher->isVisible())
         return;
 
+    /*
+     * NOT IN THE MIDDLE OF A LAUNCH.  launch() turns the event loop once while a
+     * QProcess is being started, and this is one of the two things that can come
+     * back through it -- see m_launching in dashboard.h.  Opening the switcher
+     * there would stop a task that does not exist yet and then be covered by it a
+     * few lines later.  It is held instead, and the tail of launch() puts it up.
+     */
+    if (m_launching) {
+        m_switcherPending = true;
+        return;
+    }
+
     /* Remembered before anything is stopped, because stopForeground() clears
      * m_fg and cancelling has to put back what was actually in front. */
     m_switcherWas = m_fg;
     stopForeground();
+
+    /* Whatever was loading is stopped now, so the ring is a lie -- and it is a
+     * lie that draws, which over an opaque overlay means a spinning arc in the
+     * middle of the list. */
+    m_busy->stop();
 
     m_requestTimer->stop();
     /* Full reporting again: the switcher is driven by the D-pad, A, B and Menu,
@@ -2515,6 +2653,24 @@ void Dashboard::onNav(int action, bool repeat)
     }
 
     /*
+     * ── SELECT, AND WHERE IT STOPS BEING MENU ────────────────────────────────
+     *
+     * Select and Start were one action until the Terminal needed an interrupt key
+     * that was not FN (joypad.h says why).  Splitting them at the source would
+     * have taken Select off every overlay and page that answers Menu today -- the
+     * switcher's close, the keyboard's dismiss, the Media page's controls -- for
+     * no reason any of them asked for.
+     *
+     * So the split is here and it is two lines wide.  The overlays are offered the
+     * button under its old name, because neither of them is ever the Terminal.
+     * The page is offered it under its own name FIRST, which is the Terminal's one
+     * chance to claim it, and then again as Menu, which is what every other page
+     * has always seen.  A page that does not know NavSelect exists needs no change
+     * and gets none.
+     */
+    const int overlayAction = (action == Joypad::NavSelect) ? Joypad::NavMenu : action;
+
+    /*
      * The switcher is above even the keyboard, and it is the one overlay that
      * swallows everything rather than passing on what it does not want.  It has
      * to: the thing underneath it is a stopped program or a page that is not on
@@ -2522,14 +2678,14 @@ void Dashboard::onNav(int action, bool repeat)
      * cannot see.  handleNav() returns false only when it is not up at all.
      */
     if (m_switcher->isVisible()) {
-        if (m_switcher->handleNav(action))
+        if (m_switcher->handleNav(overlayAction))
             return;
     }
 
     /* The keyboard is an overlay, so it gets first refusal: Back closes it rather
      * than popping the page being typed into. */
     if (m_keyboard->isVisible()) {
-        if (m_keyboard->handleNav(action))
+        if (m_keyboard->handleNav(overlayAction))
             return;
     }
 
@@ -2560,6 +2716,14 @@ void Dashboard::onNav(int action, bool repeat)
     PageWidget *page = current();
     if (page && page->handleNav(action))
         return;
+
+    /* Refused under its own name, so it goes back to being Menu -- for the page
+     * that has just refused it as well as for the switch below. */
+    if (action == Joypad::NavSelect) {
+        action = Joypad::NavMenu;
+        if (page && page->handleNav(action))
+            return;
+    }
 
     /*
      * Whatever the page did not want.

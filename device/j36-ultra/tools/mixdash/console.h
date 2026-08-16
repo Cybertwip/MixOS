@@ -27,14 +27,22 @@
  *     the thing that does it.  That is what "changing the sharing settings puts the
  *     console back on the panel" was.
  *
- * mixsplash learnt this first and answered it by re-taking the mode once a second
- * (console_hold in mixsplash.c, with the same list of suspects).  That was enough
- * there because the splash redraws every frame: whatever fbcon had painted was
- * covered within 40 ms of the mode coming back.  This program is not an animation.
- * Qt flushes only what a widget marked dirty, so console text drawn over the
+ * mixsplash learnt this first and answered it the same way (console_hold in
+ * mixsplash.c, with the same list of suspects).  The paragraph that stood here said
+ * re-taking the mode was enough over there because the splash redraws every frame,
+ * and that was simply wrong: the splash blits the rectangles it marked dirty -- the
+ * spinner, the bar, two lines of text -- and nothing else, so a console fbcon had
+ * painted over the whole panel stayed painted, with an animation running in a hole
+ * in the middle of it.  That was the splash "going to console mode" for the length
+ * of systemd's startup, and mixsplash now forces a full repaint when it has had to
+ * take the mode back.
+ *
+ * Which is the same answer this file needs, for the same reason and not a different
+ * one.  Qt flushes only what a widget marked dirty, so console text drawn over the
  * dashboard would sit there until something happened to be repainted -- which is
  * why hold() reports whether it had to act, and every caller repaints the whole
- * window when it says yes.
+ * window when it says yes.  Partial damage plus a stolen VT is one bug, and it has
+ * now been fixed in both of the programs that can hit it.
  *
  * AND THE STREAM GOES TO A FILE ONCE THERE IS A DASHBOARD TO PROTECT.  Until the
  * first frame this program's stdout and stderr are the most useful thing the panel

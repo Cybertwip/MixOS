@@ -84,6 +84,23 @@ public:
         NavPrevPage,
         NavNextPage,
         NavMenu,
+        /*
+         * SELECT, WHICH USED TO BE A SECOND MENU KEY AND IS NOW ITS OWN BUTTON.
+         *
+         * BTN_SELECT and BTN_START both sent NavMenu, which was fine while no
+         * page could tell them apart and wanted to.  The Terminal wants to: it
+         * needs an interrupt key, this case has no Ctrl, and the button that was
+         * carrying the interrupt was FN -- the same button whose hold is the task
+         * switcher, so the one control that must always reach the shell was also
+         * the one control the Terminal could least afford to share.
+         *
+         * So Select is delivered under its own name and FN is left to the
+         * switcher alone.  Nothing else in the shell has a use for it, and
+         * Dashboard::onNav offers it to the page first and then re-offers it as
+         * NavMenu -- which is why every other page behaves exactly as it did:
+         * see the note there.
+         */
+        NavSelect,
         NavQuit,
         /*
          * The two hardware keys on the side of the case.  They are Nav actions

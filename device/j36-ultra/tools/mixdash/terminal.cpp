@@ -1346,19 +1346,33 @@ bool TerminalPage::handleNav(int action)
         }
         return true;
     case Joypad::NavMenu:
-        /* The on-screen keyboard, for the case this device is normally in: no USB
-         * keyboard attached and a command to type anyway. */
+        /* START, and on this page it is the only thing that opens the keyboard --
+         * for the case this device is normally in: no USB keyboard attached and a
+         * command to type anyway.  Pressing it again closes it, because the
+         * keyboard overlay answers the same action with dismiss(). */
         emit textRequested(tr("Command"), QString(), false);
         return true;
-    case Joypad::NavQuit:
+    case Joypad::NavSelect:
         /*
-         * FN is the interrupt key.
+         * SELECT IS THE INTERRUPT KEY, AND IT USED TO BE FN.
          *
-         * This handheld has no Ctrl, so until now a command that would not stop on
-         * its own -- a ping with no count, a tail -f, anything that reads until the
-         * end of a pipe that never ends -- could only be got rid of by leaving the
-         * page and coming back, which does not kill it, or by cutting the power.
-         * The keyboard overlay cannot help either: it enters a LINE, and an
+         * FN was the wrong button for it and the reason is the switcher.  Held,
+         * FN is the one control that has to reach the shell from anywhere; tapped,
+         * it was Ctrl+C here.  One button, two meanings, told apart by 700 ms --
+         * so every reach for the switcher that came up short typed an interrupt
+         * into whatever was running, and every interrupt that was pressed a
+         * moment too long put the switcher up instead.  On the page where the
+         * interrupt matters most, that is the worst place to have put it.
+         *
+         * Select does nothing else on this page and nothing at all on most of the
+         * others, so it costs nothing and it is unambiguous: one press, one
+         * meaning, no clock involved.
+         *
+         * This handheld has no Ctrl, so without it a command that would not stop
+         * on its own -- a ping with no count, a tail -f, anything that reads until
+         * the end of a pipe that never ends -- could only be got rid of by leaving
+         * the page and coming back, which does not kill it, or by cutting the
+         * power.  The keyboard overlay cannot help either: it enters a LINE, and an
          * interrupt is not a line, it is a byte that has to arrive while the thing
          * being interrupted is the one holding the terminal.
          *
@@ -1390,6 +1404,12 @@ bool TerminalPage::handleNav(int action)
             send(QByteArray(1, intr));
         }
         return true;
+    case Joypad::NavQuit:
+        /* FN, and this page no longer wants it.  Refused rather than swallowed,
+         * so it falls through Dashboard::onNav to `default' and does nothing --
+         * which is what it does on every other page.  The hold is the switcher
+         * and never arrives here at all. */
+        return false;
     case Joypad::NavBack:
         return false;   /* Leaves the page.  The shell keeps running. */
     default:
@@ -1573,7 +1593,7 @@ void TerminalPage::paintEvent(QPaintEvent *)
         /* FN is named here because it is the one binding on this page nobody
          * would guess: there is no Ctrl key on the case to suggest it, and a
          * command that will not stop is exactly when the footer gets read. */
-        foot = tr("%1x%2  --  B leaves, Menu types, A is Enter, FN is Ctrl+C")
+        foot = tr("%1x%2  --  B leaves, Start types, A is Enter, Select is Ctrl+C")
                    .arg(m_cols).arg(m_rows);
 
     p.setFont(Theme::font(11));

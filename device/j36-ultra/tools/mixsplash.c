@@ -1204,25 +1204,48 @@ static int console_grab(void)
  *
  * Masking them is the wrong trade: this board has no other way in when the
  * dashboard will not start, and a recovery console is worth more than a tidy
- * boot.  So the mode is simply re-taken rather than defended.  The cost is one
- * ioctl a second against a process that is already redrawing a 640x480 canvas
- * at 25 fps, and the failure mode is bounded and self-correcting -- whatever
- * flipped it gets its own terminal reset, and the panel goes back to the splash
- * within a frame of it.
+ * boot.  So the mode is simply re-taken rather than defended.  The failure mode
+ * is bounded and self-correcting -- whatever flipped it gets its own terminal
+ * reset, and the panel goes back to the splash as soon as this notices.
+ *
+ * ── EVERY FRAME, AND THE CALLER REPAINTS EVERYTHING WHEN THIS SAYS SO ────────
+ *
+ * Both halves of that are the fix for "the splash goes to a console screen
+ * between `Starting system services' and the dashboard, and stays there".
+ *
+ * The repaint is the important one.  fbcon does not draw one line when it gets
+ * the VT back, it redraws the WHOLE console: every status message systemd has
+ * written since the boot began, over the entire panel.  This process then took
+ * the mode back a moment later and blitted its damage rectangles -- the spinner,
+ * the bar and the two lines of text -- and nothing else, because that is all it
+ * had marked dirty.  The wallpaper was still perfect in the canvas and never
+ * reached the glass again, so what was left was a console screen with a spinner
+ * turning in the middle of it, for the whole of systemd's startup.  Reported,
+ * exactly and correctly, as the splash entering console mode.
+ *
+ * The interval is the smaller half.  It used to be one second, and the argument
+ * for that was cost -- which was measured against the wrong thing: KDGETMODE
+ * reads one int under the console lock, and this loop is already compositing a
+ * 640x480 canvas 25 times a second.  One a frame is not a cost, and it is the
+ * difference between forty milliseconds of console text and a whole second of
+ * it.  At one second the flash was long enough to read, which meant it was long
+ * enough to report.
  *
  * KDGETMODE first so the common case -- nobody touched it -- costs a read and
  * no write, and so the note() only fires when something really did take it.
  */
-static void console_hold(int fd)
+static int console_hold(int fd)
 {
     int mode = KD_GRAPHICS;
 
     if (fd < 0)
-        return;
+        return 0;
     if (ioctl(fd, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS)
-        return;
-    if (ioctl(fd, KDSETMODE, KD_GRAPHICS) == 0)
-        note("something put the console back into text mode; taken again");
+        return 0;
+    if (ioctl(fd, KDSETMODE, KD_GRAPHICS) != 0)
+        return 0;
+    note("something put the console back into text mode; taken again");
+    return 1;
 }
 
 static void console_release(int fd, int keep_graphics)
@@ -1274,7 +1297,7 @@ int main(int argc, char **argv)
     uint32_t *img, *canvas;
     char stage[96], detail[96], line[512];
     double target = 0.0, shown = 0.0;
-    double t0, last_msg, handover_at = -1.0, last_hold = 0.0;
+    double t0, last_msg, handover_at = -1.0;
     int console = -1, handover = 0, opt;
 
     while ((opt = getopt(argc, argv, "i:f:d:s:t:T:1kvh")) != -1) {
@@ -1421,6 +1444,12 @@ int main(int argc, char **argv)
             g_prev_all = 1;
         }
 
+        /* Before the restore and not after the draws, so that taking the console
+         * back goes through the ordinary full-repaint path rather than needing one
+         * of its own: g_prev_all is what restore_damage() reads, one line below. */
+        if (console_hold(console))
+            g_prev_all = 1;
+
         /* Ease the bar toward the target: a tenth of the remaining distance per
          * frame, which at 25 fps closes a jump in under half a second. */
         shown += (target - shown) * 0.10;
@@ -1451,14 +1480,6 @@ int main(int argc, char **argv)
         }
 
         keep_damage();
-
-        /* Once a second, not once a frame: whatever takes the VT does it once
-         * and then blocks on a read, so a second is fast enough to hide and
-         * slow enough that this never shows up in a profile. */
-        if (t - last_hold >= 1.0) {
-            last_hold = t;
-            console_hold(console);
-        }
 
         if (g_damage_all) {
             fb_blit(&fb, canvas, 0, 0, fb.w, fb.h);
@@ -1491,6 +1512,16 @@ int main(int argc, char **argv)
             now_seconds() - handover_at > handover_timeout) {
             note("%.0fs since hand-over and nothing replaced us",
                  handover_timeout);
+            /*
+             * And the hand-over is off, which is the point of the flag and is
+             * what the comment above has always said this does.  The word means
+             * "mixdash is coming, leave the mode alone for it"; three minutes of
+             * silence is that promise being broken, and honouring it anyway left
+             * the panel holding one still frame in KD_GRAPHICS with no console
+             * behind it -- a board that looks like it is still booting, for ever,
+             * on the one path where somebody needs to read why it is not.
+             */
+            handover = 0;
             break;
         }
 

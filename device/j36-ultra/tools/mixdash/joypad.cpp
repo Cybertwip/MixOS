@@ -54,7 +54,10 @@ const Map kMap[] = {
     { BTN_TR,        Joypad::NavNextPage },
     { BTN_TL2,       Joypad::NavPrevPage },
     { BTN_TR2,       Joypad::NavNextPage },
-    { BTN_SELECT,    Joypad::NavMenu },
+    /* Select and Start are no longer the same button: the Terminal makes Select
+     * the interrupt key, and every other page still sees Menu for either of them.
+     * Dashboard::onNav is where the second half of that happens. */
+    { BTN_SELECT,    Joypad::NavSelect },
     { BTN_START,     Joypad::NavMenu },
     { BTN_MODE,      Joypad::NavQuit },
 

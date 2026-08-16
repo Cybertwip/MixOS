@@ -5085,9 +5085,9 @@ UNITMIRROR
     # /dev/tty0 in KD_GRAPHICS, which is exactly the state that function is written to
     # diagnose: it reads the mode, decides that "something put it there and did not put
     # it back", and sets KD_TEXT.  fbcon then repaints the entire console over the
-    # splash.  It lasts about a second because console_regrab() in mixsplash.c re-takes
-    # KD_GRAPHICS once a second and paints the next frame over it -- which is precisely
-    # a flash, and precisely where the user sees one.  Neither of those is a bug in
+    # splash.  It lasts one frame because console_hold() in mixsplash.c re-takes
+    # KD_GRAPHICS on every one and repaints the whole panel when it has had to -- which
+    # is precisely a flash, and precisely where the user sees one.  Neither is a bug in
     # eglprobe.  A probe whose job is to undo a console left in graphics mode cannot
     # tell a splash that is using the mode from a dead client that abandoned it, so the
     # answer is not to make it cleverer: it is not to run it while a splash is up.
@@ -8505,7 +8505,7 @@ QTCONF
 # ID_INPUT_JOYSTICK, which libinput refuses by design -- and BTN_A is evdev 0x130,
 # which is past the 255 an X keycode can hold, so the older evdev driver cannot map
 # it either.  tools/j36-padx.c does the translation itself with XTEST; its header
-# has the full reasoning, including why it grabs the pad and why not uinput.
+# has the full reasoning, including why it does not grab the pad and why not uinput.
 #
 # THE ONE WRITE THIS MAKES TO THE ROOTFS, said out loud because everything else in
 # this image goes to /run/j36: X compiles its keymap and caches the .xkm under
@@ -11355,7 +11355,7 @@ if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
     # There is no InputDevice section and AutoAddDevices is left on, which is the
     # point: a USB keyboard or mouse plugged into the dock is picked up by
     # xserver-xorg-input-libinput and works normally.  The built-in pad is the one
-    # device libinput will not take, and j36-padx has it grabbed anyway.
+    # device libinput will not take, which is why j36-padx exists to read it.
     mkdir -p "$SDROOT/opt/mixos/share/xorg"
     cat > "$SDROOT/opt/mixos/share/xorg/xorg.conf" <<'XORGCONF'
 # Written by device/j36-ultra/build-in-vm.sh for the J36 Ultra's simple-framebuffer.
@@ -12043,8 +12043,12 @@ start_client() {
 }
 
 # The bridge: the pad as a pointer, a keyboard and, on a Menu tap, `next' into the
-# pipe above.  --no-grab is NOT passed -- mixdash is still reading the pad behind
-# this and both of them acting on the same press is the bug the grab exists for.
+# pipe above.  --grab is NOT passed, and that is deliberate: a grab belongs to the
+# open descriptor and survives SIGSTOP, so a session grabbing the pad and then being
+# stopped by the dashboard is a handheld with no working buttons.  mixdash reading
+# the pad behind this is not the conflict it looks like -- while a task owns the
+# panel its reader is in watch mode and acts on nothing but the FN hold.  The header
+# of tools/j36-padx.c has the long version.
 # --watch is gone: it watched one pid, and a session that outlives any single window
 # has no one pid to watch.
 if [ -x /opt/mixos/bin/j36-padx ]; then
