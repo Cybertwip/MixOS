@@ -800,6 +800,50 @@ MODULE_PARM_DESC(role_poll_ms,
 		 "attach_grace_polls for what happens when the thing on the port "
 		 "holds the lines high without ever becoming a device.");
 
+/*
+ * ── THE ARM THAT RAN TOO EARLY, AND THE BOOT THAT NEVER CAME BACK ────────────
+ *
+ * .power_on is not a callback that happens near musb; it happens INSIDE it.
+ * mtk_musb_init() is musb's platform .init, musb_init_controller() calls it as
+ * its first act, and phy_power_on() is three lines into that. So everything
+ * .power_on did used to run in the middle of musb_init_controller(), before the
+ * core had read its own config, before musb_generic_disable(), before the IRQ
+ * was requested and long before musb_start(). What it did there was not a
+ * register read: it raised DRVVBUS, slept a hundred milliseconds, wrote DEVCTL
+ * and POWER, parked the PHY, slept again, started a session and forced the
+ * valids -- about a sixth of a second of live sequencing on the MAC and on an
+ * external power net, interleaved with a core that was mid-initialisation on
+ * the same registers.
+ *
+ * AND IT WAS ALREADY KNOWN TO BE POINTLESS. The comments in
+ * j36_usb_phy_decide_role() and j36_musb_host_kick() say it in as many words:
+ * musb_generic_disable() writes DEVCTL = 0 a moment later and musb_start()
+ * begins its own session from the hub thread, so whatever is armed here is torn
+ * down before anything can use it, and the arm that has to win is the one the
+ * first role poll runs after all of that has happened. Three seconds later, on
+ * a bus nobody else is touching, from a workqueue.
+ *
+ * Which leaves a sixth of a second of the riskiest writes this driver makes,
+ * placed at the one moment they race the core, buying nothing. On this SoC a
+ * bad access to a peripheral is not an oops -- it stalls the bus and takes the
+ * display with it, and the report is a handheld frozen with `mediatek.ko' as
+ * the last word on the panel. That is not proof this was the stall; the same
+ * code has booted this board hundreds of times and the fault is intermittent,
+ * which is exactly what a race looks like from the outside. It is the reason
+ * not to keep doing it: the deferred order is strictly closer to what musb
+ * expects, it is what the file's own comments already recommend, and it costs
+ * one poll interval of a port that is not yet sourcing 5 V.
+ *
+ * =1 puts it back, for bisecting against a board that regresses.
+ */
+static bool role_at_power_on;
+module_param(role_at_power_on, bool, 0644);
+MODULE_PARM_DESC(role_at_power_on,
+		 "decide and apply the role from inside .power_on, which is inside "
+		 "musb_init_controller() (default off: the first role poll does it "
+		 "instead, after musb_start(), which is the arm that survives). Only "
+		 "affects the first application; the poll owns the role either way.");
+
 static unsigned int role_probe_every = 5;
 module_param(role_probe_every, uint, 0644);
 MODULE_PARM_DESC(role_probe_every,
@@ -2416,25 +2460,46 @@ static int j36_usb_phy_power_on(struct phy *phy)
 	 * charge port IS the host port, pinning host is also pinning "never
 	 * charge". decide_role() measures instead. vbus=1 restores the old two
 	 * lines exactly.
+	 *
+	 * OFF BY DEFAULT NOW, and it is the poll below that does this instead --
+	 * see role_at_power_on for the whole of why. Nothing else moves: the
+	 * gate, the recover and the force-device tail all still happen in
+	 * phy_init(), so the MAC is clocked and the PHY is in its resting state
+	 * by the time musb_init_controller() reads a register.
 	 */
-	mutex_lock(&p->lock);
-	j36_usb_phy_decide_role(p);
-	mutex_unlock(&p->lock);
+	if (role_at_power_on) {
+		mutex_lock(&p->lock);
+		j36_usb_phy_decide_role(p);
+		mutex_unlock(&p->lock);
+	}
 
 	/*
-	 * Both of these are here rather than in phy_init because the role has
-	 * just been decided and DEVCTL is the reading worth having, and because
-	 * power_on is still ahead of musb_start() -- which is what makes the
-	 * busctl write safe. Dump first, probe second, so the dump shows the
-	 * function address as musb left it rather than as the probe restored it.
+	 * Both of these are here rather than in phy_init because DEVCTL is worth
+	 * a look before the core has touched it, and because power_on is still
+	 * ahead of musb_start() -- which is what makes the busctl write safe.
+	 * Dump first, probe second, so the dump shows the function address as
+	 * musb left it rather than as the probe restored it.
+	 *
+	 * The dump is reads only and stays whatever the line above does. The
+	 * probe writes, and it is behind musb_probe_layout, which is off.
 	 */
 	j36_musb_dump(p, "at power-on");
 	j36_musb_probe_busctl(p);
 
 	j36_usb_phy_scan_arm(p);
+	/*
+	 * And this is now the first thing that applies a role, not merely the
+	 * thing that re-checks it. role_poll_ms=0 with role_at_power_on=0 is
+	 * therefore a port that is never brought up at all -- which is a
+	 * legitimate way to ask for a dead port, and the only way to get one by
+	 * accident is to ask for both.
+	 */
 	if (role_poll_ms)
 		schedule_delayed_work(&p->role_work,
 				      msecs_to_jiffies(role_poll_ms));
+	else if (!role_at_power_on)
+		dev_info(p->dev,
+			 "role_poll_ms=0 and role_at_power_on=0: nothing will bring the port up, so it stays in the resting device state phy_init() left it in\n");
 	return 0;
 }
 
