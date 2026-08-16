@@ -319,9 +319,11 @@ const char *const kPhrases[][Lang::Count] = {
      * English, so a second row would be the same phrase twice with one of them
      * unreachable.  The same word for the same thing in both places is the point.
      *
-     * The footer names four buttons and translates none of them.  A, B and Menu
+     * The footer names four buttons and translates none of them.  A, B and Start
      * are printed on the case; FN is the marking on the key this overlay is opened
-     * with.  A translated button name is a button nobody can find.
+     * with.  A translated button name is a button nobody can find -- and so is a
+     * button named after its action, which is why the last of the four says Start
+     * and not Menu.  See the binding note in switcher.cpp.
      */
     { "Running",
       "En cours",
@@ -329,12 +331,12 @@ const char *const kPhrases[][Lang::Count] = {
       "Läuft",
       "A correr",
       "En ejecución" },
-    { "A switches  --  FN steps  --  Menu closes  --  B cancels",
-      "A bascule  --  FN avance  --  Menu ferme  --  B annule",
-      "A passa  --  FN avanza  --  Menu chiude  --  B annulla",
-      "A wechselt  --  FN blättert  --  Menu schließt  --  B bricht ab",
-      "A muda  --  FN avança  --  Menu fecha  --  B cancela",
-      "A cambia  --  FN avanza  --  Menu cierra  --  B cancela" },
+    { "A switches  --  FN steps  --  Start closes  --  B cancels",
+      "A bascule  --  FN avance  --  Start ferme  --  B annule",
+      "A passa  --  FN avanza  --  Start chiude  --  B annulla",
+      "A wechselt  --  FN blättert  --  Start schließt  --  B bricht ab",
+      "A muda  --  FN avança  --  Start fecha  --  B cancela",
+      "A cambia  --  FN avanza  --  Start cierra  --  B cancela" },
     /* The detail on the right of a row.  Two states and no third: what a stopped
      * task is doing is waiting, and saying "stopped" invites the reader to think
      * it crashed.  See switcherRows() in dashboard.cpp. */

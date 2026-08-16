@@ -6615,6 +6615,30 @@ dump() {
     else
         printf '(absent -- no first frame yet, so it is still on the console)\n'
     fi
+    # THE X SERVER'S OWN LOG, which is somewhere else again: Xorg is started with
+    # -logfile, so its banner lands in mixdash.log above and everything that
+    # matters -- the driver it chose, the mode it set, the font path, and any (EE)
+    # -- lands here and NOWHERE ELSE.  Without this section a desktop that comes
+    # up black is indistinguishable from one that never came up, which is exactly
+    # the report this got.  What is running is in the ps above; what X thinks of
+    # it is only here.
+    sec "/run/j36/xorg.log -- the X server, last 120 lines"
+    if [ -r /run/j36/xorg.log ]; then
+        tail -n 120 /run/j36/xorg.log 2>&1 || printf '(unreadable)\n'
+    else
+        printf '(absent -- no graphical session has been started since boot)\n'
+    fi
+    # And what the session has open.  One line per window, pid and title, rewritten
+    # by j36-xsession-main every time one opens or closes: an empty list with the
+    # session processes present in the ps above is a desktop with nothing on it,
+    # which looks exactly like a broken one and is not.
+    sec "/run/j36/xsession.windows -- what the desktop has open"
+    if [ -r /run/j36/xsession.windows ]; then
+        cat /run/j36/xsession.windows 2>&1 || printf '(unreadable)\n'
+        [ -s /run/j36/xsession.windows ] || printf '(empty -- the desktop is up with no window on it)\n'
+    else
+        printf '(absent -- no graphical session is running)\n'
+    fi
     # ── THE USB-HDMI DOCK ─────────────────────────────────────────────────────
     #
     # The other thing on this board that can put a picture somewhere, and the one
@@ -12365,38 +12389,110 @@ exit 0
 XSESSIONMAIN
     chmod 0755 "$SDROOT/opt/mixos/bin/j36-xsession-main"
 
-    # j36-xrun: the door into a session that is already up.
+    # j36-xrun: the door into the desktop, from a shell.
     #
-    # WHAT IT DELIBERATELY DOES NOT DO IS START ONE.  A session started from here
-    # would be an X server outside mixdash's task list -- nothing would stop it when
-    # the switcher took the panel back, and two programs would be drawing into
-    # /dev/fb0 with no arbiter.  The Desktop card is the only thing that starts a
-    # session, and this says so when there is none.
+    # IT ASKS THE DASHBOARD AND NOT THE SESSION, and that is the fix for a report
+    # that read "apps launched via the terminal never appear to the desktop, it is
+    # still black".  This used to write `run <cmdline>' straight into the session's
+    # control pipe, which is correct only while the session is the task in front --
+    # and the one place a person types a command on this device is the dashboard's
+    # own Terminal, which means the session is SIGSTOPped and nothing is scheduled
+    # to read that pipe.  The write SUCCEEDS: a FIFO buffers, so the shell printed
+    # no error, the window did not open, and it opened minutes later when somebody
+    # switched to the desktop for unrelated reasons.
     #
-    # It is also what makes the Terminal card useful for graphical packages: with
-    # a desktop up, `j36-xrun freedoom' from the shell puts freedoom on the glass.
+    # mixdash is the one process that can answer the request in every state -- it
+    # owns the task list, so it can continue a stopped session, or start one that
+    # is not running at all, and then put it on the glass.  So the command line
+    # goes in a queue file and SIGUSR2 says there is one; see RunRequest in
+    # tools/mixdash/switcher.h and Dashboard::takeRunRequests().
+    #
+    # THE OLD PATH IS STILL HERE, underneath, for the case the new one cannot
+    # cover: a session running with no dashboard behind it -- `startx' on a
+    # development board, mixdash killed for a test.  There the pipe is exactly
+    # right, because whoever is reading it is not stopped.
     cat > "$SDROOT/opt/mixos/bin/j36-xrun" <<'XRUN'
 #!/bin/sh
-# j36-xrun -- open a window on the J36 Ultra's graphical session.
+# j36-xrun -- open a window on the J36 Ultra's desktop.
 #
 # Usage: j36-xrun COMMAND [ARG...]
 #
-# Asks the running session for a window.  It does NOT start one: see the note in
-# device/j36-ultra/build-in-vm.sh.  Start one from the dashboard's Desktop card.
+# Asks the dashboard for a window, which starts the desktop if it is not running
+# and brings it to the front either way.  With no dashboard, asks a session that
+# is already up.  See device/j36-ultra/build-in-vm.sh for the whole argument.
 set -u
 
 RUNDIR=/run/j36
 CTL=$RUNDIR/xsession.ctl
 PIDFILE=$RUNDIR/xsession.pid
+DASHPID=$RUNDIR/mixdash.pid
+QUEUE=$RUNDIR/xrun.queue
 
 if [ "$#" -eq 0 ]; then
     echo "usage: j36-xrun COMMAND [ARG...]" >&2
     exit 2
 fi
 
-# Is there a session?  ASKED OF THE PID AND NOT OF THE PIPE, because a FIFO left
-# behind by a session that was killed outright still passes -p, and opening it for
-# writing with no reader on the other end blocks forever with no way to say why.
+# EVERY ARGUMENT IS QUOTED, because the far end runs what arrives with `sh -c': it
+# has to, since a pipe carries text and not an argv.  Single quotes make everything
+# literal except a single quote, which leaves the quoting to be written: ' -> '\''.
+# A filename with a space in it is not an attack, it is Tuesday.
+cmd=""
+for a in "$@"; do
+    q=$(printf '%s' "$a" | sed "s/'/'\\\\''/g")
+    cmd="$cmd '$q'"
+done
+cmd="${cmd# }"
+
+# A COMMAND IS ONE LINE AND MUST STAY ONE LINE.  Both readers split on newlines,
+# so an argument with one in it would arrive as two commands -- the second of them
+# whatever the user's filename happened to spell.  It is refused rather than
+# mangled: there is no correct way to run it and no reason to guess.
+#
+# The x is not decoration.  Command substitution strips every trailing newline,
+# so `nl=$(printf "\n")' is the empty string and the test below would then match
+# every command line there is.
+nl=$(printf '\nx'); nl=${nl%x}
+case "$cmd" in
+    *"$nl"*)
+        echo "j36-xrun: a newline in an argument cannot cross the queue." >&2
+        exit 2 ;;
+esac
+
+# Which process to ask.  The environment first -- every child of the dashboard
+# gets MIXDASH_PID, including this Terminal's shell -- and the file for everything
+# further away: a serial console, a cron job, a shell three execs from its parent.
+# kill -0 on both, because a pid that has gone is a pid that can have come back as
+# something else.
+dash=""
+case "${MIXDASH_PID:-}" in
+    ''|*[!0-9]*) ;;
+    *) kill -0 "$MIXDASH_PID" 2>/dev/null && dash="$MIXDASH_PID" ;;
+esac
+if [ -z "$dash" ] && [ -r "$DASHPID" ]; then
+    dpid=""
+    read -r dpid < "$DASHPID" || dpid=""
+    case "${dpid:-}" in
+        ''|*[!0-9]*) ;;
+        *) kill -0 "$dpid" 2>/dev/null && dash="$dpid" ;;
+    esac
+fi
+
+if [ -n "$dash" ]; then
+    # APPENDED, and in one write.  The line is far below PIPE_BUF, so two shells
+    # asking at once cannot interleave; the dashboard renames the file before
+    # reading it, so a line appended while it reads is not lost either.
+    if printf 'run %s\n' "$cmd" >> "$QUEUE" 2>/dev/null \
+       && kill -USR2 "$dash" 2>/dev/null; then
+        exit 0
+    fi
+    echo "j36-xrun: the dashboard would not take the request; trying the session." >&2
+fi
+
+# No dashboard, or it did not answer.  Is there a session?  ASKED OF THE PID AND
+# NOT OF THE PIPE, because a FIFO left behind by a session that was killed outright
+# still passes -p, and opening it for writing with no reader on the other end
+# blocks forever with no way to say why.
 alive=0
 if [ -r "$PIDFILE" ]; then
     spid=""
@@ -12411,21 +12507,10 @@ if [ "$alive" -eq 0 ] || [ ! -p "$CTL" ]; then
     # Left behind by a session that did not get to tidy up.  Removed here rather
     # than left to confuse the next reader.
     [ "$alive" -eq 0 ] && rm -f "$CTL" "$PIDFILE" "$RUNDIR/xsession.windows" 2>/dev/null
-    echo "j36-xrun: nothing graphical is running." >&2
+    echo "j36-xrun: nothing graphical is running, and no dashboard to start it." >&2
     echo "          Open the Desktop card on the dashboard, then run this again." >&2
     exit 1
 fi
-
-# EVERY ARGUMENT IS QUOTED, because the far end runs what arrives with `sh -c': it
-# has to, since a pipe carries text and not an argv.  Single quotes make everything
-# literal except a single quote, which leaves the quoting to be written: ' -> '\''.
-# A filename with a space in it is not an attack, it is Tuesday.
-cmd=""
-for a in "$@"; do
-    q=$(printf '%s' "$a" | sed "s/'/'\\\\''/g")
-    cmd="$cmd '$q'"
-done
-cmd="${cmd# }"
 
 printf 'run %s\n' "$cmd" > "$CTL"
 XRUN

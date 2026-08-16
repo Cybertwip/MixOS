@@ -127,6 +127,22 @@ const char kXSessionWindows[] = "/run/j36/xsession.windows";
 const char kXSessionPid[] = "/run/j36/xsession.pid";
 
 /*
+ * ── WHERE A COMMAND LINE WAITS ───────────────────────────────────────────────
+ *
+ * j36-xrun appends one shell command per line here and sends SIGUSR2; see
+ * RunRequest in switcher.h for why it asks this program rather than the session,
+ * and takeRunRequests() below for what happens to the lines.
+ *
+ * THE FILE IS RENAMED AND NOT JUST READ.  A writer that appends between the read
+ * and the unlink would otherwise have its line thrown away with the ones that
+ * were handled -- rename is atomic against an append, so what is taken is
+ * exactly what was there and anything later goes to a fresh file with a fresh
+ * signal behind it.
+ */
+const char kRunQueue[] = "/run/j36/xrun.queue";
+const char kRunQueueTaken[] = "/run/j36/xrun.queue.taken";
+
+/*
  * The graphical session's path if this card can actually run one, and an empty
  * string if it cannot.
  *
@@ -538,17 +554,47 @@ Dashboard::Dashboard(QWidget *parent)
     });
 
     /*
-     * The other way in.  A child that grabbed the pad sends SIGUSR1 and main.cpp's
-     * handler sets a flag; this is what notices.  Quarter of a second is under the
-     * time it takes to let go of a button, and the timer only runs while a task is
-     * in front -- which is the only time anything can send that signal.
+     * ── THE OTHER WAY IN, AND IT RUNS THE WHOLE TIME NOW ─────────────────────
+     *
+     * Two things outside this process can ask it for something, and neither can
+     * do more than raise a flag from a signal handler: j36-padx sends SIGUSR1 for
+     * the task switcher, because it has the pad and this program cannot see the
+     * button being held; j36-xrun sends SIGUSR2 for a window, because it has a
+     * command line and no session it is allowed to start.  Quarter of a second is
+     * under the time it takes to let go of a button.
+     *
+     * IT USED TO BE STARTED AND STOPPED with the task in front, on the reasoning
+     * that a task in front is the only time anything can signal -- true of the
+     * pad and false of everything else, and false in a way that cost both of the
+     * things this timer is for:
+     *
+     *   a request that arrived while it was stopped was not lost, it was SAVED.
+     *   The flag stayed set, the next switch started the timer, and the switcher
+     *   opened by itself a quarter of a second later on top of whatever the user
+     *   had just chosen -- the "it's buggy and does not work properly" half of
+     *   the switcher report, and it needs a stopped poll and a race to happen,
+     *   which is exactly the combination that makes it look random.
+     *
+     *   and a command typed in the Terminal could not be answered at all, since
+     *   the Terminal is this dashboard and this dashboard is not a task.
+     *
+     * So it runs from here to the end of the program.  Four wakeups a second that
+     * read two sig_atomic_ts and touch no file unless one of them is set is not a
+     * cost worth arranging a lifecycle around, and there is now no state in which
+     * a request can be posted and not answered.
      */
     m_requestTimer = new QTimer(this);
     m_requestTimer->setInterval(250);
     connect(m_requestTimer, &QTimer::timeout, this, [this]() {
+        /* The window first: the switcher is what the user is looking at when it
+         * is up, so it should be the last thing this decides, not something a
+         * queued command line pushes off the glass. */
+        if (RunRequest::take())
+            takeRunRequests();
         if (SwitcherRequest::take())
             showSwitcher();
     });
+    m_requestTimer->start();
 
     /*
      * The pad comes before the Diagnostics page because that page reports on it --
@@ -1892,15 +1938,36 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
         }
 
         /*
+         * ── THE RING HAS TO COME OFF THE GLASS, NOT JUST OUT OF THE WIDGET ───
+         *
+         * stop() hides the spinner and dirties the rectangle it was in; the paint
+         * that would actually clear those pixels is the next trip round the event
+         * loop.  Two lines down updates go off, and this program takes no such
+         * trip again until the task in front gives the panel back -- so the last
+         * frame of the arc stayed on the framebuffer, motionless, until the child
+         * happened to draw over it.
+         *
+         * For a game that is a blink.  For the graphical session it is however
+         * long an X server takes to put its first pixel up, which on this board
+         * is the better part of a minute, and a spinner that has stopped spinning
+         * is the exact picture of a hung program: "the loading overlay freezes
+         * when loading any process", and it was never the loading that froze.
+         *
+         * repaint() and not update(): update() posts an event that this loop will
+         * not get back to in time to matter.  The whole panel and not the ring's
+         * rectangle alone, because what should be on the glass while a child
+         * starts is this dashboard with the sentence naming what is starting --
+         * and the toast, the pointer and the status bar are all children of it.
+         */
+        repaint();
+
+        /*
          * The child is running and every pixel is its business from here.  Updates
          * go off HERE and not straight after start(): between the two calls this
          * dashboard is still the only thing on the glass, and a ring that cannot
          * be painted is a ring that does not turn.
          */
         setUpdatesEnabled(false);
-        /* Something outside this process can ask for the switcher now, and only
-         * now.  See switcher.h. */
-        m_requestTimer->start();
     });
 
     Task task;
@@ -1953,28 +2020,11 @@ int Dashboard::sessionTask() const
 /*
  * ── A CARD THAT WANTS A WINDOW AND NOT THE PANEL ─────────────────────────────
  *
- * Two paths and they are the same idea from either end: there has to be exactly one
- * graphical session, and this program has to end up inside it.
- *
- *   NO SESSION YET.  Start one with this program as its first window.  That is an
- *   ordinary launch() of j36-xsession, so everything the task machinery already
- *   does -- the process group, the ceiling, the busy ring, the switcher row, the
- *   frame kept while it is stopped -- happens exactly as it does for a game.  The
- *   command line goes down as one --run argument, quoted, because the far end runs
- *   it with sh -c; it must, since what crosses a pipe is text and not an argv.
- *
- *   A SESSION IS UP.  Then starting a second one would be a second X server on one
- *   framebuffer, which is the bug this whole arrangement exists to prevent.  The
- *   request goes down the control pipe instead and the session forks the window
- *   itself, inside its own process group, where mixdash's SIGSTOP still reaches it.
- *   Then the panel is handed to the session, because a window that opens behind the
- *   dashboard is a window nobody asked for.
- *
- * THE TOAST IS PAINTED BEFORE THE SWITCH, for the same reason launch() paints its
- * own: the moment setForeground() runs, updates go off and nothing here can draw.
- * Firefox takes several seconds to map a window on this board and the desktop's old
- * frame is what is on the glass until it does, so the sentence naming what is being
- * opened is the last thing this program can say about it.
+ * There has to be exactly one graphical session and this program has to end up
+ * inside it; whether one is already running is runInSession()'s business, below.
+ * What is left here is what only a CARD knows -- the program it means, whether that
+ * program is on this build at all, the name to put in a sentence, and whether the
+ * window it wants is one the session already has.
  */
 void Dashboard::launchWindowed(const QString &title, const QString &exe,
                                const QStringList &args)
@@ -1990,13 +2040,6 @@ void Dashboard::launchWindowed(const QString &title, const QString &exe,
     QString cmd = shellQuote(exe);
     for (const QString &a : args)
         cmd += QLatin1Char(' ') + shellQuote(a);
-
-    const int session = sessionTask();
-    if (session < 0) {
-        launch(tr("Desktop"), QString::fromLatin1(kXSession),
-               QStringList() << QStringLiteral("--run") << cmd);
-        return;
-    }
 
     /*
      * ── THE SAME CARD TWICE IS THE SAME WINDOW ───────────────────────────────
@@ -2015,12 +2058,53 @@ void Dashboard::launchWindowed(const QString &title, const QString &exe,
      * deliberate: j36-browser opened on one URL and then on another is still the
      * one browser.
      */
-    if (sessionWindowNames().contains(windowNameFor(exe))) {
+    const int open = sessionTask();
+    if (open >= 0 && sessionWindowNames().contains(windowNameFor(exe))) {
         toast(tr("%1 is already open").arg(title));
-        setForeground(session);
+        setForeground(open);
         return;
     }
 
+    runInSession(title, cmd);
+}
+
+/*
+ * ── ONE COMMAND LINE, INTO WHICHEVER SESSION THERE TURNS OUT TO BE ───────────
+ *
+ * The half of launchWindowed() that does not care where the request came from,
+ * split out because it now comes from two places: a card, and a person typing at
+ * the Terminal whose j36-xrun woke this program with SIGUSR2.  `cmd' is already
+ * quoted for a shell -- the far end runs it with sh -c, since what crosses a pipe
+ * is text and not an argv -- and `title' is only ever used in a sentence.
+ */
+void Dashboard::runInSession(const QString &title, const QString &cmd)
+{
+    /* One at a time, the same rule launch() has and for the same reason: what
+     * follows turns the event loop, and what comes back through it can be another
+     * request. */
+    if (m_launching || cmd.isEmpty())
+        return;
+
+    const int session = sessionTask();
+    if (session < 0) {
+        /*
+         * NO SESSION YET.  Start one with this command as its first window.  That
+         * is an ordinary launch() of j36-xsession, so everything the task
+         * machinery already does -- the process group, the ceiling, the busy ring,
+         * the switcher row, the frame kept while it is stopped -- happens exactly
+         * as it does for a game.
+         */
+        launch(tr("Desktop"), QString::fromLatin1(kXSession),
+               QStringList() << QStringLiteral("--run") << cmd);
+        return;
+    }
+
+    /*
+     * A SESSION IS UP, so starting a second one would be a second X server on one
+     * framebuffer -- the bug this whole arrangement exists to prevent.  The request
+     * goes down the control pipe instead and the session forks the window itself,
+     * inside its own process group, where mixdash's SIGSTOP still reaches it.
+     */
     if (!writeSessionControl(QStringLiteral("run ") + cmd)) {
         /*
          * ── A ROW FOR A SESSION THAT IS NOT THERE ────────────────────────────
@@ -2061,10 +2145,142 @@ void Dashboard::launchWindowed(const QString &title, const QString &exe,
         return;
     }
 
+    /*
+     * THE TOAST IS PAINTED BEFORE THE SWITCH, for the same reason launch() paints
+     * its own: the moment setForeground() runs, updates go off and nothing here can
+     * draw.  Firefox takes several seconds to map a window on this board and the
+     * desktop's old frame is what is on the glass until it does, so the sentence
+     * naming what is being opened is the last thing this program can say about it.
+     *
+     * And the panel goes to the session, because a window that opens behind the
+     * dashboard is a window nobody asked for -- which, until the queue below
+     * existed, is exactly what a command typed at the Terminal produced.
+     */
     toast(tr("Opening %1").arg(title), 8000);
     m_toast->repaint();
     QCoreApplication::processEvents();
     setForeground(session);
+}
+
+/*
+ * ── WHAT j36-xrun LEFT BEHIND ────────────────────────────────────────────────
+ *
+ * Called from the request poll when SIGUSR2 has been seen, and never otherwise:
+ * there is no file to look at until somebody has asked for one, and a poll that
+ * stats a path four times a second for the whole of a session is a poll that will
+ * eventually be found and removed by somebody who cannot see what it is for.
+ *
+ * The rename is the whole of the locking; see kRunQueue above.  Every line is a
+ * command, already quoted by the writer, and they are run in the order they were
+ * written -- though in practice there is one, since the thing that produces them
+ * is a person typing.
+ */
+void Dashboard::takeRunRequests()
+{
+    /*
+     * A launch is already turning the event loop and runInSession() would refuse
+     * anyway.  The flag goes straight back rather than the queue being read and
+     * dropped: a quarter of a second later this is the ordinary case again, and a
+     * command that was typed is a command that should run.
+     */
+    if (m_launching) {
+        RunRequest::post();
+        return;
+    }
+
+    /*
+     * ── A SESSION THAT IS STILL COMING UP CANNOT BE ASKED FOR ANYTHING ───────
+     *
+     * Its control pipe does not exist until the supervisor has made it, and on
+     * this board that is a minute after the row appears in the task list -- an X
+     * server on a cold page cache is not quick.  Writing into a pipe that is not
+     * there yet fails exactly the way a pipe whose session has DIED fails, and
+     * runInSession() reads that failure as a dead session and clears the row.
+     * That would be this program killing the desktop it started, because
+     * somebody typed a second command while it was starting.
+     *
+     * So the whole request waits, queue file and all, and the poll asks again in
+     * a quarter of a second.  It cannot spin for ever: a supervisor that never
+     * comes up is an xinit that exits, which is a finished() that takes the row
+     * away and leaves this branch for good.
+     */
+    if (sessionTask() >= 0 && !sessionSupervisorAlive()) {
+        RunRequest::post();
+        return;
+    }
+
+    const QString queue = QString::fromLatin1(kRunQueue);
+    const QString taken = QString::fromLatin1(kRunQueueTaken);
+    QFile::remove(taken);
+    if (!QFile::rename(queue, taken))
+        return;
+
+    QFile f(taken);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QFile::remove(taken);
+        return;
+    }
+    /* A queue longer than this is not one a person typed, and the file is on
+     * tmpfs written by a shell script. */
+    const QByteArray blob = f.read(8192);
+    f.close();
+    QFile::remove(taken);
+
+    QStringList lines;
+    for (const QByteArray &row : blob.split('\n')) {
+        const QString cmd = QString::fromUtf8(row).trimmed();
+        if (!cmd.isEmpty())
+            lines.append(cmd);
+    }
+
+    while (!lines.isEmpty()) {
+        const QString cmd = lines.takeFirst();
+        /*
+         * The name in the sentence is the first word's basename, which is what
+         * the session's own window list would call it -- so "Opening firefox-esr"
+         * for `firefox-esr --new-window ...' and not the whole line, which does
+         * not fit on this panel and says nothing the first word does not.
+         */
+        QString word = cmd.section(QLatin1Char(' '), 0, 0);
+        /* j36-xrun quotes every argument for the shell that will run the line, so
+         * the first word arrives as 'freedoom' and not as freedoom.  The quotes are
+         * for sh and not for a sentence on a panel. */
+        if (word.startsWith(QLatin1Char('\'')) && word.endsWith(QLatin1Char('\''))
+            && word.size() > 1)
+            word = word.mid(1, word.size() - 2);
+
+        const bool wasUp = (sessionTask() >= 0);
+        runInSession(windowNameFor(word), cmd);
+
+        /*
+         * That one started the session rather than being handed to it, so
+         * everything after it belongs to a session that does not have a pipe yet.
+         * Back in the file, in order, to be taken again when the guard above says
+         * the supervisor is ready.
+         */
+        if (!wasUp) {
+            if (!lines.isEmpty())
+                queueRunRequests(lines);
+            RunRequest::post();
+            return;
+        }
+    }
+}
+
+/*
+ * Lines back into the queue, appended, for the one case takeRunRequests() cannot
+ * finish in a single pass.  O_APPEND and one write per line, which is what
+ * j36-xrun does from the other side: a line is far below PIPE_BUF, so two writers
+ * cannot interleave one.
+ */
+void Dashboard::queueRunRequests(const QStringList &lines)
+{
+    QFile f(QString::fromLatin1(kRunQueue));
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Append))
+        return;
+    for (const QString &cmd : lines)
+        f.write(cmd.toUtf8() + '\n');
+    f.close();
 }
 
 void Dashboard::childDone(int index, const QString &message)
@@ -2161,7 +2377,6 @@ void Dashboard::setForeground(int index)
          * a grid that may have changed while a game was in front.
          */
         m_fg = -1;
-        m_requestTimer->stop();
         m_pad->setWatching(false);
 
         /*
@@ -2184,6 +2399,27 @@ void Dashboard::setForeground(int index)
 
     Task &task = m_tasks[index];
 
+    /*
+     * ── THE ARROW GOES DOWN WHILE THIS PROGRAM CAN STILL PAINT ───────────────
+     *
+     * It used to be put to sleep four lines further down, after updates were off,
+     * and sleep() only hides a widget: the pixels are cleared by the repaint that
+     * follows, and there is no repaint after this point -- this dashboard is
+     * finished drawing until the task gives the panel back.  So the arrow was
+     * left on the framebuffer, and the only thing that covered it was the restore
+     * below being a whole panel.  Where that restore had nothing to put back --
+     * the first switch to a task, a frame that could not be grabbed -- the arrow
+     * simply stayed, and one more of them stayed at every switch after it: "the
+     * mouse pointer does not disappear when switching apps, and it renders a
+     * trace behind".
+     *
+     * Sleeping it here costs one small repaint and leaves nothing of this
+     * program's own on the glass to be handed to somebody else.
+     */
+    m_pointer->sleep();
+    if (updatesEnabled())
+        repaint(m_pointer->geometry());
+
     /* Off before the frame goes back, and it stays off for as long as this task
      * is in front.  See the numbered note above. */
     setUpdatesEnabled(false);
@@ -2196,9 +2432,7 @@ void Dashboard::setForeground(int index)
     }
 
     m_fg = index;
-    m_pointer->sleep();
     m_pad->setWatching(true);
-    m_requestTimer->start();
 }
 
 /*
@@ -2304,8 +2538,17 @@ void Dashboard::showSwitcher()
      * middle of the list. */
     m_busy->stop();
 
-    m_requestTimer->stop();
-    /* Full reporting again: the switcher is driven by the D-pad, A, B and Menu,
+    /*
+     * Anything asked for between the gesture and this line is asking for what is
+     * already happening.  Both paths in can fire twice over one press -- mixdash
+     * calls a hold at 700 ms and j36-padx calls the same hold at 1000, and when
+     * the SIGSTOP that would have silenced padx is late the second one lands here
+     * -- and the flag would otherwise sit set until the user chose a row, at
+     * which point the switcher would come straight back up over their choice.
+     */
+    (void)SwitcherRequest::take();
+
+    /* Full reporting again: the switcher is driven by the D-pad, A, B and Start,
      * none of which arrive in watch mode. */
     m_pad->setWatching(false);
 

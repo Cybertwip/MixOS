@@ -662,6 +662,239 @@ static void tap(KeyCode mod, KeyCode key)
     XFlush(dpy);
 }
 
+/* ── the screen ──────────────────────────────────────────────────────────── */
+
+/*
+ * ── PUTTING BACK A SCREEN X DOES NOT KNOW IT LOST ───────────────────────────
+ *
+ * There is one framebuffer on this board and two programs draw into it: this
+ * session's X server through xf86-video-fbdev, and mixdash through Qt's linuxfb
+ * platform.  They take turns -- whichever task is in front draws, the rest of the
+ * group is SIGSTOPped -- and taking turns is enough for the pixels ONLY because
+ * mixdash copies the panel out before it stops a task and copies it back before
+ * it continues one.  See Panel::grab() and Panel::restore().
+ *
+ * WHAT THAT CANNOT COVER.  The copy back is a memcpy into /dev/fb0, and the X
+ * server is not looking at /dev/fb0: fbdev runs with ShadowFB, so X draws into
+ * its own buffer in ordinary memory and copies out only the rectangles it thinks
+ * changed.  Nothing mixdash does to the framebuffer is a change as far as X is
+ * concerned.  So anything mixdash left behind that the restore did not cover --
+ * the dashboard's own pointer, a toast, the whole screen when there was no saved
+ * frame to put back because the session had not drawn one yet -- stays on the
+ * glass until some client happens to repaint over it.  That is the trail the user
+ * sees, and it is why a desktop that is really running can look black.
+ *
+ * ASKING FOR THE REPAINT IS THE FIX, and X has had the mechanism since X10: a
+ * window with no background, mapped over everything and immediately destroyed.
+ * Mapping it changes not one pixel, because a background of None means the server
+ * paints nothing; destroying it uncovers everything underneath, and uncovering is
+ * exposure, so every client is told to redraw the part of itself that was behind
+ * it.  Their drawing is damage, damage is what ShadowFB copies, and the copy is
+ * what reaches the panel.  This is what xrefresh(1) is and does; it is written out
+ * here because x11-xserver-utils is not on this image and would be a package for
+ * one twelve-line function.
+ *
+ * The root is cleared as well, for the pixels no window covers -- that is where
+ * the card desktop_paint() hangs on the root background gets put back.
+ */
+static void screen_refresh(void)
+{
+    XSetWindowAttributes at;
+    Window w;
+
+    if (!dpy || scr_w < 1 || scr_h < 1)
+        return;
+
+    XClearWindow(dpy, RootWindow(dpy, scr));
+
+    /* override_redirect because this is not a window in any sense the window
+     * manager should hear about -- it exists for two round trips and matchbox
+     * would otherwise try to decorate and stack it. */
+    at.override_redirect = True;
+    at.background_pixmap = None;
+    at.backing_store     = NotUseful;
+    at.save_under        = False;
+    w = XCreateWindow(dpy, RootWindow(dpy, scr), 0, 0,
+                      (unsigned)scr_w, (unsigned)scr_h, 0,
+                      CopyFromParent, InputOutput, CopyFromParent,
+                      CWOverrideRedirect | CWBackPixmap | CWBackingStore | CWSaveUnder,
+                      &at);
+    XMapRaised(dpy, w);
+    XDestroyWindow(dpy, w);
+    XFlush(dpy);
+}
+
+/*
+ * ── THE DESKTOP IS NOT BLACK ANY MORE ───────────────────────────────────────
+ *
+ * A session with no window open shows the root, and an X root with nothing set on
+ * it is black.  That is correct and it is also indistinguishable from a session
+ * that failed to start, which is exactly what got reported: "Desktop is black".
+ * A person holding this device has no way to tell the two apart and no reason to
+ * guess -- there is no title bar, no taskbar and no menu to click, because the
+ * pad is the only input and every gesture it has is invisible.
+ *
+ * So the root gets a card that says what the pad does.  It is a PIXMAP HUNG ON
+ * THE ROOT'S BACKGROUND rather than a window: the server then repaints it by
+ * itself, for free, whenever a window moves off it or screen_refresh() clears it,
+ * and there is no extra client to stack, focus, stop or kill.  This is what
+ * xsetroot -bitmap does, and the reason the pixmap can be freed on the next line
+ * is the same -- the server keeps its own reference for as long as a window uses
+ * it as a background.
+ *
+ * WHY THIS PROGRAM DRAWS IT.  j36-padx is already an X client in every session,
+ * already links -lX11, and already knows the whole binding table because it is
+ * the thing that implements it -- the list below and the switch in main() cannot
+ * drift apart without somebody editing both.  A separate program would be a new
+ * binary, a new package and a second copy of the truth.
+ *
+ * CORE FONTS, and no fontconfig.  10x20 and 9x15 come from xfonts-base, which is
+ * on this image because the X server refuses to start without `fixed'.  If some
+ * future image drops them the card degrades to its background and a session with
+ * no window is a plain dark screen instead of a black one, which is still a
+ * better answer than nothing.
+ */
+static const struct {
+    const char *key;
+    const char *what;
+} help_rows[] = {
+    { "FN held",       "the task switcher -- and the way back to the dashboard" },
+    { "FN tapped",     "the next window" },
+    { "Select",        "the on-screen keyboard" },
+    { "Stick, D-pad",  "the pointer" },
+    { "A",             "click  (L3 and R3 are the middle and right buttons)" },
+    { "B",             "back" },
+    { "X, Y",          "Enter, Escape" },
+    { "L1, R1",        "scroll  (so does the right stick)" },
+    { "L2, R2",        "page up, page down" },
+    { "Start",         "the address bar" },
+    { "Vol -, Vol +",  "zoom out, zoom in" },
+};
+
+static unsigned long card_colour(Colormap cm, const char *spec, unsigned long fallback)
+{
+    XColor c;
+
+    if (XParseColor(dpy, cm, spec, &c) && XAllocColor(dpy, cm, &c))
+        return c.pixel;
+    return fallback;
+}
+
+static XFontStruct *card_font(const char *const *names)
+{
+    XFontStruct *f;
+    int i;
+
+    for (i = 0; names[i]; i++) {
+        f = XLoadQueryFont(dpy, names[i]);
+        if (f)
+            return f;
+    }
+    return NULL;
+}
+
+static void desktop_paint(void)
+{
+    static const char *const big_names[]  = { "10x20", "9x15bold", "9x15", "fixed", NULL };
+    static const char *const body_names[] = { "9x15", "8x13", "fixed", NULL };
+    const char *title = "MixOS desktop";
+    const char *lead  = "Windows open on top of this.  The pad drives them:";
+    const char *foot  = "j36-xrun COMMAND, from the dashboard's Terminal, opens a window here";
+    Window root;
+    Pixmap pm;
+    GC gc;
+    Colormap cm;
+    XFontStruct *big, *body;
+    unsigned long bg, fg, key_fg, dim;
+    int rows = (int)(sizeof help_rows / sizeof help_rows[0]);
+    int line_h, key_w, block_h, x, y, i;
+
+    if (!dpy || scr_w < 1 || scr_h < 1)
+        return;
+
+    root = RootWindow(dpy, scr);
+    cm   = DefaultColormap(dpy, scr);
+
+    bg     = card_colour(cm, "#0f131a", BlackPixel(dpy, scr));
+    fg     = card_colour(cm, "#e6edf7", WhitePixel(dpy, scr));
+    key_fg = card_colour(cm, "#78b0ff", WhitePixel(dpy, scr));
+    dim    = card_colour(cm, "#9aa7b8", WhitePixel(dpy, scr));
+
+    pm = XCreatePixmap(dpy, root, (unsigned)scr_w, (unsigned)scr_h,
+                       (unsigned)DefaultDepth(dpy, scr));
+    gc = XCreateGC(dpy, pm, 0, NULL);
+    XSetForeground(dpy, gc, bg);
+    XFillRectangle(dpy, pm, gc, 0, 0, (unsigned)scr_w, (unsigned)scr_h);
+
+    big  = card_font(big_names);
+    body = card_font(body_names);
+    if (!body)
+        body = big;
+    if (!big)
+        big = body;
+
+    if (body) {
+        line_h = body->ascent + body->descent + 4;
+
+        /* The key column is as wide as the widest key and not one pixel more, so
+         * the two columns line up at whatever size the fonts turn out to be. */
+        key_w = 0;
+        for (i = 0; i < rows; i++) {
+            int w = XTextWidth(body, help_rows[i].key, (int)strlen(help_rows[i].key));
+            if (w > key_w)
+                key_w = w;
+        }
+
+        block_h = line_h * (rows + 4);
+        x = scr_w / 12;
+        y = (scr_h - block_h) / 2;
+        if (y < line_h * 2)
+            y = line_h * 2;
+        y += big->ascent;
+
+        XSetFont(dpy, gc, big->fid);
+        XSetForeground(dpy, gc, fg);
+        XDrawString(dpy, pm, gc, x, y, title, (int)strlen(title));
+        y += line_h + big->descent;
+
+        XSetFont(dpy, gc, body->fid);
+        XSetForeground(dpy, gc, dim);
+        XDrawString(dpy, pm, gc, x, y, lead, (int)strlen(lead));
+        y += line_h * 2;
+
+        for (i = 0; i < rows; i++) {
+            XSetForeground(dpy, gc, key_fg);
+            XDrawString(dpy, pm, gc, x, y, help_rows[i].key,
+                        (int)strlen(help_rows[i].key));
+            XSetForeground(dpy, gc, fg);
+            XDrawString(dpy, pm, gc, x + key_w + line_h, y, help_rows[i].what,
+                        (int)strlen(help_rows[i].what));
+            y += line_h;
+        }
+
+        XSetForeground(dpy, gc, dim);
+        XDrawString(dpy, pm, gc, x, y + line_h, foot, (int)strlen(foot));
+    }
+
+    XSetWindowBackgroundPixmap(dpy, root, pm);
+    XClearWindow(dpy, root);
+
+    /* The server has its own reference now; this only gives up ours.  The fonts
+     * go the same way -- the text is already pixels in the pixmap. */
+    XFreePixmap(dpy, pm);
+    XFreeGC(dpy, gc);
+    if (big && big != body)
+        XFreeFont(dpy, big);
+    if (body)
+        XFreeFont(dpy, body);
+
+    /* The card outlives this connection.  Without it, a j36-padx that is killed
+     * and restarted -- or that crashes -- takes the root background with it and
+     * leaves the black screen this exists to prevent. */
+    XSetCloseDownMode(dpy, RetainPermanent);
+    XFlush(dpy);
+}
+
 /* ── where the pointer is ────────────────────────────────────────────────── */
 
 /*
@@ -1458,6 +1691,11 @@ int main(int argc, char **argv)
      * nothing and the alternative is doing this inside a button press. */
     atom_im_command = XInternAtom(dpy, "_MB_IM_INVOKER_COMMAND", False);
 
+    /* Before the first window maps, so that a session that takes a while to open
+     * one -- or is asked to open none at all -- has something on it that says so.
+     * The screen size it lays out to comes from pointer_start() above. */
+    desktop_paint();
+
     grabbing = grab;
     if (!scan_pads(grabbing)) {
         fail("no pad among /dev/input/event*, so nothing can drive this session "
@@ -1521,6 +1759,12 @@ int main(int argc, char **argv)
                 set_grab(1);
                 grabbing = 1;
             }
+            /* AND THE SCREEN IS NOT OURS EITHER.  The dashboard has been drawing
+             * on the panel for as long as this was stopped; whatever it left that
+             * its restore did not cover is still there, and X does not know a
+             * pixel changed.  This is the one moment in the session's life when
+             * that is certainly true, so this is where the repaint goes. */
+            screen_refresh();
             continue;
         }
 

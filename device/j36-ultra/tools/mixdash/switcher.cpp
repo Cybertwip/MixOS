@@ -19,6 +19,10 @@ namespace {
 /* Set by a signal handler, read by the event loop.  volatile sig_atomic_t is
  * the only type the standard promises is safe for that. */
 volatile sig_atomic_t g_requested = 0;
+/* The same again for "there is a command line waiting" -- see RunRequest in
+ * switcher.h.  Two flags and not one enum: they are set by two different signals
+ * and either may arrive while the other is pending. */
+volatile sig_atomic_t g_runRequested = 0;
 
 /*
  * A row is 46 px and the list is at most five of them, which is 230 of the 480
@@ -46,6 +50,19 @@ bool SwitcherRequest::take()
     if (!g_requested)
         return false;
     g_requested = 0;
+    return true;
+}
+
+void RunRequest::post()
+{
+    g_runRequested = 1;
+}
+
+bool RunRequest::take()
+{
+    if (!g_runRequested)
+        return false;
+    g_runRequested = 0;
     return true;
 }
 
@@ -125,11 +142,19 @@ QRect Switcher::rowRect(int i) const
  * next one, which is the thing a person holding this device wants nine times out
  * of ten.
  *
- * Menu closes the highlighted task.  It is the one destructive binding on this
+ * START closes the highlighted task.  It is the one destructive binding on this
  * overlay, so it is on the button that is furthest from the two being used to
  * navigate, and it refuses on the dashboard's own row rather than being absent
  * from it -- a binding that works everywhere except one place is a binding
  * people trust.
+ *
+ * IT IS CALLED START HERE BECAUSE THAT IS WHAT IS PRINTED ON THE CASE.  The
+ * action behind it is NavMenu and the footer used to say "Menu", which is the
+ * name of the action and the name of no button on this device -- and the button
+ * a hand reaches for when it reads "menu" is FN, which steps the list.  So the
+ * one way to close the desktop was named after the one button that would not do
+ * it: "there does not seem a way to exit desktop", exactly as reported.  The
+ * silkscreen wins over the enum; see the same rule in terminal.cpp's footer.
  */
 bool Switcher::handleNav(int action)
 {
@@ -237,5 +262,5 @@ void Switcher::paintEvent(QPaintEvent *)
     p.setPen(Theme::ink3());
     const int footY = top + m_entries.size() * (RowH + RowGap) + 8;
     p.drawText(QRect(x, footY, PanelW, FootH), Qt::AlignCenter,
-               tr("A switches  --  FN steps  --  Menu closes  --  B cancels"));
+               tr("A switches  --  FN steps  --  Start closes  --  B cancels"));
 }

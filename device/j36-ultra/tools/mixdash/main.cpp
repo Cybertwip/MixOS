@@ -134,6 +134,43 @@ namespace {
 const char kLogPath[] = "/run/j36/mixdash.log";
 
 /*
+ * ── THIS PROGRAM'S PID, WRITTEN DOWN WHERE A SHELL SCRIPT CAN FIND IT ────────
+ *
+ * Children get MIXDASH_PID in their environment and that has been enough while
+ * the only thing asking was j36-padx, which is one.  It is not enough for
+ * j36-xrun: that is a command a person types, and the two places a person types
+ * on this device -- the dashboard's own Terminal and a serial console -- are
+ * either not a child of this program at all or a child several execs removed
+ * from one, with an environment nobody has promised to carry.
+ *
+ * A file answers it for all of them, costs one open at startup, and is the same
+ * arrangement the session already uses for its own supervisor (kXSessionPid in
+ * dashboard.cpp).  Removed on the way out, and stale if this program is killed
+ * outright -- which is why every reader of it asks kill(pid, 0) before believing
+ * a word of it.
+ */
+const char kPidPath[] = "/run/j36/mixdash.pid";
+
+void writePid(void)
+{
+    char buf[24];
+    int fd = ::open(kPidPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return;
+    const int n = ::snprintf(buf, sizeof buf, "%ld\n", (long)::getpid());
+    if (n > 0)
+        (void)!::write(fd, buf, (size_t)n);
+    ::close(fd);
+}
+
+/* SAFE FROM A SIGNAL HANDLER, which is why it is unlink and nothing else: onTerm
+ * runs from SIGTERM and ends in _exit(), so atexit() never gets a turn there. */
+void dropPid(void)
+{
+    (void)::unlink(kPidPath);
+}
+
+/*
  * MIXDASH_EXPECT, copied into a fixed buffer at startup.  It is read again at the
  * bottom of every failure path, and those run from signal handlers and from a
  * terminate handler, where a QByteArray is not something to be dereferencing.
@@ -347,6 +384,7 @@ void onTerminate(void)
 void onTerm(int)
 {
     textMode();
+    dropPid();
     Trace::writeAll(2, "\nmixdash: asked to stop; console back in text mode\n");
     ::_exit(0);
 }
@@ -368,6 +406,18 @@ void onTerm(int)
 void onSwitcher(int)
 {
     SwitcherRequest::post();
+}
+
+/*
+ * SIGUSR2 -- "there is a command line in the queue, open it in the desktop".
+ *
+ * The same shape as onSwitcher and from a different asker: j36-xrun, which has a
+ * command and no session it is allowed to start.  RunRequest in switcher.h is the
+ * whole story; Dashboard polls for this one too.
+ */
+void onRun(int)
+{
+    RunRequest::post();
 }
 
 /*
@@ -613,6 +663,7 @@ int main(int argc, char **argv)
 
     ::signal(SIGALRM, onStall);
     ::signal(SIGUSR1, onSwitcher);
+    ::signal(SIGUSR2, onRun);
     ::signal(SIGTERM, onTerm);
     ::signal(SIGINT, onTerm);
     ::signal(SIGHUP, onTerm);
@@ -622,6 +673,11 @@ int main(int argc, char **argv)
     ::signal(SIGFPE, onFatal);
     ::signal(SIGILL, onFatal);
     ::atexit(textMode);
+    /* Written once the handler above can answer what it invites: a pid file that
+     * appears before SIGUSR2 is caught is a window in which the default action for
+     * it is still "terminate the process". */
+    writePid();
+    ::atexit(dropPid);
     /* Chained rather than replaced: the runtime's own handler is what prints the
      * exception's type, and it is the reason `bad_alloc' was ever a word on this
      * panel.  onTerminate adds the phase, the step and the build in front of it. */

@@ -169,4 +169,41 @@ bool take();
 
 } /* namespace SwitcherRequest */
 
+/*
+ * ── ASKING FOR A WINDOW FROM OUTSIDE THE PROCESS ─────────────────────────────
+ *
+ * The same shape as above and a different question: not "show me what is
+ * running" but "open this in the desktop".
+ *
+ * It exists because of a hole j36-xrun fell straight through.  That script wrote
+ * `run <cmdline>' into the session's control pipe and stopped there, which is
+ * correct only while the session is the task in front.  Run from the dashboard's
+ * own Terminal -- which is the one place a person types a command on this device
+ * -- the session is SIGSTOPped, so the line sits in the FIFO with nobody
+ * scheduled to read it: the write succeeds, the terminal says nothing, and the
+ * window opens minutes later when somebody switches back for unrelated reasons.
+ * With no session at all it did not even get that far.
+ *
+ * So the request is made to THIS program instead, which is the one that can
+ * answer it: it owns the task list, so it can continue a stopped session, or
+ * start one that does not exist yet, and then put it on the glass.  The command
+ * line goes in a file -- /run/j36/xrun.queue, one shell command per line -- and
+ * SIGUSR2 says there is something in it.  A signal cannot carry a string, and a
+ * file alone would need polling; together they cost one open per request and
+ * nothing at all when nobody is asking.
+ */
+namespace RunRequest {
+
+/* Safe from a signal handler, on the same terms as SwitcherRequest::post(). */
+void post();
+
+/*
+ * True once for each post().  The QUEUE is what carries the commands -- this
+ * only says "go and look at it" -- so two requests that land between two polls
+ * are one look at a file with two lines in it, which is exactly right.
+ */
+bool take();
+
+} /* namespace RunRequest */
+
 #endif /* MIXDASH_SWITCHER_H */

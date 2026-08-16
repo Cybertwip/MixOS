@@ -314,6 +314,24 @@ private:
      */
     void launchWindowed(const QString &title, const QString &exe,
                         const QStringList &args);
+    /*
+     * One shell command line into the session, wherever that leaves it: down the
+     * control pipe of the session that is running, or as the first window of one
+     * started for it.  `cmd' is already quoted -- the far end runs it with sh -c
+     * -- and `title' is only ever used in a sentence.
+     *
+     * The half of launchWindowed() that does not care who asked, because two
+     * things now do: a card, and j36-xrun by way of the queue below.
+     */
+    void runInSession(const QString &title, const QString &cmd);
+    /*
+     * Read /run/j36/xrun.queue and open what is in it.  Called from the request
+     * poll when SIGUSR2 has been seen; see RunRequest in switcher.h for why the
+     * command comes to this program rather than to the session.
+     */
+    void takeRunRequests();
+    /* Put lines back, for the pass that could not finish them. */
+    void queueRunRequests(const QStringList &lines);
     /* Where the graphical session is in m_tasks, or -1 if none is running.  By
      * exe, because there can only ever be one of it. */
     int sessionTask() const;
@@ -473,8 +491,18 @@ private:
      * what was in front rather than whatever the highlight has since moved to. */
     int m_switcherWas = -1;
     /*
-     * Polls SwitcherRequest::take().  Runs only while a task is in front, which
-     * is the only time anything can send that signal -- see switcher.h.
+     * Polls SwitcherRequest::take() and RunRequest::take().
+     *
+     * IT RUNS FOR THE WHOLE LIFE OF THE PROGRAM, and that is a fix and not an
+     * oversight.  It used to be started when a task came to the front and stopped
+     * when one went away, on the reasoning that a task in front is the only thing
+     * that can send SIGUSR1 -- which was true of that signal and is not true of
+     * SIGUSR2, since j36-xrun asks for a window from a shell on the dashboard's
+     * own Terminal page with no task in front at all.  It was also wrong about the
+     * first: a signal that arrived while the timer was stopped stayed pending in
+     * the flag and was acted on much later, which is how holding FN once put the
+     * switcher back up over the row the user had just chosen.  A quarter-second
+     * timer costs nothing measurable and removes both.
      */
     QTimer *m_requestTimer = nullptr;
 

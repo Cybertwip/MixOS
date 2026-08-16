@@ -19,6 +19,7 @@
 #include <linux/input.h>
 #include <pty.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -305,6 +306,25 @@ bool TerminalPage::startChild(const QString &command)
          * certain, and it says so in words.
          */
         ::setenv("DISPLAY", ":0", 1);
+
+        /*
+         * AND WHO TO ASK FOR ONE.  j36-xrun's whole job is getting a window onto
+         * the glass, and it cannot do it by writing into the session's pipe from
+         * here: while this Terminal is on the panel the session is SIGSTOPped, so
+         * the line is buffered and read by nobody -- "apps launched via the
+         * terminal never appear to the desktop", exactly as reported.  What it
+         * does instead is leave the command in a queue and signal the dashboard,
+         * and this is how it knows which process that is.
+         *
+         * The same variable every other child of this program gets, for the same
+         * reason -- see the note in Dashboard::launch().  A rule with one
+         * exception is a rule that gets the exception wrong, and the pty is the
+         * exception it got wrong: /run/j36/mixdash.pid covers the shell that has
+         * lost the environment anyway, and this covers the one that has not.
+         */
+        char parent[24];
+        ::snprintf(parent, sizeof parent, "%ld", (long)::getppid());
+        ::setenv("MIXDASH_PID", parent, 1);
 
         const char *home = ::getenv("HOME");
         if (home && *home)
