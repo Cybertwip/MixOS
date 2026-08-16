@@ -8766,7 +8766,7 @@ build_padx() {
 
     log "padx: building the pad-to-X bridge for armhf (emulated)"
     armhf_chroot_run "cd /home/build/padx && \
-        gcc -O2 -std=gnu11 -Wall -Wextra -o j36-padx j36-padx.c -lX11 -lXtst -lXfixes && \
+        gcc -O2 -std=gnu11 -Wall -Wextra -o j36-padx j36-padx.c -lX11 -lXtst -lXfixes -lm && \
         strip j36-padx" || return 1
     [[ -f "$src/j36-padx" ]] || { log "padx: the compile left no binary"; return 1; }
 
@@ -11961,6 +11961,7 @@ RUNDIR=/run/j36
 CTL=$RUNDIR/xsession.ctl
 WINLIST=$RUNDIR/xsession.windows
 PIDFILE=$RUNDIR/xsession.pid
+PADXPID=$RUNDIR/padx.pid
 
 # HOW MANY WINDOWS THIS BOARD WILL HOLD, and it is a real number and not a tidy one.
 # 946 MB of usable RAM with 768 MB of zram behind it, and Firefox on its own is a
@@ -12154,7 +12155,7 @@ KBD=""
 # It also means a writer's open() never blocks waiting for a reader to appear, which
 # is what lets mixdash use a plain non-blocking open and get ENXIO -- "no session" --
 # instead of hanging.
-rm -f "$CTL" 2>/dev/null
+rm -f "$CTL" "$PADXPID" 2>/dev/null
 CTLOK=0
 if mkfifo -m 0600 "$CTL" 2>/dev/null; then
     if exec 9<>"$CTL"; then
@@ -12253,28 +12254,29 @@ start_client() {
 }
 
 # The bridge: the pad as a pointer, a keyboard and, on a Menu tap, `next' into the
-# pipe above.  --grab is NOT passed, and that is deliberate: a grab belongs to the
-# open descriptor and survives SIGSTOP, so a session grabbing the pad and then being
-# stopped by the dashboard is a handheld with no working buttons.  mixdash reading
-# the pad behind this is not the conflict it looks like -- while a task owns the
-# panel its reader is in watch mode and acts on nothing but the FN hold.  The header
-# of tools/j36-padx.c has the long version.
+# pipe above.  It is the ONE input owner while X owns the panel.  On Menu hold it
+# releases EVIOCGRAB, hides X's cursor and self-stops before asking mixdash for the
+# switcher; mixdash resumes the exact pid below only after X's frame is restored.
+# This explicit pid bridge is needed because xinit may move descendants outside
+# the process group mixdash stops.  The header of tools/j36-padx.c has the full
+# hand-off contract.
 # --watch is gone: it watched one pid, and a session that outlives any single window
 # has no one pid to watch.
 if [ -x /opt/mixos/bin/j36-padx ]; then
     if [ "$CTLOK" -eq 1 ]; then
-        /opt/mixos/bin/j36-padx --ctl "$CTL" &
+        /opt/mixos/bin/j36-padx -v --grab --ctl "$CTL" &
     else
-        /opt/mixos/bin/j36-padx &
+        /opt/mixos/bin/j36-padx -v --grab &
     fi
     PADX=$!
+    echo "$PADX" > "$PADXPID" 2>/dev/null || true
 else
     echo "j36-xsession: no j36-padx, so the pad cannot drive this" >&2
     if [ -z "$FIRST" ]; then
         echo "j36-xsession: and no first window either -- there would be nothing to look at" >&2
         [ -n "$KBD" ] && kill "$KBD" 2>/dev/null
         [ -n "$WM" ] && kill "$WM" 2>/dev/null
-        rm -f "$CTL" "$WINLIST" "$PIDFILE" 2>/dev/null
+        rm -f "$CTL" "$WINLIST" "$PIDFILE" "$PADXPID" 2>/dev/null
         exit 1
     fi
 fi
@@ -12382,7 +12384,7 @@ done
 [ -n "$PADX" ] && kill "$PADX" 2>/dev/null
 [ -n "$KBD" ] && kill "$KBD" 2>/dev/null
 [ -n "$WM" ] && kill "$WM" 2>/dev/null
-rm -f "$CTL" "$WINLIST" "$PIDFILE" 2>/dev/null
+rm -f "$CTL" "$WINLIST" "$PIDFILE" "$PADXPID" 2>/dev/null
 exit 0
 XSESSIONMAIN
     chmod 0755 "$SDROOT/opt/mixos/bin/j36-xsession-main"
@@ -12650,9 +12652,25 @@ if [ "$(id -u)" -eq 0 ] && id virtua >/dev/null 2>&1; then
     fi
     export XDG_RUNTIME_DIR=/run/j36/xdg-virtua
     mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" \
-             "$XDG_RUNTIME_DIR" 2>/dev/null
+             "$XDG_RUNTIME_DIR" "$XDG_CACHE_HOME/fontconfig" \
+             "$XDG_CACHE_HOME/mozilla" 2>/dev/null
     chown virtua:virtua "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" \
                          "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR" 2>/dev/null
+    # Older images created fontconfig's child cache as root before the browser
+    # privilege drop.  Chowning only .cache above does not change that child, and
+    # Firefox then spends its launch reporting "No writable cache directories".
+    # This directory is small and bounded; repair its existing entries as well.
+    chown -R virtua:virtua "$XDG_CACHE_HOME/fontconfig" 2>/dev/null
+    # The former root browser could also have left a large Mozilla cache behind.
+    # Repair it once, marked inside that tree, rather than recursively walking it
+    # on every launch and turning a successful start into an SD-card stall.
+    cache_owner="$XDG_CACHE_HOME/mozilla/.virtua-owned-v1"
+    if [ ! -e "$cache_owner" ]; then
+        echo "j36-browser: repairing ownership of the legacy Mozilla cache" >&2
+        chown -R virtua:virtua "$XDG_CACHE_HOME/mozilla" 2>/dev/null
+        : > "$cache_owner" 2>/dev/null || true
+        chown virtua:virtua "$cache_owner" 2>/dev/null
+    fi
     chmod 0700 "$XDG_RUNTIME_DIR" 2>/dev/null
 fi
 
@@ -12805,10 +12823,17 @@ case "${J36_BROWSER##*/}" in
         # the local display access without moving HOME or the profile to /root.
         firefox_profile
         if [ -n "$RUNUSER" ]; then
-            # user.js was just rewritten by this root-owned launcher.  Everything
-            # Firefox creates below the profile is already owned by virtua, so a
-            # recursive chown on every launch would only turn a large profile into
-            # another visible SD-card stall.
+            # Builds before the privilege drop could leave prefs, databases and
+            # lock state owned by root.  Repair that legacy profile once; after the
+            # marker exists Firefox owns everything it creates and only root's
+            # freshly rewritten user.js needs a cheap direct chown.
+            profile_owner="$HOME/.mozilla/j36/.virtua-owned-v1"
+            if [ ! -e "$profile_owner" ]; then
+                echo "j36-browser: repairing ownership of the legacy Firefox profile" >&2
+                chown -R virtua:virtua "$HOME/.mozilla/j36" 2>/dev/null
+                : > "$profile_owner" 2>/dev/null || true
+                chown virtua:virtua "$profile_owner" 2>/dev/null
+            fi
             chown virtua:virtua "$HOME/.mozilla" "$HOME/.mozilla/j36" \
                                  "$HOME/.mozilla/j36/user.js" 2>/dev/null
         fi

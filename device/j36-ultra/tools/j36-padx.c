@@ -43,32 +43,22 @@
  * because a browser is open is a bug waiting for its bug report.  XTEST reaches
  * exactly one X server and stops existing when that server does.
  *
- * ── THE PAD IS NOT GRABBED ANY MORE, AND THAT IS THE FIX FOR A FROZEN DEVICE ──
+ * ── ONE PAD OWNER, WITH AN EXPLICIT HAND-OFF ─────────────────────────
  *
- * It used to be, and the reason was sound at the time: mixdash is still running
- * behind the X server -- it is the process that launched it -- and its own reader
- * has /dev/input/event* open, so without EVIOCGRAB every press was delivered
- * twice, once here and once to a dashboard walking its card grid behind the
- * browser.  The grab existed to stop that and nothing else.  It has not been
- * needed since mixdash grew WATCH MODE: while a task owns the panel its Joypad
- * reads every event and reports exactly two, the FN hold and the headphone
- * switch, because the buttons belong to the child.  Two readers, one of which is
- * deliberately deaf, is not a conflict.
+ * mixdash and this bridge both have the built-in evdev node open, but only the
+ * program whose pixels are on the panel may consume it.  The session therefore
+ * starts this bridge with --grab.  On a Menu hold it releases that grab, hides
+ * the X cursor, asks mixdash for the switcher, and stops ITSELF before another
+ * event can reach X.  mixdash records this pid and continues it only after the X
+ * frame has been restored; the SIGCONT path drains events used by the switcher
+ * before taking the grab back.
  *
- * WHAT IT COST WAS THE WHOLE DEVICE.  A grab belongs to the open descriptor, not
- * to the process being scheduled: SIGSTOP does not release it.  mixdash stops
- * this session's process group whenever the panel goes somewhere else -- FN held
- * during startup, a row chosen in the switcher, a card that opens another
- * program -- and every one of those left the pad grabbed by a process that could
- * not run.  From the outside that is a handheld whose buttons have all stopped
- * working, with no way back except the power button, and the only path that ever
- * released it in time was this program's own Menu hold.  A single-purpose
- * mechanism whose failure mode is "the device is dead" is the wrong trade against
- * a duplicate-event problem that something else already solves.
- *
- * --grab puts it back for anyone running this outside mixdash, where nothing is
- * listening behind the X server and nothing will be stopped.  set_grab() and the
- * SIGCONT path below are kept for it, and are no-ops in the default case.
+ * The explicit self-stop matters because xinit can put descendants in another
+ * process group.  Stopping only the launcher's group left this bridge alive over
+ * the dashboard: its software cursor then restored pieces of X's old framebuffer
+ * wherever it moved.  That looked like a transparent, destructive Qt cursor, but
+ * was a second live cursor owner painting stale X pixels.  There is no shared
+ * interval now: release happens before SIGUSR1 and re-grab after SIGCONT.
  *
  * WHAT IS DELIBERATELY NOT READ, which is the same narrow match the grab used and
  * matters for its own reasons.  A USB keyboard or mouse in the dock is a real X
@@ -159,6 +149,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -207,7 +198,6 @@ static unsigned pad_dirs[MAX_PADS];   /* the D-pad, per pad: see drop_pad */
 static int    ax_code[MAX_PADS][AX_N];    /* evdev code feeding this role, or -1 */
 static double ax_centre[MAX_PADS][AX_N];
 static double ax_half[MAX_PADS][AX_N];
-static double ax_dead[MAX_PADS][AX_N];    /* fraction of travel, 0..0.5 */
 static double ax_val[MAX_PADS][AX_N];     /* -1..1, deadzone already removed */
 
 #define BITS_PER_LONG  (int)(sizeof(long) * 8)
@@ -402,9 +392,8 @@ static int looks_like_pad(int fd, const char *name)
  *
  * min and max give the centre and the half-travel, which is what makes the same
  * arithmetic work for -4096..4096, -32768..32767 and 0..255 without knowing which
- * pad is on the other end.  `flat' is the driver's own idea of its deadzone and is
- * honoured when it is the larger of the two -- xpad says 128 counts out of 32768,
- * which is a tenth of what is wanted here, and hid-playstation says nothing at all.
+ * pad is on the other end.  `flat' is deliberately not applied here: mixdash does
+ * not apply that hint either, and both paths use the same Mouse deadzone setting.
  *
  * The current value is deliberately NOT read into ax_val.  A stick at rest sends
  * no events, so zero is the honest starting point; seeding from EVIOCGABS would
@@ -414,7 +403,7 @@ static int looks_like_pad(int fd, const char *name)
 static int learn_axis(int slot, int role, int fd, int code)
 {
     struct input_absinfo ai;
-    double half, dead;
+    double half;
 
     memset(&ai, 0, sizeof(ai));
     if (ioctl(fd, EVIOCGABS(code), &ai) < 0)
@@ -423,15 +412,8 @@ static int learn_axis(int slot, int role, int fd, int code)
         return 0;
 
     half = ((double)ai.maximum - (double)ai.minimum) / 2.0;
-    dead = ai.flat > 0 ? (double)ai.flat / half : 0.0;
-    if (dead < 0.06)
-        dead = 0.06;
-    if (dead > 0.5)
-        dead = 0.5;
-
     ax_centre[slot][role] = ((double)ai.maximum + (double)ai.minimum) / 2.0;
     ax_half[slot][role]   = half;
-    ax_dead[slot][role]   = dead;
     ax_code[slot][role]   = code;
     ax_val[slot][role]    = 0.0;
     return 1;
@@ -597,9 +579,10 @@ static int      scr_w, scr_h;     /* and its size, which sets every speed below 
 static int      kbd_visible;
 static int      kbd_menu_hidden;  /* restored only when Menu proved to be a tap */
 
-/* The two speed ceilings, in pixels per second, worked out from the screen at
- * startup: see pointer_start() and the two SCREENS_PER_S constants it reads. */
+/* The dashboard-equivalent response, loaded once after the X screen is known. */
 static double   stick_max;
+static double   stick_acceleration = 45.0;
+static double   stick_deadzone = 0.16;
 
 #define POINTER_STATE "/run/j36/pointer.state"
 
@@ -1365,7 +1348,10 @@ static void kbd_paint(void)
                         cap->label, (int)strlen(cap->label));
         }
     }
-    XFlush(dpy);
+    /* D-pad selection repaints must be complete before the next evdev event.
+     * Flushing only queued the fill and labels; on the fbdev X server a later
+     * cursor save-under could race that queue and restore half-painted keys. */
+    XSync(dpy, False);
 }
 
 static void kbd_send(KeySym sym)
@@ -1513,7 +1499,10 @@ static void kbd_start(void)
     if (kbd_h > scr_h) kbd_h = scr_h;
     memset(&a, 0, sizeof(a));
     a.override_redirect = True;
-    a.save_under = True;
+    /* A saved-under keyboard caches pixels from whichever owner last used the
+     * physical framebuffer.  After a dashboard hand-off those pixels are stale
+     * and unmapping the keyboard paints them back over X (or vice versa). */
+    a.save_under = False;
     a.event_mask = ExposureMask | PointerMotionMask | ButtonPressMask | ButtonReleaseMask;
     kbd_win = XCreateWindow(dpy, RootWindow(dpy, scr), 0, scr_h - kbd_h,
                             (unsigned)scr_w, (unsigned)kbd_h, 0,
@@ -1556,34 +1545,37 @@ static int on_io_error(Display *unused)
  * not in that position: it is started by mixdash, which has a Mouse settings page
  * whose whole subject is how fast this pointer should move.  A browser session that
  * ignored that setting gave the device two pointer speeds, one of them unreachable
- * from any screen -- so the file is read, and these two only decide what happens on
- * a card with no dashboard settings on it yet.  See read_dash_speed().
+ * from any screen -- so the file is read, and the constant only decides what
+ * happens on a card with no dashboard speed setting on it yet.  See
+ * read_dash_mouse().
  *
  * 0.31 of a 640 px panel is 200 px/s, which is the number that was actually asked
  * for after the 1.0 above -- 640 px/s -- turned out to be exactly the "extremely
  * fast, difficult to navigate" the whole comment above was written to fix.  The
- * D-pad keeps its old 0.85 ratio to the stick rather than a constant of its own.
  */
 #define STICK_SCREENS_PER_S  0.3125
-#define SCROLL_MAX  16.0     /* wheel notches per second at full deflection */
+#define SCROLL_MAX  14.0     /* same wheel notches/second as mixdash */
 
 /*
  * ── THE DASHBOARD'S POINTER SPEED ────────────────────────────────────────────
  *
  * mixdash keeps its settings in a plain INI file -- see pickStorePath() in
- * mixdash/settings.cpp for why that path and not another -- and the only value in
- * it this program has any business with is the one the Mouse page writes:
+ * mixdash/settings.cpp for why that path and not another -- and the Mouse page
+ * writes the three values which define the stick's logical response:
  *
  *     [mouse]
  *     pointerSpeed=200
+ *     acceleration=45
+ *     deadzone=16
  *
- * which is pixels per second at full stick deflection, the same quantity
- * stick_max is.  So it is used as stick_max, unconverted, and the D-pad ceiling
- * keeps its ratio to it.
+ * Speed is pixels per second at full deflection, acceleration becomes the same
+ * 1.0..2.5 magnitude exponent used by Joypad::driveStick(), and deadzone is a
+ * percentage.  Reading only speed made the two cursors feel different even when
+ * their end-to-end travel time happened to agree.
  *
- * PARSED BY HAND AND NOT WITH A LIBRARY.  It is one integer under one section in a
- * file this project writes, and linking an INI parser into a 40 kB bridge to read
- * it would be the larger change.  The parse is deliberately narrow: a section
+ * PARSED BY HAND AND NOT WITH A LIBRARY.  They are three numbers under one section
+ * in a file this project writes, and linking an INI parser into this bridge to read
+ * them would be the larger change.  The parse is deliberately narrow: a section
  * header other than [mouse] is skipped, whitespace either side of the = is
  * allowed, anything that is not a number is ignored, and every failure -- no file,
  * no key, an unreadable value -- leaves the caller's default alone.  A browser
@@ -1599,16 +1591,25 @@ static int on_io_error(Display *unused)
 #define DASH_SPEED_LO 80.0
 #define DASH_SPEED_HI 2400.0
 
-static double read_dash_speed(void)
+struct DashMouse {
+    double speed;
+    double acceleration;
+    double deadzone;
+};
+
+static void read_dash_mouse(struct DashMouse *cfg)
 {
     FILE *f;
     char line[256];
     int in_mouse = 0;
-    double found = 0.0;
+
+    cfg->speed = 0.0;
+    cfg->acceleration = 45.0;
+    cfg->deadzone = 16.0;
 
     f = fopen(DASH_CONF, "r");
     if (!f)
-        return 0.0;
+        return;
 
     while (fgets(line, sizeof line, f)) {
         char *p = line, *eq, *end;
@@ -1636,25 +1637,32 @@ static double read_dash_speed(void)
          * editing the file by hand does. */
         for (end = eq; end > p && (end[-1] == ' ' || end[-1] == '\t'); end--)
             end[-1] = '\0';
-        if (strcmp(p, "pointerSpeed") != 0)
-            continue;
-
         v = strtod(eq + 1, &end);
         if (end == eq + 1)
             continue;               /* the value was not a number at all */
-        found = v;
+        if (strcmp(p, "pointerSpeed") == 0)
+            cfg->speed = v;
+        else if (strcmp(p, "acceleration") == 0)
+            cfg->acceleration = v;
+        else if (strcmp(p, "deadzone") == 0)
+            cfg->deadzone = v;
         /* No break: a file with the key twice should mean what its last line says,
          * which is what QSettings itself would read back. */
     }
     fclose(f);
 
-    if (found <= 0.0)
-        return 0.0;
-    if (found < DASH_SPEED_LO)
-        found = DASH_SPEED_LO;
-    else if (found > DASH_SPEED_HI)
-        found = DASH_SPEED_HI;
-    return found;
+    if (cfg->speed > 0.0 && cfg->speed < DASH_SPEED_LO)
+        cfg->speed = DASH_SPEED_LO;
+    else if (cfg->speed > DASH_SPEED_HI)
+        cfg->speed = DASH_SPEED_HI;
+    if (cfg->acceleration < 0.0)
+        cfg->acceleration = 0.0;
+    else if (cfg->acceleration > 100.0)
+        cfg->acceleration = 100.0;
+    if (cfg->deadzone < 2.0)
+        cfg->deadzone = 2.0;
+    else if (cfg->deadzone > 60.0)
+        cfg->deadzone = 60.0;
 }
 
 /*
@@ -1662,12 +1670,9 @@ static double read_dash_speed(void)
  * back over the whole range, so that the first movement past the deadzone is a
  * small one rather than a step.
  *
- * The deadzone is the second one this value passes through: the driver has
- * already subtracted its own, computed from a centre measured when the device
- * tree was written.  A stick used for a year does not come back to where it did
- * then, and on a device with no mouse to correct it, a pointer that drifts on its
- * own walks into a corner while you read.  Six per cent of travel is below what a
- * thumb can aim and above what wear produces.
+ * The deadzone is the same user setting mixdash applies.  Keeping the setting in
+ * screen-independent axis space makes the center response identical too, rather
+ * than merely matching full-stick speed.
  */
 static double axis_norm(int slot, int role, int raw)
 {
@@ -1681,30 +1686,56 @@ static double axis_norm(int slot, int role, int raw)
     else if (t < -1.0)
         t = -1.0;
 
-    d = ax_dead[slot][role];
+    d = stick_deadzone;
     if (t > -d && t < d)
         return 0.0;
     return (t < 0.0 ? t + d : t - d) / (1.0 - d);
 }
 
-/* Squared and sign-preserving, summed over every pad and clamped: two pads is not
- * a real arrangement, and if it happens the answer should be a pointer that moves
- * once rather than one that moves twice as fast. */
-static double axis_rate(int role, double full_scale_rate)
+/* Exactly mixdash/Joypad::driveStick: the first complete left stick wins, its
+ * circular magnitude is clamped, then the configured response exponent is
+ * applied to that magnitude rather than independently to each axis. */
+static void pointer_rate(double *rx, double *ry)
 {
-    double s = 0.0;
     int i;
 
     for (i = 0; i < MAX_PADS; i++) {
-        double t = ax_val[i][role];
-        if (t != 0.0)
-            s += (t < 0.0 ? -1.0 : 1.0) * t * t;
+        double x, y, mag, curved;
+        if (ax_code[i][AX_LX] < 0 || ax_code[i][AX_LY] < 0)
+            continue;
+        x = ax_val[i][AX_LX];
+        y = ax_val[i][AX_LY];
+        mag = sqrt(x * x + y * y);
+        if (mag > 1.0) {
+            x /= mag;
+            y /= mag;
+            mag = 1.0;
+        }
+        if (mag <= 0.0) {
+            *rx = *ry = 0.0;
+            return;
+        }
+        curved = pow(mag, 1.0 + stick_acceleration * 0.015);
+        *rx = x / mag * stick_max * curved;
+        *ry = y / mag * stick_max * curved;
+        return;
     }
-    if (s > 1.0)
-        s = 1.0;
-    else if (s < -1.0)
-        s = -1.0;
-    return s * full_scale_rate;
+    *rx = *ry = 0.0;
+}
+
+/* Same first-device rule and linear 14-notch response as the dashboard's right
+ * stick. */
+static void scroll_rate(double *rx, double *ry)
+{
+    int i;
+    for (i = 0; i < MAX_PADS; i++) {
+        if (ax_code[i][AX_RX] < 0 || ax_code[i][AX_RY] < 0)
+            continue;
+        *rx = ax_val[i][AX_RX] * SCROLL_MAX;
+        *ry = ax_val[i][AX_RY] * SCROLL_MAX;
+        return;
+    }
+    *rx = *ry = 0.0;
 }
 
 static int sticks_active(void)
@@ -1824,13 +1855,9 @@ static int rep_any(void)
  * button that was down when the stop landed has a release in that same discarded
  * batch, so the state this program keeps -- direction bits, stick deflection,
  * shoulder repeats, and above all menu_down_at -- describes a hand that has since
- * let go.  menu_down_at is the one that bites: mixdash's own FN hold is 700 ms
- * and this one is 1000, so the dashboard stops the session while Menu is still
- * down here.  Left alone, the first tick after SIGCONT sees a hold that has been
- * running for however long the switcher was up, fires it, and asks for the
- * switcher again -- the user comes back to the browser and is thrown straight out
- * of it.  Zeroing the lot is the whole fix, and it costs at most one button that
- * has to be pressed again.
+ * let go.  Left alone, the first tick after SIGCONT could interpret stale hold
+ * state as a new gesture and ask for the switcher again.  Zeroing the lot is the
+ * whole fix, and it costs at most one button that has to be pressed again.
  *
  * The drain is best-effort by design: EAGAIN ends it, anything else means the
  * device left while we were stopped and the next poll will drop the slot through
@@ -1958,14 +1985,29 @@ static void usage(void)
         "                    page to the next window\n"
         "  --display NAME    which server (default $DISPLAY)\n"
         "  --focus PID       focus the X client with _NET_WM_PID=PID, then exit\n"
-        "  --grab            take the pad from every other reader (see the note at\n"
-        "                    the top of this file before using it under mixdash)\n"
-        "  --no-grab         the default: share the pad, which is what lets the\n"
-        "                    dashboard still see FN held\n"
+        "  --grab            take the pad while X owns the panel; Menu hold\n"
+        "                    explicitly releases it before the dashboard hand-off\n"
+        "  --no-grab         share the pad (the command-line default)\n"
         "  --list            name the devices that would be used, then exit\n"
         "  -v                say what is happening\n"
         "\n"
         "Select toggles the on-screen keyboard.\n");
+}
+
+static void pointer_reload_settings(void)
+{
+    struct DashMouse mouse;
+
+    read_dash_mouse(&mouse);
+    stick_max = mouse.speed > 0.0 ? mouse.speed
+                                  : STICK_SCREENS_PER_S * (double)scr_w;
+    stick_acceleration = mouse.acceleration;
+    stick_deadzone = mouse.deadzone / 100.0;
+    note("screen %dx%d: %.0f px/s, acceleration %.0f, deadzone %.0f%% (%s); "
+         "D-pad is navigation", scr_w, scr_h, stick_max, stick_acceleration,
+         stick_deadzone * 100.0,
+         mouse.speed > 0.0 ? "from " DASH_CONF
+                           : "built-in speed; no dashboard speed setting on this card");
 }
 
 /*
@@ -1977,8 +2019,6 @@ static void usage(void)
  */
 static void pointer_start(void)
 {
-    double want;
-
     scr   = DefaultScreen(dpy);
     scr_w = DisplayWidth(dpy, scr);
     scr_h = DisplayHeight(dpy, scr);
@@ -1997,8 +2037,7 @@ static void pointer_start(void)
      * speed from the dashboard's" is exactly the report this code exists to answer
      * and the answer is either "it did not read the file" or "it read this".
      */
-    want = read_dash_speed();
-    stick_max = want > 0.0 ? want : STICK_SCREENS_PER_S * (double)scr_w;
+    pointer_reload_settings();
     /* The linuxfb cursor and this X cursor hand one coordinate pair through /run.
      * Warp before the first client appears, so there is never a centre-screen X
      * cursor followed by the dashboard cursor somewhere else. */
@@ -2018,9 +2057,6 @@ static void pointer_start(void)
     }
     pointer_install_cursor();
 
-    note("screen %dx%d: %.0f px/s at full left stick (%s); D-pad is navigation",
-         scr_w, scr_h, stick_max,
-         want > 0.0 ? "from " DASH_CONF : "built in; no dashboard setting on this card");
 }
 
 int main(int argc, char **argv)
@@ -2159,7 +2195,7 @@ int main(int argc, char **argv)
         int map[MAX_PADS + 1];
         int nfd = 0, timeout, n, k;
         long now;
-        double dt, dx, dy;
+        double dt, dx, dy, sx, sy;
 
         for (i = 0; i < MAX_PADS; i++) {
             if (pad_fd[i] < 0)
@@ -2204,6 +2240,11 @@ int main(int argc, char **argv)
         if (cont_asked) {
             cont_asked = 0;
             forget_pads();
+            /* Mouse settings can be changed while this X session is stopped on
+             * the dashboard.  Reload all three response values before accepting
+             * another stick event, or a long-lived Desktop would retain its old
+             * curve while Qt immediately used the new one. */
+            pointer_reload_settings();
             /* A keyboard hidden by the Menu press belongs to the screen we left,
              * not to this resumed one.  Keep it closed across a real hand-off. */
             kbd_menu_hidden = 0;
@@ -2393,21 +2434,17 @@ int main(int argc, char **argv)
                         pointer_resync();
                         pointer_state_write();
                         menu_down_at = now;
-                        /* mixdash recognizes the hold before this bridge's own
-                         * timer.  Hide the keyboard on the press so it cannot be
-                         * frozen onto the dashboard; restore it only if release
-                         * proves this was the short next-window gesture. */
+                        /* Hide the keyboard on the press so it cannot be frozen
+                         * onto the dashboard; restore it only if release proves
+                         * this was the short next-window gesture. */
                         if (kbd_visible) {
                             kbd_menu_hidden = 1;
                             kbd_set_visible(0);
                         }
-                        /* mixdash recognizes the same hold sooner than this
-                         * bridge does and can SIGSTOP the X server before the
-                         * hold branch below gets a turn.  Hide on the press, so
-                         * the server has restored the pixels under its cursor
-                         * before either reader can hand the panel away.  A tap
-                         * restores it on release; a hold restores it after the
-                         * session is continued. */
+                        /* Hide on the press, so the server has restored the
+                         * pixels under its cursor before the hold branch hands
+                         * the panel away.  A tap restores it on release; a hold
+                         * restores it after the session is continued. */
                         if (mixdash_pid > 0 && kill(mixdash_pid, 0) == 0)
                             screen_cursor(0);
                     } else {
@@ -2440,8 +2477,9 @@ int main(int argc, char **argv)
         if (dt > (double)TICK_MS * 4.0 / 1000.0)
             dt = (double)TICK_MS * 4.0 / 1000.0;   /* woken from idle; do not lurch */
 
-        dx = axis_rate(AX_LX, stick_max) * dt;
-        dy = axis_rate(AX_LY, stick_max) * dt;
+        pointer_rate(&dx, &dy);
+        dx *= dt;
+        dy *= dt;
 
         /* The remainder is kept inside the position, so a speed below one pixel per
          * tick is a slow pointer and not a still one. */
@@ -2451,10 +2489,11 @@ int main(int argc, char **argv)
          * what accumulates is fractions of one.  Buttons 6 and 7 are the horizontal
          * wheel; a client that does not understand them ignores them, which is the
          * right outcome for a page that does not scroll sideways. */
-        scroll_y += axis_rate(AX_RY, SCROLL_MAX) * dt;
+        scroll_rate(&sx, &sy);
+        scroll_y += sy * dt;
         while (scroll_y >= 1.0)  { wheel(5); scroll_y -= 1.0; }
         while (scroll_y <= -1.0) { wheel(4); scroll_y += 1.0; }
-        scroll_x += axis_rate(AX_RX, SCROLL_MAX) * dt;
+        scroll_x += sx * dt;
         while (scroll_x >= 1.0)  { wheel(7); scroll_x -= 1.0; }
         while (scroll_x <= -1.0) { wheel(6); scroll_x += 1.0; }
 
@@ -2492,11 +2531,11 @@ int main(int argc, char **argv)
          * belongs to the descriptor and not to whether its owner is scheduled.
          * Handing it over first is the only order that leaves a usable switcher.
          *
-         * Then the hold is cleared and this carries on as normal.  The SIGSTOP
-         * arrives when it arrives; nothing here has to wait for it, and if it
-         * never comes -- a dashboard that has since died, a pid that has been
-         * reused -- the session is exactly as it was, minus a grab it takes back
-         * on the next SIGCONT or keeps living without.
+         * Then the hold state is cleared and this process stops itself.  That is
+         * stronger than waiting for the launcher's process-group stop: xinit may
+         * have put this bridge in another group, which is how the second live X
+         * cursor escaped onto the dashboard in the reported video.  mixdash has
+         * the pid file needed to continue this exact process.
          *
          * With no dashboard to ask, the old behaviour stands unchanged.
          */
@@ -2514,6 +2553,11 @@ int main(int argc, char **argv)
                  * instead.  Cancelling the repeats here is what stops a shoulder
                  * paging the browser for the whole time the switcher is up. */
                 rep_clear();
+                /* xinit may have moved this bridge outside the launcher's process
+                 * group.  Stop ourselves before a release or stick event can
+                 * restore X cursor pixels over the dashboard.  mixdash continues
+                 * this exact pid after restoring the X frame. */
+                raise(SIGSTOP);
             } else {
                 note("Menu held, closing the session");
                 if (watch_pid > 0)

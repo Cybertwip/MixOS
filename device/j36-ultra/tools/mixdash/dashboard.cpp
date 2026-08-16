@@ -126,6 +126,11 @@ const char kXSessionWindows[] = "/run/j36/xsession.windows";
  * already gone?  See launchWindowed().
  */
 const char kXSessionPid[] = "/run/j36/xsession.pid";
+/* j36-padx can be placed outside the launcher's process group by xinit.  Its own
+ * pid is therefore the authoritative second half of the X-session hand-off: it
+ * self-stops after releasing the pad, and mixdash continues this exact process
+ * only after restoring X's frame. */
+const char kPadxPid[] = "/run/j36/padx.pid";
 
 /*
  * ── WHERE A COMMAND LINE WAITS ───────────────────────────────────────────────
@@ -328,6 +333,16 @@ bool signalTask(qint64 pgid, int sig)
     if (::kill(-(pid_t)pgid, sig) == 0)
         return true;
     return ::kill((pid_t)pgid, sig) == 0;
+}
+
+bool signalPidFile(const char *path, int sig)
+{
+    QFile f(QString::fromLatin1(path));
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return false;
+    bool ok = false;
+    const qint64 pid = f.read(32).trimmed().toLongLong(&ok);
+    return ok && pid > 1 && ::kill((pid_t)pid, sig) == 0;
 }
 
 /*
@@ -2459,13 +2474,18 @@ void Dashboard::setForeground(int index)
     Panel::restore(task.frame);
     task.frame.clear();
 
+    /* Watch mode is installed before either process can consume another input
+     * event.  PadX has released EVIOCGRAB while stopped and takes it back in its
+     * SIGCONT path after draining the switcher's queued events. */
+    m_fg = index;
+    m_pad->setWatching(true);
+
     if (task.stopped) {
         signalTask(task.pgid, SIGCONT);
         task.stopped = false;
     }
-
-    m_fg = index;
-    m_pad->setWatching(true);
+    if (task.exe == QLatin1String(kXSession))
+        signalPidFile(kPadxPid, SIGCONT);
 }
 
 /*
@@ -2480,6 +2500,12 @@ void Dashboard::stopForeground()
 
     Task &task = m_tasks[m_fg];
     if (!task.stopped && signalTask(task.pgid, SIGSTOP)) {
+        /* PadX normally stopped itself just before asking for this switcher.  The
+         * explicit pid signal closes the process-group hole seen in the reported
+         * video, where it remained live and its X cursor painted stale save-under
+         * pixels over the dashboard.  Its grab has already been released. */
+        if (task.exe == QLatin1String(kXSession))
+            signalPidFile(kPadxPid, SIGSTOP);
         task.stopped = true;
         /* AFTER the stop.  panel.h: a program that is still running can be in
          * the middle of a frame, and what is wanted is the last thing the user
@@ -2519,8 +2545,12 @@ void Dashboard::closeTask(int index)
      * genuinely ignores SIGTERM stays in the list, which is at least honest.
      */
     signalTask(task.pgid, SIGCONT);
+    if (task.exe == QLatin1String(kXSession))
+        signalPidFile(kPadxPid, SIGCONT);
     task.stopped = false;
     signalTask(task.pgid, SIGTERM);
+    if (task.exe == QLatin1String(kXSession))
+        signalPidFile(kPadxPid, SIGTERM);
 
     /*
      * The row is not removed here.  finished() is what removes it, through
