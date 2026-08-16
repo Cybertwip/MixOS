@@ -178,6 +178,10 @@
 				 * kernel.h still pulls in, so this spelling is
 				 * the one that does not care which we build on */
 #include <linux/ktime.h>
+#include <linux/math.h>	/* abs(), for "has this reading moved far enough to
+				 * be worth a line" -- kernel.h drags it in too,
+				 * and naming it is cheaper than depending on
+				 * that staying true */
 #include <linux/math64.h>
 #include <linux/minmax.h>
 #include <linux/module.h>

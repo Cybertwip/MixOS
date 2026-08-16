@@ -2021,8 +2021,76 @@ watch_say() {
     echo "$1" > "$watch_status" 2>/dev/null
     return 0
 }
+
+# ── AND THE BOUND THAT A BOUND CANNOT COVER ──────────────────────────────────
+#
+# Everything above is a bound on a stage that is SLOW.  It is no bound at all on
+# a stage that takes the SoC with it, and this board has that failure for real:
+# an APB or AXI access to a MediaTek peripheral whose clock gate is shut does not
+# fault, it stalls the bus -- every master on it, the display included -- and on a
+# board whose loader leaves the watchdog off, that is not a reset, it is a
+# handheld that is simply dead until the battery is pulled.  The ticker cannot
+# report it, because the ticker is a process and there are no processes any more.
+# What it looks like from the outside is exactly what was reported: the panel
+# stops with the module's name on it and nothing ever happens again.
+#
+# Nothing in userspace can prevent that.  What it CAN do is make sure it happens
+# at most once.  Before a stage is forked its key is written to the OS partition
+# and synced; when the stage answers -- for any reason, including the bound above
+# expiring -- the key is cleared.  So a key still on the card at the next boot
+# means one thing only: the board died with that stage in flight.  That stage is
+# then skipped ONCE and the key cleared, so the boot after it tries again.
+#
+# One skip and not a latch, and that is the whole policy: a stall here is
+# intermittent -- the same modules have loaded on this board hundreds of times --
+# so a permanent disable would trade a rare dead boot for a permanently crippled
+# device.  What this promises is narrower and is the thing that was actually
+# asked for: however badly a stage misbehaves, the SECOND power-on reaches the
+# dashboard.  Pulling the power mid-boot leaves the same mark and costs the same
+# one skipped stage on the next boot, which is a fair price for not having to
+# know the difference.
+#
+# It is on /newroot -- the OS partition, ext2, already mounted rw by find_root --
+# and not on the FAT BOOT partition, which this initramfs mounts read-only.  If
+# any of it fails, every one of these calls fails quietly and the boot is exactly
+# what it was before: the mark is a safety net, never a dependency.
+watch_markfile=/newroot/opt/mixos/boot-stage
+watch_wedge=""
+watch_recalled=0
+# Written and then SYNCED, and the sync is the entire point: a board that stalls
+# the bus never flushes anything, so a mark sitting in the page cache is a mark
+# the next boot does not see.  It costs one flush per stage on an otherwise idle
+# filesystem.
+watch_mark() {
+    mkdir -p /newroot/opt/mixos 2>/dev/null
+    echo "$1" > "$watch_markfile" 2>/dev/null || return 0
+    if [ -n "$1" ]; then sync; fi
+    return 0
+}
+# Read once, and cleared in the same breath, so the answer can only ever be acted
+# on by this boot.  A mark that survived being read would skip its stage on every
+# boot from here to the end of the card.
+watch_recall() {
+    if [ "$watch_recalled" = 1 ]; then return 0; fi
+    watch_recalled=1
+    if [ -s "$watch_markfile" ]; then read -r watch_wedge < "$watch_markfile"; fi
+    if [ -n "$watch_wedge" ]; then
+        say "the last boot stopped dead inside $watch_wedge -- it is skipped this time and tried again on the next boot"
+    fi
+    watch_mark ""
+    return 0
+}
 watch_run() {
     watch_limit="$1"; watch_label="$2"; shift 2
+    watch_recall
+    if [ -n "$watch_wedge" ] && [ "$watch_wedge" = "$1" ]; then
+        watch_wedge=""
+        detail "$watch_label -- skipped, it stopped the last boot"
+        say "$1: skipped, see above; power-cycle once more and it runs again"
+        sleep 2
+        return 126
+    fi
+    watch_mark "$1"
     : > "$watch_status"
     : > "$watch_result"
     watch_say "$watch_label"
