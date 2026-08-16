@@ -2666,8 +2666,19 @@ static bool j36_moved(int now, int was, int by)
  *
  * dev_info and not dev_dbg: this is the line someone reads back off a serial
  * console or out of dmesg on a board that will not charge, and a diagnostic that
- * needs a rebuild to turn on is a diagnostic nobody has when they need it.  At
- * one line per twenty seconds it costs the ring buffer nothing.
+ * needs a rebuild to turn on is a diagnostic nobody has when they need it.  What
+ * makes that affordable is that it is printed on CHANGE -- see
+ * charging_line_every -- so an idle board with a full cell says it once and then
+ * stops, and the ring buffer belongs to whatever goes wrong next.
+ *
+ * CS_DET IS NOT ONE OF THE THINGS THAT COUNTS AS A CHANGE, and it is the reason
+ * it is read below the gate rather than above it.  It is an instantaneous
+ * comparator on a modulated current source -- the paragraph above says it read 0
+ * and 1 alternately on a board drawing a steady half-amp -- so a driver that
+ * printed whenever it moved would print every poll and this change would have
+ * bought nothing.  It is reported when something else has already decided the
+ * line is worth printing, which also means the pwrap read it costs is paid only
+ * then.
  */
 static void j36_charging_line(struct j36_pmic *p, int online, int chrdet,
 			      bool sourcing, int vchr_mv, int ma, bool ma_valid,
@@ -2675,11 +2686,39 @@ static void j36_charging_line(struct j36_pmic *p, int online, int chrdet,
 {
 	char pack_buf[16], vbat_buf[16], vchr_buf[16], level_buf[16];
 	const char *pack, *vbat, *vchr, *level;
+	int ma_now = ma_valid ? ma : -1;
+	int bat_now = bat_mv > 0 ? bat_mv : -1;
+	int level_now = p->soc_dep >= 0 ? 100 - p->soc_dep : -1;
+	int vchr_now = vchr_mv >= 0 ? vchr_mv : -1;
+	bool beat;
 	u32 con2;
 	int cs_det;
 
-	if (++p->poll_kicks % J36_CHARGING_LINE_EVERY)
+	/* Counted every poll and not only when the periodic line is switched on,
+	 * so turning it on through sysfs starts from the poll after the write
+	 * rather than from wherever a free-running counter happened to be. */
+	p->poll_kicks++;
+	beat = charging_line_every &&
+	       p->poll_kicks % charging_line_every == 0;
+
+	if (p->chg_line_seen && !beat &&
+	    online == p->chg_line_online &&
+	    chrdet == p->chg_line_chrdet &&
+	    (int)sourcing == p->chg_line_src &&
+	    level_now == p->chg_line_level &&
+	    !j36_moved(vchr_now, p->chg_line_vchr, J36_CHARGING_LINE_VCHR_MV) &&
+	    !j36_moved(bat_now, p->chg_line_vbat, J36_CHARGING_LINE_VBAT_MV) &&
+	    !j36_moved(ma_now, p->chg_line_ma, J36_CHARGING_LINE_MA))
 		return;
+
+	p->chg_line_seen = true;
+	p->chg_line_online = online;
+	p->chg_line_chrdet = chrdet;
+	p->chg_line_src = sourcing;
+	p->chg_line_level = level_now;
+	p->chg_line_vchr = vchr_now;
+	p->chg_line_vbat = bat_now;
+	p->chg_line_ma = ma_now;
 
 	cs_det = j36_pmic_read(p, J36_CHR_CON2, &con2) == 0
 		 ? !!(con2 & J36_CHR_CON2_CS_DET) : -1;
