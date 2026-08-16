@@ -204,9 +204,9 @@ const int kStartGraceMs = 90000;
 const int kPollIdleMs = 4000;
 const int kPollWatchMs = 1500;
 
-/* How long a watched start has to have been watched before an inactive unit counts
- * as a refusal rather than as a job PID 1 has not begun yet.  See poll(). */
-const int kSettleMs = 3000;
+/* A settle window used to live here: three seconds during which an inactive unit
+ * was assumed to be a job systemd had not begun rather than one it had refused.
+ * poll() asks systemd for the job now instead of timing it -- see bug EIGHT. */
 
 /* The note strip under the title: one line's worth, and how many of them there can
  * be.  Two, because the sentences that say WHY a start refused are about that long
@@ -222,9 +222,11 @@ const int kNoteMaxRows = 2;
  * BLOCKING AND BOUNDED, the same bargain wifi.cpp strikes with wpa_cli.  These
  * are local unit-state queries that answer in milliseconds; a start is the one
  * that can take a second, which is what the wider default timeout is for.  A
- * timeout returns empty, and every caller reads empty as "no" -- so a wedged
- * systemd shows up as a share that will not switch on rather than as a dashboard
- * that stops painting.
+ * timeout returns empty -- and `rc' is how a caller tells that apart from an
+ * answer, because reading empty as "no" is right for is-active and was bug SEVEN
+ * for is-enabled.  rc is -1 for a fork that never ran or never finished and the
+ * child's own exit code otherwise, so `rc >= 0' is the question "did systemd
+ * answer at all".
  *
  * AND THE WAITS ARE Shell'S, WHICH ON THIS PAGE IS NOT A DETAIL.  Starting a unit
  * is what makes systemd reset the console it logs to, and this function is the
@@ -245,7 +247,20 @@ QString SharingPage::systemctl(const QStringList &args, int timeoutMs, int *rc)
     QProcess p;
     p.setProcessChannelMode(QProcess::MergedChannels);
     p.start(systemctlPath(), args);
-    if (!Shell::waitForStarted(p, 1000))
+    /*
+     * FOUR SECONDS TO GET IT RUNNING, AND IT WAS ONE.  This budget is not about
+     * how long systemd takes to answer -- that is the timeout below -- it is about
+     * how long the kernel takes to fork, map and relocate the systemctl binary,
+     * which links libsystemd-shared and is several megabytes off an SD card on a
+     * Cortex-A7.  On a cold page cache that is comfortably more than a second.
+     *
+     * And the budget is not spent purely on waiting: Shell's waits are sliced so
+     * that the console can be held and the panel repainted between slices, and a
+     * software repaint of this page costs real milliseconds out of the same
+     * allowance.  A budget that ran out returned empty, and empty was drawn as a
+     * switch in the off position -- see bug SEVEN in sharing.h.
+     */
+    if (!Shell::waitForStarted(p, 4000))
         return QString();
     if (!Shell::waitForFinished(p, timeoutMs)) {
         p.kill();
@@ -352,14 +367,58 @@ QString SharingPage::journalTail(const QString &unit, int lines)
     return QString::fromUtf8(p.readAll()).trimmed();
 }
 
-bool SharingPage::unitEnabled(const QString &unit)
+bool SharingPage::unitEnabled(const QString &unit, bool *answered)
 {
+    int rc = -1;
     /* `is-enabled' prints enabled, disabled, static, masked or alias.  Only the
      * first of those means the unit comes up by itself, and "static" -- which
      * Debian's smbd is not, but a future packaging change could make it -- means
      * there is no install section to enable, so the switch would lie. */
-    return systemctl(QStringList() << QStringLiteral("is-enabled") << unit, 2500)
-               == QLatin1String("enabled");
+    const QString out =
+        systemctl(QStringList() << QStringLiteral("is-enabled") << unit, 4000, &rc);
+
+    /* It EXITS non-zero for a unit that is merely disabled, which is an answer and
+     * not a failure -- so the test is whether the child ran to completion at all,
+     * not what it exited with.  See bug SEVEN in sharing.h. */
+    if (answered)
+        *answered = (rc >= 0);
+    return out == QLatin1String("enabled");
+}
+
+/*
+ * ── ONE FORK PER TICK, AND IT SAYS WHETHER IT IS AN ANSWER ───────────────────
+ *
+ * A poll used to be two: is-active and is-enabled, each a cold exec of systemctl.
+ * `show' gives both in one, plus the thing neither of them can say -- whether there
+ * is a JOB in flight for the unit.
+ *
+ * Job= is the fix for bug EIGHT.  systemd prints it as `1234 start' while a job for
+ * the unit is queued or running and leaves it empty (or omits it, on a systemd old
+ * enough not to export it) when there is none, so non-empty means "this is not the
+ * final answer, come back".  Nothing here depends on the property existing: a
+ * systemd that does not export it simply falls back to the state alone, which is
+ * where this page was before.
+ */
+SharingPage::UnitSnapshot SharingPage::readUnit(const QString &unit)
+{
+    UnitSnapshot snap;
+
+    const QMap<QString, QString> props =
+        unitProperties(unit, QStringList() << QStringLiteral("ActiveState")
+                                           << QStringLiteral("UnitFileState")
+                                           << QStringLiteral("Job"));
+
+    /* An empty map is a fork that did not run.  systemd answering about a unit it
+     * has never heard of still prints ActiveState=inactive, so the presence of that
+     * one key is what separates "no answer" from "no such unit". */
+    if (!props.contains(QStringLiteral("ActiveState")))
+        return snap;
+
+    snap.answered = true;
+    snap.state = props.value(QStringLiteral("ActiveState"));
+    snap.fileState = props.value(QStringLiteral("UnitFileState"));
+    snap.job = !props.value(QStringLiteral("Job")).isEmpty();
+    return snap;
 }
 
 /* Where systemd says the unit file actually is.  Asked rather than assumed: it is
@@ -531,7 +590,11 @@ QString SharingPage::setEnabled(const QString &unit, bool on)
                                       << unit,
                                   8000, &rc);
 
-    if (unitEnabled(unit) == on)
+    /* The verification has to be able to say "I could not check", because the two
+     * failures below both write to the card and neither is a thing to do on the
+     * strength of a fork that did not run.  See bug SEVEN. */
+    bool answered = false;
+    if (unitEnabled(unit, &answered) == on && answered)
         return QString();
 
     const QString wants =
@@ -557,7 +620,18 @@ QString SharingPage::setEnabled(const QString &unit, bool on)
      * below is answered from the same picture the next boot will build. */
     systemctl(QStringList() << QStringLiteral("daemon-reload"), 8000);
 
-    if (unitEnabled(unit) == on)
+    answered = false;
+    if (unitEnabled(unit, &answered) == on)
+        return QString();
+
+    /*
+     * A CHECK THAT DID NOT RUN IS NOT A FAILURE.  The symlink above is what
+     * is-enabled reads, and it is on the card whether or not this fork managed to
+     * ask about it; reporting "systemctl enable smbd exited -1" here would put a
+     * systemctl problem on the glass under a setting that has in fact been made.
+     * Silence, and the next poll reads the card and draws the switch from it.
+     */
+    if (!answered)
         return QString();
 
     /* Still not.  systemd's own words if it left any, and the exit code if it did
@@ -1402,28 +1476,41 @@ void SharingPage::onLeave()
 
 void SharingPage::poll()
 {
-    const QString state = activeState(QString::fromLatin1(kSmbd));
-    m_active = (state == QLatin1String("active"));
-    m_enabled = unitEnabled(QString::fromLatin1(kSmbd));
+    const UnitSnapshot smbd = readUnit(QString::fromLatin1(kSmbd));
+
+    /*
+     * ASSIGNED ONLY WHEN THERE IS SOMETHING TO ASSIGN, which is bug SEVEN.  A tick
+     * whose fork did not run has learnt nothing about either switch, and the old
+     * code drew both of them from it anyway -- so a slow systemctl put "Share over
+     * the network" and "Start at boot" in the off position for four seconds and the
+     * next tick put them back.  That is the knob that resets.
+     *
+     * The watch below still treats a missing answer as "keep waiting", which is a
+     * different question and is answered by the grace rather than by the flags.
+     */
+    if (smbd.answered) {
+        m_active = (smbd.state == QLatin1String("active"));
+        m_enabled = (smbd.fileState == QLatin1String("enabled"));
+    }
 
     if (m_starting) {
         m_startGraceMs -= m_timer->interval();
-        const int watched = kStartGraceMs - m_startGraceMs;
 
-        if (m_active) {
+        if (smbd.answered && smbd.state == QLatin1String("active")) {
             endWatch(true);
-        } else if (!stateIsTransient(state) && watched >= kSettleMs) {
+        } else if (smbd.answered && !smbd.job && !stateIsTransient(smbd.state)) {
             /*
-             * It has stopped moving and it is not up.  Waiting out the rest of the
-             * grace would only make the page slower to say so.
+             * It has stopped moving, there is no job left for it, and it is not up.
+             * Waiting out the rest of the grace would only make the page slower to
+             * say so.
              *
-             * BUT NOT ON THE FIRST TICK, and that guard arrived with --no-block.  A
-             * queued job that PID 1 has not picked up yet leaves the unit sitting at
-             * `inactive', which is a settled state and is indistinguishable from one
-             * that ran and refused.  Three seconds is longer than systemd takes to
-             * begin a job it has already accepted and far shorter than anything this
-             * page would otherwise wait, so it costs nothing and stops the page
-             * reporting a failure that has not happened.
+             * `!smbd.job' IS THE WHOLE GUARD, and it used to be a three-second
+             * stopwatch.  A start job PID 1 has accepted but not begun leaves the
+             * unit at `inactive' -- settled, and indistinguishable from a refusal --
+             * and smbd.service is ordered after network-online.target, nmbd and
+             * winbind, so how long it sits there is not a number anybody can pick in
+             * advance.  systemd publishes the job; asking is exact and counting was
+             * a guess.  See bug EIGHT in sharing.h.
              */
             endWatch(false);
         } else if (m_startGraceMs <= 0) {
@@ -1708,7 +1795,15 @@ void SharingPage::onActivated(int index)
          * works without the NetBIOS name, so its failure is not the switch's. */
         setEnabled(QString::fromLatin1(kNmbd), turningOn);
 
-        m_enabled = unitEnabled(QString::fromLatin1(kSmbd));
+        /* Same rule as poll()'s: a switch is redrawn from an answer and not from
+         * silence.  If this fork did not run, the press stands as made and the
+         * next tick reads the card. */
+        bool answered = false;
+        const bool now = unitEnabled(QString::fromLatin1(kSmbd), &answered);
+        if (answered)
+            m_enabled = now;
+        else
+            m_enabled = turningOn;
         if (!err.isEmpty())
             m_note = err;
         else

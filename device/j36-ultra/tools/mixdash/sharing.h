@@ -163,6 +163,45 @@
  * `After=nmb.service' and a queued nmbd job is therefore something a queued smbd
  * job can be made to wait for.  The share does not need the NetBIOS name; it needs
  * smbd.
+ *
+ * ── AND ONCE MORE: SEVEN AND EIGHT, WHICH ARE THE SAME MISTAKE TWICE ─────────
+ *
+ * "Sharing does not work, the knobs reset, it never shares over the network,
+ * although we're connected to internet."  KNOBS, plural, and the plural is the
+ * finding: bugs ONE to SIX are all about the start, and there is a second switch on
+ * this page that has nothing to do with starting anything.
+ *
+ * SEVEN: "I COULD NOT ASK" WAS DRAWN AS "OFF".  systemctl() returns an empty string
+ * for a fork that timed out or never started, and the note above it called every
+ * caller reading that as "no" a deliberate bargain.  It is -- for is-active, where a
+ * systemd nobody can reach is genuinely not a share anybody can open.  It is not for
+ * is-enabled: "start at boot" is a symlink on the card, and a page that could not
+ * read the card has learnt nothing about the setting.  poll() assigned BOTH flags
+ * from those queries every four seconds, so one slow fork redrew both switches in
+ * the off position and the next tick put them back -- which, watched from the sofa,
+ * is a knob that resets.
+ *
+ * And a slow fork is the ordinary case here, not the exceptional one.  The budget
+ * was one second to get systemctl RUNNING; systemctl links libsystemd-shared, which
+ * is several megabytes off an SD card on a Cortex-A7, and Shell's waits spend part
+ * of that same budget repainting a 640x480 panel in software between slices.  So the
+ * fix is in three places: the budget is four seconds, the answer carries whether it
+ * IS an answer, and a tick that did not get one leaves both switches where they
+ * were.
+ *
+ * EIGHT: A QUEUED JOB WAS TIMED WITH A STOPWATCH INSTEAD OF ASKED ABOUT.  A start
+ * job PID 1 has accepted but not begun leaves ActiveState at `inactive' -- settled,
+ * indistinguishable from a refusal -- and poll() gave that three seconds' benefit of
+ * the doubt before calling the start dead.  Three seconds is a guess about how long
+ * systemd takes to dequeue, and it is wrong whenever the job is ordered behind
+ * something: smbd.service is `After=network-online.target nmbd.service
+ * winbind.service', and any of those still moving holds the job at `inactive' for as
+ * long as it takes.  systemd publishes the job -- `Job=' in `systemctl show' -- so
+ * the page asks rather than counts, and the three-second window is gone.
+ *
+ * Both of those come out of the same fork now.  A tick used to be two systemctl
+ * runs, is-active and is-enabled; it is one `show' with three properties in it,
+ * which halves the exposure to the very slowness that caused SEVEN.
  */
 #ifndef MIXDASH_SHARING_H
 #define MIXDASH_SHARING_H
@@ -220,10 +259,38 @@ private:
      * answer.  The distinction between the first two is the whole of bug ONE. */
     static QString activeState(const QString &unit);
     static bool unitActive(const QString &unit);
-    static bool unitEnabled(const QString &unit);
+    /*
+     * `answered', when asked for, says whether systemd was reached AT ALL -- which
+     * is not the same question as whether the unit is enabled, and conflating the
+     * two is bug SEVEN.  A fork that never started returns false with *answered
+     * false, and a caller that draws a switch from it must keep what it had.
+     */
+    static bool unitEnabled(const QString &unit, bool *answered = nullptr);
     /* True while the unit is still moving, so waiting longer might change the
      * answer.  Anything else has settled and will not. */
     static bool stateIsTransient(const QString &state);
+
+    /*
+     * ── WHAT ONE POLL TICK NEEDS, OUT OF ONE FORK ────────────────────────────
+     *
+     * `answered' is the field that matters and the one that did not exist.  Every
+     * query on this page returns empty on a fork that did not run, and empty read
+     * as "no" is right for is-active -- a wedged systemd is not a share anybody can
+     * reach -- and WRONG for is-enabled, because "start at boot" is a setting on the
+     * card and not a live state.  One slow fork redrew it as off.
+     *
+     * `job' is the other half.  A queued start job that PID 1 has not begun leaves
+     * ActiveState at `inactive', which is a settled state and reads as a refusal;
+     * the page used to guess its way past that with a three-second stopwatch.
+     * systemd will simply say, so it is asked instead of timed.
+     */
+    struct UnitSnapshot {
+        bool answered = false;  /* systemd was reached; the rest means something */
+        QString state;          /* ActiveState: active, activating, inactive, ... */
+        QString fileState;      /* UnitFileState: enabled, disabled, masked, ... */
+        bool job = false;       /* a job for this unit is queued or running */
+    };
+    static UnitSnapshot readUnit(const QString &unit);
     /* One field out of `systemctl show', right-hand side only. */
     static QString unitProperty(const QString &unit, const QString &prop);
     /* systemd's FragmentPath for the unit: where the .service file really is. */
