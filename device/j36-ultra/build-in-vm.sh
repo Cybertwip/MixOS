@@ -12482,11 +12482,22 @@ if [ -n "$dash" ]; then
     # APPENDED, and in one write.  The line is far below PIPE_BUF, so two shells
     # asking at once cannot interleave; the dashboard renames the file before
     # reading it, so a line appended while it reads is not lost either.
-    if printf 'run %s\n' "$cmd" >> "$QUEUE" 2>/dev/null \
-       && kill -USR2 "$dash" 2>/dev/null; then
+    #
+    # THE THREE OUTCOMES ARE NOT TWO.  Nothing written means nothing can run
+    # twice, so that one falls through to the session below.  Written and
+    # signalled is done.  Written and NOT signalled is the one that must stop
+    # here: the line is in the queue and asking the session as well would open the
+    # window twice the moment anything reads it.  It says where the request went
+    # rather than pretending it did not happen.
+    if ! printf 'run %s\n' "$cmd" >> "$QUEUE" 2>/dev/null; then
+        echo "j36-xrun: cannot write $QUEUE; asking the session directly instead." >&2
+    elif kill -USR2 "$dash" 2>/dev/null; then
         exit 0
+    else
+        echo "j36-xrun: the dashboard went away between being found and being asked." >&2
+        echo "          The command is in $QUEUE and runs when that is next read." >&2
+        exit 1
     fi
-    echo "j36-xrun: the dashboard would not take the request; trying the session." >&2
 fi
 
 # No dashboard, or it did not answer.  Is there a session?  ASKED OF THE PID AND
