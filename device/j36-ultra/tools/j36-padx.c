@@ -686,7 +686,45 @@ static void release_directions(unsigned dirs)
     if (dirs & DIR_RIGHT) key_state(kc.right, 0);
 }
 
-/* Find the client carrying _NET_WM_PID, even when matchbox has reparented it. */
+/* A session card owns the PID of the shell that launched its command.  Most small
+ * clients exec in place, but browsers commonly leave that shell waiting while a
+ * child owns the X window.  Walk /proc rather than requiring those two PIDs to be
+ * identical, so the card still names the whole launched client. */
+static int pid_belongs_to(unsigned long candidate, unsigned long launcher)
+{
+    int depth;
+
+    for (depth = 0; candidate > 1 && depth < 64; depth++) {
+        char path[64], stat[512], *end;
+        char state;
+        long parent;
+        int fd;
+        ssize_t got;
+
+        if (candidate == launcher)
+            return 1;
+        snprintf(path, sizeof path, "/proc/%lu/stat", candidate);
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            break;
+        got = read(fd, stat, sizeof stat - 1);
+        close(fd);
+        if (got <= 0)
+            break;
+        stat[got] = '\0';
+        /* comm is parenthesised and may itself contain spaces or parentheses;
+         * everything following its last ')' begins with state and PPID. */
+        end = strrchr(stat, ')');
+        if (!end || sscanf(end + 1, " %c %ld", &state, &parent) != 2
+            || parent <= 0 || (unsigned long)parent == candidate)
+            break;
+        candidate = (unsigned long)parent;
+    }
+    return 0;
+}
+
+/* Find the client carrying the launcher's _NET_WM_PID (or a descendant's), even
+ * when matchbox has reparented the X window. */
 static Window window_for_pid(Window at, unsigned long wanted, int depth)
 {
     Atom atom, actual;
@@ -703,7 +741,7 @@ static Window window_for_pid(Window at, unsigned long wanted, int depth)
         && XGetWindowProperty(dpy, at, atom, 0, 1, False, XA_CARDINAL,
                               &actual, &format, &nitems, &after, &data) == Success) {
         if (data && actual == XA_CARDINAL && format == 32 && nitems == 1
-            && *(unsigned long *)data == wanted) {
+            && pid_belongs_to(*(unsigned long *)data, wanted)) {
             XFree(data);
             return at;
         }
