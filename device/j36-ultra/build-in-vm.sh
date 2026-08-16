@@ -1980,6 +1980,78 @@ splash_off() {
     return 0
 }
 
+# ── A stage that says nothing, and the difference between slow and dead ───────
+#
+# say() pings the fuse on every line, so a stage that TALKS can no longer be
+# mistaken for a stage that has died.  What that did not cover, and what has now
+# been reported twice -- once on the audio modules and once on the graphics core
+# -- is a stage that spends its whole time inside ONE call.  `insmod' says
+# nothing between the moment it is typed and the moment the module's probe
+# returns, and mfgpower says nothing until it has finished reading the GPU.  Both
+# are silent by construction, so ninety seconds inside either one is ninety
+# seconds of silence, the fuse blows, and the panel goes back to a text console
+# that then has the charger driver's level messages scrolling the post-mortem off
+# the top of it.  That is exactly what the panel looks like from the outside.
+#
+# AND THE FUSE IS NOT THE BUG, it is the symptom.  The bug is that /init has no
+# way back out of a call that does not return.  This board has one that really
+# does not: a register read into a power domain that did not come up stalls the
+# AXI, which is the whole reason mfgpower exists, and if it happens anyway --
+# inside mfgpower itself, or inside lima's probe -- then the process is not slow,
+# it is gone, and no amount of patience recovers it.  A GPU is a feature.  The
+# dashboard is the product.  So the work is bounded, and when the bound is
+# reached the boot carries on without it, which is what "seamless end-to-end"
+# has to mean on a device whose only recovery is taking the card out.
+#
+# This is the card scan's ticker generalised, and it follows the same two rules
+# for the same reason: the work is FORKED, and the child ANSWERS by writing its
+# exit status to a file rather than being waited on or signalled, because `wait'
+# on a specific job and `kill' are neither of them things this initramfs can do.
+# Meanwhile the child says which step it is on through $watch_status and the
+# parent renders that with the elapsed seconds beside it, so a stage that wedges
+# now names the module it wedged in instead of leaving the last word on the panel
+# to whatever the kernel happened to print next.
+#
+# It costs up to one second per stage -- the parent can be inside its `sleep 1'
+# when the child answers -- and that is the price of the bound.  Six stages, six
+# seconds, on a boot that is otherwise capable of not finishing at all.
+watch_status=/dev/.watch-status
+watch_result=/dev/.watch-result
+watch_say() {
+    echo "$1" > "$watch_status" 2>/dev/null
+    return 0
+}
+watch_run() {
+    watch_limit="$1"; watch_label="$2"; shift 2
+    : > "$watch_status"
+    : > "$watch_result"
+    watch_say "$watch_label"
+    # </dev/null because these run inside `while read ... done < load.order' and a
+    # child sharing that file description could move the parent's offset.
+    ( "$@" </dev/null; echo "$?" > "$watch_result" ) &
+    watch_waited=0
+    while [ ! -s "$watch_result" ]; do
+        if [ "$watch_waited" -ge "$watch_limit" ]; then
+            say "$watch_label: nothing back in ${watch_waited}s; carrying on without it"
+            detail "$watch_label -- gave up after ${watch_waited}s"
+            return 124
+        fi
+        # An empty read is the status file caught between its truncate and its
+        # write, which is a tick of the stage's own name and not a blank line.
+        watch_step=""
+        if [ -s "$watch_status" ]; then read -r watch_step < "$watch_status"; fi
+        if [ -z "$watch_step" ]; then watch_step="$watch_label"; fi
+        detail "$watch_step -- ${watch_waited}s"
+        watch_waited=$((watch_waited + 1))
+        sleep 1
+    done
+    read -r watch_rc < "$watch_result"
+    # `return' wants a number and the file is written by a shell that could in
+    # principle have been killed mid-write.  125 is "the child did not say".
+    case "$watch_rc" in ''|*[!0-9]*) watch_rc=125 ;; esac
+    return "$watch_rc"
+}
+
 say ""
 say "J36 Ultra ARMv7 bring-up initramfs"
 say "Display: the LK's framebuffer on /dev/fb0 until something opens /dev/dri/card0."
@@ -3779,6 +3851,13 @@ run_lima() {
         say "lima: j36/modules/load.order is missing; nothing to load"
         return 1
     fi
+    # Named before it is run and not after, on the panel and on the cable both.
+    # This is the one call on the whole boot that can stall the AXI and never come
+    # back, and if it does, the last thing said is the only evidence there will
+    # ever be of where it stopped -- there is no dmesg to read afterwards and no
+    # exit status to report.
+    say "lima: powering the MFG domain through the SPM"
+    watch_say "MFG power domain"
     "$payload/mfgpower" >/tmp/mfgpower.log 2>&1
     rc=$?
     show /tmp/mfgpower.log
@@ -3788,6 +3867,11 @@ run_lima() {
     fi
     while IFS= read -r ko; do
         case "$ko" in ''|'#'*) continue ;; esac
+        # Same ordering, same reason: lima's probe resets the GP, both L2s, four
+        # PPs and every MMU, and it does all of it inside init_module.  A module
+        # that takes a long time to probe is the one whose name should be on the
+        # screen while it does, not once it has finished.
+        watch_say "$ko"
         if insmod "$payload/modules/$ko" >/tmp/insmod.log 2>&1; then
             say "lima: loaded $ko"
         else
@@ -3839,6 +3923,7 @@ run_mtkdrm() {
     fi
     while IFS= read -r ko; do
         case "$ko" in ''|'#'*) continue ;; esac
+        watch_say "$ko"
         if insmod "$payload/mtkdrm/$ko" >/tmp/insmod.log 2>&1; then
             say "mtkdrm: loaded $ko"
         else
@@ -3891,7 +3976,13 @@ run_audio() {
         # codec probe touches the PMIC, and the input driver loaded at progress 4
         # is already sampling the AUXADC every 5 ms for the headphone line -- so
         # this stage in particular should not be a still picture.
-        detail "$ko"
+        #
+        # watch_say and not detail, because this whole function now runs in the
+        # forked half of watch_run: the parent is writing a detail line a second
+        # with the elapsed count on it, and a detail from in here would be
+        # overwritten by the next tick anyway.  The status file is how the child
+        # gets a word into that line.
+        watch_say "$ko"
         if insmod "$payload/audio/$ko" $params >/tmp/insmod.log 2>&1; then
             say "audio: loaded $ko $params"
         else
@@ -3976,6 +4067,7 @@ run_usb() {
                 esac
                 ;;
         esac
+        watch_say "$ko"
         if insmod "$payload/usb/$ko" $args >/tmp/insmod.log 2>&1; then
             say "usb: loaded $ko${args:+ $args}"
         else
@@ -4097,6 +4189,7 @@ run_power() {
                 [ "$power_charge" = 1 ] || args="charge=0"
                 ;;
         esac
+        watch_say "$ko"
         if insmod "$payload/power/$ko" $args >/tmp/insmod.log 2>&1; then
             say "power: loaded $ko${args:+ $args}"
         else
@@ -4212,6 +4305,7 @@ run_wifi() {
             say "wifi: $ko is already loaded"
             continue
         fi
+        watch_say "$ko"
         if insmod "$payload/wifi/$ko" >/tmp/insmod.log 2>&1; then
             say "wifi: loaded $ko"
         else
@@ -4244,6 +4338,7 @@ run_wifi() {
     # configured.  A boot-time test that silently never matches would turn every
     # failed bring-up into the "still running" verdict.
     i=0
+    watch_say "waiting for the WLAN interface"
     while [ "$i" -lt 8 ]; do
         if wlan_iface >/dev/null; then break; fi
         if dmesg | grep -q 'j36-mt6592-wifi.*no interface was registered'; then break; fi
@@ -6765,9 +6860,30 @@ stage_from_boot
 if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_gl" = 1 ] || \
    [ "$want_audio" = 1 ] || [ "$want_usb" = 1 ] || [ "$want_power" = 1 ] || \
    [ "$want_wifi" = 1 ]; then
-    # find_payload is called by each of the four rather than once here, so that a card
-    # with no payload at all gets one message per word that was asked for, naming the
-    # word -- and so that this block does not have to know which of them needs what.
+    # find_payload used to be called by each of the four rather than once here, so
+    # that a card with no payload at all got one message per word that was asked for,
+    # naming the word -- and so that this block did not have to know which of them
+    # needs what.  Each of them still calls it and it is still what names the word,
+    # but it is called HERE FIRST, and the reason is the fork below: find_payload can
+    # mount the BOOT partition, and mount_bootfs records that it did by setting
+    # bootfs_mounted, which the umount at the bottom of this block reads.  A fork does
+    # not unshare the mount namespace -- the mount would be real for this shell -- but
+    # it does not share variables either, so a child that mounted /bootfs would leave
+    # this shell believing nothing was mounted and hand a vfat mount across
+    # switch_root for systemd to inherit and nobody to own.  One call up here settles
+    # $payload and $bootfs_mounted in the parent; every call below it returns on its
+    # first line.  Its status is deliberately ignored: no payload is a thing each
+    # runner reports for itself, in its own words.
+    #
+    # AND EACH OF THEM IS FORKED AND BOUNDED, which is what watch_run does and why it
+    # exists -- see the comment on it.  These are the stages that spend their time
+    # inside insmod, they are the stages that have been seen to outrun the splash's
+    # fuse, and one of them can stall the AXI outright.  Sixty seconds is not a
+    # measurement of how long any of them takes; it is far past anything a working one
+    # has ever needed, and the point of it is that a device with no GPU still reaches
+    # the dashboard.  setup_gl is NOT wrapped, and that is not an oversight: it sets
+    # gl_ready, setup_dash reads it, and a variable set in a child is a variable this
+    # shell never sees.  It is also the one item here that touches no hardware.
     #
     # lima first: it is the one payload with a hardware gate in front of it, and
     # nothing else should be loaded if the MFG domain does not come up.  mtkdrm
@@ -6788,17 +6904,18 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_gl" = 1 ] || \
     # roughly where each of these lands in the wall-clock of a working boot, so
     # the bar tracks time rather than tasks.  run_lima carries the MFG power
     # sequence and takes the longest of the five.
+    find_payload
     if [ "$want_lima" = 1 ]; then
         stage "Starting the graphics core"; detail "MFG power domain, lima"
-        progress 40; run_lima
+        progress 40; watch_run 60 "MFG power domain, lima" run_lima
     fi
     if [ "$want_mtkdrm" = 1 ]; then
         stage "Starting the display controller"; detail "mediatek-drm, MIPI-DSI, panel"
-        progress 55; run_mtkdrm
+        progress 55; watch_run 60 "mediatek-drm, MIPI-DSI, panel" run_mtkdrm
     fi
     if [ "$want_audio" = 1 ]; then
         stage "Starting audio"; detail "MT6592 AFE, MT6323 codec"
-        progress 62; run_audio
+        progress 62; watch_run 60 "MT6592 AFE, MT6323 codec" run_audio
         # Straight after the card, and not down with setup_dash.  run_audio has
         # just told us whether /dev/snd exists, which is the only thing worth
         # gating this on, and `default' is a property of the machine rather than
@@ -6808,7 +6925,7 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_gl" = 1 ] || \
     fi
     if [ "$want_usb" = 1 ]; then
         stage "Starting USB"; detail "MUSB host, hub, HID"
-        progress 68; run_usb
+        progress 68; watch_run 60 "MUSB host, hub, HID" run_usb
     fi
     # After USB, and one module, so it costs almost nothing in the bar.  The
     # order against run_usb is the one described on run_power: the PMIC samples
@@ -6818,7 +6935,7 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_gl" = 1 ] || \
     # longer decides charging -- but there is no reason to give it up.
     if [ "$want_power" = 1 ]; then
         stage "Starting power management"; detail "MT6323 gauge, charger, poweroff"
-        progress 71; run_power
+        progress 71; watch_run 60 "MT6323 gauge, charger, poweroff" run_power
     fi
     # After the PMIC and not before it: the connectivity rails are on the MT6323
     # and this module reaches them through symbols the PMIC module exports, so
@@ -6827,7 +6944,7 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_gl" = 1 ] || \
     # bound on the wait in run_wifi.
     if [ "$want_wifi" = 1 ]; then
         stage "Starting Wi-Fi"; detail "CONSYS power, BTIF link, firmware, wlan0"
-        progress 73; run_wifi
+        progress 73; watch_run 90 "CONSYS power, BTIF link, firmware, wlan0" run_wifi
     fi
     if [ "$want_gl" = 1 ]; then
         stage "Staging OpenGL"; detail "Mesa, EGL, GLESv2"

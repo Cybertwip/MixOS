@@ -171,13 +171,33 @@ static int mfg_power_on(void)
 	       rd(spm, SPM_MFG_PWR_CON), rd(spm, SPM_PWR_STATUS),
 	       rd(spm, SPM_PWR_STATUS_S));
 
+	/*
+	 * ONLY THE MTCMOS RAMP IS SKIPPED WHEN THE DOMAIN IS ALREADY UP, and the
+	 * word "only" is the fix.  The whole tail of this sequence used to sit
+	 * inside the else, so a board whose status bits were already set went
+	 * from here straight to reading the Mali -- with isolation possibly still
+	 * asserted, the clock possibly still disabled, reset-not possibly still
+	 * low and the SRAM possibly still in power-down, none of which the status
+	 * bits say anything about.  They report the MTCMOS switch and nothing
+	 * else.  A read into a domain in that state is the AXI stall this whole
+	 * program exists to prevent, and it does not fail, it does not time out
+	 * and it does not come back: /init sits inside it, the splash's fuse
+	 * blows ninety seconds later, and the panel goes to a text console that
+	 * never gets any further.  That is the boot that hangs at "Starting the
+	 * graphics core", and it is reachable on any warm restart that leaves the
+	 * switch on while resetting the bits around it.
+	 *
+	 * What the LK's sequence actually says is that re-running PWR_ON on a
+	 * live domain is not a no-op -- and that is true of PWR_ON and PWR_ON_S,
+	 * which drive an analogue ramp.  It is not true of the four below.  On a
+	 * domain that really is up they are already in the state they are being
+	 * written to, so writing them again changes nothing; on a domain that is
+	 * only half up they are the difference between a GPU and a wedged board.
+	 * So the ramp is conditional and the rest is unconditional.
+	 */
 	if ((rd(spm, SPM_PWR_STATUS) & MFG_PWR_STA_MASK) &&
 	    (rd(spm, SPM_PWR_STATUS_S) & MFG_PWR_STA_MASK)) {
-		/* Both status bits already set: something powered this domain
-		 * before us.  The LK's own sequence skips the ramp in exactly
-		 * this case, and so does this -- re-running PWR_ON on a live
-		 * domain is not a no-op. */
-		printf("mfgpower: the MFG domain was already powered; leaving the ramp alone\n");
+		printf("mfgpower: the MFG domain was already powered; skipping the MTCMOS ramp\n");
 	} else {
 		wr(spm, SPM_MFG_PWR_CON, rd(spm, SPM_MFG_PWR_CON) | PWR_ON);
 		wr(spm, SPM_MFG_PWR_CON, rd(spm, SPM_MFG_PWR_CON) | PWR_ON_S);
@@ -190,23 +210,44 @@ static int mfg_power_on(void)
 				rd(spm, SPM_MFG_PWR_CON));
 			return -1;
 		}
+	}
 
-		/* Order matters and it is the LK's order: release the clock and
-		 * the isolation cell, assert reset-not, and only then bring the
-		 * SRAM out of power-down and wait for its ack. */
-		value = rd(spm, SPM_MFG_PWR_CON);
-		value &= ~(PWR_CLK_DIS | PWR_ISO);
-		value |= PWR_RST_B;
-		wr(spm, SPM_MFG_PWR_CON, value);
-		wr(spm, SPM_MFG_PWR_CON, rd(spm, SPM_MFG_PWR_CON) & ~SRAM_PDN);
-		if (wait_mask(spm, SPM_MFG_PWR_CON, MFG_SRAM_ACK, 0u)) {
-			fprintf(stderr,
-				"mfgpower: MFG SRAM stayed powered down (MFG_PWR_CON=0x%08x)\n",
-				rd(spm, SPM_MFG_PWR_CON));
-			return -1;
-		}
-		printf("mfgpower: MFG domain powered, MFG_PWR_CON=0x%08x\n",
-		       rd(spm, SPM_MFG_PWR_CON));
+	/* Order matters and it is the LK's order: release the clock and the
+	 * isolation cell, assert reset-not, and only then bring the SRAM out of
+	 * power-down and wait for its ack. */
+	value = rd(spm, SPM_MFG_PWR_CON);
+	value &= ~(PWR_CLK_DIS | PWR_ISO);
+	value |= PWR_RST_B;
+	wr(spm, SPM_MFG_PWR_CON, value);
+	wr(spm, SPM_MFG_PWR_CON, rd(spm, SPM_MFG_PWR_CON) & ~SRAM_PDN);
+	if (wait_mask(spm, SPM_MFG_PWR_CON, MFG_SRAM_ACK, 0u)) {
+		fprintf(stderr,
+			"mfgpower: MFG SRAM stayed powered down (MFG_PWR_CON=0x%08x)\n",
+			rd(spm, SPM_MFG_PWR_CON));
+		return -1;
+	}
+	printf("mfgpower: MFG domain powered, MFG_PWR_CON=0x%08x\n",
+	       rd(spm, SPM_MFG_PWR_CON));
+
+	/*
+	 * THE LAST READ THAT IS STILL SAFE.  Everything from the next line on --
+	 * the MFG clock gate at 0x13000000 and every register identify() looks
+	 * at -- lives inside the domain, and SPM does not.  So this is the last
+	 * chance to turn a hang into a sentence, and it is one read: if the four
+	 * bits that make the domain reachable are not what they were just written
+	 * to be, the writes did not take, and the correct answer is to say so and
+	 * let /init boot without a GPU.  A message costs the Mali-450.  A read
+	 * into a domain that is not there costs the boot.
+	 */
+	value = rd(spm, SPM_MFG_PWR_CON);
+	if ((value & (PWR_ISO | PWR_CLK_DIS | MFG_SRAM_ACK)) ||
+	    !(value & PWR_RST_B)) {
+		fprintf(stderr,
+			"mfgpower: the MFG domain did not come out of isolation/reset (MFG_PWR_CON=0x%08x)\n",
+			value);
+		fprintf(stderr,
+			"mfgpower: refusing to read the GPU; that access would not return\n");
+		return -1;
 	}
 
 	/* Both gates, in the LK's order.  SMI common first, because the GPU's
@@ -256,8 +297,16 @@ static int identify(void)
 
 int main(void)
 {
-	int fd = open("/dev/mem", O_RDWR | O_SYNC);
+	int fd;
 
+	/* /init runs this with stdout on a file, and a file makes stdout fully
+	 * buffered: the register values printed on the way in would sit in a 4 KB
+	 * buffer and be lost if an access below never returned -- which is exactly
+	 * the failure they are printed to explain.  Line buffering costs one write
+	 * per line, on a program that prints seven. */
+	setvbuf(stdout, NULL, _IOLBF, 0);
+
+	fd = open("/dev/mem", O_RDWR | O_SYNC);
 	if (fd < 0) {
 		fprintf(stderr, "mfgpower: /dev/mem: %s\n", strerror(errno));
 		fprintf(stderr,
