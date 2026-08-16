@@ -116,6 +116,15 @@ const char kBrowserFallbackUrl[] = "https://duckduckgo.com/";
 const char kXSession[] = "/opt/mixos/bin/j36-xsession";
 const char kXSessionCtl[] = "/run/j36/xsession.ctl";
 const char kXSessionWindows[] = "/run/j36/xsession.windows";
+/*
+ * The supervisor's own pid, written by j36-xsession-main when it comes up and
+ * removed on its way out.  It exists so a question can be asked WITHOUT touching
+ * the pipe -- j36-xrun reads it for the same reason -- and here it answers the one
+ * that matters when a request down the pipe has just failed: is there still a
+ * session there at all, or is this program holding a row for something that has
+ * already gone?  See launchWindowed().
+ */
+const char kXSessionPid[] = "/run/j36/xsession.pid";
 
 /*
  * The graphical session's path if this card can actually run one, and an empty
@@ -200,6 +209,41 @@ bool writeSessionControl(const QString &line)
     const qint64 n = ::write(fd, b.constData(), size_t(b.size()));
     ::close(fd);
     return n == b.size();
+}
+
+/*
+ * Is the session's supervisor still alive?
+ *
+ * ONLY ASKED WHEN A REQUEST HAS ALREADY FAILED, and the distinction it draws is the
+ * whole reason it exists.  A write into the control pipe can fail two ways that look
+ * identical from here and want opposite handling:
+ *
+ *   the supervisor is gone   its FIFO was tidied away, or is still there with
+ *                            nothing reading it.  The row in the task list is a
+ *                            ghost -- the process has exited and this program has
+ *                            simply not been told yet -- and the right answer is to
+ *                            clear it, not to ask the user to go and close it.
+ *   the supervisor is up     but never got a pipe: mkfifo can fail, and the session
+ *                            says so and runs on without one.  That session has a
+ *                            window in it, probably the one on the glass, and
+ *                            killing it because a request bounced would be this
+ *                            program destroying working state to tidy up.
+ *
+ * The pidfile separates them and the pipe cannot.  A stale pidfile whose number has
+ * been reused is conceivable and is the reason this is only ever used to decide
+ * whether to be MORE careful: the worst it can do is leave a dead row in the list
+ * and print the old sentence.
+ */
+bool sessionSupervisorAlive()
+{
+    QFile f(QString::fromLatin1(kXSessionPid));
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return false;
+    bool ok = false;
+    const qint64 pid = f.read(32).trimmed().toLongLong(&ok);
+    if (!ok || pid <= 0)
+        return false;
+    return ::kill((pid_t)pid, 0) == 0;
 }
 
 /*
@@ -1979,13 +2023,41 @@ void Dashboard::launchWindowed(const QString &title, const QString &exe,
 
     if (!writeSessionControl(QStringLiteral("run ") + cmd)) {
         /*
-         * The session is in the task list but its pipe is not there or nothing is
-         * reading it -- a supervisor that died while its X server lived, which is
-         * not a state anything here can repair from the outside.  Said plainly,
-         * with the one action that fixes it.
+         * ── A ROW FOR A SESSION THAT IS NOT THERE ────────────────────────────
+         *
+         * The pipe is gone, or nothing is reading it.  This used to be reported
+         * as "not answering" with an instruction to go and close it in the
+         * switcher, and that sentence was written for the rare case -- a
+         * supervisor that died while its X server lived.  The case that actually
+         * happened is the ordinary one: the session ended a moment ago, and the
+         * only reason there is still a row for it is that this program has not
+         * been given its finished() yet.  Sending the user to close a task that
+         * has already exited is asking them to tidy up after a bookkeeping lag.
+         *
+         * So the ghost is cleared here instead, by the group, exactly as
+         * closeTask() would -- SIGCONT first so a stopped process can act on the
+         * SIGTERM -- and the row goes when the exit arrives, which is the rule
+         * everywhere else in this file.
+         *
+         * AND NOT RELAUNCHED IN THE SAME BREATH, deliberately.  If any of that
+         * tree is still alive it is an X server on its way down, and starting the
+         * next session on top of it is two servers on one framebuffer, which is
+         * the one thing this whole arrangement exists to prevent.  One more press
+         * is a second of the user's time; two X servers is a board that has to be
+         * power-cycled.
          */
-        toast(tr("The desktop is not answering. Close it in the switcher and "
-                 "open it again."), 5000);
+        if (sessionSupervisorAlive()) {
+            toast(tr("The desktop is not answering. Close it in the switcher and "
+                     "open it again."), 5000);
+            return;
+        }
+        Task &dead = m_tasks[session];
+        signalTask(dead.pgid, SIGCONT);
+        dead.stopped = false;
+        signalTask(dead.pgid, SIGTERM);
+        refreshSwitcher();
+        toast(tr("The desktop had already closed. Press %1 again.").arg(title),
+              5000);
         return;
     }
 
