@@ -361,6 +361,144 @@ into a 128-byte name; the precision is now explicit.
 rootfs rounded up to the next GiB, and the headroom comes from the card the operator
 actually bought.
 
+**The panel stopped with `mediatek.ko` as the last word on it and never came back.** Not a
+crash — a bus stall. On this SoC an APB or AXI access to a peripheral whose clock gate is
+shut does not fault; it stalls every master on the bus, the display included, and with the
+loader leaving the watchdog off that is a handheld that is dead until the battery is pulled.
+`j36_mt6592_usb_phy`'s `.power_on` was doing its role decision from inside
+`musb_init_controller()` — before the core had read its own config, before
+`musb_generic_disable()`, before the IRQ was requested — and what it did there was not a
+register read: it raised DRVVBUS, slept 100 ms, wrote `DEVCTL` and `POWER`, parked the PHY,
+started a session and forced the valids. A sixth of a second of live sequencing on the MAC
+and on an external power net, interleaved with a core mid-initialisation on the same
+registers. It was also **already known to be pointless**: `musb_generic_disable()` writes
+`DEVCTL = 0` a moment later and `musb_start()` begins its own session from the hub thread, so
+the arm that survives is the one the first role poll makes three seconds later on a bus
+nobody else is touching. The role is now decided there and only there; `role_at_power_on=1`
+puts the old order back for bisecting.
+
+**And a boot that dies inside a stage now costs one stage and not the device.** No amount of
+userspace care can prevent a bus stall, so `/init` bounds what one can cost instead. Each
+boot stage's key is written to the OS partition and `sync`ed before it is forked and cleared
+when it answers — for any reason, including its own timeout — so a key still on the card at
+the next boot means one thing: the board died with that stage in flight. It is skipped once,
+the key is cleared, and the boot after that tries it again. One skip, never a latch: this
+failure is intermittent, and a permanent disable would trade a rare dead boot for a
+permanently crippled device. What it promises is narrow and is what was asked for — however
+badly a stage misbehaves, the *second* power-on reaches the dashboard.
+
+**mixsplash went to a text console during "Starting the graphics core", and stayed there for
+minutes.** `say()` pings the splash's fuse on every line, so a stage that *talks* could no
+longer be mistaken for one that had died — but that does nothing for a stage that spends its
+whole life inside a single call. `insmod` says nothing until it returns and `mfgpower` said
+nothing until it had finished reading the GPU, so ninety seconds inside either is ninety
+seconds of silence and the fuse blows. Those stages now run under a bound of their own with a
+detail line and elapsed seconds beside them, and `mfgpower` reports the MTCMOS ramp step by
+step — including refusing to read the GPU when the MFG domain did not come out of isolation,
+which is the access that would not return. A wedge now says which call it is in.
+
+**The PMIC printed a line of telemetry every second, for the life of the device.** `VBUS=1
+CHRDET=1 src=1 VCHR … CS_DET=0 pack … VBAT … level 100%` twenty polls apart, for ever. The
+numbers are worth having; what was wrong was *when*. The line is now printed when one of the
+things on it has something new to say — compared against what was last **printed** rather
+than binned into buckets, because a bucket edge with a reading that dithers across it prints
+every poll, which is the disease and not the cure. `charging_line_every=20` restores the old
+heartbeat, and the diagnostics it used to carry are reachable through `sysfs` without a
+rebuild: a diagnostic you have to rebuild for is a diagnostic nobody has when they need it.
+
+**The Desktop card said "Desktop Exited".** Firefox refuses to run as root when `$HOME`
+belongs to somebody else — the test is `geteuid() == 0 && HOME is not root's &&
+!MOZ_ALLOW_ROOT` — and this session is root with `HOME=/home/virtua`, because there is no
+login and no user session. It printed one sentence to a log nobody was reading and exited,
+which the dashboard correctly reported as the window having exited. `MOZ_ALLOW_ROOT=1` is
+Mozilla's own way out of that check and the only one; moving `HOME` to `/root` would put
+every download somewhere the Files page does not look. Alongside it, a row for a session that
+has already gone is now cleared by the dashboard instead of telling the user to go and close
+it in the switcher.
+
+**Sharing's knobs reset themselves and nothing was ever shared.** The page asked `systemctl`
+whether Samba was running and read an empty answer as "no" — which is right for `is-active`
+and wrong for `is-enabled`, where empty means the unit has no install section to answer
+about. So every poll tick decided the switch the user had just moved was off and put it back.
+The status poll is now one fork per tick that reports whether it got an answer at all, and a
+switch that cannot be verified is left where the user put it rather than being overwritten by
+a question that failed.
+
+**The Packages page needed two taps to show anything new.** Opening a collection re-drew the
+cached listing instead of re-asking, so a package that had just appeared in the archive
+because Update ran was still missing, and the summaries were whatever the last `apt-cache`
+said. Leaving the collection and opening it again worked because that is the path that
+rebuilt. Every view now re-runs itself on entry, restoring the cursor where it was, and the
+first `apt-cache` after an Update gets a minute rather than a few seconds — that is the call
+that waits for apt to rebuild its binary cache from indexes just downloaded, which is
+generous on a warm cache and not enough on a cold one on this CPU. When it does time out the
+page says apt may still be rebuilding, instead of showing an empty list.
+
+**Files, Media, Diagnostics and Settings opened part-way down their own lists.** A current
+index set before `layoutChanged` follows its item down the model as the rest of the listing
+arrives, so the selection ended up wherever its row had been pushed to. The top is now
+re-pinned after the model settles, and the first row of a directory is the first row —
+except when you come *back* from a directory, where the selection returns to the folder you
+just left, which is where the eye already is. Media and Files also grew a search box; `..`
+deliberately survives the filter, so a search that matches nothing still leaves the way out.
+
+**FN was doing two jobs and could do neither.** In the terminal it sent `Ctrl+C` and
+everywhere else it was the task switcher, so the gesture that leaves a program and the
+gesture that interrupts one were the same button. `Ctrl+C` is **Select** now, showing and
+hiding the keyboard is **Start**, and FN is the switcher and nothing else, on every page.
+The footer says so in all six languages.
+
+### The desktop
+
+**The loading ring froze on the last frame it drew.** `m_busy->stop()` only marks the ring's
+rectangle dirty; the `setUpdatesEnabled(false)` two lines later — which is what stops the
+dashboard drawing over a task that now owns the panel — meant the erase was never flushed.
+The last arc sat on `/dev/fb0` for as long as the child took to draw over it, which for a
+cold X server on this board is about a minute. There is now a synchronous `repaint()` between
+the two, so what is left on the glass is the dashboard and the sentence naming what is
+starting.
+
+**The desktop was black.** It was also running: X, matchbox, the keyboard daemon and the pad
+bridge were all up, and an X root with nothing set on it is black. That is correct, and it is
+indistinguishable from a session that failed to start — there is no title bar, no taskbar and
+no menu to click, because the pad is the only input and every gesture it has is invisible.
+`j36-padx` now paints a card onto the root window naming what each button does, hung on the
+root as a background pixmap so the server repaints it for free and there is no extra client
+to stack, focus or stop. It draws with core X fonts and degrades to its background if a
+future image drops them.
+
+**The pointer stayed on the screen when a task took the panel, and smeared when it moved.**
+The arrow was put to sleep *after* updates were switched off, so nothing painted over where
+it had been; the only thing that ever covered it was a successful full-panel restore, and
+there is nothing to restore the first time a task comes forward. It now sleeps and repaints
+its own rectangle while the dashboard can still draw. The rest of that class of artefact —
+anything mixdash left on the framebuffer that X does not know changed, because fbdev runs
+with ShadowFB and only copies out rectangles it thinks are damaged — is swept by a
+full-screen expose from `j36-padx` on every `SIGCONT`. It is `xrefresh(1)`, written out in
+twelve lines rather than added as a package.
+
+**A command typed at the Terminal never opened a window.** `j36-xrun` wrote `run <cmdline>`
+straight into the session's control pipe, which is correct only while the session is the task
+in front — and the one place anybody types a command on this device is the dashboard's own
+Terminal page, where the session is `SIGSTOP`ped and nothing is scheduled to read that pipe.
+The write *succeeded*, because a FIFO buffers: no error, no window, and the window opening
+minutes later when the user switched to the desktop for unrelated reasons. `j36-xrun` now
+asks the dashboard — the one process that can answer in every state, since it can continue a
+stopped session or start one that is not running at all — through a queue file and `SIGUSR2`,
+and the dashboard brings the desktop forward behind the window it just asked for. The old
+path is still there for a session running without a dashboard behind it.
+
+**The switcher named a button this case does not have.** Its footer said "Menu closes", and
+there is no key marked Menu on this device: the action is bound to `BTN_START`, which is
+silkscreened **Start**. So the one screen that offers a way out of the desktop was naming the
+wrong button to press to take it. The footer now reads `A switches — FN steps — Start closes
+— B cancels`, in all six languages. Alongside it, the switcher's own request flag is drained
+when it opens: mixdash calls the FN hold at 700 ms and `j36-padx` calls the same hold at
+1000, and when the `SIGSTOP` that would have silenced the second one was late, the flag sat
+set until the user chose a row — at which point the switcher came straight back up over their
+choice. That poll now runs for the whole life of the program rather than only while a task is
+in front, which is also what lets a `SIGUSR2` arrive from the Terminal page at all.
+
 ## Known gaps
 
 These are in the tree's plan and are not in this release:
