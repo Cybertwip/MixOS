@@ -105,7 +105,7 @@
  *     Right stick    scroll, proportional to deflection
  *     D-pad          arrow-key navigation (the only pad navigation source)
  *     A              left click
- *     B              Back            (Alt+Left)
+ *     B              Back (Alt+Left); exit when the desktop is empty
  *     X              Return
  *     Y              Escape
  *     L1 / R1        wheel up / wheel down, repeating while held
@@ -113,7 +113,7 @@
  *     L3 / R3        middle click / right click
  *     Select         show or hide the on-screen keyboard
  *     Start          focus the address bar   (Ctrl+L)
- *     Menu           HOLD to close the session
+ *     Menu           TAP next window; HOLD dashboard task switcher
  *     Vol- / Vol+    zoom out / zoom in      (Ctrl+minus / Ctrl+plus)
  *     Home (F12)     the start page          (Alt+Home)
  *
@@ -595,6 +595,7 @@ static Display *dpy;
 static int      scr;              /* the one screen this session has */
 static int      scr_w, scr_h;     /* and its size, which sets every speed below */
 static int      kbd_visible;
+static int      kbd_menu_hidden;  /* restored only when Menu proved to be a tap */
 
 /* The two speed ceilings, in pixels per second, worked out from the screen at
  * startup: see pointer_start() and the two SCREENS_PER_S constants it reads. */
@@ -929,7 +930,7 @@ static const struct {
     { "Left stick",    "the pointer" },
     { "D-pad",         "arrow-key navigation" },
     { "A",             "click  (L3 and R3 are the middle and right buttons)" },
-    { "B",             "back" },
+    { "B",             "back -- or exit when the desktop is empty" },
     { "X, Y",          "Enter, Escape" },
     { "L1, R1",        "scroll  (so does the right stick)" },
     { "L2, R2",        "page up, page down" },
@@ -1477,9 +1478,11 @@ static void kbd_events(void)
     }
 }
 
-static void kbd_toggle(void)
+static void kbd_set_visible(int visible)
 {
-    if (!kbd_visible) {
+    if (visible == kbd_visible)
+        return;
+    if (visible) {
         /* A direction held while Select is pressed was sent to the application
          * as a real key-down.  Release it before the keyboard takes ownership. */
         release_directions(dirs_all());
@@ -1489,8 +1492,15 @@ static void kbd_toggle(void)
     } else {
         kbd_visible = 0;
         XUnmapWindow(dpy, kbd_win);
-        XFlush(dpy);
+        /* Menu can hand the framebuffer away immediately after this call.  Wait
+         * until X has restored the keyboard's save-under before mixdash paints. */
+        XSync(dpy, False);
     }
+}
+
+static void kbd_toggle(void)
+{
+    kbd_set_visible(!kbd_visible);
 }
 
 static void kbd_start(void)
@@ -1844,6 +1854,7 @@ static void forget_pads(void)
     release_directions(held);
     rep_clear();
     menu_down_at = 0;
+    kbd_menu_hidden = 0;
 }
 
 /* ── The session's control pipe ──────────────────────────────────────────── */
@@ -2193,19 +2204,24 @@ int main(int argc, char **argv)
         if (cont_asked) {
             cont_asked = 0;
             forget_pads();
+            /* A keyboard hidden by the Menu press belongs to the screen we left,
+             * not to this resumed one.  Keep it closed across a real hand-off. */
+            kbd_menu_hidden = 0;
             move_last = now;
             if (grab && !grabbing) {
                 note("continued by the dashboard, taking the pad back");
                 set_grab(1);
                 grabbing = 1;
             }
-            screen_cursor(1);
             /* AND THE SCREEN IS NOT OURS EITHER.  The dashboard has been drawing
              * on the panel for as long as this was stopped; whatever it left that
              * its restore did not cover is still there, and X does not know a
-             * pixel changed.  This is the one moment in the session's life when
-             * that is certainly true, so this is where the repaint goes. */
+             * pixel changed.  Keep the software cursor hidden while the X shadow
+             * buffer is exposed: showing it first makes X save the dashboard
+             * pixels underneath and restore them later as a transparent hole. */
+            screen_cursor(0);
             screen_refresh();
+            screen_cursor(1);
             continue;
         }
 
@@ -2305,7 +2321,17 @@ int main(int argc, char **argv)
                 case BTN_THUMBL: click(2, down); break;
                 case BTN_THUMBR: click(3, down); break;
 
-                case BTN_B: if (down) tap(kc.alt, kc.left); break;
+                case BTN_B:
+                    if (down) {
+                        /* Still Back in every client.  In an empty Desktop there
+                         * is no client to receive it, so the session accepts the
+                         * companion request as the explicit way out. */
+                        if (kbd_visible)
+                            kbd_set_visible(0);
+                        tap(kc.alt, kc.left);
+                        ctl_send("quit-empty");
+                    }
+                    break;
                 case BTN_X: if (down) tap(0, kc.ret);       break;
                 case BTN_Y: if (down) tap(0, kc.esc);       break;
 
@@ -2367,6 +2393,14 @@ int main(int argc, char **argv)
                         pointer_resync();
                         pointer_state_write();
                         menu_down_at = now;
+                        /* mixdash recognizes the hold before this bridge's own
+                         * timer.  Hide the keyboard on the press so it cannot be
+                         * frozen onto the dashboard; restore it only if release
+                         * proves this was the short next-window gesture. */
+                        if (kbd_visible) {
+                            kbd_menu_hidden = 1;
+                            kbd_set_visible(0);
+                        }
                         /* mixdash recognizes the same hold sooner than this
                          * bridge does and can SIGSTOP the X server before the
                          * hold branch below gets a turn.  Hide on the press, so
@@ -2380,7 +2414,10 @@ int main(int argc, char **argv)
                         if (menu_down_at && now - menu_down_at < MENU_HOLD_MS) {
                             note("Menu tapped, asking for the next window");
                             ctl_send("next");
+                            if (kbd_menu_hidden)
+                                kbd_set_visible(1);
                         }
+                        kbd_menu_hidden = 0;
                         screen_cursor(1);
                         menu_down_at = 0;
                     }
@@ -2471,6 +2508,7 @@ int main(int argc, char **argv)
                 screen_cursor(0);
                 kill(mixdash_pid, SIGUSR1);
                 menu_down_at = 0;
+                kbd_menu_hidden = 0;
                 /* The buttons that were down belong to a session that is about to
                  * be stopped, and their releases will be delivered to a switcher
                  * instead.  Cancelling the repeats here is what stops a shoulder

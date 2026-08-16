@@ -14,6 +14,7 @@
 #include <QFileInfo>
 #include <QFontMetrics>
 #include <QPainter>
+#include <QPointer>
 #include <QProcess>
 #include <QResizeEvent>
 #include <QTextStream>
@@ -557,91 +558,63 @@ QString SharingPage::configComplaint()
 }
 
 /*
- * ── "AT BOOT" HAS TO BE VERIFIED, NOT ISSUED ─────────────────────────────────
+ * ── "AT BOOT" IS A FILE SETTING, NOT A LIVE SYSTEMD OPERATION ─────────────────
  *
- * This used to be two systemctl calls and a re-read of is-enabled, and when the
- * enable did not take there was nothing to say so: the switch simply went back to
- * off, which reads from the outside as "the setting is not saved between boots".
+ * systemctl enable creates this exact .wants symlink.  The new device log shows
+ * four daemon reloads when both Samba units are enabled: the two systemctl calls
+ * time out, their fallbacks write the links, and each fallback reloads again.  On
+ * the Cortex-A7 that freezes the dashboard for roughly forty seconds.
  *
- * So the exit code is looked at now, the state is re-read, and when the two
- * disagree there is a fallback -- because `systemctl enable' has more ways to fail
- * on this image than on a desktop.  It writes into /etc, which is on the card and
- * has been remounted rw by the initramfs but is not guaranteed to have stayed that
- * way; it wants to talk to PID 1 over D-Bus, and finishing_touches.sh disables
- * polkit; and it refuses outright for a unit systemd calls `static' or `alias',
- * which is a packaging decision the samba maintainers can make without telling us.
- *
- * The fallback is the .wants symlink, written by hand.  That is not a trick: it is
- * exactly what `systemctl enable' produces, .wants directories are merged across
- * /etc, /run and /usr/lib, and build-in-vm.sh already boots mixdash itself this way
- * for the same reason -- see the note above the multi-user.target.wants link there.
- * is-enabled reads the same symlink back, so the switch on the glass and the state
- * on the card cannot drift apart afterwards.
- *
- * Returns an empty string when the unit really is in the asked-for state, and the
- * reason -- systemd's own first line, where there is one -- when it is not.
+ * The next boot reads /etc afresh, so no reload is required.  Write the durable
+ * setting directly and draw the switch from the same file; a slow PID 1 can then
+ * neither delay this control nor make it visually revert.
  */
 QString SharingPage::setEnabled(const QString &unit, bool on)
 {
-    int rc = -1;
-    const QString out = systemctl(QStringList()
-                                      << (on ? QStringLiteral("enable")
-                                             : QStringLiteral("disable"))
-                                      << unit,
-                                  8000, &rc);
-
-    /* The verification has to be able to say "I could not check", because the two
-     * failures below both write to the card and neither is a thing to do on the
-     * strength of a fork that did not run.  See bug SEVEN. */
-    bool answered = false;
-    if (unitEnabled(unit, &answered) == on && answered)
-        return QString();
-
     const QString wants =
         QStringLiteral("/etc/systemd/system/multi-user.target.wants");
     const QString link = wants + QLatin1Char('/') + unit + QStringLiteral(".service");
 
     if (on) {
-        const QString frag = unitPath(unit);
+        QString frag;
+        const QString name = unit + QStringLiteral(".service");
+        const QStringList roots = QStringList()
+            << QStringLiteral("/etc/systemd/system")
+            << QStringLiteral("/lib/systemd/system")
+            << QStringLiteral("/usr/lib/systemd/system");
+        for (const QString &root : roots) {
+            const QString candidate = root + QLatin1Char('/') + name;
+            if (QFileInfo(candidate).exists()) {
+                frag = candidate;
+                break;
+            }
+        }
 
-        if (frag.isEmpty() || !QFileInfo(frag).exists())
+        if (frag.isEmpty())
             return tr("there is no %1.service on this card").arg(unit);
-        QDir().mkpath(wants);
+        if (!QDir().mkpath(wants))
+            return tr("cannot write %1").arg(wants);
         /* Removed first: QFile::link will not overwrite, and a stale link is the
          * likeliest thing to be standing here. */
-        QFile::remove(link);
+        if (QFileInfo(link).isSymLink() && !QFile::remove(link))
+            return tr("cannot replace %1").arg(link);
         if (!QFile::link(frag, link))
             return tr("cannot write %1").arg(link);
     } else if (QFileInfo(link).isSymLink() && !QFile::remove(link)) {
         return tr("cannot remove %1").arg(link);
     }
 
-    /* So that this boot's systemd agrees with the card, and so that the is-enabled
-     * below is answered from the same picture the next boot will build. */
-    systemctl(QStringList() << QStringLiteral("daemon-reload"), 8000);
+    return enabledOnBoot(unit) == on
+               ? QString()
+               : tr("the start-at-boot setting for %1 was not saved").arg(unit);
+}
 
-    answered = false;
-    if (unitEnabled(unit, &answered) == on)
-        return QString();
-
-    /*
-     * A CHECK THAT DID NOT RUN IS NOT A FAILURE.  The symlink above is what
-     * is-enabled reads, and it is on the card whether or not this fork managed to
-     * ask about it; reporting "systemctl enable smbd exited -1" here would put a
-     * systemctl problem on the glass under a setting that has in fact been made.
-     * Silence, and the next poll reads the card and draws the switch from it.
-     */
-    if (!answered)
-        return QString();
-
-    /* Still not.  systemd's own words if it left any, and the exit code if it did
-     * not -- an empty message with a switch that will not move is the thing this
-     * whole function exists to stop happening again. */
-    if (!out.isEmpty())
-        return out.section('\n', 0, 0);
-    return tr("systemctl %1 %2 exited %3")
-               .arg(on ? QStringLiteral("enable") : QStringLiteral("disable"),
-                    unit, QString::number(rc));
+bool SharingPage::enabledOnBoot(const QString &unit)
+{
+    const QString link =
+        QStringLiteral("/etc/systemd/system/multi-user.target.wants/")
+        + unit + QStringLiteral(".service");
+    return QFileInfo(link).isSymLink();
 }
 
 bool SharingPage::sambaInstalled()
@@ -760,43 +733,8 @@ QString SharingPage::storedPassword() const
     return QString::fromUtf8(f.readAll()).trimmed();
 }
 
-/*
- * Hand the password to samba's own database and keep a copy the page can show.
- *
- * The order is deliberate: smbpasswd first, the file second.  If smbpasswd fails
- * -- no samba, no such unix user, a corrupt tdb -- then nothing is written, and
- * the next visit to this page reads back the password that is still genuinely in
- * force rather than one the page believes in and the server has never heard of.
- */
-QString SharingPage::applyPassword(const QString &password)
+QString SharingPage::savePassword(const QString &password)
 {
-    if (password.isEmpty())
-        return tr("could not read /dev/urandom");
-    if (smbpasswdPath().isEmpty())
-        return tr("smbpasswd is not installed");
-
-    QProcess p;
-    p.setProcessChannelMode(QProcess::MergedChannels);
-    /* -a adds the account or updates it, -s reads the password twice from stdin
-     * instead of opening the terminal this process does not have. */
-    p.start(smbpasswdPath(),
-            QStringList() << QStringLiteral("-a") << QStringLiteral("-s")
-                          << QString::fromLatin1(kUser));
-    if (!Shell::waitForStarted(p, 2000))
-        return tr("smbpasswd would not start");
-
-    const QByteArray twice = (password + "\n" + password + "\n").toUtf8();
-    p.write(twice);
-    p.closeWriteChannel();
-    if (!Shell::waitForFinished(p, 8000)) {
-        p.kill();
-        Shell::waitForFinished(p, 500);
-        return tr("smbpasswd did not finish");
-    }
-    if (p.exitCode() != 0)
-        return tr("smbpasswd failed: %1")
-                   .arg(QString::fromUtf8(p.readAll()).trimmed().section('\n', 0, 0));
-
     QDir().mkpath(QString::fromLatin1(kSecretDir));
     QFile f(QString::fromLatin1(kSecret));
     if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text))
@@ -822,14 +760,145 @@ QString SharingPage::applyPassword(const QString &password)
     return QString();
 }
 
-QString SharingPage::newPassword()
+/*
+ * Hand the password to Samba without blocking the dashboard.  The device log
+ * shows smbpasswd succeeding only after the old eight-second wait killed its
+ * client; all of Samba's libraries are a cold load from SD and eight seconds on
+ * this CPU is not a useful correctness boundary.  QProcess owns the wait now, Qt
+ * continues reading the pad and repainting, and a 45-second watchdog still turns
+ * a genuinely stuck child into a visible error.
+ */
+bool SharingPage::beginPassword(PasswordAction action)
 {
     const QString pw = generatePassword();
-    const QString err = applyPassword(pw);
-    if (!err.isEmpty())
-        return err;
+    if (pw.isEmpty()) {
+        noteFailure(tr("could not read /dev/urandom"));
+        return false;
+    }
+    const QString command = smbpasswdPath();
+    if (command.isEmpty()) {
+        noteFailure(tr("smbpasswd is not installed"));
+        return false;
+    }
+    if (m_passwordProcess)
+        return false;
+
+    QProcess *process = new QProcess(this);
+    process->setProcessChannelMode(QProcess::MergedChannels);
+    m_passwordProcess = process;
+    m_passwordAction = action;
+    m_pendingPassword = pw;
+    m_passwordTimedOut = false;
+    m_changing = true;
+    if (action == PasswordStartShare)
+        m_starting = true;      /* keep the switch at the requested position */
+    if (action == PasswordEnableBoot)
+        m_enabled = true;
+    m_note = tr("Setting the share password -- you can keep using the dashboard");
+
+    connect(process, &QProcess::started, this, [this, process]() {
+        if (m_passwordProcess != process)
+            return;
+        const QByteArray twice =
+            (m_pendingPassword + "\n" + m_pendingPassword + "\n").toUtf8();
+        process->write(twice);
+        process->closeWriteChannel();
+    });
+    connect(process, &QProcess::errorOccurred, this,
+            [this, process](QProcess::ProcessError error) {
+        if (m_passwordProcess == process && error == QProcess::FailedToStart)
+            finishPassword(-1, false);
+    });
+    connect(process,
+            static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(
+                &QProcess::finished),
+            this, [this, process](int code, QProcess::ExitStatus status) {
+        if (m_passwordProcess == process)
+            finishPassword(code, status == QProcess::NormalExit);
+    });
+
+    const QPointer<QProcess> guard(process);
+    QTimer::singleShot(45000, this, [this, guard]() {
+        if (guard && m_passwordProcess == guard.data()
+            && guard->state() != QProcess::NotRunning) {
+            m_passwordTimedOut = true;
+            guard->kill();
+        }
+    });
+
+    process->start(command,
+                   QStringList() << QStringLiteral("-a") << QStringLiteral("-s")
+                                 << QString::fromLatin1(kUser));
+    rebuild();
+    update();
+    return true;
+}
+
+void SharingPage::finishPassword(int exitCode, bool normalExit)
+{
+    QProcess *process = m_passwordProcess;
+    if (!process)
+        return;
+
+    const QString output = QString::fromUtf8(process->readAll()).trimmed();
+    const PasswordAction action = m_passwordAction;
+    const QString password = m_pendingPassword;
+    const bool timedOut = m_passwordTimedOut;
+    m_passwordProcess = nullptr;
+    m_passwordAction = PasswordNone;
+    m_pendingPassword.clear();
+    m_passwordTimedOut = false;
+    if (action == PasswordStartShare)
+        m_starting = false;
+    if (action == PasswordEnableBoot)
+        m_enabled = enabledOnBoot(QString::fromLatin1(kSmbd));
+    process->deleteLater();
+
+    QString err;
+    if (timedOut)
+        err = tr("smbpasswd did not finish within 45 seconds");
+    else if (!normalExit || exitCode < 0)
+        err = tr("smbpasswd would not start");
+    else if (exitCode != 0)
+        err = tr("smbpasswd failed: %1")
+                  .arg(output.isEmpty() ? tr("exit %1").arg(exitCode)
+                                        : output.section('\n', 0, 0));
+    else
+        err = savePassword(password);
+
+    if (!err.isEmpty()) {
+        m_changing = false;
+        noteFailure(err);
+        rebuild();
+        update();
+        return;
+    }
+
     m_reveal = true;
-    return QString();
+    switch (action) {
+    case PasswordStartShare:
+        startConfigured();
+        break;
+    case PasswordEnableBoot:
+        applyBootSetting(true);
+        break;
+    case PasswordRenew:
+        m_note = tr("new password set");
+        emit toastRequested(tr("New share password set"), 2500);
+        break;
+    case PasswordRewrite:
+        finishRewrite();
+        break;
+    case PasswordNone:
+        m_note = tr("share password set");
+        break;
+    }
+
+    /* Keep polls out through the follow-up systemctl/file operation as well as
+     * through smbpasswd itself, then publish the settled state in one rebuild. */
+    m_changing = false;
+    rebuild();
+    update();
 }
 
 /* ── the configuration ───────────────────────────────────────────────────── */
@@ -1002,8 +1071,6 @@ QString SharingPage::ensureConfigured()
         if (!err.isEmpty())
             return err;
     }
-    if (storedPassword().isEmpty())
-        return newPassword();
     return QString();
 }
 
@@ -1027,6 +1094,16 @@ void SharingPage::start()
         noteFailure(err);
         return;
     }
+    if (storedPassword().isEmpty()) {
+        beginPassword(PasswordStartShare);
+        return;
+    }
+
+    startConfigured();
+}
+
+void SharingPage::startConfigured()
+{
 
     /*
      * --no-block, WHICH IS THE WHOLE OF BUG SIX.
@@ -1361,16 +1438,11 @@ QString SharingPage::writeReport(const QString &reason)
 void SharingPage::noteFailure(const QString &reason)
 {
     m_lastFailure = reason;
-
-    const QString path = writeReport(reason);
-    if (!path.isEmpty())
-        m_reportPath = path;
-
-    /* The reason first and the path second: the strip takes two lines now, but if
-     * only one of them survives the elide it has to be the half that says why. */
-    m_note = m_reportPath.isEmpty()
-                 ? reason
-                 : tr("%1  --  written to %2").arg(reason, m_reportPath);
+    /* collectReport forks testparm, journalctl and systemctl several times.  Doing
+     * that automatically on the error path turned one failed toggle into another
+     * long UI freeze.  The dedicated "Write a diagnosis" row remains available
+     * and runs the same report when the operator explicitly asks for it. */
+    m_note = reason;
 }
 
 /* ── the page ────────────────────────────────────────────────────────────── */
@@ -1453,7 +1525,8 @@ void SharingPage::resizeEvent(QResizeEvent *event)
 
 void SharingPage::onEnter()
 {
-    m_note.clear();
+    if (!m_passwordProcess)
+        m_note.clear();
     /* Masked again on every entry.  The page is on a handheld somebody hands to
      * somebody else, and a password that stays on screen from the last visit is
      * one that gets shoulder-surfed by accident. */
@@ -1461,8 +1534,10 @@ void SharingPage::onEnter()
     /* Not resumed across a visit.  The unit carries on starting whether this page
      * is on the glass or not, so coming back and reading is-active tells the truth
      * without any state having to survive the trip. */
-    m_starting = false;
-    m_startGraceMs = 0;
+    if (m_passwordAction != PasswordStartShare) {
+        m_starting = false;
+        m_startGraceMs = 0;
+    }
     m_timer->setInterval(kPollIdleMs);
     poll();
     m_timer->start();
@@ -1471,15 +1546,16 @@ void SharingPage::onEnter()
 void SharingPage::onLeave()
 {
     m_timer->stop();
-    m_starting = false;
-    m_startGraceMs = 0;
+    if (m_passwordAction != PasswordStartShare) {
+        m_starting = false;
+        m_startGraceMs = 0;
+    }
 }
 
 void SharingPage::poll()
 {
-    /* systemctl() and smbpasswd use Shell's sliced waits, so the event loop is
-     * alive while a toggle is being applied.  Do not let this timer sample and
-     * redraw the old state in the middle of that operation. */
+    /* Do not sample live service state while an asynchronous password operation
+     * is deciding which instruction should follow it. */
     if (m_changing)
         return;
 
@@ -1497,8 +1573,10 @@ void SharingPage::poll()
      */
     if (smbd.answered) {
         m_active = (smbd.state == QLatin1String("active"));
-        m_enabled = (smbd.fileState == QLatin1String("enabled"));
     }
+    /* Start-at-boot is persisted by this exact symlink.  Unlike UnitFileState it
+     * is immediate and cannot revert because systemd happened to answer slowly. */
+    m_enabled = enabledOnBoot(QString::fromLatin1(kSmbd));
 
     if (m_starting) {
         m_startGraceMs -= m_timer->interval();
@@ -1606,6 +1684,7 @@ void SharingPage::rebuild()
              : m_starting ? tr("Starting -- smbd has not answered yet")
                           : tr("Off.  Nothing on this device is reachable from the network.");
     r.on = m_active || m_starting;
+    r.enabled = !m_changing;
     if (m_starting && !m_active) {
         r.badge = tr("starting");
         r.badgeColour = Theme::yellow();
@@ -1620,6 +1699,7 @@ void SharingPage::rebuild()
     r.detail = m_enabled ? tr("smbd comes up by itself")
                          : tr("Off.  Sharing has to be switched on after each boot.");
     r.on = m_enabled;
+    r.enabled = !m_changing;
     r.accent = Theme::blue();
     r.id = IdAtBoot;
     rows << r;
@@ -1776,13 +1856,7 @@ void SharingPage::onActivated(int index)
         break;
 
     case IdNewPassword: {
-        const QString err = newPassword();
-        if (err.isEmpty()) {
-            m_note = tr("new password set");
-            emit toastRequested(tr("New share password set"), 2500);
-        } else {
-            m_note = err;
-        }
+        beginPassword(PasswordRenew);
         break;
     }
 
@@ -1792,24 +1866,15 @@ void SharingPage::onActivated(int index)
          * ensureConfigured() deliberately skips.  The password is still made if
          * there is none, because a share with no samba account in it is a share
          * nobody can open. */
-        QString err = writeConfig();
-        if (err.isEmpty() && storedPassword().isEmpty())
-            err = newPassword();
+        const QString err = writeConfig();
         if (!err.isEmpty()) {
             m_note = err;
             break;
         }
-        /* Only if it is running.  A reload of a stopped unit is an error on some
-         * systemd versions and a no-op on others, and neither is worth putting on
-         * the glass when the answer is "it will read it when it starts". */
-        if (m_active) {
-            systemctl(QStringList() << QStringLiteral("reload")
-                                    << QString::fromLatin1(kSmbd),
-                      8000);
-            m_note = tr("configuration rewritten and reloaded");
-        } else {
-            m_note = tr("configuration rewritten");
-        }
+        if (storedPassword().isEmpty())
+            beginPassword(PasswordRewrite);
+        else
+            finishRewrite();
         break;
     }
 
@@ -1842,6 +1907,38 @@ void SharingPage::onActivated(int index)
     update();
 }
 
+void SharingPage::finishRewrite()
+{
+    /* Only if it is running.  Queueing the reload avoids turning this explicit
+     * maintenance action into another seconds-long block on a cold SD card. */
+    if (m_active) {
+        systemctl(QStringList() << QStringLiteral("--no-block")
+                                << QStringLiteral("reload")
+                                << QString::fromLatin1(kSmbd),
+                  4000);
+        m_note = tr("configuration rewritten; reload queued");
+    } else {
+        m_note = tr("configuration rewritten");
+    }
+}
+
+void SharingPage::applyBootSetting(bool on)
+{
+    QString err = setEnabled(QString::fromLatin1(kSmbd), on);
+    /* NetBIOS discovery is best-effort; the SMB share works by IP without it, so
+     * nmbd never decides the state of this switch. */
+    const QString discoveryErr = setEnabled(QString::fromLatin1(kNmbd), on);
+    m_enabled = enabledOnBoot(QString::fromLatin1(kSmbd));
+
+    if (err.isEmpty() && !discoveryErr.isEmpty())
+        err = discoveryErr;
+    if (!err.isEmpty())
+        noteFailure(err);
+    else
+        m_note = m_enabled ? tr("sharing will start at boot")
+                           : tr("sharing will not start at boot");
+}
+
 /*
  * Toggles do not emit ListPane::activated().  They mutate the pane's copy of the
  * row and emit valueChanged(), carrying the position the user just requested.
@@ -1851,8 +1948,11 @@ void SharingPage::onActivated(int index)
  */
 void SharingPage::onValueChanged(int index, int value)
 {
-    if (m_changing)
+    if (m_changing) {
+        rebuild();
+        update();
         return;
+    }
 
     const QVector<ListRow> &rows = m_list->rows();
     if (index < 0 || index >= rows.size())
@@ -1876,24 +1976,18 @@ void SharingPage::onValueChanged(int index, int value)
         if (turningOn)
             err = ensureConfigured();
 
-        if (err.isEmpty()) {
-            err = setEnabled(QString::fromLatin1(kSmbd), turningOn);
-            /* NetBIOS discovery is best-effort; the SMB share works by IP without
-             * it, so nmbd never decides the state of this switch. */
-            setEnabled(QString::fromLatin1(kNmbd), turningOn);
-
-            bool answered = false;
-            const bool now = unitEnabled(QString::fromLatin1(kSmbd), &answered);
-            m_enabled = answered ? now : turningOn;
+        if (!err.isEmpty()) {
+            noteFailure(err);
+        } else if (turningOn && storedPassword().isEmpty()) {
+            beginPassword(PasswordEnableBoot);
+        } else {
+            applyBootSetting(turningOn);
         }
-
-        if (!err.isEmpty())
-            m_note = err;
-        else
-            m_note = m_enabled ? tr("sharing will start at boot")
-                               : tr("sharing will not start at boot");
     }
 
+    /* beginPassword owns m_changing until its finished signal. */
+    if (m_passwordProcess)
+        return;
     m_changing = false;
     rebuild();
     update();

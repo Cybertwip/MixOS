@@ -222,6 +222,7 @@
 #include "widgets.h"
 
 class ListPane;
+class QProcess;
 class QTimer;
 
 class SharingPage : public PageWidget
@@ -256,6 +257,14 @@ private:
         IdRewrite,        /* put smb.conf back the way this page writes it */
         IdShowPassword,
         IdDiagnose        /* everything this page knows, onto the BOOT partition */
+    };
+
+    enum PasswordAction {
+        PasswordNone = 0,
+        PasswordStartShare,
+        PasswordEnableBoot,
+        PasswordRenew,
+        PasswordRewrite
     };
 
     /* ── the pieces underneath ── */
@@ -331,9 +340,10 @@ private:
      * this is the only place on the device that holds smbd's own words.
      */
     static QString journalTail(const QString &unit, int lines);
-    /* enable or disable, VERIFIED -- and with the .wants symlink written by hand
-     * when systemctl could not.  Empty on success, the reason otherwise. */
+    /* Enablement is the .wants symlink stored on the card.  Reading and writing
+     * it directly avoids four slow systemd reloads for two switches. */
     static QString setEnabled(const QString &unit, bool on);
+    static bool enabledOnBoot(const QString &unit);
     static bool sambaInstalled();
     static QString hostName();
     /* Every IPv4 address that is not loopback, in the order getifaddrs gives
@@ -350,16 +360,20 @@ private:
      * is Debian's plus finishing_touches.sh's two guest-readable shares, which is
      * what a card that has never had sharing switched on is carrying. */
     static bool configIsOurs();
-    /* writeConfig() unless the file is already ours, then a password unless there
-     * already is one.  Every path that makes smbd run calls this first. */
+    /* writeConfig() unless the file is already ours. */
     QString ensureConfigured();
-    /* Make sure the samba account exists and holds the stored password. */
-    QString applyPassword(const QString &password);
+    /* smbpasswd is a cold Samba process on this card and must never block Qt's
+     * input loop.  These start it and settle its result asynchronously. */
+    bool beginPassword(PasswordAction action);
+    void finishPassword(int exitCode, bool normalExit);
+    QString savePassword(const QString &password);
     QString storedPassword() const;
     QString generatePassword() const;
-    QString newPassword();
 
     void start();
+    void startConfigured();
+    void applyBootSetting(bool on);
+    void finishRewrite();
     void stop();
     void rebuild();
     /* Geometry, which is not constant: the note under the title takes one line or
@@ -390,8 +404,8 @@ private:
     /* collectReport() onto the card.  Returns where it landed, empty when nothing
      * would take it. */
     QString writeReport(const QString &reason);
-    /* Remember why, and put it on the card.  Every path that decides a start did
-     * not take goes through here. */
+    /* Remember why without automatically running the deliberately expensive full
+     * diagnosis.  The explicit diagnosis row still writes it when requested. */
     void noteFailure(const QString &reason);
 
     /* The start did not finish inside start()'s budget, so the page is now
@@ -409,12 +423,15 @@ private:
     bool m_reveal = false;      /* the password is masked until it is asked for */
     QString m_note;             /* one line under the title: what just happened */
 
-    /* A toggle can spend several seconds creating the samba password or asking
-     * systemd.  Shell keeps Qt responsive during those waits, which means the
-     * poll timer can fire inside the operation unless it is explicitly ignored.
-     * Such a poll would rebuild the row from the old service state halfway
-     * through the press and make a working switch flicker back off. */
+    /* Password creation is asynchronous.  Suppress another toggle and the live
+     * service poll until its completion selects the requested follow-up action;
+     * otherwise the old state would redraw the switch halfway through the press. */
     bool m_changing = false;
+
+    QProcess *m_passwordProcess = nullptr;
+    PasswordAction m_passwordAction = PasswordNone;
+    QString m_pendingPassword;
+    bool m_passwordTimedOut = false;
 
     /* A start is in flight and this page is waiting for it -- see bug ONE in the
      * block at the top of this file.  The grace counts down by one poll interval

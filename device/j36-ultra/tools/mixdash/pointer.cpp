@@ -11,12 +11,11 @@
 #include <QFile>
 #include <QMouseEvent>
 #include <QPainter>
-#include <QPainterPath>
+#include <QPolygon>
 #include <QTimer>
 #include <QWheelEvent>
 
 #include "settings.h"
-#include "theme.h"
 
 namespace {
 
@@ -35,21 +34,22 @@ const int kFadeStep = 36;
 const int kDoubleClickSlop = 10;
 const char kPointerState[] = "/run/j36/pointer.state";
 
-QPainterPath arrowPath()
+QPolygon arrowOuter()
 {
-    /* The classic arrow, tip at the origin.  Written out rather than loaded from
-     * an image because a 20 px bitmap would need a second one for the shadow and
-     * a third if the panel is ever a different size. */
-    QPainterPath p;
-    p.moveTo(0.0, 0.0);
-    p.lineTo(0.0, 20.4);
-    p.lineTo(5.0, 15.8);
-    p.lineTo(8.4, 23.5);
-    p.lineTo(12.2, 21.8);
-    p.lineTo(8.9, 14.4);
-    p.lineTo(15.1, 13.9);
-    p.closeSubpath();
-    return p;
+    /* These are also the exact points used by j36-padx's X cursor.  Keeping the
+     * two pictures integer-for-integer identical matters more here than a soft
+     * edge: the framebuffer cursor used to appear a few pixels away from the
+     * dashboard cursor even though their common hot spot was already correct. */
+    return QPolygon() << QPoint(0, 0) << QPoint(0, 21) << QPoint(5, 16)
+                      << QPoint(8, 24) << QPoint(13, 22) << QPoint(9, 14)
+                      << QPoint(16, 14);
+}
+
+QPolygon arrowInner()
+{
+    return QPolygon() << QPoint(2, 3) << QPoint(2, 17) << QPoint(5, 13)
+                      << QPoint(9, 21) << QPoint(10, 20) << QPoint(7, 12)
+                      << QPoint(12, 12);
 }
 
 } /* namespace */
@@ -63,9 +63,10 @@ Pointer::Pointer(QWidget *host)
     /* Without this the cursor would be found under itself by childAt() and every
      * click would land on the arrow. */
     setAttribute(Qt::WA_TransparentForMouseEvents, true);
-    /* No background fill: the parent repaints under us, which is what makes the
-     * unpainted corners of the arrow transparent. */
-    setAttribute(Qt::WA_NoSystemBackground, true);
+    /* Leave QWidget's parent-content propagation enabled.  WA_NoSystemBackground
+     * made the untouched corners undefined in the linuxfb backing store; moving
+     * that widget then exposed transparent/old rectangles around the arrow. */
+    setAutoFillBackground(false);
     hide();
 
     m_exact = QPointF(host->width() / 2.0, host->height() / 2.0);
@@ -121,31 +122,14 @@ void Pointer::sleep()
     if (isVisible())
         hide();
 
-    /*
-     * A button held when the pointer is put away would otherwise be held for
-     * ever, and the widget that received the press would stay in its pressed
-     * state.  Release what is down, at the last known position.
-     */
-    if (m_buttons != Qt::NoButton) {
-        const QPoint p = hotspot();
-        const Qt::MouseButtons was = m_buttons;
-        for (int i = 0; i < 3; ++i) {
-            static const Qt::MouseButton kButtons[3] =
-                { Qt::LeftButton, Qt::MiddleButton, Qt::RightButton };
-            if (!(was & kButtons[i]))
-                continue;
-            m_buttons &= ~kButtons[i];
-            dispatch(QEvent::MouseButtonRelease, kButtons[i], m_buttons, p);
-        }
-        m_buttons = Qt::NoButton;
-    }
+    /* A hand-off is teardown, not user input.  Synchronously delivering synthetic
+     * releases and leave events here lets their receiver change page (and delete
+     * itself) while sleep() is still walking its pointers.  The crash log landed
+     * in precisely that release loop.  Drop the private interaction state; the
+     * incoming program receives a freshly drained pad on its own side. */
+    m_buttons = Qt::NoButton;
     m_grab = nullptr;
-
-    if (m_under) {
-        QEvent leave(QEvent::Leave);
-        QApplication::sendEvent(m_under, &leave);
-        m_under = nullptr;
-    }
+    m_under = nullptr;
 
     setAwake(false);
 }
@@ -225,11 +209,12 @@ void Pointer::onFade()
         m_opacity = 255;
         m_fade->stop();
         hide();
-        if (m_under) {
-            QEvent leave(QEvent::Leave);
-            QApplication::sendEvent(m_under, &leave);
-            m_under = nullptr;
-        }
+        /* Clear the hover asynchronously.  The old synchronous send could enter a
+         * page transition here and call sleep() while this stack was still live;
+         * a posted event is discarded automatically if its receiver is deleted. */
+        if (m_under)
+            QApplication::postEvent(m_under, new QEvent(QEvent::Leave));
+        m_under = nullptr;
         setAwake(false);
         return;
     }
@@ -260,7 +245,10 @@ void Pointer::applyPosition()
 
     const QPoint p(qRound(m_exact.x()), qRound(m_exact.y()));
     if (p != pos()) {
+        const QRect old = geometry();
         move(p);
+        if (isVisible() && !m_redirected)
+            m_host->update(old);
         /* move() on a hidden widget is still where the hot spot is, and while
          * redirected that is the only thing that carries the arrow. */
         announce();
@@ -465,13 +453,11 @@ QImage Pointer::snapshot() const
     if (!m_awake || m_opacity <= 0)
         return QImage();
 
-    /* Premultiplied, like every other thing handed to GlVideo::setOverlay: the
-     * arrow is antialiased and its shadow is translucent, so the whole rectangle
-     * carries meaningful alpha and the un-multiply happens on the way to the GPU. */
+    /* Premultiplied, like every other thing handed to GlVideo::setOverlay. */
     QImage img(size(), QImage::Format_ARGB32_Premultiplied);
     img.fill(Qt::transparent);
     QPainter p(&img);
-    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setRenderHint(QPainter::Antialiasing, false);
     paintBody(p);
     return img;
 }
@@ -481,7 +467,7 @@ void Pointer::paintEvent(QPaintEvent *event)
     Q_UNUSED(event);
 
     QPainter p(this);
-    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setRenderHint(QPainter::Antialiasing, false);
     paintBody(p);
 }
 
@@ -489,19 +475,9 @@ void Pointer::paintBody(QPainter &p) const
 {
     p.setOpacity(m_opacity / 255.0);
 
-    const QPainterPath path = arrowPath();
-
-    /* A shadow, offset by a pixel and a half, so the arrow stays visible over a
-     * white image in the Media viewer as well as over the dark desktop. */
-    p.translate(1.4, 1.8);
     p.setPen(Qt::NoPen);
-    QColor shade = Theme::glass();
-    shade.setAlpha(120);
-    p.setBrush(shade);
-    p.drawPath(path);
-    p.translate(-1.4, -1.8);
-
+    p.setBrush(QColor(24, 26, 34));
+    p.drawPolygon(arrowOuter());
     p.setBrush(QColor(250, 251, 255));
-    p.setPen(QPen(QColor(24, 26, 34), 1.2));
-    p.drawPath(path);
+    p.drawPolygon(arrowInner());
 }

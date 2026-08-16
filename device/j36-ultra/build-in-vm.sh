@@ -11917,11 +11917,16 @@ chmod 0700 /run/j36/xdg 2>/dev/null
 # argument as "no window yet".  An unquoted conditional here would be a word-splitting
 # bug the day somebody runs --run with a command that has a space in it, which is
 # every command mixdash sends.
+#
+# -ac is safe here because TCP listening is disabled on the same command line and
+# the only clients can therefore be local processes.  It lets a graphical client
+# run as the unprivileged virtua account even though xinit itself and its authority
+# file belong to root; the browser must not run as root in virtua's HOME.
 exec /usr/bin/xinit "$MAIN" "$FIRST" -- \
     "$XORG" :0 vt1 \
     -config "$XCONF" \
     -logfile /run/j36/xorg.log \
-    -nolisten tcp -novtswitch -sharevts -keeptty
+    -ac -nolisten tcp -novtswitch -sharevts -keeptty
 XSESSIONLAUNCH
     chmod 0755 "$SDROOT/opt/mixos/bin/j36-xsession"
 
@@ -11987,14 +11992,6 @@ export NO_AT_BRIDGE=1
 export GDK_BACKEND=x11
 export GTK_OVERLAY_SCROLLING=0
 export GDK_CORE_DEVICE_EVENTS=1
-
-# Everything in this session is root and HOME above is virtua's, which is the one
-# combination Mozilla's own startup check refuses to run in -- it prints a sentence
-# and exits before mapping anything.  j36-browser sets this too and the long version
-# of why is there; it is repeated here because the session is what runs a window
-# somebody opened by typing `firefox' in the Terminal card, and that window would
-# otherwise close as fast as this one did and take the session with it.
-export MOZ_ALLOW_ROOT=1
 
 # WHAT A CLIENT LOOKS AT TO KNOW IT IS ALREADY INSIDE A SESSION.  j36-browser reads
 # it: with it set it execs a browser, without it it hands itself to j36-xrun.  A
@@ -12321,6 +12318,15 @@ while :; do
             echo "j36-xsession: asked to quit" >&2
             break
             ;;
+        quit-empty)
+            # B is Back while a client exists and Exit when the Desktop is empty.
+            # Reap immediately so this decision does not wait for the next tick.
+            reap_clients
+            if [ -z "$CLIENTS" ]; then
+                echo "j36-xsession: empty Desktop asked to quit" >&2
+                break
+            fi
+            ;;
         tick|"")
             ;;
         *)
@@ -12627,6 +12633,36 @@ mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR
 export NO_AT_BRIDGE=1
 export GDK_BACKEND=x11
 
+# Browsers are ordinary desktop clients, not system services.  Firefox explicitly
+# rejects euid 0 with a HOME owned by another account (the exact error is in the
+# device log), and there is no supported environment switch which changes that.
+# Keep Xorg and the pad bridge privileged for the hardware they own, but drop only
+# the browser to the owner of the writable data tree.  Xorg listens on the local
+# Unix socket only and was started with -ac specifically for this local client.
+RUNUSER=""
+if [ "$(id -u)" -eq 0 ] && id virtua >/dev/null 2>&1; then
+    for r in /usr/sbin/runuser /sbin/runuser; do
+        if [ -x "$r" ]; then RUNUSER="$r"; break; fi
+    done
+    if [ -z "$RUNUSER" ]; then
+        echo "j36-browser: cannot drop privileges (runuser is missing)" >&2
+        exit 1
+    fi
+    export XDG_RUNTIME_DIR=/run/j36/xdg-virtua
+    mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" \
+             "$XDG_RUNTIME_DIR" 2>/dev/null
+    chown virtua:virtua "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" \
+                         "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR" 2>/dev/null
+    chmod 0700 "$XDG_RUNTIME_DIR" 2>/dev/null
+fi
+
+run_browser() {
+    if [ -n "$RUNUSER" ]; then
+        exec "$RUNUSER" -u virtua -p -- "$@"
+    fi
+    exec "$@"
+}
+
 # ── Firefox on 946 MB of RAM ─────────────────────────────────────────────────
 #
 # Firefox is the browser this image installs, because JavaScript is not optional on
@@ -12725,13 +12761,12 @@ FFPREFS
 
 # Per-engine flags, and only where the default is unusable:
 #
-#   firefox gets the profile above, --no-remote so a second launch opens its own
-#   instance instead of quietly handing the URL to a dead one, and MOZ_ALLOW_ROOT --
-#   see below, it is the reason the Desktop card used to die on the spot.
+#   firefox gets the profile above and --no-remote so a second launch opens its own
+#   instance instead of quietly handing the URL to a dead one.
 #
-#   chromium refuses to start as root without --no-sandbox, and its GPU process has
-#   nothing to talk to here, so it is told not to look.  --disable-dev-shm-usage
-#   because /dev/shm on this image is small and a renderer that fills it crashes.
+#   chromium's GPU process has nothing to talk to here, so it is told not to look.
+#   --disable-dev-shm-usage because /dev/shm on this image is small and a renderer
+#   that fills it crashes.  It runs as virtua too, so its sandbox remains enabled.
 #   Its own single-process pref is --renderer-process-limit, for the same reason
 #   Fission is off above.
 #
@@ -12752,11 +12787,8 @@ case "${J36_BROWSER##*/}" in
     firefox|firefox-esr)
         # ── WHY THE DESKTOP CARD USED TO SAY "Desktop Exited" ────────────────
         #
-        # Firefox refuses to run as root when $HOME belongs to somebody else, and
-        # this card is exactly that combination on purpose: everything here runs
-        # as root because there is no login and no user session, and HOME is
-        # /home/virtua because that is the data partition and the one the Sharing
-        # card exports.  So it printed
+        # Firefox refuses to run as root when $HOME belongs to somebody else.  The
+        # old launcher did exactly that, so Firefox printed
         #
         #   Running Firefox as root in a regular user's session is not supported.
         #   ($HOME is /home/virtua which is owned by virtua.)
@@ -12768,28 +12800,29 @@ case "${J36_BROWSER##*/}" in
         # the "Desktop Exited" toast, and the black panel in between.  Five of
         # them in a row are in the reported log, six seconds apart.
         #
-        # MOZ_ALLOW_ROOT is Mozilla's own way out of that check and the only one:
-        # the test is `geteuid() == 0 && HOME is not root's && !MOZ_ALLOW_ROOT'.
-        # The alternatives are worse -- moving HOME to /root would put downloads
-        # and the profile on the OS partition and out of the share, and running
-        # the browser as virtua would need a user session, an XAUTHORITY and an
-        # audio path this image does not have.  It is the same concession
-        # chromium already gets two branches down with --no-sandbox, for the same
-        # reason and with the same honesty about it.
-        MOZ_ALLOW_ROOT=1
-        export MOZ_ALLOW_ROOT
+        # There is no Mozilla escape variable for this check.  Run the client as
+        # virtua instead; -ac plus -nolisten tcp on this private X server supplies
+        # the local display access without moving HOME or the profile to /root.
         firefox_profile
-        exec ${DBUS:+$DBUS --} "$J36_BROWSER" --no-remote \
+        if [ -n "$RUNUSER" ]; then
+            # user.js was just rewritten by this root-owned launcher.  Everything
+            # Firefox creates below the profile is already owned by virtua, so a
+            # recursive chown on every launch would only turn a large profile into
+            # another visible SD-card stall.
+            chown virtua:virtua "$HOME/.mozilla" "$HOME/.mozilla/j36" \
+                                 "$HOME/.mozilla/j36/user.js" 2>/dev/null
+        fi
+        run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" --no-remote \
             -profile "$HOME/.mozilla/j36" "$URL"
         ;;
     chromium|chromium-browser)
-        exec ${DBUS:+$DBUS --} "$J36_BROWSER" --no-sandbox --disable-gpu \
+        run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" --disable-gpu \
             --disable-dev-shm-usage --renderer-process-limit=1 \
             --password-store=basic --window-size=640,480 \
             --window-position=0,0 "$URL"
         ;;
     *)
-        exec ${DBUS:+$DBUS --} "$J36_BROWSER" "$URL"
+        run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" "$URL"
         ;;
 esac
 BROWSERLAUNCH
@@ -12849,7 +12882,7 @@ the right stick is a two-axis scroll wheel.</p>
 <tr><td class="k">Right stick</td><td>scroll</td></tr>
 <tr><td class="k">D-pad</td><td>arrow-key navigation</td></tr>
 <tr><td class="k">A</td><td>click</td></tr>
-<tr><td class="k">B</td><td>back one page</td></tr>
+<tr><td class="k">B</td><td>back one page; exit when the desktop is empty</td></tr>
 <tr><td class="k">X</td><td>Enter &mdash; submits the box you are typing in</td></tr>
 <tr><td class="k">Y</td><td>Escape &mdash; stops loading</td></tr>
 <tr><td class="k">L1, R1</td><td>scroll up and down; hold to keep scrolling</td></tr>

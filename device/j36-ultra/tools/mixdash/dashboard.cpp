@@ -2419,9 +2419,14 @@ void Dashboard::setForeground(int index)
          * explicitly.
          */
         setUpdatesEnabled(true);
-        update();
+        /* The task and X cursor have both drawn directly into the shared physical
+         * framebuffer.  update() is deferred and used to leave those pixels (and
+         * an open keyboard) visible until some unrelated animation happened.
+         * Repaint the complete dashboard before returning ownership to its input
+         * loop so the hand-off is one complete frame. */
+        repaint();
         if (m_current)
-            m_current->update();
+            m_current->repaint();
         return;
     }
 
