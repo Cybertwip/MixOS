@@ -11964,6 +11964,14 @@ export GDK_BACKEND=x11
 export GTK_OVERLAY_SCROLLING=0
 export GDK_CORE_DEVICE_EVENTS=1
 
+# Everything in this session is root and HOME above is virtua's, which is the one
+# combination Mozilla's own startup check refuses to run in -- it prints a sentence
+# and exits before mapping anything.  j36-browser sets this too and the long version
+# of why is there; it is repeated here because the session is what runs a window
+# somebody opened by typing `firefox' in the Terminal card, and that window would
+# otherwise close as fast as this one did and take the session with it.
+export MOZ_ALLOW_ROOT=1
+
 # WHAT A CLIENT LOOKS AT TO KNOW IT IS ALREADY INSIDE A SESSION.  j36-browser reads
 # it: with it set it execs a browser, without it it hands itself to j36-xrun.  A
 # variable and not a test on DISPLAY, because the Terminal card exports DISPLAY=:0
@@ -12629,8 +12637,9 @@ FFPREFS
 
 # Per-engine flags, and only where the default is unusable:
 #
-#   firefox gets the profile above, and --no-remote so a second launch opens its own
-#   instance instead of quietly handing the URL to a dead one.
+#   firefox gets the profile above, --no-remote so a second launch opens its own
+#   instance instead of quietly handing the URL to a dead one, and MOZ_ALLOW_ROOT --
+#   see below, it is the reason the Desktop card used to die on the spot.
 #
 #   chromium refuses to start as root without --no-sandbox, and its GPU process has
 #   nothing to talk to here, so it is told not to look.  --disable-dev-shm-usage
@@ -12653,6 +12662,34 @@ DBUS=""
 # had closed the moment this shell did.
 case "${J36_BROWSER##*/}" in
     firefox|firefox-esr)
+        # ── WHY THE DESKTOP CARD USED TO SAY "Desktop Exited" ────────────────
+        #
+        # Firefox refuses to run as root when $HOME belongs to somebody else, and
+        # this card is exactly that combination on purpose: everything here runs
+        # as root because there is no login and no user session, and HOME is
+        # /home/virtua because that is the data partition and the one the Sharing
+        # card exports.  So it printed
+        #
+        #   Running Firefox as root in a regular user's session is not supported.
+        #   ($HOME is /home/virtua which is owned by virtua.)
+        #
+        # and exited before mapping a window.  Which is not a browser that failed
+        # to open: it is the session's ONLY window closing the instant it was
+        # started, so j36-xsession-main's "the last window closed" rule ended the
+        # session, xinit lost its server, and the whole task went away -- which is
+        # the "Desktop Exited" toast, and the black panel in between.  Five of
+        # them in a row are in the reported log, six seconds apart.
+        #
+        # MOZ_ALLOW_ROOT is Mozilla's own way out of that check and the only one:
+        # the test is `geteuid() == 0 && HOME is not root's && !MOZ_ALLOW_ROOT'.
+        # The alternatives are worse -- moving HOME to /root would put downloads
+        # and the profile on the OS partition and out of the share, and running
+        # the browser as virtua would need a user session, an XAUTHORITY and an
+        # audio path this image does not have.  It is the same concession
+        # chromium already gets two branches down with --no-sandbox, for the same
+        # reason and with the same honesty about it.
+        MOZ_ALLOW_ROOT=1
+        export MOZ_ALLOW_ROOT
         firefox_profile
         exec ${DBUS:+$DBUS --} "$J36_BROWSER" --no-remote \
             -profile "$HOME/.mozilla/j36" "$URL"
