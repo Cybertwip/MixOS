@@ -287,6 +287,35 @@ module_param(chgreboot, bool, 0444);
 MODULE_PARM_DESC(chgreboot,
 		 "restart rather than hang when power-off is asked for with a charger attached");
 
+/*
+ * ── A HEARTBEAT IS NOT A DIAGNOSTIC ─────────────────────────────────────────
+ *
+ * The charging line used to print every twentieth poll for the life of the
+ * board, which on a console left plugged in overnight is thousands of identical
+ * lines and, on a boot whose long stages say nothing (unpacking a rootfs,
+ * bringing up the GPU), the ONLY thing in the ring buffer -- so the one message
+ * that would have explained a wedge is pushed off the top of dmesg by a meter
+ * reporting that a full cell is still full.  It is by a wide margin the loudest
+ * thing this kernel prints and it was reported as such.
+ *
+ * The line is worth keeping -- see j36_charging_line() for what the three
+ * numbers on it are for -- so what changes is WHEN.  It is printed when it says
+ * something new: a plug edge, the veto moving, a percent of charge, or an
+ * analogue reading that has walked far enough to matter.  A board sitting at
+ * 100% with nothing plugged in is silent, and a board that is charging still
+ * prints its climb, because the climb is a change.
+ *
+ * This is the interval of a periodic line ON TOP of that, in polls, and it is
+ * off by default: it exists for the case where the question is "is the poll
+ * still running at all", which no change-driven line can answer.  20 restores
+ * the old behaviour exactly.
+ */
+static unsigned int charging_line_every;
+module_param(charging_line_every, uint, 0644);
+MODULE_PARM_DESC(charging_line_every,
+		 "print the charging line every N polls whether or not anything "
+		 "changed (default 0: on change only; 20 is the old behaviour)");
+
 /* ── PWRAP (the PMIC wrapper), WACS2 ─────────────────────────────────────────
  *
  * The same transport j36_mt6592_input uses for the volume keys' AUXADC channel,
@@ -856,7 +885,22 @@ struct j36_pmic {
 				 * held so the line is one per run of the state */
 	unsigned int chr_holdoff_run;	/* consecutive polls disagreeing with
 					 * chr_held_off; see J36_CHR_HOLDOFF_POLLS */
-	unsigned int poll_kicks;	/* rate-limits j36_charging_line() */
+	unsigned int poll_kicks;	/* counts polls for charging_line_every */
+
+	/* What j36_charging_line() last put on the record, so the next poll can
+	 * ask whether it would be saying anything new.  The analogue three are
+	 * compared against what was PRINTED rather than binned into buckets:
+	 * a bucket edge and a reading that dithers across it print a line per
+	 * poll, which is the noise this is here to stop.  -1 is "no sample",
+	 * which is itself a state worth a line when it arrives or clears. */
+	bool chg_line_seen;
+	int chg_line_online;
+	int chg_line_chrdet;
+	int chg_line_src;
+	int chg_line_vchr;
+	int chg_line_vbat;
+	int chg_line_ma;
+	int chg_line_level;
 
 	/* When an operator's CV write stops the re-arm stamping 4200 back over
 	 * it.  Written from the sysfs path, read from the worker; a torn read of
@@ -2565,16 +2609,38 @@ static int j36_charger_online(struct j36_pmic *p, u32 *flags)
 	return online;
 }
 
-/* Twenty polls, which at the one-second default is one line per twenty seconds
- * -- slow enough to be free, fast enough that a plug event is never more than a
- * third of a minute from its first confirmation. */
-#define J36_CHARGING_LINE_EVERY		20
+/*
+ * How far each of the three analogue readings has to move before it is worth a
+ * line of its own.
+ *
+ * VBAT is the tightest because it is the number the whole gauge rests on and
+ * because it is the one that moves SLOWLY: 30 mV is about twenty minutes of
+ * charging, so a charge run still writes its climb into the log a couple of
+ * dozen lines at a time, which is exactly the record this line was added for.
+ * VCHR and the pack current are looser because both are noisy by construction
+ * -- VCHR sits on a divider and the pack figure is a difference of two ADC
+ * channels -- and a threshold under their noise floor is a threshold that
+ * prints every poll, which is the whole disease.
+ */
+#define J36_CHARGING_LINE_VBAT_MV	30
+#define J36_CHARGING_LINE_VCHR_MV	100
+#define J36_CHARGING_LINE_MA		100
+
+/* Two readings of the same quantity, where -1 means "no sample": far enough
+ * apart to print, or either one missing and the other not, which is a change of
+ * a different kind and always worth saying. */
+static bool j36_moved(int now, int was, int by)
+{
+	if (now < 0 || was < 0)
+		return now != was;
+	return abs(now - was) >= by;
+}
 
 /*
  * ══ IS IT CHARGING? ══
  *
- * Three numbers, roughly every twenty polls, on one line, and the reason it is
- * three:
+ * Three numbers on one line, printed when one of them has something new to say,
+ * and the reason it is three:
  *
  *   CS_DET is not the answer.  It is an instantaneous comparator on a current
  *     source that HWCV and the CSDAC ramp are actively modulating, so a snapshot
