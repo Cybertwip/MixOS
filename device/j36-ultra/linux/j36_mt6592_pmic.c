@@ -899,8 +899,13 @@ struct j36_pmic {
 	int chg_line_src;
 	int chg_line_vchr;
 	int chg_line_vbat;
-	int chg_line_ma;
 	int chg_line_level;
+	/* The pack current is the one of the three that is legitimately
+	 * NEGATIVE -- it is a difference of two ADC channels and it reads below
+	 * zero on a discharging board -- so it cannot share the -1 sentinel the
+	 * others use and carries its own flag instead. */
+	bool chg_line_ma_valid;
+	int chg_line_ma;
 
 	/* When an operator's CV write stops the re-arm stamping 4200 back over
 	 * it.  Written from the sysfs path, read from the worker; a torn read of
@@ -2686,7 +2691,6 @@ static void j36_charging_line(struct j36_pmic *p, int online, int chrdet,
 {
 	char pack_buf[16], vbat_buf[16], vchr_buf[16], level_buf[16];
 	const char *pack, *vbat, *vchr, *level;
-	int ma_now = ma_valid ? ma : -1;
 	int bat_now = bat_mv > 0 ? bat_mv : -1;
 	int level_now = p->soc_dep >= 0 ? 100 - p->soc_dep : -1;
 	int vchr_now = vchr_mv >= 0 ? vchr_mv : -1;
@@ -2706,9 +2710,10 @@ static void j36_charging_line(struct j36_pmic *p, int online, int chrdet,
 	    chrdet == p->chg_line_chrdet &&
 	    (int)sourcing == p->chg_line_src &&
 	    level_now == p->chg_line_level &&
+	    ma_valid == p->chg_line_ma_valid &&
+	    (!ma_valid || abs(ma - p->chg_line_ma) < J36_CHARGING_LINE_MA) &&
 	    !j36_moved(vchr_now, p->chg_line_vchr, J36_CHARGING_LINE_VCHR_MV) &&
-	    !j36_moved(bat_now, p->chg_line_vbat, J36_CHARGING_LINE_VBAT_MV) &&
-	    !j36_moved(ma_now, p->chg_line_ma, J36_CHARGING_LINE_MA))
+	    !j36_moved(bat_now, p->chg_line_vbat, J36_CHARGING_LINE_VBAT_MV))
 		return;
 
 	p->chg_line_seen = true;
@@ -2718,7 +2723,8 @@ static void j36_charging_line(struct j36_pmic *p, int online, int chrdet,
 	p->chg_line_level = level_now;
 	p->chg_line_vchr = vchr_now;
 	p->chg_line_vbat = bat_now;
-	p->chg_line_ma = ma_now;
+	p->chg_line_ma_valid = ma_valid;
+	p->chg_line_ma = ma;
 
 	cs_det = j36_pmic_read(p, J36_CHR_CON2, &con2) == 0
 		 ? !!(con2 & J36_CHR_CON2_CS_DET) : -1;
