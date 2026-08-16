@@ -6973,6 +6973,11 @@ if [ "$want_lima" = 1 ] || [ "$want_mtkdrm" = 1 ] || [ "$want_gl" = 1 ] || \
     # the bar tracks time rather than tasks.  run_lima carries the MFG power
     # sequence and takes the longest of the five.
     find_payload
+    # Here rather than wherever the first watch_run happens to be, so that "the last
+    # boot stopped dead inside X" is said on its own, before the first stage's name
+    # goes up, instead of arriving in the middle of one.  Every watch_run below it
+    # calls this too and gets a no-op.
+    watch_recall
     if [ "$want_lima" = 1 ]; then
         stage "Starting the graphics core"; detail "MFG power domain, lima"
         progress 40; watch_run 60 "MFG power domain, lima" run_lima
