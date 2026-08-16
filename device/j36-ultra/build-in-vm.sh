@@ -2059,12 +2059,14 @@ watch_wedge=""
 watch_recalled=0
 # Written and then SYNCED, and the sync is the entire point: a board that stalls
 # the bus never flushes anything, so a mark sitting in the page cache is a mark
-# the next boot does not see.  It costs one flush per stage on an otherwise idle
-# filesystem.
+# the next boot does not see -- and a CLEAR sitting in the page cache is a stage
+# skipped for a wedge it had nothing to do with.  Both directions are flushed for
+# that reason.  It costs two flushes per stage of an otherwise idle filesystem;
+# the first one also pays for whatever stage_from_boot unpacked, and pays it once.
 watch_mark() {
     mkdir -p /newroot/opt/mixos 2>/dev/null
     echo "$1" > "$watch_markfile" 2>/dev/null || return 0
-    if [ -n "$1" ]; then sync; fi
+    sync
     return 0
 }
 # Read once, and cleared in the same breath, so the answer can only ever be acted
@@ -2102,6 +2104,13 @@ watch_run() {
         if [ "$watch_waited" -ge "$watch_limit" ]; then
             say "$watch_label: nothing back in ${watch_waited}s; carrying on without it"
             detail "$watch_label -- gave up after ${watch_waited}s"
+            # Cleared here too, and the child is still in there somewhere.  The
+            # mark means "the board died with this in flight", and this boot is
+            # demonstrably not dead -- it is standing here saying so.  A stage
+            # that merely outran its bound has already been paid for once by
+            # being abandoned; making the next boot skip it as well would punish
+            # slow twice and call it dead.
+            watch_mark ""
             return 124
         fi
         # An empty read is the status file caught between its truncate and its
@@ -2113,6 +2122,8 @@ watch_run() {
         watch_waited=$((watch_waited + 1))
         sleep 1
     done
+    # The stage answered, whatever it answered, so the board survived it.
+    watch_mark ""
     read -r watch_rc < "$watch_result"
     # `return' wants a number and the file is written by a shell that could in
     # principle have been killed mid-write.  125 is "the child did not say".
