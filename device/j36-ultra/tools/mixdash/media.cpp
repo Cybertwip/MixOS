@@ -542,9 +542,25 @@ void MediaPage::populate(QString dir)
      * so a page that got one could be entered and never left.  See
      * defaultMediaRoot() above for how it used to get one. */
     QDir d(clampToCeiling(dir));
+
+    /*
+     * A FILTER IS A PROPERTY OF THE FOLDER IT WAS TYPED IN, so it goes when the
+     * folder does -- and stays when it does not.  The previous path is read before
+     * m_dir is overwritten because both cases come through here: opening a
+     * directory, which must clear the term, and onDisksChanged() repopulating the
+     * SAME directory a second after a stick was plugged in, which must not.  A
+     * refresh that silently dropped the search would look like the filter forgetting
+     * itself at random, since what triggers it happens off-screen.
+     */
+    const QString previous = m_dir;
+    const bool wasPlaces = m_places;
+
     m_dir = d.absolutePath();
     m_entries.clear();
     m_places = false;
+
+    if (wasPlaces || previous != m_dir)
+        m_search.clear();
 
     if (!d.exists()) {
         /* A new listing, so the cursor starts at the top of it -- see rebuild(). */
@@ -668,6 +684,9 @@ void MediaPage::populatePlaces()
 {
     m_places = true;
     m_entries.clear();
+    /* Nothing to filter up here, and leaving a term set would put it back in force
+     * the moment `..' went back down into the folder it came from. */
+    m_search.clear();
 
     for (const MediaRoot &r : mediaRoots()) {
         Entry e;
@@ -731,7 +750,7 @@ void MediaPage::onDisksChanged()
         if (m_entries.size() < 2)
             populate(mediaCeiling());
         if (browsing)
-            m_list->setCurrent(0);
+            selectTopEntry();
         return;
     }
 
@@ -751,7 +770,7 @@ void MediaPage::onDisksChanged()
     const QString was = m_dir;
     populate(QFileInfo(was).isDir() ? clampToCeiling(was) : mediaCeiling());
     if (browsing && (cursor.isEmpty() || !selectPath(cursor)))
-        m_list->setCurrent(0);
+        selectTopEntry();
 }
 
 bool MediaPage::openPath(const QString &path)
@@ -762,8 +781,10 @@ bool MediaPage::openPath(const QString &path)
 
     if (info.isDir()) {
         setView(ViewBrowse);
+        /* populate() ends in rebuild(false), which already puts the cursor on the
+         * first entry -- see selectTopEntry().  A setCurrent(0) here would undo it
+         * and land on the search box. */
         populate(info.absoluteFilePath());
-        m_list->setCurrent(0);
         return true;
     }
 
@@ -807,8 +828,53 @@ void MediaPage::rebuild(bool keepSelection)
     m_list->setRows(rows, keepSelection);
     if (keep >= 0 && keep < rows.size())
         m_list->setCurrent(keep);
+    else if (m_view != ViewPlayer)
+        selectTopEntry();
     layOutList();
     refresh();
+}
+
+/*
+ * ── THE TOP OF THE LISTING IS NOT ROW 0 ──────────────────────────────────────
+ *
+ * setRows(rows, false) lands on the first SELECTABLE row, and the first selectable
+ * row is furniture: the now-playing row while music is on, and the search box under
+ * it.  That is "at the top" in the literal sense and wrong in every other one -- it
+ * costs a press to reach the files in every directory opened, and after a search it
+ * would leave the cursor sitting on the box that was just typed into.
+ *
+ * WHEN A FILTER IS IN FORCE ONE MORE ROW IS SKIPPED, and that is not cosmetic.
+ * `..' survives the filter on purpose (see matchesSearch), so it is the first row
+ * of every filtered listing -- and landing on it means the first press of A after a
+ * search walks OUT of the folder that was just searched.
+ *
+ * Falls through to whatever setRows chose when there is nothing to land on, which
+ * is the empty directory and the search that matched nothing.  In the second case
+ * that is the box itself, which is where somebody about to clear it wants to be.
+ */
+void MediaPage::selectTopEntry()
+{
+    const QVector<ListRow> &rows = m_list->rows();
+    const bool filtered = !m_search.trimmed().isEmpty();
+
+    for (int i = 0; i < rows.size(); ++i) {
+        const int id = rows[i].id;
+        if (id < 0 || id >= m_entries.size() || !rows[i].enabled)
+            continue;
+        if (filtered && (m_entries[id].kind == KindUp || m_entries[id].kind == KindPlace))
+            continue;
+        m_list->setCurrent(i);
+        return;
+    }
+}
+
+bool MediaPage::matchesSearch(const Entry &e) const
+{
+    if (m_search.trimmed().isEmpty())
+        return true;
+    if (e.kind == KindUp || e.kind == KindPlace)
+        return true;
+    return e.name.contains(m_search.trimmed(), Qt::CaseInsensitive);
 }
 
 void MediaPage::buildBrowseRows(QVector<ListRow> &rows) const
@@ -838,11 +904,45 @@ void MediaPage::buildBrowseRows(QVector<ListRow> &rows) const
         rows.append(r);
     }
 
+    /*
+     * The search box, under the now-playing row and above the listing -- which is
+     * where it has to be: it is the one row whose position must not move when the
+     * directory changes, because it is how you change what the directory shows.
+     * Not offered on the places level, where there is nothing to filter but the
+     * volumes themselves and those are never filtered.
+     */
+    if (!m_places) {
+        ListRow s;
+        s.kind = ListRow::Action;
+        s.id = RowSearch;
+        s.glyph = GlyphFiles;
+        if (m_search.trimmed().isEmpty()) {
+            s.text = tr("Search this folder");
+            s.detail = tr("By name.  A opens the keyboard.");
+            s.accent = Theme::ink3();
+        } else {
+            s.text = m_search;
+            s.detail = tr("A edits it, B is not it -- press A and clear the box");
+            s.accent = Theme::blue();
+            s.badge = tr("filtered");
+            s.badgeColour = Theme::blue();
+        }
+        rows.append(s);
+    }
+
+    int matched = 0;
     for (int i = 0; i < m_entries.size(); ++i) {
         const Entry &e = m_entries[i];
+        if (!matchesSearch(e))
+            continue;
+        if (e.kind != KindUp && e.kind != KindPlace)
+            matched++;
         ListRow r;
         r.kind = ListRow::Item;
         r.text = e.name;
+        /* THE INDEX INTO m_entries AND NOT THE ROW NUMBER -- see the note on
+         * m_search in media.h.  A filtered listing skips rows; it renumbers
+         * nothing. */
         r.id = i;
         r.key = e.path;
 
@@ -896,6 +996,25 @@ void MediaPage::buildBrowseRows(QVector<ListRow> &rows) const
             r.badge = m_paused ? tr("paused") : tr("playing");
             r.badgeColour = m_paused ? Theme::orange() : Theme::green();
         }
+        rows.append(r);
+    }
+
+    /*
+     * A filter that matched nothing SAYS SO, on the list, rather than leaving a
+     * folder that plainly had things in it looking empty.  The pane's own
+     * placeholder cannot do this job: it is the empty-directory message, it is
+     * only drawn when there are no rows at all, and there is at least one here --
+     * the search box itself, and usually `..' with it.
+     */
+    if (!m_places && !m_search.trimmed().isEmpty() && matched == 0) {
+        ListRow r;
+        r.kind = ListRow::Item;
+        r.id = RowInert;
+        r.enabled = false;
+        r.glyph = GlyphInfo;
+        r.accent = Theme::ink3();
+        r.text = tr("Nothing here matches %1").arg(m_search.trimmed());
+        r.detail = tr("A on the box above clears it");
         rows.append(r);
     }
 }
@@ -1090,6 +1209,17 @@ void MediaPage::onActivated(int index)
     }
 
     switch (id) {
+    case RowSearch:
+        /*
+         * The keyboard opens ON the term that is already in force, so clearing a
+         * filter is select-all-and-delete rather than a second row nobody would
+         * find.  m_awaitingSearch is what makes textEntered() ours: the shell hands
+         * that callback to whichever page is up, and this page will one day want the
+         * keyboard for something else.
+         */
+        m_awaitingSearch = true;
+        emit textRequested(tr("Search this folder"), m_search, false);
+        return;
     case RowNowPlaying:
         setView(ViewPlayer);
         return;
@@ -1139,6 +1269,27 @@ void MediaPage::onActivated(int index)
     default:
         return;
     }
+}
+
+/*
+ * The keyboard closed.  Only the search box ever opens it from this page, and
+ * m_awaitingSearch is checked rather than assumed -- a callback that arrives when
+ * nothing asked for one belongs to somebody else, and taking it would set the
+ * filter to whatever the last page typed.
+ */
+void MediaPage::textEntered(const QString &text, bool accepted)
+{
+    if (!m_awaitingSearch)
+        return;
+    m_awaitingSearch = false;
+    if (!accepted)
+        return;
+
+    m_search = text;
+    /* rebuild(false), because the filter has changed what row 0 IS.  Keeping the
+     * cursor would leave it wherever the old row number now lands -- in the middle
+     * of a three-row list, or past the end of it.  Same reason populate() does. */
+    rebuild(false);
 }
 
 void MediaPage::onValueChanged(int index, int value)
@@ -1222,16 +1373,17 @@ void MediaPage::open(Entry entry)
         else
             populate(entry.path);
         if (!selectPath(child))
-            m_list->setCurrent(0);
+            selectTopEntry();
         return;
     }
     case KindPlace:
+        /* No setCurrent(0) after either of these: populate() ends in rebuild(false)
+         * and that already lands on the first entry rather than on the furniture
+         * above it.  See selectTopEntry(). */
         populate(entry.path);
-        m_list->setCurrent(0);
         return;
     case KindDir:
         populate(entry.path);
-        m_list->setCurrent(0);
         return;
     case KindImage:
         openImage(entry);

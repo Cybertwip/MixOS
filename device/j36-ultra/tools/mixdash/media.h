@@ -135,6 +135,7 @@ public:
     bool handleNav(int action) override;
     void onEnter() override;
     void onLeave() override;
+    void textEntered(const QString &text, bool accepted) override;
     bool wantsFullscreen() const override;
 
     /*
@@ -295,6 +296,17 @@ private:
         RowRepeat     = -7,
         RowShuffle    = -8,
         RowReveal     = -9,
+        /*
+         * The search box, and it is a ROW because everything on this page is.
+         * Files has a real field because it has a pane system to put one in --
+         * address, search, places, list, all reachable by walking off the edge of
+         * the one you are on.  This page is a single ListPane, and bolting a
+         * second focusable widget onto it would mean inventing that whole
+         * mechanism again for one field.  A row is discoverable without it: it is
+         * on the screen, it says what it is filtering by, and A opens the
+         * keyboard on it like every other Action row in this shell.
+         */
+        RowSearch     = -11,
         /* Headers and the read-only output line.  They are unselectable, so they
          * can never reach onActivated() -- but their id defaults to 0, which reads
          * as "entry 0" there, and one future edit that made such a row selectable
@@ -332,6 +344,13 @@ private:
     void open(Entry entry);
     /* Cursor onto the row showing this path; false if this listing has none. */
     bool selectPath(const QString &path);
+    /*
+     * Cursor onto the top of the LISTING, which is not row 0.  Row 0 is furniture
+     * -- the now-playing row, the search box -- and a new listing has to start on
+     * the first thing in it.  See media.cpp for why a filtered listing skips one
+     * more row than an unfiltered one.
+     */
+    void selectTopEntry();
     void openImage(const Entry &entry);
     /*
      * startAt is why this takes a time: a pipe cannot seek, so seeking is running
@@ -371,6 +390,18 @@ private:
     void rebuild(bool keepSelection = true);
     void buildBrowseRows(QVector<ListRow> &rows) const;
     void buildPlayerRows(QVector<ListRow> &rows) const;
+
+    /*
+     * Whether this entry survives the filter.  Case-insensitive substring, which is
+     * the same rule the Files page's glob comes to and the only one worth having on
+     * a device where typing the term took a minute on an on-screen keyboard.
+     *
+     * WHAT IS NEVER FILTERED: `..' and the volume rows.  A filter that can hide the
+     * way out of a directory is a filter that strands you in it, and the volumes are
+     * the answer to "where else could this be" -- which is the question somebody who
+     * has just searched and found nothing is asking.
+     */
+    bool matchesSearch(const Entry &e) const;
 
     /* ── the music queue ──────────────────────────────────────────────────── */
 
@@ -549,6 +580,20 @@ private:
      * to know this level exists. */
     bool m_places = false;
     QVector<Entry> m_entries;
+
+    /*
+     * The filter over the listing, and it filters ROWS rather than m_entries.  Every
+     * browse row carries its index into m_entries as its id, which is what makes
+     * onActivated() a lookup instead of a search, so the entries have to keep their
+     * positions -- a filtered m_entries would renumber them all and the first press
+     * after a search would open the wrong file.
+     *
+     * Cleared whenever the listing changes directory, because a filter is a property
+     * of the folder you typed it in.  It survives a refresh of the same folder --
+     * a track ticking on, a disk arriving -- for the same reason the cursor does.
+     */
+    QString m_search;
+    bool m_awaitingSearch = false;
 
     int m_view = ViewBrowse;
     /* Where the browser's selection was when the player view took the pane. */
