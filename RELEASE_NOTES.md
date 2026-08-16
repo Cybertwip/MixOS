@@ -147,9 +147,15 @@ EGL and mirror tests as things you can run from the page.
 together, because a device out of a box does not know where it is and everything that
 follows from where it is is the same question.
 
-**Terminal**, **Info**, **Power off**, and a **Browser** session — Firefox on an X server on
-the framebuffer, with the pad usable inside it and an on-screen keyboard laid out like the
-dashboard's.
+**Terminal**, **Info**, **Power off**, and a **Desktop** — an X server on the framebuffer
+with a window manager on it, which the **Browser** card is now one window inside rather than
+the whole of. Anything else graphical goes in beside it: `j36-xrun COMMAND` from the
+Terminal card hands a command line to the running session over a control pipe, so a program
+installed from the Packages card gets a screen without knowing anything about how this
+device is put together. **Menu** tapped pages round the open windows, **Menu** held brings
+the dashboard back with the session left running behind it, and four windows at a time is
+the cap. The Terminal card exports `DISPLAY=:0` for the same reason. The pad drives the
+pointer inside the session and the on-screen keyboard is laid out like the dashboard's.
 
 **Task switcher.** Hold **FN** and a list of what is running comes up over the top of it —
 the dashboard itself, every card that started a program, and every binary launched from the
@@ -158,8 +164,8 @@ Ctrl+C in the Terminal is untouched. FN steps down the list, A switches, Menu cl
 highlighted task, B puts back whatever was in front.
 
 Several programs run at once and exactly one of them owns the panel: the rest are stopped by
-the kernel, on their own process group, so a browser session's nine processes go down and
-come back as one thing. A task's last frame is kept and put back before it is continued,
+the kernel, on their own process group, so a desktop session — X server, window manager, pad
+bridge, on-screen keyboard and every window in it — goes down and comes back as one thing. A task's last frame is kept and put back before it is continued,
 because an X server only repaints what it thinks is damaged and would otherwise come back
 with the switcher still on its screen. Four at a time, which is what the list shows without
 scrolling and about what 946 MB will hold.
@@ -177,7 +183,7 @@ phrase table.
 | Tool | What it does |
 |---|---|
 | `mixsplash` | The boot splash, including the first-boot expansion percentage |
-| `j36-padx` | The pad as a mouse and a keyboard inside an X server. The kernel presents everything — both sticks, the D-pad, four face buttons, four shoulders, Start/Select/Menu — as one evdev device, and X wants a pointer |
+| `j36-padx` | The pad as a mouse and a keyboard inside an X server. The kernel presents everything — both sticks, the D-pad, four face buttons, four shoulders, Start/Select/Menu — as one evdev device, and X wants a pointer. Menu is the session gesture: tapped it asks for the next window, held it hands the panel back to the dashboard |
 | `j36-eglprobe` | Brings up an ES 2.0 context on lima's render node and draws a cube; the ground truth for "is the GPU working" |
 | `j36-mixmirror` | The USB-HDMI mirror, over `DRM_UDL` |
 | `mfgpower` | Powers up the MT6592 MFG (GPU) domain through the SPM's MTCMOS from userspace and proves a Mali-450 MP4 is answering, before anything hands the block to lima. Nothing on the Linux boot path un-gates it |
@@ -280,6 +286,22 @@ started the spring: `resetMotion()` deliberately leaves already-placed cards at 
 coordinates and it is `step()` that walks them to their new slots, so with the animation
 timer asleep the new layout was worked out and never travelled to. It now wakes the spring
 on every change to the list.
+
+**A volume plugged in while the Media page was open did not list.** Two faults with one
+symptom, which is why it read as "the disk only shows up after you have been through the
+Files page". `onDisksChanged()` began with `if (m_view != ViewBrowse) return`, and music
+outliving the page it was started from is the whole point of the queue — so a stick plugged
+in while the player, a picture or a film was up was dropped on the floor, and coming back to
+the listing showed the one built when there was a single root. And when the event *was*
+taken, all it added to a root's listing was a `..` row at the top: that row says "up one
+level" until you press it, the level above is a places list nobody has been told exists, and
+the volume's own name appears nowhere on the screen the user is actually looking at. Files
+has had its volumes permanently on the glass since the day it was written, for exactly this
+reason. The listing is now rebuilt whichever view is up — only the cursor bookkeeping is
+browse-only — and a root's listing carries every *other* root on it by name, one press to
+open, so a disk arrives where somebody who has just plugged one in is standing. Only on a
+root: repeating the volumes inside every folder would answer a question nobody asked of a
+directory listing.
 
 **Compiled shaders were being thrown away.** `j36-glwarm.service` brings EGL up once after
 the dashboard has painted, so the first graphics program does not pay for the whole stack
