@@ -1384,6 +1384,8 @@ void CardGrid::cancelCarry()
 
 void CardGrid::onHoldExpired()
 {
+    if (!m_rearrangeable)
+        return;
     /*
      * A was held past the threshold.  Clearing m_okArmed first is what stops the
      * release that ends this same press from also counting as a tap -- otherwise
@@ -1448,6 +1450,10 @@ bool CardGrid::handleNav(int action)
     case Joypad::NavRight: moveBy(1, 0); return true;
 
     case Joypad::NavOk:
+        if (!m_rearrangeable) {
+            activate();
+            return true;
+        }
         /*
          * A DOES NOT LAUNCH HERE.  It arms, and the release launches -- because a
          * long press is a different gesture and the two cannot be told apart at
@@ -1631,7 +1637,7 @@ void CardGrid::mousePressEvent(QMouseEvent *event)
         selectTo(m_pressed);
     /* Press and hold with the pointer is the same gesture as press and hold on
      * the pad, and reaches the same pickUp() -- see onHoldExpired. */
-    if (m_pressed >= 0) {
+    if (m_pressed >= 0 && m_rearrangeable) {
         m_okArmed = false;   /* the pointer's tap is decided in mouseRelease */
         m_hold->start();
     }
@@ -1662,7 +1668,7 @@ void CardGrid::mouseReleaseEvent(QMouseEvent *event)
     /* Only if the release is on the card the press landed on, which is what lets
      * a mis-aimed press be slid off and abandoned. */
     const int i = cardAt(event->pos());
-    if (wasHolding && i >= 0 && i == m_pressed)
+    if ((wasHolding || !m_rearrangeable) && i >= 0 && i == m_pressed)
         emit activated(i);
     m_pressed = -1;
     event->accept();

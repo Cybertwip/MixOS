@@ -86,8 +86,8 @@ const Map kMap[] = {
 
 /*
  * Slot order matches the device tree: ABS_X, ABS_Y, ABS_Z, ABS_RZ.  Slots 0 and
- * 1 are the left stick and navigate; 2 and 3 are the right stick and drive the
- * pointer unless the user has turned the pointer off.
+ * 1 are the left stick and drive the pointer; 2 and 3 are the right stick and
+ * scroll.  Navigation belongs only to the four KEY_* D-pad events above.
  *
  * SLOT 3 IS ABS_RZ AND NOT ABS_RY, AND THAT IS WHY THE POINTER DID NOT WORK.
  * generate_dts.py emits `j36,axis-map = <ch15 ABS_X 1  ch14 ABS_Y 1  ch12 ABS_Z 0
@@ -698,10 +698,9 @@ void Joypad::poll()
                         if (d.absCode[slot] != (int)ev.code)
                             continue;
                         d.absRaw[slot] = ev.value;
-                        /* The right stick only navigates when it is not pointing. */
-                        if (slot >= 2 && Settings::instance().mouse().enabled)
-                            continue;
-                        axis(d, slot, ev.value);
+                        /* No axis calls feed(): the D-pad is the sole navigation
+                         * source.  driveStick() consumes both analogue pairs once
+                         * per frame, independent of the ADC event rate. */
                     }
                 } else if (ev.type == EV_REL) {
                     relative(ev.code, ev.value);
@@ -719,9 +718,10 @@ void Joypad::poll()
                         m_relPendX = 0.0;
                         m_relPendY = 0.0;
                     }
-                    if (m_wheelPend != 0) {
-                        emit pointerWheel(m_wheelPend);
-                        m_wheelPend = 0;
+                    if (m_wheelPendX != 0 || m_wheelPendY != 0) {
+                        emit pointerWheel(m_wheelPendX, m_wheelPendY);
+                        m_wheelPendX = 0;
+                        m_wheelPendY = 0;
                     }
                 }
             }
@@ -807,7 +807,10 @@ void Joypad::relative(int code, int value)
         break;
     case REL_WHEEL:
         /* evdev counts notches, QWheelEvent counts eighths of a degree. */
-        m_wheelPend += value * 120;
+        m_wheelPendY += value * 120;
+        break;
+    case REL_HWHEEL:
+        m_wheelPendX += value * 120;
         break;
     default:
         break;
@@ -830,17 +833,15 @@ bool Joypad::pointerKey(int code, bool pressed)
         button = Qt::MiddleButton;
         break;
     case BTN_THUMBR:
-        /* Right stick click.  The stick that moves the pointer carries the button
-         * that clicks with it, which is the only arrangement that can be used
-         * one-handed. */
-        if (!cfg.enabled)
-            return false;
-        button = cfg.leftHanded ? Qt::RightButton : Qt::LeftButton;
-        break;
-    case BTN_THUMBL:
         if (!cfg.enabled)
             return false;
         button = cfg.leftHanded ? Qt::LeftButton : Qt::RightButton;
+        break;
+    case BTN_THUMBL:
+        /* The left stick owns the pointer, so its click is the primary button. */
+        if (!cfg.enabled)
+            return false;
+        button = cfg.leftHanded ? Qt::RightButton : Qt::LeftButton;
         break;
     default:
         return false;
@@ -856,17 +857,17 @@ void Joypad::driveStick(int ms)
     if (!cfg.enabled)
         return;
 
-    /* The first device that reports both right-stick axes wins.  There is exactly
+    /* The first device that reports both left-stick axes wins.  There is exactly
      * one adc-joystick on this board; the loop is here so that a USB pad plugged
      * in later is not silently ignored. */
     qreal nx = 0.0;
     qreal ny = 0.0;
     bool found = false;
     for (const Dev &d : m_devs) {
-        if (!d.absSeen[2] || !d.absSeen[3])
+        if (!d.absSeen[0] || !d.absSeen[1])
             continue;
         const qreal dz = cfg.deadzone / 100.0;
-        for (int slot = 2; slot <= 3; ++slot) {
+        for (int slot = 0; slot <= 1; ++slot) {
             const qreal mid = (d.absLo[slot] + d.absHi[slot]) / 2.0;
             const qreal half = (d.absHi[slot] - d.absLo[slot]) / 2.0;
             if (half <= 0.0)
@@ -879,7 +880,7 @@ void Joypad::driveStick(int ms)
                 v = 0.0;
             else
                 v = (v < 0.0 ? -1.0 : 1.0) * (mag - dz) / (1.0 - dz);
-            if (slot == 2)
+            if (slot == 0)
                 nx = v;
             else
                 ny = v;
@@ -887,13 +888,8 @@ void Joypad::driveStick(int ms)
         found = true;
         break;
     }
-    if (!found)
-        return;
-
     qreal mag = sqrt(nx * nx + ny * ny);
-    if (mag <= 0.0)
-        return;
-    if (mag > 1.0) {
+    if (found && mag > 1.0) {
         /* A square stick gate reads 1.41 on the diagonal.  Normalising the
          * direction and clamping the magnitude keeps diagonals from being half as
          * fast again as the axes. */
@@ -908,11 +904,56 @@ void Joypad::driveStick(int ms)
      * push cross the 640 px panel, and that spread is what lets a 12 mm stick both
      * travel and land on a scrollbar.
      */
-    const qreal exponent = 1.0 + cfg.acceleration * 0.015;
-    const qreal curved = pow(mag, exponent);
-    const qreal step = cfg.pointerSpeed * curved * ms / 1000.0;
+    if (found && mag > 0.0) {
+        const qreal exponent = 1.0 + cfg.acceleration * 0.015;
+        const qreal curved = pow(mag, exponent);
+        const qreal step = cfg.pointerSpeed * curved * ms / 1000.0;
+        emit pointerMove(nx / mag * step, ny / mag * step);
+    }
 
-    emit pointerMove(nx / mag * step, ny / mag * step);
+    /* The right stick is a wheel, not another selector.  Fractions carry between
+     * frames so a gentle deflection scrolls slowly instead of doing nothing. */
+    qreal sx = 0.0;
+    qreal sy = 0.0;
+    bool scroll = false;
+    for (const Dev &d : m_devs) {
+        if (!d.absSeen[2] || !d.absSeen[3])
+            continue;
+        const qreal dz = cfg.deadzone / 100.0;
+        for (int slot = 2; slot <= 3; ++slot) {
+            const qreal mid = (d.absLo[slot] + d.absHi[slot]) / 2.0;
+            const qreal half = (d.absHi[slot] - d.absLo[slot]) / 2.0;
+            if (half <= 0.0)
+                continue;
+            qreal v = clampReal((d.absRaw[slot] - mid) / half, -1.0, 1.0);
+            const qreal amount = fabs(v);
+            if (amount <= dz)
+                v = 0.0;
+            else
+                v = (v < 0.0 ? -1.0 : 1.0) * (amount - dz) / (1.0 - dz);
+            if (slot == 2)
+                sx = v;
+            else
+                sy = v;
+        }
+        scroll = true;
+        break;
+    }
+    if (!scroll)
+        return;
+
+    const qreal seconds = ms / 1000.0;
+    const qreal notchesPerSecond = 14.0;
+    m_stickWheelX += sx * notchesPerSecond * seconds;
+    m_stickWheelY -= sy * notchesPerSecond * seconds;
+    int wx = 0;
+    int wy = 0;
+    while (m_stickWheelX >= 1.0) { wx += 120; m_stickWheelX -= 1.0; }
+    while (m_stickWheelX <= -1.0) { wx -= 120; m_stickWheelX += 1.0; }
+    while (m_stickWheelY >= 1.0) { wy += 120; m_stickWheelY -= 1.0; }
+    while (m_stickWheelY <= -1.0) { wy -= 120; m_stickWheelY += 1.0; }
+    if (wx || wy)
+        emit pointerWheel(wx, wy);
 }
 
 void Joypad::feed(int action, bool pressed)
@@ -985,50 +1026,4 @@ void Joypad::feed(int action, bool pressed)
         m_held = action;
         m_nextRepeat = m_heldSince.elapsed() + kRepeatFirstMs;
     }
-}
-
-void Joypad::axis(Dev &d, int slot, int value)
-{
-    const int lo = d.absLo[slot];
-    const int hi = d.absHi[slot];
-    if (hi <= lo)
-        return;
-
-    /*
-     * Engage at 55% of half travel and release at 30%, because an ADC joystick
-     * with no calibration sits a long way off centre and a single threshold makes
-     * it stutter.  Hysteresis, not a deadzone.
-     */
-    const int mid = (lo + hi) / 2;
-    const int half = (hi - lo) / 2;
-    const int engage = half * 55 / 100;
-    const int release = half * 30 / 100;
-    const int dv = value - mid;
-
-    const int was = d.absState[slot];
-    int now = was;
-    if (was == 0) {
-        if (dv >= engage)
-            now = 1;
-        else if (dv <= -engage)
-            now = -1;
-    } else if (was > 0) {
-        if (dv < release)
-            now = 0;
-    } else {
-        if (dv > -release)
-            now = 0;
-    }
-    if (now == was)
-        return;
-
-    const bool horizontal = (slot == 0 || slot == 2);
-    const int negative = horizontal ? NavLeft : NavUp;
-    const int positive = horizontal ? NavRight : NavDown;
-
-    if (was != 0)
-        feed(was > 0 ? positive : negative, false);
-    d.absState[slot] = now;
-    if (now != 0)
-        feed(now > 0 ? positive : negative, true);
 }

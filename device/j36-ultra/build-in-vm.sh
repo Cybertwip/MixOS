@@ -12136,39 +12136,19 @@ fi
 # stays empty and the keyboard goes back to asking the window manager, which is
 # where this started: a card that cannot measure its own screen should get the old
 # behaviour and not no keyboard.
-if [ -x /usr/bin/matchbox-keyboard ]; then
-    if [ -r /opt/mixos/share/keyboard/j36-keyboard.xml ]; then
-        MB_KBD_CONFIG=/opt/mixos/share/keyboard/j36-keyboard.xml
-        export MB_KBD_CONFIG
-    fi
-
-    KBD_SIZE=""
-    FBDIM=""
-    if [ -r /sys/class/graphics/fb0/virtual_size ]; then
-        read -r FBDIM < /sys/class/graphics/fb0/virtual_size || FBDIM=""
-    fi
-    FBW="${FBDIM%%,*}"
-    FBH="${FBDIM##*,}"
-    case "$FBW" in ''|*[!0-9]*) FBW=0 ;; esac
-    case "$FBH" in ''|*[!0-9]*) FBH=0 ;; esac
-    if [ "$FBW" -gt 10 ] && [ "$FBH" -gt 10 ]; then
-        KBD_SIZE="--width $FBW --height $((FBH * 2 / 5))"
-    else
-        echo "j36-xsession: could not measure the screen; the keyboard will size itself" >&2
-    fi
-
-    # Unquoted on purpose: two flags and two integers this script built itself, and
-    # the empty case has to disappear rather than become an empty argument.
-    matchbox-keyboard --daemon --fontptsize 10 $KBD_SIZE >/dev/null 2>&1 &
-    KBD=$!
-fi
+# The keyboard now belongs to j36-padx itself.  That makes its painting, selected
+# key, D-pad path and pointer path the same design as mixdash/keyboard.cpp instead
+# of keeping a second matchbox process with only a similar XML layout.  KBD remains
+# empty because the teardown below also supports cards built with the older helper.
+KBD=""
 
 # ── The control FIFO ─────────────────────────────────────────────────────────
 #
 # One named pipe, mode 0600, under /run.  Anything on this card that wants a window
 # writes a line into it: `run <shell command>', `next', `prev' or `quit'.  mixdash
-# writes into it when a card is pressed while this session is already up, j36-padx
-# writes `next' when Menu is tapped, and j36-xrun is the hand-typed door to it.
+# writes into it when a card is pressed while this session is already up, including
+# `focus PID' from one of the Desktop page's live window cards; j36-padx writes
+# `next' when Menu is tapped, and j36-xrun is the hand-typed door to it.
 #
 # OPENED READ-WRITE BY THIS PROCESS, which is the whole trick and not a typo.  A FIFO
 # opened O_RDONLY returns EOF the instant the last writer closes, so a loop reading
@@ -12324,6 +12304,18 @@ while :; do
             ;;
         prev)
             [ -n "$MBREMOTE" ] && "$MBREMOTE" -prev >/dev/null 2>&1
+            ;;
+        "focus "*)
+            focus_pid="${line#focus }"
+            case "$focus_pid" in
+                ''|*[!0-9]*)
+                    echo "j36-xsession: invalid focus request '$line'" >&2
+                    ;;
+                *)
+                    /opt/mixos/bin/j36-padx --focus "$focus_pid" >/dev/null 2>&1 ||
+                        echo "j36-xsession: no live X window for pid $focus_pid" >&2
+                    ;;
+            esac
             ;;
         quit)
             echo "j36-xsession: asked to quit" >&2
@@ -12847,16 +12839,15 @@ a { text-decoration: underline; }
 <h1>MixOS</h1>
 
 <p>A graphical browser, on the panel, driven by the pad. The left stick moves the
-pointer and <b>A</b> clicks whatever it is over. The D-pad moves it too, slowly
-at first and faster the longer you hold it &mdash; the stick is for crossing the
-screen, the D-pad for landing on a small link.</p>
+pointer and <b>A</b> clicks whatever it is over. The D-pad remains navigation and
+the right stick is a two-axis scroll wheel.</p>
 
 <h2>The pad</h2>
 
 <table>
 <tr><td class="k">Left stick</td><td>move the pointer</td></tr>
 <tr><td class="k">Right stick</td><td>scroll</td></tr>
-<tr><td class="k">D-pad</td><td>move the pointer, accelerating while held</td></tr>
+<tr><td class="k">D-pad</td><td>arrow-key navigation</td></tr>
 <tr><td class="k">A</td><td>click</td></tr>
 <tr><td class="k">B</td><td>back one page</td></tr>
 <tr><td class="k">X</td><td>Enter &mdash; submits the box you are typing in</td></tr>

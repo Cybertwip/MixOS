@@ -33,12 +33,11 @@
  * THREE KINDS OF OUTPUT, because this device has three kinds of input and the
  * dashboard should not have to know which one is plugged in:
  *
- *   nav()     -- an action.  The D-pad, the left stick, the face buttons, and a
- *                USB keyboard's arrows all land here.
- *   pointer*  -- pixels and buttons.  The right stick and a USB mouse both land
- *                here, already scaled by the user's settings, because the axis
- *                ranges live in this file and the poll tick that integrates them
- *                is already running.
+ *   nav()     -- an action.  The D-pad, face buttons and a USB keyboard's arrows
+ *                land here.  No analogue stick is allowed into this path.
+ *   pointer*  -- pixels and buttons.  The left stick and a USB mouse land here,
+ *                already scaled by the user's settings.  The right stick emits
+ *                two-axis wheel events through the same family of signals.
  *   key()     -- an evdev code and the modifier state.  Only devices that look
  *                like real keyboards produce it, and only the Terminal listens.
  *
@@ -70,7 +69,7 @@ class Joypad : public QObject
 public:
     /*
      * Actions, not keys.  The dashboard handles one enum whether the press came
-     * from the keypad matrix, the gpio-keys D-pad, the joystick or a USB keyboard
+     * from the keypad matrix, the gpio-keys D-pad or a USB keyboard
      * plugged in for bring-up.
      */
     enum Nav {
@@ -270,8 +269,9 @@ signals:
     void pointerMove(qreal dx, qreal dy);
     /* button is a Qt::MouseButton value. */
     void pointerButton(int button, bool pressed);
-    /* Eighths of a degree, like QWheelEvent: 120 is one notch. */
-    void pointerWheel(int delta);
+    /* Eighths of a degree, like QWheelEvent: 120 is one notch.  Keeping both
+     * axes lets the right stick scroll in the same two dimensions as an X pad. */
+    void pointerWheel(int x, int y);
 
     void key(int code, bool pressed, int modifiers);
 
@@ -335,10 +335,8 @@ private:
         int absCode[4] = { -1, -1, -1, -1 };
         int absLo[4] = { 0, 0, 0, 0 };
         int absHi[4] = { 0, 0, 0, 0 };
-        int absState[4] = { 0, 0, 0, 0 };
-        /* Raw value of the two right-stick axes, kept because the pointer
-         * integrates a position from them on every tick rather than reacting to
-         * the edges the way nav does. */
+        /* Raw values for both sticks.  The left integrates pointer position and
+         * the right integrates wheel notches; neither is dashboard navigation. */
         int absRaw[4] = { 0, 0, 0, 0 };
         bool absSeen[4] = { false, false, false, false };
 
@@ -373,7 +371,6 @@ private:
     void updateJack();
     void drain();
     void feed(int action, bool pressed);
-    void axis(Dev &d, int slot, int value);
     /* EV_KEY from a device that reports relative motion, or a stick click. */
     bool pointerKey(int code, bool pressed);
     void driveStick(int ms);
@@ -443,7 +440,10 @@ private:
      */
     qreal m_relPendX = 0.0;
     qreal m_relPendY = 0.0;
-    int m_wheelPend = 0;
+    int m_wheelPendX = 0;
+    int m_wheelPendY = 0;
+    qreal m_stickWheelX = 0.0;
+    qreal m_stickWheelY = 0.0;
 };
 
 #endif /* MIXDASH_JOYPAD_H */

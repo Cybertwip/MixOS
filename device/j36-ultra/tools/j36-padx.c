@@ -103,7 +103,7 @@
  *
  *     Left stick     pointer, proportional to deflection
  *     Right stick    scroll, proportional to deflection
- *     D-pad          pointer, accelerating while held
+ *     D-pad          arrow-key navigation (the only pad navigation source)
  *     A              left click
  *     B              Back            (Alt+Left)
  *     X              Return
@@ -117,11 +117,9 @@
  *     Vol- / Vol+    zoom out / zoom in      (Ctrl+minus / Ctrl+plus)
  *     Home (F12)     the start page          (Alt+Home)
  *
- * BOTH the left stick and the D-pad move the pointer, and that is not redundancy.
- * A stick is the right instrument for crossing the screen and a poor one for
- * landing on a twelve-pixel link, because it never comes back to exactly centre;
- * a D-pad is the opposite, and a tap of it is a nudge of two or three pixels.
- * They add, so one thumb can do both without a mode to switch between them.
+ * The D-pad deliberately never moves the pointer.  It remains a digital arrow-key
+ * source for applications and for the on-screen keyboard, while the left stick is
+ * the only built-in pointer and the right stick is only a wheel.
  *
  * Menu is a hold and not a press because it is the only irreversible binding on
  * the pad and it sits under the thumb: a press would close the browser by
@@ -218,16 +216,13 @@ static double ax_val[MAX_PADS][AX_N];     /* -1..1, deadzone already removed */
 
 static int verbose;
 
-/* When the current D-pad hold started, for the acceleration ramp.  File scope
- * because set_dir() is what notices the hold beginning and it is called from
- * three places. */
-static long move_start;
-
 /* The two pieces of held-button state that are not per-pad.  They live here, and
  * the repeat clock is reached through a forward declaration, because drop_pad()
  * has to cancel both and it is defined long before either: see the comment there. */
 static long menu_down_at;
 static void rep_clear(void);
+static unsigned dirs_all(void);
+static void release_directions(unsigned dirs);
 
 static void note(const char *fmt, ...)
 {
@@ -274,12 +269,15 @@ static void clear_pad(int slot)
 
 static void drop_pad(int slot)
 {
+    unsigned held;
     if (pad_fd[slot] < 0)
         return;
     note("%s went away", pad_name[slot]);
     ioctl(pad_fd[slot], EVIOCGRAB, 0);
     close(pad_fd[slot]);
+    held = pad_dirs[slot];
     clear_pad(slot);
+    release_directions(held & ~dirs_all());
 
     /*
      * Cancel every held button, and not only this pad's.
@@ -596,10 +594,13 @@ static long now_ms(void)
 static Display *dpy;
 static int      scr;              /* the one screen this session has */
 static int      scr_w, scr_h;     /* and its size, which sets every speed below */
+static int      kbd_visible;
 
 /* The two speed ceilings, in pixels per second, worked out from the screen at
  * startup: see pointer_start() and the two SCREENS_PER_S constants it reads. */
-static double   stick_max, dpad_max;
+static double   stick_max;
+
+#define POINTER_STATE "/run/j36/pointer.state"
 
 /*
  * X errors are reported and not fatal, because the only calls here that can raise
@@ -623,8 +624,8 @@ static int on_x_error(Display *d, XErrorEvent *e)
  * and there is no keymap change in this session, since the only keyboard driving
  * it is this program. */
 static struct {
-    KeyCode ret, esc, page_up, page_down, home, left;
-    KeyCode alt, ctrl, minus, plus, l;
+    KeyCode ret, esc, page_up, page_down, home, left, right, up, down;
+    KeyCode alt, ctrl, shift, minus, plus, l;
 } kc;
 
 static KeyCode want(KeySym sym, const char *what)
@@ -643,8 +644,12 @@ static void resolve_keys(void)
     kc.page_down = want(XK_Page_Down, "Page Down");
     kc.home      = want(XK_Home,      "Home");
     kc.left      = want(XK_Left,      "Left");
+    kc.right     = want(XK_Right,     "Right");
+    kc.up        = want(XK_Up,        "Up");
+    kc.down      = want(XK_Down,      "Down");
     kc.alt       = want(XK_Alt_L,     "Alt");
     kc.ctrl      = want(XK_Control_L, "Control");
+    kc.shift     = want(XK_Shift_L,   "Shift");
     kc.minus     = want(XK_minus,     "minus");
     kc.plus      = want(XK_plus,      "plus");
     kc.l         = want(XK_l,         "L");
@@ -661,6 +666,87 @@ static void tap(KeyCode mod, KeyCode key)
     if (mod)
         XTestFakeKeyEvent(dpy, mod, False, 0);
     XFlush(dpy);
+}
+
+static void key_state(KeyCode key, int down)
+{
+    if (!key)
+        return;
+    XTestFakeKeyEvent(dpy, key, down ? True : False, 0);
+    XFlush(dpy);
+}
+
+static void release_directions(unsigned dirs)
+{
+    if (!dpy || kbd_visible)
+        return;
+    if (dirs & DIR_UP) key_state(kc.up, 0);
+    if (dirs & DIR_DOWN) key_state(kc.down, 0);
+    if (dirs & DIR_LEFT) key_state(kc.left, 0);
+    if (dirs & DIR_RIGHT) key_state(kc.right, 0);
+}
+
+/* Find the client carrying _NET_WM_PID, even when matchbox has reparented it. */
+static Window window_for_pid(Window at, unsigned long wanted, int depth)
+{
+    Atom atom, actual;
+    int format;
+    unsigned long nitems, after;
+    unsigned char *data = NULL;
+    Window root, parent, *children = NULL;
+    unsigned count = 0, i;
+
+    if (depth > 8)
+        return None;
+    atom = XInternAtom(dpy, "_NET_WM_PID", True);
+    if (atom != None
+        && XGetWindowProperty(dpy, at, atom, 0, 1, False, XA_CARDINAL,
+                              &actual, &format, &nitems, &after, &data) == Success) {
+        if (data && actual == XA_CARDINAL && format == 32 && nitems == 1
+            && *(unsigned long *)data == wanted) {
+            XFree(data);
+            return at;
+        }
+        if (data)
+            XFree(data);
+    }
+
+    if (!XQueryTree(dpy, at, &root, &parent, &children, &count))
+        return None;
+    for (i = 0; i < count; i++) {
+        Window hit = window_for_pid(children[i], wanted, depth + 1);
+        if (hit != None) {
+            XFree(children);
+            return hit;
+        }
+    }
+    if (children)
+        XFree(children);
+    return None;
+}
+
+static int focus_client(pid_t pid)
+{
+    Window root = RootWindow(dpy, scr);
+    Window client = window_for_pid(root, (unsigned long)pid, 0);
+    XEvent ev;
+    Atom active;
+
+    if (client == None)
+        return 0;
+    active = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
+    memset(&ev, 0, sizeof(ev));
+    ev.xclient.type = ClientMessage;
+    ev.xclient.window = client;
+    ev.xclient.message_type = active;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = 2; /* pager: this request came from the Desktop page */
+    ev.xclient.data.l[1] = CurrentTime;
+    XSendEvent(dpy, root, False, SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+    XRaiseWindow(dpy, client);
+    XSetInputFocus(dpy, client, RevertToPointerRoot, CurrentTime);
+    XFlush(dpy);
+    return 1;
 }
 
 /* ── the screen ──────────────────────────────────────────────────────────── */
@@ -802,7 +888,8 @@ static const struct {
     { "FN held",       "the task switcher -- and the way back to the dashboard" },
     { "FN tapped",     "the next window" },
     { "Select",        "the on-screen keyboard" },
-    { "Stick, D-pad",  "the pointer" },
+    { "Left stick",    "the pointer" },
+    { "D-pad",         "arrow-key navigation" },
     { "A",             "click  (L3 and R3 are the middle and right buttons)" },
     { "B",             "back" },
     { "X, Y",          "Enter, Escape" },
@@ -964,6 +1051,35 @@ static void desktop_paint(void)
 static double ptr_x, ptr_y;         /* where it is, to the sub-pixel */
 static int    sent_x, sent_y;       /* the last whole position asked for */
 
+static int pointer_state_read(int *x, int *y)
+{
+    char buf[64];
+    int fd = open(POINTER_STATE, O_RDONLY | O_CLOEXEC);
+    ssize_t n;
+    if (fd < 0)
+        return 0;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = '\0';
+    return sscanf(buf, "%d %d", x, y) == 2;
+}
+
+static void pointer_state_write(void)
+{
+    char buf[64];
+    int fd, n;
+    (void)mkdir("/run/j36", 0755);
+    fd = open(POINTER_STATE, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return;
+    n = snprintf(buf, sizeof(buf), "%d %d\n", sent_x, sent_y);
+    if (n > 0)
+        (void)write(fd, buf, (size_t)n);
+    close(fd);
+}
+
 static void pointer_resync(void)
 {
     Window root_ret, child_ret;
@@ -979,6 +1095,7 @@ static void pointer_resync(void)
     ptr_y = (double)ry;
     sent_x = rx;
     sent_y = ry;
+    pointer_state_write();
 }
 
 static void pointer_move(double dx, double dy)
@@ -1010,6 +1127,47 @@ static void pointer_move(double dx, double dy)
     XFlush(dpy);
     sent_x = ix;
     sent_y = iy;
+    pointer_state_write();
+}
+
+/* The dashboard arrow is a white classic pointer with a dark outline.  X's core
+ * cursor is two-colour, which is exactly enough to draw the same body: the mask
+ * is the outline and the source is the white inset. */
+static void pointer_install_cursor(void)
+{
+    Window root = RootWindow(dpy, scr);
+    Pixmap source = XCreatePixmap(dpy, root, 20, 28, 1);
+    Pixmap mask = XCreatePixmap(dpy, root, 20, 28, 1);
+    GC gc = XCreateGC(dpy, mask, 0, NULL);
+    XPoint outer[] = {{0,0},{0,21},{5,16},{8,24},{13,22},{9,14},{16,14}};
+    XPoint inner[] = {{2,3},{2,17},{5,13},{9,21},{10,20},{7,12},{12,12}};
+    XColor white, dark;
+    Cursor cursor;
+
+    XSetForeground(dpy, gc, 0);
+    XFillRectangle(dpy, mask, gc, 0, 0, 20, 28);
+    XFillRectangle(dpy, source, gc, 0, 0, 20, 28);
+    XSetForeground(dpy, gc, 1);
+    XFillPolygon(dpy, mask, gc, outer, 7, Complex, CoordModeOrigin);
+    XFillPolygon(dpy, source, gc, inner, 7, Complex, CoordModeOrigin);
+
+    memset(&white, 0, sizeof(white));
+    white.red = white.green = white.blue = 65535;
+    memset(&dark, 0, sizeof(dark));
+    dark.red = 24 * 257;
+    dark.green = 26 * 257;
+    dark.blue = 34 * 257;
+    cursor = XCreatePixmapCursor(dpy, source, mask, &white, &dark, 0, 0);
+    XDefineCursor(dpy, root, cursor);
+    /* Replace the common names too, so a client asking for the ordinary arrow
+     * does not resurrect the server's unrelated default shape over its window. */
+    XFixesChangeCursorByName(dpy, cursor, "left_ptr");
+    XFixesChangeCursorByName(dpy, cursor, "default");
+    XFreeCursor(dpy, cursor);
+    XFreeGC(dpy, gc);
+    XFreePixmap(dpy, source);
+    XFreePixmap(dpy, mask);
+    XFlush(dpy);
 }
 
 static void click(unsigned button, int press)
@@ -1025,102 +1183,299 @@ static void wheel(unsigned button)
     XFlush(dpy);
 }
 
-/* ── the on-screen keyboard ──────────────────────────────────────────────── */
+/* ── the shared-style on-screen keyboard ─────────────────────────────────── */
 
-/*
- * SELECT TOGGLES matchbox-keyboard, AND IT IS NOT A SIGNAL.
- *
- * This sent SIGUSR1 to the keyboard's pid.  That is what a decade of matchbox
- * recipes on the web say to do and it is not what matchbox-keyboard has ever
- * implemented: there is no signal handler anywhere in it -- not in
- * src/matchbox-keyboard.c, not in src/matchbox-keyboard-ui.c, not in
- * src/matchbox-keyboard-remote.c -- so the default disposition applied, and the
- * default disposition of SIGUSR1 is to kill the process.  THE FIRST PRESS OF
- * SELECT KILLED THE KEYBOARD.  That is why it never appeared, and why every press
- * after the first found nothing left to signal.
- *
- * What --daemon actually listens for is an X ClientMessage.  main.c's event loop
- * feeds every event to mb_kbd_remote_process_xevents() while the daemon flag is
- * set; that function answers with data.l[0] when the message type is the
- * _MB_IM_INVOKER_COMMAND atom, and the loop maps or unmaps the window on the
- * answer.  The values are MBKeyboardRemoteOperation in
- * src/matchbox-keyboard-remote.h: 0 none, 1 show, 2 hide, 3 toggle.
- *
- * TOGGLE AND NOT SHOW, for the same reason the old comment here gave: the keyboard
- * owns whether it is up.  Nothing on this side counts presses, so nothing on this
- * side can be wrong about it.
- *
- * THE MESSAGE GOES TO THE KEYBOARD'S OWN WINDOW, with an empty event mask, which
- * is the one delivery rule that does not depend on what the receiver selected for:
- * an XSendEvent with no mask goes to the client that created the destination
- * window.  Finding that window is a walk of the tree looking for the name
- * "Keyboard", because matchbox-keyboard publishes nothing better -- it sets no
- * WM_CLASS at all, and XSetStandardProperties(..., "Keyboard", ...) in
- * matchbox-keyboard-ui.c is the whole of its identification.  The walk is depth
- * limited because the window is a child of the root while it is hidden and a child
- * of a matchbox frame once it has been mapped, and neither is deep.
- */
-#define MB_IM_TOGGLE 3
+/* Matchbox's keyboard could share the dashboard layout, but not its appearance,
+ * selection model or pointer behaviour.  This small X window is therefore drawn
+ * by the same bridge that already synthesises its keys.  Its five rows, palette,
+ * D-pad focus and pointer click model mirror mixdash/keyboard.cpp. */
+enum { KA_CHAR, KA_SHIFT, KA_BACK, KA_SYMBOLS, KA_SPACE,
+       KA_LEFT, KA_RIGHT, KA_ESCAPE, KA_ENTER };
 
-static Atom   atom_im_command;
-static Window kbd_win;          /* cached across presses; re-found when it goes */
+struct KbdCap {
+    char label[12];
+    KeySym sym;
+    int action;
+    double span;
+};
 
-static int win_is_keyboard(Window w)
+#define KBD_ROWS 5
+#define KBD_COLS 12
+static struct KbdCap kbd_caps[KBD_ROWS][KBD_COLS];
+static int kbd_count[KBD_ROWS];
+static Window kbd_win;
+static GC kbd_gc;
+static XFontStruct *kbd_font;
+static int kbd_row = 1, kbd_col;
+static int kbd_upper, kbd_caps_lock, kbd_symbols;
+static int kbd_pressed = -1;
+static int kbd_h;
+
+static void kbd_add(int row, const char *label, KeySym sym, int action, double span)
 {
-    char *name = NULL;
-    int match;
-
-    if (!XFetchName(dpy, w, &name) || !name)
-        return 0;
-    match = strcmp(name, "Keyboard") == 0;
-    XFree(name);
-    return match;
+    struct KbdCap *c;
+    if (row < 0 || row >= KBD_ROWS || kbd_count[row] >= KBD_COLS)
+        return;
+    c = &kbd_caps[row][kbd_count[row]++];
+    snprintf(c->label, sizeof(c->label), "%s", label);
+    c->sym = sym;
+    c->action = action;
+    c->span = span;
 }
 
-static Window kbd_win_find(Window w, int depth)
+static void kbd_chars(int row, const char *chars)
 {
-    Window root_ret, parent_ret, *kids = NULL, hit = None;
-    unsigned int n = 0, i;
+    char s[2] = {0, 0};
+    while (*chars) {
+        s[0] = *chars++;
+        kbd_add(row, s, XStringToKeysym(s), KA_CHAR, 1.0);
+    }
+}
 
-    if (depth > 0 && win_is_keyboard(w))
-        return w;
-    if (depth >= 3)
-        return None;
-    if (!XQueryTree(dpy, w, &root_ret, &parent_ret, &kids, &n))
-        return None;
-    for (i = 0; i < n && hit == None; i++)
-        hit = kbd_win_find(kids[i], depth + 1);
-    if (kids)
-        XFree(kids);
-    return hit;
+static void kbd_build(void)
+{
+    int i;
+    const char *lower[KBD_ROWS - 1] = {
+        "1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"
+    };
+    const char *upper[KBD_ROWS - 1] = {
+        "1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"
+    };
+    const char *symbols[KBD_ROWS - 1] = {
+        "!@#$%^&*()", "-_=+[]{}|\\", ":;'\",.<>/?", "`~"
+    };
+    const char **layer = kbd_symbols ? symbols : (kbd_upper || kbd_caps_lock) ? upper : lower;
+
+    memset(kbd_count, 0, sizeof(kbd_count));
+    for (i = 0; i < 3; i++)
+        kbd_chars(i, layer[i]);
+    kbd_add(3, kbd_caps_lock ? "CAPS" : kbd_upper ? "SHIFT" : "shift",
+            NoSymbol, KA_SHIFT, 1.5);
+    kbd_chars(3, layer[3]);
+    kbd_add(3, "back", XK_BackSpace, KA_BACK, 1.5);
+
+    kbd_add(4, kbd_symbols ? "abc" : "?123", NoSymbol, KA_SYMBOLS, 1.6);
+    kbd_add(4, "<", XK_Left, KA_LEFT, 0.9);
+    kbd_add(4, "space", XK_space, KA_SPACE, 4.0);
+    kbd_add(4, ">", XK_Right, KA_RIGHT, 0.9);
+    kbd_add(4, "esc", XK_Escape, KA_ESCAPE, 1.6);
+    kbd_add(4, "enter", XK_Return, KA_ENTER, 1.6);
+    if (kbd_col >= kbd_count[kbd_row])
+        kbd_col = kbd_count[kbd_row] - 1;
+}
+
+static void kbd_rect(int row, int col, int *x, int *y, int *w, int *h)
+{
+    const int pad = 8, gap = 4;
+    double spans = 0.0, before = 0.0, unit;
+    int i;
+    for (i = 0; i < kbd_count[row]; i++) {
+        spans += kbd_caps[row][i].span;
+        if (i < col)
+            before += kbd_caps[row][i].span;
+    }
+    unit = (scr_w - 2 * pad - (kbd_count[row] - 1) * gap) / spans;
+    *h = (kbd_h - 2 * pad - (KBD_ROWS - 1) * gap) / KBD_ROWS;
+    *x = pad + (int)(before * unit) + col * gap;
+    *y = pad + row * (*h + gap);
+    *w = (int)(kbd_caps[row][col].span * unit);
+}
+
+static unsigned long kbd_colour(const char *name, unsigned long fallback)
+{
+    XColor c;
+    Colormap cm = DefaultColormap(dpy, scr);
+    return XParseColor(dpy, cm, name, &c) && XAllocColor(dpy, cm, &c)
+               ? c.pixel : fallback;
+}
+
+static void kbd_paint(void)
+{
+    int r, c;
+    unsigned long back = kbd_colour("#11141c", BlackPixel(dpy, scr));
+    unsigned long card = kbd_colour("#292e3a", WhitePixel(dpy, scr));
+    unsigned long edge = kbd_colour("#4a5263", WhitePixel(dpy, scr));
+    unsigned long ink = kbd_colour("#f4f6fb", WhitePixel(dpy, scr));
+    unsigned long blue = kbd_colour("#397de5", WhitePixel(dpy, scr));
+    unsigned long teal = kbd_colour("#25a9a0", WhitePixel(dpy, scr));
+
+    if (!kbd_win)
+        return;
+    XSetForeground(dpy, kbd_gc, back);
+    XFillRectangle(dpy, kbd_win, kbd_gc, 0, 0, (unsigned)scr_w, (unsigned)kbd_h);
+    if (kbd_font)
+        XSetFont(dpy, kbd_gc, kbd_font->fid);
+    for (r = 0; r < KBD_ROWS; r++) {
+        for (c = 0; c < kbd_count[r]; c++) {
+            int x, y, w, h, tw;
+            const struct KbdCap *cap = &kbd_caps[r][c];
+            const int selected = r == kbd_row && c == kbd_col;
+            const int pressed = kbd_pressed == r * 100 + c;
+            const int lit = cap->action == KA_ENTER ||
+                            (cap->action == KA_SHIFT && (kbd_upper || kbd_caps_lock));
+            kbd_rect(r, c, &x, &y, &w, &h);
+            XSetForeground(dpy, kbd_gc, pressed ? edge : lit ? teal : selected ? blue : card);
+            XFillRectangle(dpy, kbd_win, kbd_gc, x, y, (unsigned)w, (unsigned)h);
+            XSetForeground(dpy, kbd_gc, selected ? blue : edge);
+            XDrawRectangle(dpy, kbd_win, kbd_gc, x, y, (unsigned)(w - 1), (unsigned)(h - 1));
+            XSetForeground(dpy, kbd_gc, ink);
+            tw = kbd_font ? XTextWidth(kbd_font, cap->label, (int)strlen(cap->label))
+                          : (int)strlen(cap->label) * 8;
+            XDrawString(dpy, kbd_win, kbd_gc, x + (w - tw) / 2,
+                        y + (h + (kbd_font ? kbd_font->ascent : 10)) / 2 - 2,
+                        cap->label, (int)strlen(cap->label));
+        }
+    }
+    XFlush(dpy);
+}
+
+static void kbd_send(KeySym sym)
+{
+    KeyCode code = XKeysymToKeycode(dpy, sym);
+    int shifted = 0;
+    if (!code)
+        return;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    shifted = XKeycodeToKeysym(dpy, code, 0) != sym
+              && XKeycodeToKeysym(dpy, code, 1) == sym;
+#pragma GCC diagnostic pop
+    if (shifted)
+        key_state(kc.shift, 1);
+    key_state(code, 1);
+    key_state(code, 0);
+    if (shifted)
+        key_state(kc.shift, 0);
+}
+
+static void kbd_activate(int row, int col)
+{
+    const struct KbdCap cap = kbd_caps[row][col];
+    switch (cap.action) {
+    case KA_SHIFT:
+        if (!kbd_upper && !kbd_caps_lock) kbd_upper = 1;
+        else if (kbd_upper) { kbd_upper = 0; kbd_caps_lock = 1; }
+        else kbd_caps_lock = 0;
+        break;
+    case KA_SYMBOLS: kbd_symbols = !kbd_symbols; break;
+    case KA_BACK: case KA_SPACE: case KA_LEFT: case KA_RIGHT:
+    case KA_ESCAPE: case KA_ENTER: kbd_send(cap.sym); break;
+    case KA_CHAR:
+        kbd_send(cap.sym);
+        if (kbd_upper && !kbd_caps_lock)
+            kbd_upper = 0;
+        break;
+    }
+    kbd_build();
+    kbd_paint();
+}
+
+static void kbd_move(unsigned bit)
+{
+    int x, y, w, h, c, best = 0;
+    if (bit == DIR_LEFT)
+        kbd_col = (kbd_col + kbd_count[kbd_row] - 1) % kbd_count[kbd_row];
+    else if (bit == DIR_RIGHT)
+        kbd_col = (kbd_col + 1) % kbd_count[kbd_row];
+    else {
+        int target = kbd_row + (bit == DIR_UP ? -1 : 1);
+        int centre, distance = 0x7fffffff;
+        if (target < 0 || target >= KBD_ROWS)
+            return;
+        kbd_rect(kbd_row, kbd_col, &x, &y, &w, &h);
+        centre = x + w / 2;
+        for (c = 0; c < kbd_count[target]; c++) {
+            int d;
+            kbd_rect(target, c, &x, &y, &w, &h);
+            d = abs((x + w / 2) - centre);
+            if (d < distance) { distance = d; best = c; }
+        }
+        kbd_row = target;
+        kbd_col = best;
+    }
+    kbd_paint();
+}
+
+static int kbd_hit(int px, int py)
+{
+    int r, c;
+    for (r = 0; r < KBD_ROWS; r++)
+        for (c = 0; c < kbd_count[r]; c++) {
+            int x, y, w, h;
+            kbd_rect(r, c, &x, &y, &w, &h);
+            if (px >= x && px < x + w && py >= y && py < y + h)
+                return r * 100 + c;
+        }
+    return -1;
+}
+
+static void kbd_events(void)
+{
+    while (XPending(dpy)) {
+        XEvent ev;
+        XNextEvent(dpy, &ev);
+        if (ev.xany.window != kbd_win)
+            continue;
+        if (ev.type == Expose) {
+            kbd_paint();
+        } else if (ev.type == MotionNotify) {
+            int hit = kbd_hit(ev.xmotion.x, ev.xmotion.y);
+            if (hit >= 0 && (kbd_row != hit / 100 || kbd_col != hit % 100)) {
+                kbd_row = hit / 100;
+                kbd_col = hit % 100;
+                kbd_paint();
+            }
+        } else if (ev.type == ButtonPress && ev.xbutton.button == Button1) {
+            kbd_pressed = kbd_hit(ev.xbutton.x, ev.xbutton.y);
+            kbd_paint();
+        } else if (ev.type == ButtonRelease && ev.xbutton.button == Button1) {
+            int hit = kbd_hit(ev.xbutton.x, ev.xbutton.y);
+            kbd_pressed = -1;
+            if (hit >= 0)
+                kbd_activate(hit / 100, hit % 100);
+            else
+                kbd_paint();
+        }
+    }
 }
 
 static void kbd_toggle(void)
 {
-    XClientMessageEvent ev;
-
-    /* One round trip to check the cached window is still the keyboard, and a walk
-     * only when it is not.  A press is a human action, so neither is worth
-     * avoiding -- and a keyboard that died and was restarted has a new window. */
-    if (kbd_win != None && !win_is_keyboard(kbd_win))
-        kbd_win = None;
-    if (kbd_win == None)
-        kbd_win = kbd_win_find(RootWindow(dpy, scr), 0);
-    if (kbd_win == None) {
-        fail("no on-screen keyboard on this display -- Select toggles "
-             "matchbox-keyboard --daemon, and nothing is running it");
-        return;
+    if (!kbd_visible) {
+        /* A direction held while Select is pressed was sent to the application
+         * as a real key-down.  Release it before the keyboard takes ownership. */
+        release_directions(dirs_all());
+        kbd_visible = 1;
+        XMapRaised(dpy, kbd_win);
+        kbd_paint();
+    } else {
+        kbd_visible = 0;
+        XUnmapWindow(dpy, kbd_win);
+        XFlush(dpy);
     }
+}
 
-    memset(&ev, 0, sizeof(ev));
-    ev.type = ClientMessage;
-    ev.window = kbd_win;
-    ev.message_type = atom_im_command;
-    ev.format = 32;
-    ev.data.l[0] = MB_IM_TOGGLE;
-    XSendEvent(dpy, kbd_win, False, NoEventMask, (XEvent *)&ev);
-    XFlush(dpy);
-    note("toggled the on-screen keyboard (window 0x%lx)", (unsigned long)kbd_win);
+static void kbd_start(void)
+{
+    XSetWindowAttributes a;
+    static const char *const fonts[] = { "9x15bold", "9x15", "8x13", "fixed", NULL };
+    int i;
+    kbd_h = scr_h * 2 / 5;
+    if (kbd_h < 150) kbd_h = 150;
+    if (kbd_h > scr_h) kbd_h = scr_h;
+    memset(&a, 0, sizeof(a));
+    a.override_redirect = True;
+    a.save_under = True;
+    a.event_mask = ExposureMask | PointerMotionMask | ButtonPressMask | ButtonReleaseMask;
+    kbd_win = XCreateWindow(dpy, RootWindow(dpy, scr), 0, scr_h - kbd_h,
+                            (unsigned)scr_w, (unsigned)kbd_h, 0,
+                            CopyFromParent, InputOutput, CopyFromParent,
+                            CWOverrideRedirect | CWSaveUnder | CWEventMask, &a);
+    XStoreName(dpy, kbd_win, "MixOS Keyboard");
+    kbd_gc = XCreateGC(dpy, kbd_win, 0, NULL);
+    for (i = 0; fonts[i] && !kbd_font; i++)
+        kbd_font = XLoadQueryFont(dpy, fonts[i]);
+    kbd_build();
 }
 
 /*
@@ -1318,33 +1673,6 @@ static int sticks_active(void)
 
 /* ── the D-pad ───────────────────────────────────────────────────────────── */
 
-/*
- * The start of a press, the end of the ramp, and how long the ramp takes.
- *
- * The floor is in PIXELS and the ceiling is a fraction of the STICK, and the
- * mismatch is the point: what the start of a press is for is landing on a link, and
- * a link is a dozen pixels wide on any panel, so the slow end must not scale with
- * anything.  The far end is travel, and travel should stay in proportion to the one
- * speed the Mouse settings page actually names -- one slider, both inputs, the
- * D-pad a little short of the stick because it has no analogue middle to sit in.
- *
- * SPEED_MIN is 110 and the stick's floor is 200, so on a card with the settings at
- * their default the ramp is a real ramp and not a step.  If somebody drags the
- * slider below the floor it collapses to a flat 110, which is handled where
- * dpad_max is worked out rather than here.
- */
-#define SPEED_MIN            110.0   /* px/s: a tap is two pixels, whatever the panel */
-#define DPAD_OF_STICK        0.85
-#define RAMP_MS              900.0
-
-static double speed_at(long held_ms)
-{
-    double t = (double)held_ms / RAMP_MS;
-    if (t > 1.0)
-        t = 1.0;
-    return SPEED_MIN + (dpad_max - SPEED_MIN) * t * t;
-}
-
 static unsigned dirs_all(void)
 {
     unsigned d = 0;
@@ -1355,22 +1683,31 @@ static unsigned dirs_all(void)
 }
 
 /*
- * The ramp belongs to the hold and not to the direction: a thumb rolling from up
- * to up-right is one movement and should not drop back to walking pace halfway
- * across the screen.  So it restarts only when nothing was held and something now
- * is -- which is also why this is a function rather than three copies, since the
- * same transition arrives as a key, as a BTN_DPAD_* and as a hat.
+ * Aggregate before emitting so two attached pads holding the same direction are
+ * one X key press with one final release.  While the keyboard is visible, a press
+ * walks its selected cap instead; no analogue axis reaches this function.
  */
-static void set_dir(int slot, unsigned bit, int on, long now)
+static void set_dir(int slot, unsigned bit, int on)
 {
     unsigned was = dirs_all();
+    unsigned is;
 
     if (on)
         pad_dirs[slot] |= bit;
     else
         pad_dirs[slot] &= ~bit;
-    if (!was && dirs_all())
-        move_start = now;
+    is = dirs_all();
+    if ((was ^ is) & bit) {
+        KeyCode key = bit == DIR_UP ? kc.up
+                    : bit == DIR_DOWN ? kc.down
+                    : bit == DIR_LEFT ? kc.left : kc.right;
+        if (kbd_visible) {
+            if (is & bit)
+                kbd_move(bit);
+        } else {
+            key_state(key, (is & bit) != 0);
+        }
+    }
 }
 
 /* ── auto-repeat for the shoulders ───────────────────────────────────────── */
@@ -1455,6 +1792,7 @@ static void forget_pads(void)
 {
     struct input_event ev;
     int i, r;
+    const unsigned held = dirs_all();
 
     for (i = 0; i < MAX_PADS; i++) {
         if (pad_fd[i] < 0)
@@ -1465,6 +1803,7 @@ static void forget_pads(void)
         for (r = 0; r < AX_N; r++)
             ax_val[i][r] = 0.0;
     }
+    release_directions(held);
     rep_clear();
     menu_down_at = 0;
 }
@@ -1569,6 +1908,7 @@ static void usage(void)
         "  --ctl PATH        the session's control pipe: Menu TAPPED asks it to\n"
         "                    page to the next window\n"
         "  --display NAME    which server (default $DISPLAY)\n"
+        "  --focus PID       focus the X client with _NET_WM_PID=PID, then exit\n"
         "  --grab            take the pad from every other reader (see the note at\n"
         "                    the top of this file before using it under mixdash)\n"
         "  --no-grab         the default: share the pad, which is what lets the\n"
@@ -1576,8 +1916,7 @@ static void usage(void)
         "  --list            name the devices that would be used, then exit\n"
         "  -v                say what is happening\n"
         "\n"
-        "Select toggles matchbox-keyboard --daemon if one is on this display; it is\n"
-        "found by its window and needs no pid.\n");
+        "Select toggles the on-screen keyboard.\n");
 }
 
 /*
@@ -1611,26 +1950,35 @@ static void pointer_start(void)
      */
     want = read_dash_speed();
     stick_max = want > 0.0 ? want : STICK_SCREENS_PER_S * (double)scr_w;
-    dpad_max  = DPAD_OF_STICK * stick_max;
-    if (dpad_max < SPEED_MIN)
-        dpad_max = SPEED_MIN;       /* a setting slow enough to invert the ramp */
+    /* The linuxfb cursor and this X cursor hand one coordinate pair through /run.
+     * Warp before the first client appears, so there is never a centre-screen X
+     * cursor followed by the dashboard cursor somewhere else. */
+    if (pointer_state_read(&sent_x, &sent_y)) {
+        if (sent_x < 0) sent_x = 0;
+        if (sent_y < 0) sent_y = 0;
+        if (sent_x >= scr_w) sent_x = scr_w - 1;
+        if (sent_y >= scr_h) sent_y = scr_h - 1;
+        ptr_x = sent_x;
+        ptr_y = sent_y;
+        XTestFakeMotionEvent(dpy, scr, sent_x, sent_y, 0);
+        XFlush(dpy);
+    } else {
+        sent_x = -1;
+        sent_y = -1;
+        pointer_resync();
+    }
+    pointer_install_cursor();
 
-    /* Nothing has been asked for yet, and no real position is negative, so the
-     * first resync always adopts wherever the server starts the pointer. */
-    sent_x = -1;
-    sent_y = -1;
-    pointer_resync();
-
-    note("screen %dx%d: %.0f px/s at full stick (%s), %.0f px/s at the end of the D-pad ramp",
+    note("screen %dx%d: %.0f px/s at full left stick (%s); D-pad is navigation",
          scr_w, scr_h, stick_max,
-         want > 0.0 ? "from " DASH_CONF : "built in; no dashboard setting on this card",
-         dpad_max);
+         want > 0.0 ? "from " DASH_CONF : "built in; no dashboard setting on this card");
 }
 
 int main(int argc, char **argv)
 {
     const char *display_name = NULL;
     pid_t watch_pid = 0;
+    pid_t focus_pid = 0;
     int grab = 0, list_only = 0;
     /*
      * Whether the pad is grabbed AT THIS MOMENT, as against whether it was asked
@@ -1658,6 +2006,8 @@ int main(int argc, char **argv)
             ctl_path = argv[++i];
         else if (!strcmp(argv[i], "--display") && i + 1 < argc)
             display_name = argv[++i];
+        else if (!strcmp(argv[i], "--focus") && i + 1 < argc)
+            focus_pid = (pid_t)strtol(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--grab"))
             grab = 1;
         else if (!strcmp(argv[i], "--no-grab"))
@@ -1714,6 +2064,15 @@ int main(int argc, char **argv)
     XSetIOErrorHandler(on_io_error);
     XSetErrorHandler(on_x_error);
 
+    scr = DefaultScreen(dpy);
+    if (focus_pid > 0) {
+        const int found = focus_client(focus_pid);
+        if (!found)
+            fail("no X window advertises pid %ld", (long)focus_pid);
+        XCloseDisplay(dpy);
+        return found ? 0 : 1;
+    }
+
     if (!XTestQueryExtension(dpy, &xt_event, &xt_error, &xt_major, &xt_minor)) {
         fail("this X server has no XTEST extension, so the pad cannot drive it");
         XCloseDisplay(dpy);
@@ -1728,9 +2087,7 @@ int main(int argc, char **argv)
 
     resolve_keys();
     pointer_start();
-    /* Interned once, and created if no keyboard has interned it yet: an atom costs
-     * nothing and the alternative is doing this inside a button press. */
-    atom_im_command = XInternAtom(dpy, "_MB_IM_INVOKER_COMMAND", False);
+    kbd_start();
 
     /* Before the first window maps, so that a session that takes a while to open
      * one -- or is asked to open none at all -- has something on it that says so.
@@ -1749,12 +2106,11 @@ int main(int argc, char **argv)
     next_scan = move_last + RESCAN_MS;
 
     while (!stop_asked) {
-        struct pollfd fds[MAX_PADS];
-        int map[MAX_PADS];
+        struct pollfd fds[MAX_PADS + 1];
+        int map[MAX_PADS + 1];
         int nfd = 0, timeout, n, k;
         long now;
         double dt, dx, dy;
-        unsigned dirs;
 
         for (i = 0; i < MAX_PADS; i++) {
             if (pad_fd[i] < 0)
@@ -1765,6 +2121,11 @@ int main(int argc, char **argv)
             fds[nfd].revents = 0;
             nfd++;
         }
+        map[nfd] = -1;
+        fds[nfd].fd = ConnectionNumber(dpy);
+        fds[nfd].events = POLLIN;
+        fds[nfd].revents = 0;
+        nfd++;
 
         /* One frame while something is moving or repeating, so motion runs at the
          * panel's own rate; a quarter of a second otherwise, which is short enough
@@ -1815,6 +2176,12 @@ int main(int argc, char **argv)
             int slot = map[k];
             int gone = 0;
 
+            if (slot < 0) {
+                if (fds[k].revents & POLLIN)
+                    kbd_events();
+                continue;
+            }
+
             if (fds[k].revents & (POLLERR | POLLHUP | POLLNVAL)) {
                 drop_pad(slot);
                 continue;
@@ -1846,13 +2213,13 @@ int main(int argc, char **argv)
                      * is three states on one axis rather than two buttons, so it
                      * clears the opposite direction as well as setting its own. */
                     if (ev.code == ABS_HAT0X) {
-                        set_dir(slot, DIR_LEFT,  ev.value < 0, now);
-                        set_dir(slot, DIR_RIGHT, ev.value > 0, now);
+                        set_dir(slot, DIR_LEFT,  ev.value < 0);
+                        set_dir(slot, DIR_RIGHT, ev.value > 0);
                         continue;
                     }
                     if (ev.code == ABS_HAT0Y) {
-                        set_dir(slot, DIR_UP,   ev.value < 0, now);
-                        set_dir(slot, DIR_DOWN, ev.value > 0, now);
+                        set_dir(slot, DIR_UP,   ev.value < 0);
+                        set_dir(slot, DIR_DOWN, ev.value > 0);
                         continue;
                     }
                     /* Only the value is kept; what to do with it happens once per
@@ -1881,15 +2248,22 @@ int main(int argc, char **argv)
                  * tree uses the keyboard codes, and a USB pad whose D-pad is not a
                  * hat uses BTN_DPAD_*. */
                 case KEY_UP:
-                case BTN_DPAD_UP:    set_dir(slot, DIR_UP,    down, now); break;
+                case BTN_DPAD_UP:    set_dir(slot, DIR_UP,    down); break;
                 case KEY_DOWN:
-                case BTN_DPAD_DOWN:  set_dir(slot, DIR_DOWN,  down, now); break;
+                case BTN_DPAD_DOWN:  set_dir(slot, DIR_DOWN,  down); break;
                 case KEY_LEFT:
-                case BTN_DPAD_LEFT:  set_dir(slot, DIR_LEFT,  down, now); break;
+                case BTN_DPAD_LEFT:  set_dir(slot, DIR_LEFT,  down); break;
                 case KEY_RIGHT:
-                case BTN_DPAD_RIGHT: set_dir(slot, DIR_RIGHT, down, now); break;
+                case BTN_DPAD_RIGHT: set_dir(slot, DIR_RIGHT, down); break;
 
-                case BTN_A:      click(1, down); break;
+                case BTN_A:
+                    if (kbd_visible) {
+                        if (down)
+                            kbd_activate(kbd_row, kbd_col);
+                    } else {
+                        click(1, down);
+                    }
+                    break;
                 case BTN_THUMBL: click(2, down); break;
                 case BTN_THUMBR: click(3, down); break;
 
@@ -1933,8 +2307,6 @@ int main(int argc, char **argv)
                 case KEY_VOLUMEUP:   if (down) tap(kc.ctrl, kc.plus);  break;
 
                 case BTN_SELECT:
-                    /* See kbd_toggle(): a ClientMessage to the keyboard's window,
-                     * which is what matchbox-keyboard --daemon listens for. */
                     if (down)
                         kbd_toggle();
                     break;
@@ -1954,6 +2326,8 @@ int main(int argc, char **argv)
                      * what it has always done, which is nothing.
                      */
                     if (down) {
+                        pointer_resync();
+                        pointer_state_write();
                         menu_down_at = now;
                         /* mixdash recognizes the same hold sooner than this
                          * bridge does and can SIGSTOP the X server before the
@@ -1993,27 +2367,6 @@ int main(int argc, char **argv)
 
         dx = axis_rate(AX_LX, stick_max) * dt;
         dy = axis_rate(AX_LY, stick_max) * dt;
-
-        dirs = dirs_all();
-        if (dirs) {
-            double v = speed_at(now - move_start);
-            double px = 0.0, py = 0.0;
-            if (dirs & DIR_LEFT)  px -= v * dt;
-            if (dirs & DIR_RIGHT) px += v * dt;
-            if (dirs & DIR_UP)    py -= v * dt;
-            if (dirs & DIR_DOWN)  py += v * dt;
-            /* A diagonal would otherwise travel sqrt(2) times as far as a straight
-             * line for the same hold, which reads as the pad being faster on the
-             * slant. */
-            if (px != 0.0 && py != 0.0) {
-                px *= 0.7071;
-                py *= 0.7071;
-            }
-            dx += px;
-            dy += py;
-        } else {
-            move_start = now;
-        }
 
         /* The remainder is kept inside the position, so a speed below one pixel per
          * tick is a slow pointer and not a still one. */
@@ -2107,6 +2460,8 @@ int main(int argc, char **argv)
         }
     }
 
+    pointer_resync();
+    pointer_state_write();
     close_pads();
     XTestGrabControl(dpy, False);
     XCloseDisplay(dpy);

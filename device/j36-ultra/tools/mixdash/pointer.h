@@ -95,7 +95,7 @@ public:
 public slots:
     void onMove(qreal dx, qreal dy);
     void onButton(int button, bool pressed);
-    void onWheel(int delta);
+    void onWheel(int x, int y);
 
 signals:
     /* Emitted when the cursor appears or disappears, so the shell can drop the
@@ -128,6 +128,11 @@ private:
     void updateEnterLeave(const QPoint &hostPos);
     void setAwake(bool awake);
     void applyPosition();
+    /* /run is the hand-off between this linuxfb cursor and j36-padx's X cursor.
+     * Only one is visible at a time; both read before waking and write after a
+     * whole-pixel move, so switching surfaces never creates a second location. */
+    void readSharedPosition();
+    void writeSharedPosition();
     /* The arrow itself, into whatever painter is offered -- the widget's, or
      * snapshot()'s image.  Tip at the painter's origin. */
     void paintBody(QPainter &p) const;
@@ -138,6 +143,7 @@ private:
     /* Fractional, because a slow stick moves a third of a pixel per tick and
      * rounding each tick to zero would make low speeds mean "does not move". */
     QPointF m_exact;
+    QPoint m_sharedAt = QPoint(-1, -1);
 
     /* Held from press to release so a drag keeps going to the widget the press
      * landed on, even once the cursor has left it -- which is how a scrollbar

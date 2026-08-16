@@ -6,7 +6,9 @@
 #include "pointer.h"
 
 #include <QApplication>
+#include <QDir>
 #include <QEnterEvent>
+#include <QFile>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
@@ -31,6 +33,7 @@ const int kFadeStep = 36;
 /* How far a second press may be from the first and still be a double click.
  * Generous, because the thing aiming is a thumbstick. */
 const int kDoubleClickSlop = 10;
+const char kPointerState[] = "/run/j36/pointer.state";
 
 QPainterPath arrowPath()
 {
@@ -66,6 +69,7 @@ Pointer::Pointer(QWidget *host)
     hide();
 
     m_exact = QPointF(host->width() / 2.0, host->height() / 2.0);
+    readSharedPosition();
     applyPosition();
 
     m_clickTimer.start();
@@ -81,6 +85,10 @@ Pointer::Pointer(QWidget *host)
 
 void Pointer::wake()
 {
+    if (!m_awake) {
+        readSharedPosition();
+        applyPosition();
+    }
     m_fade->stop();
     if (m_opacity != 255) {
         m_opacity = 255;
@@ -257,6 +265,40 @@ void Pointer::applyPosition()
          * redirected that is the only thing that carries the arrow. */
         announce();
     }
+    writeSharedPosition();
+}
+
+void Pointer::readSharedPosition()
+{
+    QFile f(QString::fromLatin1(kPointerState));
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return;
+    const QList<QByteArray> fields = f.read(64).simplified().split(' ');
+    if (fields.size() != 2)
+        return;
+    bool xok = false;
+    bool yok = false;
+    const int x = fields[0].toInt(&xok);
+    const int y = fields[1].toInt(&yok);
+    if (!xok || !yok)
+        return;
+    m_exact = QPointF(x, y);
+    m_sharedAt = QPoint(x, y);
+}
+
+void Pointer::writeSharedPosition()
+{
+    const QPoint p = pos();
+    if (p == m_sharedAt)
+        return;
+    QDir().mkpath(QStringLiteral("/run/j36"));
+    QFile f(QString::fromLatin1(kPointerState));
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text))
+        return;
+    const QByteArray line = QByteArray::number(p.x()) + ' '
+                          + QByteArray::number(p.y()) + '\n';
+    if (f.write(line) == line.size())
+        m_sharedAt = p;
 }
 
 void Pointer::onMove(qreal dx, qreal dy)
@@ -264,6 +306,10 @@ void Pointer::onMove(qreal dx, qreal dy)
     if (dx == 0.0 && dy == 0.0)
         return;
 
+    /* If X moved the shared cursor while this widget slept, adopt that position
+     * before applying the first left-stick delta back on the dashboard. */
+    if (!m_awake)
+        wake();
     const QPoint before = pos();
     m_exact += QPointF(dx, dy);
     applyPosition();
@@ -344,9 +390,9 @@ void Pointer::onButton(int button, bool pressed)
         m_grab = nullptr;
 }
 
-void Pointer::onWheel(int delta)
+void Pointer::onWheel(int x, int y)
 {
-    if (delta == 0)
+    if (x == 0 && y == 0)
         return;
     wake();
 
@@ -359,10 +405,12 @@ void Pointer::onWheel(int delta)
     const QPointF global = m_host->mapToGlobal(p);
 
 #if QT_VERSION >= QT_VERSION_CHECK(5, 12, 0)
-    QWheelEvent ev(local, global, QPoint(0, 0), QPoint(0, delta), Qt::NoButton,
+    QWheelEvent ev(local, global, QPoint(0, 0), QPoint(x, y), Qt::NoButton,
                    Qt::NoModifier, Qt::NoScrollPhase, false);
 #else
-    QWheelEvent ev(local, global, QPoint(0, 0), QPoint(0, delta), delta, Qt::Vertical,
+    const int delta = y != 0 ? y : x;
+    const Qt::Orientation orientation = y != 0 ? Qt::Vertical : Qt::Horizontal;
+    QWheelEvent ev(local, global, QPoint(0, 0), QPoint(x, y), delta, orientation,
                    Qt::NoButton, Qt::NoModifier);
 #endif
     QApplication::sendEvent(w, &ev);

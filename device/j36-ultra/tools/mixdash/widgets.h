@@ -343,6 +343,9 @@ public:
     bool carrying() const { return m_carry >= 0; }
 
     void setPageTitle(const QString &t) { m_pageTitle = t; }
+    /* Live grids such as Desktop follow an external order and do not expose the
+     * launcher's long-press rearrangement gesture. */
+    void setRearrangeable(bool on) { m_rearrangeable = on; }
     QString title() const override;
     bool handleNav(int action) override;
     void handleNavRelease(int action) override;
@@ -486,6 +489,7 @@ private:
     /* The card the press landed on, so a press that slides off it does not
      * activate the one it slid onto. */
     int m_pressed = -1;
+    bool m_rearrangeable = true;
 
     /* -1 when nothing is being carried; otherwise the slot the carried card is
      * currently sitting in, which is also its index in m_entries. */

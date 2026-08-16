@@ -49,6 +49,7 @@
 
 class Busy;
 class DiagnosticsPage;
+class DesktopPage;
 class DisplayPage;
 class FilesPage;
 class Joypad;
@@ -125,7 +126,8 @@ public:
         /* A mounted USB volume.  The card carries no path -- the key is the handle,
          * and Volumes::byKey turns it back into a mount point at the moment it is
          * pressed, which is the only moment the answer is known to be current. */
-        InternalVolume
+        InternalVolume,
+        InternalDesktop
     };
 
     explicit Dashboard(QWidget *parent = nullptr);
@@ -324,6 +326,8 @@ private:
      * things now do: a card, and j36-xrun by way of the queue below.
      */
     void runInSession(const QString &title, const QString &cmd);
+    /* Select one of the graphical session's client cards and reveal it. */
+    void showDesktopWindow(qint64 pid);
     /*
      * Read /run/j36/xrun.queue and open what is in it.  Called from the request
      * poll when SIGUSR2 has been seen; see RunRequest in switcher.h for why the
@@ -384,6 +388,7 @@ private:
 
     /* Pushed on top of the grid. */
     MediaPage *m_media = nullptr;
+    DesktopPage *m_desktop = nullptr;
     SettingsPage *m_settings = nullptr;
     FilesPage *m_files = nullptr;
     TerminalPage *m_terminal = nullptr;

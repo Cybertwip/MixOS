@@ -7,6 +7,7 @@
 
 #include "busy.h"
 #include "diagnostics.h"
+#include "desktop.h"
 #include "files.h"
 #include "joypad.h"
 #include "keyboard.h"
@@ -458,6 +459,8 @@ Dashboard::Dashboard(QWidget *parent)
     m_apps->setOrder(Settings::instance().cardOrder());
     Trace::step("MediaPage");
     m_media = new MediaPage(this);
+    Trace::step("DesktopPage");
+    m_desktop = new DesktopPage(this);
     Trace::step("SettingsPage");
     m_settings = new SettingsPage(this);
 
@@ -615,7 +618,7 @@ Dashboard::Dashboard(QWidget *parent)
     connect(m_pointer, &Pointer::awakeChanged, m_busy, &Busy::setPointerStyle);
 
     Trace::step("page tables");
-    m_all << m_apps << m_media << m_settings
+    m_all << m_apps << m_media << m_desktop << m_settings
           << m_files << m_terminal << m_wifi << m_sharing << m_packages
           << m_diagnostics << m_mouse << m_display << m_region << m_info;
     for (PageWidget *page : m_all) {
@@ -651,6 +654,8 @@ Dashboard::Dashboard(QWidget *parent)
             this, &Dashboard::onTerminalRequested);
     connect(m_diagnostics, &DiagnosticsPage::launchRequested,
             this, &Dashboard::onLaunchRequested);
+    connect(m_desktop, &DesktopPage::windowRequested,
+            this, &Dashboard::showDesktopWindow);
     connect(&Strings::instance(), &Strings::languageChanged,
             this, &Dashboard::retranslate);
 
@@ -796,8 +801,8 @@ void Dashboard::buildPages()
      *      0x130, past the 255 an X keycode can hold, so the older evdev driver
      *      cannot map it.  tools/j36-padx.c closes that gap: it grabs the pad,
      *      connects to the server and synthesises motion, clicks and keys with
-     *      XTEST, so the D-pad is a pointer and A is a click.  matchbox-keyboard is
-     *      the on-screen keyboard inside the session, on Select.
+     *      XTEST, so the left stick is a pointer and A is a click.  The same bridge
+     *      draws the dashboard-style keyboard inside the session, on Select.
      *
      * WHICH BROWSER IS NOT DECIDED HERE.  The image installs firefox-esr, because
      * the 2026 web is JavaScript and a browser without it shows a blank page on half
@@ -884,8 +889,8 @@ void Dashboard::buildPages()
     desktop.title = tr("Desktop");
     desktop.accent = Theme::blue();
     desktop.glyph = GlyphDisplay;
-    desktop.exe = graphicalSession();
-    desktop.available = !desktop.exe.isEmpty();
+    desktop.internal = InternalDesktop;
+    desktop.available = !graphicalSession().isEmpty();
     if (!desktop.available)
         desktop.reason = tr("No graphical session on this card: %1.")
                              .arg(graphicalSessionMissing());
@@ -2162,6 +2167,29 @@ void Dashboard::runInSession(const QString &title, const QString &cmd)
     setForeground(session);
 }
 
+void Dashboard::showDesktopWindow(qint64 pid)
+{
+    const int task = sessionTask();
+    if (task < 0) {
+        const QString session = graphicalSession();
+        if (session.isEmpty()) {
+            toast(tr("No graphical session is installed on this card"), 4000);
+            return;
+        }
+        launch(tr("Desktop"), session, QStringList());
+        return;
+    }
+
+    /* The session may be SIGSTOPped while this page is visible.  A FIFO accepts
+     * the complete line now; its reader handles it immediately after the process
+     * group is continued below. */
+    if (pid > 0 && !writeSessionControl(QStringLiteral("focus %1").arg(pid))) {
+        toast(tr("Desktop did not accept the window switch"), 3500);
+        return;
+    }
+    setForeground(task);
+}
+
 /*
  * ── WHAT j36-xrun LEFT BEHIND ────────────────────────────────────────────────
  *
@@ -2875,6 +2903,9 @@ void Dashboard::activate(const AppEntry &entry)
         break;
     case InternalMedia:
         push(m_media);
+        break;
+    case InternalDesktop:
+        push(m_desktop);
         break;
     case InternalSettings:
         push(m_settings);

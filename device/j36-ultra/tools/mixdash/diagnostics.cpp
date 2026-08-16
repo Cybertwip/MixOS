@@ -337,8 +337,8 @@ void DiagnosticsPage::probeInput(QVector<Finding> &out)
     Finding pointer;
     pointer.name = tr("Pointing devices");
     const int mice = m_pad ? m_pad->mouseCount() : 0;
-    pointer.detail = mice > 0 ? tr("%1 attached, plus the right stick").arg(mice)
-                              : tr("none attached -- the right stick drives the pointer");
+    pointer.detail = mice > 0 ? tr("%1 attached, plus the left stick").arg(mice)
+                              : tr("none attached -- the left stick drives the pointer");
     pointer.badge = QString::number(mice);
     pointer.colour = mice > 0 ? Theme::green() : Theme::ink3();
     out.append(pointer);
