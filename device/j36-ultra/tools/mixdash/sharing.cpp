@@ -1381,6 +1381,7 @@ SharingPage::SharingPage(QWidget *parent)
     m_list = new ListPane(this);
     m_list->setRowHeight(30);
     connect(m_list, &ListPane::activated, this, &SharingPage::onActivated);
+    connect(m_list, &ListPane::valueChanged, this, &SharingPage::onValueChanged);
 
     /*
      * Slow, and it can afford to be.  Nothing on this page changes on its own
@@ -1476,6 +1477,12 @@ void SharingPage::onLeave()
 
 void SharingPage::poll()
 {
+    /* systemctl() and smbpasswd use Shell's sliced waits, so the event loop is
+     * alive while a toggle is being applied.  Do not let this timer sample and
+     * redraw the old state in the middle of that operation. */
+    if (m_changing)
+        return;
+
     const UnitSnapshot smbd = readUnit(QString::fromLatin1(kSmbd));
 
     /*
@@ -1764,54 +1771,6 @@ void SharingPage::onActivated(int index)
         return;
 
     switch (rows[index].id) {
-    case IdShare:
-        /* m_starting counts as on, because that is the position the switch is
-         * drawn in -- pressing a switch that looks on has to turn it off, and a
-         * stop is also the right way to call off a start still in flight. */
-        if (m_active || m_starting)
-            stop();
-        else
-            start();
-        break;
-
-    case IdAtBoot: {
-        const bool turningOn = !m_enabled;
-        /*
-         * Configure before enabling, not before starting only.  Enabling and then
-         * rebooting is a path to a running smbd that never went through start(),
-         * and on a card whose smb.conf is still the shipped one that reboot is
-         * what publishes /opt and the DATA partition to the network with no
-         * password.  The one line below is the whole of the fix.
-         */
-        if (turningOn) {
-            const QString err = ensureConfigured();
-            if (!err.isEmpty()) {
-                m_note = err;
-                break;
-            }
-        }
-        const QString err = setEnabled(QString::fromLatin1(kSmbd), turningOn);
-        /* nmbd's is best-effort here for the same reason its start is: the share
-         * works without the NetBIOS name, so its failure is not the switch's. */
-        setEnabled(QString::fromLatin1(kNmbd), turningOn);
-
-        /* Same rule as poll()'s: a switch is redrawn from an answer and not from
-         * silence.  If this fork did not run, the press stands as made and the
-         * next tick reads the card. */
-        bool answered = false;
-        const bool now = unitEnabled(QString::fromLatin1(kSmbd), &answered);
-        if (answered)
-            m_enabled = now;
-        else
-            m_enabled = turningOn;
-        if (!err.isEmpty())
-            m_note = err;
-        else
-            m_note = m_enabled ? tr("sharing will start at boot")
-                               : tr("sharing will not start at boot");
-        break;
-    }
-
     case IdShowPassword:
         m_reveal = !m_reveal;
         break;
@@ -1879,6 +1838,63 @@ void SharingPage::onActivated(int index)
         return;
     }
 
+    rebuild();
+    update();
+}
+
+/*
+ * Toggles do not emit ListPane::activated().  They mutate the pane's copy of the
+ * row and emit valueChanged(), carrying the position the user just requested.
+ * Keeping this separate from onActivated() makes it impossible to accidentally
+ * infer that request from a service-state flag which may still describe the
+ * previous poll.
+ */
+void SharingPage::onValueChanged(int index, int value)
+{
+    if (m_changing)
+        return;
+
+    const QVector<ListRow> &rows = m_list->rows();
+    if (index < 0 || index >= rows.size())
+        return;
+    const int id = rows[index].id;
+    if (id != IdShare && id != IdAtBoot)
+        return;
+
+    const bool turningOn = (value != 0);
+    m_changing = true;
+
+    if (id == IdShare) {
+        if (turningOn)
+            start();
+        else
+            stop();
+    } else {
+        /* Configure before enabling, not before starting only.  Otherwise a
+         * reboot could start smbd against the guest-readable image config. */
+        QString err;
+        if (turningOn)
+            err = ensureConfigured();
+
+        if (err.isEmpty()) {
+            err = setEnabled(QString::fromLatin1(kSmbd), turningOn);
+            /* NetBIOS discovery is best-effort; the SMB share works by IP without
+             * it, so nmbd never decides the state of this switch. */
+            setEnabled(QString::fromLatin1(kNmbd), turningOn);
+
+            bool answered = false;
+            const bool now = unitEnabled(QString::fromLatin1(kSmbd), &answered);
+            m_enabled = answered ? now : turningOn;
+        }
+
+        if (!err.isEmpty())
+            m_note = err;
+        else
+            m_note = m_enabled ? tr("sharing will start at boot")
+                               : tr("sharing will not start at boot");
+    }
+
+    m_changing = false;
     rebuild();
     update();
 }

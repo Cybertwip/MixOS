@@ -202,6 +202,15 @@
  * Both of those come out of the same fork now.  A tick used to be two systemctl
  * runs, is-active and is-enabled; it is one `show' with three properties in it,
  * which halves the exposure to the very slowness that caused SEVEN.
+ *
+ * NINE: THE SWITCHES WERE NOT CONNECTED TO THIS PAGE.  ListPane emits activated()
+ * for action rows and valueChanged() for toggles.  Sharing connected only the
+ * former, so pressing either switch changed the temporary ListRow painted by the
+ * pane and called none of the code below.  The next poll rebuilt that row from
+ * systemd and appeared to undo the press.  This is also why a diagnosis from an
+ * affected card showed a valid configuration but no password, no smbd journal and
+ * no systemd job: the switches had never requested any of them.  onValueChanged()
+ * is the missing connection.
  */
 #ifndef MIXDASH_SHARING_H
 #define MIXDASH_SHARING_H
@@ -233,6 +242,7 @@ protected:
 
 private slots:
     void onActivated(int index);
+    void onValueChanged(int index, int value);
     void poll();
 
 private:
@@ -398,6 +408,13 @@ private:
     bool m_enabled = false;
     bool m_reveal = false;      /* the password is masked until it is asked for */
     QString m_note;             /* one line under the title: what just happened */
+
+    /* A toggle can spend several seconds creating the samba password or asking
+     * systemd.  Shell keeps Qt responsive during those waits, which means the
+     * poll timer can fire inside the operation unless it is explicitly ignored.
+     * Such a poll would rebuild the row from the old service state halfway
+     * through the press and make a working switch flicker back off. */
+    bool m_changing = false;
 
     /* A start is in flight and this page is waiting for it -- see bug ONE in the
      * block at the top of this file.  The grace counts down by one poll interval
