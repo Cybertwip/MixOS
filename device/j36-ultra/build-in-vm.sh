@@ -4804,10 +4804,11 @@ RestartPreventExitStatus=3 4
 #
 # CHILDREN INHERIT THIS, and that is deliberate for the cube and for whatever the
 # operator installs -- they are the thing the user is looking at, and the dashboard behind
-# them is redrawable. It is NOT right for the browser, which is the one child here
-# that can eat the whole board on its own, so j36-browser-session raises its own
-# score back above zero on the way in. That pair is the whole policy: the browser
-# dies first and lands back on a dashboard that is still running.
+# them is redrawable. It is NOT right for the graphical session, which is the one
+# child here that can eat the whole board on its own, so j36-xsession-main raises its
+# own score to +300 on the way in and gives each WINDOW it opens +500. That trio is
+# the whole policy: a window dies first, then the session around it, and either way
+# what is left is a dashboard that is still running.
 OOMScoreAdjust=-300
 # /run/mixdash, 0700, for XDG_RUNTIME_DIR -- Qt keeps sockets and lock files there and
 # warns about it in its first line of output when it is not set.
@@ -6519,8 +6520,9 @@ dump() {
         /proc/sys/vm/swappiness /proc/sys/vm/page-cluster \
         /proc/sys/vm/watermark_scale_factor /proc/sys/vm/min_free_kbytes
     # Who the kernel would pick if it had to, in the order it would pick them.
-    # -300 is mixdash and everything it launched; +300 is the browser session
-    # putting itself at the front of the queue on purpose.
+    # -300 is mixdash and everything it launched; +300 is the graphical session and
+    # +500 each of its windows, both putting themselves at the front of the queue on
+    # purpose.
     sec "oom_score_adj by process"
     for _p in /proc/[0-9]*; do
         [ -r "$_p/oom_score_adj" ] || continue
@@ -8470,7 +8472,7 @@ QTCONF
     return 0
 }
 
-# ── The browser session: an X server on the framebuffer, and the pad inside it ──
+# ── The graphical session: an X server on the framebuffer, and the pad inside it ──
 #
 # WHAT CHANGED, because this file used to say the opposite.  The old note here and
 # in dashboard.cpp said an X server on this board would be the Console card again --
@@ -11305,11 +11307,11 @@ if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
     fi
 
 
-    # ── The Browser card ──────────────────────────────────────────────────────
+    # ── The graphical session, the Desktop card and the Browser card ──────────
     #
-    # Three files and a binary: an Xorg configuration, a launcher, the session
-    # script the launcher hands to xinit, and j36-padx.  The reasoning for the
-    # whole shape is above build_padx; what follows is what each piece is for.
+    # Four scripts and a binary: an Xorg configuration, the session launcher, the
+    # session itself, the browser and j36-xrun, plus j36-padx.  The reasoning for
+    # the whole shape is above build_padx; what follows is what each piece is for.
     #
     # THE BINARY IS STAGED ON ITS OWN MERITS, like the mirror.  A card with the
     # bridge and no dashboard is still a card somebody can run the launcher on from
@@ -11357,7 +11359,7 @@ if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
     mkdir -p "$SDROOT/opt/mixos/share/xorg"
     cat > "$SDROOT/opt/mixos/share/xorg/xorg.conf" <<'XORGCONF'
 # Written by device/j36-ultra/build-in-vm.sh for the J36 Ultra's simple-framebuffer.
-# See the Browser card section in that file for why each option is here.
+# See the graphical session section in that file for why each option is here.
 
 Section "ServerFlags"
     Option "AutoAddGPU"   "false"
@@ -11472,12 +11474,12 @@ XORGCONF
     cat > "$SDROOT/opt/mixos/share/keyboard/j36-keyboard.xml" <<'KEYBOARDXML'
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Written by device/j36-ultra/build-in-vm.sh for the J36 Ultra's browser session.
+  Written by device/j36-ultra/build-in-vm.sh for the J36 Ultra's graphical session.
   It mirrors the dashboard keyboard in tools/mixdash/keyboard.cpp.  Do not edit
   this file on the card: the next image writes over it.  Edit the builder.
 
-  Selected by MB_KBD_CONFIG in /opt/mixos/bin/j36-browser-session, which beats
-  every other place matchbox looks, so Debian's own keyboard.xml is left alone.
+  Selected by MB_KBD_CONFIG in /opt/mixos/bin/j36-xsession-main, which beats every
+  other place matchbox looks, so Debian's own keyboard.xml is left alone.
 -->
 <keyboard>
 
@@ -12257,7 +12259,20 @@ fi
 # into the session's control pipe, the session runs it with J36_XSESSION set, and it
 # arrives back here one branch further down.  It cannot loop: j36-xrun refuses when
 # there is no session rather than starting one.
+#
+# J36_BROWSER IS CARRIED ACROSS EXPLICITLY, because a pipe carries a command line and
+# not an environment: the session forks its windows from its OWN environment, so
+#
+#     J36_BROWSER=/usr/bin/netsurf-gtk /opt/mixos/bin/j36-browser
+#
+# typed in the Terminal card would otherwise arrive on the far side with the variable
+# gone and open Firefox -- silently doing the opposite of what was asked, on the one
+# command whose whole purpose is the day Firefox will not start.  `env' puts it back.
 if [ -z "${J36_XSESSION:-}" ]; then
+    if [ -n "${J36_BROWSER:-}" ]; then
+        exec /opt/mixos/bin/j36-xrun /usr/bin/env "J36_BROWSER=$J36_BROWSER" \
+            /opt/mixos/bin/j36-browser "$URL"
+    fi
     exec /opt/mixos/bin/j36-xrun /opt/mixos/bin/j36-browser "$URL"
 fi
 
@@ -12514,7 +12529,7 @@ screen, the D-pad for landing on a small link.</p>
 <tr><td class="k">Select</td><td>show or hide the on-screen keyboard</td></tr>
 <tr><td class="k">Start</td><td>jump to the address bar</td></tr>
 <tr><td class="k">Vol&minus;, Vol+</td><td>zoom out, zoom in</td></tr>
-<tr><td class="k">Menu</td><td><b>hold</b> to close the browser</td></tr>
+<tr><td class="k">Menu</td><td><b>tap</b> for the next window; <b>hold</b> for the dashboard</td></tr>
 </table>
 
 <p>To type a URL: <b>Start</b>, then <b>Select</b> for the keyboard, then tap the
@@ -12559,6 +12574,30 @@ no-script version, which is the one that works here</li>
 &mdash; what the Packages card installs from</li>
 </ul>
 
+<h2>Other windows</h2>
+
+<p>This browser is one window in a desktop session, not the whole of it. The
+<b>Desktop</b> card on the dashboard starts that session empty, and from the
+Terminal card:</p>
+
+<p><code>j36-xrun COMMAND</code></p>
+
+<p>opens anything else graphical in the same session &mdash;
+<code>j36-xrun xterm</code>, <code>j36-xrun freedoom1</code>, whatever the
+Packages card installed. It returns as soon as it has asked; the window turns up
+on the panel a moment later.</p>
+
+<p><b>Menu</b> tapped pages round the windows that are open, and <b>Menu</b> held
+brings the dashboard back with all of them left running behind it. Four at once
+is the limit &mdash; there is 1&nbsp;GB of RAM to share out.</p>
+
+<p>A program started straight from the Terminal card, without
+<code>j36-xrun</code>, finds the session too &mdash; <b>DISPLAY</b> is already
+set &mdash; but it will sit there drawing nothing until the Desktop is back in
+front, because a session that is not on the panel is stopped. That is what
+<code>j36-xrun</code> is for: it asks the session, so it does not matter which
+card you are looking at.</p>
+
 <h2>What it can and cannot do</h2>
 
 <p>The browser this image ships is <b>Firefox ESR</b> &mdash; a real Gecko with a
@@ -12570,12 +12609,13 @@ thirty adverts on it to be the one that runs out of memory.</p>
 
 <p><b>NetSurf</b> is installed alongside it: 4&nbsp;MB, its own engine, CSS and
 images but no JavaScript. It is the one to fall back on when Firefox will not
-start. From the Terminal card:</p>
+start. From the Terminal card, with the Desktop already open:</p>
 
 <p><code>J36_BROWSER=/usr/bin/netsurf-gtk /opt/mixos/bin/j36-browser</code></p>
 
-<p>Any other browser from the Packages card works the same way, and with none
-named this card simply runs the first one it finds.</p>
+<p>That opens as another window beside whatever is there. Any other browser from
+the Packages card works the same way, and with none named the card simply runs
+the first one it finds.</p>
 
 <h2>If nothing loads</h2>
 
