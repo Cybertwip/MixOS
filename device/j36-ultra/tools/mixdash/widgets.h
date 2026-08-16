@@ -585,7 +585,18 @@ class ListPane : public QWidget
 public:
     explicit ListPane(QWidget *parent = nullptr);
 
-    void setRows(const QVector<ListRow> &rows);
+    /*
+     * `keepCurrent' IS "THESE ROWS STAND FOR THE SAME THINGS".  A pane refreshed in
+     * place -- a value that ticked, a state that changed -- must not move the cursor
+     * out from under whoever is holding the D-pad, so the default keeps the row
+     * index whenever it is still in range and still landable.
+     *
+     * A pane given a DIFFERENT list must not: row seven of the last directory is not
+     * row seven of this one, and inheriting the number is how Media opened part way
+     * down a folder the operator had just walked into.  Pages that replace their
+     * contents say so and get the first selectable row.
+     */
+    void setRows(const QVector<ListRow> &rows, bool keepCurrent = true);
     const QVector<ListRow> &rows() const { return m_rows; }
     /* In-place, without disturbing the selection or the scroll -- for a value
      * that changed under a slider the user is still holding. */

@@ -2005,12 +2005,13 @@ ListPane::ListPane(QWidget *parent)
     setMouseTracking(true);
 }
 
-void ListPane::setRows(const QVector<ListRow> &rows)
+void ListPane::setRows(const QVector<ListRow> &rows, bool keepCurrent)
 {
     m_rows = rows;
     m_pressed = -1;
     m_dragging = false;
-    if (m_current >= m_rows.size() || m_current < 0 || !selectable(m_current))
+    if (!keepCurrent || m_current >= m_rows.size() || m_current < 0
+        || !selectable(m_current))
         m_current = nextSelectable(-1, 1);
     m_scroll = 0;
     if (m_current >= 0)
@@ -2109,9 +2110,30 @@ void ListPane::clampScroll()
     m_scroll = qBound(0, m_scroll, maxScroll);
 }
 
+/*
+ * ── SCROLLING TO A ROW NEEDS A VIEWPORT, AND THERE IS NOT ALWAYS ONE ─────────
+ *
+ * A QWidget child that has never been laid out is 100x30, which is Qt's default and
+ * not a size any pane on this device is ever drawn at.  Pages fill their list from
+ * the constructor or from onEnter(), and both of those can run before the first
+ * resizeEvent has given the pane its real geometry -- so `top + h > m_scroll + 30'
+ * was true for the second row of every list, and the pane scrolled to put a row on
+ * screen that was already on screen.
+ *
+ * clampScroll() did not undo it, because on a list longer than the card the bound it
+ * enforces is contentHeight() - height(), which is far larger than the twenty-odd
+ * pixels this put in.  So Settings and Diagnostics opened a row and a half down the
+ * page, every time, with no way to tell from the drawing that anything had scrolled.
+ *
+ * The height is checked rather than a "have I been laid out" flag because that is
+ * the actual precondition: a viewport smaller than one row cannot be scrolled to
+ * anything, whether it is a default geometry or a page mid-layout.
+ */
 void ListPane::ensureVisible(int index)
 {
     if (index < 0 || index >= m_rows.size())
+        return;
+    if (height() < m_rowHeight)
         return;
     const int top = rowTop(index);
     const int h = rowHeightFor(m_rows[index]);
@@ -2192,8 +2214,23 @@ bool ListPane::press()
     return true;
 }
 
+/*
+ * RECOMPUTED, NOT CLAMPED.  A scroll offset is an answer to "where does the current
+ * row have to be", and the geometry that question was answered against has just
+ * changed -- so clamping the old answer keeps whatever part of it the new bound
+ * happens to allow.  That is how a pane filled before its first layout carried the
+ * offset described above straight through the resize that should have corrected it.
+ *
+ * Starting from zero and asking again gives the SMALLEST scroll that keeps the
+ * current row on screen, which for a selection near the top of the list is none at
+ * all.  A pane the user had scrolled down is put back only as far as its current row
+ * needs, and the current row is where they left it.
+ */
 void ListPane::resizeEvent(QResizeEvent *event)
 {
+    m_scroll = 0;
+    if (m_current >= 0)
+        ensureVisible(m_current);
     clampScroll();
     QWidget::resizeEvent(event);
 }

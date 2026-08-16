@@ -159,6 +159,24 @@ private:
     int m_pane = PaneList;
     int m_asking = AskNothing;
     QString m_search;
+
+    /*
+     * "The cursor belongs on the first row of this directory, and nobody has moved
+     * it since we arrived."  Set by setRoot(), cleared by the first thing the
+     * operator does with the list.
+     *
+     * It exists because QFileSystemModel answers before it knows.  setRoot() asks
+     * for row 0 and gets whatever the model happens to be holding for that path --
+     * often a few entries left from a previous visit, or nothing at all -- and then
+     * the worker finishes, the model re-sorts, and the persistent current index
+     * follows its ITEM to wherever the sort put it.  Which is why Files opened part
+     * way down a directory instead of at the top of it.  A validity test cannot see
+     * that: the index is perfectly valid, it is just no longer row 0.
+     */
+    bool m_pinTop = false;
+    /* Put the cursor back on row 0 while m_pinTop stands.  Called whenever the
+     * model has finished changing its mind about what the rows are. */
+    void repinTop();
 };
 
 #endif /* MIXDASH_FILES_H */

@@ -357,8 +357,18 @@ private:
      */
     void layOutList();
 
-    /* One place builds the rows for whichever view is up. */
-    void rebuild();
+    /*
+     * One place builds the rows for whichever view is up.
+     *
+     * `keepSelection' IS ABOUT WHETHER IT IS THE SAME LIST.  Almost every caller is
+     * refreshing rows that stand for the same things -- a track ticked on, a volume
+     * slider moved, a disk arriving -- and there the cursor has to stay where the
+     * operator put it.  populate() and populatePlaces() are not that: they have just
+     * replaced the entries with a different directory's, and carrying row seven over
+     * into it lands the cursor seven rows down a list it has never seen.  That is
+     * what "Media does not start with the selection at the top" was.
+     */
+    void rebuild(bool keepSelection = true);
     void buildBrowseRows(QVector<ListRow> &rows) const;
     void buildPlayerRows(QVector<ListRow> &rows) const;
 

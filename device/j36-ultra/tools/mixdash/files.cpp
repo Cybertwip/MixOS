@@ -124,12 +124,19 @@ FilesPage::FilesPage(QWidget *parent)
     connect(m_model, &QFileSystemModel::directoryLoaded, this, [this](const QString &path) {
         if (QDir::cleanPath(path) != m_root)
             return;
-        if (!m_view->currentIndex().isValid()) {
-            const QModelIndex root = m_model->index(m_root);
-            if (m_model->rowCount(root) > 0)
-                m_view->setCurrentIndex(m_model->index(0, 0, root));
-        }
+        repinTop();
         update();
+    });
+    /*
+     * AND AGAIN AFTER THE SORT, which is the half that was missing.  directoryLoaded
+     * says the names have arrived; it does not say they are in their final order.
+     * QFileSystemModel re-sorts as entries land and moves its rows with
+     * layoutChanged, and a current index set before that follows its item down the
+     * list -- so the fix above only ever worked on a directory the model had nothing
+     * cached for.  See m_pinTop in files.h.
+     */
+    connect(m_model, &QAbstractItemModel::layoutChanged, this, [this]() {
+        repinTop();
     });
 
     /* The info panel is about whatever is highlighted, so it repaints whenever
@@ -138,6 +145,7 @@ FilesPage::FilesPage(QWidget *parent)
     connect(m_view->selectionModel(), &QItemSelectionModel::currentChanged,
             this, [this](const QModelIndex &, const QModelIndex &) { update(); });
     connect(m_view, &QAbstractItemView::clicked, this, [this](const QModelIndex &) {
+        m_pinTop = false;
         setPane(PaneList);
     });
     connect(m_view, &QAbstractItemView::doubleClicked, this, [this](const QModelIndex &) {
@@ -408,13 +416,31 @@ void FilesPage::navigateTo(const QString &path)
         emit openRequested(clean);
 }
 
+void FilesPage::repinTop()
+{
+    if (!m_pinTop)
+        return;
+    const QModelIndex root = m_model->index(m_root);
+    if (m_model->rowCount(root) <= 0)
+        return;
+    const QModelIndex first = m_model->index(0, 0, root);
+    if (!first.isValid())
+        return;
+    m_view->setCurrentIndex(first);
+    m_view->scrollToTop();
+}
+
 void FilesPage::setRoot(const QString &path)
 {
     m_root = QDir::cleanPath(path);
     m_model->setRootPath(m_root);
     const QModelIndex root = m_model->index(m_root);
     m_view->setRootIndex(root);
-    m_view->setCurrentIndex(m_model->index(0, 0, root));
+    /* Before the pin rather than after: this is the answer for a directory the
+     * model already holds in full, and repinTop() is what corrects it for one it
+     * does not.  The pin stands until the operator moves the cursor themselves. */
+    m_pinTop = true;
+    repinTop();
     emit titleChanged();
     update();
 }
@@ -452,6 +478,8 @@ void FilesPage::step(int delta)
     int row = current.isValid() ? current.row() + delta : 0;
     row = qBound(0, row, rows - 1);
     const QModelIndex next = m_model->index(row, 0, root);
+    /* The operator has taken the cursor over; nothing may move it back. */
+    m_pinTop = false;
     m_view->setCurrentIndex(next);
     m_view->scrollTo(next);
 }
@@ -481,9 +509,12 @@ bool FilesPage::leave()
 
     const QString child = m_root;
     setRoot(up);
-    /* Come back to the directory we just left, not to the top of its parent. */
+    /* Come back to the directory we just left, not to the top of its parent -- so
+     * the pin setRoot() just put down has to come off, or the parent finishing its
+     * load would drag the cursor back to row 0. */
     const QModelIndex idx = m_model->index(child);
     if (idx.isValid()) {
+        m_pinTop = false;
         m_view->setCurrentIndex(idx);
         m_view->scrollTo(idx);
     }
@@ -644,10 +675,11 @@ void FilesPage::textEntered(const QString &text, bool accepted)
         m_search = text;
         applyFilter();
         /* The filter changes what row 0 is, so the cursor goes back to the top
-         * rather than to whatever has inherited the old row number. */
-        const QModelIndex root = m_model->index(m_root);
-        if (m_model->rowCount(root) > 0)
-            m_view->setCurrentIndex(m_model->index(0, 0, root));
+         * rather than to whatever has inherited the old row number -- and through
+         * the pin, because the filtering is another thing the model does on its own
+         * schedule and lands as a layoutChanged. */
+        m_pinTop = true;
+        repinTop();
         setPane(PaneList);
         update();
     }

@@ -547,7 +547,8 @@ void MediaPage::populate(QString dir)
     m_places = false;
 
     if (!d.exists()) {
-        rebuild();
+        /* A new listing, so the cursor starts at the top of it -- see rebuild(). */
+        rebuild(false);
         emit titleChanged();
         return;
     }
@@ -641,7 +642,9 @@ void MediaPage::populate(QString dir)
      * because the way this device stops is that somebody holds the power button. */
     Settings::instance().setMediaRoot(m_dir);
 
-    rebuild();
+    /* These are a different directory's entries, so the cursor goes to the first of
+     * them and not to whichever row number the last directory left behind. */
+    rebuild(false);
     emit titleChanged();
 }
 
@@ -676,7 +679,8 @@ void MediaPage::populatePlaces()
         m_entries.append(e);
     }
 
-    rebuild();
+    /* One row per root, which is not the list that was up a moment ago either. */
+    rebuild(false);
     emit titleChanged();
 }
 
@@ -791,7 +795,7 @@ bool MediaPage::openPath(const QString &path)
 
 /* ── the rows ────────────────────────────────────────────────────────────── */
 
-void MediaPage::rebuild()
+void MediaPage::rebuild(bool keepSelection)
 {
     QVector<ListRow> rows;
     if (m_view == ViewPlayer)
@@ -799,8 +803,8 @@ void MediaPage::rebuild()
     else
         buildBrowseRows(rows);
 
-    const int keep = m_list->current();
-    m_list->setRows(rows);
+    const int keep = keepSelection ? m_list->current() : -1;
+    m_list->setRows(rows, keepSelection);
     if (keep >= 0 && keep < rows.size())
         m_list->setCurrent(keep);
     layOutList();
