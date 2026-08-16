@@ -2531,6 +2531,13 @@ void Dashboard::showSwitcher()
     /* Remembered before anything is stopped, because stopForeground() clears
      * m_fg and cancelling has to put back what was actually in front. */
     m_switcherWas = m_fg;
+
+    /* The switcher is driven entirely by buttons.  If it is opened from the
+     * dashboard itself there may still be a framebuffer cursor awake; hiding it
+     * before the full-panel repaint keeps that cursor from sitting on top of the
+     * task list.  A graphical child has its own X cursor, which j36-padx hides
+     * before it asks us for this switcher. */
+    m_pointer->sleep();
     stopForeground();
 
     /* Whatever was loading is stopped now, so the ring is a lie -- and it is a
@@ -2562,8 +2569,8 @@ void Dashboard::showSwitcher()
     m_switcher->open(switcherRows(), m_switcherWas + 1);
     setUpdatesEnabled(true);
     update();
-    /* The arrow belongs on top of every overlay, the same way the toast puts it
-     * back.  Asleep behind a task, awake if this was opened from the grid. */
+    /* Keep the arrow above the widget stack for when it next wakes, but leave it
+     * asleep while this button-driven overlay is up. */
     m_pointer->raise();
 }
 

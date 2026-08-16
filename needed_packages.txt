@@ -62,6 +62,7 @@ libtool-bin
 libudev1
 libvorbisidec1
 libvpx9
+libxfixes3
 libxkbcommon0
 libxtst6
 libzip5

@@ -178,6 +178,7 @@
 
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
+#include <X11/extensions/Xfixes.h>
 #include <X11/extensions/XTest.h>
 #include <X11/keysym.h>
 
@@ -722,6 +723,46 @@ static void screen_refresh(void)
     XMapRaised(dpy, w);
     XDestroyWindow(dpy, w);
     XFlush(dpy);
+}
+
+/*
+ * The X cursor is not part of the framebuffer snapshot mixdash saves.  With
+ * xf86-video-fbdev it is composited by the X server and the pixels underneath it
+ * are restored only when X moves or hides it.  SIGSTOP freezes the whole session,
+ * including that cleanup, so handing the panel to the task switcher while the
+ * cursor is visible leaves the cursor painted over the switcher's first frame.
+ *
+ * XFixes hides the server cursor globally, including cursors a client installed
+ * on its own window.  XSync is intentional: the dashboard may stop X immediately
+ * after SIGUSR1, so the hide must have reached the server before that signal is
+ * sent.  The cursor is restored on SIGCONT, before the refresh which repaints the
+ * resumed desktop.
+ */
+static void screen_cursor(int visible)
+{
+    static int available = -1;
+    static int hidden;
+    int event_base, error_base;
+
+    if (!dpy)
+        return;
+    if (available < 0)
+        available = XFixesQueryExtension(dpy, &event_base, &error_base) ? 1 : 0;
+    if (!available)
+        return;
+
+    if (visible) {
+        if (!hidden)
+            return;
+        XFixesShowCursor(dpy, RootWindow(dpy, scr));
+        hidden = 0;
+    } else {
+        if (hidden)
+            return;
+        XFixesHideCursor(dpy, RootWindow(dpy, scr));
+        hidden = 1;
+    }
+    XSync(dpy, False);
 }
 
 /*
@@ -1759,6 +1800,7 @@ int main(int argc, char **argv)
                 set_grab(1);
                 grabbing = 1;
             }
+            screen_cursor(1);
             /* AND THE SCREEN IS NOT OURS EITHER.  The dashboard has been drawing
              * on the panel for as long as this was stopped; whatever it left that
              * its restore did not cover is still there, and X does not know a
@@ -1913,11 +1955,21 @@ int main(int argc, char **argv)
                      */
                     if (down) {
                         menu_down_at = now;
+                        /* mixdash recognizes the same hold sooner than this
+                         * bridge does and can SIGSTOP the X server before the
+                         * hold branch below gets a turn.  Hide on the press, so
+                         * the server has restored the pixels under its cursor
+                         * before either reader can hand the panel away.  A tap
+                         * restores it on release; a hold restores it after the
+                         * session is continued. */
+                        if (mixdash_pid > 0 && kill(mixdash_pid, 0) == 0)
+                            screen_cursor(0);
                     } else {
                         if (menu_down_at && now - menu_down_at < MENU_HOLD_MS) {
                             note("Menu tapped, asking for the next window");
                             ctl_send("next");
                         }
+                        screen_cursor(1);
                         menu_down_at = 0;
                     }
                     break;
@@ -2025,6 +2077,7 @@ int main(int argc, char **argv)
                 note("Menu held, asking the dashboard for its switcher");
                 set_grab(0);
                 grabbing = 0;
+                screen_cursor(0);
                 kill(mixdash_pid, SIGUSR1);
                 menu_down_at = 0;
                 /* The buttons that were down belong to a session that is about to

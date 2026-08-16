@@ -8745,7 +8745,7 @@ QTCONF
 # here -- a browser that cannot be driven is a bad card, not a lost kernel.
 PADX_SRC="$ROOT/device/j36-ultra/tools/j36-padx.c"
 PADX_BIN=""
-PADX_BUILD_DEPS=(build-essential libx11-dev libxtst-dev)
+PADX_BUILD_DEPS=(build-essential libx11-dev libxtst-dev libxfixes-dev)
 
 build_padx() {
     local src="$ARMHF_CHROOT/home/build/padx" out="$CACHE/j36-padx"
@@ -8766,7 +8766,7 @@ build_padx() {
 
     log "padx: building the pad-to-X bridge for armhf (emulated)"
     armhf_chroot_run "cd /home/build/padx && \
-        gcc -O2 -std=gnu11 -Wall -Wextra -o j36-padx j36-padx.c -lX11 -lXtst && \
+        gcc -O2 -std=gnu11 -Wall -Wextra -o j36-padx j36-padx.c -lX11 -lXtst -lXfixes && \
         strip j36-padx" || return 1
     [[ -f "$src/j36-padx" ]] || { log "padx: the compile left no binary"; return 1; }
 
@@ -8781,13 +8781,13 @@ build_padx() {
 
     # The whitelist is short on purpose: every name on it is a package this build
     # puts on the card.  libX11 comes with xserver-xorg-core's own dependencies and
-    # libXtst is in needed_packages.txt beside it.  Anything else in here means the
-    # chroot linked something the card will not have, and the failure would surface
-    # on the board as a browser card that starts nothing.
+    # libXtst and libXfixes are in needed_packages.txt beside it.  Anything else
+    # in here means the chroot linked something the card will not have, and the
+    # failure would surface on the board as a browser card that starts nothing.
     needed="$(sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p' <<<"$header" | tr '\n' ' ')"
     for lib in $needed; do
         case "$lib" in
-            libX11.so.6|libXtst.so.6|libXext.so.6|libc.so.6|ld-linux-armhf.so.3) ;;
+            libX11.so.6|libXtst.so.6|libXfixes.so.3|libXext.so.6|libc.so.6|ld-linux-armhf.so.3) ;;
             *) unexpected="$unexpected $lib" ;;
         esac
     done
@@ -12489,7 +12489,7 @@ if [ -n "$dash" ]; then
     # here: the line is in the queue and asking the session as well would open the
     # window twice the moment anything reads it.  It says where the request went
     # rather than pretending it did not happen.
-    if ! printf 'run %s\n' "$cmd" >> "$QUEUE" 2>/dev/null; then
+    if ! printf '%s\n' "$cmd" >> "$QUEUE" 2>/dev/null; then
         echo "j36-xrun: cannot write $QUEUE; asking the session directly instead." >&2
     elif kill -USR2 "$dash" 2>/dev/null; then
         exit 0
