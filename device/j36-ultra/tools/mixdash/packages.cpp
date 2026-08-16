@@ -85,32 +85,58 @@ void PackagesPage::resizeEvent(QResizeEvent *event)
     QWidget::resizeEvent(event);
 }
 
+/*
+ * RE-ASKED AND NOT REDRAWN, which is the other half of the two-taps-to-refresh
+ * report.  This page hands every write to the Terminal and gets the panel back
+ * when apt is finished, so the one moment its answers are guaranteed to be out of
+ * date is the moment it is shown -- and what it used to do with that moment was
+ * rebuild() the rows it already had.  dpkg was re-read, apt was not: a package
+ * that had just appeared in the archive because Update ran was still missing from
+ * the collection, and the summaries were whatever the previous apt-cache said.
+ * Leaving the collection and opening it again fixed it because that is the path
+ * that runs the query, which is the workaround as reported.
+ *
+ * So the view re-runs itself, whatever it is.  It costs one apt-cache on the way
+ * back from the Terminal, which is the same call opening the collection makes,
+ * and the cursor keeps its place because rebuild() restores it.
+ */
 void PackagesPage::onEnter()
 {
     loadInstalled();
-    if (m_view == ViewHome)
-        showHome();
+    if (m_view == ViewCollection && m_collection >= 0)
+        showCollection(m_collection);
+    else if (m_view == ViewSearch && !m_term.trimmed().isEmpty())
+        showSearch(m_term);
     else
-        rebuild();
+        showHome();
 }
 
 /* ── talking to dpkg and apt ─────────────────────────────────────────────── */
 
-QString PackagesPage::run(const QString &program, const QStringList &args, int timeoutMs) const
+QString PackagesPage::run(const QString &program, const QStringList &args, int timeoutMs,
+                          bool *answered) const
 {
+    if (answered)
+        *answered = false;
     if (program.isEmpty())
         return QString();
 
     QProcess p;
     p.setProcessChannelMode(QProcess::SeparateChannels);
     p.start(program, args);
-    if (!Shell::waitForStarted(p, 2000))
+    /* 2000 was 1000's neighbour and has the same problem the Sharing page's
+     * systemctl had: the binary and its libraries come off an SD card, and the
+     * sliced wait spends part of its own budget repainting a 640x480 panel in
+     * software.  A fork that has not happened in four seconds has not happened. */
+    if (!Shell::waitForStarted(p, 4000))
         return QString();
     if (!Shell::waitForFinished(p, timeoutMs)) {
         p.kill();
         Shell::waitForFinished(p, 500);
         return QString();
     }
+    if (answered)
+        *answered = true;
     return QString::fromLocal8Bit(p.readAllStandardOutput());
 }
 
@@ -121,11 +147,23 @@ void PackagesPage::loadInstalled()
      * field matters: a package that was removed but not purged still has an entry,
      * and only "install ok installed" means it is actually there.
      */
-    m_installed.clear();
+    /*
+     * NOT CLEARED UNTIL DPKG HAS ANSWERED.  This runs on every onEnter(), including
+     * the one on the way back from an install, and dpkg-query walking a status file
+     * on this card is a wait that can be lost.  Clearing first and filling in
+     * afterwards meant a lost wait redrew the whole page as "nothing is installed"
+     * -- every badge gone, the header counting zero -- which is not a slow answer,
+     * it is a wrong one, and it is the state a second press would act on.  Last
+     * known good is the right answer to a question that did not come back.
+     */
+    bool answered = false;
     const QString out = run(dpkgQuery(), QStringList()
                                              << "-W"
                                              << "-f=${Package}\\t${db:Status-Status}\\n",
-                            15000);
+                            30000, &answered);
+    if (!answered)
+        return;
+    m_installed.clear();
     for (const QString &line : out.split('\n')) {
         const int tab = line.indexOf('\t');
         if (tab <= 0)
@@ -254,7 +292,26 @@ void PackagesPage::showCollection(int index)
     QStringList args;
     args << "show";
     args += names;
-    const QString out = run(aptCache(), args, 20000);
+
+    /*
+     * Said before the fork and painted before the wait, because the wait is
+     * synchronous: Shell::waitForFinished repaints between its slices, so the panel
+     * stays alive, but it stays alive showing whatever was on it when the fork
+     * happened.  Without this the first apt-cache after an Update -- the one that
+     * has to rebuild the binary cache from the indexes that were just downloaded --
+     * is a minute of a page that looks like it did not hear the button.
+     *
+     * And the budget is sixty seconds and not twenty for the same reason.  Twenty
+     * is generous for a warm cache and not enough for a cold one on this CPU with
+     * this card, and what the old budget bought was a kill, an empty answer, and a
+     * note telling the operator to run the Update they had just run.
+     */
+    m_note = tr("asking apt about %1...").arg(m_collections[index].title);
+    update();
+    repaint();
+
+    bool answered = false;
+    const QString out = run(aptCache(), args, 60000, &answered);
 
     QString current;
     QString summary;
@@ -264,7 +321,6 @@ void PackagesPage::showCollection(int index)
                 Pkg pkg;
                 pkg.name = current;
                 pkg.summary = summary;
-                pkg.installed = isInstalled(current);
                 m_shown.append(pkg);
             }
             current = line.section(':', 1).trimmed();
@@ -278,7 +334,6 @@ void PackagesPage::showCollection(int index)
         Pkg pkg;
         pkg.name = current;
         pkg.summary = summary;
-        pkg.installed = isInstalled(current);
         m_shown.append(pkg);
     }
 
@@ -301,7 +356,9 @@ void PackagesPage::showCollection(int index)
                 ordered.append(unique[i]);
     m_shown = ordered;
 
-    if (m_shown.isEmpty())
+    if (!answered)
+        m_note = tr("apt did not answer in a minute -- it may still be rebuilding its cache");
+    else if (m_shown.isEmpty())
         m_note = tr("apt has no package lists yet -- run Update first");
     else
         m_note.clear();
@@ -322,9 +379,16 @@ void PackagesPage::showSearch(const QString &term)
     }
 
     /* --names-only, because a full-text search of every description in the archive
-     * on this CPU takes long enough to look like a hang. */
+     * on this CPU takes long enough to look like a hang.  Same caption and same
+     * budget as the collection query, and for the same reason: this is the other
+     * call that has to wait for apt's cache to be rebuilt after an Update. */
+    m_note = tr("searching for %1...").arg(term);
+    update();
+    repaint();
+
+    bool answered = false;
     const QString out = run(aptCache(), QStringList() << "search" << "--names-only" << term,
-                            20000);
+                            60000, &answered);
     for (const QString &line : out.split('\n')) {
         const int dash = line.indexOf(" - ");
         if (dash <= 0)
@@ -332,13 +396,14 @@ void PackagesPage::showSearch(const QString &term)
         Pkg pkg;
         pkg.name = line.left(dash).trimmed();
         pkg.summary = line.mid(dash + 3).trimmed();
-        pkg.installed = isInstalled(pkg.name);
         m_shown.append(pkg);
         if (m_shown.size() >= kMaxResults)
             break;
     }
 
-    if (m_shown.isEmpty())
+    if (!answered)
+        m_note = tr("apt did not answer in a minute -- it may still be rebuilding its cache");
+    else if (m_shown.isEmpty())
         m_note = tr("nothing matched %1").arg(term);
     else if (m_shown.size() >= kMaxResults)
         m_note = tr("first %1 matches -- narrow the search for the rest").arg(kMaxResults);
@@ -453,7 +518,8 @@ void PackagesPage::rebuild()
             r.id = RowPackage;
             r.value = i;
             r.key = m_shown[i].name;
-            if (m_shown[i].installed) {
+            /* Asked here and not remembered on the Pkg -- see packages.h. */
+            if (isInstalled(m_shown[i].name)) {
                 r.badge = tr("installed");
                 r.badgeColour = Theme::green();
                 r.accent = Theme::green();
@@ -524,6 +590,7 @@ void PackagesPage::onActivated(int index)
         if (row.value < 0 || row.value >= m_shown.size())
             return;
         const Pkg &pkg = m_shown[row.value];
+        const bool installed = isInstalled(pkg.name);
 
         /*
          * Two presses, and the toast says which way it will go.  Removing a package
@@ -532,14 +599,14 @@ void PackagesPage::onActivated(int index)
          */
         if (m_armed != pkg.name) {
             m_armed = pkg.name;
-            emit toastRequested(pkg.installed
+            emit toastRequested(installed
                                     ? tr("Press A again to remove %1").arg(pkg.name)
                                     : tr("Press A again to install %1").arg(pkg.name),
                                 5000);
             return;
         }
         m_armed.clear();
-        if (pkg.installed)
+        if (installed)
             remove(pkg.name);
         else
             install(pkg.name);

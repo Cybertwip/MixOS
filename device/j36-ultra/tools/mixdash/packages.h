@@ -77,10 +77,21 @@ private:
         RowInstalledList
     };
 
+    /*
+     * NO `installed' FIELD, AND THAT IS THE FIX FOR A REAL BUG.  There used to be
+     * one, filled in by isInstalled() at the moment the view was built, and it went
+     * stale the instant the Terminal finished the apt-get this page had just handed
+     * it.  m_installed is reloaded from dpkg on every onEnter(), so coming back from
+     * an install had the right answer in hand -- and drew the old one, because
+     * rebuild() copied this field into the badge instead of asking.  The list said
+     * "not installed" next to a package that had just been installed until the
+     * collection was left and opened again, which is exactly the two-taps-to-refresh
+     * the page was reported for.  One source of truth: m_installed, asked at the
+     * moment of drawing.
+     */
     struct Pkg {
         QString name;
         QString summary;
-        bool installed = false;
     };
 
     struct Collection {
@@ -92,7 +103,17 @@ private:
         QStringList packages;
     };
 
-    QString run(const QString &program, const QStringList &args, int timeoutMs = 8000) const;
+    /*
+     * `answered' is false when the fork never started or the budget ran out and the
+     * child was killed, and it exists because an empty string means two different
+     * things.  For a query, "apt said nothing" is a fact about the archive; "apt was
+     * shot before it could speak" is a fact about the wait, and the page used to
+     * report the second one as the first -- "apt has no package lists yet, run
+     * Update first" is a wrong sentence to print at somebody who has just run Update
+     * and is watching apt rebuild its cache.
+     */
+    QString run(const QString &program, const QStringList &args, int timeoutMs = 8000,
+                bool *answered = nullptr) const;
     void loadInstalled();
     bool isInstalled(const QString &name) const;
     QString summaryFor(const QString &name) const;
