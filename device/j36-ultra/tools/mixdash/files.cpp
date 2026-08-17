@@ -18,6 +18,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QResizeEvent>
+#include <QWheelEvent>
 
 #include "joypad.h"
 #include "theme.h"
@@ -87,6 +88,10 @@ FilesPage::FilesPage(QWidget *parent)
     Trace::step("FilesPage: QListView");
     m_view = new QListView(this);
     m_view->setModel(m_model);
+    m_view->setFocusPolicy(Qt::NoFocus);
+    m_view->setMouseTracking(true);
+    m_view->viewport()->setMouseTracking(true);
+    setMouseTracking(true);
     m_view->setFrameShape(QFrame::NoFrame);
     m_view->setUniformItemSizes(true);
     m_view->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -467,6 +472,36 @@ void FilesPage::applyFilter()
                                                   + QLatin1Char('*')));
 }
 
+int FilesPage::listRow() const
+{
+    const QModelIndex root = m_model->index(m_root);
+    const QModelIndex current = m_view->currentIndex();
+    if (current.isValid() && current.parent() == root)
+        return current.row();
+    return -1;
+}
+
+QModelIndex FilesPage::listIndex(int row) const
+{
+    return m_model->index(row, 0, m_model->index(m_root));
+}
+
+bool FilesPage::selectListAt(const QPoint &pagePos)
+{
+    if (!m_view || !listRect().contains(pagePos))
+        return false;
+    const QModelIndex idx = m_view->indexAt(m_view->mapFrom(this, pagePos));
+    if (!idx.isValid())
+        return false;
+    m_pinTop = false;
+    setPane(PaneList);
+    if (idx != m_view->currentIndex()) {
+        m_view->setCurrentIndex(idx);
+        m_view->scrollTo(idx);
+    }
+    return true;
+}
+
 void FilesPage::step(int delta)
 {
     const QModelIndex root = m_model->index(m_root);
@@ -474,11 +509,15 @@ void FilesPage::step(int delta)
     if (rows <= 0)
         return;
 
-    const QModelIndex current = m_view->currentIndex();
-    int row = current.isValid() ? current.row() + delta : 0;
-    row = qBound(0, row, rows - 1);
-    const QModelIndex next = m_model->index(row, 0, root);
-    /* The operator has taken the cursor over; nothing may move it back. */
+    /* Only a child of this directory is a listing row.  The view's current
+     * index is often the directory itself after setRootIndex, and that
+     * row number belongs to the parent folder. */
+    int row = listRow();
+    if (row < 0)
+        row = delta > 0 ? 0 : rows - 1;
+    else
+        row = qBound(0, row + delta, rows - 1);
+    const QModelIndex next = listIndex(row);
     m_pinTop = false;
     m_view->setCurrentIndex(next);
     m_view->scrollTo(next);
@@ -621,10 +660,9 @@ bool FilesPage::handleNav(int action)
     default:
         switch (action) {
         case Joypad::NavUp: {
-            const QModelIndex current = m_view->currentIndex();
             /* Off the top of the listing and onto the search box, which is where
              * the eye goes anyway: it is the thing directly above. */
-            if (current.isValid() && current.row() == 0)
+            if (listRow() <= 0)
                 setPane(PaneSearch);
             else
                 step(-1);
@@ -719,13 +757,56 @@ void FilesPage::mousePressEvent(QMouseEvent *event)
         event->accept();
         return;
     }
+    if (selectListAt(at.toPoint())) {
+        event->accept();
+        return;
+    }
+    event->accept();
+}
+
+void FilesPage::mouseMoveEvent(QMouseEvent *event)
+{
+    const QPointF at = event->pos();
+
+    if (placesRect().contains(at)) {
+        for (int i = 0; i < m_places.size(); ++i) {
+            if (placeRowRect(i).contains(at) && m_place != i) {
+                m_place = i;
+                setPane(PanePlaces);
+                update();
+                break;
+            }
+        }
+        event->accept();
+        return;
+    }
+    if (selectListAt(at.toPoint())) {
+        event->accept();
+        return;
+    }
     event->accept();
 }
 
 void FilesPage::mouseDoubleClickEvent(QMouseEvent *event)
 {
-    /* The list has its own double click -- see the constructor.  This one is for
-     * the places panel, where a double click should not be a second navigation. */
+    if (selectListAt(event->pos()) || listRect().contains(event->pos())) {
+        enter();
+        event->accept();
+        return;
+    }
+    event->accept();
+}
+
+void FilesPage::wheelEvent(QWheelEvent *event)
+{
+    const int delta = event->angleDelta().y() != 0 ? event->angleDelta().y()
+                                                   : event->angleDelta().x();
+    if (delta == 0) {
+        event->accept();
+        return;
+    }
+    setPane(PaneList);
+    step(delta > 0 ? -1 : 1);
     event->accept();
 }
 

@@ -130,7 +130,7 @@ static const OptionInfoRec *JLimaAvailableOptions(int chipid, int busid)
 	return JLimaOptions;
 }
 
-static const SymTabRec JLimaChips[] = {
+static SymTabRec JLimaChips[] = {
 	{ 0, "lima" },
 	{ -1, NULL }
 };
@@ -140,7 +140,8 @@ static void JLimaIdentify(int flags)
 	(void)flags;
 	/* A NULL chipset table is a read of chips->name at address 4
 	 * on this xserver -- that is the boot SIGSEGV that left
-	 * "The window service is not running". */
+	 * "The window service is not running".  The table is not const:
+	 * xf86PrintChipsets takes a SymTabPtr. */
 	xf86PrintChipsets(JLIMA_NAME,
 			  "lima EGL offload on simple-framebuffer",
 			  JLimaChips);
@@ -1052,18 +1053,11 @@ static Bool JLimaProbe(DriverPtr drv, int flags)
 }
 
 _X_EXPORT DriverRec J36LIMA = {
-	JLIMA_VERSION,
-	JLIMA_NAME,
-	JLimaIdentify,
-	JLimaProbe,
-	JLimaAvailableOptions,
-	NULL,
-	0,
-	NULL,
-	NULL,
-	NULL,
-	NULL,
-	NULL
+	.driverVersion = JLIMA_VERSION,
+	.driverName = JLIMA_NAME,
+	.Identify = JLimaIdentify,
+	.Probe = JLimaProbe,
+	.AvailableOptions = JLimaAvailableOptions,
 };
 
 static XF86ModuleVersionInfo JLimaVersRec = {

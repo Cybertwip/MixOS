@@ -789,6 +789,10 @@ MODULE_PARM_DESC(charging_line_every,
 #define J36_CHARGING_FULL_CURRENT_MA	150
 #define J36_V_CC2TOPOFF_MV		4050
 #define J36_RECHARGING_MV		4110
+/* Linear-charger CV rail.  The shunt includes system load, so the
+ * 150 mA termination never completes and a full pack sat at the 99%
+ * UI cap.  Sitting here with the integrator at 100% is full. */
+#define J36_CV_HOLD_MV			4200
 #define J36_FULL_CHECK_TIMES		6
 #define J36_SOC_SLEW_INTERVAL_US	30000000	/* one percent per 30 s */
 #define J36_LADDER_INTERVAL_US		1000000		/* the sub-3450 mV ramp */
@@ -2096,6 +2100,7 @@ static void j36_ladder_advance(struct j36_pmic *p, bool online, int bat_mv,
 			       int ma, bool ma_valid)
 {
 	bool saturated;
+	bool at_cv;
 
 	/*
 	 * ── AN UNPLUG ENDS THE CHARGE RUN.  IT DOES NOT EMPTY THE PACK ──
@@ -2206,10 +2211,13 @@ static void j36_ladder_advance(struct j36_pmic *p, bool online, int bat_mv,
 	 * whatever the pack holds; top-off is then "seen" off that same rail.  MVII
 	 * parks for a few seconds and never meets that case.  This runs for days.
 	 */
-	saturated = p->soc_car_base > 0 && p->soc_dep == 0;
+	saturated = (p->soc_car_base > 0 && p->soc_dep == 0)
+		 || (p->soc_dep == 0 && bat_mv >= J36_CV_HOLD_MV);
+	at_cv = (bat_mv >= J36_CV_HOLD_MV);
 
-	/* An unknown current is not a small current. */
-	if (!saturated && !ma_valid) {
+	/* An unknown current is not a small current — unless the node is
+	 * already on the CV rail, where the shunt is the board, not the cell. */
+	if (!saturated && !at_cv && !ma_valid) {
 		p->full_count = 0;
 		return;
 	}
@@ -2231,7 +2239,7 @@ static void j36_ladder_advance(struct j36_pmic *p, bool online, int bat_mv,
 	 * carry the system and the pack is being drained.  Both are the same
 	 * question about magnitude, so one threshold answers both ends of it.
 	 */
-	if (!saturated &&
+	if (!saturated && !at_cv &&
 	    (ma > J36_CHARGING_FULL_CURRENT_MA ||
 	     ma < -J36_CHARGING_FULL_CURRENT_MA)) {
 		p->full_count = 0;
@@ -2520,7 +2528,8 @@ static int j36_gauge_percent(struct j36_pmic *p, bool online, int bat_mv,
 	 * current is the one reading an operator will call a lie; it is a holding
 	 * position now rather than a destination, because the ladder above can
 	 * always get out of it. */
-	if (online && !p->charge_full && pct >= 100)
+	if (online && !p->charge_full && pct >= 100 &&
+	    bat_mv < J36_CV_HOLD_MV)
 		pct = 99;
 	return pct;
 }

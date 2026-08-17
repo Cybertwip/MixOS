@@ -87,7 +87,9 @@ protected:
     void paintEvent(QPaintEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
+    void wheelEvent(QWheelEvent *event) override;
     void textEntered(const QString &text, bool accepted) override;
 
 private:
@@ -120,6 +122,14 @@ private:
     };
 
     void setRoot(const QString &path);
+    /* Row of the current listing, or -1 when the view's current index is
+     * not a child of this directory (the root index itself, a leftover
+     * from the previous folder).  step() used current.row() blindly and
+     * walked the parent's siblings. */
+    int listRow() const;
+    QModelIndex listIndex(int row) const;
+    /* Highlight the listing row under a FilesPage-local point. */
+    bool selectListAt(const QPoint &pagePos);
     void step(int delta);
     void enter();
     /* False when there is nowhere further up -- the top of the scope, or of the
