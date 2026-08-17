@@ -9023,8 +9023,11 @@ QTCONF
 #
 # So the panel is shared the plain way: mixdash stops painting, the
 # child writes /dev/fb0, and when the child exits the dashboard repaints over it.
-# No DRM, no modeset, no GBM, no EGL, no lima.  The other half of the old note --
-# that netsurf-fb and links2 are both built without a framebuffer surface -- was
+# Presentation is still simplefb -- lima has no display controller, and a
+# modeset is how the glass goes black.  GPU offload is the j36lima DDX:
+# DRI3 on the lima render node, finished buffers copied into the same
+# shadow fbdev already used.  The other half of the old note -- that
+# netsurf-fb and links2 are both built without a framebuffer surface -- was
 # correct and has since been proved from the binaries themselves; it is why the
 # answer is an X server and not a smaller trick.
 #
@@ -9049,9 +9052,12 @@ QTCONF
 PADX_SRC="$ROOT/device/j36-ultra/tools/j36-padx.c"
 PADX_LAYOUT="$ROOT/device/j36-ultra/tools/mixdash/keyboardlayout.h"
 XFB_SRC="$ROOT/device/j36-ultra/tools/j36-xfb.c"
+XLIMA_SRC="$ROOT/device/j36-ultra/tools/j36-xlima.c"
 PADX_BIN=""
 XFB_LIB=""
+XLIMA_DRV=""
 PADX_BUILD_DEPS=(build-essential libx11-dev libxtst-dev libxfixes-dev)
+XLIMA_BUILD_DEPS=(xserver-xorg-dev libdrm-dev)
 
 build_padx() {
     local src="$ARMHF_CHROOT/home/build/padx" out="$CACHE/j36-padx"
@@ -9125,6 +9131,55 @@ build_padx() {
     return 0
 }
 
+# ── j36lima: Xorg DDX that is fbdev's presentation plus lima's render node ──
+#
+# xf86-video-fbdev cannot give a GL client the Mali-450.  modesetting on
+# card0 cannot either: card0 is lima and lima has no CRTC, and asking
+# mediatek-drm for GETRESOURCES takes the panel off simplefb.  This driver
+# is the eglprobe -o arrangement as an Xorg module -- GPU renders, simplefb
+# scans out, j36-xfb still intercepts the mmap.
+build_xlima() {
+    local src="$ARMHF_CHROOT/home/build/xlima" out="$CACHE/j36lima_drv.so"
+    local header cflags dri3=""
+
+    [[ -f "$XLIMA_SRC" ]] || { log "xlima: $XLIMA_SRC is missing"; return 1; }
+    ensure_armhf_chroot || return 1
+    chroot_install_deps xlima "${XLIMA_BUILD_DEPS[@]}" || return 1
+
+    sudo rm -rf "$src"
+    sudo mkdir -p "$src"
+    sudo cp "$XLIMA_SRC" "$src/j36-xlima.c" || return 1
+
+    # dri3.h is part of xserver-xorg-dev on trixie.  Without it the driver
+    # still starts as ShadowFB; GL clients then stay on software.
+    if sudo test -f "$ARMHF_CHROOT/usr/include/xorg/dri3.h"; then
+        dri3="-DHAVE_DRI3"
+    fi
+
+    log "xlima: building the lima EGL Xorg driver for armhf (emulated)"
+    armhf_chroot_run "cd /home/build/xlima && \
+        cflags=\$(pkg-config --cflags xorg-server libdrm) && \
+        gcc -O2 -std=gnu11 -Wall -Wextra -fPIC -shared $dri3 \
+            \$cflags -o j36lima_drv.so j36-xlima.c && \
+        strip j36lima_drv.so" || return 1
+    [[ -f "$src/j36lima_drv.so" ]] || {
+        log "xlima: the compile left no driver"
+        return 1
+    }
+
+    mkdir -p "$CACHE"
+    sudo cp "$src/j36lima_drv.so" "$out" || return 1
+    sudo chown "$(id -u):$(id -g)" "$out"
+    chmod 0755 "$out"
+
+    header="$(readelf -hd "$out" 2>/dev/null)" || return 1
+    grep -q 'Class:.*ELF32' <<<"$header" || { log "xlima: not a 32-bit ELF"; return 1; }
+    grep -q 'Machine:.*ARM' <<<"$header" || { log "xlima: not an ARM ELF"; return 1; }
+    XLIMA_DRV="$out"
+    log "xlima: j36lima_drv.so is $(stat -c %s "$out") bytes"
+    return 0
+}
+
 # J36_GL is Mesa and the probe, and it is worth keeping even now that the dashboard
 # needs no GL: eglprobe is still the only thing here that says whether a frame reaches
 # the glass, and anything launched from the dashboard that does want GL resolves it
@@ -9182,6 +9237,10 @@ if [[ "${J36_DASH:-1}" == 1 ]]; then
     # mixdash fix does not also have to rebuild this.
     build_padx
     padx_rc=$?
+    # Same chroot: the lima Xorg driver needs xserver-xorg-dev.  Its own
+    # rc, so a header mismatch must not take the pad bridge with it.
+    build_xlima
+    xlima_rc=$?
     # Debian libSDL2 (X11) and libasound.  Needs the chroot still mounted;
     # the payload copies them to /opt/mixos/lib so Doom and aplay do not
     # use the handheld overlays.
@@ -9194,6 +9253,11 @@ if [[ "${J36_DASH:-1}" == 1 ]]; then
         log "padx: the pad-to-X bridge was not built, see the error above -- the Browser"
         log "    card falls back to links2 in the terminal, which needs neither X nor a"
         log "    pointer.  Nothing else in the image depends on it."
+    fi
+    if (( xlima_rc != 0 )); then
+        XLIMA_DRV=""
+        log "xlima: the lima Xorg driver was not built, see the error above --"
+        log "    the session keeps xf86-video-fbdev and software drawing."
     fi
     if (( dash_rc != 0 )); then
         MIXDASH_BIN=""
@@ -11897,6 +11961,13 @@ if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
         log "dash: staged j36-padx and the private-X framebuffer presenter"
     fi
 
+    if [[ -n "$XLIMA_DRV" && -f "$XLIMA_DRV" ]]; then
+        mkdir -p "$SDROOT/opt/mixos/lib/xorg/modules/drivers"
+        cp "$XLIMA_DRV" "$SDROOT/opt/mixos/lib/xorg/modules/drivers/j36lima_drv.so"
+        chmod 0755 "$SDROOT/opt/mixos/lib/xorg/modules/drivers/j36lima_drv.so"
+        log "dash: staged the lima EGL Xorg driver"
+    fi
+
     # Debian SDL2 (X11) and libasound, for session clients and aplay.  See
     # collect_session_libs and the LD_LIBRARY_PATH in j36-xsession-main.
     if [[ -n "$SESSION_LIB_DIR" ]]; then
@@ -11960,9 +12031,47 @@ if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
             "$SDROOT/opt/mixos/share/xorg/background.mixspl"
         log "dash: staged the X loading background into opt/mixos/share/xorg/"
     fi
+    if [[ -n "$XLIMA_DRV" && -f "$XLIMA_DRV" ]]; then
+    cat > "$SDROOT/opt/mixos/share/xorg/xorg.conf" <<'XORGCONF'
+# Written by device/j36-ultra/build-in-vm.sh for the J36 Ultra.
+# j36lima is fbdev's presentation (simplefb + ShadowFB + j36-xfb) plus
+# EGL 2.0 on card0:lima so GL clients render on the Mali-450.  It never
+# takes DRM master and never modesets.
+
+Section "Files"
+    ModulePath "/opt/mixos/lib/xorg/modules"
+    ModulePath "/usr/lib/xorg/modules"
+EndSection
+
+Section "ServerFlags"
+    Option "AutoAddGPU"   "false"
+    Option "AutoBindGPU"  "false"
+    Option "DontVTSwitch" "true"
+    Option "DontZap"      "true"
+    Option "BlankTime"    "0"
+    Option "StandbyTime"  "0"
+    Option "SuspendTime"  "0"
+    Option "OffTime"      "0"
+EndSection
+
+Section "Module"
+    Load "dri3"
+    Load "glx"
+EndSection
+
+Section "Device"
+    Identifier "j36-lima"
+    Driver     "j36lima"
+    Option     "fbdev"    "/dev/fb0"
+    Option     "ShadowFB" "true"
+    Option     "DRI"      "true"
+    Option     "DRINode"  "/dev/dri/card0"
+EndSection
+XORGCONF
+    else
     cat > "$SDROOT/opt/mixos/share/xorg/xorg.conf" <<'XORGCONF'
 # Written by device/j36-ultra/build-in-vm.sh for the J36 Ultra's simple-framebuffer.
-# See the graphical session section in that file for why each option is here.
+# The lima DDX was not built; this is the software fbdev session.
 
 Section "ServerFlags"
     Option "AutoAddGPU"   "false"
@@ -11985,6 +12094,14 @@ Section "Device"
     Option     "fbdev"    "/dev/fb0"
     Option     "ShadowFB" "true"
 EndSection
+XORGCONF
+    fi
+    if [[ -n "$XLIMA_DRV" && -f "$XLIMA_DRV" ]]; then
+        xorg_device=j36-lima
+    else
+        xorg_device=j36-simplefb
+    fi
+    cat >> "$SDROOT/opt/mixos/share/xorg/xorg.conf" <<XORGTAIL
 
 # The bridge is the sole owner of the built-in controls while X is visible.  Keep
 # ordinary USB keyboards and mice on libinput, but do not also translate this pad
@@ -12002,7 +12119,7 @@ EndSection
 
 Section "Screen"
     Identifier   "j36-screen"
-    Device       "j36-simplefb"
+    Device       "$xorg_device"
     Monitor      "j36-panel"
     DefaultDepth 24
 EndSection
@@ -12011,7 +12128,7 @@ Section "ServerLayout"
     Identifier "j36-layout"
     Screen 0   "j36-screen"
 EndSection
-XORGCONF
+XORGTAIL
 
     # ── The on-screen keyboard's layout ──────────────────────────────────────
     #
@@ -12342,6 +12459,17 @@ fi
 # file belong to root; the browser must not run as root in virtua's HOME.
 export J36_REAL_XORG="$XORG"
 export J36_XFB_SHADOW=/run/j36/xframebuffer
+# Mesa, not the RK3326 Mali blob, and lima, not a modesetting probe.
+# Xorg loads j36lima_drv.so which DRI3-opens the lima node; clients
+# inherit this path so eglInitialize talks to the same libraries
+# eglprobe -o already proved.
+if [ -d /run/j36/gl ]; then
+    export LD_LIBRARY_PATH="/run/j36/gl${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+export MESA_LOADER_DRIVER_OVERRIDE=lima
+export GALLIUM_DRIVER=lima
+export MESA_GLES_VERSION_OVERRIDE=2.0
+export LIBGL_DRIVERS_PATH=/usr/lib/arm-linux-gnueabihf/dri
 exec /usr/bin/xinit "$MAIN" "$FIRST" -- \
     "$XWRAP" :0 vt1 \
     -config "$XCONF" \
@@ -12426,12 +12554,10 @@ export GDK_BACKEND=x11
 export MOZ_CRASHREPORTER_DISABLE=1
 export MOZ_CRASHREPORTER_NO_REPORT=1
 # WebRender's compositor process died on this board with
-# "CompositorBridgeChild receives IPC close" a few seconds after Firefox
-# mapped a window.  Force the old in-process Basic compositor; the
-# matching user.js prefs are rewritten on every j36-browser start.
+# "CompositorBridgeChild receives IPC close".  Keep WR off and e10s
+# off; GLES2 goes through EGL on card0:lima instead.
 export MOZ_WEBRENDER=0
-export MOZ_ACCELERATED=0
-export MOZ_X11_EGL=0
+export MOZ_X11_EGL=1
 # Official ESR sometimes ignores the remote-tabs prefs; this is the
 # remaining door into a single process, which is what stops the
 # compositor child dying and taking the window with it.
@@ -12462,9 +12588,27 @@ export QT_QPA_PLATFORM=xcb
 # exactly the "Doom has sound but no picture" failure.  X11 keeps it in this
 # session, under matchbox and under the dashboard's foreground hand-off.
 export SDL_VIDEODRIVER=x11
-export SDL_RENDER_DRIVER=software
 export SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR=0
-export LIBGL_ALWAYS_SOFTWARE=1
+# Acceleration is EGL 2.0 on card0:lima.  SDL still needs the x11 VIDEO
+# driver to be a window; a client that asks for GL/GLES hits Mesa lima
+# through DRI3.  Doom's default renderer stays software -- it is a
+# software rasteriser -- but LIBGL_ALWAYS_SOFTWARE is off so GLES2
+# clients are not forced onto llvmpipe.
+if [ -r /opt/mixos/lib/xorg/modules/drivers/j36lima_drv.so ]; then
+    unset LIBGL_ALWAYS_SOFTWARE
+    export SDL_RENDER_DRIVER=software
+    export SDL_VIDEO_GL_DRIVER=libGLESv2.so.2
+    export SDL_VIDEO_EGL_DRIVER=libEGL.so.1
+else
+    export SDL_RENDER_DRIVER=software
+    export LIBGL_ALWAYS_SOFTWARE=1
+fi
+if [ -d /run/j36/gl ]; then
+    export LD_LIBRARY_PATH="/run/j36/gl${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+export MESA_LOADER_DRIVER_OVERRIDE=lima
+export GALLIUM_DRIVER=lima
+export MESA_GLES_VERSION_OVERRIDE=2.0
 # MixOS overwrites Debian's libSDL2 with an rk3326 build that has kmsdrm
 # and no x11 backend.  dsda-doom then prints "Could not initialize SDL
 # [x11 not available]" and exits.  The X11 copy lives under /opt/mixos/lib.
@@ -13203,8 +13347,7 @@ export QT_QPA_PLATFORM=xcb
 export MOZ_CRASHREPORTER_DISABLE=1
 export MOZ_CRASHREPORTER_NO_REPORT=1
 export MOZ_WEBRENDER=0
-export MOZ_ACCELERATED=0
-export MOZ_X11_EGL=0
+export MOZ_X11_EGL=1
 export MOZ_FORCE_DISABLE_E10S=1
 export MOZ_DISABLE_CONTENT_SANDBOX=1
 export MOZ_DISABLE_GMP_SANDBOX=1
@@ -13337,9 +13480,9 @@ user_pref("layers.gpu-process.enabled", false);
 user_pref("gfx.webrender.force-disabled", true);
 user_pref("gfx.webrender.software", false);
 user_pref("gfx.webrender.software.opengl", false);
-user_pref("gfx.x11-egl.force-disabled", true);
+user_pref("gfx.x11-egl.force-enabled", true);
 user_pref("gfx.canvas.accelerated", false);
-user_pref("webgl.disabled", true);
+user_pref("webgl.disabled", false);
 user_pref("layers.acceleration.disabled", true);
 user_pref("media.hardware-video-decoding.enabled", false);
 user_pref("accessibility.force_disabled", 1);
