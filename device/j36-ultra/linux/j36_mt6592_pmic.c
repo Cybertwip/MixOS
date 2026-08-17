@@ -312,13 +312,16 @@ MODULE_PARM_DESC(chgreboot,
  * This is the interval of a periodic line ON TOP of that, in polls, and it is
  * off by default: it exists for the case where the question is "is the poll
  * still running at all", which no change-driven line can answer.  20 restores
- * the old behaviour exactly.
+ * the old every-twenty-polls behaviour.  Analogue wobble (pack mA, VCHR, VBAT
+ * millivolts) is not a reason to print: a charge sitting at 100% still swings
+ * a couple of hundred milliamps every poll, and treating that as a change
+ * put the heartbeat back in all but name.
  */
 static unsigned int charging_line_every;
 module_param(charging_line_every, uint, 0644);
 MODULE_PARM_DESC(charging_line_every,
 		 "print the charging line every N polls whether or not anything "
-		 "changed (default 0: on change only; 20 is the old behaviour)");
+		 "changed (default 0: cable/percent only; 20 is the old behaviour)");
 
 /* ── PWRAP (the PMIC wrapper), WACS2 ─────────────────────────────────────────
  *
@@ -2619,36 +2622,9 @@ static int j36_charger_online(struct j36_pmic *p, u32 *flags)
 }
 
 /*
- * How far each of the three analogue readings has to move before it is worth a
- * line of its own.
- *
- * VBAT is the tightest because it is the number the whole gauge rests on and
- * because it is the one that moves SLOWLY: 30 mV is about twenty minutes of
- * charging, so a charge run still writes its climb into the log a couple of
- * dozen lines at a time, which is exactly the record this line was added for.
- * VCHR and the pack current are looser because both are noisy by construction
- * -- VCHR sits on a divider and the pack figure is a difference of two ADC
- * channels -- and a threshold under their noise floor is a threshold that
- * prints every poll, which is the whole disease.
- */
-#define J36_CHARGING_LINE_VBAT_MV	30
-#define J36_CHARGING_LINE_VCHR_MV	100
-#define J36_CHARGING_LINE_MA		100
-
-/* Two readings of the same quantity, where -1 means "no sample": far enough
- * apart to print, or either one missing and the other not, which is a change of
- * a different kind and always worth saying. */
-static bool j36_moved(int now, int was, int by)
-{
-	if (now < 0 || was < 0)
-		return now != was;
-	return abs(now - was) >= by;
-}
-
-/*
  * ══ IS IT CHARGING? ══
  *
- * Three numbers on one line, printed when one of them has something new to say,
+ * Three numbers on one line, printed when the CABLE or the PERCENT changes,
  * and the reason it is three:
  *
  *   CS_DET is not the answer.  It is an instantaneous comparator on a current
@@ -2659,11 +2635,14 @@ static bool j36_moved(int now, int was, int by)
  *   pack mA is the shunt pair -- ISENSE minus BATSNS over R_SENSE -- and a fixed
  *     offset between the two channels would read as a constant phantom current
  *     that looks exactly like a charge.  A positive number here is not by itself
- *     proof of anything.
+ *     proof of anything.  It also swings a couple of hundred milliamps every
+ *     poll on a board that is actually charging, so it is not a print trigger.
  *
  *   VBAT is the one that cannot be faked.  A cell that is taking charge climbs.
- *     If this number rises over a couple of minutes the board is charging
- *     whatever the other two say, and if it falls it is not.
+ *     The percent derived from it is the print trigger; the millivolt reading
+ *     is reported on that line, not as a reason to write another one.  30 mV
+ *     of ripple around a full cell was enough to reprint every second and
+ *     refill the journal with a meter.
  *
  * Printed on BOTH paths, cable in and cable out -- which here is one call site
  * taking `online` as an argument rather than MVII's two, because this poll has a
@@ -2673,21 +2652,17 @@ static bool j36_moved(int now, int was, int by)
  * line only printed with a cable in, which is exactly the half of the experiment
  * that cannot distinguish the two.
  *
- * dev_info and not dev_dbg: this is the line someone reads back off a serial
- * console or out of dmesg on a board that will not charge, and a diagnostic that
- * needs a rebuild to turn on is a diagnostic nobody has when they need it.  What
- * makes that affordable is that it is printed on CHANGE -- see
- * charging_line_every -- so an idle board with a full cell says it once and then
- * stops, and the ring buffer belongs to whatever goes wrong next.
+ * Analog wobble is not a change.  A board sitting on the charger at 100% is
+ * silent after the first line.  charging_line_every is the opt-in heartbeat
+ * for "is the poll still running".
  *
  * CS_DET IS NOT ONE OF THE THINGS THAT COUNTS AS A CHANGE, and it is the reason
  * it is read below the gate rather than above it.  It is an instantaneous
  * comparator on a modulated current source -- the paragraph above says it read 0
  * and 1 alternately on a board drawing a steady half-amp -- so a driver that
- * printed whenever it moved would print every poll and this change would have
- * bought nothing.  It is reported when something else has already decided the
- * line is worth printing, which also means the pwrap read it costs is paid only
- * then.
+ * printed whenever it moved would print every poll.  It is reported when
+ * something else has already decided the line is worth printing, which also
+ * means the pwrap read it costs is paid only then.
  */
 static void j36_charging_line(struct j36_pmic *p, int online, int chrdet,
 			      bool sourcing, int vchr_mv, int ma, bool ma_valid,
@@ -2713,11 +2688,7 @@ static void j36_charging_line(struct j36_pmic *p, int online, int chrdet,
 	    online == p->chg_line_online &&
 	    chrdet == p->chg_line_chrdet &&
 	    (int)sourcing == p->chg_line_src &&
-	    level_now == p->chg_line_level &&
-	    ma_valid == p->chg_line_ma_valid &&
-	    (!ma_valid || abs(ma - p->chg_line_ma) < J36_CHARGING_LINE_MA) &&
-	    !j36_moved(vchr_now, p->chg_line_vchr, J36_CHARGING_LINE_VCHR_MV) &&
-	    !j36_moved(bat_now, p->chg_line_vbat, J36_CHARGING_LINE_VBAT_MV))
+	    level_now == p->chg_line_level)
 		return;
 
 	p->chg_line_seen = true;

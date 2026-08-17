@@ -127,6 +127,15 @@ LABEL=ROOTFS / ${ROOT_FILESYSTEM_FORMAT} ${ROOT_FILESYSTEM_MOUNT_OPTIONS} 0 0
 LABEL=BOOT /boot vfat defaults 0 2
 EOF
 
+# A bootstrap that predates the two-partition layout still has LABEL=DATA
+# in MixOSBuild/etc/fstab.  systemd then waits 90 seconds for a volume that
+# is not on the card, and every WorkingDirectory=/home/virtua unit -- audio
+# included -- fails as a dependency.  The spare copy on BOOT is already
+# right; keep the live one in step.
+if sudo grep -q '^[[:space:]]*LABEL=DATA[[:space:]]' MixOSBuild/etc/fstab 2>/dev/null; then
+  sudo sed -i '/^[[:space:]]*LABEL=DATA[[:space:]]/d' MixOSBuild/etc/fstab
+fi
+
 # Disable getty on tty0 and tty1
 sudo chroot MixOSBuild/ bash -c "systemctl disable getty@tty0.service getty@tty1.service"
 

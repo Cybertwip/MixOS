@@ -92,6 +92,15 @@ void take();
 bool hold();
 
 /*
+ * The dashboard is giving the panel to mixshutdown and will not take it back.
+ * hold() becomes a no-op so the one-second console guard cannot paint a curtain
+ * over the splash, and text() will not flip the VT to KD_TEXT on the way out --
+ * that would flash the journal over a picture that is supposed to stay up until
+ * the rail drops.  Async-signal-safe: one store.
+ */
+void handoff();
+
+/*
  * KD_TEXT, and the stream back on the console with it.  Every failure path calls
  * this BEFORE it writes a word, because a console in KD_GRAPHICS is a console fbcon
  * is not drawing and a report written to a log file on a tmpfs is a report nobody

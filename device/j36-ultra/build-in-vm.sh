@@ -4779,9 +4779,16 @@ mount_card() {
 # A mix-only update can land on a card whose ROOTFS predates the two-partition
 # layout.  Its /etc/fstab still asks systemd for LABEL=DATA at /home/virtua even
 # though p3 no longer exists; the device log showed the resulting 90-second device
-# timeout holding every WorkingDirectory=/home/virtua service, including audio and
-# the dashboard.  Do not edit the shared rootfs.  Mask only that generated mount in
-# /run, and only when the fstab asks for DATA and this SD card has no p3 at all.
+# timeout holding every WorkingDirectory=/home/virtua service, including audio
+# (j36-asound, audiopath) -- which is why aplay never got a libasound that
+# exports snd_pcm_subformat_value and the startup chime was silent.
+#
+# Do not edit the shared rootfs.  Mask the generated mount AND the fsck job
+# that also waits on DATA.device.  p3 existing is not enough to keep the
+# units: a leftover partition with some other label still leaves systemd
+# waiting 90 seconds for LABEL=DATA.  Only an actual /dev/disk/by-label/DATA
+# (or a p3 we cannot see yet because this initramfs has no udev) is a reason
+# to leave the fstab line alone, and even then the J36 home is on ROOTFS.
 mask_missing_legacy_home() {
     [ -r /newroot/etc/fstab ] || return 0
     legacy_mp=""
@@ -4790,18 +4797,30 @@ mask_missing_legacy_home() {
             LABEL=DATA) legacy_mp="$fs_mp"; break ;;
         esac
     done < /newroot/etc/fstab
-    [ "$legacy_mp" = /home/virtua ] || return 0
+    [ -n "$legacy_mp" ] || return 0
 
-    case "$rootdev" in
-        /dev/mmcblk*p*) data_dev="${rootdev%p*}p3" ;;
-        *) return 0 ;;
-    esac
-    [ -b "$data_dev" ] && return 0
+    # A real DATA volume on this card: leave systemd to mount it.  The
+    # by-label node is the only honest test -- p3 existing with another
+    # label is how the 90-second wait survived the first version of this.
+    [ -e /newroot/dev/disk/by-label/DATA ] && return 0
+    [ -e /dev/disk/by-label/DATA ] && return 0
 
-    mkdir -p /newroot/run/systemd/system
-    if ln -sfn /dev/null /newroot/run/systemd/system/home-virtua.mount; then
-        say "storage: masked stale LABEL=DATA home mount; /home/virtua is on ROOTFS"
-    fi
+    mkdir -p /newroot/run/systemd/system \
+             /newroot/run/systemd/system/audiopath.service.d \
+             /newroot/run/systemd/system/wifi_importer.service.d
+    ln -sfn /dev/null /newroot/run/systemd/system/home-virtua.mount
+    ln -sfn /dev/null \
+        "/newroot/run/systemd/system/systemd-fsck@dev-disk-by\\x2dlabel-DATA.service"
+    # WorkingDirectory=/home/virtua on the shared-rootfs RK3326 units is
+    # RequiresMountsFor=/home/virtua, which re-pulls the masked mount and
+    # fails the unit as a dependency of DATA.device.  Point them at / so
+    # they fail on their own missing RK3326 controls instead of blocking
+    # audio setup for 90 seconds.
+    printf '%s\n' '[Service]' 'WorkingDirectory=/' \
+        > /newroot/run/systemd/system/audiopath.service.d/zz-j36.conf
+    printf '%s\n' '[Service]' 'WorkingDirectory=/' \
+        > /newroot/run/systemd/system/wifi_importer.service.d/zz-j36.conf
+    say "storage: masked stale LABEL=DATA home mount; /home/virtua is on ROOTFS"
 }
 
 setup_dash() {
@@ -5139,11 +5158,21 @@ WAITSPLASH
 
         cat > /newroot/run/systemd/system/j36-mixshutdown.service <<UNITMIXSHUTDOWN
 # Written by the J36 Ultra initramfs, into a tmpfs.
+#
+# mixdash starts this unit BEFORE it asks PID 1 to power off, so it cannot
+# be After=shutdown.target -- that would deadlock the start on the isolate
+# it has not yet requested.  It also cannot be Before=shutdown.target: an
+# already-active Type=simple unit ordered before that target has to stop
+# before the isolate can begin, and this process is the picture -- it is
+# not supposed to stop.  That pairing was the hang: the splash sat on
+# "Saving data and stopping services" until the board was power-cycled.
+#
+# IgnoreOnIsolate plus KillMode=none is Plymouth's answer for the same
+# job.  The renderer outlives the isolate and paints until the rail drops.
 [Unit]
 Description=MixOS animated shutdown screen
 DefaultDependencies=no
-After=local-fs.target
-Before=shutdown.target umount.target final.target
+IgnoreOnIsolate=yes
 
 [Service]
 Type=simple
@@ -5153,6 +5182,8 @@ ExecStartPre=-/bin/rm -f /run/j36/mixshutdown.ready
 ExecStart=$mixos_root/bin/mixshutdown -i $mixos_root/share/mixsplash/background.mixspl -f /run/j36/mixshutdown.ctl -s "Powering off" -r /run/j36/mixshutdown.ready -t 0 -T 0 -k
 ExecStartPost=/run/j36/bin/j36-wait-splash /run/j36/mixshutdown.ready
 Restart=no
+KillMode=none
+SendSIGKILL=no
 TimeoutStartSec=5
 TimeoutStopSec=1
 OOMScoreAdjust=-900
@@ -6126,19 +6157,32 @@ ASOUNDRC
 #!/bin/sh
 # j36-asound -- put this board's default PCM in front of the card's own.
 #
-# Written by the J36 Ultra initramfs into /run and started once by
-# j36-asound.service, after local-fs.target.  The ordering is kept for the cards
-# written before this layout, where /home/virtua was a separate partition carrying
-# the file being covered: binding before it was mounted would have covered the wrong
-# file and the mount would have hidden the work.  On a current card /home/virtua is a
-# directory on the root filesystem and the ordering is simply free.
+# Written by the J36 Ultra initramfs into /run.  /init runs it once against
+# /newroot before switch_root so aplay works from the dashboard's first
+# paint; j36-asound.service runs it again as a no-op if the binds already
+# landed, or as the original repair if /init could not.
+#
+# J36_ASOUND_ROOT prefixes every path when this is invoked from the
+# initramfs (set to /newroot).  The systemd unit leaves it unset.
 #
 # Nothing here is a write.  Every path is bind-mounted over, so the card keeps
 # whatever it had and a reboot into anything else sees it.
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
+root="${J36_ASOUND_ROOT:-}"
 
-src=/run/j36/asound.conf
+# The initramfs busybox has no readlink applet.  Follow one symlink by
+# hand so /init can apply the binds before switch_root; on the rootfs
+# readlink -f is there and is used.
+resolve() {
+	if command -v readlink >/dev/null 2>&1; then
+		readlink -f "$1" 2>/dev/null
+		return
+	fi
+	printf '%s\n' "$1"
+}
+
+src="$root/run/j36/asound.conf"
 [ -f "$src" ] || { echo "j36-asound: $src is missing"; exit 0; }
 
 done_targets=""
@@ -6146,7 +6190,7 @@ bound=0
 for p in /etc/asound.conf /home/virtua/.asoundrc /root/.asoundrc; do
 	# -f after the resolve, so a dangling symlink is skipped rather than being
 	# a mount target that does not exist.
-	t=$(readlink -f "$p" 2>/dev/null) || continue
+	t=$(resolve "$root$p") || continue
 	[ -n "$t" ] && [ -f "$t" ] || continue
 	case " $done_targets " in *" $t "*) continue ;; esac
 	done_targets="$done_targets $t"
@@ -6192,14 +6236,18 @@ fi
 # years ago.  The first complete library found wins and is bound over every
 # incomplete one, so the frozen copy stops being what the loader picks.
 good=""
-for d in /usr/lib/arm-linux-gnueabihf /lib/arm-linux-gnueabihf \
+# /opt/mixos/lib first: that is the Debian copy the payload staged, and it
+# is the only one this board can promise has snd_pcm_subformat_value.  The
+# card's own trees come after, in apt's order, so a newer package still
+# wins over a frozen /usr/local overlay.
+for d in /opt/mixos/lib /usr/lib/arm-linux-gnueabihf /lib/arm-linux-gnueabihf \
          /usr/lib /lib /usr/local/lib/arm-linux-gnueabihf /usr/local/lib \
          /opt/lib /opt/system/lib; do
-	[ -d "$d" ] || continue
-	for f in "$d"/libasound.so.2 "$d"/libasound.so.2.*; do
+	[ -d "$root$d" ] || continue
+	for f in "$root$d"/libasound.so.2 "$root$d"/libasound.so.2.*; do
 		[ -f "$f" ] || continue
 		grep -q snd_pcm_subformat_value "$f" 2>/dev/null || continue
-		good=$(readlink -f "$f" 2>/dev/null)
+		good=$(resolve "$f")
 		[ -n "$good" ] && break
 		good=""
 	done
@@ -6220,10 +6268,10 @@ covered=0
 for d in /usr/lib/arm-linux-gnueabihf /lib/arm-linux-gnueabihf \
          /usr/lib /lib /usr/local/lib/arm-linux-gnueabihf /usr/local/lib \
          /opt/lib /opt/system/lib; do
-	[ -d "$d" ] || continue
-	for f in "$d"/libasound.so.2 "$d"/libasound.so.2.*; do
+	[ -d "$root$d" ] || continue
+	for f in "$root$d"/libasound.so.2 "$root$d"/libasound.so.2.*; do
 		[ -f "$f" ] || continue
-		t=$(readlink -f "$f" 2>/dev/null) || continue
+		t=$(resolve "$f") || continue
 		[ -n "$t" ] || continue
 		case " $seen_libs " in *" $t "*) continue ;; esac
 		seen_libs="$seen_libs $t"
@@ -6244,42 +6292,23 @@ exit 0
 ASOUNDSH
     chmod 0755 /newroot/run/j36/bin/j36-asound
 
-    # THE THREE ORDERING LINES ARE ONE DECISION EACH.
+    # THE UNIT IS A BACKSTOP.  /init runs the same script against /newroot
+    # immediately below, so the binds exist before systemd even starts.  The
+    # unit repeats the work in case a later mount covered them, and it must
+    # not wait for local-fs.target: that target waits on a stale LABEL=DATA
+    # fstab line for 90 seconds, which is how this unit used to fail as a
+    # dependency and leave aplay on a libasound that cannot satisfy it.
     #
-    # After=local-fs.target, for the cards written before this layout, where the file
-    # being covered was on a separate home partition.  Bind before that partition was
-    # mounted and two things went wrong at once: readlink -f resolved /etc/asound.conf
-    # into the empty /home/virtua on the rootfs and found nothing to cover, and then
-    # the real mount arrived and brought the RG351MP's file back uncovered.
-    # There is deliberately no RequiresMountsFor=/home/virtua.  On a mix-only
-    # upgrade from the old three-partition layout, a stale LABEL=DATA fstab entry
-    # can point at a partition which no longer exists.  Pulling that device into
-    # this unit made ALSA fail as a dependency, precisely when the rootfs-backed
-    # /home/virtua underneath it was already usable.  After= orders a real legacy
-    # mount when one exists without inheriting its failure.
-    #
-    # Before=sysinit.target, which is as early as a unit that needs a mounted
-    # filesystem can be.  `default' has to be right before the first process that
-    # asks for it, and alsa-lib resolves the name once per open and keeps the
-    # handle -- so a player that starts a second too early plays out of the old file
-    # for its whole run.
-    #
-    # DefaultDependencies=no is what makes that legal rather than a cycle: the
-    # default set puts After=sysinit.target on every service, and a unit both after
-    # and before the same target is a loop systemd breaks by dropping one of them at
-    # random.  j36-splash.service above does the same thing for the same reason.
-    #
-    # RemainAfterExit because the mounts outlive the process that made them, and no
-    # ExecStop: they are meant to last as long as the boot does, and unmounting them
-    # at shutdown would only uncover a file nothing is going to read again.  The
-    # leading `-' on ExecStart is the belt: this runs before sysinit.target, and a
-    # unit that can fail there is a unit that can hold up a boot over a sound file.
+    # After=-.mount is "the root filesystem is there".  DefaultDependencies=no
+    # is what makes Before=sysinit.target legal.  RemainAfterExit because the
+    # mounts outlive the process, and no ExecStop: unmounting them at shutdown
+    # would only uncover a file nothing is going to read again.
     cat > /newroot/run/systemd/system/j36-asound.service <<'UNITASOUND'
 # Written by the J36 Ultra initramfs, into a tmpfs.  See setup_asound in /init.
 [Unit]
 Description=Point ALSA at the J36 Ultra's card, and at a libasound aplay can use
 DefaultDependencies=no
-After=local-fs.target
+After=-.mount
 Before=sysinit.target shutdown.target
 Conflicts=shutdown.target
 ConditionPathExists=/run/j36/asound.conf
@@ -6296,6 +6325,14 @@ UNITASOUND
     mkdir -p /newroot/run/systemd/system/sysinit.target.wants
     ln -sf ../j36-asound.service \
            /newroot/run/systemd/system/sysinit.target.wants/j36-asound.service
+
+    # Do the binds now, on the mounted rootfs, so aplay is usable from the
+    # dashboard's first paint even if the unit is delayed or cancelled.
+    if J36_ASOUND_ROOT=/newroot /bin/sh /newroot/run/j36/bin/j36-asound; then
+        say "asound: binds applied before switch_root"
+    else
+        say "asound: pre-switch binds failed; the unit will try again"
+    fi
 
     say "asound: default is plug over hw:CARD=j36 for the whole system"
     return 0
@@ -8544,6 +8581,7 @@ verify_expand_libs() {
 # the id with it.
 MIXDASH_BIN=""
 QT_PAYLOAD=""
+SESSION_LIB_DIR=""
 
 # No t64 package names here on purpose.  trixie's armhf Qt is libqt5core5t64,
 # libqt5gui5t64 and so on, forkward's rename is suite-specific, and qtbase5-dev
@@ -8780,6 +8818,52 @@ write_fontconfig() {
   </match>
 </fontconfig>
 FCCONF
+}
+
+# Libraries the shared rootfs cannot be trusted to provide.
+#
+#   libSDL2  MixOS overwrites Debian's copy with an rk3326 build that only
+#            has kmsdrm.  dsda-doom then prints "x11 not available" and exits.
+#   libasound  the same overlay, or an older freeze in /usr/local, is what
+#            aplay dies on: undefined symbol snd_pcm_subformat_value.  The
+#            dashboard's chime is aplay of startup.wav, so that is silence.
+#
+# Both come from the armhf chroot -- a clean Debian trixie -- and land in
+# $CACHE so the payload copy does not need the chroot still mounted.
+collect_session_libs() {
+    local out="$CACHE/session-libs" so asound copied=0
+    SESSION_LIB_DIR=""
+    mkdir -p "$out"
+
+    chroot_install_deps sdl2x11 libsdl2-2.0-0 || \
+        log "sdl: Debian libsdl2-2.0-0 would not install; X clients keep the handheld SDL"
+    chroot_install_deps asound2 libasound2 || \
+        log "alsa: Debian libasound2 would not install; aplay keeps the card's libasound"
+
+    so=$(sudo readlink -f "$ARMHF_CHROOT/usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0" 2>/dev/null || true)
+    if [[ -n "$so" && -f "$so" ]] && sudo grep -q libX11.so "$so" 2>/dev/null; then
+        sudo cp -a "$so" "$out/" || return 1
+        sudo ln -sfn "$(basename "$so")" "$out/libSDL2-2.0.so.0"
+        log "sdl: staged Debian libSDL2 with X11 ($(basename "$so"))"
+        copied=1
+    else
+        log "sdl: no X11 libSDL2 in the chroot"
+    fi
+
+    asound=$(sudo readlink -f "$ARMHF_CHROOT/usr/lib/arm-linux-gnueabihf/libasound.so.2" 2>/dev/null || true)
+    if [[ -n "$asound" && -f "$asound" ]] && \
+       sudo grep -q snd_pcm_subformat_value "$asound" 2>/dev/null; then
+        sudo cp -a "$asound" "$out/" || return 1
+        sudo ln -sfn "$(basename "$asound")" "$out/libasound.so.2"
+        log "alsa: staged Debian libasound ($(basename "$asound"))"
+        copied=1
+    else
+        log "alsa: no libasound in the chroot exports snd_pcm_subformat_value"
+    fi
+
+    [[ "$copied" -eq 1 ]] || return 1
+    SESSION_LIB_DIR="$out"
+    return 0
 }
 
 # Bumped whenever this function stages something it did not stage before.  The
@@ -9098,6 +9182,10 @@ if [[ "${J36_DASH:-1}" == 1 ]]; then
     # mixdash fix does not also have to rebuild this.
     build_padx
     padx_rc=$?
+    # Debian libSDL2 (X11) and libasound.  Needs the chroot still mounted;
+    # the payload copies them to /opt/mixos/lib so Doom and aplay do not
+    # use the handheld overlays.
+    collect_session_libs || true
     armhf_chroot_teardown
     set -e
     if (( padx_rc != 0 )); then
@@ -11809,6 +11897,22 @@ if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
         log "dash: staged j36-padx and the private-X framebuffer presenter"
     fi
 
+    # Debian SDL2 (X11) and libasound, for session clients and aplay.  See
+    # collect_session_libs and the LD_LIBRARY_PATH in j36-xsession-main.
+    if [[ -n "$SESSION_LIB_DIR" ]]; then
+        mkdir -p "$SDROOT/opt/mixos/lib"
+        staged_libs=""
+        if [[ -e "$SESSION_LIB_DIR/libSDL2-2.0.so.0" ]]; then
+            cp -a "$SESSION_LIB_DIR"/libSDL2-2.0.so.0* "$SDROOT/opt/mixos/lib/"
+            staged_libs="${staged_libs:+$staged_libs }SDL2"
+        fi
+        if [[ -e "$SESSION_LIB_DIR/libasound.so.2" ]]; then
+            cp -a "$SESSION_LIB_DIR"/libasound.so.2* "$SDROOT/opt/mixos/lib/"
+            staged_libs="${staged_libs:+$staged_libs }libasound"
+        fi
+        [[ -n "$staged_libs" ]] && log "dash: staged $staged_libs into opt/mixos/lib"
+    fi
+
     # The X configuration.
     #
     # Deliberately tiny, and every line in it is load-bearing:
@@ -12321,6 +12425,27 @@ export GDK_BACKEND=x11
 # still represented by Firefox's exit status and journal output.
 export MOZ_CRASHREPORTER_DISABLE=1
 export MOZ_CRASHREPORTER_NO_REPORT=1
+# WebRender's compositor process died on this board with
+# "CompositorBridgeChild receives IPC close" a few seconds after Firefox
+# mapped a window.  Force the old in-process Basic compositor; the
+# matching user.js prefs are rewritten on every j36-browser start.
+export MOZ_WEBRENDER=0
+export MOZ_ACCELERATED=0
+export MOZ_X11_EGL=0
+# Official ESR sometimes ignores the remote-tabs prefs; this is the
+# remaining door into a single process, which is what stops the
+# compositor child dying and taking the window with it.
+export MOZ_FORCE_DISABLE_E10S=1
+# This kernel is out of tree.  Firefox's seccomp policy does not know its
+# syscalls, and the compositor child is what dies -- "IPC close /
+# AbnormalShutdown" a few seconds after the window maps.  The sandbox is
+# for a multi-user desktop; this session is one local client on a private
+# X server with no network listener.
+export MOZ_DISABLE_CONTENT_SANDBOX=1
+export MOZ_DISABLE_GMP_SANDBOX=1
+export MOZ_DISABLE_RDD_SANDBOX=1
+export MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
+export MOZ_DISABLE_GPU_SANDBOX=1
 export GTK_OVERLAY_SCROLLING=0
 export GDK_CORE_DEVICE_EVENTS=1
 
@@ -12340,6 +12465,15 @@ export SDL_VIDEODRIVER=x11
 export SDL_RENDER_DRIVER=software
 export SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR=0
 export LIBGL_ALWAYS_SOFTWARE=1
+# MixOS overwrites Debian's libSDL2 with an rk3326 build that has kmsdrm
+# and no x11 backend.  dsda-doom then prints "Could not initialize SDL
+# [x11 not available]" and exits.  The X11 copy lives under /opt/mixos/lib.
+# SDL_DYNAMIC_API is the one override that still wins when a game is
+# linked with DT_RPATH into /usr/lib -- LD_LIBRARY_PATH loses to RPATH.
+if [ -e /opt/mixos/lib/libSDL2-2.0.so.0 ]; then
+    export LD_LIBRARY_PATH="/opt/mixos/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export SDL_DYNAMIC_API=/opt/mixos/lib/libSDL2-2.0.so.0
+fi
 
 # WHAT A CLIENT LOOKS AT TO KNOW IT IS ALREADY INSIDE A SESSION.  j36-browser reads
 # it: with it set it execs a browser, without it it hands itself to j36-xrun.  A
@@ -12621,6 +12755,9 @@ reap_clients() {
 # A CLIENT IS NOT FORKED UNTIL X ACCEPTS A CONNECTION.  A cgroup thaw completes
 # asynchronously, and SDL calls XOpenDisplay while selecting its video backend; a
 # client that wins that race reports the misleading "x11 not available" and exits.
+# The same string is also SDL's error when SDL_VIDEODRIVER=x11 is set but the
+# loaded libSDL2 was built without that backend -- MixOS's rk3326 overlay --
+# which is why /opt/mixos/lib is on LD_LIBRARY_PATH above.
 # j36-padx --probe performs the same connection test without knowing or listing the
 # application being launched.  The server is normally ready on the first pass.
 wait_for_x() {
@@ -13060,6 +13197,20 @@ export GDK_BACKEND=x11
 # Firefox must use Debian's full font catalogue and virtua's writable XDG cache.
 unset FONTCONFIG_FILE FONTCONFIG_PATH QT_QPA_FB_DISABLE_INPUT QT_QPA_FONTDIR
 export QT_QPA_PLATFORM=xcb
+# Same compositor and sandbox switches as j36-xsession-main.  Set here
+# because this script is what execs Firefox, and because a hand-typed
+# `j36-browser` must not depend on the session file being the same build.
+export MOZ_CRASHREPORTER_DISABLE=1
+export MOZ_CRASHREPORTER_NO_REPORT=1
+export MOZ_WEBRENDER=0
+export MOZ_ACCELERATED=0
+export MOZ_X11_EGL=0
+export MOZ_FORCE_DISABLE_E10S=1
+export MOZ_DISABLE_CONTENT_SANDBOX=1
+export MOZ_DISABLE_GMP_SANDBOX=1
+export MOZ_DISABLE_RDD_SANDBOX=1
+export MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
+export MOZ_DISABLE_GPU_SANDBOX=1
 
 # Browsers are ordinary desktop clients, not system services.  Firefox explicitly
 # rejects euid 0 with a HOME owned by another account (the exact error is in the
@@ -13157,10 +13308,12 @@ run_browser() {
 firefox_profile() {
     # v1 allowed two writers after deleting a live lock.  v2 was then repeatedly
     # frozen as a complete X cgroup, which left affected Places databases locked
-    # and produced Firefox's "files in use by another application" warning.  A
-    # v3 profile is a clean boundary from both failure modes and cheaper than an
-    # SD-card SQLite repair during launch.
-    prof="$HOME/.mozilla/j36-v3"
+    # and produced Firefox's "files in use by another application" warning.  v3
+    # was a clean boundary from both.  v4 drops WebRender and e10s: the device
+    # log showed Firefox mapping a window and dying a few seconds later with
+    # "CompositorBridgeChild receives IPC close / AbnormalShutdown".  A new
+    # directory is cheaper than repairing a GPU-process cache on the card.
+    prof="$HOME/.mozilla/j36-v4"
     mkdir -p "$prof" 2>/dev/null || return 1
 
     # Never remove Firefox's lock here.  It distinguishes a stale crash marker
@@ -13179,13 +13332,25 @@ firefox_profile() {
 user_pref("fission.autostart", false);
 user_pref("dom.ipc.processCount", 1);
 user_pref("dom.ipc.processCount.webIsolated", 1);
-user_pref("gfx.webrender.software", true);
+user_pref("browser.tabs.remote.autostart", false);
+user_pref("layers.gpu-process.enabled", false);
+user_pref("gfx.webrender.force-disabled", true);
+user_pref("gfx.webrender.software", false);
+user_pref("gfx.webrender.software.opengl", false);
+user_pref("gfx.x11-egl.force-disabled", true);
+user_pref("gfx.canvas.accelerated", false);
+user_pref("webgl.disabled", true);
 user_pref("layers.acceleration.disabled", true);
 user_pref("media.hardware-video-decoding.enabled", false);
+user_pref("accessibility.force_disabled", 1);
+user_pref("security.sandbox.content.level", 0);
+user_pref("security.sandbox.gpu.level", 0);
+user_pref("browser.tabs.remote.autostart.force-disable", true);
 user_pref("general.smoothScroll", false);
 user_pref("ui.prefersReducedMotion", 1);
 user_pref("browser.cache.disk.capacity", 32768);
-user_pref("browser.cache.memory.capacity", 16384);
+user_pref("browser.cache.memory.capacity", 8192);
+user_pref("javascript.options.mem.max", 128000);
 user_pref("browser.sessionstore.interval", 300000);
 user_pref("browser.sessionstore.resume_from_crash", false);
 user_pref("browser.tabs.crashReporting.sendReport", false);
@@ -13262,18 +13427,18 @@ case "${J36_BROWSER##*/}" in
             # lock state owned by root.  Repair that legacy profile once; after the
             # marker exists Firefox owns everything it creates and only root's
             # freshly rewritten user.js needs a cheap direct chown.
-            profile_owner="$HOME/.mozilla/j36-v3/.virtua-owned-v1"
+            profile_owner="$HOME/.mozilla/j36-v4/.virtua-owned-v1"
             if [ ! -e "$profile_owner" ]; then
                 echo "j36-browser: preparing the Firefox profile" >&2
-                chown -R virtua:virtua "$HOME/.mozilla/j36-v3" 2>/dev/null
+                chown -R virtua:virtua "$HOME/.mozilla/j36-v4" 2>/dev/null
                 : > "$profile_owner" 2>/dev/null || true
                 chown virtua:virtua "$profile_owner" 2>/dev/null
             fi
-            chown virtua:virtua "$HOME/.mozilla" "$HOME/.mozilla/j36-v3" \
-                                 "$HOME/.mozilla/j36-v3/user.js" 2>/dev/null
+            chown virtua:virtua "$HOME/.mozilla" "$HOME/.mozilla/j36-v4" \
+                                 "$HOME/.mozilla/j36-v4/user.js" 2>/dev/null
         fi
         run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" --no-remote \
-            -profile "$HOME/.mozilla/j36-v3" "$URL"
+            -profile "$HOME/.mozilla/j36-v4" "$URL"
         ;;
     chromium|chromium-browser)
         run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" --disable-gpu \

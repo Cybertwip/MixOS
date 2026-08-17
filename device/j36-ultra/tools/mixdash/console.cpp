@@ -38,6 +38,7 @@ int g_tty = -1;
  * takes the mode once and never looks at it again.
  */
 volatile sig_atomic_t g_held = 0;
+volatile sig_atomic_t g_handoff = 0;
 
 /* The stream, when it has been moved off the console. */
 int g_log = -1;
@@ -133,7 +134,7 @@ void take()
 {
     int mode = KD_TEXT;
 
-    if (g_tty < 0)
+    if (g_handoff || g_tty < 0)
         return;
     /*
      * The flag goes up whether or not the ioctl was needed, because it means "the
@@ -150,11 +151,19 @@ void take()
     ::ioctl(g_tty, KDSETMODE, KD_GRAPHICS);
 }
 
+void handoff()
+{
+    /* Dropped first so a hold() already in flight on another path sees the
+     * hand-off rather than re-taking a VT mixshutdown has just claimed. */
+    g_handoff = 1;
+    g_held = 0;
+}
+
 bool hold()
 {
     int mode = KD_GRAPHICS;
 
-    if (g_tty < 0 || !g_held)
+    if (g_handoff || g_tty < 0 || !g_held)
         return false;
 
     trimLog();
@@ -168,6 +177,8 @@ bool hold()
 
 void text()
 {
+    if (g_handoff)
+        return;
     /* The stream first, so that a caller which writes its report immediately after
      * this returns writes it to the panel and not to the file. */
     restoreStream();

@@ -1534,25 +1534,42 @@ void MediaPage::playOnce(const QString &path)
      * that straight to aplay avoids cold-loading ffmpeg and libavcodec from the
      * SD card at the exact moment X and the dashboard are starting.  The old path
      * took nearly three minutes in the device log once Firefox joined that I/O
-     * queue; aplay begins the same six-second chime immediately. */
+     * queue; aplay begins the same six-second chime immediately.
+     *
+     * The `|| ffmpeg' is for the card whose aplay cannot even start: the shared
+     * rootfs still has a libasound that predates snd_pcm_subformat_value, and
+     * j36-asound covering it can lose a race with this first-paint call.  A
+     * silent chime is worse than a late one. */
+    /* MixOS overlays an old libasound that aplay cannot even start under.
+     * The payload stages Debian's copy in /opt/mixos/lib; putting that
+     * directory first is how the chime plays before j36-asound has bound
+     * anything, and how it still plays if that unit is cancelled. */
+    const QString mixlib = QStringLiteral("LD_LIBRARY_PATH=/opt/mixos/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} ");
+
     const QString ap = aplayPath();
     if (path.endsWith(QStringLiteral(".wav"), Qt::CaseInsensitive)
         && !ap.isEmpty()) {
-        QProcess::startDetached(ap, QStringList()
-                               << QStringLiteral("-q")
-                               << QStringLiteral("-D") << dev << path);
+        QString cmd = mixlib + shellQuote(ap) + " -q -D " + shellQuote(dev) + " " +
+                      shellQuote(path);
+        if (!ff.isEmpty())
+            cmd += " || " + mixlib + shellQuote(ff) +
+                   " -nostdin -hide_banner -loglevel quiet -i " +
+                   shellQuote(path) + " -vn -ar " + QString::number(kRate) +
+                   " -ac 2 -f alsa " + shellQuote(dev);
+        QProcess::startDetached(QStringLiteral("/bin/sh"),
+                                QStringList() << QStringLiteral("-c") << cmd);
         return;
     }
     if (ff.isEmpty())
         return;
 
-    const QString decode = shellQuote(ff) +
+    const QString decode = mixlib + shellQuote(ff) +
                            " -nostdin -hide_banner -loglevel quiet -i " + shellQuote(path) +
                            " -vn -ar " + QString::number(kRate) + " -ac 2 ";
 
     QString cmd = decode + "-f alsa " + shellQuote(dev);
     if (!ap.isEmpty())
-        cmd += " || " + decode + "-f wav - | " + shellQuote(ap) +
+        cmd += " || " + decode + "-f wav - | " + mixlib + shellQuote(ap) +
                " -q -D " + shellQuote(dev) + " -";
 
     QProcess::startDetached(QStringLiteral("/bin/sh"), QStringList() << "-c" << cmd);

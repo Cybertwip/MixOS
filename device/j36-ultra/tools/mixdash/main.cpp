@@ -390,9 +390,10 @@ void onTerminate(void)
 
 void onTerm(int)
 {
+    /* Console::text() is a no-op after powerOff() called handoff(), so a
+     * SIGTERM from the isolate cannot flash the journal over mixshutdown. */
     textMode();
     dropPid();
-    Trace::writeAll(2, "\nmixdash: asked to stop; console back in text mode\n");
     ::_exit(0);
 }
 

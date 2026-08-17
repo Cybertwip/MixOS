@@ -6,6 +6,7 @@
 #include "dashboard.h"
 
 #include "busy.h"
+#include "console.h"
 #include "diagnostics.h"
 #include "files.h"
 #include "joypad.h"
@@ -2900,18 +2901,19 @@ void Dashboard::refreshSwitcher()
  * and it is most of the reason a power-off on this board has ever been reported
  * as one.
  *
- * So: a styled fallback frame painted and flushed BEFORE the request goes out;
- * the pad and the pointer put away for good, because there is nothing left to
- * press; then a dedicated mixshutdown service which confirms its first animated
- * frame before this process asks PID 1 to power off.  It has its own cgroup and
- * DefaultDependencies=no, so stopping mixdash does not stop the picture halfway
- * through filesystem shutdown.
+ * So: the pad and the pointer put away for good, because there is nothing left
+ * to press; then a dedicated mixshutdown service which confirms its first
+ * animated frame before this process asks PID 1 to power off.  The dashboard
+ * does not paint a curtain of its own -- that was the "message before the
+ * splash".  mixshutdown has its own cgroup, DefaultDependencies=no and
+ * KillMode=none, so stopping mixdash does not stop the picture halfway through
+ * filesystem shutdown.
  *
- * The second line of the curtain is not padding.  There is no power-path FET on
- * this PMIC, so VBAT is VSYS: with a charger in, VBUS holds the system rail up
- * and the RTC cannot pull it down.  The driver restarts the board instead of
- * halting it warm -- see j36_mt6592_pmic.c -- so a power-off attempted on the
- * charger looks like a reboot, and the one thing the user needs to know is that
+ * The splash detail is not padding.  There is no power-path FET on this PMIC,
+ * so VBAT is VSYS: with a charger in, VBUS holds the system rail up and the
+ * RTC cannot pull it down.  The driver restarts the board instead of halting
+ * it warm -- see j36_mt6592_pmic.c -- so a power-off attempted on the charger
+ * looks like a reboot, and the one thing the user needs to know is that
  * unplugging fixes it.
  */
 void Dashboard::powerOff()
@@ -2926,63 +2928,36 @@ void Dashboard::powerOff()
     m_toastTimer->stop();
     m_toast->hide();
 
-    /* Nothing after this point is interactive.  Put the dashboard cursor away
-     * before the fallback frame is flushed, so it cannot be baked into the
-     * picture the standalone renderer replaces. */
+    /* Nothing after this point is interactive.  The pad is disconnected rather
+     * than suspended: watch mode keeps reading, and a switcher opened over a
+     * machine that is already on its way down is the shell answering buttons
+     * that can no longer lead anywhere. */
     m_pad->disconnect(this);
     m_pad->setWatching(true);
     m_pointer->sleep();
-
-    QLabel *curtain = new QLabel(this);
-    curtain->setAlignment(Qt::AlignCenter);
-    curtain->setWordWrap(true);
-    curtain->setTextFormat(Qt::RichText);
-    curtain->setStyleSheet(
-        "QLabel {"
-        " background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-        " stop:0 #111A2A, stop:0.5 #0A0D14, stop:1 #07080D);"
-        " color: #E8EAF2; font-size: 15px; border: 1px solid #25344A;"
-        " padding: 44px;"
-        " }");
-    curtain->setText(
-        QStringLiteral("<div style='color:#54A8FF;font-size:13px'>MIXOS</div>"
-                       "<div style='font-size:25px;margin-top:18px'>%1</div>"
-                       "<div style='color:#AAB4C4;font-size:13px;margin-top:18px'>%2</div>")
-            .arg(tr("Powering off").toHtmlEscaped(),
-                 tr("Saving data and stopping services. If the board comes back up, "
-                    "unplug the charger and try again.").toHtmlEscaped()));
-    curtain->setGeometry(rect());
-    curtain->show();
-    curtain->raise();
-    /* Painted here, not on the next trip round the loop: there is no next trip. */
-    curtain->repaint();
-    QCoreApplication::processEvents();
-
-    /*
-     * THE PAD WAS DISCONNECTED, not suspended.  There is no setSuspended() any more
-     * -- watch mode keeps reading, because a task switcher whose button is not
-     * read is a switcher nobody can reach -- and "keeps reading" is exactly what
-     * this one path does not want.  Everything after this line is a machine on its
-     * way down behind a curtain, and a switcher opened over it, or a card grid
-     * walked under it, would both be the shell answering buttons that can no
-     * longer lead anywhere.
-     *
-     * Severed and not re-connected, because this function has no other side: the
-     * request has gone to PID 1 and the only way back is a power cycle.
-     */
     setUpdatesEnabled(false);
 
-    /* The renderer reads a regular append-only control file.  Writing it before
-     * systemctl starts the unit means its very first animated frame already says
-     * what is happening; there is no network, disk probe or dashboard event loop
-     * in this path. */
+    /*
+     * Hand the panel to mixshutdown BEFORE this process paints anything of its
+     * own.  The old curtain was a QLabel flushed onto /dev/fb0 and then kept
+     * there by the one-second console guard, so the operator saw "Saving data
+     * and stopping services" in dashboard chrome and never the splash.  The
+     * standalone renderer is the picture; this process must not draw over it.
+     *
+     * The control file is written first so the very first animated frame already
+     * says what is happening.  The charger warning stays on that frame as the
+     * detail line -- this PMIC cannot latch off with VBUS up, so a cable in
+     * looks like a freeze unless the splash says why.
+     */
     QFile control(QStringLiteral("/run/j36/mixshutdown.ctl"));
     if (control.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
         control.write("stage:Powering off\n");
-        control.write("detail:Saving data and stopping services\n");
+        control.write("detail:Unplug the charger if it comes back on\n");
         control.write("progress:100\n");
         control.close();
     }
+
+    Console::handoff();
 
     const QString systemctl = firstExisting(QStringList() << "/bin/systemctl"
                                                            << "/usr/bin/systemctl");
@@ -2996,6 +2971,9 @@ void Dashboard::powerOff()
     }
 
     QProcess::startDetached(exe, QStringList());
+    /* atexit would put the VT back to KD_TEXT and flash the journal over the
+     * splash.  The picture is mixshutdown's now; this process is done. */
+    ::_exit(0);
 }
 
 /* ── activating a card ───────────────────────────────────────────────────── */
