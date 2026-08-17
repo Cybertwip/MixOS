@@ -12012,7 +12012,9 @@ export QT_QPA_PLATFORM=xcb
 # exactly the "Doom has sound but no picture" failure.  X11 keeps it in this
 # session, under matchbox and under the dashboard's foreground hand-off.
 export SDL_VIDEODRIVER=x11
+export SDL_RENDER_DRIVER=software
 export SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR=0
+export LIBGL_ALWAYS_SOFTWARE=1
 
 # WHAT A CLIENT LOOKS AT TO KNOW IT IS ALREADY INSIDE A SESSION.  j36-browser reads
 # it: with it set it execs a browser, without it it hands itself to j36-xrun.  A

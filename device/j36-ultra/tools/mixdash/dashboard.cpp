@@ -218,10 +218,9 @@ QString graphicalBrowserSession()
  * QFile::open -- see the note on kXSessionCtl.  QFile would use an ordinary open()
  * and hang this program on a FIFO whose session has gone.
  *
- * O_CLOEXEC because every child this dashboard starts inherits its descriptors and
- * a write end of the session's pipe held open by a game is a session that cannot
- * tell when its last window closed.  It is closed immediately anyway; the flag is
- * for the fork that happens between the open and the close.
+ * O_CLOEXEC because every child this dashboard starts inherits its descriptors.
+ * It is closed immediately anyway; the flag closes the fork-between-open-and-close
+ * window and keeps an unrelated game from retaining a handle to session control.
  */
 bool writeSessionControl(const QString &line)
 {
