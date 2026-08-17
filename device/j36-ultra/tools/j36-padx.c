@@ -105,7 +105,7 @@
  *     L3 / R3        middle click / right click
  *     Select         show or hide the on-screen keyboard
  *     Start          focus the address bar   (Ctrl+L)
- *     Menu           TAP next window; HOLD dashboard task switcher
+ *     Menu           TAP or HOLD the dashboard task switcher (per window)
  *     Vol- / Vol+    zoom out / zoom in      (Ctrl+minus / Ctrl+plus)
  *     Home (F12)     the start page          (Alt+Home)
  *
@@ -760,6 +760,114 @@ static Window window_for_pid(Window at, unsigned long wanted, int depth)
     if (children)
         XFree(children);
     return None;
+}
+
+static int window_looks_like_game(Window window)
+{
+    XClassHint hint;
+    char name[320];
+    const char *needles[] = {
+        "doom", "prboom", "dsda", "chocolate", "freedoom", "gzdoom",
+        "crispy", "retroarch", "mednafen", "scummvm", "pcsx", "mupen",
+        "ppsspp", "dolphin", "mame", "fbneo", "snes9x", "nestopia",
+        "yabause", "dosbox", "openbor", "ioquake", "quake", "hexen",
+        "heretic", "strife", "sdl_app", "love", NULL
+    };
+    char hay[640];
+    int i;
+
+    hay[0] = '\0';
+    memset(&hint, 0, sizeof(hint));
+    if (XGetClassHint(dpy, window, &hint)) {
+        snprintf(hay, sizeof(hay), "%s %s",
+                 hint.res_name ? hint.res_name : "",
+                 hint.res_class ? hint.res_class : "");
+        if (hint.res_name)
+            XFree(hint.res_name);
+        if (hint.res_class)
+            XFree(hint.res_class);
+    }
+    client_name(window, name, sizeof(name));
+    if (name[0]) {
+        size_t n = strlen(hay);
+        snprintf(hay + n, sizeof(hay) - n, " %s", name);
+    }
+    for (i = 0; hay[i]; ++i) {
+        if (hay[i] >= 'A' && hay[i] <= 'Z')
+            hay[i] = (char)(hay[i] - 'A' + 'a');
+    }
+    for (i = 0; needles[i]; ++i) {
+        if (strstr(hay, needles[i]))
+            return 1;
+    }
+    return 0;
+}
+
+static Window focused_window(void)
+{
+    Window root = RootWindow(dpy, scr);
+    Atom active_prop = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", True);
+    Atom actual;
+    int format;
+    unsigned long nitems, after;
+    unsigned char *data = NULL;
+    Window active = None;
+
+    if (active_prop == None)
+        return None;
+    if (XGetWindowProperty(dpy, root, active_prop, 0, 1, False, XA_WINDOW,
+                           &actual, &format, &nitems, &after, &data) == Success
+        && data && actual == XA_WINDOW && format == 32 && nitems == 1)
+        active = *(Window *)data;
+    if (data)
+        XFree(data);
+    return active;
+}
+
+static int focused_is_game(void)
+{
+    Window w = focused_window();
+
+    return w != None && window_looks_like_game(w);
+}
+
+static int close_window(Window client)
+{
+    Window root = RootWindow(dpy, scr);
+    XWindowAttributes attr;
+    Atom protocols, del, *list = NULL;
+    int count = 0, i, supports = 0;
+    XEvent ev;
+
+    if (client == None || client == root
+        || !XGetWindowAttributes(dpy, client, &attr)
+        || attr.map_state != IsViewable)
+        return 0;
+
+    protocols = XInternAtom(dpy, "WM_PROTOCOLS", True);
+    del = XInternAtom(dpy, "WM_DELETE_WINDOW", True);
+    if (protocols != None && del != None
+        && XGetWMProtocols(dpy, client, &list, &count)) {
+        for (i = 0; i < count; i++) {
+            if (list[i] == del)
+                supports = 1;
+        }
+        XFree(list);
+    }
+    if (supports) {
+        memset(&ev, 0, sizeof(ev));
+        ev.xclient.type = ClientMessage;
+        ev.xclient.window = client;
+        ev.xclient.message_type = protocols;
+        ev.xclient.format = 32;
+        ev.xclient.data.l[0] = (long)del;
+        ev.xclient.data.l[1] = CurrentTime;
+        XSendEvent(dpy, client, False, NoEventMask, &ev);
+    } else {
+        XKillClient(dpy, client);
+    }
+    XFlush(dpy);
+    return 1;
 }
 
 static int activate_window(Window client)
