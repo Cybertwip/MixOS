@@ -9053,11 +9053,14 @@ PADX_SRC="$ROOT/device/j36-ultra/tools/j36-padx.c"
 PADX_LAYOUT="$ROOT/device/j36-ultra/tools/mixdash/keyboardlayout.h"
 XFB_SRC="$ROOT/device/j36-ultra/tools/j36-xfb.c"
 XLIMA_SRC="$ROOT/device/j36-ultra/tools/j36-xlima.c"
+EGLX_SRC="$ROOT/device/j36-ultra/tools/j36-eglx.c"
 PADX_BIN=""
 XFB_LIB=""
 XLIMA_DRV=""
+EGLX_LIB=""
 PADX_BUILD_DEPS=(build-essential libx11-dev libxtst-dev libxfixes-dev)
 XLIMA_BUILD_DEPS=(xserver-xorg-dev libdrm-dev)
+EGLX_BUILD_DEPS=(build-essential libx11-dev libgbm-dev libdrm-dev)
 
 build_padx() {
     local src="$ARMHF_CHROOT/home/build/padx" out="$CACHE/j36-padx"
@@ -9180,6 +9183,47 @@ build_xlima() {
     return 0
 }
 
+# ── j36-eglx: lima EGL backend for X11 clients (GLES3 + GL 4.5 compat) ──
+#
+# Mesa's X11 EGL platform cannot eglInitialize on this board.  This
+# library is the platform: GBM lima, XPutImage present, GLES3 / GL 4.5
+# compatibility contexts when a client asks for them.
+build_eglx() {
+    local src="$ARMHF_CHROOT/home/build/eglx" out="$CACHE/libj36-eglx.so"
+    local header
+
+    [[ -f "$EGLX_SRC" ]] || { log "eglx: $EGLX_SRC is missing"; return 1; }
+    ensure_armhf_chroot || return 1
+    chroot_install_deps eglx "${EGLX_BUILD_DEPS[@]}" || return 1
+
+    sudo rm -rf "$src"
+    sudo mkdir -p "$src"
+    sudo cp "$EGLX_SRC" "$src/j36-eglx.c" || return 1
+
+    log "eglx: building the lima EGL X11 backend for armhf (emulated)"
+    armhf_chroot_run "cd /home/build/eglx && \
+        gcc -O2 -std=gnu11 -Wall -Wextra -fPIC -shared \
+            -Wl,-soname,libj36-eglx.so \
+            -o libj36-eglx.so j36-eglx.c -lX11 -lgbm -ldl -lpthread && \
+        strip libj36-eglx.so" || return 1
+    [[ -f "$src/libj36-eglx.so" ]] || {
+        log "eglx: the compile left no library"
+        return 1
+    }
+
+    mkdir -p "$CACHE"
+    sudo cp "$src/libj36-eglx.so" "$out" || return 1
+    sudo chown "$(id -u):$(id -g)" "$out"
+    chmod 0755 "$out"
+
+    header="$(readelf -hd "$out" 2>/dev/null)" || return 1
+    grep -q 'Class:.*ELF32' <<<"$header" || { log "eglx: not a 32-bit ELF"; return 1; }
+    grep -q 'Machine:.*ARM' <<<"$header" || { log "eglx: not an ARM ELF"; return 1; }
+    EGLX_LIB="$out"
+    log "eglx: libj36-eglx.so is $(stat -c %s "$out") bytes"
+    return 0
+}
+
 # J36_GL is Mesa and the probe, and it is worth keeping even now that the dashboard
 # needs no GL: eglprobe is still the only thing here that says whether a frame reaches
 # the glass, and anything launched from the dashboard that does want GL resolves it
@@ -9241,6 +9285,9 @@ if [[ "${J36_DASH:-1}" == 1 ]]; then
     # rc, so a header mismatch must not take the pad bridge with it.
     build_xlima
     xlima_rc=$?
+    # Same chroot: the lima EGL X11 backend needs libgbm and libX11.
+    build_eglx
+    eglx_rc=$?
     # Debian libSDL2 (X11) and libasound.  Needs the chroot still mounted;
     # the payload copies them to /opt/mixos/lib so Doom and aplay do not
     # use the handheld overlays.
@@ -9258,6 +9305,11 @@ if [[ "${J36_DASH:-1}" == 1 ]]; then
         XLIMA_DRV=""
         log "xlima: the lima Xorg driver was not built, see the error above --"
         log "    the session keeps xf86-video-fbdev and software drawing."
+    fi
+    if (( eglx_rc != 0 )); then
+        EGLX_LIB=""
+        log "eglx: the lima EGL backend was not built, see the error above --"
+        log "    X11 clients keep Mesa's X11 platform (eglInitialize will fail)."
     fi
     if (( dash_rc != 0 )); then
         MIXDASH_BIN=""
@@ -11968,6 +12020,21 @@ if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
         log "dash: staged the lima EGL Xorg driver"
     fi
 
+    if [[ -n "$EGLX_LIB" && -f "$EGLX_LIB" ]]; then
+        mkdir -p "$SDROOT/opt/mixos/lib" "$SDROOT/opt/mixos/share/gl/egl_vendor.d"
+        cp "$EGLX_LIB" "$SDROOT/opt/mixos/lib/libj36-eglx.so"
+        chmod 0755 "$SDROOT/opt/mixos/lib/libj36-eglx.so"
+        cat > "$SDROOT/opt/mixos/share/gl/egl_vendor.d/10_j36lima.json" <<'EGLJSON'
+{
+    "file_format_version" : "1.0.0",
+    "ICD" : {
+        "library_path" : "/opt/mixos/lib/libj36-eglx.so"
+    }
+}
+EGLJSON
+        log "dash: staged the lima EGL X11 backend"
+    fi
+
     # Debian SDL2 (X11) and libasound, for session clients and aplay.  See
     # collect_session_libs and the LD_LIBRARY_PATH in j36-xsession-main.
     if [[ -n "$SESSION_LIB_DIR" ]]; then
@@ -12468,8 +12535,9 @@ if [ -d /run/j36/gl ]; then
 fi
 export MESA_LOADER_DRIVER_OVERRIDE=lima
 export GALLIUM_DRIVER=lima
-export MESA_GLES_VERSION_OVERRIDE=2.0
 export LIBGL_DRIVERS_PATH=/usr/lib/arm-linux-gnueabihf/dri
+# Do not pin MESA_GLES_VERSION_OVERRIDE=2.0: that blocked GLES3 / GL 4.5
+# compat.  j36-eglx creates those contexts when a client asks.
 exec /usr/bin/xinit "$MAIN" "$FIRST" -- \
     "$XWRAP" :0 vt1 \
     -config "$XCONF" \
@@ -12553,17 +12621,13 @@ export GDK_BACKEND=x11
 # still represented by Firefox's exit status and journal output.
 export MOZ_CRASHREPORTER_DISABLE=1
 export MOZ_CRASHREPORTER_NO_REPORT=1
-# The device log is unambiguous: Firefox's glxtest reports
-# "libEGL initialize failed", "GLX extension missing" and "No GPUs
-# detected via PCI", then NewRenderer::Run is slow (~5 s) and the
-# compositor child dies with CompositorBridgeChild / AbnormalShutdown.
-# lima is GLES2 on a platform DRM node; Firefox wants desktop GL or
-# GLES3 over X11/EGL.  Forcing MOZ_X11_EGL put it on that broken path.
-# Software WebRender in-process is the compositor that cannot be
-# killed by an IPC close.  EGL 2.0 / lima stays for SDL and the DDX.
+# j36-eglx turns X11 eglGetDisplay into GBM lima and will create a
+# GLES3 or GL 4.5 compat context when Firefox asks.  Keep the GPU
+# process off: an IPC close of that child is still what killed the
+# window.  Software WR stays the compositor fallback.
 export MOZ_WEBRENDER=0
 export MOZ_WEBRENDER_SOFTWARE=1
-export MOZ_X11_EGL=0
+export MOZ_X11_EGL=1
 # Official ESR sometimes ignores the remote-tabs prefs; this is the
 # remaining door into a single process, which is what stops the
 # compositor child dying and taking the window with it.
@@ -12614,7 +12678,6 @@ if [ -d /run/j36/gl ]; then
 fi
 export MESA_LOADER_DRIVER_OVERRIDE=lima
 export GALLIUM_DRIVER=lima
-export MESA_GLES_VERSION_OVERRIDE=2.0
 # MixOS overwrites Debian's libSDL2 with an rk3326 build that has kmsdrm
 # and no x11 backend.  dsda-doom then prints "Could not initialize SDL
 # [x11 not available]" and exits.  The X11 copy lives under /opt/mixos/lib.

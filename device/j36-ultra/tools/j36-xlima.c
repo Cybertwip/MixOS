@@ -244,7 +244,14 @@ typedef int32_t JLimaEGLint;
 #define JL_EGL_RENDERABLE_TYPE		0x3040
 #define JL_EGL_CONTEXT_CLIENT_VERSION	0x3098
 #define JL_EGL_OPENGL_ES2_BIT		0x0004
+#define JL_EGL_OPENGL_ES3_BIT		0x00000040
+#define JL_EGL_OPENGL_BIT		0x0008
 #define JL_EGL_OPENGL_ES_API		0x30A0
+#define JL_EGL_OPENGL_API		0x30A2
+#define JL_EGL_CONTEXT_MAJOR_VERSION	0x3098
+#define JL_EGL_CONTEXT_MINOR_VERSION	0x30FB
+#define JL_EGL_CONTEXT_OPENGL_PROFILE_MASK 0x30FD
+#define JL_EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT 0x00000002
 #define JL_EGL_PLATFORM_GBM_KHR		0x31D7
 #define JL_EGL_PLATFORM_SURFACELESS	0x31DD
 #define JL_EGL_WIDTH			0x3057
@@ -326,9 +333,37 @@ static void jlima_egl_fini(JLimaPtr p)
 	p->egl_renderer[0] = '\0';
 }
 
+static JLimaEGLContext jlima_try_context(JLimaPtr p, JLimaEGLConfig cfg,
+					 JLimaEGLenum api, const JLimaEGLint *attr,
+					 const char *gl_override, const char *gles_override)
+{
+	JLimaEGLContext ctx;
+
+	if (gl_override)
+		setenv("MESA_GL_VERSION_OVERRIDE", gl_override, 1);
+	else
+		unsetenv("MESA_GL_VERSION_OVERRIDE");
+	if (gles_override)
+		setenv("MESA_GLES_VERSION_OVERRIDE", gles_override, 1);
+	else
+		unsetenv("MESA_GLES_VERSION_OVERRIDE");
+	if (gl_override)
+		setenv("MESA_GLSL_VERSION_OVERRIDE", "460", 1);
+	else
+		unsetenv("MESA_GLSL_VERSION_OVERRIDE");
+	if (!jl_eglBindAPI(api))
+		return NULL;
+	ctx = jl_eglCreateContext(p->egl_dpy, cfg, NULL, attr);
+	if (ctx && jl_eglMakeCurrent(p->egl_dpy, NULL, NULL, ctx))
+		return ctx;
+	if (ctx && jl_eglDestroyContext)
+		jl_eglDestroyContext(p->egl_dpy, ctx);
+	return NULL;
+}
+
 static Bool jlima_egl_init(ScrnInfoPtr pScrn, JLimaPtr p)
 {
-	static const JLimaEGLint cfg_attr[] = {
+	static const JLimaEGLint cfg_es[] = {
 		JL_EGL_RENDERABLE_TYPE, JL_EGL_OPENGL_ES2_BIT,
 		JL_EGL_RED_SIZE, 8,
 		JL_EGL_GREEN_SIZE, 8,
@@ -336,13 +371,26 @@ static Bool jlima_egl_init(ScrnInfoPtr pScrn, JLimaPtr p)
 		JL_EGL_SURFACE_TYPE, 0,
 		JL_EGL_NONE
 	};
-	static const JLimaEGLint ctx_attr[] = {
+	static const JLimaEGLint ctx_gl46[] = {
+		JL_EGL_CONTEXT_MAJOR_VERSION, 4,
+		JL_EGL_CONTEXT_MINOR_VERSION, 6,
+		JL_EGL_CONTEXT_OPENGL_PROFILE_MASK,
+		JL_EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT,
+		JL_EGL_NONE
+	};
+	static const JLimaEGLint ctx_es32[] = {
+		JL_EGL_CONTEXT_MAJOR_VERSION, 3,
+		JL_EGL_CONTEXT_MINOR_VERSION, 2,
+		JL_EGL_NONE
+	};
+	static const JLimaEGLint ctx_es2[] = {
 		JL_EGL_CONTEXT_CLIENT_VERSION, 2,
 		JL_EGL_NONE
 	};
 	JLimaEGLConfig pick[8];
 	JLimaEGLint n = 0, major = 0, minor = 0;
 	const unsigned char *s;
+	const char *kind = "GLES2";
 
 	if (p->dri_fd < 0)
 		return FALSE;
@@ -398,19 +446,34 @@ static Bool jlima_egl_init(ScrnInfoPtr pScrn, JLimaPtr p)
 		jlima_egl_fini(p);
 		return FALSE;
 	}
-	if (!jl_eglBindAPI(JL_EGL_OPENGL_ES_API) ||
-	    !jl_eglChooseConfig(p->egl_dpy, cfg_attr, pick, 8, &n) || n < 1) {
+	if (!jl_eglChooseConfig(p->egl_dpy, cfg_es, pick, 8, &n) || n < 1) {
 		xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-			   "lima: no EGL 2.0 config on %s\n", p->dri_path);
+			   "lima: no EGL config on %s\n", p->dri_path);
 		jlima_egl_fini(p);
 		return FALSE;
 	}
 	p->egl_cfg = pick[0];
-	p->egl_ctx = jl_eglCreateContext(p->egl_dpy, p->egl_cfg, NULL, ctx_attr);
-	if (!p->egl_ctx ||
-	    !jl_eglMakeCurrent(p->egl_dpy, NULL, NULL, p->egl_ctx)) {
+	/* Highest version Mesa will advertise, then GLES2.  Import/readback
+	 * only needs a current context; GLES 3.2 / GL 4.6 compat are what
+	 * Firefox and desktop GL request. */
+	p->egl_ctx = jlima_try_context(p, p->egl_cfg, JL_EGL_OPENGL_API,
+				       ctx_gl46, "4.6COMPAT", NULL);
+	if (p->egl_ctx)
+		kind = "GL 4.6 compat";
+	if (!p->egl_ctx) {
+		p->egl_ctx = jlima_try_context(p, p->egl_cfg, JL_EGL_OPENGL_ES_API,
+					       ctx_es32, NULL, "3.2");
+		if (p->egl_ctx)
+			kind = "GLES 3.2";
+	}
+	if (!p->egl_ctx) {
+		p->egl_ctx = jlima_try_context(p, p->egl_cfg, JL_EGL_OPENGL_ES_API,
+					       ctx_es2, NULL, NULL);
+		kind = "GLES2";
+	}
+	if (!p->egl_ctx) {
 		xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-			   "lima: EGL 2.0 context failed on %s\n", p->dri_path);
+			   "lima: no EGL context on %s\n", p->dri_path);
 		jlima_egl_fini(p);
 		return FALSE;
 	}
@@ -435,8 +498,8 @@ static Bool jlima_egl_init(ScrnInfoPtr pScrn, JLimaPtr p)
 		 s ? (const char *)s : "EGL 2.0");
 	s = jl_glGetString ? jl_glGetString(JL_GL_VERSION) : NULL;
 	xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-		   "lima: EGL %d.%d GLES2 on %s -- renderer \"%s\" version \"%s\"\n",
-		   major, minor, p->dri_path, p->egl_renderer,
+		   "lima: EGL %d.%d %s on %s -- renderer \"%s\" version \"%s\"\n",
+		   major, minor, kind, p->dri_path, p->egl_renderer,
 		   s ? (const char *)s : "?");
 	p->egl2 = TRUE;
 	return TRUE;
@@ -668,6 +731,13 @@ static Bool jlima_dri3_init(ScreenPtr screen)
 
 #endif /* HAVE_DRI3 */
 
+static Bool JLimaSaveScreen(ScreenPtr pScreen, int mode)
+{
+	(void)pScreen;
+	(void)mode;
+	return TRUE;
+}
+
 static Bool JLimaCloseScreen(ScreenPtr pScreen)
 {
 	ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
@@ -828,7 +898,10 @@ static Bool JLimaScreenInit(ScreenPtr pScreen, int argc, char **argv)
 	if (p->dri_fd >= 0)
 		p->dri3 = jlima_dri3_init(pScreen);
 #endif
-	pScreen->SaveScreen = xf86SaveScreen;
+	/* xf86SaveScreen was removed from the xserver headers this
+	 * chroot ships.  DPMS/blanking is already off in xorg.conf;
+	 * a no-op keeps the ScreenRec populated. */
+	pScreen->SaveScreen = JLimaSaveScreen;
 	return TRUE;
 }
 
@@ -974,7 +1047,8 @@ _X_EXPORT DriverRec J36LIMA = {
 	JLimaProbe,
 	JLimaAvailableOptions,
 	NULL,
-	0
+	0,
+	NULL
 };
 
 static XF86ModuleVersionInfo JLimaVersRec = {

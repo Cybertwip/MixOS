@@ -468,10 +468,16 @@ struct api {
                                  * major_version is 0. */
 };
 
+#ifndef EGL_OPENGL_ES3_BIT
+#define EGL_OPENGL_ES3_BIT 0x00000040
+#endif
+
 static const struct api APIS[] = {
-    { "GL",  EGL_OPENGL_API,    EGL_OPENGL_BIT,     0 }, /* SDL's default request */
-    { "ES1", EGL_OPENGL_ES_API, EGL_OPENGL_ES_BIT,  1 }, /* fixed-function GL */
-    { "ES2", EGL_OPENGL_ES_API, EGL_OPENGL_ES2_BIT, 2 },
+    { "GL",   EGL_OPENGL_API,    EGL_OPENGL_BIT,     0 }, /* SDL's default request */
+    { "GL46", EGL_OPENGL_API,    EGL_OPENGL_BIT,     4 }, /* 4.6 compat, via j36-eglx */
+    { "ES1",  EGL_OPENGL_ES_API, EGL_OPENGL_ES_BIT,  1 }, /* fixed-function GL */
+    { "ES2",  EGL_OPENGL_ES_API, EGL_OPENGL_ES2_BIT, 2 },
+    { "ES3",  EGL_OPENGL_ES_API, EGL_OPENGL_ES3_BIT, 3 },
 };
 
 /*
