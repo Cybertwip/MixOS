@@ -1266,6 +1266,25 @@ static double now_seconds(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+/* A service which hands the physical panel to this process must know when a
+ * complete frame, rather than merely a successful exec, is on the glass.  The
+ * marker makes that boundary observable without pulling libsystemd into this
+ * static initramfs binary. */
+static void mark_ready(const char *path)
+{
+    int fd;
+
+    if (!path)
+        return;
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "mixsplash: cannot create ready marker %s: %s\n",
+                path, strerror(errno));
+        return;
+    }
+    close(fd);
+}
+
 static void usage(void)
 {
     fprintf(stderr,
@@ -1275,6 +1294,7 @@ static void usage(void)
         "            /dev/.mixsplash); an existing FIFO at that path works too\n"
         "  -d NODE   framebuffer (default /dev/fb0)\n"
         "  -s TEXT   the first stage line\n"
+        "  -r FILE   create FILE after the first complete frame is visible\n"
         "  -t SECS   give up if nothing arrives and no hand-over (default 90)\n"
         "  -T SECS   give up this long after hand-over (default 180, 0 = never)\n"
         "  -1        draw one frame and exit (no animation, no channel)\n"
@@ -1288,6 +1308,7 @@ int main(int argc, char **argv)
     const char *chanpath = "/dev/.mixsplash";
     const char *fbpath = "/dev/fb0";
     const char *first_stage = "Starting MixOS";
+    const char *readypath = NULL;
     double idle_timeout = 90.0;
     double handover_timeout = 180.0;
     int oneshot = 0, keep_graphics = 0;
@@ -1298,14 +1319,15 @@ int main(int argc, char **argv)
     char stage[96], detail[96], line[512];
     double target = 0.0, shown = 0.0;
     double t0, last_msg, handover_at = -1.0;
-    int console = -1, handover = 0, opt;
+    int console = -1, handover = 0, ready_marked = 0, opt;
 
-    while ((opt = getopt(argc, argv, "i:f:d:s:t:T:1kvh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:f:d:s:r:t:T:1kvh")) != -1) {
         switch (opt) {
         case 'i': imgpath = optarg; break;
         case 'f': chanpath = optarg; break;
         case 'd': fbpath = optarg; break;
         case 's': first_stage = optarg; break;
+        case 'r': readypath = optarg; break;
         case 't': idle_timeout = atof(optarg); break;
         case 'T': handover_timeout = atof(optarg); break;
         case '1': oneshot = 1; break;
@@ -1353,8 +1375,10 @@ int main(int argc, char **argv)
      * there is no VT at all, the picture is already up and the worst case is
      * fbcon eventually drawing over it. */
     fb_blit(&fb, canvas, 0, 0, fb.w, fb.h);
-    if (oneshot)
+    if (oneshot) {
+        mark_ready(readypath);
         return 0;
+    }
 
     console = console_grab();
 
@@ -1487,6 +1511,14 @@ int main(int argc, char **argv)
             for (i = 0; i < g_ndamage; ++i)
                 fb_blit(&fb, canvas, g_damage[i].x, g_damage[i].y,
                         g_damage[i].w, g_damage[i].h);
+        }
+
+        if (!ready_marked) {
+            /* Everything above this line is synchronous memory-mapped fbdev I/O:
+             * when the marker exists the wallpaper, status and first animation
+             * frame have all reached the scan-out buffer. */
+            mark_ready(readypath);
+            ready_marked = 1;
         }
 
         /*

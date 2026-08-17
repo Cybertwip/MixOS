@@ -116,6 +116,10 @@ void Pointer::wake()
 
 void Pointer::sleep()
 {
+    /* This is the ownership boundary.  Persist even when the last movement was
+     * sub-pixel or the position happened not to change during this wake cycle;
+     * PadX adopts this exact full-screen coordinate before its first X frame. */
+    writeSharedPosition();
     m_idle->stop();
     m_fade->stop();
     m_opacity = 255;

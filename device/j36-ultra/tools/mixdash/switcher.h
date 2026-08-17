@@ -54,6 +54,8 @@
 #include <QVector>
 #include <QWidget>
 
+class QMouseEvent;
+
 class Switcher : public QWidget
 {
     Q_OBJECT
@@ -115,11 +117,17 @@ signals:
 
 protected:
     void paintEvent(QPaintEvent *event) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
+    void mousePressEvent(QMouseEvent *event) override;
+    void mouseReleaseEvent(QMouseEvent *event) override;
 
 private:
     /* The rectangle row `i' occupies, in this widget's coordinates.  One
      * function so the painter and any future hit test cannot disagree. */
     QRect rowRect(int i) const;
+    int rowAt(const QPoint &point) const;
+    int rowHeight() const;
+    int rowGap() const;
     /* Where the column of rows starts, given how many there are: the block is
      * centred vertically, which on a panel with four rows on it looks composed
      * and with one row on it does not look broken. */

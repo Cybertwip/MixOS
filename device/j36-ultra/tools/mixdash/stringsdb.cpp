@@ -269,15 +269,21 @@ const char *const kPhrases[][Lang::Count] = {
       "poweroff ist nicht auf dieser Karte",
       "poweroff não está neste cartão",
       "poweroff no está en esta tarjeta" },
-    /* The shutdown curtain.  Two lines, and the blank one between them is part of
-     * the string: the second line is the only place the charger rule is ever told
-     * to somebody looking at the panel. */
-    { "Powering off\n\nIf the board comes back up, unplug the charger and try again.",
-      "Extinction\n\nSi la console redémarre, débranchez le chargeur et réessayez.",
-      "Spegnimento\n\nSe la console si riaccende, scollega il caricatore e riprova.",
-      "Wird ausgeschaltet\n\nWenn das Gerät wieder startet, das Ladegerät abziehen und erneut versuchen.",
-      "A desligar\n\nSe a consola voltar a ligar, desligue o carregador e tente de novo.",
-      "Apagando\n\nSi la consola vuelve a encenderse, desconecta el cargador e inténtalo de nuevo." },
+    /* The shutdown fallback.  mixshutdown replaces it within one frame on the
+     * normal path; it remains the full explanation if that standalone renderer
+     * is absent or cannot open the framebuffer. */
+    { "Powering off",
+      "Extinction",
+      "Spegnimento",
+      "Wird ausgeschaltet",
+      "A desligar",
+      "Apagando" },
+    { "Saving data and stopping services. If the board comes back up, unplug the charger and try again.",
+      "Enregistrement des données et arrêt des services. Si la console redémarre, débranchez le chargeur et réessayez.",
+      "Salvataggio dei dati e arresto dei servizi. Se la console si riaccende, scollega il caricatore e riprova.",
+      "Daten werden gespeichert und Dienste beendet. Wenn das Gerät wieder startet, das Ladegerät abziehen und erneut versuchen.",
+      "A guardar dados e a parar serviços. Se a consola voltar a ligar, desligue o carregador e tente de novo.",
+      "Guardando datos y deteniendo servicios. Si la consola vuelve a encenderse, desconecta el cargador e inténtalo de nuevo." },
 
     /* The USB volume cards.  %1 is the disk's name, which is its filesystem label
      * and therefore not translated -- it is whatever the stick was formatted with. */

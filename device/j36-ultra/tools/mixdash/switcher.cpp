@@ -9,6 +9,7 @@
 
 #include <signal.h>
 
+#include <QMouseEvent>
 #include <QPainter>
 
 #include "joypad.h"
@@ -24,19 +25,15 @@ volatile sig_atomic_t g_requested = 0;
  * and either may arrive while the other is pending. */
 volatile sig_atomic_t g_runRequested = 0;
 
-/*
- * A row is 46 px and the list is at most five of them, which is 230 of the 480
- * this panel has -- so the block, its heading and its footer fit with room
- * either side and the whole thing never needs to scroll.  That is not a
- * coincidence, it is the reason Dashboard caps the number of tasks: a switcher
- * that scrolled would need a scrollbar, a viewport and a scroll position, to
- * choose between four things on a device with 946 MB of memory.
- */
+/* Rows stay card-sized at the usual task count and compress just enough when one
+ * persistent X service contributes several real windows.  Eight useful cards on
+ * a 480-line panel still fit without turning the switcher into a scrolling page. */
 const int RowH = 46;
 const int RowGap = 6;
 const int PanelW = 420;
 const int HeadH = 34;
 const int FootH = 26;
+const int Edge = 16;
 
 }
 
@@ -69,10 +66,9 @@ bool RunRequest::take()
 Switcher::Switcher(QWidget *parent)
     : QWidget(parent)
 {
-    /* The pointer is asleep behind this and the pad drives it, so it wants no
-     * mouse events; and it paints every pixel of itself, so it wants no system
-     * background underneath. */
-    setAttribute(Qt::WA_TransparentForMouseEvents, true);
+    /* The D-pad remains the digital navigation source, while the left stick's
+     * shared dashboard pointer may hover and click the same cards. */
+    setMouseTracking(true);
     setAttribute(Qt::WA_NoSystemBackground, true);
     /* And it says so, which is not the same statement: NoSystemBackground stops
      * Qt filling this widget, OpaquePaintEvent tells Qt it need not paint the
@@ -114,14 +110,36 @@ void Switcher::refresh(const QVector<Entry> &entries)
 int Switcher::listTop() const
 {
     const int n = qMax(1, m_entries.size());
-    const int block = n * RowH + (n - 1) * RowGap;
-    return (height() - block) / 2;
+    const int block = n * rowHeight() + (n - 1) * rowGap();
+    const int available = qMax(0, height() - HeadH - FootH - 2 * Edge);
+    return HeadH + Edge + qMax(0, (available - block) / 2);
+}
+
+int Switcher::rowHeight() const
+{
+    const int n = qMax(1, m_entries.size());
+    const int available = qMax(0, height() - HeadH - FootH - 2 * Edge);
+    return qMax(30, qMin(RowH, (available - (n - 1) * RowGap) / n));
+}
+
+int Switcher::rowGap() const
+{
+    return RowGap;
 }
 
 QRect Switcher::rowRect(int i) const
 {
     const int x = (width() - PanelW) / 2;
-    return QRect(x, listTop() + i * (RowH + RowGap), PanelW, RowH);
+    const int h = rowHeight();
+    return QRect(x, listTop() + i * (h + rowGap()), PanelW, h);
+}
+
+int Switcher::rowAt(const QPoint &point) const
+{
+    for (int i = 0; i < m_entries.size(); ++i)
+        if (rowRect(i).contains(point))
+            return i;
+    return -1;
 }
 
 /*
@@ -200,6 +218,40 @@ bool Switcher::handleNav(int action)
     return true;
 }
 
+void Switcher::mouseMoveEvent(QMouseEvent *event)
+{
+    const int row = rowAt(event->pos());
+    if (row >= 0 && row != m_sel) {
+        m_sel = row;
+        update();
+    }
+    event->accept();
+}
+
+void Switcher::mousePressEvent(QMouseEvent *event)
+{
+    if (event->button() != Qt::LeftButton) {
+        event->accept();
+        return;
+    }
+    const int row = rowAt(event->pos());
+    if (row >= 0 && row != m_sel) {
+        m_sel = row;
+        update();
+    }
+    event->accept();
+}
+
+void Switcher::mouseReleaseEvent(QMouseEvent *event)
+{
+    const int row = rowAt(event->pos());
+    if (event->button() == Qt::LeftButton && row >= 0) {
+        m_sel = row;
+        emit chosen(row);
+    }
+    event->accept();
+}
+
 void Switcher::paintEvent(QPaintEvent *)
 {
     QPainter p(this);
@@ -260,7 +312,9 @@ void Switcher::paintEvent(QPaintEvent *)
      */
     p.setFont(Theme::font(11));
     p.setPen(Theme::ink3());
-    const int footY = top + m_entries.size() * (RowH + RowGap) + 8;
+    const int count = m_entries.size();
+    const int footY = top + count * rowHeight()
+                    + qMax(0, count - 1) * rowGap() + 8;
     p.drawText(QRect(x, footY, PanelW, FootH), Qt::AlignCenter,
                tr("A switches  --  FN steps  --  Start closes  --  B cancels"));
 }

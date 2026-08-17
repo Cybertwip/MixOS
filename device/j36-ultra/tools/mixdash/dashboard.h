@@ -328,9 +328,9 @@ private:
      */
     void takeRunRequests();
     /*
-     * The X server is infrastructure, not a child task.  systemd starts and
-     * parks it before this process; these two methods transfer the framebuffer
-     * to and from that service without ever inserting it into m_tasks.
+     * The X server is infrastructure, not a child task.  systemd starts it on a
+     * private framebuffer before this process; these methods toggle only PadX's
+     * panel presenter without ever inserting the service into m_tasks.
      */
     void setDesktopForeground();
     bool desktopExposed() const;
@@ -513,12 +513,11 @@ private:
     QTimer *m_requestTimer = nullptr;
     /*
      * X lives in j36-xdesktop.service for the whole boot.  It only becomes a
-     * switcher task while a real client has been requested or is still open.
-     * Its saved framebuffer is separate from Task for the same reason: there is
-     * no QProcess owned by this object and no server row while it is idle.
+     * switcher task while a real client has been requested or is still open.  Its
+     * private framebuffer is authoritative even while hidden, so unlike a native
+     * Task it needs no physical-panel snapshot here.
      */
     QTimer *m_desktopStateTimer = nullptr;
-    QByteArray m_desktopFrame;
     bool m_desktopForeground = false;
     bool m_desktopPending = false;
     int m_desktopPendingPolls = 0;

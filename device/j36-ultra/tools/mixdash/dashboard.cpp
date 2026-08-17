@@ -95,10 +95,10 @@ const char kBrowserFallbackUrl[] = "https://duckduckgo.com/";
  * ── THE GRAPHICAL SESSION ────────────────────────────────────────────────────
  *
  * The X server is a boot service, not an application owned by this dashboard.
- * systemd starts j36-xdesktop.service before mixdash and parks its complete cgroup
- * after the server, window manager and pad bridge are ready.  An X client request
- * makes that service a temporary switcher target; an idle server has no card, no
- * page and no task row.
+ * systemd starts j36-xdesktop.service before mixdash.  Xorg renders into a private
+ * framebuffer in /run and PadX parks only the copy to /dev/fb0 after the server,
+ * window manager and input bridge are ready.  An X client request makes that
+ * service a temporary switcher target; an idle server has no card or task row.
  *
  * kXSessionCtl is that pipe: a FIFO the session holds open read-write, taking one
  * line at a time -- `run <command>', `next', `prev', `quit'.  Opened O_WRONLY |
@@ -108,20 +108,15 @@ const char kBrowserFallbackUrl[] = "https://duckduckgo.com/";
  * With the flag, a session that died without tidying up its pipe fails ENXIO in
  * microseconds and the card says so.
  *
- * kXSessionWindows is what the session writes its window list into, one
- * `pid<TAB>title' per line, rewritten by rename so a reader gets the old list or
- * the new one and never half of either.  It is read when the switcher opens, which
- * is why it must be a file and not a request-and-wait.
+ * kXSessionWindows is what the session writes its EWMH window list into, one
+ * `xid<TAB>pid<TAB>active<TAB>title' per line, rewritten by rename so a reader
+ * gets the old list or the new one and never half of either.  The XID keeps
+ * clients that omit optional _NET_WM_PID metadata generic and focusable.
  */
 const char kXSession[] = "/opt/mixos/bin/j36-xsession";
 const char kXSessionCtl[] = "/run/j36/xsession.ctl";
 const char kXSessionWindows[] = "/run/j36/xsession.windows";
-const char kXServicePid[] = "/run/j36/xdesktop.pid";
-/* The freezer is a system-wide kernel interface.  This exact path is therefore
- * part of the safety boundary, not merely a convenient way to find the unit.
- * Accepting `/` (or even system.slice) because a stale pidfile happened to point
- * there would freeze the dashboard and every other userspace process with it. */
-const char kXServiceCgroup[] = "/system.slice/j36-xdesktop.service";
+const char kXSessionPending[] = "/run/j36/xsession.pending";
 /*
  * The supervisor's own pid, written by j36-xsession-main when it comes up and
  * removed on its way out.  It exists so a question can be asked WITHOUT touching
@@ -131,10 +126,13 @@ const char kXServiceCgroup[] = "/system.slice/j36-xdesktop.service";
  */
 const char kXSessionPid[] = "/run/j36/xsession.pid";
 /* j36-padx can be placed outside the launcher's process group by xinit.  Its own
- * pid is therefore the authoritative second half of the X-session hand-off: it
- * self-stops after releasing the pad, and mixdash continues this exact process
- * only after restoring X's frame. */
+ * pid is therefore the endpoint for presentation and pad-ownership requests;
+ * Xorg and its clients themselves are never stopped. */
 const char kPadxPid[] = "/run/j36/padx.pid";
+/* One byte written only after PadX has stopped or started copying X's private
+ * framebuffer to the panel.  This is the ownership fence; no application or X
+ * process is suspended to create it. */
+const char kPadxPresented[] = "/run/j36/xdesktop.presented";
 
 /* Foreground targets below -1 are kept out of m_tasks. */
 const int kDesktopTarget = -2;
@@ -307,30 +305,95 @@ bool sessionSupervisorAlive()
  * repaint, so anything unexpected in it costs a detail line and never a frame.  A
  * missing file is the ordinary case -- there is no session -- and answers empty.
  */
-QStringList sessionWindowNames()
+struct SessionWindow {
+    quint64 xid = 0;
+    qint64 pid = 0;
+    bool active = false;
+    QString name;
+};
+
+QVector<SessionWindow> sessionWindows()
 {
-    QStringList names;
+    QVector<SessionWindow> windows;
     QFile f(QString::fromLatin1(kXSessionWindows));
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
-        return names;
+        return windows;
     /* A window list this long is a list nothing can render anyway, and the file is
      * on tmpfs written by a loop with a cap of four. */
     const QByteArray blob = f.read(4096);
     for (const QByteArray &row : blob.split('\n')) {
+        const int tab1 = row.indexOf('\t');
+        const int tab2 = tab1 >= 0 ? row.indexOf('\t', tab1 + 1) : -1;
+        const int tab3 = tab2 >= 0 ? row.indexOf('\t', tab2 + 1) : -1;
+        if (tab1 < 0 || tab2 < 0 || tab3 < 0)
+            continue;
+        bool xidOk = false;
+        bool pidOk = false;
+        bool activeOk = false;
+        const quint64 xid = row.left(tab1).trimmed().toULongLong(&xidOk);
+        const qint64 pid = row.mid(tab1 + 1, tab2 - tab1 - 1)
+                               .trimmed().toLongLong(&pidOk);
+        const int active = row.mid(tab2 + 1, tab3 - tab2 - 1)
+                               .trimmed().toInt(&activeOk);
+        /* A mapped XID is the generic identity.  _NET_WM_PID is optional, and
+         * filtering on it silently hid perfectly valid SDL/Xlib applications. */
+        if (!xidOk || !pidOk || !activeOk
+            || (xid == 0 && !liveProcess(pid)))
+            continue;
+        const QString name = QString::fromUtf8(row.mid(tab3 + 1)).trimmed();
+        if (!name.isEmpty()) {
+            SessionWindow window;
+            window.xid = xid;
+            window.pid = pid;
+            window.active = active != 0;
+            window.name = name;
+            windows.append(window);
+        }
+    }
+    return windows;
+}
+
+int activeDesktopTarget()
+{
+    const QVector<SessionWindow> windows = sessionWindows();
+    for (int i = 0; i < windows.size(); ++i)
+        if (windows[i].active)
+            return kDesktopTarget - i;
+    return kDesktopTarget;
+}
+
+QStringList sessionWindowNames()
+{
+    QStringList names;
+    const QVector<SessionWindow> windows = sessionWindows();
+    for (const SessionWindow &window : windows)
+        names.append(window.name);
+    return names;
+}
+
+QStringList sessionPendingNames()
+{
+    QStringList names;
+    QFile f(QString::fromLatin1(kXSessionPending));
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return names;
+    const QList<QByteArray> rows = f.read(4096).split('\n');
+    for (const QByteArray &row : rows) {
         const int tab = row.indexOf('\t');
         if (tab < 0)
             continue;
         bool ok = false;
         const qint64 pid = row.left(tab).trimmed().toLongLong(&ok);
-        /* The supervisor rewrites this file every two seconds.  Do not expose
-         * that interval as a selectable, empty X root after a launcher exits. */
-        if (!ok || !liveProcess(pid))
-            continue;
         const QString name = QString::fromUtf8(row.mid(tab + 1)).trimmed();
-        if (!name.isEmpty())
+        if (ok && liveProcess(pid) && !name.isEmpty())
             names.append(name);
     }
     return names;
+}
+
+bool sessionClientPending()
+{
+    return !sessionPendingNames().isEmpty();
 }
 
 /*
@@ -379,150 +442,50 @@ bool signalPidFile(const char *path, int sig)
     return pid > 1 && ::kill((pid_t)pid, sig) == 0;
 }
 
-/* The cgroup freezer stops scheduling PadX, but it does not release an evdev
- * EVIOCGRAB held by its open descriptor and cannot ask X to erase its cursor.
- * A Menu hold performs those two operations before it asks for the switcher.  An
- * automatic return after the last window exits has no Menu event, so mixdash asks
- * PadX for the same parked state and observes its per-process stop before freezing
- * the complete service. */
-bool parkDesktopInput()
+bool desktopPresented(bool wanted)
+{
+    QFile f(QString::fromLatin1(kPadxPresented));
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return false;
+    return f.read(8).trimmed() == (wanted ? QByteArrayLiteral("1")
+                                         : QByteArrayLiteral("0"));
+}
+
+bool waitDesktopPresented(bool wanted)
+{
+    /* The hidden path is normally one XSync plus PadX's at-most-250 ms idle poll;
+     * the visible path also copies one complete frame.  A second is a failure,
+     * not a reason to block the dashboard indefinitely. */
+    for (int i = 0; i < 1000; ++i) {
+        if (desktopPresented(wanted))
+            return true;
+        ::usleep(1000);
+    }
+    return false;
+}
+
+bool setDesktopPresented(bool visible)
 {
     const qint64 pid = livePidFile(kPadxPid);
-    if (pid <= 1)
+    if (pid <= 1) {
+        qWarning() << "mixdash: the window presenter is not running";
         return false;
-    char state = processState(pid);
-    if (state == 'T' || state == 't')
+    }
+    if (desktopPresented(visible))
         return true;
-    if (::kill((pid_t)pid, SIGUSR2) != 0)
-        return false;
-    /* PadX's idle poll is at most 250 ms.  Leave enough room for a cold XSync and
-     * SD-card scheduling without ever turning this into a user-visible wait. */
-    for (int i = 0; i < 750; ++i) {
-        state = processState(pid);
-        if (state == 'T' || state == 't')
-            return true;
-        if (state == '\0' || state == 'Z' || state == 'X' || state == 'x')
-            break;
-        ::usleep(1000);
-    }
-    /* A late park must not strand the foreground with its input bridge stopped.
-     * SIGCONT is harmless if it never reached raise(SIGSTOP). */
-    ::kill((pid_t)pid, SIGCONT);
-    qWarning() << "mixdash: PadX did not acknowledge the park request";
-    return false;
-}
 
-/*
- * The X server used to be a child of mixdash and was stopped by process group.
- * The device log proved that xinit does not keep that promise: xinit and PadX
- * were T while Xorg, matchbox and the session shell were still S.  systemd's
- * service cgroup is the actual ownership boundary, so this reads that boundary
- * from the service leader instead of guessing a collection of pids.
- */
-QString desktopCgroupDir()
-{
-    const qint64 leader = livePidFile(kXServicePid);
-    if (leader <= 0)
-        return QString();
-
-    QFile f(QStringLiteral("/proc/%1/cgroup").arg(leader));
-    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
-        return QString();
-    const QList<QByteArray> rows = f.read(4096).split('\n');
-    for (const QByteArray &row : rows) {
-        if (!row.startsWith("0::"))
-            continue;
-        const QByteArray rel = row.mid(3).trimmed();
-        if (rel != QByteArray(kXServiceCgroup)) {
-            qWarning().noquote()
-                << QStringLiteral("mixdash: refusing window-service cgroup '%1'; expected '%2'")
-                      .arg(QString::fromUtf8(rel), QString::fromLatin1(kXServiceCgroup));
-            return QString();
-        }
-        return QStringLiteral("/sys/fs/cgroup") + QString::fromUtf8(rel);
-    }
-    return QString();
-}
-
-bool writeDesktopFreeze(const QString &dir, bool frozen)
-{
-    const QByteArray path = QFile::encodeName(dir + QStringLiteral("/cgroup.freeze"));
-    const int fd = ::open(path.constData(), O_WRONLY | O_CLOEXEC);
-    if (fd < 0)
-        return false;
-    const char value[2] = { frozen ? '1' : '0', '\n' };
-    const bool ok = ::write(fd, value, sizeof(value)) == (ssize_t)sizeof(value);
-    ::close(fd);
-    return ok;
-}
-
-bool waitDesktopFreeze(const QString &dir, bool frozen)
-{
-    const QByteArray wanted = frozen ? QByteArrayLiteral("frozen 1")
-                                     : QByteArrayLiteral("frozen 0");
-    for (int i = 0; i < 250; ++i) {
-        QFile events(dir + QStringLiteral("/cgroup.events"));
-        if (events.open(QIODevice::ReadOnly | QIODevice::Text)
-            && events.read(2048).contains(wanted)) {
-            return true;
-        }
-        ::usleep(1000);
-    }
-    return false;
-}
-
-bool setDesktopFrozen(bool frozen)
-{
-    const QString dir = desktopCgroupDir();
-    if (dir.isEmpty()) {
-        qWarning() << "mixdash: cannot resolve the window service's safe cgroup";
-        return false;
-    }
-
-    if (frozen && !parkDesktopInput()) {
-        qWarning() << "mixdash: refusing to freeze X while PadX still owns input";
-        return false;
-    }
-
-    if (!writeDesktopFreeze(dir, frozen)) {
+    if (::kill((pid_t)pid, visible ? SIGCONT : SIGUSR2) != 0
+        || !waitDesktopPresented(visible)) {
         qWarning().noquote()
-            << QStringLiteral("mixdash: could not write %1 to %2/cgroup.freeze")
-                  .arg(frozen ? 1 : 0).arg(dir);
-        if (frozen)
-            signalPidFile(kPadxPid, SIGCONT);
+            << QStringLiteral("mixdash: window presenter did not become %1")
+                  .arg(visible ? QStringLiteral("visible")
+                               : QStringLiteral("hidden"));
         return false;
     }
-
-    /* cgroup.freeze changes asynchronously in both directions.  Snapshot or
-     * resume only after the kernel reports that every member crossed the
-     * boundary; otherwise Xorg can still be painting while Qt takes fb0. */
-    if (waitDesktopFreeze(dir, frozen)) {
-        if (!frozen) {
-            /* PadX deliberately SIGSTOPs itself before handing the pad back.  A
-             * cgroup thaw does not clear that per-process stop. */
-            signalPidFile(kPadxPid, SIGCONT);
-        }
-        qInfo().noquote()
-            << QStringLiteral("mixdash: window service %1 (%2)")
-                  .arg(frozen ? QStringLiteral("frozen")
-                              : QStringLiteral("thawed"), dir);
-        return true;
-    }
-
-    /* Keep a failed hand-off on the side that owned the panel before this call.
-     * A timeout followed by a late transition is otherwise worse than a plain
-     * failure: the caller could paint because it believed X stayed frozen while
-     * the kernel completed the old thaw request underneath it.  The last write
-     * wins, and waiting again makes the rollback an observed state. */
-    const bool rolledBack = writeDesktopFreeze(dir, !frozen)
-                            && waitDesktopFreeze(dir, !frozen);
-    if (frozen && rolledBack)
-        signalPidFile(kPadxPid, SIGCONT);
-    qWarning().noquote()
-        << QStringLiteral("mixdash: timed out waiting for window-service %1; rollback %2")
-              .arg(frozen ? QStringLiteral("freeze") : QStringLiteral("thaw"),
-                   rolledBack ? QStringLiteral("succeeded") : QStringLiteral("failed"));
-    return false;
+    qInfo().noquote()
+        << QStringLiteral("mixdash: window presentation %1; clients stayed live")
+              .arg(visible ? QStringLiteral("enabled") : QStringLiteral("parked"));
+    return true;
 }
 
 /*
@@ -2197,16 +2160,22 @@ void Dashboard::pollDesktopService()
 {
     const bool alive = sessionSupervisorAlive();
     const QStringList windows = alive ? sessionWindowNames() : QStringList();
+    const bool clientStarting = alive && sessionClientPending();
     if (alive && m_desktopPending) {
         if (!windows.isEmpty()) {
             m_desktopPending = false;
             m_desktopPendingPolls = 0;
+        } else if (clientStarting) {
+            /* A large generic client may still be faulting executable pages from
+             * the SD card.  Keep its X loading background in front for as long as
+             * the recorded launcher is genuinely alive, with no browser/game
+             * allowlist and no arbitrary startup deadline. */
+            m_desktopPendingPolls = 0;
         } else if (++m_desktopPendingPolls >= 20) {
-            /* start_client records a process immediately, before its first X
-             * window maps.  Ten seconds with no record therefore means the
-             * request failed before exec (or exited immediately), not merely a
-             * slow Firefox startup.  Do not leave the server masquerading as an
-             * application after that failed request. */
+            /* Give the FIFO and launcher up to ten seconds to establish their
+             * pending record.  Once one exists, the branch above has no deadline;
+             * reaching this point means the request failed before exec or exited
+             * immediately, not merely that a large application is cold. */
             m_desktopPending = false;
             m_desktopPendingPolls = 0;
         }
@@ -2215,7 +2184,6 @@ void Dashboard::pollDesktopService()
     if (!alive) {
         m_desktopPending = false;
         m_desktopPendingPolls = 0;
-        m_desktopFrame.clear();
         if (m_desktopForeground) {
             /* The service no longer owns either the framebuffer or an evdev
              * grab.  Recover the shell without waiting for a QProcess signal --
@@ -2235,7 +2203,6 @@ void Dashboard::pollDesktopService()
          * there must never be an empty root presented as a Desktop app. */
         if (m_desktopForeground)
             setForeground(-1);
-        m_desktopFrame.clear();
     }
 
     if (alive != m_desktopWasAlive) {
@@ -2282,14 +2249,13 @@ void Dashboard::launchWindowed(const QString &title, const QString &exe,
      * device in the out-of-memory killer, and the frame on the glass while that
      * happens is the desktop's old one, so it reads as a freeze.
      *
-     * The name is the one the session writes into its window list, which is the
-     * program's own name with the j36- prefix off -- see client_title() in
-     * j36-xsession-main.  Matching on it rather than on the whole command line is
-     * deliberate: j36-browser opened on one URL and then on another is still the
-     * one browser.
+     * The name is the launcher's pending record, which is the program's own name
+     * with the j36- prefix off -- see client_title() in j36-xsession-main.  X's
+     * mapped-window titles are page titles and cannot answer this question;
+     * j36-browser opened on another URL is still the one browser process.
      */
     if (sessionSupervisorAlive()
-        && sessionWindowNames().contains(windowNameFor(exe))) {
+        && sessionPendingNames().contains(windowNameFor(exe))) {
         toast(tr("%1 is already open").arg(title));
         setDesktopForeground();
         return;
@@ -2622,13 +2588,14 @@ void Dashboard::setDesktopForeground()
         repaint(m_pointer->geometry());
 
     setUpdatesEnabled(false);
-    Panel::restore(m_desktopFrame);
-    m_desktopFrame.clear();
+    /* PadX publishes a complete private-X frame as part of the acknowledged
+     * transition below.  Restoring a stale physical-frame snapshot here was the
+     * source of the dashboard-through-Firefox "dirty" image after a crash. */
     m_fg = -1;
     m_desktopForeground = true;
     m_pad->setWatching(true);
 
-    if (!setDesktopFrozen(false)) {
+    if (!setDesktopPresented(true)) {
         m_desktopForeground = false;
         m_pad->setWatching(false);
         setUpdatesEnabled(true);
@@ -2640,16 +2607,17 @@ void Dashboard::setDesktopForeground()
 }
 
 /*
- * Freeze whatever is in front, if it is a task.  Split out of setForeground()
- * because launch() needs exactly this half and none of the rest: it is on its way
- * to a program that does not exist yet, so there is nothing to hand the panel to.
+ * Park whatever is in front.  Native tasks are stopped; the X service only stops
+ * presenting its private framebuffer and its clients keep running.  Split out of
+ * setForeground() because launch() needs exactly this half and none of the rest.
  */
 bool Dashboard::stopForeground()
 {
     if (m_desktopForeground) {
-        if (!setDesktopFrozen(true))
+        if (!setDesktopPresented(false))
             return false;
-        m_desktopFrame = Panel::grab();
+        /* X keeps its authoritative frame in /run.  Never snapshot the physical
+         * panel here: it may contain a dashboard transition and is not X state. */
         m_desktopForeground = false;
         m_fg = -1;
         return true;
@@ -2745,19 +2713,17 @@ void Dashboard::showSwitcher()
 
     /* Remembered before anything is stopped, because stopForeground() clears
      * m_fg and cancelling has to put back what was actually in front. */
-    m_switcherWas = m_desktopForeground ? kDesktopTarget : m_fg;
+    m_switcherWas = m_desktopForeground ? activeDesktopTarget() : m_fg;
 
-    /* The switcher is driven entirely by buttons.  If it is opened from the
-     * dashboard itself there may still be a framebuffer cursor awake; hiding it
-     * before the full-panel repaint keeps that cursor from sitting on top of the
-     * task list.  A graphical child has its own X cursor, which j36-padx hides
-     * before it asks us for this switcher. */
+    /* Start with no cursor baked into the full-panel repaint.  The D-pad can drive
+     * the list immediately; moving the left stick wakes this same shared pointer
+     * at the coordinate PadX just persisted and enables hover/click selection. */
     m_pointer->sleep();
     if (!stopForeground()) {
-        /* A graphical bridge stops itself before asking for this overlay.  If
-         * its ownership group could not be stopped safely, put that bridge back
-         * and keep the existing foreground instead of painting over a writer. */
-        if (m_switcherWas == kDesktopTarget)
+        /* If the presenter did not acknowledge the ownership transfer, ask it
+         * to resume and keep the existing foreground instead of painting across
+         * an unresolved writer. */
+        if (m_switcherWas <= kDesktopTarget)
             signalPidFile(kPadxPid, SIGCONT);
         else if (m_switcherWas >= 0 && m_switcherWas < m_tasks.size())
             signalTask(m_tasks[m_switcherWas].pgid, SIGCONT);
@@ -2801,14 +2767,30 @@ void Dashboard::showSwitcher()
 
 void Dashboard::setSwitcherTarget(int target)
 {
-    if (target == kDesktopTarget) {
+    if (target <= kDesktopTarget) {
         /* If the last client exited while the switcher was opening, there is no
          * application to return to.  Keep the idle server parked and reveal the
          * dashboard instead of exposing an empty X root as an app. */
-        if (desktopExposed())
+        if (desktopExposed()) {
+            const QVector<SessionWindow> windows = sessionWindows();
+            const int index = kDesktopTarget - target;
+            if (index >= 0 && index < windows.size()) {
+                /* The service never paused, so its control loop can focus the
+                 * chosen mapped window while the dashboard still covers it. */
+                if (windows[index].xid != 0) {
+                    writeSessionControl(QStringLiteral("focus-window %1")
+                                            .arg(windows[index].xid));
+                } else {
+                    /* Compatibility fallback for a window manager which did not
+                     * publish its EWMH client list. */
+                    writeSessionControl(QStringLiteral("focus %1")
+                                            .arg(windows[index].pid));
+                }
+            }
             setDesktopForeground();
-        else
+        } else {
             setForeground(-1);
+        }
         return;
     }
     setForeground(target);
@@ -2820,22 +2802,29 @@ int Dashboard::switcherTarget(int row) const
         return -1;
     if (row <= m_tasks.size())
         return row - 1;
-    if (row == m_tasks.size() + 1 && desktopExposed())
-        return kDesktopTarget;
+    const int desktopRow = row - m_tasks.size() - 1;
+    if (desktopRow >= 0 && desktopExposed()) {
+        const int count = qMax(1, sessionWindows().size());
+        if (desktopRow < count)
+            return kDesktopTarget - desktopRow;
+    }
     return -1;
 }
 
 int Dashboard::switcherRow(int target) const
 {
-    if (target == kDesktopTarget)
-        return desktopExposed() ? m_tasks.size() + 1 : 0;
+    if (target <= kDesktopTarget) {
+        const int row = m_tasks.size() + 1 + (kDesktopTarget - target);
+        return desktopExposed() && row < switcherRows().size() ? row : 0;
+    }
     if (target >= 0 && target < m_tasks.size())
         return target + 1;
     return 0;
 }
 
-/* Row 0 is the dashboard, ordinary child tasks follow, and the window service is
- * appended only while it owns real clients (or one is being launched). */
+/* Row 0 is the dashboard, ordinary child tasks follow, then one small selectable
+ * card per mapped X window.  A single loading card occupies that space before the
+ * first window maps; the persistent service itself never gets a row. */
 QVector<Switcher::Entry> Dashboard::switcherRows() const
 {
     QVector<Switcher::Entry> rows;
@@ -2866,27 +2855,28 @@ QVector<Switcher::Entry> Dashboard::switcherRows() const
     }
 
     if (desktopExposed()) {
-        Switcher::Entry e;
-        e.title = tr("Windowed apps");
-        const QString state = (m_desktopForeground
-                               || m_switcherWas == kDesktopTarget)
-                                  ? tr("in front") : tr("waiting");
-        const QStringList windows = sessionWindowNames();
-        QString what;
-        if (windows.isEmpty())
-            what = tr("opening a window");
-        else if (windows.size() <= 3)
-            what = windows.join(QStringLiteral(", "));
-        else
-            what = tr("%1 and %2 more")
-                       .arg(windows.mid(0, 3).join(QStringLiteral(", ")))
-                       .arg(windows.size() - 3);
-        e.detail = tr("%1 -- %2").arg(state, what);
-        /* START closes application processes.  This row represents a permanent
-         * service and therefore cannot be closed as a task.  Individual windows
-         * retain their title-bar close button. */
-        e.closable = false;
-        rows.append(e);
+        const QVector<SessionWindow> windows = sessionWindows();
+        if (windows.isEmpty()) {
+            Switcher::Entry e;
+            e.title = tr("Windowed app");
+            e.detail = tr("opening a window");
+            e.closable = false;
+            rows.append(e);
+        } else {
+            for (int i = 0; i < windows.size(); ++i) {
+                Switcher::Entry e;
+                e.title = windows[i].name;
+                e.detail = (m_desktopForeground
+                            && (windows[i].active
+                                || m_switcherWas == kDesktopTarget - i))
+                               ? tr("in front") : tr("waiting");
+                /* START operates on native process groups.  X windows retain
+                 * their title-bar close button and are focused by choosing the
+                 * card with D-pad/A or the shared pointer. */
+                e.closable = false;
+                rows.append(e);
+            }
+        }
     }
     return rows;
 }
@@ -2910,10 +2900,12 @@ void Dashboard::refreshSwitcher()
  * and it is most of the reason a power-off on this board has ever been reported
  * as one.
  *
- * So: a curtain that says what is happening, painted and flushed BEFORE the
- * request goes out; the pad and the pointer put away for good, because there is
- * nothing left to press; and the process started detached, because nothing here
- * wants its exit code and there is no event loop to come back to.
+ * So: a styled fallback frame painted and flushed BEFORE the request goes out;
+ * the pad and the pointer put away for good, because there is nothing left to
+ * press; then a dedicated mixshutdown service which confirms its first animated
+ * frame before this process asks PID 1 to power off.  It has its own cgroup and
+ * DefaultDependencies=no, so stopping mixdash does not stop the picture halfway
+ * through filesystem shutdown.
  *
  * The second line of the curtain is not padding.  There is no power-path FET on
  * this PMIC, so VBAT is VSYS: with a charger in, VBUS holds the system rail up
@@ -2934,12 +2926,31 @@ void Dashboard::powerOff()
     m_toastTimer->stop();
     m_toast->hide();
 
+    /* Nothing after this point is interactive.  Put the dashboard cursor away
+     * before the fallback frame is flushed, so it cannot be baked into the
+     * picture the standalone renderer replaces. */
+    m_pad->disconnect(this);
+    m_pad->setWatching(true);
+    m_pointer->sleep();
+
     QLabel *curtain = new QLabel(this);
     curtain->setAlignment(Qt::AlignCenter);
     curtain->setWordWrap(true);
+    curtain->setTextFormat(Qt::RichText);
     curtain->setStyleSheet(
-        "QLabel { background: #0A0B10; color: #E8EAF2; font-size: 17px; }");
-    curtain->setText(tr("Powering off\n\nIf the board comes back up, unplug the charger and try again."));
+        "QLabel {"
+        " background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+        " stop:0 #111A2A, stop:0.5 #0A0D14, stop:1 #07080D);"
+        " color: #E8EAF2; font-size: 15px; border: 1px solid #25344A;"
+        " padding: 44px;"
+        " }");
+    curtain->setText(
+        QStringLiteral("<div style='color:#54A8FF;font-size:13px'>MIXOS</div>"
+                       "<div style='font-size:25px;margin-top:18px'>%1</div>"
+                       "<div style='color:#AAB4C4;font-size:13px;margin-top:18px'>%2</div>")
+            .arg(tr("Powering off").toHtmlEscaped(),
+                 tr("Saving data and stopping services. If the board comes back up, "
+                    "unplug the charger and try again.").toHtmlEscaped()));
     curtain->setGeometry(rect());
     curtain->show();
     curtain->raise();
@@ -2948,7 +2959,7 @@ void Dashboard::powerOff()
     QCoreApplication::processEvents();
 
     /*
-     * THE PAD IS DISCONNECTED, not suspended.  There is no setSuspended() any more
+     * THE PAD WAS DISCONNECTED, not suspended.  There is no setSuspended() any more
      * -- watch mode keeps reading, because a task switcher whose button is not
      * read is a switcher nobody can reach -- and "keeps reading" is exactly what
      * this one path does not want.  Everything after this line is a machine on its
@@ -2959,9 +2970,31 @@ void Dashboard::powerOff()
      * Severed and not re-connected, because this function has no other side: the
      * request has gone to PID 1 and the only way back is a power cycle.
      */
-    m_pad->disconnect(this);
-    m_pad->setWatching(true);
-    m_pointer->sleep();
+    setUpdatesEnabled(false);
+
+    /* The renderer reads a regular append-only control file.  Writing it before
+     * systemctl starts the unit means its very first animated frame already says
+     * what is happening; there is no network, disk probe or dashboard event loop
+     * in this path. */
+    QFile control(QStringLiteral("/run/j36/mixshutdown.ctl"));
+    if (control.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+        control.write("stage:Powering off\n");
+        control.write("detail:Saving data and stopping services\n");
+        control.write("progress:100\n");
+        control.close();
+    }
+
+    const QString systemctl = firstExisting(QStringList() << "/bin/systemctl"
+                                                           << "/usr/bin/systemctl");
+    if (!systemctl.isEmpty()
+        && QFileInfo(QStringLiteral("/run/systemd/system/j36-mixshutdown.service")).exists()) {
+        const int rc = QProcess::execute(systemctl,
+                                         QStringList() << "start"
+                                                       << "j36-mixshutdown.service");
+        if (rc != 0)
+            qWarning() << "mixdash: mixshutdown service failed with" << rc;
+    }
+
     QProcess::startDetached(exe, QStringList());
 }
 
@@ -3377,6 +3410,20 @@ bool Dashboard::eventFilter(QObject *watched, QEvent *event)
     if (event->type() == QEvent::KeyPress) {
         QKeyEvent *key = static_cast<QKeyEvent *>(event);
 
+        /* The on-screen keyboard is navigated by D-pad/arrow keys.  Give those
+         * keys to its navigation path before the raw-key path below: forwarding
+         * Left/Right to Keyboard::keyPressed moved the text caret instead, so the
+         * next selected character appeared to replace or erase existing input. */
+        const bool keyboardVisible = m_keyboard->isVisible();
+        const int keyboardNav = navForKey(key->key());
+        if (keyboardVisible
+            && (keyboardNav == Joypad::NavUp || keyboardNav == Joypad::NavDown
+                || keyboardNav == Joypad::NavLeft
+                || keyboardNav == Joypad::NavRight)) {
+            onNav(keyboardNav, key->isAutoRepeat());
+            return true;
+        }
+
         /*
          * A page that wants raw keys gets them here too, so a workstation build can
          * type into the Terminal.  Qt has already mapped the scan code to a Qt key,
@@ -3385,7 +3432,7 @@ bool Dashboard::eventFilter(QObject *watched, QEvent *event)
          * used since it had a keyboard driver at all.
          */
         PageWidget *page = current();
-        const bool toKeyboard = m_keyboard->isVisible();
+        const bool toKeyboard = keyboardVisible;
         /* Escape is never forwarded: on a workstation it is the only way out of a
          * page that has asked for every other key, and a terminal with no way out
          * of it is a terminal you reboot the machine to leave. */

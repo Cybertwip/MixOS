@@ -4776,6 +4776,34 @@ mount_card() {
     return 1
 }
 
+# A mix-only update can land on a card whose ROOTFS predates the two-partition
+# layout.  Its /etc/fstab still asks systemd for LABEL=DATA at /home/virtua even
+# though p3 no longer exists; the device log showed the resulting 90-second device
+# timeout holding every WorkingDirectory=/home/virtua service, including audio and
+# the dashboard.  Do not edit the shared rootfs.  Mask only that generated mount in
+# /run, and only when the fstab asks for DATA and this SD card has no p3 at all.
+mask_missing_legacy_home() {
+    [ -r /newroot/etc/fstab ] || return 0
+    legacy_mp=""
+    while read -r fs_spec fs_mp fs_rest; do
+        case "$fs_spec" in
+            LABEL=DATA) legacy_mp="$fs_mp"; break ;;
+        esac
+    done < /newroot/etc/fstab
+    [ "$legacy_mp" = /home/virtua ] || return 0
+
+    case "$rootdev" in
+        /dev/mmcblk*p*) data_dev="${rootdev%p*}p3" ;;
+        *) return 0 ;;
+    esac
+    [ -b "$data_dev" ] && return 0
+
+    mkdir -p /newroot/run/systemd/system
+    if ln -sfn /dev/null /newroot/run/systemd/system/home-virtua.mount; then
+        say "storage: masked stale LABEL=DATA home mount; /home/virtua is on ROOTFS"
+    fi
+}
+
 setup_dash() {
     if [ -z "$rootdev" ]; then
         say "dash: no rootfs was found, so there is no systemd to configure"
@@ -4799,8 +4827,9 @@ setup_dash() {
     # The card, before the unit, so that the dashboard's Files page has it from its
     # first paint rather than after a rescan the operator has no way to trigger.
     mount_card
+    mask_missing_legacy_home
 
-    # ── WHERE MESA KEEPS ITS COMPILED SHADERS, WHICH TWO UNITS HAVE TO AGREE ON ──
+    # ── WHERE MESA KEEPS ITS COMPILED SHADERS ──────────────────────────────────
     #
     # WHAT WAS WRONG, AND IT IS WORTH BEING PRECISE ABOUT IT.  j36-glwarm.service
     # further down set a cache directory on itself and nothing else did.  So the
@@ -4922,6 +4951,12 @@ WorkingDirectory=$mixos_root/bin
 # its ExecStartPre.  Re-running on every restart attempt is harmless by design.
 ExecStartPre=-/bin/sh -c '{ echo "stage:Starting the dashboard"; echo "progress:100"; } >> /dev/.mixsplash'
 ExecStart=$mixos_root/bin/mixdash
+# Native framebuffer tasks are children of this unit and may be SIGSTOPped in the
+# switcher.  They cannot consume SIGTERM while stopped, but SIGKILL does not need
+# them scheduled.  Bound that path so one hung game cannot hold poweroff for PID
+# 1's 90-second default.
+KillMode=control-group
+TimeoutStopSec=5
 # ── the backstop for the dashboard that never gets as far as its own code ────
 #
 # dismissSplash() covers every way mixdash can fail once it is running, because it
@@ -5071,6 +5106,64 @@ UNITFC
         say "      own config and may build a cache -- watch for a long \"fonts\" phase"
     fi
 
+    # ── THE ROOTFS SHUTDOWN SPLASH ───────────────────────────────────────────
+    #
+    # The initramfs mixsplash can now remain the panel owner throughout X startup:
+    # j36-xfb redirects Xorg into /run and its presenter begins parked.  mixdash's
+    # first complete paint dismisses that original process, so no second hand-off
+    # splash is needed.  The same renderer is staged under its mixshutdown name in
+    # a separate service cgroup for the other end of the boot, while systemd tears
+    # the dashboard and filesystems down.
+    #
+    # A successful exec is not a visible frame.  mixshutdown writes a marker only
+    # after its first complete blit, and this waiter turns that into the boundary
+    # the dashboard observes before asking PID 1 to power off.
+    if [ -x "/newroot$mixos_root/bin/mixsplash" ] && \
+       [ -x "/newroot$mixos_root/bin/mixshutdown" ] && \
+       [ -f "/newroot$mixos_root/share/mixsplash/background.mixspl" ]; then
+        mkdir -p /newroot/run/j36/bin
+        cat > /newroot/run/j36/bin/j36-wait-splash <<'WAITSPLASH'
+#!/bin/sh
+marker="${1:-}"
+[ -n "$marker" ] || exit 2
+n=0
+while [ "$n" -lt 80 ]; do
+    [ -e "$marker" ] && exit 0
+    sleep 0.05
+    n=$((n + 1))
+done
+echo "mixsplash: no complete frame after 4 seconds ($marker)" >&2
+exit 1
+WAITSPLASH
+        chmod 0755 /newroot/run/j36/bin/j36-wait-splash
+
+        cat > /newroot/run/systemd/system/j36-mixshutdown.service <<UNITMIXSHUTDOWN
+# Written by the J36 Ultra initramfs, into a tmpfs.
+[Unit]
+Description=MixOS animated shutdown screen
+DefaultDependencies=no
+After=local-fs.target
+Before=shutdown.target umount.target final.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStartPre=-/bin/rm -f /run/j36/mixshutdown.ready
+ExecStart=$mixos_root/bin/mixshutdown -i $mixos_root/share/mixsplash/background.mixspl -f /run/j36/mixshutdown.ctl -s "Powering off" -r /run/j36/mixshutdown.ready -t 0 -T 0 -k
+ExecStartPost=/run/j36/bin/j36-wait-splash /run/j36/mixshutdown.ready
+Restart=no
+TimeoutStartSec=5
+TimeoutStopSec=1
+OOMScoreAdjust=-900
+StandardOutput=journal
+StandardError=journal
+UNITMIXSHUTDOWN
+        say "dash: standalone animated shutdown renderer is ready"
+    else
+        say "dash: no rootfs splash renderer; hand-off and shutdown use the dashboard fallback"
+    fi
+
     # ── X IS A SERVICE, NOT A DASHBOARD CHILD ────────────────────────────────
     #
     # The old dashboard launched j36-xsession as one of its QProcess tasks.  That
@@ -5080,106 +5173,105 @@ UNITFC
     # were all still runnable -- exactly the set of processes that can overwrite
     # a linuxfb dashboard and make it look frozen.
     #
-    # systemd already has the boundary we need: a service cgroup contains every
-    # descendant regardless of process group.  Start it before mixdash, wait until
-    # PadX says XTEST and the input bridge are ready, then freeze that complete
-    # cgroup.  mixdash only thaws it when a real client is requested.  There is no
-    # Desktop card and an idle server never appears in the task switcher.
+    # Xorg now maps a private framebuffer in /run through j36-xfb.so.  PadX is the
+    # sole presenter and copies it to /dev/fb0 only while a window is foreground.
+    # Parking that copy keeps Xorg, Firefox and every other client scheduled, so
+    # task switching cannot trip compositor watchdogs or delay SIGTERM at shutdown.
+    # There is no Desktop card and an idle server never appears in the switcher.
     xserver_on_card=0
-    for xserver in /usr/bin/Xorg /usr/lib/xorg/Xorg /usr/bin/X; do
+    for xserver in /usr/lib/xorg/Xorg /usr/bin/Xorg /usr/bin/X; do
         [ -x "/newroot$xserver" ] && xserver_on_card=1
     done
     if [ -x "/newroot$mixos_root/bin/j36-xsession" ] && \
+       [ -x "/newroot$mixos_root/bin/j36-Xorg" ] && \
+       [ -r "/newroot$mixos_root/lib/j36-xfb.so" ] && \
        [ -x /newroot/usr/bin/xinit ] && [ "$xserver_on_card" -eq 1 ]; then
         mkdir -p /newroot/run/j36/bin
+        cat > /newroot/run/j36/bin/j36-xwarm <<'XDESKTOPWARM'
+#!/bin/sh
+# Fault the small persistent-X working set in while the boot splash can still
+# animate.  Once Xorg opens fb0 the splash has to stop, so every page read before
+# that ownership boundary is time removed from the only necessarily static gap.
+root="${MIXOS_ROOT:-/opt/mixos}"
+
+warm_file() {
+    [ -f "$1" ] && [ -r "$1" ] || return 0
+    dd if="$1" of=/dev/null bs=262144 2>/dev/null || true
+}
+
+warm_binary() {
+    file="$1"
+    warm_file "$file"
+    command -v ldd >/dev/null 2>&1 || return 0
+    ldd "$file" 2>/dev/null | while read -r first second third rest; do
+        case "$first" in /*) warm_file "$first" ;; esac
+        case "$third" in /*) warm_file "$third" ;; esac
+    done
+}
+
+for file in /usr/lib/xorg/Xorg /usr/bin/Xorg /usr/bin/xinit \
+            /usr/bin/xkbcomp /usr/bin/matchbox-window-manager \
+            "$root/bin/j36-padx"; do
+    [ -x "$file" ] && warm_binary "$file"
+done
+
+for file in /usr/lib/xorg/modules/libfb.so \
+            /usr/lib/xorg/modules/libshadow.so \
+            /usr/lib/xorg/modules/libfbdevhw.so \
+            /usr/lib/xorg/modules/drivers/fbdev_drv.so \
+            /usr/lib/xorg/modules/input/libinput_drv.so \
+            /usr/share/fonts/X11/misc/fonts.dir; do
+    warm_file "$file"
+done
+exit 0
+XDESKTOPWARM
+        chmod 0755 /newroot/run/j36/bin/j36-xwarm
+
         cat > /newroot/run/j36/bin/j36-xdesktop-park <<'XDESKTOPPARK'
 #!/bin/sh
-# Wait for the server's input bridge to reach its deliberately ungrabbed,
-# self-stopped boot state, then freeze every process in the systemd cgroup.
+# Wait until Xorg is rendering only into its private /run framebuffer and PadX
+# has acknowledged that no scanline is being copied to the physical panel.
 set -u
 
 ready=/run/j36/padx.ready
 padpid=/run/j36/padx.pid
-leaderfile=/run/j36/xdesktop.pid
+presented=/run/j36/xdesktop.presented
 parked=/run/j36/xdesktop.parked
 rm -f "$parked"
 
 fail_park() {
     echo "j36-xdesktop: $*" >&2
-    # An unparked Xorg and linuxfb mixdash may never share fb0.  If the ownership
-    # boundary cannot be proved, leave windowed apps unavailable for this boot
-    # instead of starting the dashboard under a live framebuffer writer.
+    # A service without the interposer/presenter must never be allowed to become
+    # the dashboard's second /dev/fb0 writer.
     systemctl stop j36-xdesktop.service >/dev/null 2>&1 || true
     exit 1
 }
 
 n=0
+asked=0
 while [ "$n" -lt 900 ]; do
-    if [ -f "$ready" ] && [ -r "$padpid" ] && [ -r "$leaderfile" ]; then
-        pp=""; read -r pp < "$padpid" || pp=""
-        case "$pp" in
-            ''|*[!0-9]*) ;;
-            *)
-                # --start-parked writes ready after releasing the grab and then
-                # SIGSTOPs itself.  Waiting for T closes the one-instruction race
-                # between those two operations before the cgroup is frozen.
-                if grep -q '^State:.*T' "/proc/$pp/status" 2>/dev/null; then
-                    break
+    pp=""
+    [ -r "$padpid" ] && read -r pp < "$padpid" || pp=""
+    case "$pp" in
+        ''|*[!0-9]*) ;;
+        *)
+            if kill -0 "$pp" 2>/dev/null && [ -f "$ready" ]; then
+                if [ "$(sed -n '1p' "$presented" 2>/dev/null)" = 0 ]; then
+                    printf 'hidden private framebuffer\n' > "$parked"
+                    exit 0
                 fi
-                ;;
-        esac
-    fi
+                if [ "$asked" -eq 0 ]; then
+                    kill -USR2 "$pp" 2>/dev/null || true
+                    asked=1
+                fi
+            fi
+            ;;
+    esac
     sleep 0.1
     n=$((n + 1))
 done
 
-if [ "$n" -ge 900 ]; then
-    fail_park "server did not become ready in 90 seconds"
-fi
-
-leader=""; read -r leader < "$leaderfile" || leader=""
-case "$leader" in
-    ''|*[!0-9]*)
-        fail_park "invalid service leader pid"
-        ;;
-esac
-
-cg=""
-while IFS=: read -r hierarchy controllers path; do
-    if [ "$hierarchy" = 0 ] && [ -z "$controllers" ]; then
-        cg="$path"
-        break
-    fi
-done < "/proc/$leader/cgroup"
-
-case "$cg" in
-    /system.slice/j36-xdesktop.service)
-        freezer="/sys/fs/cgroup$cg/cgroup.freeze"
-        ;;
-    *)
-        fail_park "refusing unsafe service cgroup '$cg'"
-        ;;
-esac
-
-if [ -w "$freezer" ]; then
-    printf '1\n' > "$freezer"
-    n=0
-    while [ "$n" -lt 100 ]; do
-        grep -q '^frozen 1$' "/sys/fs/cgroup$cg/cgroup.events" 2>/dev/null && break
-        sleep 0.01
-        n=$((n + 1))
-    done
-    if [ "$n" -ge 100 ]; then
-        # Let systemd's stop job schedule the service before asking it to die.
-        printf '0\n' > "$freezer" 2>/dev/null || true
-        fail_park "cgroup freezer did not quiesce the service"
-    fi
-else
-    fail_park "the complete service cgroup has no writable freezer"
-fi
-
-printf 'frozen %s\n' "$cg" > "$parked"
-exit 0
+fail_park "private framebuffer presenter did not become ready in 90 seconds"
 XDESKTOPPARK
         chmod 0755 /newroot/run/j36/bin/j36-xdesktop-park
 
@@ -5189,31 +5281,33 @@ XDESKTOPPARK
 Description=Persistent X window service for MixOS
 Documentation=file:///opt/mixos/README.txt
 After=systemd-user-sessions.service
-# If the dashboard crashes while X owns the panel, a replacement dashboard must
-# never start underneath that still-running server.  Stop this cgroup with the
-# shell; its next start dependency creates and parks a clean service first.
-PartOf=mixdash.service
+# The server is infrastructure, not a dashboard child.  A dashboard restart leaves
+# clients alive on their private frame; the replacement parks presentation before
+# it paints and can expose those same windows again.
 
 [Service]
 Type=simple
 User=root
 Group=root
 WorkingDirectory=$mixos_root/bin
-# Stop the splash before X first touches the shared framebuffer.  mixdash starts
-# only after the service has been parked, so none of these three ever draws over
-# another one.
-ExecStartPre=-/bin/sh -c ': > /dev/.mixsplash-done; { echo "stage:Starting window services"; echo "progress:100"; echo quit; } >> /dev/.mixsplash'
-ExecStartPre=/bin/sleep 0.25
+# Read Xorg, its direct modules and its small helpers while mixsplash is still the
+# only framebuffer owner and is free to animate.  Stop it only after those cold SD
+# reads have completed; X itself is the remaining non-overlappable interval.
+ExecStartPre=-/bin/sh -c '{ echo "stage:Starting window services"; echo "detail:Preparing the background server"; echo "progress:96"; } >> /dev/.mixsplash'
+ExecStartPre=/run/j36/bin/j36-xwarm
+ExecStartPre=-/bin/sh -c '{ echo "detail:Starting the private window framebuffer"; echo "progress:98"; } >> /dev/.mixsplash'
 ExecStart=$mixos_root/bin/j36-xsession
-ExecStopPost=-/bin/rm -f /run/j36/xdesktop.pid /run/j36/xdesktop.parked /run/j36/padx.ready
+ExecStopPost=-/bin/rm -f /run/j36/xdesktop.pid /run/j36/xdesktop.parked /run/j36/padx.ready /run/j36/xdesktop.presented /run/j36/xframebuffer
 Environment="J36_XSERVICE=1"
+Environment="J36_XFB_PRESENT=1"
+Environment="MIXOS_ROOT=$mixos_root"
 Environment="LD_LIBRARY_PATH=/run/j36/gl:$mixos_root/qt/lib"
 Environment="MESA_SHADER_CACHE_DIR=$gl_cache"
 Environment="XDG_CACHE_HOME=$gl_cache"
 Environment="MESA_SHADER_CACHE_MAX_SIZE=32M"
 OOMScoreAdjust=300
 KillMode=control-group
-TimeoutStopSec=10
+TimeoutStopSec=4
 Restart=no
 StandardOutput=journal
 StandardError=journal
@@ -5222,7 +5316,7 @@ UNITXDESKTOP
         cat > /newroot/run/systemd/system/j36-xdesktop-park.service <<'UNITXDESKTOPPARK'
 # Written by the J36 Ultra initramfs, into a tmpfs.
 [Unit]
-Description=Park the MixOS X service before the dashboard takes the panel
+Description=Park MixOS X presentation before the dashboard takes the panel
 Requires=j36-xdesktop.service
 After=j36-xdesktop.service
 PartOf=mixdash.service
@@ -5239,7 +5333,8 @@ UNITXDESKTOPPARK
 Wants=j36-xdesktop-park.service
 After=j36-xdesktop-park.service
 UNITXDASHORDER
-        say "dash: X is a persistent service, parked before mixdash starts"
+        say "dash: the original boot splash stays animated while private X starts"
+        say "dash: X stays live on a private framebuffer and is parked before mixdash starts"
     else
         say "dash: no complete X stack; no window service unit was written"
     fi
@@ -5510,76 +5605,12 @@ UNITDBGREPLAY
         say "      /run/j36/eglprobe -f from a shell afterwards"
     fi
 
-    # ── WARMING EGL, WHICH IS THE SAME BINARY WITH NO ARGUMENTS ─────────────────
-    #
-    # WHAT IS SLOW.  The first thing on this board to want graphics pays for the
-    # whole stack coming up: the loader maps libEGL, libgbm, libGLESv2 and the
-    # DRI driver behind them, every one of their DT_NEEDEDs comes off the card,
-    # lima's first open of the render node sets up its context, and Mesa builds
-    # the config table.  On a Cortex-A7 reading a microSD that is most of a
-    # second, and it is paid by whatever the operator just launched -- so it
-    # reads as "the emulator takes a moment to start" rather than as boot time.
-    #
-    # WHAT THIS DOES.  Runs it once, in the background, after the dashboard is
-    # already on the panel, where nobody is waiting.  Everything above is then
-    # in the page cache and in the kernel's lima state, and the app that follows
-    # finds it warm.  Nothing is left running: the probe exits, and what remains
-    # is cache.
-    #
-    # WHY THE PROBE AND NOT A PROGRAM WRITTEN FOR THIS.  Because with no
-    # arguments it is exactly this and nothing else.  main() with argc == 1 does
-    # a read-only fb_report -- two ioctls, no writes -- then load(), then probe()
-    # on the display node and on renderD128: eglInitialize, the config table,
-    # and one context per API.  It is the -f, -p, -c, -o and -z modes that paint
-    # or modeset, and none of them is passed here.  See the paragraph above for
-    # what happened the last time this binary ran at boot with -f.
-    #
-    # AND ITS OUTPUT GOES TO THE JOURNAL AND NOWHERE ELSE.  journal+console here
-    # would be forty lines of Mesa drawn over a dashboard that has just finished
-    # painting, which is the failure console.h in mixdash exists to prevent; the
-    # same argument holds for anything else this board starts behind it.
-    if [ "$probe_ready" = 1 ] && [ "$gl_ready" = 1 ] && [ "$gl_debug" != 1 ]; then
-        cat > /newroot/run/systemd/system/j36-glwarm.service <<UNITGLWARM
-# Written by the J36 Ultra initramfs, into a tmpfs.  Not on the card.
-[Unit]
-Description=Warm the EGL stack so the first graphics app does not pay for it
-# After, and not Requires: a dashboard that failed is a board somebody is about
-# to run something on by hand, and the warm-up is worth just as much there.
-After=mixdash.service
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-Environment="LD_LIBRARY_PATH=/run/j36/gl:$mixos_root/qt/lib"
-# THE SAME THREE LINES AS mixdash.service, WORD FOR WORD, AND THAT IS THE POINT.
-# This unit compiles the cube's shaders and the dashboard's children are what run
-# them again later; if the two disagree about where compiled shaders live then the
-# second one starts from source and this unit warmed nothing.  It used to name only
-# XDG_CACHE_HOME, and only here, which is exactly the disagreement described.  The
-# path itself was worked out in setup_dash -- see the block above mixdash.service
-# for why it prefers the card and when it does not get it.
-Environment="MESA_SHADER_CACHE_DIR=$gl_cache"
-Environment="XDG_CACHE_HOME=$gl_cache"
-Environment="MESA_SHADER_CACHE_MAX_SIZE=32M"
-ExecStartPre=-/bin/mkdir -p $gl_cache
-# Leading dash: a probe that could not make a context is a board with no GL, and
-# that is a thing to read in the journal, not a failed unit to restart.
-ExecStart=-/run/j36/eglprobe
-StandardOutput=journal
-StandardError=journal
-# Behind the dashboard in both queues.  The whole point is that this costs
-# nobody anything; a warm-up that made the first frame late would be a loss.
-Nice=10
-IOSchedulingClass=idle
-TimeoutStartSec=120
-[Install]
-WantedBy=multi-user.target
-UNITGLWARM
-        mkdir -p /newroot/run/systemd/system/multi-user.target.wants
-        ln -sf ../j36-glwarm.service \
-               /newroot/run/systemd/system/multi-user.target.wants/j36-glwarm.service
-        say "dash: j36-glwarm.service brings EGL up once after the dashboard, so the"
-        say "      first app that wants graphics finds the stack already warm"
-    fi
+    # Do not warm EGL behind the live shell.  On the device this read-only probe
+    # stayed in eglInitialize for two minutes, overlapped Firefox's first launch,
+    # and held multi-user.target until systemd killed it.  The persistent X path
+    # is deliberately software-rendered and gains nothing from that contention;
+    # an explicitly launched GL program can initialise Mesa in its own lifecycle.
+    say "dash: boot-time EGL warm-up is disabled; it previously stalled the live UI"
 
     say "dash: mixdash.service is the shell"
     say "      $mixos_root/bin/mixdash, Qt on linuxfb over /dev/fb0"
@@ -6220,9 +6251,12 @@ ASOUNDSH
     # mounted and two things went wrong at once: readlink -f resolved /etc/asound.conf
     # into the empty /home/virtua on the rootfs and found nothing to cover, and then
     # the real mount arrived and brought the RG351MP's file back uncovered.
-    # RequiresMountsFor names a path and not a device, so it is satisfied by the root
-    # mount itself on a current card and by the p3 mount on an old one -- which is why
-    # both lines could stay as they were when the partition went away.
+    # There is deliberately no RequiresMountsFor=/home/virtua.  On a mix-only
+    # upgrade from the old three-partition layout, a stale LABEL=DATA fstab entry
+    # can point at a partition which no longer exists.  Pulling that device into
+    # this unit made ALSA fail as a dependency, precisely when the rootfs-backed
+    # /home/virtua underneath it was already usable.  After= orders a real legacy
+    # mount when one exists without inheriting its failure.
     #
     # Before=sysinit.target, which is as early as a unit that needs a mounted
     # filesystem can be.  `default' has to be right before the first process that
@@ -6245,7 +6279,6 @@ ASOUNDSH
 [Unit]
 Description=Point ALSA at the J36 Ultra's card, and at a libasound aplay can use
 DefaultDependencies=no
-RequiresMountsFor=/home/virtua
 After=local-fs.target
 Before=sysinit.target shutdown.target
 Conflicts=shutdown.target
@@ -6778,10 +6811,12 @@ dump() {
     run ps -eo pid,ppid,stat,etimes,args
     run systemctl --no-pager status mixdash
     run systemctl --no-pager status j36-xdesktop j36-xdesktop-park
+    run systemctl --no-pager status j36-mixshutdown
     show /run/j36/xdesktop.pid
     show /run/j36/xdesktop.parked
-    show /sys/fs/cgroup/system.slice/j36-xdesktop.service/cgroup.freeze
-    show /sys/fs/cgroup/system.slice/j36-xdesktop.service/cgroup.events
+    show /run/j36/xdesktop.presented
+    show /run/j36/mixshutdown.ready
+    run stat -c 'private X framebuffer: %s bytes, mode %a' /run/j36/xframebuffer
     # mixdash moves its own stdout and stderr into this file once it has painted a
     # frame, so that a Qt warning is not drawn across the dashboard -- which means
     # everything the dashboard has said since boot is HERE and not in the journal,
@@ -6815,6 +6850,13 @@ dump() {
         [ -s /run/j36/xsession.windows ] || printf '(empty -- the window service is idle and must remain parked)\n'
     else
         printf '(absent -- no graphical session is running)\n'
+    fi
+    sec "/run/j36/xsession.pending -- clients still loading before a window maps"
+    if [ -r /run/j36/xsession.pending ]; then
+        cat /run/j36/xsession.pending 2>&1 || printf '(unreadable)\n'
+        [ -s /run/j36/xsession.pending ] || printf '(empty)\n'
+    else
+        printf '(absent)\n'
     fi
     # ── THE USB-HDMI DOCK ─────────────────────────────────────────────────────
     #
@@ -8922,15 +8964,19 @@ QTCONF
 # here -- a browser that cannot be driven is a bad card, not a lost kernel.
 PADX_SRC="$ROOT/device/j36-ultra/tools/j36-padx.c"
 PADX_LAYOUT="$ROOT/device/j36-ultra/tools/mixdash/keyboardlayout.h"
+XFB_SRC="$ROOT/device/j36-ultra/tools/j36-xfb.c"
 PADX_BIN=""
+XFB_LIB=""
 PADX_BUILD_DEPS=(build-essential libx11-dev libxtst-dev libxfixes-dev)
 
 build_padx() {
     local src="$ARMHF_CHROOT/home/build/padx" out="$CACHE/j36-padx"
+    local xfb_out="$CACHE/j36-xfb.so"
     local header needed lib unexpected=""
 
     [[ -f "$PADX_SRC" ]] || { log "padx: $PADX_SRC is missing"; return 1; }
     [[ -f "$PADX_LAYOUT" ]] || { log "padx: $PADX_LAYOUT is missing"; return 1; }
+    [[ -f "$XFB_SRC" ]] || { log "padx: $XFB_SRC is missing"; return 1; }
 
     ensure_armhf_chroot || return 1
     # Its own stamp, for the reason spelled out above chroot_install_deps: adding
@@ -8943,17 +8989,26 @@ build_padx() {
     sudo mkdir -p "$src/mixdash"
     sudo cp "$PADX_SRC" "$src/j36-padx.c" || return 1
     sudo cp "$PADX_LAYOUT" "$src/mixdash/keyboardlayout.h" || return 1
+    sudo cp "$XFB_SRC" "$src/j36-xfb.c" || return 1
 
     log "padx: building the pad-to-X bridge for armhf (emulated)"
     armhf_chroot_run "cd /home/build/padx && \
         gcc -O2 -std=gnu11 -Wall -Wextra -o j36-padx j36-padx.c -lX11 -lXtst -lXfixes -lm && \
-        strip j36-padx" || return 1
-    [[ -f "$src/j36-padx" ]] || { log "padx: the compile left no binary"; return 1; }
+        gcc -O2 -std=gnu11 -Wall -Wextra -fPIC -shared \
+            -Wl,-soname,j36-xfb.so -o j36-xfb.so j36-xfb.c -ldl && \
+        strip j36-padx j36-xfb.so" || return 1
+    [[ -f "$src/j36-padx" && -f "$src/j36-xfb.so" ]] || {
+        log "padx: the compile left no bridge or framebuffer interposer"
+        return 1
+    }
 
     mkdir -p "$CACHE"
     sudo cp "$src/j36-padx" "$out" || return 1
+    sudo cp "$src/j36-xfb.so" "$xfb_out" || return 1
     sudo chown "$(id -u):$(id -g)" "$out"
+    sudo chown "$(id -u):$(id -g)" "$xfb_out"
     chmod 0755 "$out"
+    chmod 0755 "$xfb_out"
 
     header="$(readelf -hd "$out" 2>/dev/null)" || return 1
     grep -q 'Class:.*ELF32' <<<"$header" || { log "padx: not a 32-bit ELF"; return 1; }
@@ -8978,7 +9033,11 @@ build_padx() {
     fi
 
     PADX_BIN="$out"
-    log "padx: j36-padx is $(stat -c %s "$out") bytes, dynamic ARM, needs $needed"
+    header="$(readelf -hd "$xfb_out" 2>/dev/null)" || return 1
+    grep -q 'Class:.*ELF32' <<<"$header" || { log "padx: j36-xfb.so is not 32-bit"; return 1; }
+    grep -q 'Machine:.*ARM' <<<"$header" || { log "padx: j36-xfb.so is not ARM"; return 1; }
+    XFB_LIB="$xfb_out"
+    log "padx: j36-padx is $(stat -c %s "$out") bytes and j36-xfb.so is $(stat -c %s "$xfb_out") bytes"
     return 0
 }
 
@@ -9043,6 +9102,7 @@ if [[ "${J36_DASH:-1}" == 1 ]]; then
     set -e
     if (( padx_rc != 0 )); then
         PADX_BIN=""
+        XFB_LIB=""
         log "padx: the pad-to-X bridge was not built, see the error above -- the Browser"
         log "    card falls back to links2 in the terminal, which needs neither X nor a"
         log "    pointer.  Nothing else in the image depends on it."
@@ -10931,22 +10991,17 @@ over the top, which is also what keeps /run/j36 visible after systemd starts.
 Pull the card into an R36S and none of it exists.  Nothing was written to the
 filesystem, so there is nothing to undo.
 
-And it is brought up once, on purpose, by j36-glwarm.service -- the same
-eglprobe with no arguments, run after the dashboard has painted, output to the
-journal only.  The first program on this board to want graphics otherwise pays
-for the whole stack arriving off the card: the loader maps Mesa and everything
-under it, lima opens its render node for the first time, and the config table
-is built.  That is most of a second on this SoC, and it is charged to whatever
-the operator just launched.  Running it where nobody is waiting moves the cost
-off them; the probe exits and what it leaves behind is page cache, the lima
-state and a directory of compiled shaders.  Under j36.gl=debug the unit is not
-written at all, because mixdash-probe.service has already done it twice before
-the dashboard.
+There is deliberately no boot-time EGL warm-up.  The old j36-glwarm.service was
+meant to move a one-second first-context cost out of an application's launch, but
+on the actual board eglInitialize remained stuck for two minutes, contended with
+Firefox and held multi-user.target until systemd killed it.  An explicitly
+launched GL program now initialises Mesa in its own lifecycle, where its failure
+is attributable to that program and cannot stall the live shell in the background.
 
 That directory is the one thing here that is written rather than mapped, and it
 is shared on purpose.  The initramfs picks it once -- /var/cache/mixos/gl when
 the rootfs can be written to, /run/j36/glcache when it cannot -- and puts it in
-the environment of BOTH this unit and mixdash.service, capped at 32M through
+the environment of mixdash and the window service, capped at 32M through
 MESA_SHADER_CACHE_MAX_SIZE.  mixdash draws with Qt on linuxfb and has no use
 for it; its children do, and a systemd unit is the only place a value can be
 set that every one of them inherits.  It is what makes the Diagnostics GPU
@@ -11709,7 +11764,28 @@ if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
         mkdir -p "$SDROOT/opt/mixos/share/mixdash"
         cp "$ROOT/device/j36-ultra/resources/startup.mp3" \
            "$SDROOT/opt/mixos/share/mixdash/startup.mp3"
-        log "dash: staged the startup chime into opt/mixos/share/mixdash/"
+        if [[ -f "$ROOT/device/j36-ultra/resources/startup.wav" ]]; then
+            cp "$ROOT/device/j36-ultra/resources/startup.wav" \
+               "$SDROOT/opt/mixos/share/mixdash/startup.wav"
+        fi
+        log "dash: staged the startup chime and its zero-decode WAV"
+    fi
+
+    # The initramfs copy of mixsplash disappears as a pathname at switch_root,
+    # even though the boot instance keeps running from its mapped pages.  A second
+    # copy in the root payload is therefore what can animate the safe interval
+    # after X has been parked and what remains alive while systemd shuts the card
+    # down.  mixshutdown is an intentional app name for the same small renderer;
+    # the control file supplies its shutdown wording and the service gives it a
+    # cgroup independent of mixdash.
+    if [[ "$SPLASH_OK" -eq 1 && -n "$MIXDASH_BIN" && -n "$QT_PAYLOAD" &&
+          -x "$WORK/mixsplash" && -f "$INITROOT/splash.mixspl" ]]; then
+        mkdir -p "$SDROOT/opt/mixos/share/mixsplash"
+        install -m 0755 "$WORK/mixsplash" "$SDROOT/opt/mixos/bin/mixsplash"
+        ln -sfn mixsplash "$SDROOT/opt/mixos/bin/mixshutdown"
+        cp "$INITROOT/splash.mixspl" \
+           "$SDROOT/opt/mixos/share/mixsplash/background.mixspl"
+        log "dash: staged mixsplash and mixshutdown for animated hand-offs"
     fi
 
 
@@ -11725,7 +11801,12 @@ if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
     if [[ -n "$PADX_BIN" ]]; then
         cp "$PADX_BIN" "$SDROOT/opt/mixos/bin/j36-padx"
         chmod 0755 "$SDROOT/opt/mixos/bin/j36-padx"
-        log "dash: staged j36-padx into opt/mixos/bin/"
+        if [[ -n "$XFB_LIB" && -f "$XFB_LIB" ]]; then
+            mkdir -p "$SDROOT/opt/mixos/lib"
+            cp "$XFB_LIB" "$SDROOT/opt/mixos/lib/j36-xfb.so"
+            chmod 0755 "$SDROOT/opt/mixos/lib/j36-xfb.so"
+        fi
+        log "dash: staged j36-padx and the private-X framebuffer presenter"
     fi
 
     # The X configuration.
@@ -11769,6 +11850,12 @@ if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
     # picked up by xserver-xorg-input-libinput.  The one InputClass below excludes
     # only the built-in pad, which j36-padx reads and grabs itself.
     mkdir -p "$SDROOT/opt/mixos/share/xorg"
+    if [[ -f "$ROOT/device/j36-ultra/resources/x.jpg" ]]; then
+        python3 "$ROOT/device/j36-ultra/tools/jpeg2raw.py" \
+            "$ROOT/device/j36-ultra/resources/x.jpg" \
+            "$SDROOT/opt/mixos/share/xorg/background.mixspl"
+        log "dash: staged the X loading background into opt/mixos/share/xorg/"
+    fi
     cat > "$SDROOT/opt/mixos/share/xorg/xorg.conf" <<'XORGCONF'
 # Written by device/j36-ultra/build-in-vm.sh for the J36 Ultra's simple-framebuffer.
 # See the graphical session section in that file for why each option is here.
@@ -12021,16 +12108,16 @@ KEYBOARDXML
     #                       Terminal card -- `j36-xrun freedoom' -- and by mixdash.
     #
     # ONE X SERVER, EVER.  j36-xrun deliberately cannot start a session: a second
-    # server is two display stacks scribbling on one framebuffer with nothing
-    # arbitrating.  j36-xdesktop.service starts the single instance at boot and
-    # parks its complete cgroup before mixdash starts.  A client request makes the
-    # service visible as a temporary Windowed-apps switcher target; an idle server
+    # server would be a second display stack with no useful ownership boundary.
+    # j36-xdesktop.service starts the single instance at boot on a private /run
+    # framebuffer.  PadX parks only its panel presenter before mixdash starts.  A
+    # client request contributes its real windows to the switcher; an idle server
     # is infrastructure and has no card, page or task row.
     #
-    # THE WHOLE TREE IS ONE SYSTEMD CGROUP.  xinit does not keep Xorg, its session
-    # supervisor and every helper in one process group; the device log proved it.
-    # Freezing the service cgroup is the atomic boundary that stops every possible
-    # framebuffer writer before mixdash paints.
+    # THE WHOLE TREE REMAINS SCHEDULED.  Freezing it stalled Firefox's compositor
+    # clocks and kept shutdown signals from running.  The mmap interposer prevents
+    # Xorg from owning /dev/fb0 in the first place, so presentation can switch
+    # without pausing any client.
     #
     # POSIX sh and not bash, for all four: these are scripts the user may end up
     # running by hand from the initramfs shell, and there is nothing in them that
@@ -12041,6 +12128,21 @@ KEYBOARDXML
     # referenced by anything here any more, and a stale one left next to the new one
     # is the file somebody reads when they go looking for why a window did not open.
     rm -f "$SDROOT/opt/mixos/bin/j36-browser-session" 2>/dev/null || true
+
+    cat > "$SDROOT/opt/mixos/bin/j36-Xorg" <<'XORGWRAP'
+#!/bin/sh
+# Only the Xorg server receives the mmap interposer.  Session clients inherit the
+# ordinary environment and cannot accidentally redirect a framebuffer they open.
+set -u
+: "${J36_REAL_XORG:?j36-Xorg needs J36_REAL_XORG}"
+[ -x "$J36_REAL_XORG" ] || { echo "j36-Xorg: $J36_REAL_XORG is not executable" >&2; exit 1; }
+[ -r /opt/mixos/lib/j36-xfb.so ] || { echo "j36-Xorg: j36-xfb.so is missing" >&2; exit 1; }
+export J36_XFB_DEVICE=/dev/fb0
+export J36_XFB_SHADOW=/run/j36/xframebuffer
+export LD_PRELOAD=/opt/mixos/lib/j36-xfb.so
+exec "$J36_REAL_XORG" "$@"
+XORGWRAP
+    chmod 0755 "$SDROOT/opt/mixos/bin/j36-Xorg"
 
     cat > "$SDROOT/opt/mixos/bin/j36-xsession" <<'XSESSIONLAUNCH'
 #!/bin/sh
@@ -12057,6 +12159,7 @@ set -u
 
 XCONF=/opt/mixos/share/xorg/xorg.conf
 MAIN=/opt/mixos/bin/j36-xsession-main
+XWRAP=/opt/mixos/bin/j36-Xorg
 
 # One optional flag and one argument, which is all mixdash ever sends.  Parsed with
 # case rather than a while/shift loop because `shift' on an empty argument list is
@@ -12087,10 +12190,14 @@ esac
 # /usr/bin/Xorg is the setuid wrapper instead.  Either works, because this runs as
 # root; the list is only about which of them exists.
 XORG=""
-for c in /usr/bin/Xorg /usr/lib/xorg/Xorg /usr/bin/X; do
+# Prefer the real server over Xorg.wrap.  A setuid compatibility wrapper enters
+# secure-execution mode and the dynamic loader is then required to discard
+# LD_PRELOAD, which would put Xorg straight back on the physical framebuffer.
+for c in /usr/lib/xorg/Xorg /usr/bin/Xorg /usr/bin/X; do
     [ -x "$c" ] && { XORG="$c"; break; }
 done
-if [ -z "$XORG" ] || [ ! -x /usr/bin/xinit ]; then
+if [ -z "$XORG" ] || [ ! -x /usr/bin/xinit ] || [ ! -x "$XWRAP" ] \
+   || [ ! -r /opt/mixos/lib/j36-xfb.so ]; then
     echo "j36-xsession: no X server on this card (needs xserver-xorg-core and xinit)" >&2
     exit 1
 fi
@@ -12099,6 +12206,7 @@ fi
 # with whatever else boots it and nothing in this image writes to it.  /run is tmpfs.
 mkdir -p /run/j36 /run/j36/xdg 2>/dev/null
 chmod 0700 /run/j36/xdg 2>/dev/null
+rm -f /run/j36/xframebuffer /run/j36/xdesktop.presented 2>/dev/null
 
 # The service leader survives the exec below with the same pid.  mixdash reads
 # its cgroup from /proc rather than trying to reconstruct xinit's process groups.
@@ -12128,8 +12236,10 @@ fi
 # the only clients can therefore be local processes.  It lets a graphical client
 # run as the unprivileged virtua account even though xinit itself and its authority
 # file belong to root; the browser must not run as root in virtua's HOME.
+export J36_REAL_XORG="$XORG"
+export J36_XFB_SHADOW=/run/j36/xframebuffer
 exec /usr/bin/xinit "$MAIN" "$FIRST" -- \
-    "$XORG" :0 vt1 \
+    "$XWRAP" :0 vt1 \
     -config "$XCONF" \
     -logfile /run/j36/xorg.log \
     -ac -nolisten tcp -novtswitch -sharevts -keeptty
@@ -12166,6 +12276,7 @@ FIRST="${1:-}"
 RUNDIR=/run/j36
 CTL=$RUNDIR/xsession.ctl
 WINLIST=$RUNDIR/xsession.windows
+PENDING=$RUNDIR/xsession.pending
 PIDFILE=$RUNDIR/xsession.pid
 PADXPID=$RUNDIR/padx.pid
 
@@ -12205,6 +12316,11 @@ unset XAUTHORITY WAYLAND_DISPLAY
 # GDK_BACKEND is pinned because GTK4 prefers Wayland and would find none.
 export NO_AT_BRIDGE=1
 export GDK_BACKEND=x11
+# A crash must return to the dashboard, not map a second Firefox crash-reporter
+# window over a framebuffer whose launcher has already exited.  The report is
+# still represented by Firefox's exit status and journal output.
+export MOZ_CRASHREPORTER_DISABLE=1
+export MOZ_CRASHREPORTER_NO_REPORT=1
 export GTK_OVERLAY_SCROLLING=0
 export GDK_CORE_DEVICE_EVENTS=1
 
@@ -12386,7 +12502,8 @@ KBD=""
 # It also means a writer's open() never blocks waiting for a reader to appear, which
 # is what lets mixdash use a plain non-blocking open and get ENXIO -- "no session" --
 # instead of hanging.
-rm -f "$CTL" "$PADXPID" "$RUNDIR/padx.ready" 2>/dev/null
+rm -f "$CTL" "$PADXPID" "$PENDING" "$RUNDIR/padx.ready" \
+      "$RUNDIR/xdesktop.presented" 2>/dev/null
 CTLOK=0
 if mkfifo -m 0600 "$CTL" 2>/dev/null; then
     if exec 9<>"$CTL"; then
@@ -12403,12 +12520,13 @@ fi
 # clear message instead of a script that blocks forever on open().
 echo $$ > "$PIDFILE" 2>/dev/null || true
 : > "$WINLIST" 2>/dev/null || true
+: > "$PENDING" 2>/dev/null || true
 
 # A word into the pipe every two seconds, so the blocking read above has a timeout.
 # Without it the loop would notice a window closing only when the next request came
 # in, which for a session with one window and no keyboard is never.  It is a child of
-# this script and so in the same process group, which means mixdash's SIGSTOP freezes
-# the ticker too and a backgrounded session does not spend a wakeup every two seconds.
+# this script and stays with the service.  It keeps the EWMH snapshot current even
+# while the dashboard is in front; one two-second wakeup is the complete idle cost.
 if [ "$CTLOK" -eq 1 ]; then
     ( while :; do sleep 2; echo tick; done ) >&9 2>/dev/null &
     TICKER=$!
@@ -12420,6 +12538,14 @@ fi
 # is not expanded on the way past.
 client_title() {
     ct_first="${1%% *}"
+    # Both mixdash's shellQuote() and j36-xrun quote argv[0].  Those quotes belong
+    # to the later `sh -c', not to the launch identity: keeping the trailing one
+    # turned "j36-browser" into "browser'" and defeated duplicate suppression,
+    # which is how three Firefox instances appeared in the device log.
+    case "$ct_first" in
+        \'*\') ct_first="${ct_first#\'}"; ct_first="${ct_first%\'}" ;;
+        \"*\") ct_first="${ct_first#\"}"; ct_first="${ct_first%\"}" ;;
+    esac
     ct_name="${ct_first##*/}"
     case "$ct_name" in
         j36-*) ct_name="${ct_name#j36-}" ;;
@@ -12461,12 +12587,33 @@ reap_clients() {
     done
     CLIENTS="${rc_live# }"
 
+    : > "$PENDING.new" 2>/dev/null || return 0
+    for rc_pid in $CLIENTS; do
+        rc_title=""
+        [ -r "$RUNDIR/win.$rc_pid" ] && read -r rc_title < "$RUNDIR/win.$rc_pid"
+        [ -n "$rc_title" ] || rc_title="window"
+        printf '%s\t%s\n' "$rc_pid" "$rc_title" >> "$PENDING.new"
+    done
+    mv -f "$PENDING.new" "$PENDING" 2>/dev/null
+
+    # The switcher reflects X WINDOWS, not launcher shells.  Firefox may exec via
+    # runuser/dbus and a crash helper may outlive that launcher; the EWMH list is
+    # the only generic answer that remains true for both without naming games or
+    # browsers.  Fall back to launch records only if the WM has no client list.
+    if /opt/mixos/bin/j36-padx --display "$DISPLAY" --windows \
+           > "$WINLIST.new" 2>/dev/null; then
+        mv -f "$WINLIST.new" "$WINLIST" 2>/dev/null
+        return 0
+    fi
+
     : > "$WINLIST.new" 2>/dev/null || return 0
     for rc_pid in $CLIENTS; do
         rc_title=""
         [ -r "$RUNDIR/win.$rc_pid" ] && read -r rc_title < "$RUNDIR/win.$rc_pid"
         [ -n "$rc_title" ] || rc_title="window"
-        printf '%s\t%s\n' "$rc_pid" "$rc_title" >> "$WINLIST.new"
+        # No EWMH list: retain the launcher's PID as a compatibility focus key.
+        # XID 0 tells mixdash to use the older `focus PID' request.
+        printf '0\t%s\t0\t%s\n' "$rc_pid" "$rc_title" >> "$WINLIST.new"
     done
     mv -f "$WINLIST.new" "$WINLIST" 2>/dev/null
 }
@@ -12521,17 +12668,15 @@ start_client() {
 
 # The bridge: the pad as a pointer, a keyboard and, on a Menu tap, `next' into the
 # pipe above.  It is the ONE input owner while X owns the panel.  On Menu hold it
-# releases EVIOCGRAB, hides X's cursor and self-stops before asking mixdash for the
-# switcher; mixdash resumes the exact pid below only after X's frame is restored.
-# The explicit pid remains the per-process half of the hand-off: PadX self-stops
-# after releasing EVIOCGRAB, while mixdash freezes the complete systemd cgroup.
+# releases EVIOCGRAB, hides X's cursor and parks its private-frame presenter before
+# asking mixdash for the switcher.  Xorg and every client remain scheduled.
 # The header of tools/j36-padx.c has the full contract.
 # --watch is gone: it watched one pid, and a session that outlives any single window
 # has no one pid to watch.
 if [ -x /opt/mixos/bin/j36-padx ]; then
-    # A boot service comes up without taking the pad, hides its cursor and stops
-    # itself once ready.  The park unit then freezes the rest of the cgroup before
-    # mixdash starts.  A session run by hand keeps the old immediate-grab path.
+    # A boot service comes up without taking the pad, hides its cursor and keeps
+    # presentation parked.  The park unit observes that acknowledgement before
+    # mixdash starts.  A session run by hand keeps the immediate-grab path.
     if [ "${J36_XSERVICE:-}" = 1 ]; then
         if [ "$CTLOK" -eq 1 ]; then
             /opt/mixos/bin/j36-padx -v --grab --start-parked --ctl "$CTL" &
@@ -12551,7 +12696,8 @@ else
         echo "j36-xsession: and no first window either -- there would be nothing to look at" >&2
         [ -n "$KBD" ] && kill "$KBD" 2>/dev/null
         [ -n "$WM" ] && kill "$WM" 2>/dev/null
-        rm -f "$CTL" "$WINLIST" "$PIDFILE" "$PADXPID" 2>/dev/null
+        rm -f "$CTL" "$WINLIST" "$PENDING" "$PIDFILE" "$PADXPID" \
+              "$RUNDIR/xdesktop.presented" 2>/dev/null
         exit 1
     fi
 fi
@@ -12578,6 +12724,18 @@ while :; do
             ;;
         prev)
             [ -n "$MBREMOTE" ] && "$MBREMOTE" -prev >/dev/null 2>&1
+            ;;
+        "focus-window "*)
+            focus_window="${line#focus-window }"
+            case "$focus_window" in
+                ''|*[!0-9]*)
+                    echo "j36-xsession: invalid X window request '$line'" >&2
+                    ;;
+                *)
+                    /opt/mixos/bin/j36-padx --focus-window "$focus_window" >/dev/null 2>&1 ||
+                        echo "j36-xsession: no mapped X window with id $focus_window" >&2
+                    ;;
+            esac
             ;;
         "focus "*)
             focus_pid="${line#focus }"
@@ -12645,7 +12803,8 @@ done
 [ -n "$PADX" ] && kill "$PADX" 2>/dev/null
 [ -n "$KBD" ] && kill "$KBD" 2>/dev/null
 [ -n "$WM" ] && kill "$WM" 2>/dev/null
-rm -f "$CTL" "$WINLIST" "$PIDFILE" "$PADXPID" "$RUNDIR/padx.ready" 2>/dev/null
+rm -f "$CTL" "$WINLIST" "$PENDING" "$PIDFILE" "$PADXPID" "$RUNDIR/padx.ready" \
+      "$RUNDIR/xdesktop.presented" 2>/dev/null
 exit 0
 XSESSIONMAIN
     chmod 0755 "$SDROOT/opt/mixos/bin/j36-xsession-main"
@@ -12996,12 +13155,12 @@ run_browser() {
 # from a shell script, and it puts it on the DATA partition where the rest of this
 # session's state already goes.
 firefox_profile() {
-    # v1 was launched by older images after unconditionally deleting its lock.
-    # That allowed two Firefox processes to write the same Places databases and
-    # the resulting profile now crashes in pthread mutex handling on affected
-    # cards.  A new name is both a clean migration boundary and cheaper than
-    # trying to repair a collection of interdependent SQLite files on an SD card.
-    prof="$HOME/.mozilla/j36-v2"
+    # v1 allowed two writers after deleting a live lock.  v2 was then repeatedly
+    # frozen as a complete X cgroup, which left affected Places databases locked
+    # and produced Firefox's "files in use by another application" warning.  A
+    # v3 profile is a clean boundary from both failure modes and cheaper than an
+    # SD-card SQLite repair during launch.
+    prof="$HOME/.mozilla/j36-v3"
     mkdir -p "$prof" 2>/dev/null || return 1
 
     # Never remove Firefox's lock here.  It distinguishes a stale crash marker
@@ -13029,6 +13188,8 @@ user_pref("browser.cache.disk.capacity", 32768);
 user_pref("browser.cache.memory.capacity", 16384);
 user_pref("browser.sessionstore.interval", 300000);
 user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("browser.tabs.crashReporting.sendReport", false);
+user_pref("browser.crashReports.unsubmittedCheck.enabled", false);
 user_pref("browser.startup.page", 1);
 user_pref("browser.startup.homepage", "$home_url");
 user_pref("network.captive-portal-service.enabled", false);
@@ -13101,18 +13262,18 @@ case "${J36_BROWSER##*/}" in
             # lock state owned by root.  Repair that legacy profile once; after the
             # marker exists Firefox owns everything it creates and only root's
             # freshly rewritten user.js needs a cheap direct chown.
-            profile_owner="$HOME/.mozilla/j36-v2/.virtua-owned-v1"
+            profile_owner="$HOME/.mozilla/j36-v3/.virtua-owned-v1"
             if [ ! -e "$profile_owner" ]; then
                 echo "j36-browser: preparing the Firefox profile" >&2
-                chown -R virtua:virtua "$HOME/.mozilla/j36-v2" 2>/dev/null
+                chown -R virtua:virtua "$HOME/.mozilla/j36-v3" 2>/dev/null
                 : > "$profile_owner" 2>/dev/null || true
                 chown virtua:virtua "$profile_owner" 2>/dev/null
             fi
-            chown virtua:virtua "$HOME/.mozilla" "$HOME/.mozilla/j36-v2" \
-                                 "$HOME/.mozilla/j36-v2/user.js" 2>/dev/null
+            chown virtua:virtua "$HOME/.mozilla" "$HOME/.mozilla/j36-v3" \
+                                 "$HOME/.mozilla/j36-v3/user.js" 2>/dev/null
         fi
         run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" --no-remote \
-            -profile "$HOME/.mozilla/j36-v2" "$URL"
+            -profile "$HOME/.mozilla/j36-v3" "$URL"
         ;;
     chromium|chromium-browser)
         run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" --disable-gpu \

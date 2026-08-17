@@ -253,13 +253,14 @@ volatile sig_atomic_t g_splashDismissed = 0;
 
 void dismissSplash(int giveBackTheConsole)
 {
-    static const char channel[] = "/dev/.mixsplash";
+    static const char bootChannel[] = "/dev/.mixsplash";
+    static const char *const channels[] = { bootChannel, nullptr };
     static const char doneFlag[] = "/dev/.mixsplash-done";
     static const char handOver[] = "progress:100\nquit\n";
     static const char giveBack[] = "progress:100\nabort\n";
     const char *message = giveBackTheConsole ? giveBack : handOver;
     size_t length = giveBackTheConsole ? sizeof(giveBack) - 1 : sizeof(handOver) - 1;
-    int fd;
+    int fd, i;
 
     if (g_splashDismissed)
         return;
@@ -269,11 +270,17 @@ void dismissSplash(int giveBackTheConsole)
     if (fd >= 0)
         ::close(fd);
 
-    fd = ::open(channel, O_WRONLY | O_APPEND | O_NONBLOCK | O_CLOEXEC);
-    if (fd >= 0) {
-        ssize_t written = ::write(fd, message, length);
-        (void)written;
-        ::close(fd);
+    /* Xorg now renders into a private /run mapping until a windowed task is in
+     * front, so the original initramfs splash safely stays animated through X
+     * startup and the dashboard's first paint.  This one channel spans switch_root
+     * because /dev was moved, not recreated. */
+    for (i = 0; channels[i]; ++i) {
+        fd = ::open(channels[i], O_WRONLY | O_APPEND | O_NONBLOCK | O_CLOEXEC);
+        if (fd >= 0) {
+            ssize_t written = ::write(fd, message, length);
+            (void)written;
+            ::close(fd);
+        }
     }
 }
 
@@ -890,7 +897,10 @@ int main(int argc, char **argv)
              * directory finds the file it was just built next to.
              */
             MediaPage::playOnce(firstReadable(QStringList()
+                                              << "/opt/mixos/share/mixdash/startup.wav"
                                               << "/opt/mixos/share/mixdash/startup.mp3"
+                                              << QCoreApplication::applicationDirPath()
+                                                     + "/startup.wav"
                                               << QCoreApplication::applicationDirPath()
                                                      + "/startup.mp3"
                                               << QCoreApplication::applicationDirPath()

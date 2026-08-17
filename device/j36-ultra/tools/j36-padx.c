@@ -48,22 +48,19 @@
  * mixdash and this bridge both have the built-in evdev node open, but only the
  * program whose pixels are on the panel may consume it.  The session therefore
  * starts this bridge with --grab.  On a Menu hold it releases that grab, hides
- * the X cursor, asks mixdash for the switcher, and stops ITSELF before another
- * event can reach X.  mixdash records this pid and continues it only after the X
- * frame has been restored; the SIGCONT path drains events used by the switcher
- * before taking the grab back.
+ * the X cursor, stops presenting X's private framebuffer and asks mixdash for the
+ * switcher.  SIGCONT turns presentation back on, drains the switcher's events,
+ * adopts the dashboard's saved cursor coordinate, and takes the grab back.
  *
  * When the final X client exits there is no Menu gesture to perform that first
  * half.  mixdash sends SIGUSR2 instead; this bridge performs the same cursor-hide,
- * queue drain and grab release, then self-stops.  Only after `/proc` reports that
- * stop does mixdash freeze the complete service cgroup and repaint the dashboard.
+ * queue drain and grab release, then acknowledges that its panel copy is off.
  *
- * The explicit self-stop matters because xinit can put descendants in another
- * process group.  Stopping only the launcher's group left this bridge alive over
- * the dashboard: its software cursor then restored pieces of X's old framebuffer
- * wherever it moved.  That looked like a transparent, destructive Qt cursor, but
- * was a second live cursor owner painting stale X pixels.  There is no shared
- * interval now: release happens before SIGUSR1 and re-grab after SIGCONT.
+ * Older builds stopped processes to arbitrate /dev/fb0.  xinit can put descendants
+ * in another process group, and freezing the complete cgroup kept the pixels safe
+ * only by freezing Firefox's compositor and its clocks.  The mmap interposer and
+ * presenter remove both failures: X never maps the panel, and only a two-byte
+ * presented-state acknowledgement sits between one owner and the other.
  *
  * WHAT IS DELIBERATELY NOT READ, which is the same narrow match the grab used and
  * matters for its own reasons.  A USB keyboard or mouse in the dock is a real X
@@ -158,6 +155,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -165,13 +163,16 @@
 #include <unistd.h>
 
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <linux/fb.h>
 #include <linux/input.h>
 
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
 #include <X11/extensions/Xfixes.h>
 #include <X11/extensions/XTest.h>
 #include <X11/keysym.h>
@@ -197,6 +198,12 @@
 #define DIR_LEFT  0x4
 #define DIR_RIGHT 0x8
 
+#define XFB_SHADOW_PATH "/run/j36/xframebuffer"
+#define PRESENTED_PATH  "/run/j36/xdesktop.presented"
+#define X_BACKGROUND    "/opt/mixos/share/xorg/background.mixspl"
+#define MIXSPL_MAGIC    "MIXSPL1\0"
+#define MIXSPL_HEADER   24
+
 static int    pad_fd[MAX_PADS];
 static dev_t  pad_dev[MAX_PADS];      /* which device node, so a rescan skips it */
 static char   pad_name[MAX_PADS][128];
@@ -220,6 +227,7 @@ static long menu_down_at;
 static void rep_clear(void);
 static unsigned dirs_all(void);
 static void release_directions(unsigned dirs);
+static void pointer_reload_settings(void);
 
 static void note(const char *fmt, ...)
 {
@@ -754,14 +762,16 @@ static Window window_for_pid(Window at, unsigned long wanted, int depth)
     return None;
 }
 
-static int focus_client(pid_t pid)
+static int activate_window(Window client)
 {
     Window root = RootWindow(dpy, scr);
-    Window client = window_for_pid(root, (unsigned long)pid, 0);
+    XWindowAttributes attr;
     XEvent ev;
     Atom active;
 
-    if (client == None)
+    if (client == None || client == root
+        || !XGetWindowAttributes(dpy, client, &attr)
+        || attr.map_state != IsViewable)
         return 0;
     active = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
     memset(&ev, 0, sizeof(ev));
@@ -778,20 +788,137 @@ static int focus_client(pid_t pid)
     return 1;
 }
 
+static int focus_client(pid_t pid)
+{
+    Window root = RootWindow(dpy, scr);
+    return activate_window(window_for_pid(root, (unsigned long)pid, 0));
+}
+
+static unsigned long client_pid(Window window)
+{
+    Atom prop = XInternAtom(dpy, "_NET_WM_PID", True);
+    Atom actual;
+    int format;
+    unsigned long nitems, after, pid = 0;
+    unsigned char *data = NULL;
+
+    if (prop != None
+        && XGetWindowProperty(dpy, window, prop, 0, 1, False, XA_CARDINAL,
+                              &actual, &format, &nitems, &after, &data) == Success
+        && data && actual == XA_CARDINAL && format == 32 && nitems == 1)
+        pid = *(unsigned long *)data;
+    if (data)
+        XFree(data);
+    return pid;
+}
+
+static void client_name(Window window, char *out, size_t size)
+{
+    Atom prop = XInternAtom(dpy, "_NET_WM_NAME", True);
+    Atom utf8 = XInternAtom(dpy, "UTF8_STRING", True);
+    Atom actual;
+    int format;
+    unsigned long nitems, after;
+    unsigned char *data = NULL;
+    char *legacy = NULL;
+    size_t n = 0, i;
+
+    if (!size)
+        return;
+    out[0] = '\0';
+    if (prop != None && utf8 != None
+        && XGetWindowProperty(dpy, window, prop, 0, (long)(size / 4 + 1),
+                              False, utf8, &actual, &format, &nitems, &after,
+                              &data) == Success
+        && data && actual == utf8 && format == 8) {
+        n = nitems < size - 1 ? (size_t)nitems : size - 1;
+        memcpy(out, data, n);
+        out[n] = '\0';
+    }
+    if (data)
+        XFree(data);
+    if (!out[0] && XFetchName(dpy, window, &legacy) && legacy) {
+        snprintf(out, size, "%s", legacy);
+        XFree(legacy);
+    }
+    if (!out[0])
+        snprintf(out, size, "window");
+    for (i = 0; out[i]; ++i) {
+        unsigned char ch = (unsigned char)out[i];
+        if (ch == '\n' || ch == '\r' || ch == '\t' || ch < 0x20)
+            out[i] = ' ';
+    }
+}
+
+/* One line per mapped application window, from the window manager's own EWMH
+ * list.  Unlike launcher PIDs this includes a browser child or crash window that
+ * outlived the shell which started it, so the dashboard never declares X idle
+ * while a real child window is still composited in the private frame. */
+static int print_windows(void)
+{
+    Window root = RootWindow(dpy, scr);
+    Atom list = XInternAtom(dpy, "_NET_CLIENT_LIST", True);
+    Atom active_prop = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", True);
+    Atom actual;
+    int format, count = 0;
+    unsigned long nitems, after, i;
+    unsigned char *data = NULL;
+    Window active = None;
+
+    if (active_prop != None) {
+        unsigned char *active_data = NULL;
+        unsigned long active_items = 0, active_after = 0;
+        if (XGetWindowProperty(dpy, root, active_prop, 0, 1, False, XA_WINDOW,
+                               &actual, &format, &active_items, &active_after,
+                               &active_data) == Success
+            && active_data && actual == XA_WINDOW && format == 32
+            && active_items == 1)
+            active = *(Window *)active_data;
+        if (active_data)
+            XFree(active_data);
+    }
+
+    if (list == None
+        || XGetWindowProperty(dpy, root, list, 0, 4096, False, XA_WINDOW,
+                              &actual, &format, &nitems, &after, &data) != Success
+        || !data || actual != XA_WINDOW || format != 32) {
+        if (data)
+            XFree(data);
+        return 1;
+    }
+    for (i = 0; i < nitems; ++i) {
+        const Window window = ((Window *)data)[i];
+        XWindowAttributes attr;
+        unsigned long pid;
+        char name[320];
+
+        if (!XGetWindowAttributes(dpy, window, &attr)
+            || attr.map_state != IsViewable)
+            continue;
+        pid = client_pid(window);
+        client_name(window, name, sizeof name);
+        /* The XID is the identity and focus target.  _NET_WM_PID is useful
+         * metadata but optional in EWMH, so never make it an application
+         * allowlist by accident: an arbitrary SDL/Xlib client without that
+         * property still gets a selectable card. */
+        printf("%lu\t%lu\t%d\t%s\n", (unsigned long)window, pid,
+               window == active ? 1 : 0, name);
+        count++;
+    }
+    XFree(data);
+    return count >= 0 ? 0 : 1;
+}
+
 /* ── the screen ──────────────────────────────────────────────────────────── */
 
 /*
- * The X cursor is not part of the framebuffer snapshot mixdash saves.  With
- * xf86-video-fbdev it is composited by the X server and the pixels underneath it
- * are restored only when X moves or hides it.  SIGSTOP freezes the whole session,
- * including that cleanup, so handing the panel to the task switcher while the
- * cursor is visible leaves the cursor painted over the switcher's first frame.
+ * The X cursor is composited by the server.  Hide it into the private framebuffer
+ * before presentation is parked, so its last visible shape is never mistaken for
+ * the dashboard's cursor during the handoff.
  *
  * XFixes hides the server cursor globally, including cursors a client installed
- * on its own window.  XSync is intentional: the dashboard may stop X immediately
- * after SIGUSR1, so the hide must have reached the server before that signal is
- * sent.  The cursor is restored on SIGCONT, after mixdash has copied the saved X
- * frame back to the one framebuffer.
+ * on its own window.  XSync is intentional: the hidden acknowledgement must mean
+ * the private frame already contains the cursor's save-under.
  */
 static void screen_cursor(int visible)
 {
@@ -821,31 +948,336 @@ static void screen_cursor(int visible)
 }
 
 /*
- * The root is deliberately only an opaque backing colour.  It is server state,
- * not a Desktop application or an instruction page: mixdash never exposes it
- * while idle, and a real client maps over it immediately after a launch request.
- * Keeping a server-owned background is still important because XClearWindow on
- * resume can then replace any dashboard pixels not covered by a restored client.
+ * ── THE ONE FRAMEBUFFER WRITER ─────────────────────────────────────────────
+ *
+ * Xorg maps XFB_SHADOW_PATH through j36-xfb.so, not /dev/fb0.  This bridge is
+ * the presenter: while a windowed task is in front it copies changed scanlines
+ * from that cached mapping to the real panel; while the dashboard or a native
+ * task is in front it copies nothing.  Xorg and its clients never stop running.
+ *
+ * A full copy is made on every transition to visible.  Afterwards a cached row
+ * comparison preserves fbdev ShadowFB's useful damage behaviour: a 20x28 cursor
+ * move writes a few scanlines, not 1.2 MB of uncached panel memory.  Reading the
+ * cached shadow once per display tick is ordinary RAM bandwidth and is far less
+ * expensive than the framebuffer writes it avoids.
  */
+struct Presenter {
+    unsigned char *panel;
+    unsigned char *shadow;
+    unsigned char *last;
+    size_t map_len;
+    size_t start;
+    size_t visible;
+    size_t stride;
+    unsigned rows;
+    int panel_fd;
+    int shadow_fd;
+    int ready;
+    int active;
+};
+
+static struct Presenter presenter = {
+    NULL, NULL, NULL, 0, 0, 0, 0, 0, -1, -1, 0, 0
+};
+
+static void presented_ack(int active)
+{
+    char value[2] = { active ? '1' : '0', '\n' };
+    int fd;
+
+    (void)mkdir("/run/j36", 0755);
+    fd = open(PRESENTED_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        fail("cannot write %s: %s", PRESENTED_PATH, strerror(errno));
+        return;
+    }
+    if (write(fd, value, sizeof value) != (ssize_t)sizeof value)
+        fail("cannot acknowledge presentation in %s: %s",
+             PRESENTED_PATH, strerror(errno));
+    close(fd);
+}
+
+static int presenter_start(void)
+{
+    struct fb_var_screeninfo var;
+    struct fb_fix_screeninfo fix;
+    struct stat st;
+    size_t start, visible;
+
+    memset(&var, 0, sizeof var);
+    memset(&fix, 0, sizeof fix);
+    presenter.panel_fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+    if (presenter.panel_fd < 0
+        || ioctl(presenter.panel_fd, FBIOGET_VSCREENINFO, &var) < 0
+        || ioctl(presenter.panel_fd, FBIOGET_FSCREENINFO, &fix) < 0) {
+        fail("cannot inspect /dev/fb0 for the X presenter: %s", strerror(errno));
+        goto fail;
+    }
+    start = (size_t)var.yoffset * (size_t)fix.line_length;
+    visible = (size_t)var.yres * (size_t)fix.line_length;
+    if (!fix.smem_len || !fix.line_length || !var.yres
+        || start > (size_t)fix.smem_len
+        || visible > (size_t)fix.smem_len - start) {
+        fail("invalid panel mapping for the X presenter: len=%lu start=%zu visible=%zu",
+             (unsigned long)fix.smem_len, start, visible);
+        goto fail;
+    }
+
+    presenter.shadow_fd = open(XFB_SHADOW_PATH, O_RDWR | O_CLOEXEC);
+    if (presenter.shadow_fd < 0) {
+        fail("private X framebuffer %s is missing: %s",
+             XFB_SHADOW_PATH, strerror(errno));
+        goto fail;
+    }
+    if (fstat(presenter.shadow_fd, &st) < 0) {
+        fail("cannot inspect private X framebuffer %s: %s",
+             XFB_SHADOW_PATH, strerror(errno));
+        goto fail;
+    }
+    if (st.st_size < (off_t)fix.smem_len) {
+        fail("private X framebuffer %s is short: %lld bytes, need %lu",
+             XFB_SHADOW_PATH, (long long)st.st_size,
+             (unsigned long)fix.smem_len);
+        goto fail;
+    }
+
+    presenter.panel = mmap(NULL, fix.smem_len, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, presenter.panel_fd, 0);
+    presenter.shadow = mmap(NULL, fix.smem_len, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, presenter.shadow_fd, 0);
+    if (presenter.panel == MAP_FAILED || presenter.shadow == MAP_FAILED) {
+        fail("cannot map the X presenter: %s", strerror(errno));
+        goto fail;
+    }
+    presenter.last = malloc(visible);
+    if (!presenter.last) {
+        fail("cannot allocate %zu bytes for the X presenter", visible);
+        goto fail;
+    }
+
+    presenter.map_len = fix.smem_len;
+    presenter.start = start;
+    presenter.visible = visible;
+    presenter.stride = fix.line_length;
+    presenter.rows = var.yres;
+    presenter.ready = 1;
+    presenter.active = 0;
+    memset(presenter.last, 0, visible);
+    presented_ack(0);
+    note("presenter ready: %ux%u, stride %lu, %zu visible bytes",
+         var.xres, var.yres, (unsigned long)fix.line_length, visible);
+    return 1;
+
+fail:
+    if (presenter.panel && presenter.panel != MAP_FAILED)
+        munmap(presenter.panel, fix.smem_len);
+    if (presenter.shadow && presenter.shadow != MAP_FAILED)
+        munmap(presenter.shadow, fix.smem_len);
+    if (presenter.panel_fd >= 0)
+        close(presenter.panel_fd);
+    if (presenter.shadow_fd >= 0)
+        close(presenter.shadow_fd);
+    presenter.panel = presenter.shadow = NULL;
+    presenter.panel_fd = presenter.shadow_fd = -1;
+    return 0;
+}
+
+static void presenter_set(int active)
+{
+    unsigned char *panel, *shadow;
+
+    if (!presenter.ready)
+        return;
+    if (!active) {
+        presenter.active = 0;
+        presented_ack(0);
+        return;
+    }
+
+    panel = presenter.panel + presenter.start;
+    shadow = presenter.shadow + presenter.start;
+    /* Snapshot first and publish that exact snapshot.  Xorg is deliberately
+     * still rendering while this runs; copying shadow to panel first could let
+     * it change before `last' was updated, leaving panel != last and therefore a
+     * permanently missed dirty row on the next comparison. */
+    memcpy(presenter.last, shadow, presenter.visible);
+    memcpy(panel, presenter.last, presenter.visible);
+    presenter.active = 1;
+    presented_ack(1);
+}
+
+static void presenter_tick(void)
+{
+    unsigned char *panel, *shadow;
+    unsigned y;
+
+    if (!presenter.ready || !presenter.active)
+        return;
+    panel = presenter.panel + presenter.start;
+    shadow = presenter.shadow + presenter.start;
+    for (y = 0; y < presenter.rows; ++y) {
+        const size_t at = (size_t)y * presenter.stride;
+        if (memcmp(shadow + at, presenter.last + at, presenter.stride) == 0)
+            continue;
+        /* As in presenter_set(), panel and last must be byte-identical even if
+         * Xorg writes this row in the middle of the copy.  Any partial snapshot
+         * then differs from Xorg's settled row and is repaired next tick. */
+        memcpy(presenter.last + at, shadow + at, presenter.stride);
+        memcpy(panel + at, presenter.last + at, presenter.stride);
+    }
+}
+
+static void presenter_stop(void)
+{
+    if (!presenter.ready)
+        return;
+    presenter.active = 0;
+    presented_ack(0);
+    munmap(presenter.panel, presenter.map_len);
+    munmap(presenter.shadow, presenter.map_len);
+    free(presenter.last);
+    close(presenter.panel_fd);
+    close(presenter.shadow_fd);
+    presenter.panel = presenter.shadow = presenter.last = NULL;
+    presenter.panel_fd = presenter.shadow_fd = -1;
+    presenter.ready = 0;
+}
+
+static uint32_t little_u32(const unsigned char *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static int read_all(int fd, void *buf, size_t length)
+{
+    unsigned char *p = buf;
+    size_t done = 0;
+
+    while (done < length) {
+        ssize_t got = read(fd, p + done, length - done);
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got <= 0)
+            return 0;
+        done += (size_t)got;
+    }
+    return 1;
+}
+
+/* A build-time-decoded x.jpg.  The source stores 0x00RRGGBB independently of
+ * the X visual; XPutPixel performs the one-time conversion while X is hidden. */
+static Pixmap desktop_background(Window root)
+{
+    unsigned char hdr[MIXSPL_HEADER];
+    uint32_t *pixels = NULL;
+    XImage *image = NULL;
+    Pixmap pixmap = None;
+    GC gc = NULL;
+    unsigned sw, sh, stride;
+    size_t bytes;
+    int fd = -1, x, y;
+    int32_t sx16, sy16, scale16, ox, oy;
+
+    fd = open(X_BACKGROUND, O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || !read_all(fd, hdr, sizeof hdr)
+        || memcmp(hdr, MIXSPL_MAGIC, 8) != 0)
+        goto out;
+    sw = little_u32(hdr + 8);
+    sh = little_u32(hdr + 12);
+    stride = little_u32(hdr + 16);
+    if (!sw || !sh || sw > 8192 || sh > 8192 || stride != sw * 4)
+        goto out;
+    bytes = (size_t)stride * sh;
+    pixels = malloc(bytes);
+    if (!pixels || !read_all(fd, pixels, bytes))
+        goto out;
+
+    image = XCreateImage(dpy, DefaultVisual(dpy, scr), DefaultDepth(dpy, scr),
+                         ZPixmap, 0, NULL, (unsigned)scr_w, (unsigned)scr_h,
+                         32, 0);
+    if (!image)
+        goto out;
+    image->data = calloc(1, (size_t)image->bytes_per_line * image->height);
+    if (!image->data)
+        goto out;
+
+    /* Cover, centred: preserve the square artwork's proportions and crop the
+     * excess instead of stretching its X across a 4:3 screen. */
+    sx16 = (int32_t)(((int64_t)sw << 16) / scr_w);
+    sy16 = (int32_t)(((int64_t)sh << 16) / scr_h);
+    scale16 = sx16 < sy16 ? sx16 : sy16;
+    ox = ((int32_t)sw << 16) - scale16 * scr_w;
+    oy = ((int32_t)sh << 16) - scale16 * scr_h;
+    for (y = 0; y < scr_h; ++y) {
+        int sy = (oy / 2 + scale16 * y) >> 16;
+        if (sy < 0) sy = 0;
+        if (sy >= (int)sh) sy = (int)sh - 1;
+        for (x = 0; x < scr_w; ++x) {
+            int sx = (ox / 2 + scale16 * x) >> 16;
+            uint32_t rgb;
+            if (sx < 0) sx = 0;
+            if (sx >= (int)sw) sx = (int)sw - 1;
+            rgb = pixels[(size_t)sy * sw + (unsigned)sx];
+            XPutPixel(image, x, y,
+                      ((unsigned long)((rgb >> 16) & 0xff) << 16)
+                    | ((unsigned long)((rgb >> 8) & 0xff) << 8)
+                    | (unsigned long)(rgb & 0xff));
+        }
+    }
+
+    pixmap = XCreatePixmap(dpy, root, (unsigned)scr_w, (unsigned)scr_h,
+                           (unsigned)DefaultDepth(dpy, scr));
+    if (pixmap == None)
+        goto out;
+    gc = XCreateGC(dpy, pixmap, 0, NULL);
+    if (!gc) {
+        XFreePixmap(dpy, pixmap);
+        pixmap = None;
+        goto out;
+    }
+    XPutImage(dpy, pixmap, gc, image, 0, 0, 0, 0,
+              (unsigned)scr_w, (unsigned)scr_h);
+
+out:
+    if (fd >= 0)
+        close(fd);
+    if (gc)
+        XFreeGC(dpy, gc);
+    if (image)
+        XDestroyImage(image); /* also frees image->data */
+    free(pixels);
+    return pixmap;
+}
+
+/* The root is the loading frame, not a Desktop card.  A real client maps over it
+ * when ready; until then the staged X artwork makes the handoff intentional. */
 static void desktop_paint(void)
 {
     Window root;
     Colormap cm;
     XColor colour;
     unsigned long bg;
+    static Pixmap background = None;
 
     if (!dpy || scr_w < 1 || scr_h < 1)
         return;
 
     root = RootWindow(dpy, scr);
-    cm   = DefaultColormap(dpy, scr);
-    bg = BlackPixel(dpy, scr);
-    if (XParseColor(dpy, cm, "#0f131a", &colour)
-        && XAllocColor(dpy, cm, &colour))
-        bg = colour.pixel;
-    XSetWindowBackground(dpy, root, bg);
+    if (background == None)
+        background = desktop_background(root);
+    if (background != None) {
+        XSetWindowBackgroundPixmap(dpy, root, background);
+    } else {
+        cm = DefaultColormap(dpy, scr);
+        bg = BlackPixel(dpy, scr);
+        if (XParseColor(dpy, cm, "#0f131a", &colour)
+            && XAllocColor(dpy, cm, &colour))
+            bg = colour.pixel;
+        XSetWindowBackground(dpy, root, bg);
+    }
     XClearWindow(dpy, root);
-    XFlush(dpy);
+    XSync(dpy, False);
 }
 
 /* ── where the pointer is ────────────────────────────────────────────────── */
@@ -921,6 +1353,32 @@ static void pointer_resync(void)
     sent_x = rx;
     sent_y = ry;
     pointer_state_write();
+}
+
+/*
+ * Adopt the dashboard's hot spot at every ownership transfer, not only when X
+ * starts.  The old resume path kept X's last coordinate while the dashboard had
+ * continued moving the same logical pointer; opening a window therefore looked
+ * like a reset (usually near the centre) even though /run held the right value.
+ */
+static void pointer_adopt_shared(void)
+{
+    int x, y;
+
+    if (!pointer_state_read(&x, &y)) {
+        pointer_resync();
+        return;
+    }
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= scr_w) x = scr_w - 1;
+    if (y >= scr_h) y = scr_h - 1;
+    ptr_x = (double)x;
+    ptr_y = (double)y;
+    sent_x = x;
+    sent_y = y;
+    XTestFakeMotionEvent(dpy, scr, x, y, 0);
+    XSync(dpy, False);
 }
 
 static void pointer_move(double dx, double dy)
@@ -1356,6 +1814,8 @@ static void kbd_set_visible(int visible)
     if (visible == kbd_visible)
         return;
     if (visible) {
+        XEvent ev;
+
         /* A direction held while Select is pressed was sent to the application
          * as a real key-down.  Release it before the keyboard takes ownership. */
         release_directions(dirs_all());
@@ -1363,9 +1823,23 @@ static void kbd_set_visible(int visible)
         kbd_build();
         kbd_visible = 1;
         XMapRaised(dpy, kbd_win);
-        /* Mapping produces one Expose, which paints the complete keyboard.  Doing
-         * it here as well painted all 46 caps twice on every open. */
-        XFlush(dpy);
+        /*
+         * Do not delegate the first frame to Expose.  Xlib can read that event
+         * into its private queue while XPending() is called elsewhere; once it
+         * has done that the X socket is no longer readable, so poll() has no
+         * reason to call kbd_events().  The mapped window then stays at its grey
+         * background until pointer motion happens to wake the loop.
+         *
+         * Map first, wait until the server has made the window drawable, remove
+         * the now-redundant expose, and put one complete keyboard on the glass.
+         * This pair of round trips happens only when the keyboard opens.  D-pad
+         * movement still repaints two caps with XFlush and stays asynchronous.
+         */
+        XSync(dpy, False);
+        while (XCheckTypedWindowEvent(dpy, kbd_win, Expose, &ev))
+            ;
+        kbd_paint();
+        XSync(dpy, False);
     } else {
         kbd_state_write();
         kbd_visible = 0;
@@ -1787,6 +2261,41 @@ static void forget_pads(void)
     kbd_menu_hidden = 0;
 }
 
+/* Stop and start only PRESENTATION.  Xorg, the window manager and every client
+ * stay scheduled on their private framebuffer, so a task-switch gesture cannot
+ * turn into a multi-second Firefox compositor stall. */
+static void session_hide(int *grabbing)
+{
+    if (kbd_visible)
+        kbd_set_visible(0);
+    kbd_menu_hidden = 0;
+    forget_pads();
+    pointer_resync();
+    pointer_state_write();
+    if (*grabbing) {
+        set_grab(0);
+        *grabbing = 0;
+    }
+    screen_cursor(0);
+    XSync(dpy, False);
+    presenter_set(0);
+}
+
+static void session_show(int wants_grab, int *grabbing)
+{
+    forget_pads();
+    pointer_reload_settings();
+    pointer_adopt_shared();
+    kbd_menu_hidden = 0;
+    if (wants_grab && !*grabbing) {
+        set_grab(1);
+        *grabbing = 1;
+    }
+    screen_cursor(1);
+    XSync(dpy, False);
+    presenter_set(1);
+}
+
 /* ── The session's control pipe ──────────────────────────────────────────── */
 
 /*
@@ -1848,8 +2357,8 @@ static void ctl_send(const char *word)
 #define RESCAN_MS 2000
 
 /* Written only by the long-lived bridge (the one with --ctl), after X, the root
- * backing and the pad scan are ready.  The boot park unit uses it before
- * freezing the service cgroup. */
+ * backing, private-frame presenter and pad scan are ready.  The boot park unit
+ * uses it before allowing the dashboard to paint. */
 #define READY_PATH "/run/j36/padx.ready"
 #define MIXDASH_PID_PATH "/run/j36/mixdash.pid"
 
@@ -1861,20 +2370,10 @@ static void on_signal(int sig)
     stop_asked = 1;
 }
 
-/*
- * This session has just been let run again.
- *
- * mixdash stops the whole process group when the switcher takes the panel, and
- * continues it when the user comes back -- so SIGCONT is the only notification
- * this process gets that it is in front once more.  Two things follow from it:
- * everything the pad queued while we were away is thrown out (forget_pads, and
- * the note there is the important one), and with --grab the pad is taken back.
- * A flag and nothing else: both are work for the loop, not for a handler.
- *
- * Harmless when nothing stopped us.  SIGCONT is delivered to a process that was
- * never stopped as well; the queue is empty in that case and a re-grab of a
- * device already grabbed is a no-op.
- */
+/* SIGCONT now means "present X" rather than "resume X".  A running process still
+ * receives it, which preserves the small pidfile signalling interface while the
+ * service and every client remain scheduled.  Work stays in the main loop because
+ * Xlib, mmap copies and evdev ioctls are not signal-safe. */
 static volatile sig_atomic_t cont_asked;
 
 static void on_cont(int sig)
@@ -1883,10 +2382,8 @@ static void on_cont(int sig)
     cont_asked = 1;
 }
 
-/* mixdash uses SIGUSR2 for the hand-off that has no Menu gesture behind it: the
- * final X client closed and the idle service must disappear automatically.  A
- * signal handler cannot call Xlib or ioctl, so it only interrupts poll; the main
- * loop hides the cursor, releases EVIOCGRAB and stops itself below. */
+/* SIGUSR2 is the inverse: stop presenting, hide X's cursor and release EVIOCGRAB.
+ * It interrupts poll; the main loop performs and acknowledges the transition. */
 static volatile sig_atomic_t park_asked;
 
 static void on_park(int sig)
@@ -1934,10 +2431,12 @@ static void usage(void)
         "  --display NAME    which server (default $DISPLAY)\n"
         "  --probe           verify that X accepts a connection, then exit\n"
         "  --focus PID       focus the X client with _NET_WM_PID=PID, then exit\n"
+        "  --focus-window ID focus one mapped X window by its XID, then exit\n"
+        "  --windows         list XID<TAB>PID<TAB>active<TAB>title\n"
         "  --grab            take the pad while X owns the panel; Menu hold\n"
         "                    explicitly releases it before the dashboard hand-off\n"
-        "  --start-parked    boot-service mode: initialise without a grab, hide\n"
-        "                    the cursor, report ready and wait for SIGCONT\n"
+        "  --start-parked    boot-service mode: keep X live on its private frame,\n"
+        "                    release the pad, hide presentation, report ready\n"
         "  --no-grab         share the pad (the command-line default)\n"
         "  --list            name the devices that would be used, then exit\n"
         "  -v                say what is happening\n"
@@ -1992,20 +2491,9 @@ static void pointer_start(void)
     /* The linuxfb cursor and this X cursor hand one coordinate pair through /run.
      * Warp before the first client appears, so there is never a centre-screen X
      * cursor followed by the dashboard cursor somewhere else. */
-    if (pointer_state_read(&sent_x, &sent_y)) {
-        if (sent_x < 0) sent_x = 0;
-        if (sent_y < 0) sent_y = 0;
-        if (sent_x >= scr_w) sent_x = scr_w - 1;
-        if (sent_y >= scr_h) sent_y = scr_h - 1;
-        ptr_x = sent_x;
-        ptr_y = sent_y;
-        XTestFakeMotionEvent(dpy, scr, sent_x, sent_y, 0);
-        XFlush(dpy);
-    } else {
-        sent_x = -1;
-        sent_y = -1;
-        pointer_resync();
-    }
+    sent_x = -1;
+    sent_y = -1;
+    pointer_adopt_shared();
     pointer_install_cursor();
 
 }
@@ -2015,7 +2503,9 @@ int main(int argc, char **argv)
     const char *display_name = NULL;
     pid_t watch_pid = 0;
     pid_t focus_pid = 0;
-    int grab = 0, list_only = 0, probe_only = 0, start_parked = 0;
+    Window focus_window_id = None;
+    int grab = 0, list_only = 0, probe_only = 0, windows_only = 0;
+    int start_parked = 0;
     /*
      * Whether the pad is grabbed AT THIS MOMENT, as against whether it was asked
      * for on the command line.  The two differ for as long as the switcher is up:
@@ -2032,7 +2522,7 @@ int main(int argc, char **argv)
     const char *mixdash_env;
     int i, xt_event, xt_error, xt_major, xt_minor;
 
-    long move_last = 0, next_scan = 0;
+    long move_last = 0, next_scan = 0, next_present = 0;
     double scroll_x = 0.0, scroll_y = 0.0;
 
     for (i = 1; i < argc; i++) {
@@ -2044,8 +2534,12 @@ int main(int argc, char **argv)
             display_name = argv[++i];
         else if (!strcmp(argv[i], "--focus") && i + 1 < argc)
             focus_pid = (pid_t)strtol(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--focus-window") && i + 1 < argc)
+            focus_window_id = (Window)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--probe"))
             probe_only = 1;
+        else if (!strcmp(argv[i], "--windows"))
+            windows_only = 1;
         else if (!strcmp(argv[i], "--grab"))
             grab = 1;
         else if (!strcmp(argv[i], "--start-parked")) {
@@ -2099,8 +2593,8 @@ int main(int argc, char **argv)
      * gets to them; a write to a dead X connection must not take the process out
      * before close_pads() has run. */
     signal(SIGPIPE, SIG_IGN);
-    /* The dashboard's switcher stopped this whole group and has now let it run
-     * again; the pad has to be taken back.  See on_cont(). */
+    /* SIGCONT is the dashboard's inexpensive "present X now" notification.  It
+     * is delivered even though this process is no longer stopped. */
     signal(SIGCONT, on_cont);
     /* Automatic return to the dashboard has no Menu press in PadX to perform the
      * release first.  mixdash asks for that same parked state explicitly. */
@@ -2124,6 +2618,18 @@ int main(int argc, char **argv)
     }
 
     scr = DefaultScreen(dpy);
+    if (windows_only) {
+        const int rc = print_windows();
+        XCloseDisplay(dpy);
+        return rc;
+    }
+    if (focus_window_id != None) {
+        const int found = activate_window(focus_window_id);
+        if (!found)
+            fail("no mapped X window with id %lu", (unsigned long)focus_window_id);
+        XCloseDisplay(dpy);
+        return found ? 0 : 1;
+    }
     if (focus_pid > 0) {
         const int found = focus_client(focus_pid);
         if (!found)
@@ -2148,8 +2654,14 @@ int main(int argc, char **argv)
     pointer_start();
     kbd_start();
 
-    /* Install the opaque root backing before the first client maps. */
+    /* Install the loading background before the first client maps. */
     desktop_paint();
+
+    if (getenv("J36_XFB_PRESENT") && !presenter_start()) {
+        fail("the boot X service has no safe shadow-framebuffer presenter");
+        XCloseDisplay(dpy);
+        return 1;
+    }
 
     grabbing = grab && !start_parked;
     if (!scan_pads(grabbing)) {
@@ -2159,8 +2671,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (start_parked)
+    if (start_parked) {
         screen_cursor(0);
+        presenter_set(0);
+    } else {
+        presenter_set(1);
+    }
 
     if (ctl_path) {
         const int ready = open(READY_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
@@ -2171,13 +2687,12 @@ int main(int argc, char **argv)
             fail("cannot write %s: %s", READY_PATH, strerror(errno));
     }
 
-    if (start_parked) {
-        note("ready in boot-service mode, waiting parked without the pad grab");
-        raise(SIGSTOP);
-    }
+    if (start_parked)
+        note("ready in boot-service mode: X is live, presentation and pad are parked");
 
     move_last = now_ms();
     next_scan = move_last + RESCAN_MS;
+    next_present = move_last + TICK_MS;
 
     while (!stop_asked) {
         struct pollfd fds[MAX_PADS + 1];
@@ -2208,7 +2723,8 @@ int main(int argc, char **argv)
          * even when no event has arrived, because an axis held still sends nothing
          * -- evdev reports changes, and a stick resting against its stop has
          * stopped changing. */
-        timeout = (dirs_all() || menu_down_at || rep_any() || sticks_active())
+        timeout = (presenter.active || dirs_all() || menu_down_at
+                   || rep_any() || sticks_active())
                   ? TICK_MS : 250;
         n = poll(fds, (nfds_t)nfd, timeout);
         if (n < 0 && errno != EINTR)
@@ -2216,66 +2732,23 @@ int main(int argc, char **argv)
 
         now = now_ms();
 
-        /*
-         * Let run again, and the first thing that happens is the only thing that
-         * can happen safely: nothing the pad said while we were stopped is ours.
-         *
-         * Checked here, ahead of the reads, because after them is too late -- the
-         * queue would already have been replayed into the browser.  The iteration
-         * is then abandoned: the poll that was interrupted by the SIGCONT has
-         * nothing left to report, and the next one round starts from a pad with no
-         * buttons down and no backlog.
-         */
+        /* Presentation resumed.  Drain dashboard input, adopt the dashboard's
+         * exact hot spot, then copy one complete X frame before acknowledging. */
         if (cont_asked) {
             cont_asked = 0;
-            forget_pads();
-            /* Mouse settings can be changed while this X session is stopped on
-             * the dashboard.  Reload all three response values before accepting
-             * another stick event, or a long-lived Desktop would retain its old
-             * curve while Qt immediately used the new one. */
-            pointer_reload_settings();
-            /* A keyboard hidden by the Menu press belongs to the screen we left,
-             * not to this resumed one.  Keep it closed across a real hand-off. */
-            kbd_menu_hidden = 0;
+            session_show(grab, &grabbing);
             move_last = now;
-            if (grab && !grabbing) {
-                note("continued by the dashboard, taking the pad back");
-                set_grab(1);
-                grabbing = 1;
-            }
-            /* AND THE SCREEN IS NOT OURS EITHER.  The dashboard has been drawing
-             * on the panel for as long as this was stopped.  It restored the
-             * complete saved X frame before SIGCONT, and X now renders directly
-             * into that same framebuffer.  Show the cursor only after the handoff
-             * is complete so its save-under can never capture dashboard pixels. */
-            XClearWindow(dpy, RootWindow(dpy, scr));
-            XSync(dpy, False);
-            screen_cursor(0);
-            screen_cursor(1);
+            next_present = now + TICK_MS;
+            note("window presentation enabled; the pad and shared pointer are active");
             continue;
         }
 
-        /* The last window exited while X owned the panel.  Unlike a Menu hold,
-         * that event originates in mixdash, so perform the input half of the
-         * ownership transfer here before mixdash freezes this cgroup.  Keeping
-         * EVIOCGRAB across SIGSTOP made the repainted dashboard look alive while
-         * every one of its controls was actually locked out by this process. */
+        /* The dashboard requests the inverse transfer after the final client or
+         * before drawing its switcher.  Only this presenter stops; X stays live. */
         if (park_asked) {
             park_asked = 0;
-            if (kbd_visible)
-                kbd_set_visible(0);
-            kbd_menu_hidden = 0;
-            forget_pads();
-            pointer_resync();
-            pointer_state_write();
-            if (grabbing) {
-                set_grab(0);
-                grabbing = 0;
-            }
-            screen_cursor(0);
-            XSync(dpy, False);
-            note("parked by the dashboard, releasing the pad before X is frozen");
-            raise(SIGSTOP);
+            session_hide(&grabbing);
+            note("window presentation parked; X and its clients remain live");
             continue;
         }
 
@@ -2313,6 +2786,13 @@ int main(int argc, char **argv)
                     gone = 1;
                     break;
                 }
+
+                /* Keep the descriptor drained while the dashboard owns input,
+                 * but never translate those events into the hidden X session.
+                 * Without the old SIGSTOP this explicit gate is the half that
+                 * makes "one pad owner" remain true. */
+                if (presenter.ready && !presenter.active)
+                    continue;
 
                 if (ev.type == EV_ABS) {
                     int r;
@@ -2515,6 +2995,16 @@ int main(int argc, char **argv)
         for (i = 0; i < REP_N; i++)
             rep_fire(i, now);
 
+        /* Xorg has rendered into ordinary shared memory throughout this loop.
+         * Publish only the rows it changed, only while the X task is front, and
+         * at most once per panel tick.  A chatty evdev device can wake poll much
+         * faster than 60 Hz; scanning 1.2 MB for every such wake made pointer
+         * motion steal CPU from the application it was meant to drive. */
+        if (presenter.active && now >= next_present) {
+            presenter_tick();
+            next_present = now + TICK_MS;
+        }
+
         /*
          * Look for a pad that was not there before.  A slow cadence and only when
          * there is somewhere to put one, so the usual case -- the built-in pad and
@@ -2539,18 +3029,14 @@ int main(int argc, char **argv)
          * so nothing has been taken away -- it has been moved behind a screen
          * that says what it is about to close.
          *
-         * THE PAD GOES BACK BEFORE THE SIGNAL, and that ordering is the whole
-         * trick.  mixdash is about to draw a switcher and drive it with the pad;
-         * it cannot read a device this process has grabbed, and a moment later it
-         * will stop this process -- with the grab still held, because a grab
-         * belongs to the descriptor and not to whether its owner is scheduled.
-         * Handing it over first is the only order that leaves a usable switcher.
+         * THE PAD AND PRESENTATION GO BACK BEFORE THE SIGNAL, and that ordering is
+         * the whole trick.  mixdash is about to draw a switcher and drive it with
+         * the pad; it cannot read a device this process has grabbed or safely
+         * paint while one last scanline copy is in flight.
          *
-         * Then the hold state is cleared and this process stops itself.  That is
-         * stronger than waiting for the launcher's process-group stop: xinit may
-         * have put this bridge in another group, which is how the second live X
-         * cursor escaped onto the dashboard in the reported video.  mixdash has
-         * the pid file needed to continue this exact process.
+         * This process remains scheduled and drains the hidden session's evdev
+         * descriptor without translating it.  The acknowledgement written after
+         * presenter_set(0) replaces the old self-stop/process-group handshake.
          *
          * With no dashboard to ask, the old behaviour stands unchanged.
          */
@@ -2558,22 +3044,12 @@ int main(int argc, char **argv)
             mixdash_pid = live_mixdash(mixdash_pid);
             if (mixdash_pid > 0 && kill(mixdash_pid, 0) == 0) {
                 note("Menu held, asking the dashboard for its switcher");
-                set_grab(0);
-                grabbing = 0;
-                screen_cursor(0);
-                kill(mixdash_pid, SIGUSR1);
                 menu_down_at = 0;
-                kbd_menu_hidden = 0;
-                /* The buttons that were down belong to a session that is about to
-                 * be stopped, and their releases will be delivered to a switcher
-                 * instead.  Cancelling the repeats here is what stops a shoulder
-                 * paging the browser for the whole time the switcher is up. */
-                rep_clear();
-                /* xinit may have moved this bridge outside the launcher's process
-                 * group.  Stop ourselves before a release or stick event can
-                 * restore X cursor pixels over the dashboard.  mixdash continues
-                 * this exact pid after restoring the X frame. */
-                raise(SIGSTOP);
+                session_hide(&grabbing);
+                /* The hidden acknowledgement is on disk before the signal.  The
+                 * dashboard may therefore paint immediately after it receives
+                 * SIGUSR1 without racing one final presenter copy. */
+                kill(mixdash_pid, SIGUSR1);
             } else {
                 note("Menu held, closing the session");
                 if (watch_pid > 0)
@@ -2602,6 +3078,7 @@ int main(int argc, char **argv)
     pointer_state_write();
     if (ctl_path)
         unlink(READY_PATH);
+    presenter_stop();
     close_pads();
     XTestGrabControl(dpy, False);
     XCloseDisplay(dpy);

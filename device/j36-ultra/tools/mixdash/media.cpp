@@ -1527,7 +1527,23 @@ void MediaPage::playOnce(const QString &path)
 
     const QString ff = ffmpegPath();
     const QString dev = alsaDevice();
-    if (ff.isEmpty() || dev.isEmpty())
+    if (dev.isEmpty())
+        return;
+
+    /* The startup asset has a build-decoded WAV beside its source MP3.  Feeding
+     * that straight to aplay avoids cold-loading ffmpeg and libavcodec from the
+     * SD card at the exact moment X and the dashboard are starting.  The old path
+     * took nearly three minutes in the device log once Firefox joined that I/O
+     * queue; aplay begins the same six-second chime immediately. */
+    const QString ap = aplayPath();
+    if (path.endsWith(QStringLiteral(".wav"), Qt::CaseInsensitive)
+        && !ap.isEmpty()) {
+        QProcess::startDetached(ap, QStringList()
+                               << QStringLiteral("-q")
+                               << QStringLiteral("-D") << dev << path);
+        return;
+    }
+    if (ff.isEmpty())
         return;
 
     const QString decode = shellQuote(ff) +
@@ -1535,7 +1551,6 @@ void MediaPage::playOnce(const QString &path)
                            " -vn -ar " + QString::number(kRate) + " -ac 2 ";
 
     QString cmd = decode + "-f alsa " + shellQuote(dev);
-    const QString ap = aplayPath();
     if (!ap.isEmpty())
         cmd += " || " + decode + "-f wav - | " + shellQuote(ap) +
                " -q -D " + shellQuote(dev) + " -";
