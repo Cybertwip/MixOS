@@ -368,6 +368,15 @@ private:
      * the list, and only die when something else eventually continued it.
      */
     void closeTask(int index);
+    /* Hide toast / busy / volume so they cannot be baked into a hand-off. */
+    void hideTransientOverlays();
+    /* Sleep the linuxfb pointer and hide toast/busy/volume.  Does not
+     * paint: the next writer is a full-panel copy (PadX or Panel::restore),
+     * and a Qt flush here is a complete dashboard frame that linuxfb can
+     * deliver on top of the X loading screen. */
+    void flushOverlaysOffPanel();
+    /* Ask one mapped X window (index into sessionWindows()) to close. */
+    void closeSessionWindow(int index);
     /* Where a QProcess is in m_tasks, or -1.  By pointer and not by a captured
      * index, because closing one task renumbers every task after it. */
     int indexOfTask(QProcess *proc) const;
@@ -522,6 +531,10 @@ private:
     bool m_desktopPending = false;
     int m_desktopPendingPolls = 0;
     bool m_desktopWasAlive = false;
+    /* After a new windowed launch, raise the newest mapped X client so a
+     * Browser card is not hidden behind Doom. */
+    bool m_desktopRaiseNewest = false;
+    int m_desktopWindowCount = 0;
 
     /*
      * ── A LAUNCH IS NOT RE-ENTRANT ───────────────────────────────────────────

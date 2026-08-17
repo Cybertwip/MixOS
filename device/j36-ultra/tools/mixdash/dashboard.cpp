@@ -29,6 +29,7 @@
 
 #include <QCoreApplication>
 #include <QDebug>
+#include <QEvent>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -397,6 +398,26 @@ bool sessionClientPending()
     return !sessionPendingNames().isEmpty();
 }
 
+qint64 sessionPendingPid(const QString &name)
+{
+    if (name.isEmpty())
+        return 0;
+    QFile f(QString::fromLatin1(kXSessionPending));
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return 0;
+    for (const QByteArray &row : f.read(4096).split('\n')) {
+        const int tab = row.indexOf('\t');
+        if (tab < 0)
+            continue;
+        bool ok = false;
+        const qint64 pid = row.left(tab).trimmed().toLongLong(&ok);
+        const QString got = QString::fromUtf8(row.mid(tab + 1)).trimmed();
+        if (ok && pid > 1 && got == name)
+            return pid;
+    }
+    return 0;
+}
+
 /*
  * The name the session will give a window opened on this program.
  *
@@ -656,7 +677,11 @@ Dashboard::Dashboard(QWidget *parent)
     m_toast = new QLabel(this);
     m_toast->setAlignment(Qt::AlignCenter);
     m_toast->setStyleSheet(
-        "QLabel { background: rgba(8, 9, 14, 216); color: #E8EAF2;"
+        /* Opaque, not rgba.  linuxfb blends a translucent label against
+         * whatever happens to be in the backing store -- leftover cards
+         * in the rounded corners, or a previous longer sentence after
+         * adjustSize() shrinks the widget. */
+        "QLabel { background: #14161E; color: #E8EAF2;"
         "         border: 1px solid #4A4E5C; border-radius: 12px;"
         "         padding: 7px 16px; font-size: 13px; }");
     m_toast->hide();
@@ -664,7 +689,10 @@ Dashboard::Dashboard(QWidget *parent)
     m_toastTimer = new QTimer(this);
     m_toastTimer->setSingleShot(true);
     connect(m_toastTimer, &QTimer::timeout, this, [this]() {
+        const QRect dirty = m_toast->geometry();
         m_toast->hide();
+        if (updatesEnabled())
+            repaint(dirty);
         /* An armed Power off expires with its own prompt.  Anything else would leave
          * a button that shuts the board down on the next press, minutes later, with
          * no warning on screen. */
@@ -707,6 +735,8 @@ Dashboard::Dashboard(QWidget *parent)
         const int target = switcherTarget(row);
         if (target >= 0)
             closeTask(target);
+        else if (target <= kDesktopTarget)
+            closeSessionWindow(kDesktopTarget - target);
     });
     connect(m_switcher, &Switcher::dismissed, this, [this]() {
         /* Cancel is "put back what was in front", and it is the ordinary switch
@@ -1837,6 +1867,7 @@ void Dashboard::paintEvent(QPaintEvent *)
 
 void Dashboard::toast(const QString &text, int ms)
 {
+    const QRect previous = m_toast->isVisible() ? m_toast->geometry() : QRect();
     m_toast->setText(text);
     m_toast->adjustSize();
     /* It used to be lifted clear of the dock; with the dock gone it sits on the
@@ -1848,6 +1879,18 @@ void Dashboard::toast(const QString &text, int ms)
     m_toast->raise();
     m_pointer->raise();
     m_toastTimer->start(ms);
+
+    /* linuxfb: a shorter sentence shrinks the label and the rounded
+     * corners are transparent.  Union the old and new rectangles and
+     * paint the parent through both now, or the previous toast stays
+     * as a ghost beside the new one.  Skip this while the panel belongs
+     * to X -- updates are off and a flush would race PadX. */
+    if (!updatesEnabled())
+        return;
+    QRect dirty = m_toast->geometry();
+    if (previous.isValid())
+        dirty |= previous;
+    repaint(dirty);
 }
 
 namespace {
@@ -2166,6 +2209,7 @@ void Dashboard::pollDesktopService()
         if (!windows.isEmpty()) {
             m_desktopPending = false;
             m_desktopPendingPolls = 0;
+            m_desktopRaiseNewest = true;
         } else if (clientStarting) {
             /* A large generic client may still be faulting executable pages from
              * the SD card.  Keep its X loading background in front for as long as
@@ -2205,6 +2249,22 @@ void Dashboard::pollDesktopService()
         if (m_desktopForeground)
             setForeground(-1);
     }
+
+    if (alive && m_desktopRaiseNewest) {
+        const QVector<SessionWindow> mapped = sessionWindows();
+        if (mapped.size() > m_desktopWindowCount && !mapped.isEmpty()) {
+            const SessionWindow &newest = mapped.last();
+            if (newest.xid != 0)
+                writeSessionControl(QStringLiteral("focus-window %1").arg(newest.xid));
+            else if (newest.pid > 1)
+                writeSessionControl(QStringLiteral("focus %1").arg(newest.pid));
+            m_desktopRaiseNewest = false;
+        }
+    }
+    if (alive)
+        m_desktopWindowCount = windows.size();
+    else
+        m_desktopWindowCount = 0;
 
     if (alive != m_desktopWasAlive) {
         m_desktopWasAlive = alive;
@@ -2257,7 +2317,13 @@ void Dashboard::launchWindowed(const QString &title, const QString &exe,
      */
     if (sessionSupervisorAlive()
         && sessionPendingNames().contains(windowNameFor(exe))) {
-        toast(tr("%1 is already open").arg(title));
+        /* Do not toast.  toast() paints the dashboard, and this path
+         * immediately hands the panel to X -- that paint is the whole
+         * card grid landing on the loading screen.  Focus the existing
+         * launcher and present; the window is the feedback. */
+        const qint64 pid = sessionPendingPid(windowNameFor(exe));
+        if (pid > 1)
+            writeSessionControl(QStringLiteral("focus %1").arg(pid));
         setDesktopForeground();
         return;
     }
@@ -2307,21 +2373,18 @@ void Dashboard::runInSession(const QString &title, const QString &cmd)
 
     m_desktopPending = true;
     m_desktopPendingPolls = 0;
+    m_desktopRaiseNewest = true;
 
     /*
-     * THE TOAST IS PAINTED BEFORE THE SWITCH, for the same reason launch() paints
-     * its own: the moment setForeground() runs, updates go off and nothing here can
-     * draw.  Firefox takes several seconds to map a window on this board and the
-     * desktop's old frame is what is on the glass until it does, so the sentence
-     * naming what is being opened is the last thing this program can say about it.
-     *
-     * And the panel goes to the session, because a window that opens behind the
-     * dashboard is a window nobody asked for -- which, until the queue below
-     * existed, is exactly what a command typed at the Terminal produced.
+     * Do not leave "Opening ..." or the linuxfb arrow on the physical
+     * panel.  The hand-off turns updates off and PadX then copies X's
+     * private frame; a toast or cursor that was only half flushed is the
+     * cut overlay / glitched mouse the board was reported for.  The new
+     * window is raised once it maps -- see pollDesktopService.  The
+     * pointer is slept inside setDesktopForeground(), after overlays are
+     * down and before the one full clean frame.
      */
-    toast(tr("Opening %1").arg(title), 8000);
-    m_toast->repaint();
-    QCoreApplication::processEvents();
+    qInfo() << "mixdash: opening windowed" << title;
     setDesktopForeground();
 }
 
@@ -2498,6 +2561,7 @@ void Dashboard::setForeground(int index)
          * restored here -- and a frame kept for the dashboard would be a frame of
          * a grid that may have changed while a game was in front.
          */
+        hideTransientOverlays();
         m_fg = -1;
         m_pad->setWatching(false);
 
@@ -2540,12 +2604,11 @@ void Dashboard::setForeground(int index)
      * mouse pointer does not disappear when switching apps, and it renders a
      * trace behind".
      *
-     * Sleeping it here costs one small repaint and leaves nothing of this
-     * program's own on the glass to be handed to somebody else.
+     * Hide the pointer and toasts without painting.  The restore below
+     * is a full-panel copy; a Qt flush here would be a dashboard frame
+     * that linuxfb can deliver after that copy.
      */
-    m_pointer->sleep();
-    if (updatesEnabled())
-        repaint(m_pointer->geometry());
+    flushOverlaysOffPanel();
 
     /* Off before the frame goes back, and it stays off for as long as this task
      * is in front.  See the numbered note above. */
@@ -2580,13 +2643,19 @@ void Dashboard::setDesktopForeground()
             toast(tr("The current task could not be paused"), 5000);
         return;
     }
+
+    /* Hide toast/pointer/busy and dismiss the switcher WITHOUT a Qt
+     * paint.  A full dashboard repaint here was the "whole render on
+     * top of the X loading screen" when a card was pressed again: hide()
+     * of the "already open" toast counted as an overlay on the glass,
+     * so we flushed the card grid onto /dev/fb0 and linuxfb delivered
+     * that frame after PadX had already published X.  Updates go off
+     * immediately so those hide() dirty regions are discarded; PadX's
+     * full copy (and its first refresh ticks) own the panel. */
+    flushOverlaysOffPanel();
     if (m_switcher->isVisible())
         m_switcher->dismiss();
     m_switcherWas = -1;
-
-    m_pointer->sleep();
-    if (updatesEnabled())
-        repaint(m_pointer->geometry());
 
     setUpdatesEnabled(false);
     /* PadX publishes a complete private-X frame as part of the acknowledged
@@ -2647,6 +2716,46 @@ int Dashboard::indexOfTask(QProcess *proc) const
         if (m_tasks[i].proc.data() == proc)
             return i;
     return -1;
+}
+
+void Dashboard::hideTransientOverlays()
+{
+    m_toastTimer->stop();
+    m_toast->hide();
+    m_busy->stop();
+    if (m_volumeBar)
+        m_volumeBar->hide();
+}
+
+void Dashboard::flushOverlaysOffPanel()
+{
+    hideTransientOverlays();
+    if (m_pointer)
+        m_pointer->sleep();
+    /* No repaint.  hide() posts dirty regions; the caller turns updates
+     * off immediately so linuxfb discards them.  A full flush here was
+     * a complete dashboard frame delivered on top of the X loading
+     * screen after PadX had already published. */
+}
+
+void Dashboard::closeSessionWindow(int index)
+{
+    const QVector<SessionWindow> windows = sessionWindows();
+    if (index < 0 || index >= windows.size())
+        return;
+    const SessionWindow &w = windows[index];
+    if (w.xid != 0) {
+        if (!writeSessionControl(QStringLiteral("close-window %1").arg(w.xid))) {
+            toast(tr("The window service is not answering"), 4000);
+            return;
+        }
+    } else if (w.pid > 1) {
+        ::kill((pid_t)w.pid, SIGTERM);
+    } else {
+        return;
+    }
+    toast(tr("Closing %1").arg(w.name));
+    refreshSwitcher();
 }
 
 void Dashboard::closeTask(int index)
@@ -2711,6 +2820,8 @@ void Dashboard::showSwitcher()
         m_switcherPending = true;
         return;
     }
+
+    hideTransientOverlays();
 
     /* Remembered before anything is stopped, because stopForeground() clears
      * m_fg and cancelling has to put back what was actually in front. */
@@ -2871,10 +2982,7 @@ QVector<Switcher::Entry> Dashboard::switcherRows() const
                             && (windows[i].active
                                 || m_switcherWas == kDesktopTarget - i))
                                ? tr("in front") : tr("waiting");
-                /* START operates on native process groups.  X windows retain
-                 * their title-bar close button and are focused by choosing the
-                 * card with D-pad/A or the shared pointer. */
-                e.closable = false;
+                e.closable = true;
                 rows.append(e);
             }
         }

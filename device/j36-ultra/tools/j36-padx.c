@@ -89,13 +89,15 @@
  * and from the ABS_HAT0X/ABS_HAT0Y hat, because those three are how the same four
  * directions arrive from the three families.
  *
- * THE MAP.  Chosen so that the four things a browser needs -- point, click, go
- * back, scroll -- are the four things nearest the thumbs, and so that no binding
- * needs a chord:
+ * THE MAP is one map for every window.  There is no title or class search
+ * that turns a client into a "game" and another into a "browser".  The pad
+ * is never EVIOCGRAB'd while X is in front, so every client sees the real
+ * joystick, D-pad and buttons.  The X pointer is a second, always-visible
+ * device on the RIGHT stick, used to hit a close box:
  *
- *     Left stick     pointer, proportional to deflection
- *     Right stick    scroll, proportional to deflection
- *     D-pad          arrow-key navigation (the only pad navigation source)
+ *     Left stick     the client's own analog stick (never XTEST mouse)
+ *     Right stick    X pointer, always drawn
+ *     D-pad          the client's own hat / arrow keys (also X arrows)
  *     A              left click
  *     B              Back (Alt+Left)
  *     X              Return
@@ -109,9 +111,9 @@
  *     Vol- / Vol+    zoom out / zoom in      (Ctrl+minus / Ctrl+plus)
  *     Home (F12)     the start page          (Alt+Home)
  *
- * The D-pad deliberately never moves the pointer.  It remains a digital arrow-key
- * source for applications and for the on-screen keyboard, while the left stick is
- * the only built-in pointer and the right stick is only a wheel.
+ * The cursor is never hidden while this process is presenting.  A hidden
+ * XFixes cursor is how a window became un-closeable: the close box was
+ * there and the pointer was not.
  *
  * Menu is a hold and not a press because it is the only irreversible binding on
  * the pad and it sits under the thumb: a press would close the browser by
@@ -762,75 +764,6 @@ static Window window_for_pid(Window at, unsigned long wanted, int depth)
     return None;
 }
 
-static int window_looks_like_game(Window window)
-{
-    XClassHint hint;
-    char name[320];
-    const char *needles[] = {
-        "doom", "prboom", "dsda", "chocolate", "freedoom", "gzdoom",
-        "crispy", "retroarch", "mednafen", "scummvm", "pcsx", "mupen",
-        "ppsspp", "dolphin", "mame", "fbneo", "snes9x", "nestopia",
-        "yabause", "dosbox", "openbor", "ioquake", "quake", "hexen",
-        "heretic", "strife", "sdl_app", "love", NULL
-    };
-    char hay[640];
-    int i;
-
-    hay[0] = '\0';
-    memset(&hint, 0, sizeof(hint));
-    if (XGetClassHint(dpy, window, &hint)) {
-        snprintf(hay, sizeof(hay), "%s %s",
-                 hint.res_name ? hint.res_name : "",
-                 hint.res_class ? hint.res_class : "");
-        if (hint.res_name)
-            XFree(hint.res_name);
-        if (hint.res_class)
-            XFree(hint.res_class);
-    }
-    client_name(window, name, sizeof(name));
-    if (name[0]) {
-        size_t n = strlen(hay);
-        snprintf(hay + n, sizeof(hay) - n, " %s", name);
-    }
-    for (i = 0; hay[i]; ++i) {
-        if (hay[i] >= 'A' && hay[i] <= 'Z')
-            hay[i] = (char)(hay[i] - 'A' + 'a');
-    }
-    for (i = 0; needles[i]; ++i) {
-        if (strstr(hay, needles[i]))
-            return 1;
-    }
-    return 0;
-}
-
-static Window focused_window(void)
-{
-    Window root = RootWindow(dpy, scr);
-    Atom active_prop = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", True);
-    Atom actual;
-    int format;
-    unsigned long nitems, after;
-    unsigned char *data = NULL;
-    Window active = None;
-
-    if (active_prop == None)
-        return None;
-    if (XGetWindowProperty(dpy, root, active_prop, 0, 1, False, XA_WINDOW,
-                           &actual, &format, &nitems, &after, &data) == Success
-        && data && actual == XA_WINDOW && format == 32 && nitems == 1)
-        active = *(Window *)data;
-    if (data)
-        XFree(data);
-    return active;
-}
-
-static int focused_is_game(void)
-{
-    Window w = focused_window();
-
-    return w != None && window_looks_like_game(w);
-}
-
 static int close_window(Window client)
 {
     Window root = RootWindow(dpy, scr);
@@ -1068,6 +1001,12 @@ static void screen_cursor(int visible)
  * move writes a few scanlines, not 1.2 MB of uncached panel memory.  Reading the
  * cached shadow once per display tick is ordinary RAM bandwidth and is far less
  * expensive than the framebuffer writes it avoids.
+ *
+ * The first few ticks after becoming visible are also full copies.  mixdash
+ * linuxfb can still flush a leftover 20x28 pointer rectangle after this
+ * process has already published X; the row cache would then skip those
+ * scanlines forever (shadow == last, panel is stale).  Re-publishing wins
+ * that race without leaving a ghost box around the X cursor.
  */
 struct Presenter {
     unsigned char *panel;
@@ -1082,10 +1021,13 @@ struct Presenter {
     int shadow_fd;
     int ready;
     int active;
+    int refresh;
 };
 
+#define PRESENTER_REFRESH_TICKS 12
+
 static struct Presenter presenter = {
-    NULL, NULL, NULL, 0, 0, 0, 0, 0, -1, -1, 0, 0
+    NULL, NULL, NULL, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0
 };
 
 static void presented_ack(int active)
@@ -1190,27 +1132,33 @@ fail:
     return 0;
 }
 
-static void presenter_set(int active)
+static void presenter_publish_all(void)
 {
-    unsigned char *panel, *shadow;
+    unsigned char *panel = presenter.panel + presenter.start;
+    unsigned char *shadow = presenter.shadow + presenter.start;
 
-    if (!presenter.ready)
-        return;
-    if (!active) {
-        presenter.active = 0;
-        presented_ack(0);
-        return;
-    }
-
-    panel = presenter.panel + presenter.start;
-    shadow = presenter.shadow + presenter.start;
     /* Snapshot first and publish that exact snapshot.  Xorg is deliberately
      * still rendering while this runs; copying shadow to panel first could let
      * it change before `last' was updated, leaving panel != last and therefore a
      * permanently missed dirty row on the next comparison. */
     memcpy(presenter.last, shadow, presenter.visible);
     memcpy(panel, presenter.last, presenter.visible);
+}
+
+static void presenter_set(int active)
+{
+    if (!presenter.ready)
+        return;
+    if (!active) {
+        presenter.active = 0;
+        presenter.refresh = 0;
+        presented_ack(0);
+        return;
+    }
+
+    presenter_publish_all();
     presenter.active = 1;
+    presenter.refresh = PRESENTER_REFRESH_TICKS;
     presented_ack(1);
 }
 
@@ -1221,6 +1169,11 @@ static void presenter_tick(void)
 
     if (!presenter.ready || !presenter.active)
         return;
+    if (presenter.refresh > 0) {
+        presenter_publish_all();
+        presenter.refresh--;
+        return;
+    }
     panel = presenter.panel + presenter.start;
     shadow = presenter.shadow + presenter.start;
     for (y = 0; y < presenter.rows; ++y) {
@@ -1240,6 +1193,7 @@ static void presenter_stop(void)
     if (!presenter.ready)
         return;
     presenter.active = 0;
+    presenter.refresh = 0;
     presented_ack(0);
     munmap(presenter.panel, presenter.map_len);
     munmap(presenter.shadow, presenter.map_len);
@@ -2177,19 +2131,19 @@ static double axis_norm(int slot, int role, int raw)
     return (t < 0.0 ? t + d : t - d) / (1.0 - d);
 }
 
-/* Exactly mixdash/Joypad::driveStick: the first complete left stick wins, its
- * circular magnitude is clamped, then the configured response exponent is
- * applied to that magnitude rather than independently to each axis. */
+/* Right stick is the X pointer.  The left stick is left to the client as
+ * a real analog axis -- mapping it to the mouse is what made every FPS
+ * spin, and guessing "this window is a game" is not a policy. */
 static void pointer_rate(double *rx, double *ry)
 {
     int i;
 
     for (i = 0; i < MAX_PADS; i++) {
         double x, y, mag, curved;
-        if (ax_code[i][AX_LX] < 0 || ax_code[i][AX_LY] < 0)
+        if (ax_code[i][AX_RX] < 0 || ax_code[i][AX_RY] < 0)
             continue;
-        x = ax_val[i][AX_LX];
-        y = ax_val[i][AX_LY];
+        x = ax_val[i][AX_RX];
+        y = ax_val[i][AX_RY];
         mag = sqrt(x * x + y * y);
         if (mag > 1.0) {
             x /= mag;
@@ -2208,18 +2162,10 @@ static void pointer_rate(double *rx, double *ry)
     *rx = *ry = 0.0;
 }
 
-/* Same first-device rule and linear 14-notch response as the dashboard's right
- * stick. */
+/* Wheel is L1/R1 only.  The right stick is the pointer, so it must not
+ * also accumulate scroll notches. */
 static void scroll_rate(double *rx, double *ry)
 {
-    int i;
-    for (i = 0; i < MAX_PADS; i++) {
-        if (ax_code[i][AX_RX] < 0 || ax_code[i][AX_RY] < 0)
-            continue;
-        *rx = ax_val[i][AX_RX] * SCROLL_MAX;
-        *ry = ax_val[i][AX_RY] * SCROLL_MAX;
-        return;
-    }
     *rx = *ry = 0.0;
 }
 
@@ -2384,20 +2330,23 @@ static void session_hide(int *grabbing)
         set_grab(0);
         *grabbing = 0;
     }
-    screen_cursor(0);
+    /* Leave the X cursor as it is.  Hiding it here baked an invisible
+     * pointer into the next present, and the close box could not be hit. */
     XSync(dpy, False);
     presenter_set(0);
 }
 
 static void session_show(int wants_grab, int *grabbing)
 {
+    (void)wants_grab;
     forget_pads();
     pointer_reload_settings();
     pointer_adopt_shared();
     kbd_menu_hidden = 0;
-    if (wants_grab && !*grabbing) {
-        set_grab(1);
-        *grabbing = 1;
+    /* Never EVIOCGRAB while presenting.  Every client must see the pad. */
+    if (*grabbing) {
+        set_grab(0);
+        *grabbing = 0;
     }
     screen_cursor(1);
     XSync(dpy, False);
@@ -2540,6 +2489,7 @@ static void usage(void)
         "  --probe           verify that X accepts a connection, then exit\n"
         "  --focus PID       focus the X client with _NET_WM_PID=PID, then exit\n"
         "  --focus-window ID focus one mapped X window by its XID, then exit\n"
+        "  --close-window ID ask one mapped X window to close, then exit\n"
         "  --windows         list XID<TAB>PID<TAB>active<TAB>title\n"
         "  --grab            take the pad while X owns the panel; Menu hold\n"
         "                    explicitly releases it before the dashboard hand-off\n"
@@ -2612,6 +2562,7 @@ int main(int argc, char **argv)
     pid_t watch_pid = 0;
     pid_t focus_pid = 0;
     Window focus_window_id = None;
+    Window close_window_id = None;
     int grab = 0, list_only = 0, probe_only = 0, windows_only = 0;
     int start_parked = 0;
     /*
@@ -2644,6 +2595,8 @@ int main(int argc, char **argv)
             focus_pid = (pid_t)strtol(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--focus-window") && i + 1 < argc)
             focus_window_id = (Window)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--close-window") && i + 1 < argc)
+            close_window_id = (Window)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--probe"))
             probe_only = 1;
         else if (!strcmp(argv[i], "--windows"))
@@ -2738,6 +2691,13 @@ int main(int argc, char **argv)
         XCloseDisplay(dpy);
         return found ? 0 : 1;
     }
+    if (close_window_id != None) {
+        const int found = close_window(close_window_id);
+        if (!found)
+            fail("no mapped X window with id %lu", (unsigned long)close_window_id);
+        XCloseDisplay(dpy);
+        return found ? 0 : 1;
+    }
     if (focus_pid > 0) {
         const int found = focus_client(focus_pid);
         if (!found)
@@ -2771,7 +2731,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    grabbing = grab && !start_parked;
+    /* The pad is never exclusively grabbed.  --grab still means "this
+     * process is the dashboard's partner", not "hide the device from
+     * every client". */
+    grabbing = 0;
+    (void)grab;
     if (!scan_pads(grabbing)) {
         fail("no pad among /dev/input/event*, so nothing can drive this session "
              "-- run with --list to see what was rejected");
@@ -2780,9 +2744,9 @@ int main(int argc, char **argv)
     }
 
     if (start_parked) {
-        screen_cursor(0);
         presenter_set(0);
     } else {
+        screen_cursor(1);
         presenter_set(1);
     }
 
@@ -2844,10 +2808,10 @@ int main(int argc, char **argv)
          * exact hot spot, then copy one complete X frame before acknowledging. */
         if (cont_asked) {
             cont_asked = 0;
-            session_show(grab, &grabbing);
+            session_show(0, &grabbing);
             move_last = now;
             next_present = now + TICK_MS;
-            note("window presentation enabled; the pad and shared pointer are active");
+            note("window presentation enabled; pad is shared, pointer is visible");
             continue;
         }
 
@@ -3037,28 +3001,27 @@ int main(int argc, char **argv)
                         pointer_resync();
                         pointer_state_write();
                         menu_down_at = now;
-                        /* Hide the keyboard on the press so it cannot be frozen
-                         * onto the dashboard; restore it only if release proves
-                         * this was the short next-window gesture. */
                         if (kbd_visible) {
                             kbd_menu_hidden = 1;
                             kbd_set_visible(0);
                         }
-                        /* Hide on the press, so the server has restored the
-                         * pixels under its cursor before the hold branch hands
-                         * the panel away.  A tap restores it on release; a hold
-                         * restores it after the session is continued. */
-                        if (mixdash_pid > 0 && kill(mixdash_pid, 0) == 0)
-                            screen_cursor(0);
                     } else {
                         if (menu_down_at && now - menu_down_at < MENU_HOLD_MS) {
-                            note("Menu tapped, asking for the next window");
-                            ctl_send("next");
-                            if (kbd_menu_hidden)
-                                kbd_set_visible(1);
+                            mixdash_pid = live_mixdash(mixdash_pid);
+                            if (mixdash_pid > 0 && kill(mixdash_pid, 0) == 0) {
+                                note("Menu tapped, opening the task switcher");
+                                session_hide(&grabbing);
+                                kill(mixdash_pid, SIGUSR1);
+                            } else {
+                                note("Menu tapped, asking for the next window");
+                                ctl_send("next");
+                                if (kbd_menu_hidden)
+                                    kbd_set_visible(1);
+                            }
                         }
                         kbd_menu_hidden = 0;
-                        screen_cursor(1);
+                        if (presenter.active)
+                            screen_cursor(1);
                         menu_down_at = 0;
                     }
                     break;
@@ -3102,6 +3065,9 @@ int main(int argc, char **argv)
 
         for (i = 0; i < REP_N; i++)
             rep_fire(i, now);
+
+        if (presenter.active)
+            screen_cursor(1);
 
         /* Xorg has rendered into ordinary shared memory throughout this loop.
          * Publish only the rows it changed, only while the X task is front, and
