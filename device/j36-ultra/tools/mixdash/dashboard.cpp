@@ -3127,8 +3127,12 @@ void Dashboard::onOpenRequested(const QString &path)
     }
 
     if (info.isFile() && info.isExecutable()) {
-        push(m_terminal);
-        m_terminal->runCommand(shellQuote(path));
+        /* Clicking an executable in Files is an application launch, whatever its
+         * package or filename.  Always route it through the one Desktop session;
+         * guessing from a list of known games makes every newly installed X/SDL
+         * program fail until MixOS learns its name.  The Terminal remains the
+         * explicit place for commands that need a pty. */
+        launchWindowed(info.fileName(), path, QStringList());
         return;
     }
 
@@ -3198,8 +3202,10 @@ void Dashboard::onNav(int action, bool repeat)
     /* The keyboard is an overlay, so it gets first refusal: Back closes it rather
      * than popping the page being typed into. */
     if (m_keyboard->isVisible()) {
-        if (m_keyboard->handleNav(overlayAction))
-            return;
+        /* Modal means exclusive.  In particular no direction is ever re-offered
+         * to Wi-Fi or Settings after it moves the selected key. */
+        m_keyboard->handleNav(overlayAction);
+        return;
     }
 
     /*

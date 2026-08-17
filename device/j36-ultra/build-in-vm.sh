@@ -8783,14 +8783,15 @@ build_padx() {
     grep -q 'Machine:.*ARM' <<<"$header" || { log "padx: not an ARM ELF"; return 1; }
 
     # The whitelist is short on purpose: every name on it is a package this build
-    # puts on the card.  libX11 comes with xserver-xorg-core's own dependencies and
-    # libXtst and libXfixes are in needed_packages.txt beside it.  Anything else
+    # puts on the card.  libX11 comes with xserver-xorg-core's own dependencies,
+    # libm with libc6, and libXtst/libXfixes are in needed_packages.txt beside it.
+    # Anything else
     # in here means the chroot linked something the card will not have, and the
     # failure would surface on the board as a browser card that starts nothing.
     needed="$(sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p' <<<"$header" | tr '\n' ' ')"
     for lib in $needed; do
         case "$lib" in
-            libX11.so.6|libXtst.so.6|libXfixes.so.3|libXext.so.6|libc.so.6|ld-linux-armhf.so.3) ;;
+            libX11.so.6|libXtst.so.6|libXfixes.so.3|libXext.so.6|libm.so.6|libc.so.6|ld-linux-armhf.so.3) ;;
             *) unexpected="$unexpected $lib" ;;
         esac
     done
@@ -11560,13 +11561,18 @@ if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
     #   the panel the LK already lit.  AutoAddGPU and AutoBindGPU off close the same
     #   door from the other side.
     #
-    #   ShadowFB MUST BE OFF.  mixdash and X take turns owning the same physical
-    #   framebuffer, and mixdash restores an X frame before it continues the
-    #   stopped session.  With ShadowFB on, X keeps a second private copy which is
-    #   not changed by that restore; its next damage blit then puts stale black or
-    #   partially repainted rectangles back over the restored screen.  Direct
-    #   rendering is a little more expensive on this uncached simplefb, but at
-    #   640x480 it is the only arrangement with one authoritative set of pixels.
+    #   ShadowFB MUST BE ON.  /dev/fb0 is uncached device memory; making Firefox,
+    #   XRender and the software cursor read/modify/write it directly makes every
+    #   operation enormously slow and, more seriously, makes the cursor save-under
+    #   race scanout and leave transparent holes.  The shadow is ordinary cached
+    #   RAM and fbdev copies completed damage to the panel.  mixdash snapshots the
+    #   completed X frame only after PadX has hidden the server cursor, and restores
+    #   that same frame before continuing X, so the shadow and the saved frame are
+    #   already the same image at both ownership boundaries.
+    #
+    #   GLX is disabled.  This is a 2D fbdev session and every shipped client uses
+    #   software drawing; loading swrast for an unused indirect-GLX provider cost
+    #   fourteen seconds in the device log before PadX or a window could start.
     #
     #   DefaultDepth 24 matches the panel: x8r8g8b8, 32 bits per pixel with 24 of
     #   them meaningful, which is what X calls depth 24.  Left out, X starts at
@@ -11582,10 +11588,9 @@ if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
     #   and XTEST is exactly the thing the DPMS/screensaver idle timer does not
     #   count as activity.
     #
-    # There is no InputDevice section and AutoAddDevices is left on, which is the
-    # point: a USB keyboard or mouse plugged into the dock is picked up by
-    # xserver-xorg-input-libinput and works normally.  The built-in pad is the one
-    # device libinput will not take, which is why j36-padx exists to read it.
+    # AutoAddDevices is left on so a USB keyboard or mouse plugged into the dock is
+    # picked up by xserver-xorg-input-libinput.  The one InputClass below excludes
+    # only the built-in pad, which j36-padx reads and grabs itself.
     mkdir -p "$SDROOT/opt/mixos/share/xorg"
     cat > "$SDROOT/opt/mixos/share/xorg/xorg.conf" <<'XORGCONF'
 # Written by device/j36-ultra/build-in-vm.sh for the J36 Ultra's simple-framebuffer.
@@ -11602,11 +11607,24 @@ Section "ServerFlags"
     Option "OffTime"      "0"
 EndSection
 
+Section "Module"
+    Disable "glx"
+EndSection
+
 Section "Device"
     Identifier "j36-simplefb"
     Driver     "fbdev"
     Option     "fbdev"    "/dev/fb0"
-    Option     "ShadowFB" "false"
+    Option     "ShadowFB" "true"
+EndSection
+
+# The bridge is the sole owner of the built-in controls while X is visible.  Keep
+# ordinary USB keyboards and mice on libinput, but do not also translate this pad
+# as a partial keyboard behind PadX's XTEST events.
+Section "InputClass"
+    Identifier   "j36-built-in-pad"
+    MatchProduct "J36 Ultra built-in gamepad"
+    Option       "Ignore" "true"
 EndSection
 
 Section "Monitor"
@@ -12753,14 +12771,18 @@ run_browser() {
 # from a shell script, and it puts it on the DATA partition where the rest of this
 # session's state already goes.
 firefox_profile() {
-    prof="$HOME/.mozilla/j36"
+    # v1 was launched by older images after unconditionally deleting its lock.
+    # That allowed two Firefox processes to write the same Places databases and
+    # the resulting profile now crashes in pthread mutex handling on affected
+    # cards.  A new name is both a clean migration boundary and cheaper than
+    # trying to repair a collection of interdependent SQLite files on an SD card.
+    prof="$HOME/.mozilla/j36-v2"
     mkdir -p "$prof" 2>/dev/null || return 1
 
-    # A profile Firefox did not shut down cleanly keeps its lock, and the next start
-    # is a modal "Firefox is already running" that a D-pad cannot dismiss.  --no-remote
-    # below means a second window is a second instance, so the lock is the only thing
-    # that would refuse it.
-    rm -f "$prof/.parentlock" "$prof/lock" 2>/dev/null
+    # Never remove Firefox's lock here.  It distinguishes a stale crash marker
+    # itself; deleting a live lock is what let two instances corrupt the old
+    # profile.  The dashboard and the session already suppress duplicate Browser
+    # requests, and this is the final safety net when the script is run by hand.
 
     # The start page, quoted for a JS string literal.  It is a file:// URL off this
     # card in the normal case, but it is whatever was passed in, so backslashes and
@@ -12784,6 +12806,8 @@ user_pref("browser.sessionstore.interval", 300000);
 user_pref("browser.sessionstore.resume_from_crash", false);
 user_pref("browser.startup.page", 1);
 user_pref("browser.startup.homepage", "$home_url");
+user_pref("network.captive-portal-service.enabled", false);
+user_pref("network.connectivity-service.enabled", false);
 user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("browser.aboutwelcome.enabled", false);
 user_pref("browser.uitour.enabled", false);
@@ -12852,18 +12876,18 @@ case "${J36_BROWSER##*/}" in
             # lock state owned by root.  Repair that legacy profile once; after the
             # marker exists Firefox owns everything it creates and only root's
             # freshly rewritten user.js needs a cheap direct chown.
-            profile_owner="$HOME/.mozilla/j36/.virtua-owned-v1"
+            profile_owner="$HOME/.mozilla/j36-v2/.virtua-owned-v1"
             if [ ! -e "$profile_owner" ]; then
-                echo "j36-browser: repairing ownership of the legacy Firefox profile" >&2
-                chown -R virtua:virtua "$HOME/.mozilla/j36" 2>/dev/null
+                echo "j36-browser: preparing the Firefox profile" >&2
+                chown -R virtua:virtua "$HOME/.mozilla/j36-v2" 2>/dev/null
                 : > "$profile_owner" 2>/dev/null || true
                 chown virtua:virtua "$profile_owner" 2>/dev/null
             fi
-            chown virtua:virtua "$HOME/.mozilla" "$HOME/.mozilla/j36" \
-                                 "$HOME/.mozilla/j36/user.js" 2>/dev/null
+            chown virtua:virtua "$HOME/.mozilla" "$HOME/.mozilla/j36-v2" \
+                                 "$HOME/.mozilla/j36-v2/user.js" 2>/dev/null
         fi
         run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" --no-remote \
-            -profile "$HOME/.mozilla/j36" "$URL"
+            -profile "$HOME/.mozilla/j36-v2" "$URL"
         ;;
     chromium|chromium-browser)
         run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" --disable-gpu \

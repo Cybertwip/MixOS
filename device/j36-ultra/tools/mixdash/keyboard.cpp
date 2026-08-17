@@ -90,6 +90,13 @@ const int kPad = 8;
 Keyboard::Keyboard(QWidget *parent)
     : QWidget(parent)
 {
+    /* linuxfb has no compositor.  A translucent top-level child makes every
+     * D-pad focus change read and blend the page below again; on the uncached
+     * panel that was slow and successive partial updates visibly ate the text
+     * field.  The keyboard owns its rectangle while it is open, so say so to Qt
+     * and paint it opaquely.  Its colours, gradients and layout stay unchanged. */
+    setAttribute(Qt::WA_OpaquePaintEvent);
+    setAttribute(Qt::WA_NoSystemBackground);
     setMouseTracking(true);
     hide();
     buildLayout();
@@ -627,8 +634,7 @@ void Keyboard::paintEvent(QPaintEvent *event)
 
     /* The panel itself: solid enough to read a passphrase against whatever the
      * page underneath happens to be. */
-    QColor back = Theme::window();
-    back.setAlpha(244);
+    const QColor back = Theme::window();
     p.setPen(Qt::NoPen);
     p.setBrush(back);
     p.drawRoundedRect(QRectF(0, 0, width(), height() + Theme::Radius), Theme::Radius,
