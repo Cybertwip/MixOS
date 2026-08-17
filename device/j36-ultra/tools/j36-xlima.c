@@ -943,16 +943,37 @@ static Bool JLimaPreInit(ScrnInfoPtr pScrn, int flags)
 	if (!xf86SetDefaultVisual(pScrn, -1))
 		return FALSE;
 
+	if (pScrn->numEntities < 1) {
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+			   "lima: no entity (the fb slot was not claimed)\n");
+		return FALSE;
+	}
+
 	p = pScrn->driverPrivate = xnfcalloc(1, sizeof(JLimaRec));
 	p->fb_fd = -1;
 	p->dri_fd = -1;
 	p->pEnt = xf86GetEntityInfo(pScrn->entityList[0]);
+	if (pScrn->confScreen)
+		pScrn->monitor = pScrn->confScreen->monitor;
 
-	xf86CollectOptions(pScrn, NULL);
+	/*
+	 * Do not call xf86CollectOptions().  On this xserver it ends in
+	 * xf86MergeOutputClassOptions(), which logs "unsupported bus type 0"
+	 * for an FB-slot entity and then reads a NULL platform device
+	 * (SIGSEGV at 0xb0).  That is the crash after "Default visual is
+	 * TrueColor" in the device log.  Device options are already on the
+	 * GDev from xorg.conf.
+	 */
 	if (!(p->options = malloc(sizeof(JLimaOptions))))
 		return FALSE;
 	memcpy(p->options, JLimaOptions, sizeof(JLimaOptions));
-	xf86ProcessOptions(pScrn->scrnIndex, pScrn->options, p->options);
+	{
+		pointer opts = pScrn->options;
+
+		if (!opts && p->pEnt && p->pEnt->device)
+			opts = p->pEnt->device->options;
+		xf86ProcessOptions(pScrn->scrnIndex, opts, p->options);
+	}
 
 	fbdev = xf86GetOptValString(p->options, OPTION_FBDEV);
 	if (!fbdev)
