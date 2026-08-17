@@ -18,6 +18,7 @@ firefox-esr
 firmware-mediatek
 firmware-realtek
 fonts-noto-cjk
+fonts-noto-core
 git
 hostapd
 iw

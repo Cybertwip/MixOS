@@ -11560,11 +11560,13 @@ if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
     #   the panel the LK already lit.  AutoAddGPU and AutoBindGPU off close the same
     #   door from the other side.
     #
-    #   ShadowFB "true" makes X render into ordinary memory and blit the damaged
-    #   rectangles out.  On this panel the framebuffer is uncached memory at
-    #   0x82700000 and read-modify-write into it is slower than doing the work in
-    #   RAM and copying once; it is also what gives a software cursor somewhere to
-    #   save and restore from.
+    #   ShadowFB MUST BE OFF.  mixdash and X take turns owning the same physical
+    #   framebuffer, and mixdash restores an X frame before it continues the
+    #   stopped session.  With ShadowFB on, X keeps a second private copy which is
+    #   not changed by that restore; its next damage blit then puts stale black or
+    #   partially repainted rectangles back over the restored screen.  Direct
+    #   rendering is a little more expensive on this uncached simplefb, but at
+    #   640x480 it is the only arrangement with one authoritative set of pixels.
     #
     #   DefaultDepth 24 matches the panel: x8r8g8b8, 32 bits per pixel with 24 of
     #   them meaningful, which is what X calls depth 24.  Left out, X starts at
@@ -11604,7 +11606,7 @@ Section "Device"
     Identifier "j36-simplefb"
     Driver     "fbdev"
     Option     "fbdev"    "/dev/fb0"
-    Option     "ShadowFB" "true"
+    Option     "ShadowFB" "false"
 EndSection
 
 Section "Monitor"
@@ -11826,8 +11828,8 @@ KEYBOARDXML
     # ONE X SERVER, EVER.  j36-xrun deliberately cannot start a session: a second
     # server, or a session started outside mixdash's task list, is two programs
     # scribbling on one framebuffer with nothing arbitrating.  Starting one is the
-    # Desktop card's job and only the Desktop card's job, and everything else asks
-    # the one that is already running.
+    # dashboard's job and only the dashboard's job.  It warms that one session at
+    # boot, parks it in the task list, and everything else asks for that instance.
     #
     # THE WHOLE TREE IS STILL ONE PROCESS GROUP, which is what makes mixdash's
     # switcher work: dashboard.cpp's GroupLeaderProcess puts the launcher in its own
@@ -11947,10 +11949,10 @@ XSESSIONLAUNCH
     # THE CONTROL LOOP IS THE FOREGROUND PROCESS and j36-padx is not, which is the
     # one structural change from the old browser session.  It has to be: the session
     # outlives any single window now, so the thing that decides when it is over
-    # cannot be a bridge that was watching one pid.  The loop ends the session when
-    # the last window closes, when the pad bridge dies (which is how "the X server
-    # went away" is noticed, since the bridge is an X client), or when somebody
-    # writes `quit'.
+    # cannot be a bridge that was watching one pid.  The loop keeps an empty X
+    # server ready and ends the session only when the pad bridge dies (which is how
+    # "the X server went away" is noticed, since the bridge is an X client), or
+    # when somebody writes `quit' / `quit-empty'.
     cat > "$SDROOT/opt/mixos/bin/j36-xsession-main" <<'XSESSIONMAIN'
 #!/bin/sh
 # j36-xsession-main -- the X client xinit runs, and the whole life of the session.
@@ -11997,11 +11999,27 @@ export GDK_BACKEND=x11
 export GTK_OVERLAY_SCROLLING=0
 export GDK_CORE_DEVICE_EVENTS=1
 
+# mixdash itself is a Qt linuxfb program and systemd gives it a private two-font
+# fontconfig file.  The graphical session is a DIFFERENT display stack.  Letting
+# either setting cross this boundary makes a Qt client open /dev/fb0 behind X and
+# limits Firefox to the dashboard's two faces; that produced both the missing-
+# glyph boxes and "No writable cache directories" in the device log.
+unset FONTCONFIG_FILE FONTCONFIG_PATH QT_QPA_FB_DISABLE_INPUT QT_QPA_FONTDIR
+export QT_QPA_PLATFORM=xcb
+
+# SDL must be a WINDOW here.  Its kmsdrm backend can open the DRM device and play
+# audio while drawing into a scanout the still-lit simplefb panel never shows --
+# exactly the "Doom has sound but no picture" failure.  X11 keeps it in this
+# session, under matchbox and under the dashboard's foreground hand-off.
+export SDL_VIDEODRIVER=x11
+export SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR=0
+
 # WHAT A CLIENT LOOKS AT TO KNOW IT IS ALREADY INSIDE A SESSION.  j36-browser reads
 # it: with it set it execs a browser, without it it hands itself to j36-xrun.  A
-# variable and not a test on DISPLAY, because the Terminal card exports DISPLAY=:0
-# unconditionally -- a shell that has a display NAME has not necessarily got a
-# server, and that difference is the whole point of j36-xrun.
+# variable and not a test on DISPLAY, because DISPLAY only says where a client
+# would connect; it does not say that mixdash has transferred the physical panel
+# to that server.  The Terminal deliberately leaves DISPLAY unset and uses
+# j36-xrun for that ownership transfer.
 export J36_XSESSION=1
 export J36_XSESSION_CTL="$CTL"
 
@@ -12029,7 +12047,6 @@ WM=""; KBD=""; PADX=""; TICKER=""
 # rather than in this string: a title comes from a command line the user typed and a
 # space in one would turn a list of two windows into a list of three.
 CLIENTS=""
-STARTED=0
 
 # matchbox: a kiosk window manager, 340 kB, no panel and no desktop.  Something has
 # to give a client input focus -- without a WM an X server hands focus to PointerRoot
@@ -12158,7 +12175,7 @@ KBD=""
 # It also means a writer's open() never blocks waiting for a reader to appear, which
 # is what lets mixdash use a plain non-blocking open and get ENXIO -- "no session" --
 # instead of hanging.
-rm -f "$CTL" "$PADXPID" 2>/dev/null
+rm -f "$CTL" "$PADXPID" "$RUNDIR/padx.ready" 2>/dev/null
 CTLOK=0
 if mkfifo -m 0600 "$CTL" 2>/dev/null; then
     if exec 9<>"$CTL"; then
@@ -12251,7 +12268,6 @@ start_client() {
     sc_pid=$!
     client_title "$sc_cmd" > "$RUNDIR/win.$sc_pid" 2>/dev/null
     CLIENTS="$CLIENTS $sc_pid"
-    STARTED=1
     reap_clients
     echo "j36-xsession: window $sc_pid is $sc_cmd" >&2
 }
@@ -12341,15 +12357,12 @@ while :; do
 
     reap_clients
 
-    # THE SESSION ENDS WHEN ITS LAST WINDOW DOES, and only once it has had one.  A
-    # session started from the Desktop card with no --run has never had a window and
-    # sits here waiting to be asked for one, which is the whole point of that card; a
-    # session started for the browser goes away when the browser is closed, which is
-    # what that card has always done.  One rule, both behaviours.
-    if [ "$STARTED" -eq 1 ] && [ -z "$CLIENTS" ]; then
-        echo "j36-xsession: the last window closed" >&2
-        break
-    fi
+    # AN EMPTY DESKTOP STAYS ALIVE.  X is expensive to initialise on this SD card,
+    # and a stopped, windowless session is cheap.  More importantly it leaves a
+    # known :0 ready for the next j36-xrun request instead of making the first
+    # graphical command race a server that is still starting.  B on the empty
+    # Desktop sends quit-empty above, and the switcher's close action still tears
+    # the task down explicitly, so persistence does not remove either exit path.
 
     # The bridge is an X client, so it dies when the server does.  That makes it the
     # cheapest test for "the X server has gone" that does not involve opening a
@@ -12387,7 +12400,7 @@ done
 [ -n "$PADX" ] && kill "$PADX" 2>/dev/null
 [ -n "$KBD" ] && kill "$KBD" 2>/dev/null
 [ -n "$WM" ] && kill "$WM" 2>/dev/null
-rm -f "$CTL" "$WINLIST" "$PIDFILE" "$PADXPID" 2>/dev/null
+rm -f "$CTL" "$WINLIST" "$PIDFILE" "$PADXPID" "$RUNDIR/padx.ready" 2>/dev/null
 exit 0
 XSESSIONMAIN
     chmod 0755 "$SDROOT/opt/mixos/bin/j36-xsession-main"
@@ -12638,6 +12651,12 @@ mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR
 export NO_AT_BRIDGE=1
 export GDK_BACKEND=x11
 
+# The dashboard service confines its own Qt process to a two-font fontconfig file.
+# j36-browser can also be invoked by hand, so repeat the session boundary here:
+# Firefox must use Debian's full font catalogue and virtua's writable XDG cache.
+unset FONTCONFIG_FILE FONTCONFIG_PATH QT_QPA_FB_DISABLE_INPUT QT_QPA_FONTDIR
+export QT_QPA_PLATFORM=xcb
+
 # Browsers are ordinary desktop clients, not system services.  Firefox explicitly
 # rejects euid 0 with a HOME owned by another account (the exact error is in the
 # device log), and there is no supported environment switch which changes that.
@@ -12704,9 +12723,9 @@ run_browser() {
 #   isolation for about 400 MB.  Content is still out of the parent, so a renderer
 #   that dies is a tab that dies.
 #
-#   Software WebRender and no hardware video.  X here is xf86-video-fbdev with
-#   ShadowFB and no DRI3, so Mesa is swrast whatever anybody asks for, and asking is
-#   a few seconds of probing followed by the fallback.
+#   Software WebRender and no hardware video.  X here is xf86-video-fbdev on a
+#   simple framebuffer with no DRI3, so Mesa is swrast whatever anybody asks for,
+#   and asking is a few seconds of probing followed by the fallback.
 #
 #   Small caches and a lazy session store.  The disk cache lives on the SD card and
 #   is worth having but not worth 300 MB of it; the session store's default is to
@@ -12814,12 +12833,13 @@ case "${J36_BROWSER##*/}" in
         #   Running Firefox as root in a regular user's session is not supported.
         #   ($HOME is /home/virtua which is owned by virtua.)
         #
-        # and exited before mapping a window.  Which is not a browser that failed
-        # to open: it is the session's ONLY window closing the instant it was
-        # started, so j36-xsession-main's "the last window closed" rule ended the
-        # session, xinit lost its server, and the whole task went away -- which is
-        # the "Desktop Exited" toast, and the black panel in between.  Five of
-        # them in a row are in the reported log, six seconds apart.
+        # and exited before mapping a window.  Older sessions then treated it as
+        # their only window closing, ended X, and made the whole task disappear --
+        # which was the "Desktop Exited" toast and the black panel in between.
+        # Five of them in a row are in the reported log, six seconds apart.  The
+        # persistent session above prevents that secondary failure, but it cannot
+        # turn a root-owned Firefox profile into a browser, so the privilege drop
+        # remains the primary fix.
         #
         # There is no Mozilla escape variable for this check.  Run the client as
         # virtua instead; -ac plus -nolisten tcp on this private X server supplies
@@ -12967,8 +12987,8 @@ no-script version, which is the one that works here</li>
 <h2>Other windows</h2>
 
 <p>This browser is one window in a desktop session, not the whole of it. The
-<b>Desktop</b> card on the dashboard starts that session empty, and from the
-Terminal card:</p>
+dashboard starts that session once at boot and parks it in the background; the
+<b>Desktop</b> card lists what is open in it. From the Terminal card:</p>
 
 <p><code>j36-xrun COMMAND</code></p>
 
@@ -12981,12 +13001,11 @@ on the panel a moment later.</p>
 brings the dashboard back with all of them left running behind it. Four at once
 is the limit &mdash; there is 1&nbsp;GB of RAM to share out.</p>
 
-<p>A program started straight from the Terminal card, without
-<code>j36-xrun</code>, finds the session too &mdash; <b>DISPLAY</b> is already
-set &mdash; but it will sit there drawing nothing until the Desktop is back in
-front, because a session that is not on the panel is stopped. That is what
-<code>j36-xrun</code> is for: it asks the session, so it does not matter which
-card you are looking at.</p>
+<p>A graphical program must be started with <code>j36-xrun</code>. The dashboard
+Terminal intentionally does not export a raw <b>DISPLAY</b>: a Desktop in the
+background is stopped, and connecting to it directly is how a game could play
+sound while drawing no picture. <code>j36-xrun</code> first transfers the panel,
+then starts the client, so it does not matter which card you were looking at.</p>
 
 <h2>What it can and cannot do</h2>
 

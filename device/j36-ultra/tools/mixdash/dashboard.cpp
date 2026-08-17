@@ -131,6 +131,7 @@ const char kXSessionPid[] = "/run/j36/xsession.pid";
  * self-stops after releasing the pad, and mixdash continues this exact process
  * only after restoring X's frame. */
 const char kPadxPid[] = "/run/j36/padx.pid";
+const char kPadxReady[] = "/run/j36/padx.ready";
 
 /*
  * ── WHERE A COMMAND LINE WAITS ───────────────────────────────────────────────
@@ -615,6 +616,19 @@ Dashboard::Dashboard(QWidget *parent)
     m_requestTimer->start();
 
     /*
+     * Xorg has to touch the physical framebuffer while it starts, so it cannot be
+     * initialised invisibly alongside a running linuxfb dashboard.  Warm it as an
+     * ordinary foreground task, wait until j36-xsession-main has created its
+     * control pipe, then snapshot and SIGSTOP it through the same hand-off every
+     * other task uses.  From that point on :0 is genuinely ready in the background
+     * and a j36-xrun request only has to restore one frame and SIGCONT it.
+     */
+    m_desktopWarmTimer = new QTimer(this);
+    m_desktopWarmTimer->setInterval(250);
+    connect(m_desktopWarmTimer, &QTimer::timeout,
+            this, &Dashboard::pollDesktopWarmup);
+
+    /*
      * The pad comes before the Diagnostics page because that page reports on it --
      * how many devices are open, how many of them look like a mouse -- and holding
      * the pointer to a Joypad that does not exist yet would be a null on the first
@@ -717,6 +731,9 @@ Dashboard::Dashboard(QWidget *parent)
     Trace::step("goHome");
     goHome();
     qApp->installEventFilter(this);
+    /* After the initial dashboard and splash hand-off have settled.  Starting it
+     * in the constructor would let Xorg draw before Qt's first complete frame. */
+    QTimer::singleShot(1000, this, &Dashboard::startDesktopInBackground);
     Trace::step("constructed");
 }
 
@@ -882,12 +899,13 @@ void Dashboard::buildPages()
      * bringing up and taking down again for two releases was the answer sitting
      * there unused.
      *
-     * So this card starts that server and nothing else: a window manager with
-     * titlebars, the on-screen keyboard, the pad as a pointer, and an empty root
-     * window waiting to be asked for something.  From there `j36-xrun freedoom' in
-     * the Terminal -- which now has DISPLAY set for exactly this reason -- puts
-     * freedoom on the glass beside whatever else is open, and a tap of Menu pages
-     * between the windows.
+     * The dashboard now warms that server at boot and parks it as a stopped task:
+     * a window manager with titlebars, the shared on-screen keyboard, the pad as a
+     * pointer, and an empty root ready to be asked for something.  This card lists
+     * those windows and brings the selected one forward.  From the Terminal,
+     * `j36-xrun freedoom' transfers the panel before starting the client; a raw
+     * DISPLAY is deliberately not exported there because a background session is
+     * stopped and cannot service it.
      *
      * IT IS ONE TASK IN THE SWITCHER however many windows are inside it, and that is
      * not a simplification: it is one process group, one X server and one
@@ -2047,6 +2065,70 @@ int Dashboard::sessionTask() const
 }
 
 /*
+ * Bring X up once, while it is allowed to own the framebuffer, and put it behind
+ * the dashboard only after its supervisor and control FIFO exist.  A stopped X
+ * session cannot finish booting, so "background" starts at that readiness point,
+ * not one instruction after QProcess::start().
+ */
+void Dashboard::startDesktopInBackground()
+{
+    if (m_launching || sessionTask() >= 0 || !m_desktopWarmTimer)
+        return;
+
+    const QString session = graphicalSession();
+    if (session.isEmpty())
+        return;
+
+    m_warmingDesktop = true;
+    launch(tr("Desktop"), session, QStringList());
+    if (m_warmingDesktop && sessionTask() >= 0)
+        m_desktopWarmTimer->start();
+    else
+        m_warmingDesktop = false;
+}
+
+void Dashboard::pollDesktopWarmup()
+{
+    if (!m_warmingDesktop) {
+        m_desktopWarmTimer->stop();
+        return;
+    }
+
+    const int session = sessionTask();
+    if (session < 0) {
+        /* FailedToStart/finished removes the task asynchronously. */
+        if (!m_launching) {
+            m_warmingDesktop = false;
+            m_desktopWarmTimer->stop();
+        }
+        return;
+    }
+    if (!sessionSupervisorAlive()
+        || !QFileInfo(QString::fromLatin1(kPadxReady)).exists())
+        return;
+
+    m_warmingDesktop = false;
+    m_desktopWarmTimer->stop();
+    m_toastTimer->stop();
+    m_toast->hide();
+
+    /* If the user already used the switcher to return to the dashboard, the
+     * session is stopped and there is nothing left to do. */
+    if (m_fg == session)
+        setForeground(-1);
+    toast(tr("Desktop is ready in the background"), 3000);
+}
+
+void Dashboard::cancelDesktopWarmup()
+{
+    if (!m_warmingDesktop)
+        return;
+    m_warmingDesktop = false;
+    if (m_desktopWarmTimer)
+        m_desktopWarmTimer->stop();
+}
+
+/*
  * ── A CARD THAT WANTS A WINDOW AND NOT THE PANEL ─────────────────────────────
  *
  * There has to be exactly one graphical session and this program has to end up
@@ -2127,6 +2209,29 @@ void Dashboard::runInSession(const QString &title, const QString &cmd)
                QStringList() << QStringLiteral("--run") << cmd);
         return;
     }
+
+    /* The boot warm-up owns the framebuffer until Xorg and the supervisor are
+     * ready.  A request made while that is happening is kept in the same queue
+     * j36-xrun uses; attempting the FIFO now would misread "not created yet" as
+     * "the session died".  The request poll drains it the instant readiness is
+     * observable, and the warm-up must no longer park the session underneath it. */
+    if (!sessionSupervisorAlive()) {
+        cancelDesktopWarmup();
+        queueRunRequests(QStringList() << cmd);
+        RunRequest::post();
+        toast(tr("Desktop is starting; %1 will open when it is ready").arg(title),
+              5000);
+        m_toast->repaint();
+        QCoreApplication::processEvents();
+        /* The user may have returned to the dashboard before the boot warm-up
+         * completed, leaving this half-started task stopped.  It cannot create
+         * its FIFO while stopped, so let it finish in front; the queued command
+         * is dispatched as soon as the supervisor appears. */
+        if (m_fg != session)
+            setForeground(session);
+        return;
+    }
+    cancelDesktopWarmup();
 
     /*
      * A SESSION IS UP, so starting a second one would be a second X server on one
@@ -2413,6 +2518,12 @@ void Dashboard::setForeground(int index)
 {
     if (index >= m_tasks.size())
         index = -1;
+
+    /* Any explicit switch while the Desktop is warming supersedes the boot-time
+     * request to park it.  pollDesktopWarmup() clears the flag before making its
+     * own switch, while launch() establishes it by assigning m_fg directly. */
+    if (m_warmingDesktop)
+        cancelDesktopWarmup();
 
     /* linuxfb and the task's X server cannot safely paint one native keyboard
      * window.  Close the dashboard surface before the framebuffer changes hands;

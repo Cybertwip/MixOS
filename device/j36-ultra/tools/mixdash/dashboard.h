@@ -339,6 +339,11 @@ private:
     /* Where the graphical session is in m_tasks, or -1 if none is running.  By
      * exe, because there can only ever be one of it. */
     int sessionTask() const;
+    /* Start :0 once after the first dashboard frame, then park it as an ordinary
+     * background task as soon as its supervisor is ready. */
+    void startDesktopInBackground();
+    void pollDesktopWarmup();
+    void cancelDesktopWarmup();
     /*
      * SIGSTOP whatever is in front and keep its frame, leaving nothing owning the
      * panel.  The half of setForeground() that launch() needs on its own -- it is
@@ -510,6 +515,10 @@ private:
      * timer costs nothing measurable and removes both.
      */
     QTimer *m_requestTimer = nullptr;
+    /* The X server is warmed once at boot and stopped only after its control FIFO
+     * exists, so the first graphical command never has to race Xorg startup. */
+    QTimer *m_desktopWarmTimer = nullptr;
+    bool m_warmingDesktop = false;
 
     /*
      * ── A LAUNCH IS NOT RE-ENTRANT ───────────────────────────────────────────

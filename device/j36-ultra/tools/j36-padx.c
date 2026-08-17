@@ -776,66 +776,6 @@ static int focus_client(pid_t pid)
 /* ── the screen ──────────────────────────────────────────────────────────── */
 
 /*
- * ── PUTTING BACK A SCREEN X DOES NOT KNOW IT LOST ───────────────────────────
- *
- * There is one framebuffer on this board and two programs draw into it: this
- * session's X server through xf86-video-fbdev, and mixdash through Qt's linuxfb
- * platform.  They take turns -- whichever task is in front draws, the rest of the
- * group is SIGSTOPped -- and taking turns is enough for the pixels ONLY because
- * mixdash copies the panel out before it stops a task and copies it back before
- * it continues one.  See Panel::grab() and Panel::restore().
- *
- * WHAT THAT CANNOT COVER.  The copy back is a memcpy into /dev/fb0, and the X
- * server is not looking at /dev/fb0: fbdev runs with ShadowFB, so X draws into
- * its own buffer in ordinary memory and copies out only the rectangles it thinks
- * changed.  Nothing mixdash does to the framebuffer is a change as far as X is
- * concerned.  So anything mixdash left behind that the restore did not cover --
- * the dashboard's own pointer, a toast, the whole screen when there was no saved
- * frame to put back because the session had not drawn one yet -- stays on the
- * glass until some client happens to repaint over it.  That is the trail the user
- * sees, and it is why a desktop that is really running can look black.
- *
- * ASKING FOR THE REPAINT IS THE FIX, and X has had the mechanism since X10: a
- * window with no background, mapped over everything and immediately destroyed.
- * Mapping it changes not one pixel, because a background of None means the server
- * paints nothing; destroying it uncovers everything underneath, and uncovering is
- * exposure, so every client is told to redraw the part of itself that was behind
- * it.  Their drawing is damage, damage is what ShadowFB copies, and the copy is
- * what reaches the panel.  This is what xrefresh(1) is and does; it is written out
- * here because x11-xserver-utils is not on this image and would be a package for
- * one twelve-line function.
- *
- * The root is cleared as well, for the pixels no window covers -- that is where
- * the card desktop_paint() hangs on the root background gets put back.
- */
-static void screen_refresh(void)
-{
-    XSetWindowAttributes at;
-    Window w;
-
-    if (!dpy || scr_w < 1 || scr_h < 1)
-        return;
-
-    XClearWindow(dpy, RootWindow(dpy, scr));
-
-    /* override_redirect because this is not a window in any sense the window
-     * manager should hear about -- it exists for two round trips and matchbox
-     * would otherwise try to decorate and stack it. */
-    at.override_redirect = True;
-    at.background_pixmap = None;
-    at.backing_store     = NotUseful;
-    at.save_under        = False;
-    w = XCreateWindow(dpy, RootWindow(dpy, scr), 0, 0,
-                      (unsigned)scr_w, (unsigned)scr_h, 0,
-                      CopyFromParent, InputOutput, CopyFromParent,
-                      CWOverrideRedirect | CWBackPixmap | CWBackingStore | CWSaveUnder,
-                      &at);
-    XMapRaised(dpy, w);
-    XDestroyWindow(dpy, w);
-    XFlush(dpy);
-}
-
-/*
  * The X cursor is not part of the framebuffer snapshot mixdash saves.  With
  * xf86-video-fbdev it is composited by the X server and the pixels underneath it
  * are restored only when X moves or hides it.  SIGSTOP freezes the whole session,
@@ -845,8 +785,8 @@ static void screen_refresh(void)
  * XFixes hides the server cursor globally, including cursors a client installed
  * on its own window.  XSync is intentional: the dashboard may stop X immediately
  * after SIGUSR1, so the hide must have reached the server before that signal is
- * sent.  The cursor is restored on SIGCONT, before the refresh which repaints the
- * resumed desktop.
+ * sent.  The cursor is restored on SIGCONT, after mixdash has copied the saved X
+ * frame back to the one framebuffer.
  */
 static void screen_cursor(int visible)
 {
@@ -887,7 +827,7 @@ static void screen_cursor(int visible)
  *
  * So the root gets a card that says what the pad does.  It is a PIXMAP HUNG ON
  * THE ROOT'S BACKGROUND rather than a window: the server then repaints it by
- * itself, for free, whenever a window moves off it or screen_refresh() clears it,
+ * itself, for free, whenever a window moves off it or exposes it,
  * and there is no extra client to stack, focus, stop or kill.  This is what
  * xsetroot -bitmap does, and the reason the pixmap can be freed on the next line
  * is the same -- the server keeps its own reference for as long as a window uses
@@ -2046,6 +1986,11 @@ static void ctl_send(const char *word)
 /* How often a free slot goes looking for a pad that was not there before. */
 #define RESCAN_MS 2000
 
+/* Written only by the long-lived bridge (the one with --ctl), after X, the root
+ * desktop and the pad grab are all ready.  mixdash uses it to know when the
+ * boot-time Desktop can safely be snapshotted and parked. */
+#define READY_PATH "/run/j36/padx.ready"
+
 static volatile sig_atomic_t stop_asked;
 
 static void on_signal(int sig)
@@ -2215,6 +2160,11 @@ int main(int argc, char **argv)
     if (mixdash_pid < 0)
         mixdash_pid = 0;
 
+    /* A bridge killed outright may have left yesterday's readiness behind.  The
+     * short --focus helper has no control pipe and must not disturb the live one. */
+    if (ctl_path)
+        unlink(READY_PATH);
+
     for (i = 0; i < MAX_PADS; i++)
         clear_pad(i);
 
@@ -2289,6 +2239,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (ctl_path) {
+        const int ready = open(READY_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                               0644);
+        if (ready >= 0)
+            close(ready);
+        else
+            fail("cannot write %s: %s", READY_PATH, strerror(errno));
+    }
+
     move_last = now_ms();
     next_scan = move_last + RESCAN_MS;
 
@@ -2357,13 +2316,11 @@ int main(int argc, char **argv)
                 grabbing = 1;
             }
             /* AND THE SCREEN IS NOT OURS EITHER.  The dashboard has been drawing
-             * on the panel for as long as this was stopped; whatever it left that
-             * its restore did not cover is still there, and X does not know a
-             * pixel changed.  Keep the software cursor hidden while the X shadow
-             * buffer is exposed: showing it first makes X save the dashboard
-             * pixels underneath and restore them later as a transparent hole. */
+             * on the panel for as long as this was stopped.  It restored the
+             * complete saved X frame before SIGCONT, and X now renders directly
+             * into that same framebuffer.  Show the cursor only after the handoff
+             * is complete so its save-under can never capture dashboard pixels. */
             screen_cursor(0);
-            screen_refresh();
             screen_cursor(1);
             continue;
         }
@@ -2688,6 +2645,8 @@ int main(int argc, char **argv)
         kbd_state_write();
     pointer_resync();
     pointer_state_write();
+    if (ctl_path)
+        unlink(READY_PATH);
     close_pads();
     XTestGrabControl(dpy, False);
     XCloseDisplay(dpy);

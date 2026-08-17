@@ -13,6 +13,7 @@
 #include <QPainter>
 #include <QResizeEvent>
 #include <QTimer>
+#include <QWheelEvent>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -284,28 +285,23 @@ bool TerminalPage::startChild(const QString &command)
         ::unsetenv("LD_PRELOAD");
 
         /*
-         * ── DISPLAY, SO THAT AN INSTALLED APPLICATION HAS SOMEWHERE TO GO ────
+         * ── NO RAW DISPLAY FROM THE DASHBOARD TERMINAL ───────────────────────
          *
-         * This is the shell the Packages page installs things from, and until now
-         * anything graphical it installed had nowhere to draw: this dashboard is
-         * linuxfb on /dev/fb0 and is not an X client, and SDL2 on this image is
-         * built with the x11 and kmsdrm backends and no fbdev one, so `freedoom'
-         * typed here died on "no available video device" whatever was installed.
+         * The graphical session is deliberately SIGSTOPped while this Terminal
+         * owns the panel.  Exporting :0 here let an X or SDL program connect to a
+         * server which could not process its request; SDL could even start audio
+         * while its window remained hidden, which is Doom's "sound but no picture"
+         * failure.  It also bypassed the one process that can transfer ownership
+         * of /dev/fb0 safely.
          *
-         * There is a graphical session now -- the Desktop card starts it -- and it
-         * is always :0, because j36-xsession names the display on Xorg's command
-         * line and only ever runs one server.  With this set, an X program typed
-         * into this shell opens a window in it.
-         *
-         * SET EVEN WHEN NO SESSION IS RUNNING, deliberately.  DISPLAY names a
-         * display; it has never promised a server on the other end, and a variable
-         * written once when the pty is forked cannot track a session that comes and
-         * goes.  A program run with no session gets "cannot open display :0", which
-         * is a sentence with an answer -- open the Desktop card -- where the old
-         * failure was not.  /opt/mixos/bin/j36-xrun is the one that knows for
-         * certain, and it says so in words.
+         * j36-xrun is that transfer: it queues the command to mixdash, which wakes
+         * (or starts) the Desktop, restores its frame and only then runs the client
+         * with DISPLAY=:0 inside the session.  Keep raw graphical launches from
+         * accidentally taking the broken path; `j36-xrun /usr/games/doom' is the
+         * supported terminal command and now has one unambiguous route.
          */
-        ::setenv("DISPLAY", ":0", 1);
+        ::unsetenv("DISPLAY");
+        ::setenv("J36_XRUN", "/opt/mixos/bin/j36-xrun", 1);
 
         /*
          * AND WHO TO ASK FOR ONE.  j36-xrun's whole job is getting a window onto
@@ -1483,6 +1479,33 @@ void TerminalPage::resizeEvent(QResizeEvent *event)
     syncWindowSize();
 
     QWidget::resizeEvent(event);
+}
+
+void TerminalPage::wheelEvent(QWheelEvent *event)
+{
+    const int notches = event->angleDelta().y() / 120;
+    if (notches == 0) {
+        event->ignore();
+        return;
+    }
+
+    if (m_altActive) {
+        /* Full-screen programs own their alternate screen.  Give them Page Up /
+         * Page Down rather than scrolling a history which deliberately does not
+         * contain that screen. */
+        const QByteArray sequence = notches > 0 ? QByteArray("\033[5~")
+                                                : QByteArray("\033[6~");
+        for (int i = 0; i < qAbs(notches); ++i)
+            send(sequence);
+    } else {
+        /* One wheel notch is two rows.  The right stick deliberately produces
+         * wheel notches, so this path is shared with a USB mouse and neither has
+         * to move the pointer over a tiny scrollbar that the Terminal does not
+         * otherwise need. */
+        m_view = qBound(0, m_view + notches * 2, m_scrollbackLines);
+        update();
+    }
+    event->accept();
 }
 
 QColor TerminalPage::colourFor(short index, bool foreground, uchar flags) const
