@@ -12129,6 +12129,10 @@ Section "Module"
     Disable "glx"
 EndSection
 
+Section "Extensions"
+    Option "GLX" "false"
+EndSection
+
 Section "Device"
     Identifier "j36-lima"
     Driver     "j36lima"
@@ -12156,6 +12160,10 @@ EndSection
 
 Section "Module"
     Disable "glx"
+EndSection
+
+Section "Extensions"
+    Option "GLX" "false"
 EndSection
 
 Section "Device"
@@ -12546,7 +12554,7 @@ exec /usr/bin/xinit "$MAIN" "$FIRST" -- \
     "$XWRAP" :0 vt1 \
     -config "$XCONF" \
     -logfile /run/j36/xorg.log \
-    -ac -nolisten tcp -novtswitch -sharevts -keeptty
+    -ac -nolisten tcp -novtswitch -sharevts -keeptty -extension GLX
 XSESSIONLAUNCH
     chmod 0755 "$SDROOT/opt/mixos/bin/j36-xsession"
 

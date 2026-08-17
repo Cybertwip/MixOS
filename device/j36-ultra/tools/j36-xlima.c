@@ -96,7 +96,6 @@ typedef struct {
 	struct fb_fix_screeninfo fix;
 	struct fb_var_screeninfo var;
 	CloseScreenProcPtr	CloseScreen;
-	CreateScreenResourcesProcPtr CreateScreenResources;
 	Bool			shadow;
 	int			dri_fd;
 	char			dri_path[280];
@@ -781,60 +780,17 @@ static Bool JLimaCloseScreen(ScreenPtr pScreen)
 	return (*pScreen->CloseScreen)(pScreen);
 }
 
-static void JLimaUpdatePacked(ScreenPtr pScreen, shadowBufPtr pBuf)
+static void *
+JLimaShadowWindow(ScreenPtr pScreen, CARD32 row, CARD32 offset, int mode,
+		  CARD32 *size, void *closure)
 {
 	ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
 	JLimaPtr p = JLIMAPTR(pScrn);
-	RegionPtr damage = DamageRegion(pBuf->pDamage);
-	int nbox = RegionNumRects(damage);
-	BoxPtr box = RegionRects(damage);
-	int stride = p->fix.line_length;
-	int bpp = p->var.bits_per_pixel;
-	int i;
 
-	if (!p->fb)
-		return;
-	for (i = 0; i < nbox; i++) {
-		int x = box[i].x1;
-		int y = box[i].y1;
-		int w = box[i].x2 - box[i].x1;
-		int h = box[i].y2 - box[i].y1;
-		int bytes = w * ((bpp + 7) / 8);
-		int row;
-		unsigned char *src = (unsigned char *)pBuf->pPixmap->devPrivate.ptr;
-		int src_stride = pBuf->pPixmap->devKind;
-
-		if (x < 0 || y < 0 || w <= 0 || h <= 0)
-			continue;
-		for (row = 0; row < h; row++) {
-			memcpy(p->fb + (size_t)(y + row) * stride +
-				       (size_t)x * ((bpp + 7) / 8),
-			       src + (size_t)(y + row) * src_stride +
-				     (size_t)x * ((bpp + 7) / 8),
-			       (size_t)bytes);
-		}
-	}
-}
-
-static Bool JLimaCreateScreenResources(ScreenPtr pScreen)
-{
-	ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
-	JLimaPtr p = JLIMAPTR(pScrn);
-	Bool ok;
-	PixmapPtr pix;
-
-	pScreen->CreateScreenResources = p->CreateScreenResources;
-	ok = (*pScreen->CreateScreenResources)(pScreen);
-	pScreen->CreateScreenResources = JLimaCreateScreenResources;
-	if (!ok)
-		return FALSE;
-
-	if (p->shadow) {
-		pix = pScreen->GetScreenPixmap(pScreen);
-		if (!shadowAdd(pScreen, pix, JLimaUpdatePacked, NULL, 0, 0))
-			return FALSE;
-	}
-	return TRUE;
+	(void)mode;
+	(void)closure;
+	*size = p->fix.line_length;
+	return (void *)(p->fb + (size_t)row * p->fix.line_length + offset);
 }
 
 static Bool JLimaScreenInit(ScreenPtr pScreen, int argc, char **argv)
@@ -896,12 +852,9 @@ static Bool JLimaScreenInit(ScreenPtr pScreen, int argc, char **argv)
 	xf86SetBlackWhitePixels(pScreen);
 
 	if (p->shadow) {
-		if (!shadowSetup(pScreen))
+		if (!shadowInit(pScreen, shadowUpdatePackedWeak(), JLimaShadowWindow))
 			return FALSE;
 	}
-
-	p->CreateScreenResources = pScreen->CreateScreenResources;
-	pScreen->CreateScreenResources = JLimaCreateScreenResources;
 
 	xf86SetBackingStore(pScreen);
 	miDCInitialize(pScreen, xf86GetPointerScreenFuncs());
