@@ -69,11 +69,10 @@ void paintGlyph(QPainter &p, const QRectF &box, int glyph, const QColor &ink);
  * want the whole panel and every scrap of GPU there is -- native fullscreen on this
  * board goes through GBM/DRM and gets lima, and that is not a thing to give up.
  *
- * LaunchWindowed is for a program that is an X CLIENT.  It does not take the panel;
- * it is handed to the graphical session -- j36-xsession, which the Desktop card
- * starts -- and appears as a window inside it, beside whatever else is already
- * there.  The session is ONE task in the switcher however many windows are in it,
- * because it is one process group and one framebuffer's worth of pixels; the
+ * LaunchWindowed is for a program that is an X CLIENT.  It is handed to the
+ * persistent graphical service and appears as a window beside whatever else is
+ * already there.  The service is one switcher target while clients exist,
+ * however many windows are in it, because it owns one framebuffer image; the
  * windows inside it are cycled with a tap of Menu.
  *
  * WHICH ONE A CARD WANTS IS A PROPERTY OF THE PROGRAM AND NOT OF THE LAUNCHER, so

@@ -1132,7 +1132,7 @@ for required in MACH_MT6592 ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT \
                 NLS_UTF8 NLS_CODEPAGE_437 \
                 WATCHDOG WATCHDOG_CORE MEDIATEK_WATCHDOG \
                 NET UNIX INET SECCOMP_FILTER NAMESPACES NET_NS PID_NS \
-                CGROUPS FHANDLE INOTIFY_USER SIGNALFD TIMERFD EPOLL \
+                CGROUPS FREEZER FHANDLE INOTIFY_USER SIGNALFD TIMERFD EPOLL \
                 DEVTMPFS DEVTMPFS_MOUNT TMPFS TMPFS_XATTR TMPFS_POSIX_ACL \
                 PROC_FS PROC_SYSCTL SYSFS SWAP ZRAM ZSMALLOC \
                 EXT2_FS_XATTR EXT2_FS_POSIX_ACL BTRFS_FS_POSIX_ACL \
@@ -5071,6 +5071,179 @@ UNITFC
         say "      own config and may build a cache -- watch for a long \"fonts\" phase"
     fi
 
+    # ── X IS A SERVICE, NOT A DASHBOARD CHILD ────────────────────────────────
+    #
+    # The old dashboard launched j36-xsession as one of its QProcess tasks.  That
+    # made xinit's process group the alleged ownership boundary, but xinit puts
+    # Xorg and its client side in different groups.  The device log consequently
+    # showed xinit and PadX stopped while Xorg, matchbox and the session supervisor
+    # were all still runnable -- exactly the set of processes that can overwrite
+    # a linuxfb dashboard and make it look frozen.
+    #
+    # systemd already has the boundary we need: a service cgroup contains every
+    # descendant regardless of process group.  Start it before mixdash, wait until
+    # PadX says XTEST and the input bridge are ready, then freeze that complete
+    # cgroup.  mixdash only thaws it when a real client is requested.  There is no
+    # Desktop card and an idle server never appears in the task switcher.
+    xserver_on_card=0
+    for xserver in /usr/bin/Xorg /usr/lib/xorg/Xorg /usr/bin/X; do
+        [ -x "/newroot$xserver" ] && xserver_on_card=1
+    done
+    if [ -x "/newroot$mixos_root/bin/j36-xsession" ] && \
+       [ -x /newroot/usr/bin/xinit ] && [ "$xserver_on_card" -eq 1 ]; then
+        mkdir -p /newroot/run/j36/bin
+        cat > /newroot/run/j36/bin/j36-xdesktop-park <<'XDESKTOPPARK'
+#!/bin/sh
+# Wait for the server's input bridge to reach its deliberately ungrabbed,
+# self-stopped boot state, then freeze every process in the systemd cgroup.
+set -u
+
+ready=/run/j36/padx.ready
+padpid=/run/j36/padx.pid
+leaderfile=/run/j36/xdesktop.pid
+parked=/run/j36/xdesktop.parked
+rm -f "$parked"
+
+fail_park() {
+    echo "j36-xdesktop: $*" >&2
+    # An unparked Xorg and linuxfb mixdash may never share fb0.  If the ownership
+    # boundary cannot be proved, leave windowed apps unavailable for this boot
+    # instead of starting the dashboard under a live framebuffer writer.
+    systemctl stop j36-xdesktop.service >/dev/null 2>&1 || true
+    exit 1
+}
+
+n=0
+while [ "$n" -lt 900 ]; do
+    if [ -f "$ready" ] && [ -r "$padpid" ] && [ -r "$leaderfile" ]; then
+        pp=""; read -r pp < "$padpid" || pp=""
+        case "$pp" in
+            ''|*[!0-9]*) ;;
+            *)
+                # --start-parked writes ready after releasing the grab and then
+                # SIGSTOPs itself.  Waiting for T closes the one-instruction race
+                # between those two operations before the cgroup is frozen.
+                if grep -q '^State:.*T' "/proc/$pp/status" 2>/dev/null; then
+                    break
+                fi
+                ;;
+        esac
+    fi
+    sleep 0.1
+    n=$((n + 1))
+done
+
+if [ "$n" -ge 900 ]; then
+    fail_park "server did not become ready in 90 seconds"
+fi
+
+leader=""; read -r leader < "$leaderfile" || leader=""
+case "$leader" in
+    ''|*[!0-9]*)
+        fail_park "invalid service leader pid"
+        ;;
+esac
+
+cg=""
+while IFS=: read -r hierarchy controllers path; do
+    if [ "$hierarchy" = 0 ] && [ -z "$controllers" ]; then
+        cg="$path"
+        break
+    fi
+done < "/proc/$leader/cgroup"
+
+case "$cg" in
+    /system.slice/j36-xdesktop.service)
+        freezer="/sys/fs/cgroup$cg/cgroup.freeze"
+        ;;
+    *)
+        fail_park "refusing unsafe service cgroup '$cg'"
+        ;;
+esac
+
+if [ -w "$freezer" ]; then
+    printf '1\n' > "$freezer"
+    n=0
+    while [ "$n" -lt 100 ]; do
+        grep -q '^frozen 1$' "/sys/fs/cgroup$cg/cgroup.events" 2>/dev/null && break
+        sleep 0.01
+        n=$((n + 1))
+    done
+    if [ "$n" -ge 100 ]; then
+        # Let systemd's stop job schedule the service before asking it to die.
+        printf '0\n' > "$freezer" 2>/dev/null || true
+        fail_park "cgroup freezer did not quiesce the service"
+    fi
+else
+    fail_park "the complete service cgroup has no writable freezer"
+fi
+
+printf 'frozen %s\n' "$cg" > "$parked"
+exit 0
+XDESKTOPPARK
+        chmod 0755 /newroot/run/j36/bin/j36-xdesktop-park
+
+        cat > /newroot/run/systemd/system/j36-xdesktop.service <<UNITXDESKTOP
+# Written by the J36 Ultra initramfs, into a tmpfs.
+[Unit]
+Description=Persistent X window service for MixOS
+Documentation=file:///opt/mixos/README.txt
+After=systemd-user-sessions.service
+# If the dashboard crashes while X owns the panel, a replacement dashboard must
+# never start underneath that still-running server.  Stop this cgroup with the
+# shell; its next start dependency creates and parks a clean service first.
+PartOf=mixdash.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=$mixos_root/bin
+# Stop the splash before X first touches the shared framebuffer.  mixdash starts
+# only after the service has been parked, so none of these three ever draws over
+# another one.
+ExecStartPre=-/bin/sh -c ': > /dev/.mixsplash-done; { echo "stage:Starting window services"; echo "progress:100"; echo quit; } >> /dev/.mixsplash'
+ExecStartPre=/bin/sleep 0.25
+ExecStart=$mixos_root/bin/j36-xsession
+ExecStopPost=-/bin/rm -f /run/j36/xdesktop.pid /run/j36/xdesktop.parked /run/j36/padx.ready
+Environment="J36_XSERVICE=1"
+Environment="LD_LIBRARY_PATH=/run/j36/gl:$mixos_root/qt/lib"
+Environment="MESA_SHADER_CACHE_DIR=$gl_cache"
+Environment="XDG_CACHE_HOME=$gl_cache"
+Environment="MESA_SHADER_CACHE_MAX_SIZE=32M"
+OOMScoreAdjust=300
+KillMode=control-group
+TimeoutStopSec=10
+Restart=no
+StandardOutput=journal
+StandardError=journal
+UNITXDESKTOP
+
+        cat > /newroot/run/systemd/system/j36-xdesktop-park.service <<'UNITXDESKTOPPARK'
+# Written by the J36 Ultra initramfs, into a tmpfs.
+[Unit]
+Description=Park the MixOS X service before the dashboard takes the panel
+Requires=j36-xdesktop.service
+After=j36-xdesktop.service
+PartOf=mixdash.service
+
+[Service]
+Type=oneshot
+ExecStart=/run/j36/bin/j36-xdesktop-park
+RemainAfterExit=yes
+UNITXDESKTOPPARK
+
+        cat >> /newroot/run/systemd/system/mixdash.service <<'UNITXDASHORDER'
+
+[Unit]
+Wants=j36-xdesktop-park.service
+After=j36-xdesktop-park.service
+UNITXDASHORDER
+        say "dash: X is a persistent service, parked before mixdash starts"
+    else
+        say "dash: no complete X stack; no window service unit was written"
+    fi
+
     # ── the middle of systemd, narrated once a second ────────────────────────────
     #
     # Between switch_root and mixdash there is a stretch of systemd -- fsck, udev,
@@ -6604,6 +6777,11 @@ dump() {
     show /sys/class/tty/tty0/active
     run ps -eo pid,ppid,stat,etimes,args
     run systemctl --no-pager status mixdash
+    run systemctl --no-pager status j36-xdesktop j36-xdesktop-park
+    show /run/j36/xdesktop.pid
+    show /run/j36/xdesktop.parked
+    show /sys/fs/cgroup/system.slice/j36-xdesktop.service/cgroup.freeze
+    show /sys/fs/cgroup/system.slice/j36-xdesktop.service/cgroup.events
     # mixdash moves its own stdout and stderr into this file once it has painted a
     # frame, so that a Qt warning is not drawn across the dashboard -- which means
     # everything the dashboard has said since boot is HERE and not in the journal,
@@ -6615,10 +6793,9 @@ dump() {
     else
         printf '(absent -- no first frame yet, so it is still on the console)\n'
     fi
-    # THE X SERVER'S OWN LOG, which is somewhere else again: Xorg is started with
-    # -logfile, so its banner lands in mixdash.log above and everything that
-    # matters -- the driver it chose, the mode it set, the font path, and any (EE)
-    # -- lands here and NOWHERE ELSE.  Without this section a desktop that comes
+    # THE X SERVER'S OWN LOG, which is somewhere else again: the service sends
+    # its ordinary output to the journal, while Xorg's -logfile puts the driver,
+    # mode, font path and every (EE) here.  Without this section a window service that comes
     # up black is indistinguishable from one that never came up, which is exactly
     # the report this got.  What is running is in the ps above; what X thinks of
     # it is only here.
@@ -6630,12 +6807,12 @@ dump() {
     fi
     # And what the session has open.  One line per window, pid and title, rewritten
     # by j36-xsession-main every time one opens or closes: an empty list with the
-    # session processes present in the ps above is a desktop with nothing on it,
-    # which looks exactly like a broken one and is not.
-    sec "/run/j36/xsession.windows -- what the desktop has open"
+    # session processes present in the ps above is an idle infrastructure service,
+    # not a selectable Desktop app.
+    sec "/run/j36/xsession.windows -- what the window service has open"
     if [ -r /run/j36/xsession.windows ]; then
         cat /run/j36/xsession.windows 2>&1 || printf '(unreadable)\n'
-        [ -s /run/j36/xsession.windows ] || printf '(empty -- the desktop is up with no window on it)\n'
+        [ -s /run/j36/xsession.windows ] || printf '(empty -- the window service is idle and must remain parked)\n'
     else
         printf '(absent -- no graphical session is running)\n'
     fi
@@ -11536,7 +11713,7 @@ if [[ -n "$MIXDASH_BIN" || -n "$MIXMIRROR_BIN" || -n "$PADX_BIN" ]]; then
     fi
 
 
-    # ── The graphical session, the Desktop card and the Browser card ──────────
+    # ── The graphical window service and the Browser card ─────────────────────
     #
     # Four scripts and a binary: an Xorg configuration, the session launcher, the
     # session itself, the browser and j36-xrun, plus j36-padx.  The reasoning for
@@ -11825,11 +12002,11 @@ KEYBOARDXML
     # take.  The X server was there, half an hour of build time went into making it
     # coexist with the dashboard, and it was reachable by exactly one program.
     #
-    # So the server is now a SESSION and the browser is one of its clients:
+    # So X is now a BOOT SERVICE and the browser is one of its clients:
     #
-    #   j36-xsession        the launcher.  Finds Xorg, makes the run directories and
-    #                       execs xinit.  This is what mixdash starts, and it is one
-    #                       task in mixdash's list however many windows are in it.
+    #   j36-xsession        the service launcher.  Finds Xorg, makes the run
+    #                       directories and execs xinit.  systemd starts it before
+    #                       mixdash and keeps it outside the dashboard task list.
     #
     #   j36-xsession-main   the session.  Window manager, on-screen keyboard, the
     #                       pad bridge, and a control FIFO that anything on this card
@@ -11844,16 +12021,16 @@ KEYBOARDXML
     #                       Terminal card -- `j36-xrun freedoom' -- and by mixdash.
     #
     # ONE X SERVER, EVER.  j36-xrun deliberately cannot start a session: a second
-    # server, or a session started outside mixdash's task list, is two programs
-    # scribbling on one framebuffer with nothing arbitrating.  Starting one is the
-    # dashboard's job and only the dashboard's job.  It warms that one session at
-    # boot, parks it in the task list, and everything else asks for that instance.
+    # server is two display stacks scribbling on one framebuffer with nothing
+    # arbitrating.  j36-xdesktop.service starts the single instance at boot and
+    # parks its complete cgroup before mixdash starts.  A client request makes the
+    # service visible as a temporary Windowed-apps switcher target; an idle server
+    # is infrastructure and has no card, page or task row.
     #
-    # THE WHOLE TREE IS STILL ONE PROCESS GROUP, which is what makes mixdash's
-    # switcher work: dashboard.cpp's GroupLeaderProcess puts the launcher in its own
-    # group, nothing below it calls setsid, and every window this session opens is
-    # forked by the control loop -- so kill(-pgid, SIGSTOP) still freezes the server,
-    # the window manager, the keyboard, the bridge and all four windows as one thing.
+    # THE WHOLE TREE IS ONE SYSTEMD CGROUP.  xinit does not keep Xorg, its session
+    # supervisor and every helper in one process group; the device log proved it.
+    # Freezing the service cgroup is the atomic boundary that stops every possible
+    # framebuffer writer before mixdash paints.
     #
     # POSIX sh and not bash, for all four: these are scripts the user may end up
     # running by hand from the initramfs shell, and there is nothing in them that
@@ -11867,13 +12044,13 @@ KEYBOARDXML
 
     cat > "$SDROOT/opt/mixos/bin/j36-xsession" <<'XSESSIONLAUNCH'
 #!/bin/sh
-# j36-xsession -- the J36 Ultra's graphical session.
+# j36-xsession -- the J36 Ultra's persistent graphical service.
 #
 # Usage: j36-xsession [--run COMMAND]
 #
-# Brings an X server up on /dev/fb0 with xinit and hands the panel to
-# j36-xsession-main.  With --run, COMMAND is the first window; without it the
-# session comes up empty and waits to be asked for one.  Written by
+# Brings an X server up on /dev/fb0 with xinit and hands lifecycle control to
+# j36-xsession-main.  The boot service starts it empty; --run remains available
+# for diagnostics and supplies an initial window.  Written by
 # device/j36-ultra/build-in-vm.sh; the reasoning is in that file, in the graphical
 # session section.
 set -u
@@ -11923,6 +12100,12 @@ fi
 mkdir -p /run/j36 /run/j36/xdg 2>/dev/null
 chmod 0700 /run/j36/xdg 2>/dev/null
 
+# The service leader survives the exec below with the same pid.  mixdash reads
+# its cgroup from /proc rather than trying to reconstruct xinit's process groups.
+if [ "${J36_XSERVICE:-}" = 1 ]; then
+    echo $$ > /run/j36/xdesktop.pid 2>/dev/null || true
+fi
+
 [ -f "$XCONF" ] || { echo "j36-xsession: $XCONF is missing" >&2; exit 1; }
 [ -x "$MAIN" ]  || { echo "j36-xsession: $MAIN is missing" >&2; exit 1; }
 
@@ -11970,11 +12153,11 @@ XSESSIONLAUNCH
     # cannot be a bridge that was watching one pid.  The loop keeps an empty X
     # server ready and ends the session only when the pad bridge dies (which is how
     # "the X server went away" is noticed, since the bridge is an X client), or
-    # when somebody writes `quit' / `quit-empty'.
+    # when the owning service stops or somebody writes `quit'.
     cat > "$SDROOT/opt/mixos/bin/j36-xsession-main" <<'XSESSIONMAIN'
 #!/bin/sh
 # j36-xsession-main -- the X client xinit runs, and the whole life of the session.
-# $1, when it is not empty, is a shell command line to open the first window with.
+# $1, when it is not empty, is an optional diagnostic command to open initially.
 # Not meant to be run by hand; j36-xsession sets up the server it needs.
 set -u
 
@@ -12009,6 +12192,14 @@ export XDG_CACHE_HOME="$HOME/.cache"
 export XDG_DATA_HOME="$HOME/.local/share"
 export XDG_RUNTIME_DIR=/run/j36/xdg
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" 2>/dev/null
+
+# THIS SERVICE OWNS :0.  xinit normally exports the same value to its client, but
+# every later program inherits this explicit contract rather than an implementation
+# detail of xinit.  Xorg below is local-only and starts with -ac, so stale desktop
+# variables are both unnecessary and capable of making XOpenDisplay choose the
+# wrong endpoint or authorization file.
+export DISPLAY=:0
+unset XAUTHORITY WAYLAND_DISPLAY
 
 # NO_AT_BRIDGE stops GTK spending its startup waiting for an accessibility bus.
 # GDK_BACKEND is pinned because GTK4 prefers Wayland and would find none.
@@ -12185,8 +12376,8 @@ KBD=""
 # One named pipe, mode 0600, under /run.  Anything on this card that wants a window
 # writes a line into it: `run <shell command>', `next', `prev' or `quit'.  mixdash
 # writes into it when a card is pressed while this session is already up, including
-# `focus PID' from one of the Desktop page's live window cards; j36-padx writes
-# `next' when Menu is tapped, and j36-xrun is the hand-typed door to it.
+# `focus PID' from a window chooser; j36-padx writes `next' when Menu is tapped,
+# and j36-xrun is the hand-typed door to it.
 #
 # OPENED READ-WRITE BY THIS PROCESS, which is the whole trick and not a typo.  A FIFO
 # opened O_RDONLY returns EOF the instant the last writer closes, so a loop reading
@@ -12243,10 +12434,26 @@ client_title() {
 # it reads this when the switcher opens, which is a repaint, and a file that is
 # rewritten by rename is a file that is either the old list or the new one and never
 # half of either.
+client_alive() {
+    ca_pid="$1"
+    [ -r "/proc/$ca_pid/status" ] || return 1
+    ca_state=""
+    while read -r ca_key ca_value ca_rest; do
+        if [ "$ca_key" = State: ]; then
+            ca_state="$ca_value"
+            break
+        fi
+    done < "/proc/$ca_pid/status"
+    case "$ca_state" in
+        ''|Z|X|x) return 1 ;;
+    esac
+    kill -0 "$ca_pid" 2>/dev/null
+}
+
 reap_clients() {
     rc_live=""
     for rc_pid in $CLIENTS; do
-        if kill -0 "$rc_pid" 2>/dev/null; then
+        if client_alive "$rc_pid"; then
             rc_live="$rc_live $rc_pid"
         else
             rm -f "$RUNDIR/win.$rc_pid" 2>/dev/null
@@ -12264,6 +12471,24 @@ reap_clients() {
     mv -f "$WINLIST.new" "$WINLIST" 2>/dev/null
 }
 
+# A CLIENT IS NOT FORKED UNTIL X ACCEPTS A CONNECTION.  A cgroup thaw completes
+# asynchronously, and SDL calls XOpenDisplay while selecting its video backend; a
+# client that wins that race reports the misleading "x11 not available" and exits.
+# j36-padx --probe performs the same connection test without knowing or listing the
+# application being launched.  The server is normally ready on the first pass.
+wait_for_x() {
+    wx_n=0
+    while [ "$wx_n" -lt 50 ]; do
+        if /opt/mixos/bin/j36-padx --display "$DISPLAY" --probe >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.1
+        wx_n=$((wx_n + 1))
+    done
+    echo "j36-xsession: X display $DISPLAY did not accept a client connection" >&2
+    return 1
+}
+
 # Open a window.
 #
 # `sh -c' because what arrives is a command LINE and not an argv -- it came down a
@@ -12273,6 +12498,8 @@ reap_clients() {
 start_client() {
     sc_cmd="$1"
     [ -n "$sc_cmd" ] || return 0
+
+    wait_for_x || return 0
 
     reap_clients
     sc_n=0
@@ -12296,13 +12523,22 @@ start_client() {
 # pipe above.  It is the ONE input owner while X owns the panel.  On Menu hold it
 # releases EVIOCGRAB, hides X's cursor and self-stops before asking mixdash for the
 # switcher; mixdash resumes the exact pid below only after X's frame is restored.
-# This explicit pid bridge is needed because xinit may move descendants outside
-# the process group mixdash stops.  The header of tools/j36-padx.c has the full
-# hand-off contract.
+# The explicit pid remains the per-process half of the hand-off: PadX self-stops
+# after releasing EVIOCGRAB, while mixdash freezes the complete systemd cgroup.
+# The header of tools/j36-padx.c has the full contract.
 # --watch is gone: it watched one pid, and a session that outlives any single window
 # has no one pid to watch.
 if [ -x /opt/mixos/bin/j36-padx ]; then
-    if [ "$CTLOK" -eq 1 ]; then
+    # A boot service comes up without taking the pad, hides its cursor and stops
+    # itself once ready.  The park unit then freezes the rest of the cgroup before
+    # mixdash starts.  A session run by hand keeps the old immediate-grab path.
+    if [ "${J36_XSERVICE:-}" = 1 ]; then
+        if [ "$CTLOK" -eq 1 ]; then
+            /opt/mixos/bin/j36-padx -v --grab --start-parked --ctl "$CTL" &
+        else
+            /opt/mixos/bin/j36-padx -v --grab --start-parked &
+        fi
+    elif [ "$CTLOK" -eq 1 ]; then
         /opt/mixos/bin/j36-padx -v --grab --ctl "$CTL" &
     else
         /opt/mixos/bin/j36-padx -v --grab &
@@ -12359,15 +12595,6 @@ while :; do
             echo "j36-xsession: asked to quit" >&2
             break
             ;;
-        quit-empty)
-            # B is Back while a client exists and Exit when the Desktop is empty.
-            # Reap immediately so this decision does not wait for the next tick.
-            reap_clients
-            if [ -z "$CLIENTS" ]; then
-                echo "j36-xsession: empty Desktop asked to quit" >&2
-                break
-            fi
-            ;;
         tick|"")
             ;;
         *)
@@ -12377,12 +12604,10 @@ while :; do
 
     reap_clients
 
-    # AN EMPTY DESKTOP STAYS ALIVE.  X is expensive to initialise on this SD card,
-    # and a stopped, windowless session is cheap.  More importantly it leaves a
-    # known :0 ready for the next j36-xrun request instead of making the first
-    # graphical command race a server that is still starting.  B on the empty
-    # Desktop sends quit-empty above, and the switcher's close action still tears
-    # the task down explicitly, so persistence does not remove either exit path.
+    # AN EMPTY SERVER STAYS ALIVE.  X is expensive to initialise on this SD card,
+    # and a parked, windowless service is cheap.  More importantly it leaves a
+    # known :0 ready for the next j36-xrun request.  It is infrastructure and is
+    # stopped only with j36-xdesktop.service, never by an application gesture.
 
     # The bridge is an X client, so it dies when the server does.  That makes it the
     # cheapest test for "the X server has gone" that does not involve opening a
@@ -12453,9 +12678,9 @@ XSESSIONMAIN
 #
 # Usage: j36-xrun COMMAND [ARG...]
 #
-# Asks the dashboard for a window, which starts the desktop if it is not running
-# and brings it to the front either way.  With no dashboard, asks a session that
-# is already up.  See device/j36-ultra/build-in-vm.sh for the whole argument.
+# Asks the dashboard to expose the already-running window service and launch a
+# client in it.  With no dashboard, asks an active session directly.  See
+# device/j36-ultra/build-in-vm.sh for the whole argument.
 set -u
 
 RUNDIR=/run/j36
@@ -12554,8 +12779,8 @@ if [ "$alive" -eq 0 ] || [ ! -p "$CTL" ]; then
     # Left behind by a session that did not get to tidy up.  Removed here rather
     # than left to confuse the next reader.
     [ "$alive" -eq 0 ] && rm -f "$CTL" "$PIDFILE" "$RUNDIR/xsession.windows" 2>/dev/null
-    echo "j36-xrun: nothing graphical is running, and no dashboard to start it." >&2
-    echo "          Open the Desktop card on the dashboard, then run this again." >&2
+    echo "j36-xrun: the window service or dashboard is not running." >&2
+    echo "          Restart j36-xdesktop.service and mixdash.service, then try again." >&2
     exit 1
 fi
 
@@ -13012,9 +13237,10 @@ no-script version, which is the one that works here</li>
 
 <h2>Other windows</h2>
 
-<p>This browser is one window in a desktop session, not the whole of it. The
-dashboard starts that session once at boot and parks it in the background; the
-<b>Desktop</b> card lists what is open in it. From the Terminal card:</p>
+<p>This browser is one client of the window service, not the whole of it. The
+service starts before the dashboard and remains parked in the background until
+a client asks for the panel. It has no Desktop card or empty desktop screen. From
+the Terminal card:</p>
 
 <p><code>j36-xrun COMMAND</code></p>
 
@@ -13024,14 +13250,16 @@ Packages card installed. It returns as soon as it has asked; the window turns up
 on the panel a moment later.</p>
 
 <p><b>Menu</b> tapped pages round the windows that are open, and <b>Menu</b> held
-brings the dashboard back with all of them left running behind it. Four at once
+opens the task switcher with one <b>Windowed apps</b> entry for the active service.
+The entry disappears when its last client exits. Four foreground targets at once
 is the limit &mdash; there is 1&nbsp;GB of RAM to share out.</p>
 
 <p>A graphical program must be started with <code>j36-xrun</code>. The dashboard
-Terminal intentionally does not export a raw <b>DISPLAY</b>: a Desktop in the
-background is stopped, and connecting to it directly is how a game could play
-sound while drawing no picture. <code>j36-xrun</code> first transfers the panel,
-then starts the client, so it does not matter which card you were looking at.</p>
+Terminal intentionally does not export a raw <b>DISPLAY</b>: the window service is
+parked while the dashboard owns the framebuffer, and connecting directly is how
+a game could play sound while drawing no picture. <code>j36-xrun</code> transfers
+the panel and starts the client, so it does not matter which card you were looking
+at.</p>
 
 <h2>What it can and cannot do</h2>
 
@@ -13044,7 +13272,7 @@ thirty adverts on it to be the one that runs out of memory.</p>
 
 <p><b>NetSurf</b> is installed alongside it: 4&nbsp;MB, its own engine, CSS and
 images but no JavaScript. It is the one to fall back on when Firefox will not
-start. From the Terminal card, with the Desktop already open:</p>
+start. From the Terminal card:</p>
 
 <p><code>J36_BROWSER=/usr/bin/netsurf-gtk /opt/mixos/bin/j36-browser</code></p>
 

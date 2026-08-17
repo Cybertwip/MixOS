@@ -51,7 +51,6 @@ SOURCES += \
     console.cpp \
     shell.cpp \
     dashboard.cpp \
-    desktop.cpp \
     files.cpp \
     disks.cpp \
     widgets.cpp \
@@ -76,7 +75,6 @@ SOURCES += \
 
 HEADERS += \
     dashboard.h \
-    desktop.h \
     files.h \
     disks.h \
     trace.h \

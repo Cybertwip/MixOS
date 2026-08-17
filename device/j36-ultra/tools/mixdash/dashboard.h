@@ -49,7 +49,6 @@
 
 class Busy;
 class DiagnosticsPage;
-class DesktopPage;
 class DisplayPage;
 class FilesPage;
 class Joypad;
@@ -126,8 +125,7 @@ public:
         /* A mounted USB volume.  The card carries no path -- the key is the handle,
          * and Volumes::byKey turns it back into a mount point at the moment it is
          * pressed, which is the only moment the answer is known to be current. */
-        InternalVolume,
-        InternalDesktop
+        InternalVolume
     };
 
     explicit Dashboard(QWidget *parent = nullptr);
@@ -309,55 +307,54 @@ private:
     /*
      * Open a card's program as a WINDOW rather than giving it the panel.
      *
-     * With a graphical session already running this is a line down its control
-     * pipe and a switch to it; with none it starts one with this program as its
-     * first window, which is one ordinary launch() of j36-xsession.  Either way
-     * the session is ONE task -- see LaunchMode in widgets.h.
+     * This is a line down the persistent window service's control pipe followed
+     * by a framebuffer hand-off.  The server is never inserted into m_tasks.
      */
     void launchWindowed(const QString &title, const QString &exe,
                         const QStringList &args);
     /*
-     * One shell command line into the session, wherever that leaves it: down the
-     * control pipe of the session that is running, or as the first window of one
-     * started for it.  `cmd' is already quoted -- the far end runs it with sh -c
-     * -- and `title' is only ever used in a sentence.
+     * One shell command line into the persistent window service's control pipe.
+     * `cmd' is already quoted -- the far end runs it with sh -c -- and `title' is
+     * only ever used in a sentence.
      *
      * The half of launchWindowed() that does not care who asked, because two
      * things now do: a card, and j36-xrun by way of the queue below.
      */
     void runInSession(const QString &title, const QString &cmd);
-    /* Select one of the graphical session's client cards and reveal it. */
-    void showDesktopWindow(qint64 pid);
     /*
      * Read /run/j36/xrun.queue and open what is in it.  Called from the request
      * poll when SIGUSR2 has been seen; see RunRequest in switcher.h for why the
      * command comes to this program rather than to the session.
      */
     void takeRunRequests();
-    /* Put lines back, for the pass that could not finish them. */
-    void queueRunRequests(const QStringList &lines);
-    /* Where the graphical session is in m_tasks, or -1 if none is running.  By
-     * exe, because there can only ever be one of it. */
-    int sessionTask() const;
-    /* Start :0 once after the first dashboard frame, then park it as an ordinary
-     * background task as soon as its supervisor is ready. */
-    void startDesktopInBackground();
-    void pollDesktopWarmup();
-    void cancelDesktopWarmup();
+    /*
+     * The X server is infrastructure, not a child task.  systemd starts and
+     * parks it before this process; these two methods transfer the framebuffer
+     * to and from that service without ever inserting it into m_tasks.
+     */
+    void setDesktopForeground();
+    bool desktopExposed() const;
+    void pollDesktopService();
     /*
      * SIGSTOP whatever is in front and keep its frame, leaving nothing owning the
      * panel.  The half of setForeground() that launch() needs on its own -- it is
      * on its way to a program that does not exist yet.
      */
-    void stopForeground();
+    bool stopForeground();
     /*
      * Stop the task in front, if any, and put the switcher up.  The ordering is
      * the contract switcher.h describes: nothing may be drawing when the overlay
      * paints.
      */
     void showSwitcher();
-    /* The rows, built from m_tasks.  Row 0 is always this dashboard, so row n+1
-     * is task n and setForeground(row - 1) is the inverse. */
+    /* Translate between switcher rows and foreground targets.  -2 is the
+     * windowed-app service, -1 the dashboard, and non-negative values are
+     * ordinary m_tasks entries. */
+    void setSwitcherTarget(int target);
+    int switcherTarget(int row) const;
+    int switcherRow(int target) const;
+    /* The rows: dashboard, ordinary m_tasks, then the optional window-service
+     * target while it has clients. */
     QVector<Switcher::Entry> switcherRows() const;
     /* New rows for a switcher that is already up.  Does nothing when it is not,
      * which is most of the time, so callers need not check. */
@@ -393,7 +390,6 @@ private:
 
     /* Pushed on top of the grid. */
     MediaPage *m_media = nullptr;
-    DesktopPage *m_desktop = nullptr;
     SettingsPage *m_settings = nullptr;
     FilesPage *m_files = nullptr;
     TerminalPage *m_terminal = nullptr;
@@ -450,8 +446,8 @@ private:
      * Four, and both halves of the number are real.  It is what switcher.cpp can
      * lay out without a scrollbar on a 480 px panel -- five rows including the
      * dashboard's -- and it is about as much as 946 MB of RAM will hold, given
-     * that a browser session is an X server plus Firefox and that alone is a
-     * third of it.  A fifth task would be a switcher that scrolls leading to an
+     * that the persistent X service plus Firefox alone can use roughly a third
+     * of it.  A fifth target would be a switcher that scrolls leading to an
      * out-of-memory kill.
      */
     static const int kMaxTasks = 4;
@@ -466,9 +462,9 @@ private:
         QString exe;
         /*
          * The process group, which is the pid because launch() makes every child
-         * a group leader.  Signals go to -pid: a session is a shell that runs
-         * xinit that forks an X server, and stopping only the shell would leave
-         * the server drawing over the switcher.
+         * a group leader.  Signals go to -pid so a launcher and everything it
+         * forks stop together.  The X service is not represented by this struct;
+         * its systemd cgroup is the ownership boundary instead.
          *
          * Kept as a number of its own rather than read from `proc' at signal
          * time, because a QProcess that has finished answers 0 for its pid and
@@ -497,7 +493,7 @@ private:
      */
     int m_fg = -1;
     Switcher *m_switcher = nullptr;
-    /* Which row the switcher was opened on, so that cancelling puts back exactly
+    /* Which target the switcher was opened on, so cancelling puts back exactly
      * what was in front rather than whatever the highlight has since moved to. */
     int m_switcherWas = -1;
     /*
@@ -515,10 +511,18 @@ private:
      * timer costs nothing measurable and removes both.
      */
     QTimer *m_requestTimer = nullptr;
-    /* The X server is warmed once at boot and stopped only after its control FIFO
-     * exists, so the first graphical command never has to race Xorg startup. */
-    QTimer *m_desktopWarmTimer = nullptr;
-    bool m_warmingDesktop = false;
+    /*
+     * X lives in j36-xdesktop.service for the whole boot.  It only becomes a
+     * switcher task while a real client has been requested or is still open.
+     * Its saved framebuffer is separate from Task for the same reason: there is
+     * no QProcess owned by this object and no server row while it is idle.
+     */
+    QTimer *m_desktopStateTimer = nullptr;
+    QByteArray m_desktopFrame;
+    bool m_desktopForeground = false;
+    bool m_desktopPending = false;
+    int m_desktopPendingPolls = 0;
+    bool m_desktopWasAlive = false;
 
     /*
      * ── A LAUNCH IS NOT RE-ENTRANT ───────────────────────────────────────────

@@ -53,6 +53,11 @@
  * frame has been restored; the SIGCONT path drains events used by the switcher
  * before taking the grab back.
  *
+ * When the final X client exits there is no Menu gesture to perform that first
+ * half.  mixdash sends SIGUSR2 instead; this bridge performs the same cursor-hide,
+ * queue drain and grab release, then self-stops.  Only after `/proc` reports that
+ * stop does mixdash freeze the complete service cgroup and repaint the dashboard.
+ *
  * The explicit self-stop matters because xinit can put descendants in another
  * process group.  Stopping only the launcher's group left this bridge alive over
  * the dashboard: its software cursor then restored pieces of X's old framebuffer
@@ -95,7 +100,7 @@
  *     Right stick    scroll, proportional to deflection
  *     D-pad          arrow-key navigation (the only pad navigation source)
  *     A              left click
- *     B              Back (Alt+Left); exit when the desktop is empty
+ *     B              Back (Alt+Left)
  *     X              Return
  *     Y              Escape
  *     L1 / R1        wheel up / wheel down, repeating while held
@@ -764,7 +769,7 @@ static int focus_client(pid_t pid)
     ev.xclient.window = client;
     ev.xclient.message_type = active;
     ev.xclient.format = 32;
-    ev.xclient.data.l[0] = 2; /* pager: this request came from the Desktop page */
+    ev.xclient.data.l[0] = 2; /* pager: this request came from the window chooser */
     ev.xclient.data.l[1] = CurrentTime;
     XSendEvent(dpy, root, False, SubstructureRedirectMask | SubstructureNotifyMask, &ev);
     XRaiseWindow(dpy, client);
@@ -816,174 +821,30 @@ static void screen_cursor(int visible)
 }
 
 /*
- * ── THE DESKTOP IS NOT BLACK ANY MORE ───────────────────────────────────────
- *
- * A session with no window open shows the root, and an X root with nothing set on
- * it is black.  That is correct and it is also indistinguishable from a session
- * that failed to start, which is exactly what got reported: "Desktop is black".
- * A person holding this device has no way to tell the two apart and no reason to
- * guess -- there is no title bar, no taskbar and no menu to click, because the
- * pad is the only input and every gesture it has is invisible.
- *
- * So the root gets a card that says what the pad does.  It is a PIXMAP HUNG ON
- * THE ROOT'S BACKGROUND rather than a window: the server then repaints it by
- * itself, for free, whenever a window moves off it or exposes it,
- * and there is no extra client to stack, focus, stop or kill.  This is what
- * xsetroot -bitmap does, and the reason the pixmap can be freed on the next line
- * is the same -- the server keeps its own reference for as long as a window uses
- * it as a background.
- *
- * WHY THIS PROGRAM DRAWS IT.  j36-padx is already an X client in every session,
- * already links -lX11, and already knows the whole binding table because it is
- * the thing that implements it -- the list below and the switch in main() cannot
- * drift apart without somebody editing both.  A separate program would be a new
- * binary, a new package and a second copy of the truth.
- *
- * CORE FONTS, and no fontconfig.  10x20 and 9x15 come from xfonts-base, which is
- * on this image because the X server refuses to start without `fixed'.  If some
- * future image drops them the card degrades to its background and a session with
- * no window is a plain dark screen instead of a black one, which is still a
- * better answer than nothing.
+ * The root is deliberately only an opaque backing colour.  It is server state,
+ * not a Desktop application or an instruction page: mixdash never exposes it
+ * while idle, and a real client maps over it immediately after a launch request.
+ * Keeping a server-owned background is still important because XClearWindow on
+ * resume can then replace any dashboard pixels not covered by a restored client.
  */
-static const struct {
-    const char *key;
-    const char *what;
-} help_rows[] = {
-    { "FN held",       "the task switcher -- and the way back to the dashboard" },
-    { "FN tapped",     "the next window" },
-    { "Select",        "the on-screen keyboard" },
-    { "Left stick",    "the pointer" },
-    { "D-pad",         "arrow-key navigation" },
-    { "A",             "click  (L3 and R3 are the middle and right buttons)" },
-    { "B",             "back -- or exit when the desktop is empty" },
-    { "X, Y",          "Enter, Escape" },
-    { "L1, R1",        "scroll  (so does the right stick)" },
-    { "L2, R2",        "page up, page down" },
-    { "Start",         "the address bar" },
-    { "Vol -, Vol +",  "zoom out, zoom in" },
-};
-
-static unsigned long card_colour(Colormap cm, const char *spec, unsigned long fallback)
-{
-    XColor c;
-
-    if (XParseColor(dpy, cm, spec, &c) && XAllocColor(dpy, cm, &c))
-        return c.pixel;
-    return fallback;
-}
-
-static XFontStruct *card_font(const char *const *names)
-{
-    XFontStruct *f;
-    int i;
-
-    for (i = 0; names[i]; i++) {
-        f = XLoadQueryFont(dpy, names[i]);
-        if (f)
-            return f;
-    }
-    return NULL;
-}
-
 static void desktop_paint(void)
 {
-    static const char *const big_names[]  = { "10x20", "9x15bold", "9x15", "fixed", NULL };
-    static const char *const body_names[] = { "9x15", "8x13", "fixed", NULL };
-    const char *title = "MixOS desktop";
-    const char *lead  = "Windows open on top of this.  The pad drives them:";
-    const char *foot  = "j36-xrun COMMAND, from the dashboard's Terminal, opens a window here";
     Window root;
-    Pixmap pm;
-    GC gc;
     Colormap cm;
-    XFontStruct *big, *body;
-    unsigned long bg, fg, key_fg, dim;
-    int rows = (int)(sizeof help_rows / sizeof help_rows[0]);
-    int line_h, key_w, block_h, x, y, i;
+    XColor colour;
+    unsigned long bg;
 
     if (!dpy || scr_w < 1 || scr_h < 1)
         return;
 
     root = RootWindow(dpy, scr);
     cm   = DefaultColormap(dpy, scr);
-
-    bg     = card_colour(cm, "#0f131a", BlackPixel(dpy, scr));
-    fg     = card_colour(cm, "#e6edf7", WhitePixel(dpy, scr));
-    key_fg = card_colour(cm, "#78b0ff", WhitePixel(dpy, scr));
-    dim    = card_colour(cm, "#9aa7b8", WhitePixel(dpy, scr));
-
-    pm = XCreatePixmap(dpy, root, (unsigned)scr_w, (unsigned)scr_h,
-                       (unsigned)DefaultDepth(dpy, scr));
-    gc = XCreateGC(dpy, pm, 0, NULL);
-    XSetForeground(dpy, gc, bg);
-    XFillRectangle(dpy, pm, gc, 0, 0, (unsigned)scr_w, (unsigned)scr_h);
-
-    big  = card_font(big_names);
-    body = card_font(body_names);
-    if (!body)
-        body = big;
-    if (!big)
-        big = body;
-
-    if (body) {
-        line_h = body->ascent + body->descent + 4;
-
-        /* The key column is as wide as the widest key and not one pixel more, so
-         * the two columns line up at whatever size the fonts turn out to be. */
-        key_w = 0;
-        for (i = 0; i < rows; i++) {
-            int w = XTextWidth(body, help_rows[i].key, (int)strlen(help_rows[i].key));
-            if (w > key_w)
-                key_w = w;
-        }
-
-        block_h = line_h * (rows + 4);
-        x = scr_w / 12;
-        y = (scr_h - block_h) / 2;
-        if (y < line_h * 2)
-            y = line_h * 2;
-        y += big->ascent;
-
-        XSetFont(dpy, gc, big->fid);
-        XSetForeground(dpy, gc, fg);
-        XDrawString(dpy, pm, gc, x, y, title, (int)strlen(title));
-        y += line_h + big->descent;
-
-        XSetFont(dpy, gc, body->fid);
-        XSetForeground(dpy, gc, dim);
-        XDrawString(dpy, pm, gc, x, y, lead, (int)strlen(lead));
-        y += line_h * 2;
-
-        for (i = 0; i < rows; i++) {
-            XSetForeground(dpy, gc, key_fg);
-            XDrawString(dpy, pm, gc, x, y, help_rows[i].key,
-                        (int)strlen(help_rows[i].key));
-            XSetForeground(dpy, gc, fg);
-            XDrawString(dpy, pm, gc, x + key_w + line_h, y, help_rows[i].what,
-                        (int)strlen(help_rows[i].what));
-            y += line_h;
-        }
-
-        XSetForeground(dpy, gc, dim);
-        XDrawString(dpy, pm, gc, x, y + line_h, foot, (int)strlen(foot));
-    }
-
-    XSetWindowBackgroundPixmap(dpy, root, pm);
+    bg = BlackPixel(dpy, scr);
+    if (XParseColor(dpy, cm, "#0f131a", &colour)
+        && XAllocColor(dpy, cm, &colour))
+        bg = colour.pixel;
+    XSetWindowBackground(dpy, root, bg);
     XClearWindow(dpy, root);
-
-    /* The server has its own reference now; this only gives up ours.  The fonts
-     * go the same way -- the text is already pixels in the pixmap. */
-    XFreePixmap(dpy, pm);
-    XFreeGC(dpy, gc);
-    if (big && big != body)
-        XFreeFont(dpy, big);
-    if (body)
-        XFreeFont(dpy, body);
-
-    /* The card outlives this connection.  Without it, a j36-padx that is killed
-     * and restarted -- or that crashes -- takes the root background with it and
-     * leaves the black screen this exists to prevent. */
-    XSetCloseDownMode(dpy, RetainPermanent);
     XFlush(dpy);
 }
 
@@ -1987,9 +1848,10 @@ static void ctl_send(const char *word)
 #define RESCAN_MS 2000
 
 /* Written only by the long-lived bridge (the one with --ctl), after X, the root
- * desktop and the pad grab are all ready.  mixdash uses it to know when the
- * boot-time Desktop can safely be snapshotted and parked. */
+ * backing and the pad scan are ready.  The boot park unit uses it before
+ * freezing the service cgroup. */
 #define READY_PATH "/run/j36/padx.ready"
+#define MIXDASH_PID_PATH "/run/j36/mixdash.pid"
 
 static volatile sig_atomic_t stop_asked;
 
@@ -2021,6 +1883,45 @@ static void on_cont(int sig)
     cont_asked = 1;
 }
 
+/* mixdash uses SIGUSR2 for the hand-off that has no Menu gesture behind it: the
+ * final X client closed and the idle service must disappear automatically.  A
+ * signal handler cannot call Xlib or ioctl, so it only interrupts poll; the main
+ * loop hides the cursor, releases EVIOCGRAB and stops itself below. */
+static volatile sig_atomic_t park_asked;
+
+static void on_park(int sig)
+{
+    (void)sig;
+    park_asked = 1;
+}
+
+/* The X service starts before mixdash, so it cannot inherit MIXDASH_PID.  Resolve
+ * the pidfile again when a hand-off gesture happens; this also recovers cleanly
+ * when systemd has restarted the dashboard since the service was started. */
+static pid_t live_mixdash(pid_t cached)
+{
+    char buf[64], *end;
+    long value;
+    int fd;
+    ssize_t got;
+
+    if (cached > 1 && kill(cached, 0) == 0)
+        return cached;
+    fd = open(MIXDASH_PID_PATH, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    got = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (got <= 0)
+        return 0;
+    buf[got] = '\0';
+    errno = 0;
+    value = strtol(buf, &end, 10);
+    if (errno || end == buf || value <= 1 || kill((pid_t)value, 0) < 0)
+        return 0;
+    return (pid_t)value;
+}
+
 static void usage(void)
 {
     fprintf(stderr,
@@ -2031,9 +1932,12 @@ static void usage(void)
         "  --ctl PATH        the session's control pipe: Menu TAPPED asks it to\n"
         "                    page to the next window\n"
         "  --display NAME    which server (default $DISPLAY)\n"
+        "  --probe           verify that X accepts a connection, then exit\n"
         "  --focus PID       focus the X client with _NET_WM_PID=PID, then exit\n"
         "  --grab            take the pad while X owns the panel; Menu hold\n"
         "                    explicitly releases it before the dashboard hand-off\n"
+        "  --start-parked    boot-service mode: initialise without a grab, hide\n"
+        "                    the cursor, report ready and wait for SIGCONT\n"
         "  --no-grab         share the pad (the command-line default)\n"
         "  --list            name the devices that would be used, then exit\n"
         "  -v                say what is happening\n"
@@ -2111,7 +2015,7 @@ int main(int argc, char **argv)
     const char *display_name = NULL;
     pid_t watch_pid = 0;
     pid_t focus_pid = 0;
-    int grab = 0, list_only = 0;
+    int grab = 0, list_only = 0, probe_only = 0, start_parked = 0;
     /*
      * Whether the pad is grabbed AT THIS MOMENT, as against whether it was asked
      * for on the command line.  The two differ for as long as the switcher is up:
@@ -2140,8 +2044,14 @@ int main(int argc, char **argv)
             display_name = argv[++i];
         else if (!strcmp(argv[i], "--focus") && i + 1 < argc)
             focus_pid = (pid_t)strtol(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--probe"))
+            probe_only = 1;
         else if (!strcmp(argv[i], "--grab"))
             grab = 1;
+        else if (!strcmp(argv[i], "--start-parked")) {
+            start_parked = 1;
+            grab = 1;
+        }
         else if (!strcmp(argv[i], "--no-grab"))
             grab = 0;
         else if (!strcmp(argv[i], "--list"))
@@ -2159,6 +2069,7 @@ int main(int argc, char **argv)
         mixdash_pid = (pid_t)strtol(mixdash_env, NULL, 10);
     if (mixdash_pid < 0)
         mixdash_pid = 0;
+    mixdash_pid = live_mixdash(mixdash_pid);
 
     /* A bridge killed outright may have left yesterday's readiness behind.  The
      * short --focus helper has no control pipe and must not disturb the live one. */
@@ -2191,6 +2102,9 @@ int main(int argc, char **argv)
     /* The dashboard's switcher stopped this whole group and has now let it run
      * again; the pad has to be taken back.  See on_cont(). */
     signal(SIGCONT, on_cont);
+    /* Automatic return to the dashboard has no Menu press in PadX to perform the
+     * release first.  mixdash asks for that same parked state explicitly. */
+    signal(SIGUSR2, on_park);
 
     dpy = XOpenDisplay(display_name);
     if (!dpy) {
@@ -2200,6 +2114,14 @@ int main(int argc, char **argv)
     }
     XSetIOErrorHandler(on_io_error);
     XSetErrorHandler(on_x_error);
+
+    /* The persistent session uses this as its generic readiness gate before it
+     * forks a client.  Opening one X connection is the exact test SDL's X11
+     * backend performs, without depending on x11-utils being installed. */
+    if (probe_only) {
+        XCloseDisplay(dpy);
+        return 0;
+    }
 
     scr = DefaultScreen(dpy);
     if (focus_pid > 0) {
@@ -2226,18 +2148,19 @@ int main(int argc, char **argv)
     pointer_start();
     kbd_start();
 
-    /* Before the first window maps, so that a session that takes a while to open
-     * one -- or is asked to open none at all -- has something on it that says so.
-     * The screen size it lays out to comes from pointer_start() above. */
+    /* Install the opaque root backing before the first client maps. */
     desktop_paint();
 
-    grabbing = grab;
+    grabbing = grab && !start_parked;
     if (!scan_pads(grabbing)) {
         fail("no pad among /dev/input/event*, so nothing can drive this session "
              "-- run with --list to see what was rejected");
         XCloseDisplay(dpy);
         return 1;
     }
+
+    if (start_parked)
+        screen_cursor(0);
 
     if (ctl_path) {
         const int ready = open(READY_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
@@ -2246,6 +2169,11 @@ int main(int argc, char **argv)
             close(ready);
         else
             fail("cannot write %s: %s", READY_PATH, strerror(errno));
+    }
+
+    if (start_parked) {
+        note("ready in boot-service mode, waiting parked without the pad grab");
+        raise(SIGSTOP);
     }
 
     move_last = now_ms();
@@ -2320,8 +2248,34 @@ int main(int argc, char **argv)
              * complete saved X frame before SIGCONT, and X now renders directly
              * into that same framebuffer.  Show the cursor only after the handoff
              * is complete so its save-under can never capture dashboard pixels. */
+            XClearWindow(dpy, RootWindow(dpy, scr));
+            XSync(dpy, False);
             screen_cursor(0);
             screen_cursor(1);
+            continue;
+        }
+
+        /* The last window exited while X owned the panel.  Unlike a Menu hold,
+         * that event originates in mixdash, so perform the input half of the
+         * ownership transfer here before mixdash freezes this cgroup.  Keeping
+         * EVIOCGRAB across SIGSTOP made the repainted dashboard look alive while
+         * every one of its controls was actually locked out by this process. */
+        if (park_asked) {
+            park_asked = 0;
+            if (kbd_visible)
+                kbd_set_visible(0);
+            kbd_menu_hidden = 0;
+            forget_pads();
+            pointer_resync();
+            pointer_state_write();
+            if (grabbing) {
+                set_grab(0);
+                grabbing = 0;
+            }
+            screen_cursor(0);
+            XSync(dpy, False);
+            note("parked by the dashboard, releasing the pad before X is frozen");
+            raise(SIGSTOP);
             continue;
         }
 
@@ -2423,14 +2377,13 @@ int main(int argc, char **argv)
 
                 case BTN_B:
                     if (down) {
-                        /* Still Back in every client.  In an empty Desktop there
-                         * is no client to receive it, so the session accepts the
-                         * companion request as the explicit way out. */
+                        /* Back belongs to the focused client.  The X server is a
+                         * persistent service now, so an empty root is never an
+                         * instruction to tear the service down. */
                         if (kbd_visible) {
                             kbd_set_visible(0);
                         } else {
                             tap(kc.alt, kc.left);
-                            ctl_send("quit-empty");
                         }
                     }
                     break;
@@ -2492,6 +2445,7 @@ int main(int argc, char **argv)
                      * what it has always done, which is nothing.
                      */
                     if (down) {
+                        mixdash_pid = live_mixdash(mixdash_pid);
                         pointer_resync();
                         pointer_state_write();
                         menu_down_at = now;
@@ -2601,6 +2555,7 @@ int main(int argc, char **argv)
          * With no dashboard to ask, the old behaviour stands unchanged.
          */
         if (menu_down_at && now - menu_down_at >= MENU_HOLD_MS) {
+            mixdash_pid = live_mixdash(mixdash_pid);
             if (mixdash_pid > 0 && kill(mixdash_pid, 0) == 0) {
                 note("Menu held, asking the dashboard for its switcher");
                 set_grab(0);
