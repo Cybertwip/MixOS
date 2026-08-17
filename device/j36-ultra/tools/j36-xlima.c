@@ -968,22 +968,47 @@ static void JLimaInstallMode(ScrnInfoPtr pScrn, JLimaPtr p)
 {
 	DisplayModePtr mode = xnfcalloc(1, sizeof(DisplayModeRec));
 	char *name = xnfalloc(32);
+	const int hdisplay = (int)p->var.xres;
+	const int vdisplay = (int)p->var.yres;
 
 	/* The server walks pScrn->currentMode the instant PreInit
 	 * returns.  A NULL mode is a read at offset 0x18 -- the crash
-	 * after "Using gamma correction" in the device log. */
+	 * after "Using gamma correction" in the device log.
+	 *
+	 * The mode also needs honest timings.  A zero pixel clock or totals
+	 * equal to the visible size leave helpers in the refresh path with a
+	 * divide-by-zero, which is the later SIGFPE that brings down the
+	 * window service. */
 	snprintf(name, 32, "%dx%d", p->var.xres, p->var.yres);
 	mode->name = name;
 	mode->status = MODE_OK;
 	mode->type = M_T_BUILTIN;
-	mode->HDisplay = p->var.xres;
-	mode->VDisplay = p->var.yres;
-	mode->HSyncStart = mode->HDisplay;
-	mode->HSyncEnd = mode->HDisplay;
-	mode->HTotal = mode->HDisplay;
-	mode->VSyncStart = mode->VDisplay;
-	mode->VSyncEnd = mode->VDisplay;
-	mode->VTotal = mode->VDisplay;
+	mode->HDisplay = hdisplay;
+	mode->VDisplay = vdisplay;
+	if (hdisplay == 640 && vdisplay == 480) {
+		/* Standard VGA timings.  The panel is scanned out by simplefb,
+		 * but Xorg still expects a coherent modeline for bookkeeping. */
+		mode->Clock = 25175;
+		mode->HSyncStart = 656;
+		mode->HSyncEnd = 752;
+		mode->HTotal = 800;
+		mode->VSyncStart = 490;
+		mode->VSyncEnd = 492;
+		mode->VTotal = 525;
+	} else {
+		/* Keep every divisor non-zero if another simplefb geometry ever
+		 * appears on this path.  The exact porch values do not drive the
+		 * glass here; they only satisfy the server's mode math. */
+		mode->Clock = hdisplay * vdisplay * 60 / 1000;
+		if (mode->Clock <= 0)
+			mode->Clock = 1;
+		mode->HSyncStart = hdisplay + 16;
+		mode->HSyncEnd = mode->HSyncStart + 96;
+		mode->HTotal = mode->HSyncEnd + 48;
+		mode->VSyncStart = vdisplay + 10;
+		mode->VSyncEnd = mode->VSyncStart + 2;
+		mode->VTotal = mode->VSyncEnd + 33;
+	}
 	mode->next = mode;
 	mode->prev = mode;
 	pScrn->modes = mode;
@@ -1106,6 +1131,9 @@ static Bool JLimaPreInit(ScrnInfoPtr pScrn, int flags)
 	}
 
 	pScrn->progClock = TRUE;
+	pScrn->rgbBits = 8;
+	pScrn->chipset = "lima";
+	pScrn->videoRam = (int)(p->fb_len / 1024);
 	if (!xf86SetGamma(pScrn, zeros))
 		return FALSE;
 	JLimaInstallMode(pScrn, p);
@@ -1115,6 +1143,23 @@ static Bool JLimaPreInit(ScrnInfoPtr pScrn, int flags)
 	pScrn->LeaveVT = JLimaLeaveVT;
 	pScrn->ValidMode = JLimaValidMode;
 	pScrn->FreeScreen = JLimaFreeScreen;
+
+	/*
+	 * fbdev finishes PreInit with the mode printed and DPI set.  The server
+	 * does the same if the driver does not, and on this xserver both paths
+	 * SIGFPE when the mode has no pixel clock or the monitor has no physical
+	 * size -- exactly the one-millisecond crash after "Using gamma correction".
+	 */
+	if (pScrn->monitor) {
+		if (pScrn->monitor->widthMM <= 0)
+			pScrn->monitor->widthMM = 169;
+		if (pScrn->monitor->heightMM <= 0)
+			pScrn->monitor->heightMM = 127;
+	}
+	pScrn->displayWidth = pScrn->virtualX;
+	xf86PrintModes(pScrn);
+	xf86SetDpi(pScrn, 0, 0);
+
 	pScrn->vtSema = FALSE;
 	return TRUE;
 }

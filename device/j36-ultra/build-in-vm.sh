@@ -12182,6 +12182,7 @@ EndSection
 
 Section "Monitor"
     Identifier "j36-panel"
+    DisplaySize  169 127
     Option     "DPMS" "false"
 EndSection
 
