@@ -917,6 +917,79 @@ static Bool JLimaScreenInit(ScreenPtr pScreen, int argc, char **argv)
 	return TRUE;
 }
 
+static Bool JLimaSwitchMode(ScrnInfoPtr pScrn, DisplayModePtr mode)
+{
+	(void)pScrn;
+	(void)mode;
+	return TRUE;
+}
+
+static void JLimaAdjustFrame(ScrnInfoPtr pScrn, int x, int y)
+{
+	(void)pScrn;
+	(void)x;
+	(void)y;
+}
+
+static Bool JLimaEnterVT(ScrnInfoPtr pScrn)
+{
+	pScrn->vtSema = TRUE;
+	return TRUE;
+}
+
+static void JLimaLeaveVT(ScrnInfoPtr pScrn)
+{
+	pScrn->vtSema = FALSE;
+}
+
+static ModeStatus JLimaValidMode(ScrnInfoPtr pScrn, DisplayModePtr mode,
+				 Bool verbose, int flags)
+{
+	(void)pScrn;
+	(void)mode;
+	(void)verbose;
+	(void)flags;
+	return MODE_OK;
+}
+
+static void JLimaFreeScreen(ScrnInfoPtr pScrn)
+{
+	JLimaPtr p = JLIMAPTR(pScrn);
+
+	if (!p)
+		return;
+	free(p->options);
+	free(p->pEnt);
+	free(p);
+	pScrn->driverPrivate = NULL;
+}
+
+static void JLimaInstallMode(ScrnInfoPtr pScrn, JLimaPtr p)
+{
+	DisplayModePtr mode = xnfcalloc(1, sizeof(DisplayModeRec));
+	char *name = xnfalloc(32);
+
+	/* The server walks pScrn->currentMode the instant PreInit
+	 * returns.  A NULL mode is a read at offset 0x18 -- the crash
+	 * after "Using gamma correction" in the device log. */
+	snprintf(name, 32, "%dx%d", p->var.xres, p->var.yres);
+	mode->name = name;
+	mode->status = MODE_OK;
+	mode->type = M_T_BUILTIN;
+	mode->HDisplay = p->var.xres;
+	mode->VDisplay = p->var.yres;
+	mode->HSyncStart = mode->HDisplay;
+	mode->HSyncEnd = mode->HDisplay;
+	mode->HTotal = mode->HDisplay;
+	mode->VSyncStart = mode->VDisplay;
+	mode->VSyncEnd = mode->VDisplay;
+	mode->VTotal = mode->VDisplay;
+	mode->next = mode;
+	mode->prev = mode;
+	pScrn->modes = mode;
+	pScrn->currentMode = mode;
+}
+
 static Bool JLimaPreInit(ScrnInfoPtr pScrn, int flags)
 {
 	JLimaPtr p;
@@ -1035,6 +1108,13 @@ static Bool JLimaPreInit(ScrnInfoPtr pScrn, int flags)
 	pScrn->progClock = TRUE;
 	if (!xf86SetGamma(pScrn, zeros))
 		return FALSE;
+	JLimaInstallMode(pScrn, p);
+	pScrn->SwitchMode = JLimaSwitchMode;
+	pScrn->AdjustFrame = JLimaAdjustFrame;
+	pScrn->EnterVT = JLimaEnterVT;
+	pScrn->LeaveVT = JLimaLeaveVT;
+	pScrn->ValidMode = JLimaValidMode;
+	pScrn->FreeScreen = JLimaFreeScreen;
 	pScrn->vtSema = FALSE;
 	return TRUE;
 }
@@ -1067,6 +1147,12 @@ static Bool JLimaProbe(DriverPtr drv, int flags)
 		pScrn->Probe = JLimaProbe;
 		pScrn->PreInit = JLimaPreInit;
 		pScrn->ScreenInit = JLimaScreenInit;
+		pScrn->SwitchMode = JLimaSwitchMode;
+		pScrn->AdjustFrame = JLimaAdjustFrame;
+		pScrn->EnterVT = JLimaEnterVT;
+		pScrn->LeaveVT = JLimaLeaveVT;
+		pScrn->ValidMode = JLimaValidMode;
+		pScrn->FreeScreen = JLimaFreeScreen;
 		found++;
 	}
 	free(devSections);
