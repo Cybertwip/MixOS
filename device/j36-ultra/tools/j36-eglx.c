@@ -166,7 +166,7 @@ struct Dpy {
 	struct gbm_device *gbm;
 	int dri_fd;
 	Display *xdpy;
-	char path[64];
+	char path[280];
 	int inited;
 };
 
@@ -302,7 +302,7 @@ static int open_lima(char *path, size_t path_sz)
 	if (!d)
 		return -1;
 	while ((e = readdir(d))) {
-		char p[64];
+		char p[280];
 
 		if (strncmp(e->d_name, "card", 4) &&
 		    strncmp(e->d_name, "renderD", 7))
@@ -344,7 +344,7 @@ static struct Dpy *open_lima_display(Display *xdpy)
 {
 	struct Dpy *d = NULL;
 	int i, fd;
-	char path[64];
+	char path[280];
 	EGLDisplay mesa = EGL_NO_DISPLAY;
 
 	load_real();

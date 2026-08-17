@@ -42,7 +42,10 @@
 #endif
 
 #include <xorg-server.h>
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
 #include <xf86.h>
+#pragma GCC diagnostic pop
 #include <xf86cmap.h>
 #include <fb.h>
 #include <micmap.h>
@@ -96,7 +99,7 @@ typedef struct {
 	CreateScreenResourcesProcPtr CreateScreenResources;
 	Bool			shadow;
 	int			dri_fd;
-	char			dri_path[64];
+	char			dri_path[280];
 	Bool			dri3;
 	Bool			egl2;
 	char			egl_renderer[96];
@@ -127,12 +130,20 @@ static const OptionInfoRec *JLimaAvailableOptions(int chipid, int busid)
 	return JLimaOptions;
 }
 
+static const SymTabRec JLimaChips[] = {
+	{ 0, "lima" },
+	{ -1, NULL }
+};
+
 static void JLimaIdentify(int flags)
 {
 	(void)flags;
+	/* A NULL chipset table is a read of chips->name at address 4
+	 * on this xserver -- that is the boot SIGSEGV that left
+	 * "The window service is not running". */
 	xf86PrintChipsets(JLIMA_NAME,
 			  "lima EGL offload on simple-framebuffer",
-			  NULL);
+			  JLimaChips);
 }
 
 /*
@@ -187,7 +198,7 @@ static int open_lima_node(const char *forced, char *out, size_t out_sz)
 	DIR *dir;
 	struct dirent *de;
 	int fd;
-	char path[64];
+	char path[280];
 
 	if (forced && forced[0])
 		return try_lima_path(forced, out, out_sz);
@@ -1048,6 +1059,10 @@ _X_EXPORT DriverRec J36LIMA = {
 	JLimaAvailableOptions,
 	NULL,
 	0,
+	NULL,
+	NULL,
+	NULL,
+	NULL,
 	NULL
 };
 
