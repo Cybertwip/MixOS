@@ -12123,6 +12123,8 @@ Section "ServerFlags"
 EndSection
 
 Section "Module"
+    Load "shadow"
+    Load "fb"
     Load "dri3"
     Load "glx"
 EndSection
@@ -12623,13 +12625,12 @@ export GDK_BACKEND=x11
 # still represented by Firefox's exit status and journal output.
 export MOZ_CRASHREPORTER_DISABLE=1
 export MOZ_CRASHREPORTER_NO_REPORT=1
-# j36-eglx turns X11 eglGetDisplay into GBM lima and will create a
-# GLES 3.2 or GL 4.6 compat context when Firefox asks.  Keep the GPU
-# process off: an IPC close of that child is still what killed the
-# window.  Software WR stays the compositor fallback.
+# Firefox is software-only on this board (see j36-browser); do not set
+# MOZ_X11_EGL here -- it forces a glxtest EGL probe that dies on fbdev
+# and can stack-smash through j36-eglx.  j36-eglx stays on LD_PRELOAD
+# below for GL games; j36-browser unsets it before execing Firefox.
 export MOZ_WEBRENDER=0
 export MOZ_WEBRENDER_SOFTWARE=1
-export MOZ_X11_EGL=1
 # Official ESR sometimes ignores the remote-tabs prefs; this is the
 # remaining door into a single process, which is what stops the
 # compositor child dying and taking the window with it.
@@ -13442,7 +13443,6 @@ export MOZ_CRASHREPORTER_DISABLE=1
 export MOZ_CRASHREPORTER_NO_REPORT=1
 export MOZ_WEBRENDER=0
 export MOZ_WEBRENDER_SOFTWARE=1
-export MOZ_X11_EGL=1
 export MOZ_FORCE_DISABLE_E10S=1
 export MOZ_DISABLE_CONTENT_SANDBOX=1
 export MOZ_DISABLE_GMP_SANDBOX=1
@@ -13517,9 +13517,10 @@ run_browser() {
 #   that dies is a tab that dies.
 #
 #   Software WebRender in the parent process, no GPU process, no X11 EGL.
-#   lima is GLES2 on card0; Firefox's glxtest cannot initialise EGL or find
-#   GLX, and a remote compositor then dies with AbnormalShutdown.  Software
-#   WR stays in-process so that IPC close cannot take the window with it.
+#   MOZ_AVOID_OPENGL_ALTOGETHER skips glxtest entirely; MOZ_X11_EGL must
+#   stay unset and LD_PRELOAD must not include j36-eglx, or glxtest still
+#   runs and the 2026-08-17 log dies with "libEGL no display" and stack
+#   smashing before the window maps.
 #
 #   Small caches and a lazy session store.  The disk cache lives on the SD card and
 #   is worth having but not worth 300 MB of it; the session store's default is to
@@ -13548,12 +13549,11 @@ firefox_profile() {
     # v1 allowed two writers after deleting a live lock.  v2 was then repeatedly
     # frozen as a complete X cgroup, which left affected Places databases locked
     # and produced Firefox's "files in use by another application" warning.  v3
-    # was a clean boundary from both.  v4 forced X11 EGL and still died: the
-    # 2026-08-17 log has glxtest "libEGL initialize failed", "GLX extension
-    # missing", NewRenderer::Run 4832 ms, then CompositorBridgeChild
-    # AbnormalShutdown.  v5 is software WebRender in the parent process --
-    # lima is GLES2 and Firefox will not compositor on it.
-    prof="$HOME/.mozilla/j36-v5"
+    # was a clean boundary from both.  v4 forced X11 EGL and still died: glxtest
+    # "libEGL initialize failed", "GLX extension missing", then AbnormalShutdown.
+    # v5 kept MOZ_X11_EGL=1 in the launcher; v6 skips glxtest entirely and drops
+    # j36-eglx before exec (2026-08-17 stack smashing in glxtest).
+    prof="$HOME/.mozilla/j36-v6"
     mkdir -p "$prof" 2>/dev/null || return 1
 
     # Never remove Firefox's lock here.  It distinguishes a stale crash marker
@@ -13683,24 +13683,23 @@ case "${J36_BROWSER##*/}" in
             # lock state owned by root.  Repair that legacy profile once; after the
             # marker exists Firefox owns everything it creates and only root's
             # freshly rewritten user.js needs a cheap direct chown.
-            profile_owner="$HOME/.mozilla/j36-v5/.virtua-owned-v1"
+            profile_owner="$HOME/.mozilla/j36-v6/.virtua-owned-v1"
             if [ ! -e "$profile_owner" ]; then
                 echo "j36-browser: preparing the Firefox profile" >&2
-                chown -R virtua:virtua "$HOME/.mozilla/j36-v5" 2>/dev/null
+                chown -R virtua:virtua "$HOME/.mozilla/j36-v6" 2>/dev/null
                 : > "$profile_owner" 2>/dev/null || true
                 chown virtua:virtua "$profile_owner" 2>/dev/null
             fi
-            chown virtua:virtua "$HOME/.mozilla" "$HOME/.mozilla/j36-v5" \
-                                 "$HOME/.mozilla/j36-v5/user.js" 2>/dev/null
+            chown virtua:virtua "$HOME/.mozilla" "$HOME/.mozilla/j36-v6" \
+                                 "$HOME/.mozilla/j36-v6/user.js" 2>/dev/null
         fi
-        # Use the lima EGL backend.  Forcing software here is what made
-        # glxtest skip the GPU after eglInitialize failed on Mesa's X11
-        # platform; j36-eglx is that platform now.
-        if [ -r /opt/mixos/lib/libj36-eglx.so ]; then
-            export LD_PRELOAD="/opt/mixos/lib/libj36-eglx.so${LD_PRELOAD:+:$LD_PRELOAD}"
-        fi
+        # Software-only: do not inherit the session's j36-eglx preload or
+        # MOZ_X11_EGL.  glxtest forks with LD_PRELOAD and dies on this stack.
+        unset MOZ_X11_EGL LD_PRELOAD
+        export MOZ_AVOID_OPENGL_ALTOGETHER=1
+        export LIBGL_ALWAYS_SOFTWARE=1
         run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" --no-remote \
-            -profile "$HOME/.mozilla/j36-v5" "$URL"
+            -profile "$HOME/.mozilla/j36-v6" "$URL"
         ;;
     chromium|chromium-browser)
         run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" --disable-gpu \

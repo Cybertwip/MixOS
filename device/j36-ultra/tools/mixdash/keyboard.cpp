@@ -277,10 +277,16 @@ void Keyboard::buildLayout()
 
     m_rows.append(bottom);
 
+    if (m_row < 0)
+        m_row = 0;
     if (m_row >= m_rows.size())
         m_row = m_rows.size() - 1;
-    if (m_col >= m_rows[m_row].size())
-        m_col = m_rows[m_row].size() - 1;
+    if (!m_rows.isEmpty()) {
+        if (m_col < 0)
+            m_col = 0;
+        if (m_col >= m_rows[m_row].size())
+            m_col = m_rows[m_row].size() - 1;
+    }
 }
 
 QRectF Keyboard::fieldRect() const
@@ -341,6 +347,7 @@ void Keyboard::insert(const QString &s)
 
 void Keyboard::backspace()
 {
+    m_caret = qBound(0, m_caret, m_text.size());
     if (m_caret <= 0 || m_text.isEmpty())
         return;
     m_text.remove(m_caret - 1, 1);
@@ -373,7 +380,7 @@ void Keyboard::setCapsLocked(bool on)
     update();
 }
 
-void Keyboard::pressCap(const Cap &cap)
+void Keyboard::pressCap(Cap cap)
 {
     switch (cap.special) {
     case KeyChar:
@@ -445,7 +452,7 @@ void Keyboard::pressCap(const Cap &cap)
 
 bool Keyboard::handleNav(int action)
 {
-    if (!isVisible())
+    if (!isVisible() || m_rows.isEmpty())
         return false;
 
     const int oldRow = m_row;
@@ -457,36 +464,57 @@ bool Keyboard::handleNav(int action)
             /* Keep the horizontal position across rows of different lengths by
              * matching the centre of the cap, not its index -- otherwise moving
              * up from the space bar lands on the first key of the row above. */
-            const qreal cx = m_rows[m_row][m_col].rect.center().x();
+            const qreal cx = (m_row < m_rows.size() && m_col >= 0 && m_col < m_rows[m_row].size())
+                           ? m_rows[m_row][m_col].rect.center().x()
+                           : 0.0;
             --m_row;
             m_col = 0;
-            for (int c = 0; c < m_rows[m_row].size(); ++c)
-                if (m_rows[m_row][c].rect.contains(cx, m_rows[m_row][c].rect.center().y()))
+            qreal bestDist = 1e9;
+            for (int c = 0; c < m_rows[m_row].size(); ++c) {
+                const qreal d = qAbs(m_rows[m_row][c].rect.center().x() - cx);
+                if (d < bestDist) {
+                    bestDist = d;
                     m_col = c;
+                }
+            }
             updateCaps(oldRow, oldCol, m_row, m_col);
         }
         return true;
     case Joypad::NavDown:
         if (m_row < m_rows.size() - 1) {
-            const qreal cx = m_rows[m_row][m_col].rect.center().x();
+            const qreal cx = (m_row >= 0 && m_row < m_rows.size() && m_col >= 0 && m_col < m_rows[m_row].size())
+                           ? m_rows[m_row][m_col].rect.center().x()
+                           : 0.0;
             ++m_row;
             m_col = 0;
-            for (int c = 0; c < m_rows[m_row].size(); ++c)
-                if (m_rows[m_row][c].rect.contains(cx, m_rows[m_row][c].rect.center().y()))
+            qreal bestDist = 1e9;
+            for (int c = 0; c < m_rows[m_row].size(); ++c) {
+                const qreal d = qAbs(m_rows[m_row][c].rect.center().x() - cx);
+                if (d < bestDist) {
+                    bestDist = d;
                     m_col = c;
+                }
+            }
             updateCaps(oldRow, oldCol, m_row, m_col);
         }
         return true;
     case Joypad::NavLeft:
-        m_col = (m_col - 1 + m_rows[m_row].size()) % m_rows[m_row].size();
-        updateCaps(oldRow, oldCol, m_row, m_col);
+        if (m_row >= 0 && m_row < m_rows.size() && !m_rows[m_row].isEmpty()) {
+            m_col = (m_col - 1 + m_rows[m_row].size()) % m_rows[m_row].size();
+            updateCaps(oldRow, oldCol, m_row, m_col);
+        }
         return true;
     case Joypad::NavRight:
-        m_col = (m_col + 1) % m_rows[m_row].size();
-        updateCaps(oldRow, oldCol, m_row, m_col);
+        if (m_row >= 0 && m_row < m_rows.size() && !m_rows[m_row].isEmpty()) {
+            m_col = (m_col + 1) % m_rows[m_row].size();
+            updateCaps(oldRow, oldCol, m_row, m_col);
+        }
         return true;
     case Joypad::NavOk:
-        pressCap(m_rows[m_row][m_col]);
+        if (m_row >= 0 && m_row < m_rows.size() && m_col >= 0 && m_col < m_rows[m_row].size()) {
+            const Cap cap = m_rows[m_row][m_col];
+            pressCap(cap);
+        }
         return true;
     case Joypad::NavBack:
         dismiss(false);
@@ -522,7 +550,8 @@ void Keyboard::keyPressed(int code, bool pressed, int modifiers)
         backspace();
         return;
     case KEY_DELETE:
-        if (m_caret < m_text.size()) {
+        m_caret = qBound(0, m_caret, m_text.size());
+        if (m_caret >= 0 && m_caret < m_text.size()) {
             m_text.remove(m_caret, 1);
             update();
         }
@@ -667,8 +696,9 @@ void Keyboard::paintEvent(QPaintEvent *event)
 
         /* Scrolled so the caret is always on screen, which for a 63-character key
          * is the difference between usable and not. */
-        const qreal inner = field.width() - 20;
-        qreal caretX = ffm.horizontalAdvance(shown.left(m_caret));
+        const qreal inner = qMax(1.0, field.width() - 20);
+        const int safeCaret = qBound(0, m_caret, shown.size());
+        qreal caretX = ffm.horizontalAdvance(shown.left(safeCaret));
         qreal offset = 0;
         if (caretX > inner)
             offset = caretX - inner;

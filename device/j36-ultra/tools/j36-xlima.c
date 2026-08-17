@@ -1116,6 +1116,17 @@ static Bool JLimaPreInit(ScrnInfoPtr pScrn, int flags)
 		   fbdev, p->var.xres, p->var.yres, p->var.bits_per_pixel,
 		   p->fix.line_length, p->shadow ? "on" : "off");
 
+	if (p->shadow) {
+		if (!xf86LoadSubModule(pScrn, "shadow")) {
+			JLimaFreeScreen(pScrn);
+			return FALSE;
+		}
+	}
+	if (!xf86LoadSubModule(pScrn, "fb")) {
+		JLimaFreeScreen(pScrn);
+		return FALSE;
+	}
+
 	if (want_dri) {
 		p->dri_fd = open_lima_node(drinode, p->dri_path,
 					   sizeof(p->dri_path));
@@ -1151,10 +1162,10 @@ static Bool JLimaPreInit(ScrnInfoPtr pScrn, int flags)
 	 * size -- exactly the one-millisecond crash after "Using gamma correction".
 	 */
 	if (pScrn->monitor) {
-		if (pScrn->monitor->widthMM <= 0)
-			pScrn->monitor->widthMM = 169;
-		if (pScrn->monitor->heightMM <= 0)
-			pScrn->monitor->heightMM = 127;
+		if (pScrn->monitor->widthmm <= 0)
+			pScrn->monitor->widthmm = 169;
+		if (pScrn->monitor->heightmm <= 0)
+			pScrn->monitor->heightmm = 127;
 	}
 	pScrn->displayWidth = pScrn->virtualX;
 	xf86PrintModes(pScrn);

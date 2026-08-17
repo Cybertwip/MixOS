@@ -95,7 +95,7 @@ private:
 
     void buildLayout();
     void relayout();
-    void pressCap(const Cap &cap);
+    void pressCap(Cap cap);
     void insert(const QString &s);
     void backspace();
     void loadSharedState();

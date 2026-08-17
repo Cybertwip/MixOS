@@ -1648,8 +1648,14 @@ static void kbd_build(void)
     kbd_add(4, ">", XK_Right, KA_RIGHT, J36_KBD_ARROW_SPAN);
     kbd_add(4, "cancel", XK_Escape, KA_ESCAPE, J36_KBD_CANCEL_SPAN);
     kbd_add(4, "done", XK_Return, KA_ENTER, J36_KBD_ACCEPT_SPAN);
+    if (kbd_row < 0)
+        kbd_row = 0;
+    if (kbd_row >= J36_KBD_ROWS)
+        kbd_row = J36_KBD_ROWS - 1;
+    if (kbd_col < 0)
+        kbd_col = 0;
     if (kbd_col >= kbd_count[kbd_row])
-        kbd_col = kbd_count[kbd_row] - 1;
+        kbd_col = kbd_count[kbd_row] > 0 ? kbd_count[kbd_row] - 1 : 0;
 }
 
 static void kbd_rect(int row, int col, int *x, int *y, int *w, int *h)
@@ -1657,11 +1663,17 @@ static void kbd_rect(int row, int col, int *x, int *y, int *w, int *h)
     const int pad = 8, gap = 4;
     double spans = 0.0, before = 0.0, unit;
     int i;
+    if (row < 0 || row >= J36_KBD_ROWS || col < 0 || col >= kbd_count[row]) {
+        *x = *y = *w = *h = 0;
+        return;
+    }
     for (i = 0; i < kbd_count[row]; i++) {
         spans += kbd_caps[row][i].span;
         if (i < col)
             before += kbd_caps[row][i].span;
     }
+    if (spans <= 0.0)
+        spans = 1.0;
     unit = (scr_w - 2 * pad - (kbd_count[row] - 1) * gap) / spans;
     *h = (kbd_h - 2 * pad - (J36_KBD_ROWS - 1) * gap) / J36_KBD_ROWS;
     *x = pad + (int)(before * unit) + col * gap;
@@ -1761,6 +1773,8 @@ static void kbd_set_visible(int visible);
 
 static int kbd_activate(int row, int col)
 {
+    if (row < 0 || row >= J36_KBD_ROWS || col < 0 || col >= kbd_count[row])
+        return 0;
     const struct KbdCap cap = kbd_caps[row][col];
     int rebuilt = 0;
     switch (cap.action) {
@@ -1799,6 +1813,11 @@ static void kbd_move(unsigned bit)
 {
     int x, y, w, h, c, best = 0;
     const int old = kbd_row * 100 + kbd_col;
+    if (kbd_row < 0 || kbd_row >= J36_KBD_ROWS || kbd_count[kbd_row] <= 0) {
+        kbd_row = 1;
+        kbd_col = 0;
+        return;
+    }
     if (bit == DIR_LEFT)
         kbd_col = (kbd_col + kbd_count[kbd_row] - 1) % kbd_count[kbd_row];
     else if (bit == DIR_RIGHT)
@@ -1806,7 +1825,7 @@ static void kbd_move(unsigned bit)
     else {
         int target = kbd_row + (bit == DIR_UP ? -1 : 1);
         int centre, distance = 0x7fffffff;
-        if (target < 0 || target >= J36_KBD_ROWS)
+        if (target < 0 || target >= J36_KBD_ROWS || kbd_count[target] <= 0)
             return;
         kbd_rect(kbd_row, kbd_col, &x, &y, &w, &h);
         centre = x + w / 2;
