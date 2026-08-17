@@ -89,6 +89,7 @@ HEADERS += \
     stringsdb.h \
     pointer.h \
     keyboard.h \
+    keyboardlayout.h \
     switcher.h \
     panel.h \
     volume.h \

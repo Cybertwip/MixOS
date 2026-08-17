@@ -6,13 +6,19 @@
 #include "keyboard.h"
 
 #include <QFontMetrics>
+#include <QFile>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPaintEvent>
+#include <QRegion>
 #include <QResizeEvent>
+#include <QSaveFile>
+#include <QTextStream>
 
 #include <linux/input.h>
 
 #include "joypad.h"
+#include "keyboardlayout.h"
 #include "theme.h"
 
 namespace KeyMap {
@@ -79,29 +85,6 @@ const int kRowGap = 4;
 const int kFieldH = 34;
 const int kPad = 8;
 
-const char *kLower[4] = {
-    "1234567890",
-    "qwertyuiop",
-    "asdfghjkl",
-    "zxcvbnm"
-};
-
-const char *kUpper[4] = {
-    "1234567890",
-    "QWERTYUIOP",
-    "ASDFGHJKL",
-    "ZXCVBNM"
-};
-
-/* The symbols a passphrase, a URL and an apt package name are actually made of.
- * Four rows of ten so the grid geometry does not change between layers. */
-const char *kSymbols[4] = {
-    "!@#$%^&*()",
-    "-_=+[]{}|\\",
-    ":;'\",.<>/?",
-    "`~\xC2\xA3\xE2\x82\xAC"
-};
-
 } /* namespace */
 
 Keyboard::Keyboard(QWidget *parent)
@@ -112,16 +95,72 @@ Keyboard::Keyboard(QWidget *parent)
     buildLayout();
 }
 
+void Keyboard::loadSharedState()
+{
+    /* Safe defaults are also the first-open position on a fresh boot. */
+    m_row = 1;
+    m_col = 0;
+    m_layer = 0;
+    m_shiftLatched = false;
+
+    QFile file(QString::fromLatin1(J36_KBD_STATE_PATH));
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+        return;
+
+    struct j36_keyboard_state state = {};
+    QTextStream in(&file);
+    in >> state.version >> state.row >> state.col
+       >> state.layer >> state.shift_latched;
+    if (in.status() != QTextStream::Ok ||
+        state.version != J36_KBD_STATE_VERSION ||
+        state.row < 0 || state.row >= J36_KBD_ROWS ||
+        state.col < 0 || state.col >= J36_KBD_MAX_COLS ||
+        state.layer < 0 || state.layer > 2 ||
+        (state.shift_latched != 0 && state.shift_latched != 1))
+        return;
+
+    m_row = state.row;
+    m_col = state.col;
+    m_layer = state.layer;
+    m_shiftLatched = state.layer == 1 && state.shift_latched;
+}
+
+void Keyboard::saveSharedState() const
+{
+    QSaveFile file(QString::fromLatin1(J36_KBD_STATE_PATH));
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
+        return;
+
+    QTextStream out(&file);
+    out << J36_KBD_STATE_VERSION << ' ' << m_row << ' ' << m_col << ' '
+        << m_layer << ' ' << (m_shiftLatched ? 1 : 0) << '\n';
+    out.flush();
+    if (out.status() == QTextStream::Ok)
+        file.commit();
+    else
+        file.cancelWriting();
+}
+
+void Keyboard::updateCaps(int oldRow, int oldCol, int newRow, int newCol)
+{
+    QRegion damage;
+    if (oldRow >= 0 && oldRow < m_rows.size() &&
+        oldCol >= 0 && oldCol < m_rows[oldRow].size())
+        damage += m_rows[oldRow][oldCol].rect.adjusted(-2, -2, 2, 2).toAlignedRect();
+    if (newRow >= 0 && newRow < m_rows.size() &&
+        newCol >= 0 && newCol < m_rows[newRow].size())
+        damage += m_rows[newRow][newCol].rect.adjusted(-2, -2, 2, 2).toAlignedRect();
+    if (!damage.isEmpty())
+        update(damage);
+}
+
 void Keyboard::open(const QString &prompt, const QString &initial, bool password)
 {
     m_prompt = prompt;
     m_text = initial;
     m_caret = m_text.size();
     m_password = password;
-    m_layer = 0;
-    m_shiftLatched = false;
-    m_row = 1;
-    m_col = 0;
+    loadSharedState();
     m_pressed = -1;
     buildLayout();
     relayout();
@@ -134,6 +173,7 @@ void Keyboard::dismiss(bool accepted)
 {
     if (!isVisible())
         return;
+    saveSharedState();
     hide();
     emit finished(m_text, accepted);
 }
@@ -142,9 +182,10 @@ void Keyboard::buildLayout()
 {
     m_rows.clear();
 
-    const char **layer = m_layer == 1 ? kUpper : m_layer == 2 ? kSymbols : kLower;
+    const char *const *layer = m_layer == 1 ? j36_kbd_upper
+                             : m_layer == 2 ? j36_kbd_symbols : j36_kbd_lower;
 
-    for (int r = 0; r < 4; ++r) {
+    for (int r = 0; r < J36_KBD_CHAR_ROWS; ++r) {
         QVector<Cap> row;
         const QString chars = QString::fromUtf8(layer[r]);
         for (int i = 0; i < chars.size(); ++i) {
@@ -177,14 +218,14 @@ void Keyboard::buildLayout()
                         : m_shiftLatched   ? tr("SHIFT")   /* on, one character */
                                            : tr("CAPS");   /* locked            */
             shift.special = KeyShift;
-            shift.span = 1.5;
+            shift.span = J36_KBD_SHIFT_SPAN;
             shift.lit = (m_layer == 1);
             row.prepend(shift);
 
             Cap back;
             back.label = tr("back");
             back.special = KeyBackspace;
-            back.span = 1.5;
+            back.span = J36_KBD_BACK_SPAN;
             row.append(back);
         }
         m_rows.append(row);
@@ -194,37 +235,37 @@ void Keyboard::buildLayout()
     Cap sym;
     sym.label = m_layer == 2 ? "abc" : "?123";
     sym.special = KeySymbols;
-    sym.span = 1.6;
+    sym.span = J36_KBD_SYMBOL_SPAN;
     bottom.append(sym);
 
     Cap left;
     left.label = "<";
     left.special = KeyLeft;
-    left.span = 0.9;
+    left.span = J36_KBD_ARROW_SPAN;
     bottom.append(left);
 
     Cap space;
     space.label = tr("space");
     space.special = KeySpace;
-    space.span = 4.0;
+    space.span = J36_KBD_SPACE_SPAN;
     bottom.append(space);
 
     Cap right;
     right.label = ">";
     right.special = KeyRight;
-    right.span = 0.9;
+    right.span = J36_KBD_ARROW_SPAN;
     bottom.append(right);
 
     Cap cancel;
     cancel.label = tr("cancel");
     cancel.special = KeyCancel;
-    cancel.span = 1.6;
+    cancel.span = J36_KBD_CANCEL_SPAN;
     bottom.append(cancel);
 
     Cap ok;
     ok.label = tr("done");
     ok.special = KeyAccept;
-    ok.span = 1.6;
+    ok.span = J36_KBD_ACCEPT_SPAN;
     bottom.append(ok);
 
     m_rows.append(bottom);
@@ -400,6 +441,9 @@ bool Keyboard::handleNav(int action)
     if (!isVisible())
         return false;
 
+    const int oldRow = m_row;
+    const int oldCol = m_col;
+
     switch (action) {
     case Joypad::NavUp:
         if (m_row > 0) {
@@ -412,7 +456,7 @@ bool Keyboard::handleNav(int action)
             for (int c = 0; c < m_rows[m_row].size(); ++c)
                 if (m_rows[m_row][c].rect.contains(cx, m_rows[m_row][c].rect.center().y()))
                     m_col = c;
-            update();
+            updateCaps(oldRow, oldCol, m_row, m_col);
         }
         return true;
     case Joypad::NavDown:
@@ -423,16 +467,16 @@ bool Keyboard::handleNav(int action)
             for (int c = 0; c < m_rows[m_row].size(); ++c)
                 if (m_rows[m_row][c].rect.contains(cx, m_rows[m_row][c].rect.center().y()))
                     m_col = c;
-            update();
+            updateCaps(oldRow, oldCol, m_row, m_col);
         }
         return true;
     case Joypad::NavLeft:
         m_col = (m_col - 1 + m_rows[m_row].size()) % m_rows[m_row].size();
-        update();
+        updateCaps(oldRow, oldCol, m_row, m_col);
         return true;
     case Joypad::NavRight:
         m_col = (m_col + 1) % m_rows[m_row].size();
-        update();
+        updateCaps(oldRow, oldCol, m_row, m_col);
         return true;
     case Joypad::NavOk:
         pressCap(m_rows[m_row][m_col]);
@@ -532,21 +576,25 @@ int Keyboard::capAt(const QPoint &p) const
 void Keyboard::mouseMoveEvent(QMouseEvent *event)
 {
     const int hit = capAt(event->pos());
-    if (hit >= 0) {
+    if (hit >= 0 && (m_row != hit / 100 || m_col != hit % 100)) {
+        const int oldRow = m_row;
+        const int oldCol = m_col;
         m_row = hit / 100;
         m_col = hit % 100;
-        update();
+        updateCaps(oldRow, oldCol, m_row, m_col);
     }
     event->accept();
 }
 
 void Keyboard::mousePressEvent(QMouseEvent *event)
 {
+    const int oldRow = m_row;
+    const int oldCol = m_col;
     m_pressed = capAt(event->pos());
     if (m_pressed >= 0) {
         m_row = m_pressed / 100;
         m_col = m_pressed % 100;
-        update();
+        updateCaps(oldRow, oldCol, m_row, m_col);
     }
     /* Accepted even on a miss: the keyboard is modal, and a press on its
      * background must not reach the page underneath. */
@@ -571,10 +619,11 @@ void Keyboard::mouseReleaseEvent(QMouseEvent *event)
     event->accept();
 }
 
-void Keyboard::paintEvent(QPaintEvent *)
+void Keyboard::paintEvent(QPaintEvent *event)
 {
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
+    const QRegion dirty = event->region();
 
     /* The panel itself: solid enough to read a passphrase against whatever the
      * page underneath happens to be. */
@@ -588,39 +637,45 @@ void Keyboard::paintEvent(QPaintEvent *)
     p.setPen(QPen(Theme::border(), 1.0));
     p.drawLine(QPointF(0, 0.5), QPointF(width(), 0.5));
 
-    p.setFont(Theme::font(12));
-    p.setPen(Theme::ink3());
-    p.drawText(QRectF(kPad + 6, kPad - 2, width() - 2 * kPad, 20),
-               Qt::AlignLeft | Qt::AlignVCenter, m_prompt);
+    const QRectF promptRect(kPad + 6, kPad - 2, width() - 2 * kPad, 20);
+    if (dirty.intersects(promptRect.toAlignedRect())) {
+        p.setFont(Theme::font(12));
+        p.setPen(Theme::ink3());
+        p.drawText(promptRect, Qt::AlignLeft | Qt::AlignVCenter, m_prompt);
+    }
 
     /* The field. */
     const QRectF field = fieldRect();
-    Theme::vgrad(p, field, Theme::glass().lighter(140), Theme::glass().lighter(120), 8);
-    p.setBrush(Qt::NoBrush);
-    p.setPen(QPen(Theme::blue(), 1.4));
-    p.drawRoundedRect(field.adjusted(0.5, 0.5, -0.5, -0.5), 8, 8);
+    if (dirty.intersects(field.adjusted(-2, -2, 2, 2).toAlignedRect())) {
+        Theme::vgrad(p, field, Theme::glass().lighter(140),
+                     Theme::glass().lighter(120), 8);
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(Theme::blue(), 1.4));
+        p.drawRoundedRect(field.adjusted(0.5, 0.5, -0.5, -0.5), 8, 8);
 
-    const QString shown = m_password ? QString(m_text.size(), QChar(0x2022)) : m_text;
-    const QFont fieldFont = Theme::font(14);
-    const QFontMetrics ffm(fieldFont);
-    p.setFont(fieldFont);
-    p.setPen(Theme::ink());
+        const QString shown = m_password ? QString(m_text.size(), QChar(0x2022)) : m_text;
+        const QFont fieldFont = Theme::font(14);
+        const QFontMetrics ffm(fieldFont);
+        p.setFont(fieldFont);
+        p.setPen(Theme::ink());
 
-    /* Scrolled so the caret is always on screen, which for a 63-character key is
-     * the difference between usable and not. */
-    const qreal inner = field.width() - 20;
-    qreal caretX = ffm.horizontalAdvance(shown.left(m_caret));
-    qreal offset = 0;
-    if (caretX > inner)
-        offset = caretX - inner;
-    p.save();
-    p.setClipRect(field.adjusted(8, 0, -8, 0));
-    p.drawText(QRectF(field.x() + 10 - offset, field.y(), qMax(inner, caretX + 20), field.height()),
-               Qt::AlignLeft | Qt::AlignVCenter, shown);
-    p.setPen(QPen(Theme::blue(), 1.6));
-    p.drawLine(QPointF(field.x() + 10 - offset + caretX, field.y() + 6),
-               QPointF(field.x() + 10 - offset + caretX, field.bottom() - 6));
-    p.restore();
+        /* Scrolled so the caret is always on screen, which for a 63-character key
+         * is the difference between usable and not. */
+        const qreal inner = field.width() - 20;
+        qreal caretX = ffm.horizontalAdvance(shown.left(m_caret));
+        qreal offset = 0;
+        if (caretX > inner)
+            offset = caretX - inner;
+        p.save();
+        p.setClipRect(field.adjusted(8, 0, -8, 0));
+        p.drawText(QRectF(field.x() + 10 - offset, field.y(),
+                          qMax(inner, caretX + 20), field.height()),
+                   Qt::AlignLeft | Qt::AlignVCenter, shown);
+        p.setPen(QPen(Theme::blue(), 1.6));
+        p.drawLine(QPointF(field.x() + 10 - offset + caretX, field.y() + 6),
+                   QPointF(field.x() + 10 - offset + caretX, field.bottom() - 6));
+        p.restore();
+    }
 
     /* The caps. */
     const QFont capFont = Theme::font(15, true);
@@ -628,6 +683,8 @@ void Keyboard::paintEvent(QPaintEvent *)
     for (int r = 0; r < m_rows.size(); ++r) {
         for (int c = 0; c < m_rows[r].size(); ++c) {
             const Cap &cap = m_rows[r][c];
+            if (!dirty.intersects(cap.rect.adjusted(-2, -2, 2, 2).toAlignedRect()))
+                continue;
             const bool focused = (r == m_row && c == m_col);
             const bool down = (m_pressed == r * 100 + c);
             const bool accent = (cap.special == KeyAccept);

@@ -92,6 +92,10 @@ BASE_ARTIFACT_DIR="${MIXOS_ARTIFACT_DIR:-${DARKOS_ARTIFACT_DIR:-$(darkos_artifac
 ARTIFACT_DIR="${J36_ARTIFACT_DIR:-${BASE_ARTIFACT_DIR}/j36-ultra}"
 RESUME_R36="${J36_RESUME_R36:-1}"
 MIX_ONLY=0
+# A full image can optionally be archived after it has crossed the VM boundary and
+# passed the host-side size check.  Kept out of build-in-vm.sh so the archive can
+# never be made from the pre-injection base image.
+COMPRESS=0
 # --no-splash.  Passed to the VM as J36_SPLASH and applied to the bootargs line in
 # device/j36-ultra/build-in-vm.sh, which is the only place that line exists.
 SPLASH=1
@@ -108,7 +112,7 @@ VM_R36_STATE_DIR="/home/ubuntu/darkos-r36-state"
 
 usage() {
     cat <<USAGE
-Usage: ./build-j36-ultra.sh [--mix-only] [--no-splash]
+Usage: ./build-j36-ultra.sh [--mix-only | --compress] [--no-splash]
 
 Resumes the R36 Ultra build (build-r36-ultra.sh, checkpointed) and then adds the
 J36 Ultra layer on top of it in the same Multipass VM: $VM_NAME
@@ -151,6 +155,15 @@ J36 Ultra layer on top of it in the same Multipass VM: $VM_NAME
                                       is one edit away from any machine that can
                                       read it.
 
+    ./build-j36-ultra.sh --compress   full build only.  After the final .img has
+                                      both payloads folded in, has been copied to
+                                      $BASE_ARTIFACT_DIR and has passed the host
+                                      size check, also writes <image>.zip there
+                                      using ZIP's maximum compression level (-9).
+                                      The raw .img is retained for direct flashing.
+                                      Cannot be combined with --mix-only because
+                                      that mode deliberately produces no image.
+
 The first J36 run creates the persistent ARMv7 Linux 6.12 LTS workspace.  Later
 runs reuse it and rebuild only changed kernel, DTB, input-module, initramfs and
 boot.img files.
@@ -173,10 +186,15 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --mix-only) MIX_ONLY=1; shift ;;
+        --compress) COMPRESS=1; shift ;;
         --no-splash) SPLASH=0; shift ;;
         *) usage >&2; exit 2 ;;
     esac
 done
+
+if [[ "$MIX_ONLY" == 1 && "$COMPRESS" == 1 ]]; then
+    darkos_die "--compress cannot be combined with --mix-only: that mode produces boot/ and root/, not an image."
+fi
 
 # --mix-only means the base image is not this run's business at all, so resuming the
 # base build would be a contradiction: it is the long step, and skipping it is the
@@ -188,6 +206,10 @@ fi
 
 [[ "$(uname -s)" == "Darwin" ]] || darkos_die "run this wrapper on macOS"
 [[ "$RESUME_R36" == "0" || "$RESUME_R36" == "1" ]] || darkos_die "J36_RESUME_R36 must be 0 or 1."
+if [[ "$COMPRESS" == 1 ]]; then
+    command -v zip >/dev/null 2>&1 || darkos_die "--compress needs the 'zip' command on the workstation."
+    command -v unzip >/dev/null 2>&1 || darkos_die "--compress needs 'unzip' to verify the completed archive."
+fi
 [[ -d "$BOARD_SRC" ]] || darkos_die "MVII board sources are missing: $BOARD_SRC
 they are committed; restore them from git"
 
@@ -335,6 +357,36 @@ fi
 # mode there is no artifact directory: nothing is exported except the image itself.
 FLASH_IMAGE=""
 FLASH_PAYLOAD=""
+COMPRESSED_ARCHIVE=""
+
+compress_flash_image() {
+    local image_path="$1"
+    local image_dir image_name archive_name partial_name
+
+    image_dir="$(dirname -- "$image_path")"
+    image_name="$(basename -- "$image_path")"
+    archive_name="${image_name}.zip"
+    # End in .zip so Info-ZIP does not append another extension.  The .part in
+    # front of it keeps an interrupted archive from looking complete.
+    partial_name="${image_name}.part.zip"
+
+    [[ -s "$image_path" ]] || darkos_die "cannot compress the missing or empty image: $image_path"
+    rm -f -- "$image_dir/$partial_name"
+    darkos_log "Compressing $image_name at ZIP level 9 (the raw image is retained)"
+    if ! (cd -- "$image_dir" && zip -9 -q "$partial_name" "$image_name"); then
+        rm -f -- "$image_dir/$partial_name"
+        darkos_die "compression failed; the verified raw image is still at $image_path"
+    fi
+    if ! unzip -tqq "$image_dir/$partial_name"; then
+        rm -f -- "$image_dir/$partial_name"
+        darkos_die "the ZIP test failed; the verified raw image is still at $image_path"
+    fi
+    mv -f -- "$image_dir/$partial_name" "$image_dir/$archive_name"
+    printf '%s\n' "$archive_name" > "$image_dir/latest-archive.txt"
+    COMPRESSED_ARCHIVE="$image_dir/$archive_name"
+    darkos_log "Compressed image verified: $COMPRESSED_ARCHIVE"
+}
+
 if [[ "$MIX_ONLY" == 1 ]]; then
     FLASH_PAYLOAD=exported
 else
@@ -397,6 +449,10 @@ sync "$DEST"
         darkos_warn "  multipass info $VM_NAME"
         darkos_warn "and that the workstation has room for another $VM_IMAGE_SIZE bytes."
         darkos_die "the image was built but did not reach $BASE_ARTIFACT_DIR"
+    fi
+
+    if [[ "$COMPRESS" == 1 ]]; then
+        compress_flash_image "$BASE_ARTIFACT_DIR/$FLASH_IMAGE"
     fi
 
     # ── and only now, the ones this run superseded ────────────────────────────
@@ -464,6 +520,7 @@ if (( freed > 0 )); then
 else
     printf "  prune: nothing to remove; %s is the only output image here\n" "$KEEP"
 fi
+
 df -h --output=avail "$BUILD_DIR" | tail -1 | xargs printf "  prune: %s free in the VM now\n"
 ' j36-image-prune "$VM_BUILD_DIR" "$FLASH_IMAGE" "$VM_R36_STATE_DIR"
 elif [[ -n "$FLASH_IMAGE" && "$FLASH_IMAGE" != none ]]; then
@@ -472,6 +529,10 @@ elif [[ -n "$FLASH_IMAGE" && "$FLASH_IMAGE" != none ]]; then
 else
     darkos_warn "No base image was found in the VM, so there is nothing flashable to hand over."
     darkos_warn "Run without J36_RESUME_R36=0 so the base build produces one."
+fi
+
+if [[ "$COMPRESS" == 1 && -z "$COMPRESSED_ARCHIVE" ]]; then
+    darkos_die "--compress was requested, but this run produced no verified final image to archive."
 fi
 
 # ── What was produced, and what to do with it ─────────────────────────────────
@@ -505,6 +566,9 @@ if [[ "$MIX_ONLY" == 1 ]]; then
     darkos_log "No image was built or modified.  Run ./build-j36-ultra.sh with no flag for that."
 elif [[ "$FLASH_PAYLOAD" == "in-image" ]]; then
     darkos_log "Flash this, and nothing else has to be copied: $BASE_ARTIFACT_DIR/$FLASH_IMAGE"
+    if [[ -n "$COMPRESSED_ARCHIVE" ]]; then
+        darkos_log "Compressed copy: $COMPRESSED_ARCHIVE (unzip it before flashing)"
+    fi
     darkos_log "  sudo dd if=$BASE_ARTIFACT_DIR/$FLASH_IMAGE of=/dev/rdiskN bs=4m status=progress"
     darkos_log "  The launcher is already on BOOT and /opt/mixos on the OS partition; no copying afterwards"
     darkos_log "  Iterating on the board specifics after this?  ./build-j36-ultra.sh --mix-only, then copy boot/ onto BOOT"

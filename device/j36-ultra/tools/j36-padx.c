@@ -171,6 +171,8 @@
 #include <X11/extensions/XTest.h>
 #include <X11/keysym.h>
 
+#include "mixdash/keyboardlayout.h"
+
 /* ── shared shape ────────────────────────────────────────────────────────── */
 
 /* Four is not a limit anyone will reach -- it is the built-in pad plus whatever
@@ -1139,8 +1141,11 @@ static void pointer_move(double dx, double dy)
     else if (ptr_y > (double)(scr_h - 1))
         ptr_y = (double)(scr_h - 1);
 
-    ix = (int)ptr_x;
-    iy = (int)ptr_y;
+    /* Qt's qRound() is the dashboard side of this same logical coordinate.
+     * Rounding here too removes the persistent sub-pixel lag that truncation
+     * created when crossing from one renderer to the other. */
+    ix = (int)floor(ptr_x + 0.5);
+    iy = (int)floor(ptr_y + 0.5);
     /* Below a pixel per tick this is the slow end doing its job, not a stall: the
      * fraction stays in ptr_x/ptr_y and the move happens a few ticks later. */
     if (ix == sent_x && iy == sent_y)
@@ -1221,22 +1226,68 @@ struct KbdCap {
     double span;
 };
 
-#define KBD_ROWS 5
-#define KBD_COLS 12
-static struct KbdCap kbd_caps[KBD_ROWS][KBD_COLS];
-static int kbd_count[KBD_ROWS];
+static struct KbdCap kbd_caps[J36_KBD_ROWS][J36_KBD_MAX_COLS];
+static int kbd_count[J36_KBD_ROWS];
 static Window kbd_win;
 static GC kbd_gc;
 static XFontStruct *kbd_font;
+static unsigned long kbd_back, kbd_card, kbd_focus, kbd_edge;
+static unsigned long kbd_ink, kbd_blue, kbd_teal;
 static int kbd_row = 1, kbd_col;
 static int kbd_upper, kbd_caps_lock, kbd_symbols;
 static int kbd_pressed = -1;
 static int kbd_h;
 
+static void kbd_state_read(void)
+{
+    struct j36_keyboard_state state;
+    FILE *f = fopen(J36_KBD_STATE_PATH, "r");
+    if (!f)
+        return;
+    memset(&state, 0, sizeof(state));
+    if (fscanf(f, "%d %d %d %d %d", &state.version, &state.row, &state.col,
+               &state.layer, &state.shift_latched) == 5 &&
+        state.version == J36_KBD_STATE_VERSION &&
+        state.row >= 0 && state.row < J36_KBD_ROWS &&
+        state.col >= 0 && state.col < J36_KBD_MAX_COLS &&
+        state.layer >= 0 && state.layer <= 2 &&
+        (state.shift_latched == 0 || state.shift_latched == 1)) {
+        kbd_row = state.row;
+        kbd_col = state.col;
+        kbd_symbols = state.layer == 2;
+        kbd_upper = state.layer == 1 && state.shift_latched;
+        kbd_caps_lock = state.layer == 1 && !state.shift_latched;
+    }
+    fclose(f);
+}
+
+static void kbd_state_write(void)
+{
+    char temporary[sizeof(J36_KBD_STATE_PATH) + 8];
+    FILE *f;
+    int okay;
+    int layer = kbd_symbols ? 2 : (kbd_upper || kbd_caps_lock) ? 1 : 0;
+    snprintf(temporary, sizeof(temporary), "%s.tmp", J36_KBD_STATE_PATH);
+    f = fopen(temporary, "w");
+    if (!f)
+        return;
+    okay = fprintf(f, "%d %d %d %d %d\n", J36_KBD_STATE_VERSION,
+                   kbd_row, kbd_col, layer, kbd_upper ? 1 : 0) >= 0;
+    if (fclose(f) != 0)
+        okay = 0;
+    if (!okay) {
+        unlink(temporary);
+        return;
+    }
+    if (rename(temporary, J36_KBD_STATE_PATH) < 0)
+        unlink(temporary);
+}
+
 static void kbd_add(int row, const char *label, KeySym sym, int action, double span)
 {
     struct KbdCap *c;
-    if (row < 0 || row >= KBD_ROWS || kbd_count[row] >= KBD_COLS)
+    if (row < 0 || row >= J36_KBD_ROWS ||
+        kbd_count[row] >= J36_KBD_MAX_COLS)
         return;
     c = &kbd_caps[row][kbd_count[row]++];
     snprintf(c->label, sizeof(c->label), "%s", label);
@@ -1257,31 +1308,25 @@ static void kbd_chars(int row, const char *chars)
 static void kbd_build(void)
 {
     int i;
-    const char *lower[KBD_ROWS - 1] = {
-        "1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"
-    };
-    const char *upper[KBD_ROWS - 1] = {
-        "1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"
-    };
-    const char *symbols[KBD_ROWS - 1] = {
-        "!@#$%^&*()", "-_=+[]{}|\\", ":;'\",.<>/?", "`~"
-    };
-    const char **layer = kbd_symbols ? symbols : (kbd_upper || kbd_caps_lock) ? upper : lower;
+    const char *const *layer = kbd_symbols ? j36_kbd_symbols
+                             : (kbd_upper || kbd_caps_lock) ? j36_kbd_upper
+                                                            : j36_kbd_lower;
 
     memset(kbd_count, 0, sizeof(kbd_count));
     for (i = 0; i < 3; i++)
         kbd_chars(i, layer[i]);
     kbd_add(3, kbd_caps_lock ? "CAPS" : kbd_upper ? "SHIFT" : "shift",
-            NoSymbol, KA_SHIFT, 1.5);
+            NoSymbol, KA_SHIFT, J36_KBD_SHIFT_SPAN);
     kbd_chars(3, layer[3]);
-    kbd_add(3, "back", XK_BackSpace, KA_BACK, 1.5);
+    kbd_add(3, "back", XK_BackSpace, KA_BACK, J36_KBD_BACK_SPAN);
 
-    kbd_add(4, kbd_symbols ? "abc" : "?123", NoSymbol, KA_SYMBOLS, 1.6);
-    kbd_add(4, "<", XK_Left, KA_LEFT, 0.9);
-    kbd_add(4, "space", XK_space, KA_SPACE, 4.0);
-    kbd_add(4, ">", XK_Right, KA_RIGHT, 0.9);
-    kbd_add(4, "esc", XK_Escape, KA_ESCAPE, 1.6);
-    kbd_add(4, "enter", XK_Return, KA_ENTER, 1.6);
+    kbd_add(4, kbd_symbols ? "abc" : "?123", NoSymbol, KA_SYMBOLS,
+            J36_KBD_SYMBOL_SPAN);
+    kbd_add(4, "<", XK_Left, KA_LEFT, J36_KBD_ARROW_SPAN);
+    kbd_add(4, "space", XK_space, KA_SPACE, J36_KBD_SPACE_SPAN);
+    kbd_add(4, ">", XK_Right, KA_RIGHT, J36_KBD_ARROW_SPAN);
+    kbd_add(4, "cancel", XK_Escape, KA_ESCAPE, J36_KBD_CANCEL_SPAN);
+    kbd_add(4, "done", XK_Return, KA_ENTER, J36_KBD_ACCEPT_SPAN);
     if (kbd_col >= kbd_count[kbd_row])
         kbd_col = kbd_count[kbd_row] - 1;
 }
@@ -1297,7 +1342,7 @@ static void kbd_rect(int row, int col, int *x, int *y, int *w, int *h)
             before += kbd_caps[row][i].span;
     }
     unit = (scr_w - 2 * pad - (kbd_count[row] - 1) * gap) / spans;
-    *h = (kbd_h - 2 * pad - (KBD_ROWS - 1) * gap) / KBD_ROWS;
+    *h = (kbd_h - 2 * pad - (J36_KBD_ROWS - 1) * gap) / J36_KBD_ROWS;
     *x = pad + (int)(before * unit) + col * gap;
     *y = pad + row * (*h + gap);
     *w = (int)(kbd_caps[row][col].span * unit);
@@ -1311,47 +1356,65 @@ static unsigned long kbd_colour(const char *name, unsigned long fallback)
                ? c.pixel : fallback;
 }
 
+static void kbd_draw_cap(int r, int c)
+{
+    int x, y, w, h, tw;
+    const struct KbdCap *cap;
+    int selected, pressed, accent, lit;
+
+    if (!kbd_win || r < 0 || r >= J36_KBD_ROWS ||
+        c < 0 || c >= kbd_count[r])
+        return;
+    cap = &kbd_caps[r][c];
+    selected = r == kbd_row && c == kbd_col;
+    pressed = kbd_pressed == r * 100 + c;
+    accent = cap->action == KA_ENTER;
+    lit = cap->action == KA_SHIFT && (kbd_upper || kbd_caps_lock);
+    kbd_rect(r, c, &x, &y, &w, &h);
+    XSetForeground(dpy, kbd_gc,
+                   pressed ? kbd_edge : accent ? kbd_blue : lit ? kbd_teal
+                                                        : selected ? kbd_focus : kbd_card);
+    XFillRectangle(dpy, kbd_win, kbd_gc, x, y, (unsigned)w, (unsigned)h);
+    XSetForeground(dpy, kbd_gc, selected ? kbd_blue : kbd_edge);
+    XDrawRectangle(dpy, kbd_win, kbd_gc, x, y, (unsigned)(w - 1), (unsigned)(h - 1));
+    XSetForeground(dpy, kbd_gc, kbd_ink);
+    tw = kbd_font ? XTextWidth(kbd_font, cap->label, (int)strlen(cap->label))
+                  : (int)strlen(cap->label) * 8;
+    XDrawString(dpy, kbd_win, kbd_gc, x + (w - tw) / 2,
+                y + (h + (kbd_font ? kbd_font->ascent : 10)) / 2 - 2,
+                cap->label, (int)strlen(cap->label));
+}
+
+static void kbd_repaint_ids(int a, int b, int c)
+{
+    const int ids[3] = {a, b, c};
+    int i, j;
+    for (i = 0; i < 3; i++) {
+        if (ids[i] < 0)
+            continue;
+        for (j = 0; j < i && ids[j] != ids[i]; j++)
+            ;
+        if (j == i)
+            kbd_draw_cap(ids[i] / 100, ids[i] % 100);
+    }
+    XFlush(dpy);
+}
+
 static void kbd_paint(void)
 {
     int r, c;
-    unsigned long back = kbd_colour("#11141c", BlackPixel(dpy, scr));
-    unsigned long card = kbd_colour("#292e3a", WhitePixel(dpy, scr));
-    unsigned long edge = kbd_colour("#4a5263", WhitePixel(dpy, scr));
-    unsigned long ink = kbd_colour("#f4f6fb", WhitePixel(dpy, scr));
-    unsigned long blue = kbd_colour("#397de5", WhitePixel(dpy, scr));
-    unsigned long teal = kbd_colour("#25a9a0", WhitePixel(dpy, scr));
-
     if (!kbd_win)
         return;
-    XSetForeground(dpy, kbd_gc, back);
+    XSetForeground(dpy, kbd_gc, kbd_back);
     XFillRectangle(dpy, kbd_win, kbd_gc, 0, 0, (unsigned)scr_w, (unsigned)kbd_h);
     if (kbd_font)
         XSetFont(dpy, kbd_gc, kbd_font->fid);
-    for (r = 0; r < KBD_ROWS; r++) {
-        for (c = 0; c < kbd_count[r]; c++) {
-            int x, y, w, h, tw;
-            const struct KbdCap *cap = &kbd_caps[r][c];
-            const int selected = r == kbd_row && c == kbd_col;
-            const int pressed = kbd_pressed == r * 100 + c;
-            const int lit = cap->action == KA_ENTER ||
-                            (cap->action == KA_SHIFT && (kbd_upper || kbd_caps_lock));
-            kbd_rect(r, c, &x, &y, &w, &h);
-            XSetForeground(dpy, kbd_gc, pressed ? edge : lit ? teal : selected ? blue : card);
-            XFillRectangle(dpy, kbd_win, kbd_gc, x, y, (unsigned)w, (unsigned)h);
-            XSetForeground(dpy, kbd_gc, selected ? blue : edge);
-            XDrawRectangle(dpy, kbd_win, kbd_gc, x, y, (unsigned)(w - 1), (unsigned)(h - 1));
-            XSetForeground(dpy, kbd_gc, ink);
-            tw = kbd_font ? XTextWidth(kbd_font, cap->label, (int)strlen(cap->label))
-                          : (int)strlen(cap->label) * 8;
-            XDrawString(dpy, kbd_win, kbd_gc, x + (w - tw) / 2,
-                        y + (h + (kbd_font ? kbd_font->ascent : 10)) / 2 - 2,
-                        cap->label, (int)strlen(cap->label));
-        }
-    }
-    /* D-pad selection repaints must be complete before the next evdev event.
-     * Flushing only queued the fill and labels; on the fbdev X server a later
-     * cursor save-under could race that queue and restore half-painted keys. */
-    XSync(dpy, False);
+    for (r = 0; r < J36_KBD_ROWS; r++)
+        for (c = 0; c < kbd_count[r]; c++)
+            kbd_draw_cap(r, c);
+    /* Queue one complete frame.  XSync here put a server round-trip on every
+     * D-pad step and exposed the background fill before the labels arrived. */
+    XFlush(dpy);
 }
 
 static void kbd_send(KeySym sym)
@@ -1373,31 +1436,48 @@ static void kbd_send(KeySym sym)
         key_state(kc.shift, 0);
 }
 
-static void kbd_activate(int row, int col)
+static void kbd_set_visible(int visible);
+
+static int kbd_activate(int row, int col)
 {
     const struct KbdCap cap = kbd_caps[row][col];
+    int rebuilt = 0;
     switch (cap.action) {
     case KA_SHIFT:
         if (!kbd_upper && !kbd_caps_lock) kbd_upper = 1;
         else if (kbd_upper) { kbd_upper = 0; kbd_caps_lock = 1; }
         else kbd_caps_lock = 0;
+        rebuilt = 1;
         break;
-    case KA_SYMBOLS: kbd_symbols = !kbd_symbols; break;
+    case KA_SYMBOLS: kbd_symbols = !kbd_symbols; rebuilt = 1; break;
     case KA_BACK: case KA_SPACE: case KA_LEFT: case KA_RIGHT:
-    case KA_ESCAPE: case KA_ENTER: kbd_send(cap.sym); break;
+        kbd_send(cap.sym);
+        break;
+    case KA_ESCAPE: case KA_ENTER:
+        /* These are the same cancel/done caps as the dashboard surface: deliver
+         * the conventional X key, then close the one active keyboard owner. */
+        kbd_send(cap.sym);
+        kbd_set_visible(0);
+        return 2;
     case KA_CHAR:
         kbd_send(cap.sym);
-        if (kbd_upper && !kbd_caps_lock)
+        if (kbd_upper && !kbd_caps_lock) {
             kbd_upper = 0;
+            rebuilt = 1;
+        }
         break;
     }
-    kbd_build();
-    kbd_paint();
+    if (rebuilt) {
+        kbd_build();
+        kbd_paint();
+    }
+    return rebuilt;
 }
 
 static void kbd_move(unsigned bit)
 {
     int x, y, w, h, c, best = 0;
+    const int old = kbd_row * 100 + kbd_col;
     if (bit == DIR_LEFT)
         kbd_col = (kbd_col + kbd_count[kbd_row] - 1) % kbd_count[kbd_row];
     else if (bit == DIR_RIGHT)
@@ -1405,7 +1485,7 @@ static void kbd_move(unsigned bit)
     else {
         int target = kbd_row + (bit == DIR_UP ? -1 : 1);
         int centre, distance = 0x7fffffff;
-        if (target < 0 || target >= KBD_ROWS)
+        if (target < 0 || target >= J36_KBD_ROWS)
             return;
         kbd_rect(kbd_row, kbd_col, &x, &y, &w, &h);
         centre = x + w / 2;
@@ -1418,13 +1498,13 @@ static void kbd_move(unsigned bit)
         kbd_row = target;
         kbd_col = best;
     }
-    kbd_paint();
+    kbd_repaint_ids(old, kbd_row * 100 + kbd_col, -1);
 }
 
 static int kbd_hit(int px, int py)
 {
     int r, c;
-    for (r = 0; r < KBD_ROWS; r++)
+    for (r = 0; r < J36_KBD_ROWS; r++)
         for (c = 0; c < kbd_count[r]; c++) {
             int x, y, w, h;
             kbd_rect(r, c, &x, &y, &w, &h);
@@ -1441,25 +1521,31 @@ static void kbd_events(void)
         XNextEvent(dpy, &ev);
         if (ev.xany.window != kbd_win)
             continue;
-        if (ev.type == Expose) {
+        if (ev.type == Expose && ev.xexpose.count == 0) {
             kbd_paint();
         } else if (ev.type == MotionNotify) {
             int hit = kbd_hit(ev.xmotion.x, ev.xmotion.y);
             if (hit >= 0 && (kbd_row != hit / 100 || kbd_col != hit % 100)) {
+                int old = kbd_row * 100 + kbd_col;
                 kbd_row = hit / 100;
                 kbd_col = hit % 100;
-                kbd_paint();
+                kbd_repaint_ids(old, hit, kbd_pressed);
             }
         } else if (ev.type == ButtonPress && ev.xbutton.button == Button1) {
+            int old = kbd_row * 100 + kbd_col;
             kbd_pressed = kbd_hit(ev.xbutton.x, ev.xbutton.y);
-            kbd_paint();
+            if (kbd_pressed >= 0) {
+                kbd_row = kbd_pressed / 100;
+                kbd_col = kbd_pressed % 100;
+            }
+            kbd_repaint_ids(old, kbd_pressed, -1);
         } else if (ev.type == ButtonRelease && ev.xbutton.button == Button1) {
             int hit = kbd_hit(ev.xbutton.x, ev.xbutton.y);
+            int old_pressed = kbd_pressed;
             kbd_pressed = -1;
-            if (hit >= 0)
-                kbd_activate(hit / 100, hit % 100);
-            else
-                kbd_paint();
+            if (hit < 0 || hit != old_pressed ||
+                kbd_activate(hit / 100, hit % 100) == 0)
+                kbd_repaint_ids(old_pressed, kbd_row * 100 + kbd_col, -1);
         }
     }
 }
@@ -1472,14 +1558,19 @@ static void kbd_set_visible(int visible)
         /* A direction held while Select is pressed was sent to the application
          * as a real key-down.  Release it before the keyboard takes ownership. */
         release_directions(dirs_all());
+        kbd_state_read();
+        kbd_build();
         kbd_visible = 1;
         XMapRaised(dpy, kbd_win);
-        kbd_paint();
+        /* Mapping produces one Expose, which paints the complete keyboard.  Doing
+         * it here as well painted all 46 caps twice on every open. */
+        XFlush(dpy);
     } else {
+        kbd_state_write();
         kbd_visible = 0;
         XUnmapWindow(dpy, kbd_win);
         /* Menu can hand the framebuffer away immediately after this call.  Wait
-         * until X has restored the keyboard's save-under before mixdash paints. */
+         * until the server has applied the unmap before mixdash paints. */
         XSync(dpy, False);
     }
 }
@@ -1498,16 +1589,25 @@ static void kbd_start(void)
     if (kbd_h < 150) kbd_h = 150;
     if (kbd_h > scr_h) kbd_h = scr_h;
     memset(&a, 0, sizeof(a));
+    kbd_back = kbd_colour("#2c2e38", BlackPixel(dpy, scr));
+    kbd_card = kbd_colour("#383a46", WhitePixel(dpy, scr));
+    kbd_focus = kbd_colour("#464957", WhitePixel(dpy, scr));
+    kbd_edge = kbd_colour("#4a4e5c", WhitePixel(dpy, scr));
+    kbd_ink = kbd_colour("#e8eaf2", WhitePixel(dpy, scr));
+    kbd_blue = kbd_colour("#0a84ff", WhitePixel(dpy, scr));
+    kbd_teal = kbd_colour("#30b0c7", WhitePixel(dpy, scr));
     a.override_redirect = True;
     /* A saved-under keyboard caches pixels from whichever owner last used the
      * physical framebuffer.  After a dashboard hand-off those pixels are stale
      * and unmapping the keyboard paints them back over X (or vice versa). */
     a.save_under = False;
+    a.background_pixel = kbd_back;
     a.event_mask = ExposureMask | PointerMotionMask | ButtonPressMask | ButtonReleaseMask;
     kbd_win = XCreateWindow(dpy, RootWindow(dpy, scr), 0, scr_h - kbd_h,
                             (unsigned)scr_w, (unsigned)kbd_h, 0,
                             CopyFromParent, InputOutput, CopyFromParent,
-                            CWOverrideRedirect | CWSaveUnder | CWEventMask, &a);
+                            CWOverrideRedirect | CWSaveUnder | CWBackPixel |
+                            CWEventMask, &a);
     XStoreName(dpy, kbd_win, "MixOS Keyboard");
     kbd_gc = XCreateGC(dpy, kbd_win, 0, NULL);
     for (i = 0; fonts[i] && !kbd_font; i++)
@@ -1524,6 +1624,8 @@ static void kbd_start(void)
 static int on_io_error(Display *unused)
 {
     (void)unused;
+    if (kbd_visible)
+        kbd_state_write();
     close_pads();
     fprintf(stderr, "j36-padx: the X server went away\n");
     _exit(0);
@@ -2367,10 +2469,12 @@ int main(int argc, char **argv)
                         /* Still Back in every client.  In an empty Desktop there
                          * is no client to receive it, so the session accepts the
                          * companion request as the explicit way out. */
-                        if (kbd_visible)
+                        if (kbd_visible) {
                             kbd_set_visible(0);
-                        tap(kc.alt, kc.left);
-                        ctl_send("quit-empty");
+                        } else {
+                            tap(kc.alt, kc.left);
+                            ctl_send("quit-empty");
+                        }
                     }
                     break;
                 case BTN_X: if (down) tap(0, kc.ret);       break;
@@ -2580,6 +2684,8 @@ int main(int argc, char **argv)
         }
     }
 
+    if (kbd_visible)
+        kbd_state_write();
     pointer_resync();
     pointer_state_write();
     close_pads();

@@ -98,6 +98,9 @@ private:
     void pressCap(const Cap &cap);
     void insert(const QString &s);
     void backspace();
+    void loadSharedState();
+    void saveSharedState() const;
+    void updateCaps(int oldRow, int oldCol, int newRow, int newCol);
     /* Upper case that stays until it is turned off, as against the one-shot upper
      * a single tap of shift gives.  The two differ only in m_shiftLatched. */
     bool capsLocked() const { return m_layer == 1 && !m_shiftLatched; }

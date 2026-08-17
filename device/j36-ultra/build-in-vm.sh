@@ -8744,6 +8744,7 @@ QTCONF
 # dashboard already uses does.  Non-fatal on failure, like every other accessory
 # here -- a browser that cannot be driven is a bad card, not a lost kernel.
 PADX_SRC="$ROOT/device/j36-ultra/tools/j36-padx.c"
+PADX_LAYOUT="$ROOT/device/j36-ultra/tools/mixdash/keyboardlayout.h"
 PADX_BIN=""
 PADX_BUILD_DEPS=(build-essential libx11-dev libxtst-dev libxfixes-dev)
 
@@ -8752,6 +8753,7 @@ build_padx() {
     local header needed lib unexpected=""
 
     [[ -f "$PADX_SRC" ]] || { log "padx: $PADX_SRC is missing"; return 1; }
+    [[ -f "$PADX_LAYOUT" ]] || { log "padx: $PADX_LAYOUT is missing"; return 1; }
 
     ensure_armhf_chroot || return 1
     # Its own stamp, for the reason spelled out above chroot_install_deps: adding
@@ -8761,8 +8763,9 @@ build_padx() {
     chroot_install_deps padx "${PADX_BUILD_DEPS[@]}" || return 1
 
     sudo rm -rf "$src"
-    sudo mkdir -p "$src"
+    sudo mkdir -p "$src/mixdash"
     sudo cp "$PADX_SRC" "$src/j36-padx.c" || return 1
+    sudo cp "$PADX_LAYOUT" "$src/mixdash/keyboardlayout.h" || return 1
 
     log "padx: building the pad-to-X bridge for armhf (emulated)"
     armhf_chroot_run "cd /home/build/padx && \

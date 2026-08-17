@@ -1513,7 +1513,16 @@ void Dashboard::onTitleChanged()
 
 void Dashboard::onTextRequested(const QString &prompt, const QString &initial, bool password)
 {
-    m_textTarget = qobject_cast<PageWidget *>(sender());
+    PageWidget *target = qobject_cast<PageWidget *>(sender());
+    /* Pages keep running while an external task owns the panel.  A delayed signal
+     * must not create a second, invisible linuxfb keyboard behind PadX's X
+     * surface; cancel the impossible request at its source instead. */
+    if (m_fg >= 0) {
+        if (target)
+            target->textEntered(initial, false);
+        return;
+    }
+    m_textTarget = target;
     m_keyboard->open(prompt, initial, password);
     m_keyboard->raise();
     m_pointer->raise();
@@ -2404,6 +2413,12 @@ void Dashboard::setForeground(int index)
 {
     if (index >= m_tasks.size())
         index = -1;
+
+    /* linuxfb and the task's X server cannot safely paint one native keyboard
+     * window.  Close the dashboard surface before the framebuffer changes hands;
+     * dismiss() also writes the shared selection/layer state PadX will load. */
+    if (index >= 0 && m_keyboard->isOpen())
+        m_keyboard->dismiss(false);
 
     stopForeground();
 
