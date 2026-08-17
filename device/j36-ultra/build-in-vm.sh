@@ -8837,8 +8837,9 @@ collect_session_libs() {
 
     chroot_install_deps sdl2x11 libsdl2-2.0-0 || \
         log "sdl: Debian libsdl2-2.0-0 would not install; X clients keep the handheld SDL"
+    chroot_install_deps asound2 libasound2t64 || \
     chroot_install_deps asound2 libasound2 || \
-        log "alsa: Debian libasound2 would not install; aplay keeps the card's libasound"
+        log "alsa: Debian libasound would not install; aplay keeps the card's libasound"
 
     so=$(sudo readlink -f "$ARMHF_CHROOT/usr/lib/arm-linux-gnueabihf/libSDL2-2.0.so.0" 2>/dev/null || true)
     if [[ -n "$so" && -f "$so" ]] && sudo grep -q libX11.so "$so" 2>/dev/null; then
@@ -9183,11 +9184,11 @@ build_xlima() {
     return 0
 }
 
-# ── j36-eglx: lima EGL backend for X11 clients (GLES3 + GL 4.5 compat) ──
+# ── j36-eglx: lima EGL backend for X11 clients (GLES 3.2 + GL 4.6 compat) ──
 #
 # Mesa's X11 EGL platform cannot eglInitialize on this board.  This
-# library is the platform: GBM lima, XPutImage present, GLES3 / GL 4.5
-# compatibility contexts when a client asks for them.
+# library is the platform: GBM lima, XPutImage present, GLES 3.2 /
+# GL 4.6 compatibility contexts when a client asks for them.
 build_eglx() {
     local src="$ARMHF_CHROOT/home/build/eglx" out="$CACHE/libj36-eglx.so"
     local header
@@ -12536,8 +12537,8 @@ fi
 export MESA_LOADER_DRIVER_OVERRIDE=lima
 export GALLIUM_DRIVER=lima
 export LIBGL_DRIVERS_PATH=/usr/lib/arm-linux-gnueabihf/dri
-# Do not pin MESA_GLES_VERSION_OVERRIDE=2.0: that blocked GLES3 / GL 4.5
-# compat.  j36-eglx creates those contexts when a client asks.
+# Do not pin MESA_GLES_VERSION_OVERRIDE=2.0: that blocked GLES 3.2 /
+# GL 4.6 compat.  j36-eglx creates those contexts when a client asks.
 exec /usr/bin/xinit "$MAIN" "$FIRST" -- \
     "$XWRAP" :0 vt1 \
     -config "$XCONF" \
@@ -12622,7 +12623,7 @@ export GDK_BACKEND=x11
 export MOZ_CRASHREPORTER_DISABLE=1
 export MOZ_CRASHREPORTER_NO_REPORT=1
 # j36-eglx turns X11 eglGetDisplay into GBM lima and will create a
-# GLES3 or GL 4.5 compat context when Firefox asks.  Keep the GPU
+# GLES 3.2 or GL 4.6 compat context when Firefox asks.  Keep the GPU
 # process off: an IPC close of that child is still what killed the
 # window.  Software WR stays the compositor fallback.
 export MOZ_WEBRENDER=0
@@ -12678,6 +12679,17 @@ if [ -d /run/j36/gl ]; then
 fi
 export MESA_LOADER_DRIVER_OVERRIDE=lima
 export GALLIUM_DRIVER=lima
+# lima EGL X11 backend: intercept eglGetDisplay so Firefox/SDL do not
+# hit Mesa's broken X11 platform.  Not on Xorg itself -- that process
+# only wants j36-xfb.so.
+if [ -r /opt/mixos/lib/libj36-eglx.so ]; then
+    export LD_PRELOAD="/opt/mixos/lib/libj36-eglx.so${LD_PRELOAD:+:$LD_PRELOAD}"
+    if [ -r /opt/mixos/share/gl/egl_vendor.d/10_j36lima.json ]; then
+        export __EGL_VENDOR_LIBRARY_FILENAMES=/opt/mixos/share/gl/egl_vendor.d/10_j36lima.json
+    fi
+fi
+# virtua must open card0:lima.  This session is one local user.
+chmod a+rw /dev/dri/card0 /dev/dri/renderD128 2>/dev/null || true
 # MixOS overwrites Debian's libSDL2 with an rk3326 build that has kmsdrm
 # and no x11 backend.  dsda-doom then prints "Could not initialize SDL
 # [x11 not available]" and exits.  The X11 copy lives under /opt/mixos/lib.
@@ -13429,7 +13441,7 @@ export MOZ_CRASHREPORTER_DISABLE=1
 export MOZ_CRASHREPORTER_NO_REPORT=1
 export MOZ_WEBRENDER=0
 export MOZ_WEBRENDER_SOFTWARE=1
-export MOZ_X11_EGL=0
+export MOZ_X11_EGL=1
 export MOZ_FORCE_DISABLE_E10S=1
 export MOZ_DISABLE_CONTENT_SANDBOX=1
 export MOZ_DISABLE_GMP_SANDBOX=1
@@ -13680,10 +13692,12 @@ case "${J36_BROWSER##*/}" in
             chown virtua:virtua "$HOME/.mozilla" "$HOME/.mozilla/j36-v5" \
                                  "$HOME/.mozilla/j36-v5/user.js" 2>/dev/null
         fi
-        # Firefox-only.  The session keeps lima for SDL/GLES2; this process
-        # must not inherit that and retry the EGL path glxtest already lost.
-        export LIBGL_ALWAYS_SOFTWARE=1
-        unset MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER
+        # Use the lima EGL backend.  Forcing software here is what made
+        # glxtest skip the GPU after eglInitialize failed on Mesa's X11
+        # platform; j36-eglx is that platform now.
+        if [ -r /opt/mixos/lib/libj36-eglx.so ]; then
+            export LD_PRELOAD="/opt/mixos/lib/libj36-eglx.so${LD_PRELOAD:+:$LD_PRELOAD}"
+        fi
         run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" --no-remote \
             -profile "$HOME/.mozilla/j36-v5" "$URL"
         ;;
