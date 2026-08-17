@@ -363,9 +363,18 @@ static JLimaEGLContext jlima_try_context(JLimaPtr p, JLimaEGLConfig cfg,
 		setenv("MESA_GLSL_VERSION_OVERRIDE", "460", 1);
 	else
 		unsetenv("MESA_GLSL_VERSION_OVERRIDE");
-	if (!jl_eglBindAPI(api))
+
+	if (!jl_eglBindAPI(api)) {
+		unsetenv("MESA_GL_VERSION_OVERRIDE");
+		unsetenv("MESA_GLES_VERSION_OVERRIDE");
+		unsetenv("MESA_GLSL_VERSION_OVERRIDE");
 		return NULL;
+	}
 	ctx = jl_eglCreateContext(p->egl_dpy, cfg, NULL, attr);
+	unsetenv("MESA_GL_VERSION_OVERRIDE");
+	unsetenv("MESA_GLES_VERSION_OVERRIDE");
+	unsetenv("MESA_GLSL_VERSION_OVERRIDE");
+
 	if (ctx && jl_eglMakeCurrent(p->egl_dpy, NULL, NULL, ctx))
 		return ctx;
 	if (ctx && jl_eglDestroyContext)
@@ -407,9 +416,9 @@ static Bool jlima_egl_init(ScrnInfoPtr pScrn, JLimaPtr p)
 	if (p->dri_fd < 0)
 		return FALSE;
 
-	p->libegl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
+	p->libegl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
 	if (!p->libegl)
-		p->libegl = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
+		p->libegl = dlopen("libEGL.so", RTLD_NOW | RTLD_LOCAL);
 	if (!p->libegl) {
 		xf86DrvMsg(pScrn->scrnIndex, X_INFO,
 			   "lima: libEGL not on this search path (%s)\n",
@@ -434,7 +443,7 @@ static Bool jlima_egl_init(ScrnInfoPtr pScrn, JLimaPtr p)
 		return FALSE;
 	}
 
-	p->libgbm = dlopen("libgbm.so.1", RTLD_NOW | RTLD_GLOBAL);
+	p->libgbm = dlopen("libgbm.so.1", RTLD_NOW | RTLD_LOCAL);
 	if (p->libgbm) {
 		jl_gbm_create_device = dlsym(p->libgbm, "gbm_create_device");
 		jl_gbm_device_destroy = dlsym(p->libgbm, "gbm_device_destroy");

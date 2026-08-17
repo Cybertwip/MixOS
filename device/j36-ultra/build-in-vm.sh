@@ -5182,7 +5182,7 @@ ExecStartPre=-/bin/rm -f /run/j36/mixshutdown.ready
 ExecStart=$mixos_root/bin/mixshutdown -i $mixos_root/share/mixsplash/background.mixspl -f /run/j36/mixshutdown.ctl -s "Powering off" -r /run/j36/mixshutdown.ready -t 0 -T 0 -k
 ExecStartPost=/run/j36/bin/j36-wait-splash /run/j36/mixshutdown.ready
 Restart=no
-KillMode=none
+KillMode=mixed
 SendSIGKILL=no
 TimeoutStartSec=5
 TimeoutStopSec=1
@@ -12126,7 +12126,7 @@ Section "Module"
     Load "shadow"
     Load "fb"
     Load "dri3"
-    Load "glx"
+    Disable "glx"
 EndSection
 
 Section "Device"
