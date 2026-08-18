@@ -19,6 +19,9 @@ firmware-realtek
 fonts-noto-cjk
 fonts-noto-core
 git
+# The GLib TLS module.  Without it the WebKitGTK engines (surf, luakit) have no
+# https backend and every TLS site fails to load.
+glib-networking
 hostapd
 iw
 joystick
