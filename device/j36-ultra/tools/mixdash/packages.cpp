@@ -214,7 +214,8 @@ void PackagesPage::buildCollections()
     browsers.accent = Theme::teal();
     browsers.glyph = GlyphWifi;
     browsers.packages = QStringList()
-                        << "firefox-esr" << "chromium" << "netsurf-gtk" << "lynx"
+                        << "surf" << "luakit" << "firefox-esr" << "chromium"
+                        << "netsurf-gtk" << "lynx"
                         << "openssh-server" << "isc-dhcp-client" << "network-manager"
                         << "wireless-tools" << "iw" << "rfkill" << "curl" << "wget";
     m_collections.append(browsers);

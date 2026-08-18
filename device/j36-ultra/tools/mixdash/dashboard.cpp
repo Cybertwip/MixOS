@@ -199,9 +199,11 @@ QString graphicalSession()
  */
 QString graphicalBrowserSession()
 {
+    /* Same order as the search in j36-browser: the JavaScript-capable light
+     * browsers first, because surf is what the image ships with. */
     static const char *const kBrowsers[] = {
-        "firefox-esr", "firefox", "netsurf-gtk", "netsurf", "epiphany-browser",
-        "luakit", "surf", "dillo", "falkon", "qutebrowser", "chromium",
+        "surf", "luakit", "firefox-esr", "firefox", "netsurf-gtk", "netsurf",
+        "epiphany-browser", "dillo", "falkon", "qutebrowser", "chromium",
         "chromium-browser"
     };
 
@@ -1000,13 +1002,14 @@ void Dashboard::buildPages()
      *      XTEST, so the left stick is a pointer and A is a click.  The same bridge
      *      draws the dashboard-style keyboard inside the session, on Select.
      *
-     * WHICH BROWSER IS NOT DECIDED HERE.  The image installs firefox-esr, because
-     * the 2026 web is JavaScript and a browser without it shows a blank page on half
-     * the sites anybody would open -- Debian trixie has a real armhf build, 140 ESR,
-     * so this is Gecko with a JIT and not a compatibility shim.  It also installs
-     * netsurf-gtk beside it, 4 MB and no JavaScript, for the day 946 MB of RAM with
-     * no swap is not enough to start the other one.  Beyond those two the session
-     * script takes whichever of a dozen browsers is on the card, chromium included,
+     * WHICH BROWSER IS NOT DECIDED HERE.  The image ships surf, the suckless
+     * WebKitGTK browser: the 2026 web is JavaScript and a browser without it shows
+     * a blank page on half the sites anybody would open, and surf runs a real
+     * JavaScript engine at a small fraction of Firefox's footprint -- which matters
+     * on a board whose previous browser spent a minute loading and then OOM'd
+     * before its window mapped.  netsurf-gtk rides along, 4 MB and no JavaScript,
+     * for the day even WebKit is too much.  Beyond those the session script takes
+     * whichever of a dozen browsers is on the card, Firefox and chromium included,
      * so a browser installed from the Packages page later is the one this card runs.
      * Nothing in this file has to change for that; the list below only has to stay
      * in the same order as the script's.
@@ -1046,7 +1049,7 @@ void Dashboard::buildPages()
                         || !firstExisting(QStringList() << kBrowserExe).isEmpty();
     if (!browser.available)
         browser.reason = tr("No browser on this card. The Packages page can add "
-                            "firefox-esr, or links2 for a text one.");
+                            "surf, or links2 for a text one.");
     apps.append(browser);
 
     /*

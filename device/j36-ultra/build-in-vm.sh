@@ -948,10 +948,11 @@ done
 # So the swap device is RAM.  zram is a block device that compresses what is
 # written to it and keeps it in memory, which is not a way of getting memory out of
 # nothing -- it is trading CPU for capacity, and this board has eight Cortex-A7
-# cores that are doing nothing whenever it is short of memory.  At the ~2:1 lz4
-# gets on browser heap, 768 MiB of swap costs about 380 MiB of RAM and gives back
-# 768, so the machine behaves roughly like one with 1.3 GiB.  /init sizes it from
-# MemTotal and caps what it may physically eat -- see setup_zram.
+# cores that are doing nothing whenever it is short of memory.  The device is
+# sized at twice MemTotal -- 2 GiB on this board -- and capped at what it may
+# physically eat, 50% of RAM; at the ~2:1 lz4 gets on browser heap that cap holds
+# about a gigabyte of swapped data, so the machine behaves roughly like one with
+# 2 GiB.  /init sizes it from MemTotal -- see setup_zram.
 #
 # =y AND NOT =m, which is the opposite of the rule every driver in this file
 # follows.  There is no modprobe on this rootfs: modules are staged into
@@ -976,17 +977,18 @@ config_y ZSMALLOC
 # default rather than merely available.
 #
 # lz4 IS THE DEFAULT AND NOT zstd, and on a faster machine it would be the other
-# way round.  zstd gets close to 3:1 against lz4's 2:1, which over 768 MiB of swap
-# is 260 MiB of RAM instead of 380.  But every page swapped back IN is decompressed
-# on the core that faulted, and on a 1.4 GHz Cortex-A7 with no crypto extensions
-# that is roughly 25 us for lz4 against something over 100 for zstd.  Swap-in
-# latency is what a person experiences as the window not coming back, and reclaim
-# runs in kswapd where a slow compressor turns into a stall on every allocation.
-# The fast one wins the default on this SoC.
+# way round.  zstd gets close to 3:1 against lz4's 2:1, so the 50%-of-RAM pool
+# this device caps at would hold about half again as much swapped data.  But every
+# page swapped back IN is decompressed on the core that faulted, and on a 1.4 GHz
+# Cortex-A7 with no crypto extensions that is roughly 25 us for lz4 against
+# something over 100 for zstd.  Swap-in latency is what a person experiences as
+# the window not coming back, and reclaim runs in kswapd where a slow compressor
+# turns into a stall on every allocation.  The fast one wins the default on this
+# SoC.
 #
 # zstd is built anyway, and it is the reason this block is three lines longer than
-# it needs to be: it is the one lever left if Firefox still runs out on this board,
-# and pulling it is
+# it needs to be: it is the one lever left if the browser still runs out on this
+# board, and pulling it is
 #
 #     swapoff /dev/zram0
 #     echo zstd > /sys/block/zram0/comp_algorithm
@@ -2176,7 +2178,7 @@ want_log=1
 # word is here to turn it OFF, from any machine that can write a FAT partition, on
 # the boot where swap is the thing under suspicion.
 #
-# 0 or auto, in MiB.  auto is 80% of MemTotal; a number is that many MiB, for
+# 0 or auto, in MiB.  auto is twice MemTotal; a number is that many MiB, for
 # measuring one size against another without rebuilding anything.
 want_zram=auto
 # The third word that defaults to ON, and the only one whose OFF exists for a reason
@@ -2393,12 +2395,12 @@ for arg in $(cat /proc/cmdline); do
         j36.zram|j36.zram=1|j36.zram=auto)
             want_zram=auto
             ;;
-        # A size in MiB instead of the 80%-of-MemTotal default, because the right
+        # A size in MiB instead of the twice-MemTotal default, because the right
         # number here is not knowable from a datasheet: it depends on how well the
-        # thing running on the board compresses.  384 is conservative, 768 is what
-        # auto picks on this 946 MiB machine, and anything above MemTotal is allowed
-        # on purpose -- see the mem_limit in setup_zram, which is what actually
-        # bounds the damage.
+        # thing running on the board compresses.  1024 is conservative, 2048 is
+        # what auto picks on this 946 MiB machine, and anything above MemTotal is
+        # allowed on purpose -- the device size is a belief, not a spend, and the
+        # mem_limit in setup_zram is what actually bounds the damage.
         j36.zram=[0-9]*)
             want_zram="${arg#j36.zram=}"
             ;;
@@ -2492,20 +2494,25 @@ fi
 # failure when it IS short.  Without it the sequence is: allocation fails, the OOM
 # killer picks the biggest process, the browser disappears.  With it the kernel has
 # somewhere to put the pages nothing has touched for a while -- and on this board
-# that is most of Firefox, whose resident set is largely a 130 MB libxul it read
-# once and font caches it will not read again.  Those compress about 2:1, so the
-# machine gets roughly 768 MiB of address space back for about 380 MiB of RAM.
+# that is most of the browser, whose resident set is largely engine libraries it
+# read once and page caches it will not read again.  Those compress about 2:1, so
+# the capped pool buys back roughly twice its own size in address space.
 #
 # THE TWO NUMBERS, AND WHY THERE ARE TWO.  disksize is what the kernel is allowed
-# to BELIEVE the swap device holds, and it is 80% of RAM.  mem_limit is what zram
-# is allowed to physically consume, and it is 35%.  They are different questions:
-# the first sets how much reclaim is possible, and the second is what stops the
-# swap-death spiral -- pages compressing badly, zram eating RAM to store them,
-# which is more pressure, which swaps more pages in.  Past mem_limit zram simply
-# refuses the write, the page stays where it was, and the machine degrades to the
-# behaviour it had before this function existed instead of collapsing.  With a 2:1
-# ratio the limit is never reached; with a 1.5:1 one it caps the swap at about
-# 480 MiB, which is still a win and is still bounded.
+# to BELIEVE the swap device holds, and it is twice RAM -- 2 GiB on this board's
+# 1 GiB.  That is larger than any physical number here on purpose: it is the
+# address space a browser wants the machine to PRETEND it has, and the pretence
+# is what keeps the page allocator reclaiming instead of killing.  mem_limit is
+# what zram is allowed to physically consume, and it is 50% of RAM.  They are
+# different questions: the first sets how much reclaim is possible, and the
+# second is what stops the swap-death spiral -- pages compressing badly, zram
+# eating RAM to store them, which is more pressure, which swaps more pages in.
+# Past mem_limit zram simply refuses the write, the page stays where it was, and
+# the machine degrades to the behaviour it had before this function existed
+# instead of collapsing.  At the ~2:1 lz4 gets on browser heap the limit holds
+# about 1 GiB of swapped data before that degradation starts; at 3:1, closer to
+# 1.5 GiB.  Either way it is bounded, and either is far past where the old 80%
+# device ran out.
 setup_zram() {
     if [ "$want_zram" = 0 ]; then
         say "zram: j36.zram=0, so this boot has no swap at all"
@@ -2528,24 +2535,29 @@ setup_zram() {
             ;;
     esac
 
-    # auto is 80%; a number from the command line is MiB and is taken as given,
-    # including a number larger than RAM.  That is not a mistake to guard against
-    # -- it is how a compressible workload is measured, and mem_limit below is the
-    # guard that makes trying it safe.
+    # auto is 200% of RAM -- 2 GiB of device on this board's 1 GiB -- and a
+    # number from the command line is MiB and is taken as given, including a
+    # number larger than RAM.  That is not a mistake to guard against: disksize
+    # is what the kernel is told the swap holds, not what it spends, and
+    # mem_limit below is the guard that makes any of it safe.
     if [ "$want_zram" = auto ]; then
-        disk_kb=$((memkb * 80 / 100))
+        disk_kb=$((memkb * 200 / 100))
     else
         case "$want_zram" in
             *[!0-9]*)
                 say "zram: j36.zram=$want_zram is not a number of MiB; using auto"
-                disk_kb=$((memkb * 80 / 100))
+                disk_kb=$((memkb * 200 / 100))
                 ;;
             *)
                 disk_kb=$((want_zram * 1024))
                 ;;
         esac
     fi
-    lim_kb=$((memkb * 35 / 100))
+    # 50% of RAM, and not more: the compressed pool lives in the same memory the
+    # machine is short of, so the pool is capped at the point where feeding it
+    # any further would cost more than it returns.  See the comment above the
+    # function for what happens at the cap.
+    lim_kb=$((memkb * 50 / 100))
 
     # comp_algorithm FIRST.  Writing disksize is what initialises the device, and
     # every knob that describes how it stores pages is -EBUSY after that.  lz4 is
@@ -5016,7 +5028,7 @@ RestartSec=2
 # and scrolls the first one off a 480-pixel panel, which is exactly how the last
 # bad_alloc was read as three unrelated failures.
 RestartPreventExitStatus=3 4
-# ── who the kernel kills when 946 MB and 768 MB of zram are both gone ────────
+# ── who the kernel kills when 946 MB of RAM and the zram pool are both gone ──
 #
 # There is swap on this board now, which moves the OOM killer from "the first thing
 # that goes wrong" to "the last", but it does not remove it: swap postpones the
@@ -9848,11 +9860,11 @@ j36.zram=auto
     is CPU traded for capacity, and this board has eight Cortex-A7 cores that are
     idle exactly when it is short of memory.
 
-    auto makes the device 80% of MemTotal -- 768 MB here -- and caps what it may
-    physically consume at 35%, which is 331 MB.  Those are two different limits on
-    purpose.  The first says how much can be swapped out; the second is what stops
-    the spiral where badly-compressing pages make zram eat the memory that the
-    swapping was meant to free.  Past it zram refuses the write, the page stays
+    auto makes the device twice MemTotal -- about 2 GB here -- and caps what it
+    may physically consume at 50%, which is about 473 MB.  Those are two different
+    limits on purpose.  The first says how much can be swapped out; the second is
+    what stops the spiral where badly-compressing pages make zram eat the memory
+    that the swapping was meant to free.  Past it zram refuses the write, the page stays
     where it was, and the board degrades to how it behaved before this word rather
     than falling over.  At the ~2:1 lz4 gets on browser heap the cap is never
     reached and the machine behaves like one with about 1.3 GB.
@@ -12598,9 +12610,10 @@ PIDFILE=$RUNDIR/xsession.pid
 PADXPID=$RUNDIR/padx.pid
 
 # HOW MANY WINDOWS THIS BOARD WILL HOLD, and it is a real number and not a tidy one.
-# 946 MB of usable RAM with 768 MB of zram behind it, and Firefox on its own is a
-# third of the first figure.  Four is what a user can plausibly want open and about
-# where the OOM killer starts making the decision instead.  Over it, the request is
+# 946 MB of usable RAM with an lz4 zram pool behind it that is capped at half of
+# that, and a Firefox -- the day somebody installs one -- is a third of the first
+# figure on its own.  Four is what a user can plausibly want open and about where
+# the OOM killer starts making the decision instead.  Over it, the request is
 # refused OUT LOUD -- see start_client -- because a window that silently never
 # appears is indistinguishable from a program that crashed.
 MAXCLIENTS=4
@@ -13329,46 +13342,41 @@ XRUN
     # the X server moved out.
     #
     # THE BROWSER IS CHOSEN AND NOT HARDCODED, because the Packages card exists:
- RUNUSER=""
-if [ "$(id -u)" -eq 0 ] && id virtua >/dev/null 2>&1; then
-    for r in /usr/sbin/runuser /sbin/runuser; do
-        if [ -x "$r" ]; then RUNUSER="$r"; break; fi
-    done
-    if [ -z "$RUNUSER" ]; then
-        echo "j36-browser: cannot drop privileges (runuser is missing)" >&2
-        exit 1
-    fi
-    VIRTUA_HOME="$(getent passwd virtua 2>/dev/null | cut -d: -f6)"
-    [ -n "$VIRTUA_HOME" ] || VIRTUA_HOME="/home/virtua"
-    export HOME="$VIRTUA_HOME"
-    export USER=virtua
-    export LOGNAME=virtua
-    export XDG_CONFIG_HOME="$HOME/.config"
-    export XDG_CACHE_HOME="$HOME/.cache"
-    export XDG_DATA_HOME="$HOME/.local/share"
-    export XDG_RUNTIME_DIR=/run/j36/xdg-virtua
-    mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" \
-             "$XDG_RUNTIME_DIR" "$XDG_CACHE_HOME/fontconfig" \
-             "$XDG_CACHE_HOME/mozilla" "$HOME/.mozilla/j36-v6" 2>/dev/null
-    chown -R virtua:virtua "$HOME/.config" "$HOME/.cache" "$HOME/.local" \
-                           "$HOME/.mozilla" "$XDG_RUNTIME_DIR" 2>/dev/null
-    # Older images created fontconfig's child cache as root before the browser
-    # privilege drop.  Chowning only .cache above does not change that child, and
-    # Firefox then spends its launch reporting "No writable cache directories".
-    # This directory is small and bounded; repair its existing entries as well.
-    chown -R virtua:virtua "$XDG_CACHE_HOME/fontconfig" 2>/dev/null
-    # The former root browser could also have left a large Mozilla cache behind.
-    # Repair it once, marked inside that tree, rather than recursively walking it
-    # on every launch and turning a successful start into an SD-card stall.
-    cache_owner="$XDG_CACHE_HOME/mozilla/.virtua-owned-v1"
-    if [ ! -e "$cache_owner" ]; then
-        echo "j36-browser: repairing ownership of the legacy Mozilla cache" >&2
-        chown -R virtua:virtua "$XDG_CACHE_HOME/mozilla" 2>/dev/null
-        : > "$cache_owner" 2>/dev/null || true
-        chown virtua:virtua "$cache_owner" 2>/dev/null
-    fi
-    chmod 0700 "$XDG_RUNTIME_DIR" 2>/dev/null
-fiit with J36_XSESSION set, and it
+    # somebody who installs firefox-esr or chromium from it should get that browser
+    # here without editing anything.  What the image itself ships with is surf, the
+    # suckless WebKit browser, and it is first in the search: the web in 2026 is
+    # JavaScript, so the engine has to run it, and 946 MB of usable RAM is not much
+    # to run an engine in.  surf is WebKitGTK -- a real JavaScript engine with one
+    # window and no chrome of its own -- at a fraction of Firefox's footprint, and
+    # it is on the panel in seconds where Firefox spent a minute faulting 130 MB of
+    # libxul off the SD card and then OOM'd before the window mapped.
+    #
+    # luakit is next: the same engine with more of a browser around it, also one
+    # card-press away on the Packages page.  Firefox stays reachable by name -- it
+    # is farther down the search, so a card that installs it keeps working -- but
+    # it is no longer what this board ships with.
+    cat > "$SDROOT/opt/mixos/bin/j36-browser" <<'BROWSERLAUNCH'
+#!/bin/sh
+# j36-browser -- a graphical browser on the J36 Ultra's panel.
+#
+# Usage: j36-browser [URL]
+#
+# AN X CLIENT, not a session.  Inside a session it picks a browser, writes the
+# profile and execs it; outside one it hands itself to j36-xrun, so the command line
+# that used to bring up a whole X server still opens a browser -- in the session that
+# is already running.  Written by device/j36-ultra/build-in-vm.sh; the reasoning is
+# in that file, in the graphical session section.
+set -u
+
+START=/opt/mixos/share/browser/start.html
+
+URL="${1:-}"
+if [ -z "$URL" ]; then
+    if [ -f "$START" ]; then URL="file://$START"; else URL="https://duckduckgo.com/"; fi
+fi
+
+# NOT INSIDE A SESSION: ask the one that is.  j36-xrun writes this same command line
+# into the session's control pipe, the session runs it with J36_XSESSION set, and it
 # arrives back here one branch further down.  It cannot loop: j36-xrun refuses when
 # there is no session rather than starting one.
 #
@@ -13402,27 +13410,29 @@ if [ -n "$J36_BROWSER" ] && [ ! -x "$J36_BROWSER" ]; then
     exit 1
 fi
 
-# Any of these, first one wins.  See the comment above this heredoc for the order.
+# Any of these, first one wins.  See the comment above this heredoc for the order:
+# the JavaScript-capable light browsers first, because they are what the image
+# ships with; the heavy and the JS-less ones after, reachable by installing them.
 if [ -z "$J36_BROWSER" ]; then
-    for b in firefox-esr firefox netsurf-gtk netsurf epiphany-browser luakit surf \
+    for b in surf luakit firefox-esr firefox netsurf-gtk netsurf epiphany-browser \
              dillo falkon qutebrowser chromium chromium-browser; do
         if [ -x "/usr/bin/$b" ]; then J36_BROWSER="/usr/bin/$b"; break; fi
     done
 fi
 if [ -z "$J36_BROWSER" ]; then
-    echo "j36-browser: no browser installed -- the Packages card can add firefox-esr" >&2
+    echo "j36-browser: no browser installed -- the Packages card can add surf" >&2
     exit 1
 fi
 
 # SAID OUT LOUD, EVERY TIME.  The loop above is a fallback chain and a fallback that
 # is taken silently is a fallback nobody knows they are using: an image that was
-# supposed to carry firefox-esr and does not comes up on netsurf, renders half the
-# web as a blank page, and looks like a broken browser rather than a missing package.
+# supposed to carry surf and does not comes up on dillo, renders half the web as a
+# blank page, and looks like a broken browser rather than a missing package.
 # stderr here is mixdash's stdout, which is /run/j36/mixdash.log after the first
 # frame, so the answer is one grep away from anyone asking "which browser is this?".
 case "${J36_BROWSER##*/}" in
-    firefox|firefox-esr) ;;
-    *) echo "j36-browser: firefox-esr is not on this card; falling back to ${J36_BROWSER##*/}, which may not run JavaScript" >&2 ;;
+    surf|luakit|firefox|firefox-esr) ;;
+    *) echo "j36-browser: surf/luakit are not on this card; falling back to ${J36_BROWSER##*/}, which may not run JavaScript" >&2 ;;
 esac
 echo "j36-browser: using $J36_BROWSER" >&2
 
@@ -13511,17 +13521,25 @@ run_browser() {
     exec "$@"
 }
 
-# ── Firefox on 946 MB of RAM ─────────────────────────────────────────────────
+# ── Browsers on 946 MB of RAM ────────────────────────────────────────────────
 #
-# Firefox is the browser this image installs, because JavaScript is not optional on
-# the 2026 web.  It is also 253 MB of package and a 130 MB libxul.so mmapped off an
-# SD card, on a board with 946 MB of usable memory, and NONE OF THAT IS A REASON TO
-# SHIP IT UNTUNED.  There is 768 MB of lz4 zram swap behind it now -- see
-# setup_zram in /init -- and that changes how much room there is, not how much
-# Firefox asks for; a browser that needs 1.4 GB on a machine with 1.3 GB of
-# effective memory is still a browser that gets killed, and it gets killed after
-# spending the intervening minute compressing pages.  The swap buys the headroom
-# these prefs then live inside.  Out of the box it would start four
+# THE IMAGE SHIPS SURF, not Firefox.  JavaScript is not optional on the 2026 web,
+# but 253 MB of package and a 130 MB libxul.so mmapped off an SD card are not how
+# a board with 946 MB of usable memory gets it: Firefox spent a minute faulting
+# itself in and then ran the machine out of memory before the window mapped.
+# surf is WebKitGTK -- a real JavaScript engine -- at a fraction of that, single
+# window and no chrome, which is exactly what this pad-driven one-window session
+# wants, and luakit is the same engine one step up.  Both are reachable through
+# the search above and nothing in this section applies to them.
+#
+# Firefox stays RUNNABLE, because the Packages card can install it and then it is
+# the browser the session finds.  It is also NONE OF THAT IS A REASON TO RUN IT
+# UNTUNED.  There is an lz4 zram pool behind it now -- setup_zram in /init,
+# twice MemTotal with a 50% cap -- and that changes how much room there is, not
+# how much Firefox asks for; a browser that needs 1.4 GB on a machine with about
+# 1.9 GB of effective memory is still a browser that gets killed, and it gets
+# killed after spending the intervening minute compressing pages.  The swap buys
+# the headroom these prefs then live inside.  Out of the box it would start four
 # or five content processes -- Fission gives every origin on a page its own -- and
 # the third one is where this board runs out.  So a user.js is written into an
 # explicit profile before every launch:

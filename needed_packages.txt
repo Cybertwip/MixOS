@@ -14,7 +14,6 @@ espeak-ng
 evtest
 exfatprogs
 ffmpeg
-firefox-esr
 firmware-mediatek
 firmware-realtek
 fonts-noto-cjk
@@ -92,6 +91,10 @@ rsync
 rustc
 samba
 sshpass
+# surf is the browser the base image ships.  It is WebKitGTK -- real JavaScript --
+# at a small fraction of firefox-esr's footprint, which OOM'd this 1 GB board
+# before its window mapped.  firefox-esr stays installable from the Packages card.
+surf
 systemd-timesyncd
 tar
 unzip

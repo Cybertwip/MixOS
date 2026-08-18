@@ -109,17 +109,17 @@ const char *const kPhrases[][Lang::Count] = {
       "Browser",
       "Navegador",
       "Navegador" },
-    /* firefox-esr and links2 are package names and stay in every column; the
+    /* surf and links2 are package names and stay in every column; the
      * Packages card is named here as the card, so it takes each language's word for
      * it.  The English is one literal split across two source lines in
      * dashboard.cpp -- the compiler joins them before tr() ever sees it, so the key
      * is the joined string and the single space after "add" is part of it. */
-    { "No browser on this card. The Packages page can add firefox-esr, or links2 for a text one.",
-      "Aucun navigateur sur cette carte. La page Paquets peut ajouter firefox-esr, ou links2 pour un navigateur texte.",
-      "Nessun browser su questa scheda. La pagina Pacchetti può aggiungere firefox-esr, o links2 per uno testuale.",
-      "Kein Browser auf dieser Karte. Die Seite Pakete kann firefox-esr hinzufügen, oder links2 für einen Textbrowser.",
-      "Nenhum navegador neste cartão. A página Pacotes pode adicionar firefox-esr, ou links2 para um de texto.",
-      "Ningún navegador en esta tarjeta. La página Paquetes puede añadir firefox-esr, o links2 para uno de texto." },
+    { "No browser on this card. The Packages page can add surf, or links2 for a text one.",
+      "Aucun navigateur sur cette carte. La page Paquets peut ajouter surf, ou links2 pour un navigateur texte.",
+      "Nessun browser su questa scheda. La pagina Pacchetti può aggiungere surf, o links2 per uno testuale.",
+      "Kein Browser auf dieser Karte. Die Seite Pakete kann surf hinzufügen, oder links2 für einen Textbrowser.",
+      "Nenhum navegador neste cartão. A página Pacotes pode adicionar surf, ou links2 para um de texto.",
+      "Ningún navegador en esta tarjeta. La página Paquetes puede añadir surf, o links2 para uno de texto." },
     /* The five below are the toast the Browser card shows when it opens links2
      * instead of Firefox, and the four half-sentences that go in its %1.  They are
      * separate rows rather than five finished sentences because the reason is chosen
