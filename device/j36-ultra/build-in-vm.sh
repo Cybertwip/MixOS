@@ -2616,16 +2616,33 @@ setup_zram() {
     #   decompression, seven of them for pages nobody asked for, and they land in
     #   the memory the machine was short of.  0 means read one page.
     #
-    #   watermark_scale_factor 100.  How far above the low watermark kswapd keeps
+    #   watermark_scale_factor 200.  How far above the low watermark kswapd keeps
     #   reclaiming, in tenths of a percent of the zone -- 10 by default, so 0.1%,
     #   which on this board is about a megabyte of headroom.  An allocation that
     #   arrives while kswapd is still working goes into DIRECT reclaim, where the
     #   allocating thread does the compressing itself and stalls until it finishes;
-    #   that is what a UI freeze under memory pressure actually is.  100 is 1%,
-    #   roughly ten megabytes, which is enough for kswapd to stay ahead.
-    echo 150 > /proc/sys/vm/swappiness 2>/dev/null || true
-    echo 0   > /proc/sys/vm/page-cluster 2>/dev/null || true
-    echo 100 > /proc/sys/vm/watermark_scale_factor 2>/dev/null || true
+    #   that is what a UI freeze under memory pressure actually is.  200 is 2%,
+    #   about twenty megabytes, which buys kswapd the head start it needs when a
+    #   browser starts drinking hundreds of megabytes at once.
+    #
+    #   min_free_kbytes 8192.  The reserve the kernel keeps for itself, in kB,
+    #   where the default scales down to about three and a half megabytes on this
+    #   machine.  OOM-killing a victim is itself an allocation: the reap wants
+    #   order-0 pages while the machine is out of them, and a reserve that is
+    #   gone by then turns the kill into the same stall the kill was meant to
+    #   end.  Eight megabytes is a fraction of a percent of the board and keeps
+    #   the emergency machinery able to run.
+    #
+    #   panic_on_oom 0.  The default already, written anyway because it is the one
+    #   number whose wrong value turns a dead browser into a dead board: the shape
+    #   of an OOM on this machine is that the hungriest window dies and the
+    #   dashboard keeps running, which is both the oom_score_adj ladder in the
+    #   session and this line promising there is no reboot path through it.
+    echo 150  > /proc/sys/vm/swappiness 2>/dev/null || true
+    echo 0    > /proc/sys/vm/page-cluster 2>/dev/null || true
+    echo 200  > /proc/sys/vm/watermark_scale_factor 2>/dev/null || true
+    echo 8192 > /proc/sys/vm/min_free_kbytes 2>/dev/null || true
+    echo 0    > /proc/sys/vm/panic_on_oom 2>/dev/null || true
 
     say "zram: $((disk_kb / 1024)) MiB of lz4 swap, capped at $((lim_kb / 1024)) MiB of real RAM"
     say "      (${memkb} kB total; j36.zram=0 in bootargs turns it off)"
@@ -6980,11 +6997,12 @@ dump() {
     # Read back rather than assumed.  setup_zram writes these into /proc before
     # switch_root and nothing in this image writes them afterwards -- but the
     # rootfs is shared, systemd-sysctl applies whatever /etc/sysctl.d holds, and a
-    # tuning file added there later would silently undo all three.  150 / 0 / 100
-    # is what /init set; anything else came from the rootfs.
-    showall "the three knobs that decide how the swap gets used" \
+    # tuning file added there later would silently undo them.  150 / 0 / 200 /
+    # 8192 / 0 is what /init set; anything else came from the rootfs.
+    showall "the knobs that decide how the swap gets used" \
         /proc/sys/vm/swappiness /proc/sys/vm/page-cluster \
-        /proc/sys/vm/watermark_scale_factor /proc/sys/vm/min_free_kbytes
+        /proc/sys/vm/watermark_scale_factor /proc/sys/vm/min_free_kbytes \
+        /proc/sys/vm/panic_on_oom
     # Who the kernel would pick if it had to, in the order it would pick them.
     # -300 is mixdash and everything it launched; +300 is the graphical session and
     # +500 each of its windows, both putting themselves at the front of the queue on
@@ -9866,15 +9884,16 @@ j36.zram=auto
     what stops the spiral where badly-compressing pages make zram eat the memory
     that the swapping was meant to free.  Past it zram refuses the write, the page stays
     where it was, and the board degrades to how it behaved before this word rather
-    than falling over.  At the ~2:1 lz4 gets on browser heap the cap is never
-    reached and the machine behaves like one with about 1.3 GB.
+    than falling over.  At the ~2:1 lz4 gets on browser heap the cap holds about
+    950 MB of swapped data, so the machine behaves like one with about 1.9 GB.
 
-    /init also sets vm.swappiness=150, vm.page-cluster=0 and
-    vm.watermark_scale_factor=100, all three of which are properties of THIS swap
-    device rather than of the rootfs -- which is why they are written from here
-    and not from a sysctl.d file on a partition an R36S also boots.  Section 7 of
-    mixos-log.txt reads all of them back, along with zram's own mm_stat, which is
-    the only place the compression ratio it is actually getting is visible.
+    /init also sets vm.swappiness=150, vm.page-cluster=0,
+    vm.watermark_scale_factor=200, vm.min_free_kbytes=8192 and vm.panic_on_oom=0,
+    all five of which are properties of THIS swap device rather than of the rootfs
+    -- which is why they are written from here and not from a sysctl.d file on a
+    partition an R36S also boots.  Section 7 of mixos-log.txt reads all of them
+    back, along with zram's own mm_stat, which is the only place the compression
+    ratio it is actually getting is visible.
 
     j36.zram=0 -- or `noswap' -- turns the whole thing off, including the three
     sysctls, so that a board can be measured with it and without it and the
@@ -12618,6 +12637,23 @@ PADXPID=$RUNDIR/padx.pid
 # appears is indistinguishable from a program that crashed.
 MAXCLIENTS=4
 
+# THE MEMORY FLOOR, AND WHY IT EXISTS.  The kernel's own OOM killer is the wrong
+# tool for this board's most common emergency: by the time it runs the machine has
+# spent minutes in direct reclaim, every allocation stalls on the compressing core,
+# and from the panel that looks exactly like a kernel freeze -- and the victim it
+# finally picks has to be torn down out of deep swap before its memory is back.
+# The shape of the failure this board wants is different: the hungriest WINDOW
+# dies quickly, while there is still memory to die quickly in, and the dashboard
+# and the server keep running.  So this session watches MemAvailable on every tick
+# of the loop below, and when it crosses this line it SIGKILLs the client with the
+# largest footprint -- see shed_under_pressure.  64 MiB is where that still works:
+# low enough that nothing is killed for a page cache the kernel would happily have
+# dropped anyway, high enough that the kill and the teardown that follows land
+# before reclaim turns into the stall that reads as a freeze.  The OOM killer and
+# the oom_score_adj ladder stay armed behind it -- see start_client -- for the
+# pressure that outruns a two-second tick.
+MEM_FLOOR_KB=65536
+
 mkdir -p "$RUNDIR" 2>/dev/null
 
 # HOME IS THE DATA PARTITION AND NOT ROOT'S.  Downloads, cookies, profiles and
@@ -12993,6 +13029,77 @@ reap_clients() {
     mv -f "$WINLIST.new" "$WINLIST" 2>/dev/null
 }
 
+# MemAvailable in kB, empty on any failure.  A while-read over /proc/meminfo in
+# the same style as client_alive's read of /proc/PID/status, because this script
+# has no awk and no reason to grow a dependency for twelve lines of parsing.
+mem_avail_kb() {
+    ma_kb=""
+    while read -r ma_key ma_value ma_rest; do
+        if [ "$ma_key" = "MemAvailable:" ]; then
+            ma_kb="$ma_value"
+            break
+        fi
+    done < /proc/meminfo 2>/dev/null
+    case "$ma_kb" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s' "$ma_kb"
+}
+
+# One client's claim on the machine, in kB: resident pages PLUS what it has
+# already pushed into zram, because a browser that has been running for a while
+# is mostly swap at this point and its RSS alone would make it look small.  Both
+# lines are in /proc/PID/status and both are printed in kB.
+client_footprint_kb() {
+    cf_kb=0
+    while read -r cf_key cf_value cf_rest; do
+        case "$cf_key" in
+            VmRSS:|VmSwap:)
+                case "$cf_value" in
+                    ''|*[!0-9]*) ;;
+                    *) cf_kb=$((cf_kb + cf_value)) ;;
+                esac
+                ;;
+        esac
+    done < "/proc/$1/status" 2>/dev/null
+    printf '%s' "$cf_kb"
+}
+
+# THE KILL THAT BEATS THE OOM KILLER.  See MEM_FLOOR_KB above for why this
+# exists and why it runs here instead of in the kernel.  One pass per tick:
+# kill the single largest client, reap, and let the next tick decide again --
+# pressure that survives one kill gets a second opinion two seconds later, and
+# pressure that does not never loses a second window.
+shed_under_pressure() {
+    sup_avail="$(mem_avail_kb)" || return 0
+    [ "$sup_avail" -ge "$MEM_FLOOR_KB" ] && return 0
+    [ -n "$CLIENTS" ] || return 0
+
+    sup_victim=""
+    sup_largest=-1
+    for sup_pid in $CLIENTS; do
+        sup_size="$(client_footprint_kb "$sup_pid")"
+        case "$sup_size" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        if [ "$sup_size" -gt "$sup_largest" ]; then
+            sup_largest="$sup_size"
+            sup_victim="$sup_pid"
+        fi
+    done
+    [ -n "$sup_victim" ] || return 0
+
+    # The negative pid names the client's whole process group -- the one setsid
+    # gave it in start_client -- and the group is the point: the memory is not
+    # all in the window itself, it is in the engine children under it, and a
+    # kill that leaves those alive has freed nothing.  `kill -9 -PID' is the
+    # POSIX spelling of a group kill, and it is spelled without a `--' because
+    # this script runs under dash and not every kill builtin knows that word.
+    echo "j36-xsession: MemAvailable ${sup_avail} kB is under the ${MEM_FLOOR_KB} kB floor; closing window $sup_victim before the OOM killer gets the choice" >&2
+    kill -9 "-$sup_victim" 2>/dev/null || kill -9 "$sup_victim" 2>/dev/null
+    reap_clients
+}
+
 # A CLIENT IS NOT FORKED UNTIL X ACCEPTS A CONNECTION.  A cgroup thaw completes
 # asynchronously, and SDL calls XOpenDisplay while selecting its video backend; a
 # client that wins that race reports the misleading "x11 not available" and exits.
@@ -13016,10 +13123,17 @@ wait_for_x() {
 
 # Open a window.
 #
-# `sh -c' because what arrives is a command LINE and not an argv -- it came down a
+# `sh -c' because what arrives is a command LINE and not a argv -- it came down a
 # pipe as text, and j36-xrun quoted every argument on the way in so that a filename
 # with a space in it survives the trip.  The subshell exists to raise oom_score_adj
 # before the exec: see the +300/+500 note at the top.
+#
+# SETSID IS THE OTHER HALF OF THE OOM STORY.  A window's memory is not all in the
+# window: the engine forks children under it, and the day it has to die -- by this
+# session's own floor or by the kernel's killer -- killing one pid leaves the rest
+# holding everything.  setsid makes the client a session and process-group leader
+# of its own, so `kill -9 -PID' reaches the whole tree; that is what both
+# shed_under_pressure and the teardown at the bottom use.
 start_client() {
     sc_cmd="$1"
     [ -n "$sc_cmd" ] || return 0
@@ -13036,7 +13150,15 @@ start_client() {
         return 0
     fi
 
-    ( echo 500 2>/dev/null > /proc/self/oom_score_adj; exec sh -c "$sc_cmd" ) &
+    # A window started under the floor is a window that either never maps or gets
+    # killed a few seconds after it does, and both ends look like a broken board.
+    # Refused out loud, the same shape as the MAXCLIENTS refusal above.
+    if sc_avail="$(mem_avail_kb)" && [ "$sc_avail" -lt "$MEM_FLOOR_KB" ]; then
+        echo "j36-xsession: MemAvailable ${sc_avail} kB is under the ${MEM_FLOOR_KB} kB floor; close a window before opening another" >&2
+        return 0
+    fi
+
+    ( echo 500 2>/dev/null > /proc/self/oom_score_adj; exec setsid sh -c "$sc_cmd" ) &
     sc_pid=$!
     client_title "$sc_cmd" > "$RUNDIR/win.$sc_pid" 2>/dev/null
     CLIENTS="$CLIENTS $sc_pid"
@@ -13152,6 +13274,10 @@ while :; do
 
     reap_clients
 
+    # The floor check shares the ticker: one MemAvailable read every two seconds
+    # while the session is in front or parked, which is the complete cost of it.
+    shed_under_pressure
+
     # AN EMPTY SERVER STAYS ALIVE.  X is expensive to initialise on this SD card,
     # and a parked, windowless service is cheap.  More importantly it leaves a
     # known :0 ready for the next j36-xrun request.  It is infrastructure and is
@@ -13171,8 +13297,13 @@ done
 # SIGTERM and then three seconds, because a browser asked to quit writes its session
 # and its cookie jar out, and this card's whole point is that the file is still there
 # next time.  SIGKILL only for the ones that did not.
+#
+# TO THE GROUP, both times: setsid in start_client made each window the leader of
+# one, and the engine children underneath it exit with it instead of being left
+# orphaned on a machine that is shutting down.  The single-pid kill is the fallback
+# for the client whose setsid did not take.
 for p in $CLIENTS; do
-    kill "$p" 2>/dev/null
+    kill -TERM "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null
 done
 i=0
 while [ "$i" -lt 30 ]; do
@@ -13185,7 +13316,7 @@ while [ "$i" -lt 30 ]; do
     i=$((i + 1))
 done
 for p in $CLIENTS; do
-    kill -9 "$p" 2>/dev/null
+    kill -9 "-$p" 2>/dev/null || kill -9 "$p" 2>/dev/null
     rm -f "$RUNDIR/win.$p" 2>/dev/null
 done
 
