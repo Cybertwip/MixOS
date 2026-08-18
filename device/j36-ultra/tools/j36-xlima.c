@@ -97,7 +97,6 @@ typedef struct {
 	struct fb_var_screeninfo var;
 	CloseScreenProcPtr	CloseScreen;
 	CreateScreenResourcesProcPtr CreateScreenResources;
-	void			*shadowFB;
 	Bool			shadow;
 	int			dri_fd;
 	char			dri_path[280];
@@ -760,17 +759,39 @@ static Bool JLimaSaveScreen(ScreenPtr pScreen, int mode)
 	return TRUE;
 }
 
-static void *
-JLimaShadowWindow(ScreenPtr pScreen, CARD32 row, CARD32 offset, int mode,
-		  CARD32 *size, void *closure)
+static void JLimaUpdatePacked(ScreenPtr pScreen, shadowBufPtr pBuf)
 {
 	ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
 	JLimaPtr p = JLIMAPTR(pScrn);
+	RegionPtr damage = DamageRegion(pBuf->pDamage);
+	int nbox = RegionNumRects(damage);
+	BoxPtr box = RegionRects(damage);
+	int stride = p->fix.line_length;
+	int bpp = p->var.bits_per_pixel;
+	int i;
 
-	(void)mode;
-	(void)closure;
-	*size = p->fix.line_length;
-	return (void *)(p->fb + (size_t)row * p->fix.line_length + offset);
+	if (!p->fb)
+		return;
+	for (i = 0; i < nbox; i++) {
+		int x = box[i].x1;
+		int y = box[i].y1;
+		int w = box[i].x2 - box[i].x1;
+		int h = box[i].y2 - box[i].y1;
+		int bytes = w * ((bpp + 7) / 8);
+		int row;
+		unsigned char *src = (unsigned char *)pBuf->pPixmap->devPrivate.ptr;
+		int src_stride = pBuf->pPixmap->devKind;
+
+		if (x < 0 || y < 0 || w <= 0 || h <= 0)
+			continue;
+		for (row = 0; row < h; row++) {
+			memcpy(p->fb + (size_t)(y + row) * stride +
+				       (size_t)x * ((bpp + 7) / 8),
+			       src + (size_t)(y + row) * src_stride +
+				     (size_t)x * ((bpp + 7) / 8),
+			       (size_t)bytes);
+		}
+	}
 }
 
 static Bool
@@ -788,10 +809,12 @@ JLimaCreateScreenResources(ScreenPtr pScreen)
 	if (!ret)
 		return FALSE;
 
-	pPixmap = pScreen->GetScreenPixmap(pScreen);
-	if (!shadowAdd(pScreen, pPixmap, shadowUpdatePacked,
-		       JLimaShadowWindow, 0, 0))
-		return FALSE;
+	if (p->shadow) {
+		pPixmap = pScreen->GetScreenPixmap(pScreen);
+		if (!shadowAdd(pScreen, pPixmap, JLimaUpdatePacked,
+			       NULL, 0, 0))
+			return FALSE;
+	}
 
 	return TRUE;
 }
@@ -801,13 +824,7 @@ static Bool JLimaCloseScreen(ScreenPtr pScreen)
 	ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
 	JLimaPtr p = JLIMAPTR(pScrn);
 
-	if (p->shadow) {
-		shadowRemove(pScreen, pScreen->GetScreenPixmap(pScreen));
-		free(p->shadowFB);
-		p->shadowFB = NULL;
-	}
 	pScreen->CloseScreen = p->CloseScreen;
-	pScreen->CreateScreenResources = p->CreateScreenResources;
 	if (p->fb && p->fb != MAP_FAILED) {
 		munmap(p->fb, p->fb_len);
 		p->fb = NULL;
@@ -883,15 +900,11 @@ static Bool JLimaScreenInit(ScreenPtr pScreen, int argc, char **argv)
 	xf86SetBlackWhitePixels(pScreen);
 
 	if (p->shadow) {
-		p->shadowFB = calloc(1, (size_t)displayWidth * (size_t)pScrn->virtualY *
-				     (size_t)((pScrn->bitsPerPixel + 7) / 8));
-		if (!p->shadowFB)
-			return FALSE;
 		if (!shadowSetup(pScreen))
 			return FALSE;
-		p->CreateScreenResources = pScreen->CreateScreenResources;
-		pScreen->CreateScreenResources = JLimaCreateScreenResources;
 	}
+	p->CreateScreenResources = pScreen->CreateScreenResources;
+	pScreen->CreateScreenResources = JLimaCreateScreenResources;
 
 	xf86SetBackingStore(pScreen);
 	miDCInitialize(pScreen, xf86GetPointerScreenFuncs());
