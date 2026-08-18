@@ -760,6 +760,19 @@ static Bool JLimaSaveScreen(ScreenPtr pScreen, int mode)
 	return TRUE;
 }
 
+static void *
+JLimaShadowWindow(ScreenPtr pScreen, CARD32 row, CARD32 offset, int mode,
+		  CARD32 *size, void *closure)
+{
+	ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
+	JLimaPtr p = JLIMAPTR(pScrn);
+
+	(void)mode;
+	(void)closure;
+	*size = p->fix.line_length;
+	return (void *)(p->fb + (size_t)row * p->fix.line_length + offset);
+}
+
 static Bool
 JLimaCreateScreenResources(ScreenPtr pScreen)
 {
@@ -809,19 +822,6 @@ static Bool JLimaCloseScreen(ScreenPtr pScreen)
 		p->dri_fd = -1;
 	}
 	return (*pScreen->CloseScreen)(pScreen);
-}
-
-static void *
-JLimaShadowWindow(ScreenPtr pScreen, CARD32 row, CARD32 offset, int mode,
-		  CARD32 *size, void *closure)
-{
-	ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
-	JLimaPtr p = JLIMAPTR(pScrn);
-
-	(void)mode;
-	(void)closure;
-	*size = p->fix.line_length;
-	return (void *)(p->fb + (size_t)row * p->fix.line_length + offset);
 }
 
 static Bool JLimaScreenInit(ScreenPtr pScreen, int argc, char **argv)
