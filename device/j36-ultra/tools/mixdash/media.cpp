@@ -2903,12 +2903,20 @@ void MediaPage::panelLost()
     m_panelHidden = true;
     if (m_pace)
         m_pace->stop();
-    /* A seek the slider was holding is dropped rather than committed into a
-     * panel this page no longer owns: commitSeek() would restart the chain,
-     * and the new chain would be one this stop never reached. */
-    if (m_seekTimer)
-        m_seekTimer->stop();
-    m_seekTarget = -1.0;
+
+    /*
+     * A seek the slider was holding is COMMITTED, not dropped: seekTo() has
+     * already moved the clock to the target, so abandoning the restart would
+     * leave the picture minutes behind its own due-time arithmetic and pump()
+     * dropping everything until ffmpeg caught up the hard way.  commitSeek()
+     * starts the fresh chain, and openVideoNow() stops it again at its tail --
+     * which is where a film that only came up while the panel was gone is
+     * stopped too.
+     */
+    if (m_seekTimer && m_seekTimer->isActive()) {
+        commitSeek();
+        return;
+    }
 
     if (!videoLive() || m_paused)
         return;
