@@ -13329,40 +13329,46 @@ XRUN
     # the X server moved out.
     #
     # THE BROWSER IS CHOSEN AND NOT HARDCODED, because the Packages card exists:
-    # somebody who installs chromium or dillo from it should get that browser here
-    # without editing anything.  What the image itself installs is firefox-esr, and
-    # it is first in the list, because the web in 2026 is JavaScript and a browser
-    # that does not run it is a browser that shows a blank page on half the sites
-    # anybody would open.  Debian trixie has a real armhf build --
-    # 140.12.0esr, 253 MB installed -- so this is a genuine Gecko with a JIT and
-    # not a compatibility shim.
-    #
-    # netsurf-gtk is second and is also installed: 4 MB, its own engine, no
-    # JavaScript.  It is there because 946 MB of usable RAM is not much to run
-    # Firefox in, and the day it will not start is the day something still has to
-    # open a page.  Everything after those two is only reachable by installing it.
-    cat > "$SDROOT/opt/mixos/bin/j36-browser" <<'BROWSERLAUNCH'
-#!/bin/sh
-# j36-browser -- a graphical browser on the J36 Ultra's panel.
-#
-# Usage: j36-browser [URL]
-#
-# AN X CLIENT, not a session.  Inside a session it picks a browser, writes the
-# profile and execs it; outside one it hands itself to j36-xrun, so the command line
-# that used to bring up a whole X server still opens a browser -- in the session that
-# is already running.  Written by device/j36-ultra/build-in-vm.sh; the reasoning is
-# in that file, in the graphical session section.
-set -u
-
-START=/opt/mixos/share/browser/start.html
-
-URL="${1:-}"
-if [ -z "$URL" ]; then
-    if [ -f "$START" ]; then URL="file://$START"; else URL="https://duckduckgo.com/"; fi
-fi
-
-# NOT INSIDE A SESSION: ask the one that is.  j36-xrun writes this same command line
-# into the session's control pipe, the session runs it with J36_XSESSION set, and it
+ RUNUSER=""
+if [ "$(id -u)" -eq 0 ] && id virtua >/dev/null 2>&1; then
+    for r in /usr/sbin/runuser /sbin/runuser; do
+        if [ -x "$r" ]; then RUNUSER="$r"; break; fi
+    done
+    if [ -z "$RUNUSER" ]; then
+        echo "j36-browser: cannot drop privileges (runuser is missing)" >&2
+        exit 1
+    fi
+    VIRTUA_HOME="$(getent passwd virtua 2>/dev/null | cut -d: -f6)"
+    [ -n "$VIRTUA_HOME" ] || VIRTUA_HOME="/home/virtua"
+    export HOME="$VIRTUA_HOME"
+    export USER=virtua
+    export LOGNAME=virtua
+    export XDG_CONFIG_HOME="$HOME/.config"
+    export XDG_CACHE_HOME="$HOME/.cache"
+    export XDG_DATA_HOME="$HOME/.local/share"
+    export XDG_RUNTIME_DIR=/run/j36/xdg-virtua
+    mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" \
+             "$XDG_RUNTIME_DIR" "$XDG_CACHE_HOME/fontconfig" \
+             "$XDG_CACHE_HOME/mozilla" "$HOME/.mozilla/j36-v6" 2>/dev/null
+    chown -R virtua:virtua "$HOME/.config" "$HOME/.cache" "$HOME/.local" \
+                           "$HOME/.mozilla" "$XDG_RUNTIME_DIR" 2>/dev/null
+    # Older images created fontconfig's child cache as root before the browser
+    # privilege drop.  Chowning only .cache above does not change that child, and
+    # Firefox then spends its launch reporting "No writable cache directories".
+    # This directory is small and bounded; repair its existing entries as well.
+    chown -R virtua:virtua "$XDG_CACHE_HOME/fontconfig" 2>/dev/null
+    # The former root browser could also have left a large Mozilla cache behind.
+    # Repair it once, marked inside that tree, rather than recursively walking it
+    # on every launch and turning a successful start into an SD-card stall.
+    cache_owner="$XDG_CACHE_HOME/mozilla/.virtua-owned-v1"
+    if [ ! -e "$cache_owner" ]; then
+        echo "j36-browser: repairing ownership of the legacy Mozilla cache" >&2
+        chown -R virtua:virtua "$XDG_CACHE_HOME/mozilla" 2>/dev/null
+        : > "$cache_owner" 2>/dev/null || true
+        chown virtua:virtua "$cache_owner" 2>/dev/null
+    fi
+    chmod 0700 "$XDG_RUNTIME_DIR" 2>/dev/null
+fiit with J36_XSESSION set, and it
 # arrives back here one branch further down.  It cannot loop: j36-xrun refuses when
 # there is no session rather than starting one.
 #
@@ -13466,12 +13472,20 @@ if [ "$(id -u)" -eq 0 ] && id virtua >/dev/null 2>&1; then
         echo "j36-browser: cannot drop privileges (runuser is missing)" >&2
         exit 1
     fi
+    VIRTUA_HOME="$(getent passwd virtua 2>/dev/null | cut -d: -f6)"
+    [ -n "$VIRTUA_HOME" ] || VIRTUA_HOME="/home/virtua"
+    export HOME="$VIRTUA_HOME"
+    export USER=virtua
+    export LOGNAME=virtua
+    export XDG_CONFIG_HOME="$HOME/.config"
+    export XDG_CACHE_HOME="$HOME/.cache"
+    export XDG_DATA_HOME="$HOME/.local/share"
     export XDG_RUNTIME_DIR=/run/j36/xdg-virtua
     mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" \
              "$XDG_RUNTIME_DIR" "$XDG_CACHE_HOME/fontconfig" \
-             "$XDG_CACHE_HOME/mozilla" 2>/dev/null
-    chown virtua:virtua "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" \
-                         "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR" 2>/dev/null
+             "$XDG_CACHE_HOME/mozilla" "$HOME/.mozilla/j36-v6" 2>/dev/null
+    chown -R virtua:virtua "$HOME/.config" "$HOME/.cache" "$HOME/.local" \
+                           "$HOME/.mozilla" "$XDG_RUNTIME_DIR" 2>/dev/null
     # Older images created fontconfig's child cache as root before the browser
     # privilege drop.  Chowning only .cache above does not change that child, and
     # Firefox then spends its launch reporting "No writable cache directories".

@@ -40,6 +40,7 @@
 #include <sys/ioctl.h>
 #include <pthread.h>
 #include <dirent.h>
+#include <time.h>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -178,6 +179,8 @@ struct Win {
 	Display *xdpy;
 	Window xw;
 	int w, h;
+	int interval;
+	struct timespec last_swap;
 };
 
 static struct Real R;
@@ -786,6 +789,8 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig cfg,
 	w->xw = xw;
 	w->w = (int)uw;
 	w->h = (int)uh;
+	w->interval = 1;
+	clock_gettime(CLOCK_MONOTONIC, &w->last_swap);
 	return surf;
 }
 
@@ -908,13 +913,36 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surf)
 	XDestroyImage(img);
 	gbm_bo_unmap(bo, data);
 	gbm_surface_release_buffer(w->gs, bo);
+	if (w->interval > 0) {
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		uint64_t target_ns = (uint64_t)w->interval * 16666667ULL;
+		uint64_t elapsed_ns = (uint64_t)(now.tv_sec - w->last_swap.tv_sec) * 1000000000ULL +
+				      (uint64_t)(now.tv_nsec - w->last_swap.tv_nsec);
+		if (elapsed_ns < target_ns) {
+			struct timespec req;
+			uint64_t diff = target_ns - elapsed_ns;
+			req.tv_sec = (time_t)(diff / 1000000000ULL);
+			req.tv_nsec = (long)(diff % 1000000000ULL);
+			nanosleep(&req, NULL);
+		}
+		clock_gettime(CLOCK_MONOTONIC, &w->last_swap);
+	}
+
 	(void)ok;
 	return EGL_TRUE;
 }
 
 EGLBoolean eglSwapInterval(EGLDisplay dpy, EGLint interval)
 {
+	int i;
 	load_real();
+	pthread_mutex_lock(&lock);
+	for (i = 0; i < MAX_WIN; i++) {
+		if (wins[i].used && wins[i].public == dpy)
+			wins[i].interval = interval > 0 ? interval : 0;
+	}
+	pthread_mutex_unlock(&lock);
 	if (!R.SwapInterval)
 		return EGL_TRUE;
 	return R.SwapInterval(dpy_mesa(dpy), interval);
