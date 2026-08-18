@@ -5089,8 +5089,8 @@ Environment="LD_LIBRARY_PATH=/run/j36/gl:$mixos_root/qt/lib"
 # child cleared out of its environment.  Setting both to one path means the
 # warm-up and the dashboard land in the same place under every one of those paths.
 # The deprecated MESA_GLSL_CACHE_DIR is deliberately NOT set: Mesa prints a
-# deprecation line to stderr when it sees it, and stderr here is journal+console,
-# which is a message drawn across the panel.
+# deprecation line to stderr when it sees it, and this unit is journal-only until
+# the dashboard owns the panel.
 #
 # The ceiling is not caution about disk -- Mesa's own default is measured in
 # gigabytes, and this board has neither the storage nor the shaders to want it.
@@ -5113,18 +5113,12 @@ Environment="QT_QPA_FB_DISABLE_INPUT=1"
 # QtGui links fontconfig -- so it is a fallback, not the font path.  main.cpp loads
 # the payload's faces by name through QFontDatabase::addApplicationFont.
 Environment="QT_QPA_FONTDIR=$mixos_root/qt/fonts"
-# journal AND console, and it is startup-only in practice.  Until the first frame the
-# panel is the best place these two can go: a dashboard that dies before it paints has
-# nothing else to say why, and the journal is on an ext2 partition the machine that
-# flashed this card cannot read.  From the first frame the dashboard takes both
-# descriptors off the console itself and points them at /run/j36/mixdash.log -- see
-# Console::toLog in tools/mixdash/console.cpp -- because after that a Qt warning here
-# is a line of text drawn straight across the grid, and it arrives through a channel
-# that holding the console mode cannot close, the text being the dashboard own output.
-# j36-logdump copies the tail of that file into BOOT:/mixos-log.txt, so nothing said
-# after the first frame is lost by the move.
-StandardOutput=journal+console
-StandardError=journal+console
+# Keep both descriptors off the panel during the hand-off.  mixsplash remains the
+# only visible boot UI until mixdash's first paint, and Console::toLog then moves
+# them to /run/j36/mixdash.log for the rest of the session.  j36-logdump copies the
+# diagnostic tail to BOOT, so journal-only startup does not lose the failure reason.
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -5297,6 +5291,7 @@ ready=/run/j36/padx.ready
 padpid=/run/j36/padx.pid
 presented=/run/j36/xdesktop.presented
 parked=/run/j36/xdesktop.parked
+xpid=/run/j36/xdesktop.pid
 rm -f "$parked"
 
 fail_park() {
@@ -5310,6 +5305,23 @@ fail_park() {
 n=0
 asked=0
 while [ "$n" -lt 900 ]; do
+    # The unit is Type=simple, so systemd can briefly show it as started while
+    # xinit is still bringing Xorg up.  Once xinit exits, however, waiting the
+    # full 90 seconds only exposes the boot to a dead-service timeout and delays
+    # the dashboard.  Fail immediately; mixdash can then take the panel and
+    # report the real X failure without a long console-looking gap.
+    xp=""
+    if [ -r "$xpid" ]; then
+        read -r xp < "$xpid" || xp=""
+        case "$xp" in
+            ''|*[!0-9]*) ;;
+            *)
+                if ! kill -0 "$xp" 2>/dev/null; then
+                    fail_park "persistent X service exited before presentation was ready"
+                fi
+                ;;
+        esac
+    fi
     pp=""
     [ -r "$padpid" ] && read -r pp < "$padpid" || pp=""
     case "$pp" in
@@ -7096,10 +7108,11 @@ Type=simple
 RemainAfterExit=yes
 ExecStart=/bin/sh /run/j36/bin/j36-logdump boot
 ExecStop=/bin/sh /run/j36/bin/j36-logdump now
-# The shutdown pass mounts a FAT, writes about a megabyte and unmounts it.  Thirty
-# seconds is generous for that on a slow card and still short enough that a board
-# which cannot do it does not hang the shutdown.
-TimeoutStopSec=30
+# The shutdown pass mounts a FAT, writes about a megabyte and unmounts it.  Keep the
+# diagnostic useful, but do not let a slow or wedged card hold the poweroff isolate
+# behind a shell that is still walking the journal.
+KillMode=control-group
+TimeoutStopSec=8
 StandardOutput=journal
 StandardError=journal
 UNITLOG
@@ -9165,13 +9178,13 @@ build_padx() {
     return 0
 }
 
-# ── j36lima: Xorg DDX that is fbdev's presentation plus lima's render node ──
+# ── j36lima: Xorg DDX that is fbdev's presentation plus lima discovery ─────
 #
 # xf86-video-fbdev cannot give a GL client the Mali-450.  modesetting on
 # card0 cannot either: card0 is lima and lima has no CRTC, and asking
 # mediatek-drm for GETRESOURCES takes the panel off simplefb.  This driver
-# is the eglprobe -o arrangement as an Xorg module -- GPU renders, simplefb
-# scans out, j36-xfb still intercepts the mmap.
+# is the simplefb presentation path; client-side acceleration uses j36-eglx,
+# and j36-xfb still intercepts the mmap.
 build_xlima() {
     local src="$ARMHF_CHROOT/home/build/xlima" out="$CACHE/j36lima_drv.so"
     local header cflags dri3=""
@@ -12134,8 +12147,8 @@ EGLJSON
     cat > "$SDROOT/opt/mixos/share/xorg/xorg.conf" <<'XORGCONF'
 # Written by device/j36-ultra/build-in-vm.sh for the J36 Ultra.
 # j36lima is fbdev's presentation (simplefb + ShadowFB + j36-xfb) plus
-# EGL 2.0 on card0:lima so GL clients render on the Mali-450.  It never
-# takes DRM master and never modesets.
+# lima-node discovery.  Client EGL acceleration is supplied by j36-eglx.
+# It never takes DRM master and never modesets.
 
 Section "Files"
     ModulePath "/opt/mixos/lib/xorg/modules"
