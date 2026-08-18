@@ -913,10 +913,11 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surf)
 	XDestroyImage(img);
 	gbm_bo_unmap(bo, data);
 	gbm_surface_release_buffer(w->gs, bo);
-	if (w->interval > 0) {
+	{
 		struct timespec now;
 		clock_gettime(CLOCK_MONOTONIC, &now);
-		uint64_t target_ns = (uint64_t)w->interval * 16666667ULL;
+		int eff_interval = w->interval > 0 ? w->interval : 1;
+		uint64_t target_ns = (uint64_t)eff_interval * 16666667ULL;
 		uint64_t elapsed_ns = (uint64_t)(now.tv_sec - w->last_swap.tv_sec) * 1000000000ULL +
 				      (uint64_t)(now.tv_nsec - w->last_swap.tv_nsec);
 		if (elapsed_ns < target_ns) {

@@ -2145,6 +2145,11 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
          */
         repaint();
 
+        /* The panel is the child's from here, so the film goes with it -- the
+         * GPU pass that presents one is not subject to Qt's updates flag. */
+        if (m_media)
+            m_media->panelLost();
+
         /*
          * The child is running and every pixel is its business from here.  Updates
          * go off HERE and not straight after start(): between the two calls this
@@ -2240,6 +2245,8 @@ void Dashboard::pollDesktopService()
             repaint();
             if (m_current)
                 m_current->repaint();
+            if (m_media)
+                m_media->panelRegained();
             toast(tr("The window service stopped"), 4500);
         }
     } else if (!m_desktopPending && windows.isEmpty()) {
@@ -2585,8 +2592,17 @@ void Dashboard::setForeground(int index)
         repaint();
         if (m_current)
             m_current->repaint();
+        /* After the repaint: a film that was running while the panel was gone
+         * puts its resumed frame over this one, not under it. */
+        if (m_media)
+            m_media->panelRegained();
         return;
     }
+
+    /* The film's GPU pass writes the scanout behind Qt's back, so it is stopped
+     * before the incoming task -- or its kept frame -- goes up. */
+    if (m_media)
+        m_media->panelLost();
 
     Task &task = m_tasks[index];
 
@@ -2657,6 +2673,11 @@ void Dashboard::setDesktopForeground()
         m_switcher->dismiss();
     m_switcherWas = -1;
 
+    /* Before PadX starts copying X's frame to the panel: the film's GPU pass is
+     * the other writer that would race it there. */
+    if (m_media)
+        m_media->panelLost();
+
     setUpdatesEnabled(false);
     /* PadX publishes a complete private-X frame as part of the acknowledged
      * transition below.  Restoring a stale physical-frame snapshot here was the
@@ -2672,6 +2693,8 @@ void Dashboard::setDesktopForeground()
         repaint();
         if (m_current)
             m_current->repaint();
+        if (m_media)
+            m_media->panelRegained();
         toast(tr("The window service could not be resumed"), 5000);
     }
 }
@@ -2847,6 +2870,12 @@ void Dashboard::showSwitcher()
      * lie that draws, which over an opaque overlay means a spinning arc in the
      * middle of the list. */
     m_busy->stop();
+
+    /* The switcher paints the panel through Qt while a film presents through
+     * the GPU, and the two would trade the glass every frame; the film stops
+     * for as long as the list is up, whichever way the choice goes. */
+    if (m_media)
+        m_media->panelLost();
 
     /*
      * Anything asked for between the gesture and this line is asking for what is

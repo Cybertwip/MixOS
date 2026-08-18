@@ -20,6 +20,7 @@
 #include <QResizeEvent>
 #include <QTimer>
 
+#include <cmath>
 #include <signal.h>
 
 #include "disks.h"
@@ -1794,7 +1795,7 @@ void MediaPage::probeThen(const QString &path, int purpose, const Entry &entry,
     m_probe->start(ffprobe, QStringList()
                                 << "-v" << "error"
                                 << "-show_entries"
-                                << "stream=codec_type,r_frame_rate:"
+                                << "stream=codec_type,r_frame_rate,avg_frame_rate:"
                                    "format=duration:format_tags=title,artist"
                                 << "-of" << "default=noprint_wrappers=1"
                                 << path);
@@ -1807,31 +1808,52 @@ void MediaPage::onProbeFinished()
 
     if (m_probe) {
         /*
-         * Parsed in one walk.  r_frame_rate arrives as a rational -- "30000/1001"
-         * for anything that came off American television -- and only the FIRST
-         * stream's is taken, because ffprobe prints one per stream and the audio
-         * stream's is meaningless.  hasAudio is set from codec_type rather than
-         * from a second -select_streams run.
+         * Parsed in one walk.  Both rates arrive as rationals -- "30000/1001" for
+         * anything that came off American television -- and only the VIDEO stream's
+         * are taken: ffprobe prints one per stream, the audio stream's are
+         * meaningless, and the audio stream comes first in some containers, which
+         * is what the in-stream tracking is for.  hasAudio is set from codec_type
+         * rather than from a second -select_streams run.
+         *
+         * avg_frame_rate is preferred over r_frame_rate because they answer
+         * different questions: avg is the stream's actual rate, while r is the
+         * LOWEST rate every timestamp can be represented at -- a timebase in
+         * disguise for VFR files and for some MPEG-TS, where it can be five
+         * digits.  A rate that size becomes an ffmpeg `-r' that duplicates every
+         * frame thousands of times and a pacing clock that calls every one of
+         * them due, and the result is the film fast-forwarding at CPU speed.
          */
         QString title, artist;
         bool sawStreams = false, audio = false;
+        bool inVideoStream = false;
+        double avgRate = 0.0, baseRate = 0.0;
         const QStringList lines =
             QString::fromUtf8(m_probe->readAllStandardOutput()).split('\n');
         for (const QString &line : lines) {
             const QString t = line.trimmed();
             if (t.startsWith(QStringLiteral("codec_type="))) {
                 sawStreams = true;
-                if (t.mid(11) == QStringLiteral("audio"))
-                    audio = true;
-            } else if (t.startsWith(QStringLiteral("r_frame_rate=")) && m_probeFps <= 0.0) {
-                const QStringList r = t.mid(13).split('/');
+                const QString ctype = t.mid(11);
+                audio = audio || ctype == QStringLiteral("audio");
+                inVideoStream = ctype == QStringLiteral("video");
+            } else if (inVideoStream && (t.startsWith(QStringLiteral("avg_frame_rate=")) ||
+                                         t.startsWith(QStringLiteral("r_frame_rate=")))) {
+                const bool avg = t.startsWith(QStringLiteral("avg_frame_rate="));
+                const QStringList r = t.mid(t.indexOf('=') + 1).split('/');
+                double fps = 0.0;
                 if (r.size() == 2 && r.at(1).toDouble() > 0.0)
-                    m_probeFps = r.at(0).toDouble() / r.at(1).toDouble();
-                else
-                    m_probeFps = r.value(0).toDouble();
+                    fps = r.at(0).toDouble() / r.at(1).toDouble();
+                else if (r.size() == 1)
+                    fps = r.value(0).toDouble();
+                if (fps > 0.0 && !std::isnan(fps) && !std::isinf(fps)) {
+                    if (avg && avgRate <= 0.0)
+                        avgRate = fps;
+                    else if (!avg && baseRate <= 0.0)
+                        baseRate = fps;
+                }
             } else if (t.startsWith(QStringLiteral("duration="))) {
                 const double d = t.mid(9).toDouble();
-                if (d > 0.0)
+                if (d > 0.0 && !std::isnan(d) && !std::isinf(d))
                     m_probeDuration = d;
             } else if (t.startsWith(QStringLiteral("TAG:title="))) {
                 title = t.mid(10).trimmed();
@@ -1849,6 +1871,8 @@ void MediaPage::onProbeFinished()
         if (!title.isEmpty())
             m_probeTitle = artist.isEmpty() ? title
                                             : artist + QStringLiteral(" - ") + title;
+
+        m_probeFps = avgRate > 0.0 ? avgRate : baseRate;
 
         m_probe->deleteLater();
         m_probe = nullptr;
@@ -2016,14 +2040,26 @@ void MediaPage::openVideoNow(const Entry &entry, double startAt)
     m_videoDuration = m_probeDuration;
     m_videoHasAudio = m_probeAudio;
     /*
-     * Clamped, and the ceiling is not squeamishness about 60 fps material -- it is
-     * that the whole cost of a frame on this board is paid whether or not the eye
-     * can use it, and `-r' below makes ffmpeg do the dropping in the one place that
-     * can do it without decoding twice.  The floor covers a container whose
-     * r_frame_rate is nonsense, which is most of them when the stream is a slide
-     * show.  25 when there was no answer at all.
+     * Clamped, and BOTH ends of the clamp are load-bearing.
+     *
+     * The ceiling is not squeamishness about 60 fps material -- it is that the
+     * whole cost of a frame on this board is paid whether or not the eye can use
+     * it, and `-r' below makes ffmpeg do the dropping in the one place that can
+     * do it without decoding twice.
+     *
+     * The floor is the other half: the probed rate is a container's own claim and
+     * is not always a claim about the picture -- r_frame_rate is a timebase for
+     * some MPEG-TS and avg_frame_rate can be a frame an hour on a slideshow, and
+     * both flow straight into `-r' and into pump()'s due-time arithmetic.  A rate
+     * of 90000 makes ffmpeg duplicate every frame thousands of times and pump()
+     * call all of them due, which plays the film at CPU speed; a rate of 0.001
+     * parks the first frame in the pace timer for a month.  Neither is a film.
+     *
+     * 25 when there was no answer at all.
      */
-    m_videoFps = m_probeFps > 0.0 ? qBound(1.0, m_probeFps, 30.0) : 25.0;
+    const bool sane = m_probeFps > 0.0 && !std::isnan(m_probeFps)
+                      && !std::isinf(m_probeFps);
+    m_videoFps = sane ? qBound(5.0, m_probeFps, 30.0) : 25.0;
     /* The tags win and the file name is the floor -- for a film exactly as for a
      * track.  See displayTitle(). */
     m_trackTitle = displayTitle(item, m_probeTitle);
@@ -2221,6 +2257,15 @@ void MediaPage::openVideoNow(const Entry &entry, double startAt)
     m_pausedAt = (qint64)(startAt * 1000.0);
     setView(ViewVideo);
     refresh();
+
+    /* The probe that gates this function can outlast a panel hand-off: a film
+     * asked for at the glass may only start once the glass belongs to somebody
+     * else.  It comes up stopped in that case, exactly as panelLost() would
+     * have stopped it, and comes back with the panel. */
+    if (m_panelHidden) {
+        signalVideoChain(SIGSTOP);
+        m_pausedAt += m_clock.elapsed();
+    }
 }
 
 /*
@@ -2231,11 +2276,14 @@ void MediaPage::openVideoNow(const Entry &entry, double startAt)
  * the ones pump() needs to catch the sound up with.  So everything Qt has comes
  * out here and the queue is bounded from the producer instead.
  *
- * m_capped is the backstop for the case `-re' does not cover: a stall long enough
- * that the burst afterwards is measured in seconds of film.  Twenty-four frames is
- * about a second, which is far more than pump() can ever make use of -- anything
- * older than that is going to be dropped unwatched anyway, so it is dropped here
- * instead of after it has been carried around.
+ * The cap is the backstop for the case `-re' does not cover: a stall long enough
+ * that the burst afterwards is measured in seconds of film.  Six frames is a few
+ * hundred kilobytes in the planar format and far more than pump() can ever make
+ * use of -- to catch the sound up it only needs frames that are still DUE, and
+ * anything older than that is going to be dropped unwatched anyway.  So it is
+ * dropped here instead of after it has been carried around -- a buffer that used
+ * to hold twenty-four frames was eleven megabytes on a board whose whole memory
+ * budget is a thousand.
  */
 void MediaPage::fill()
 {
@@ -2246,7 +2294,7 @@ void MediaPage::fill()
     const int bytes = frameBytes();
     if (bytes <= 0)
         return;
-    const int cap = bytes * 24;
+    const int cap = bytes * 6;
     if (m_buffer.size() <= cap)
         return;
 
@@ -2295,7 +2343,7 @@ void MediaPage::pump()
         m_pace->stop();
 
     const int bytes = frameBytes();
-    if (bytes <= 0 || m_view != ViewVideo || m_paused)
+    if (bytes <= 0 || m_view != ViewVideo || m_paused || m_panelHidden)
         return;
 
     const double rate = m_videoFps > 0.0 ? m_videoFps : 25.0;
@@ -2370,7 +2418,8 @@ void MediaPage::refresh()
 
 void MediaPage::present()
 {
-    if (!m_gl || m_view != ViewVideo || !isVisible() || m_planes.isEmpty())
+    if (!m_gl || m_view != ViewVideo || !isVisible() || m_planes.isEmpty()
+        || m_panelHidden)
         return;
 
     const int w = m_frameW, h = m_frameH;
@@ -2810,6 +2859,83 @@ void MediaPage::dropFrame()
     m_gl = nullptr;
 }
 
+/* ── panel ownership ─────────────────────────────────────────────────────── */
+
+/*
+ * SIGSTOP or SIGCONT, to the film's processes and nothing else: the decoder
+ * and whichever pair is feeding the card.  The music chain is deliberately not
+ * in the list -- it does not draw, and a dashboard that is not in front is
+ * still the one place its sound is meant to be heard from.
+ */
+void MediaPage::signalVideoChain(int sig)
+{
+    QProcess *const chain[] = { m_decoder, m_videoAudio, m_videoAplay };
+    for (size_t i = 0; i < sizeof(chain) / sizeof(chain[0]); ++i) {
+        QProcess *p = chain[i];
+        if (!p || p->state() != QProcess::Running || p->processId() <= 0)
+            continue;
+        ::kill((pid_t)p->processId(), sig);
+    }
+}
+
+/*
+ * THE PANEL HAS CHANGED HANDS, SO THE FILM HAS TO STOP WRITING IT.
+ *
+ * The GPU path draws into the memory the panel is scanning, straight past Qt --
+ * which is what lets it put a picture up at all, and what would let it keep
+ * that picture going over a task, a window service or the switcher the moment
+ * one of them is in front.  Two writers on one framebuffer is the flicker the
+ * board was reported for, and both of them paying for it -- the film decoding
+ * and drawing at full rate while something else is on the glass -- is what
+ * turned the flicker into a freeze.
+ *
+ * So the film goes exactly where the pause button puts it: its processes
+ * SIGSTOP'd, and the clock banked, because the sound is stopped with the
+ * picture and the due-time arithmetic in pump() has to stop with both.  It is
+ * a nesting state, not the pause state: m_paused is what the user set, and a
+ * film that was playing when the panel went away is playing -- from the same
+ * position, sound and picture together -- the moment it comes back.
+ */
+void MediaPage::panelLost()
+{
+    if (m_panelHidden)
+        return;
+    m_panelHidden = true;
+    if (m_pace)
+        m_pace->stop();
+    /* A seek the slider was holding is dropped rather than committed into a
+     * panel this page no longer owns: commitSeek() would restart the chain,
+     * and the new chain would be one this stop never reached. */
+    if (m_seekTimer)
+        m_seekTimer->stop();
+    m_seekTarget = -1.0;
+
+    if (!videoLive() || m_paused)
+        return;
+    signalVideoChain(SIGSTOP);
+    m_pausedAt += m_clock.elapsed();
+}
+
+/*
+ * The panel is the dashboard's again.  What was paused by the user stays
+ * paused -- its frame goes back through the queued present() a repaint of this
+ * page issues -- and what was running is let run, from the banked clock.
+ */
+void MediaPage::panelRegained()
+{
+    if (!m_panelHidden)
+        return;
+    m_panelHidden = false;
+    if (!videoLive() || m_paused)
+        return;
+    signalVideoChain(SIGCONT);
+    m_clock.restart();
+    /* The frame that was in the pipe when the panel went away is due the
+     * moment this returns; readyRead will not fire to say so until the decoder
+     * -- which has only just been continued -- writes the next one. */
+    pump();
+}
+
 /* ── the transport ───────────────────────────────────────────────────────── */
 
 void MediaPage::togglePause()
@@ -2856,7 +2982,10 @@ void MediaPage::togglePause()
 
 double MediaPage::position() const
 {
-    return (m_pausedAt + (m_paused ? 0 : m_clock.elapsed())) / 1000.0;
+    /* The shell's pause stops the clock the same way the user's does: the
+     * picture and the sound are both frozen while the panel is gone. */
+    const bool frozen = m_paused || m_panelHidden;
+    return (m_pausedAt + (frozen ? 0 : m_clock.elapsed())) / 1000.0;
 }
 
 void MediaPage::seekTo(double seconds)

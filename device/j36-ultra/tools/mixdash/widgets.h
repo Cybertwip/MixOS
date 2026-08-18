@@ -133,6 +133,19 @@ public:
     virtual void onEnter();
     virtual void onLeave();
 
+    /*
+     * The panel has changed hands.  onEnter/onLeave are about the page STACK;
+     * these are about the PANEL -- a task in front, the window service in
+     * front, or the switcher on the glass all take it without moving the stack.
+     * A page that writes pixels outside Qt (a film in the scanout) must stop
+     * the moment the panel is not the dashboard's, because there is no
+     * compositor here to arbitrate two writers, and start again when it comes
+     * back.  Both are called idempotently -- a switcher opening over a task
+     * that is already in front loses the panel twice.
+     */
+    virtual void panelLost();
+    virtual void panelRegained();
+
     /* True while the page wants the whole panel -- no status bar, no dock.  Video
      * playback and the Terminal both do. */
     virtual bool wantsFullscreen() const;

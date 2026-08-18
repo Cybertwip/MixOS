@@ -462,6 +462,8 @@ bool PageWidget::handleNav(int) { return false; }
 void PageWidget::handleNavRelease(int) {}
 void PageWidget::onEnter() {}
 void PageWidget::onLeave() {}
+void PageWidget::panelLost() {}
+void PageWidget::panelRegained() {}
 bool PageWidget::wantsFullscreen() const { return false; }
 bool PageWidget::wantsKeys() const { return false; }
 void PageWidget::keyPressed(int, bool, int) {}

@@ -179,6 +179,19 @@ public:
      * See the redirected-mode note in pointer.h.
      */
     bool glOwnsScreen() const;
+    /*
+     * ── THE PANEL IS NOT THE DASHBOARD'S ANY MORE, OR IT IS AGAIN ──────────
+     *
+     * The film is drawn straight into scanout memory by the GPU, so it is the
+     * one thing on this page that keeps writing while Qt is stopped -- a task
+     * or the window service in front, or the switcher on the glass, would
+     * otherwise race it for the panel, frame by frame.  Losing the panel
+     * SIGSTOPs the film's processes the way the pause button does and banks
+     * the clock the picture is paced against; getting it back lets them run
+     * and puts the held frame up again.  Music is untouched: it does not draw.
+     */
+    void panelLost() override;
+    void panelRegained() override;
     void setVolumeOverlay(const QImage &argb, const QRect &at);
     void setPointerOverlay(const QImage &argb, const QRect &at);
     /* And the loading ring, which is the shell's for the same reason the other two
@@ -749,6 +762,19 @@ private:
     QElapsedTimer m_clock;
     qint64 m_pausedAt = 0;
     bool m_paused = false;
+
+    /*
+     * The dashboard is not in front -- a task, the window service or the
+     * switcher owns the panel.  Kept apart from m_paused because the two have
+     * different lifetimes: the pause button is the user's, this one is the
+     * shell's, and they nest -- a film can be paused while the panel is gone
+     * and gone while the film runs.  pump() and present() answer to it,
+     * because a frame that is drawn while somebody else owns the glass is a
+     * frame painted over their picture.
+     */
+    bool m_panelHidden = false;
+    /* SIGSTOP or SIGCONT to every process in the film's chain.  See panelLost(). */
+    void signalVideoChain(int sig);
 
     QString m_note;
 
