@@ -2087,7 +2087,11 @@ void Dashboard::launch(const QString &title, const QString &exe, const QStringLi
         if (i < 0)
             return;
         const QString what = m_tasks[i].title;
-        if (status == QProcess::CrashExit)
+        /* A death by the switcher's Start button is not a crash, even though it
+         * arrives as one. */
+        if (m_tasks[i].closing)
+            childDone(i, tr("Closed %1").arg(what));
+        else if (status == QProcess::CrashExit)
             childDone(i, tr("%1 crashed").arg(what));
         else if (code != 0)
             childDone(i, tr("%1 exited %2").arg(what).arg(code));
@@ -2770,13 +2774,25 @@ void Dashboard::closeSessionWindow(int index)
     if (index < 0 || index >= windows.size())
         return;
     const SessionWindow &w = windows[index];
-    if (w.xid != 0) {
+    /*
+     * A KILL AND NOT A CLOSE EVENT.  A window-close is a request to the program,
+     * and a wedged browser is perfectly free to sit on it -- window still mapped,
+     * memory still held, and the user pressing the button again for no visible
+     * result.  The window's PID is known from the EWMH list, so the session is
+     * asked to SIGKILL the client group that owns it instead; the window goes
+     * away because the process does.  A window with no PID (EWMH says so) falls
+     * back to the close event, which is the only remaining way to reach it.
+     */
+    if (w.pid > 1) {
+        if (!writeSessionControl(QStringLiteral("kill-window %1").arg(w.pid))) {
+            toast(tr("The window service is not answering"), 4000);
+            return;
+        }
+    } else if (w.xid != 0) {
         if (!writeSessionControl(QStringLiteral("close-window %1").arg(w.xid))) {
             toast(tr("The window service is not answering"), 4000);
             return;
         }
-    } else if (w.pid > 1) {
-        ::kill((pid_t)w.pid, SIGTERM);
     } else {
         return;
     }
@@ -2795,18 +2811,20 @@ void Dashboard::closeTask(int index)
 
     /*
      * SIGCONT FIRST, and the header says why: a stopped process cannot run a
-     * signal handler, so SIGTERM on its own would sit pending against something
+     * signal handler, so a kill on its own would sit pending against something
      * that never gets to act on it.  The task would vanish from the switcher and
      * carry on existing.
      *
-     * Then SIGTERM, and then nothing.  There is no SIGKILL after a timeout here:
-     * a shell that decided a program had had long enough would be second-guessing
-     * that program's own shutdown and persistence work.  A task that genuinely
-     * ignores SIGTERM stays in the list, which is at least honest.
+     * Then SIGKILL, straight ahead.  This button is the user saying the task is
+     * gone NOW: a graceful SIGTERM is a request the program can ignore for
+     * seconds it does not have on a board this size, and a task that ignored it
+     * would stay in this list looking closed but alive.  Unsaved state is the
+     * price of the button's promise, and the price the user chose by pressing it.
      */
+    task.closing = true;
     signalTask(task.pgid, SIGCONT);
     task.stopped = false;
-    signalTask(task.pgid, SIGTERM);
+    signalTask(task.pgid, SIGKILL);
 
     /*
      * The row is not removed here.  finished() is what removes it, through

@@ -482,6 +482,9 @@ private:
          */
         qint64 pgid = 0;
         bool stopped = false;
+        /* Set by closeTask() before the SIGKILL, so finished() reports the exit
+         * as the deliberate close it was rather than as a crash. */
+        bool closing = false;
         /*
          * The panel as this task last drew it, while it is stopped.  Cleared the
          * moment it is put back, so the memory is only spent on tasks that are

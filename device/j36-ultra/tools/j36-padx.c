@@ -2922,6 +2922,30 @@ int main(int argc, char **argv)
                     continue;
                 down = (ev.value == 1);
 
+                /*
+                 * MODAL WHILE THE KEYBOARD IS UP.  The D-pad walks the caps,
+                 * A activates one, B closes, Select toggles, and Menu still
+                 * reaches the switcher.  Every other button is swallowed
+                 * instead of being synthesised into the client: a wheel notch,
+                 * a zoom tap, a Ctrl+L or an Alt+Home landing in the field the
+                 * user is typing into reads exactly as "the keyboard erased my
+                 * input", which is what this guard exists to make impossible.
+                 * The directions pass through to set_dir(), which owns them
+                 * while the keyboard is up: kbd_move() only, never a key.
+                 */
+                if (kbd_visible) {
+                    switch (ev.code) {
+                    case KEY_UP:    case KEY_DOWN:
+                    case KEY_LEFT:  case KEY_RIGHT:
+                    case BTN_DPAD_UP:   case BTN_DPAD_DOWN:
+                    case BTN_DPAD_LEFT: case BTN_DPAD_RIGHT:
+                    case BTN_A: case BTN_B: case BTN_SELECT: case BTN_MODE:
+                        break;
+                    default:
+                        continue;
+                    }
+                }
+
                 switch (ev.code) {
                 /* Two spellings of the same four directions: this board's device
                  * tree uses the keyboard codes, and a USB pad whose D-pad is not a

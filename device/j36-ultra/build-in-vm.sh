@@ -12987,6 +12987,35 @@ client_alive() {
     kill -0 "$ca_pid" 2>/dev/null
 }
 
+# Is $1 -- a window's _NET_WM_PID, the process that owns the window, usually a
+# browser's engine child -- inside the tree rooted at client $2: the client itself
+# or any descendant?  Walks the PPID chain in /proc, the same idea as
+# pid_belongs_to in tools/j36-padx.c: killing the CLIENT means finding which
+# client's tree that process sits in.  64 hops is deeper than any launcher chain
+# on this card and the stop that keeps a /proc loop from eating a stale pid cycle.
+belongs_to() {
+    bt_pid="$1"
+    bt_client="$2"
+    bt_depth=0
+    case "$bt_pid" in ''|*[!0-9]*) return 1 ;; esac
+    while [ "$bt_pid" -gt 1 ] && [ "$bt_depth" -lt 64 ]; do
+        [ "$bt_pid" = "$bt_client" ] && return 0
+        [ -r "/proc/$bt_pid/stat" ] || return 1
+        # read exits nonzero on an EOF without a newline but still fills the
+        # variable, so the test is whether anything arrived at all.
+        read -r bt_line < "/proc/$bt_pid/stat" || [ -n "$bt_line" ] || return 1
+        # The command name is parenthesised and may contain anything at all,
+        # including spaces and ')' itself -- strip through the LAST ') ', and
+        # what is left is "state ppid ...".
+        bt_rest="${bt_line##*) }"
+        set -- $bt_rest
+        bt_pid="${2:-}"
+        case "$bt_pid" in ''|*[!0-9]*) return 1 ;; esac
+        bt_depth=$((bt_depth + 1))
+    done
+    return 1
+}
+
 reap_clients() {
     rc_live=""
     for rc_pid in $CLIENTS; do
@@ -13246,6 +13275,40 @@ while :; do
                 *)
                     /opt/mixos/bin/j36-padx --close-window "$close_window" >/dev/null 2>&1 ||
                         echo "j36-xsession: no mapped X window with id $close_window" >&2
+                    ;;
+            esac
+            ;;
+        "kill-window "*)
+            # ASKED FOR BY THE SWITCHER'S START BUTTON, which means go away now.
+            # A close-window is a WM_DELETE_WINDOW request the program may sit on
+            # for as long as it likes, and a stuck browser keeps the window mapped
+            # and its memory held while the button appears to do nothing.  The
+            # number here is the window's _NET_WM_PID from the EWMH list; find the
+            # client whose tree it belongs to and SIGKILL the whole process group
+            # -- the group, because the memory is in the engine children under the
+            # launcher, not in the launcher alone.  A pid that belongs to no
+            # client gets killed on its own as the best remaining answer.
+            kill_window="${line#kill-window }"
+            case "$kill_window" in
+                ''|*[!0-9]*)
+                    echo "j36-xsession: invalid X window kill '$line'" >&2
+                    ;;
+                *)
+                    kw_owner=""
+                    for kw_c in $CLIENTS; do
+                        if belongs_to "$kill_window" "$kw_c"; then
+                            kw_owner="$kw_c"
+                            break
+                        fi
+                    done
+                    if [ -n "$kw_owner" ]; then
+                        echo "j36-xsession: killing client $kw_owner for window process $kill_window" >&2
+                        kill -9 "-$kw_owner" 2>/dev/null || kill -9 "$kw_owner" 2>/dev/null
+                    else
+                        echo "j36-xsession: no client owns window process $kill_window; killing it alone" >&2
+                        kill -9 "$kill_window" 2>/dev/null
+                    fi
+                    reap_clients
                     ;;
             esac
             ;;
