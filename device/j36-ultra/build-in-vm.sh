@@ -9068,9 +9068,9 @@ QTCONF
 # So the panel is shared the plain way: mixdash stops painting, the
 # child writes /dev/fb0, and when the child exits the dashboard repaints over it.
 # Presentation is still simplefb -- lima has no display controller, and a
-# modeset is how the glass goes black.  GPU offload is the j36lima DDX:
-# DRI3 on the lima render node, finished buffers copied into the same
-# shadow fbdev already used.  The other half of the old note -- that
+# modeset is how the glass goes black.  The X server remains a software
+# ShadowFB presenter; client EGL acceleration is j36-eglx, which renders on
+# the lima node and copies finished images with XPutImage.  The other half of the old note -- that
 # netsurf-fb and links2 are both built without a framebuffer surface -- was
 # correct and has since been proved from the binaries themselves; it is why the
 # answer is an X server and not a smaller trick.
@@ -12169,7 +12169,6 @@ EndSection
 Section "Module"
     Load "shadow"
     Load "fb"
-    Load "dri3"
     Disable "glx"
 EndSection
 
@@ -12182,8 +12181,7 @@ Section "Device"
     Driver     "j36lima"
     Option     "fbdev"    "/dev/fb0"
     Option     "ShadowFB" "true"
-    Option     "DRI"      "true"
-    Option     "DRINode"  "/dev/dri/card0"
+    Option     "DRI"      "false"
 EndSection
 XORGCONF
     else
@@ -12587,10 +12585,9 @@ fi
 # file belong to root; the browser must not run as root in virtua's HOME.
 export J36_REAL_XORG="$XORG"
 export J36_XFB_SHADOW=/run/j36/xframebuffer
-# Mesa, not the RK3326 Mali blob, and lima, not a modesetting probe.
-# Xorg loads j36lima_drv.so which DRI3-opens the lima node; clients
-# inherit this path so eglInitialize talks to the same libraries
-# eglprobe -o already proved.
+# Mesa, not the RK3326 Mali blob, and lima, not a modesetting probe.  Xorg
+# stays software-only; graphical clients inherit j36-eglx and use the same
+# libraries as eglprobe without asking Xorg to provide DRI2/DRI3.
 if [ -d /run/j36/gl ]; then
     export LD_LIBRARY_PATH="/run/j36/gl${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
@@ -12603,7 +12600,8 @@ exec /usr/bin/xinit "$MAIN" "$FIRST" -- \
     "$XWRAP" :0 vt1 \
     -config "$XCONF" \
     -logfile /run/j36/xorg.log \
-    -ac -nolisten tcp -novtswitch -sharevts -keeptty -extension GLX
+    -ac -nolisten tcp -novtswitch -sharevts -keeptty \
+    -extension GLX -extension DRI2 -extension DRI3
 XSESSIONLAUNCH
     chmod 0755 "$SDROOT/opt/mixos/bin/j36-xsession"
 

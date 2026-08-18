@@ -12,21 +12,18 @@
  * black.  j36-xfb.so still intercepts that mmap so PadX can park the picture
  * without freezing Firefox.
  *
- * What fbdev cannot do is hand a GL client the Mali-450.  There is no DRI3,
- * GLX is switched off to avoid a fourteen-second swrast probe, and SDL that
- * asks for the x11 video driver with a GLES renderer finds nothing that
- * talks to card0.  This driver is fbdev's presentation plus lima's render
- * node:
+ * The X server is intentionally software-only.  Its DRI2/DRI3 extension path
+ * cannot describe a render-only lima card attached to simplefb reliably and
+ * aborts during Xorg extension startup.  GLX is switched off to avoid a
+ * fourteen-second swrast probe.  Client-side acceleration is supplied by the
+ * companion j36-eglx library, which talks to lima directly and presents with
+ * XPutImage.  This driver is fbdev's presentation plus lima-node discovery:
  *
  *   - the same /dev/fb0 mmap, the same ShadowFB, the same 640x480 x8r8g8b8,
  *     no VT, no CRTC, no ADDFB2, no DRM master;
- *   - an EGL 2.0 (GLES2) context is created on card0:lima, the same way
- *     eglprobe -o does -- GBM if the node accepts it, surfaceless if not;
- *   - DRI3 `open` returns that lima node so Mesa's lima_dri.so is the
- *     renderer behind every GLX/EGL client;
- *   - pixmap_from_fds imports a finished lima dma-buf through EGLImage
- *     and reads it into the shadow, which is GPU offload with simplefb
- *     scanout.
+ *   - the lima node can be identified without opening a modesetting device,
+ *     so the panel remains on simplefb throughout X startup;
+ *   - j36-eglx handles EGL/GBM acceleration outside the X server.
  *
  * Card0 on the kernel we ship IS lima.  The probe tries /dev/dri/card0
  * first and only walks the other nodes if that one is not lima.  A
@@ -81,6 +78,12 @@
 
 #define JLIMA_NAME		"j36lima"
 #define JLIMA_VERSION		1000
+
+#if defined(__GNUC__)
+#define JLIMA_UNUSED __attribute__((unused))
+#else
+#define JLIMA_UNUSED
+#endif
 
 enum {
 	OPTION_FBDEV,
@@ -383,7 +386,7 @@ static JLimaEGLContext jlima_try_context(JLimaPtr p, JLimaEGLConfig cfg,
 	return NULL;
 }
 
-static Bool jlima_egl_init(ScrnInfoPtr pScrn, JLimaPtr p)
+static Bool JLIMA_UNUSED jlima_egl_init(ScrnInfoPtr pScrn, JLimaPtr p)
 {
 	static const JLimaEGLint cfg_es[] = {
 		JL_EGL_RENDERABLE_TYPE, JL_EGL_OPENGL_ES2_BIT,
@@ -724,7 +727,7 @@ static dri3_screen_info_rec jlima_dri3_info = {
 	.open_client = jlima_dri3_open_client,
 };
 
-static Bool jlima_dri3_init(ScreenPtr screen)
+static Bool JLIMA_UNUSED jlima_dri3_init(ScreenPtr screen)
 {
 	ScrnInfoPtr pScrn = xf86ScreenToScrn(screen);
 	JLimaPtr p = JLIMAPTR(pScrn);
@@ -903,12 +906,7 @@ static Bool JLimaScreenInit(ScreenPtr pScreen, int argc, char **argv)
 	p->CloseScreen = pScreen->CloseScreen;
 	pScreen->CloseScreen = JLimaCloseScreen;
 
-	if (p->dri_fd >= 0)
-		jlima_egl_init(pScrn, p);
-#ifdef HAVE_DRI3
-	if (p->dri_fd >= 0)
-		p->dri3 = jlima_dri3_init(pScreen);
-#endif
+	/* Server-side DRI2/DRI3 is disabled.  X clients use j36-eglx instead. */
 	/* xf86SaveScreen was removed from the xserver headers this
 	 * chroot ships.  DPMS/blanking is already off in xorg.conf;
 	 * a no-op keeps the ScreenRec populated. */
@@ -1018,7 +1016,7 @@ static Bool JLimaPreInit(ScrnInfoPtr pScrn, int flags)
 {
 	JLimaPtr p;
 	const char *fbdev, *drinode;
-	Bool shadow = TRUE, want_dri = TRUE;
+	Bool shadow = TRUE, want_dri = FALSE;
 	Gamma zeros = { 0.0, 0.0, 0.0 };
 	rgb zeros_rgb = { 0, 0, 0 };
 
@@ -1138,6 +1136,9 @@ static Bool JLimaPreInit(ScrnInfoPtr pScrn, int flags)
 				   "lima: card0 GPU offload on %s (EGL 2.0 / DRI3, no modeset)\n",
 				   p->dri_path);
 		}
+	} else {
+		xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+			   "lima: server DRI disabled; client EGL uses j36-eglx\n");
 	}
 
 	pScrn->progClock = TRUE;
