@@ -2308,16 +2308,12 @@ void MediaPage::pump()
          * position() the strip and the seek bar are drawn from. */
         const double due = (m_videoStart + m_framesDecoded / rate) * 1000.0;
         const double now = position() * 1000.0;
-
-        /*
-         * A whole frame period of slack before anything is called early.  The
-         * alternative is arming a timer for three milliseconds, twenty-five times
-         * a second, on a board where the timer itself costs more than the wait.
-         */
         const double ahead = due - now;
-        if (ahead > 1000.0 / rate) {
+
+        /* If the frame is ahead of time, wait for its due time instead of showing immediately */
+        if (ahead > 2.0) {
             if (m_pace)
-                m_pace->start(qMax(1, (int)(ahead - 1000.0 / rate)));
+                m_pace->start(qMax(1, (int)qRound(ahead)));
             return;
         }
 

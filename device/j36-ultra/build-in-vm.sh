@@ -12147,6 +12147,11 @@ XORGCONF
 # Written by device/j36-ultra/build-in-vm.sh for the J36 Ultra's simple-framebuffer.
 # The lima DDX was not built; this is the software fbdev session.
 
+Section "Files"
+    ModulePath "/opt/mixos/lib/xorg/modules"
+    ModulePath "/usr/lib/xorg/modules"
+EndSection
+
 Section "ServerFlags"
     Option "AutoAddGPU"   "false"
     Option "AutoBindGPU"  "false"
@@ -12633,21 +12638,9 @@ export GDK_BACKEND=x11
 # still represented by Firefox's exit status and journal output.
 export MOZ_CRASHREPORTER_DISABLE=1
 export MOZ_CRASHREPORTER_NO_REPORT=1
-# Firefox is software-only on this board (see j36-browser); do not set
-# MOZ_X11_EGL here -- it forces a glxtest EGL probe that dies on fbdev
-# and can stack-smash through j36-eglx.  j36-eglx stays on LD_PRELOAD
-# below for GL games; j36-browser unsets it before execing Firefox.
+export MOZ_DISABLE_GLX_TEST=1
 export MOZ_WEBRENDER=0
 export MOZ_WEBRENDER_SOFTWARE=1
-# Official ESR sometimes ignores the remote-tabs prefs; this is the
-# remaining door into a single process, which is what stops the
-# compositor child dying and taking the window with it.
-export MOZ_FORCE_DISABLE_E10S=1
-# This kernel is out of tree.  Firefox's seccomp policy does not know its
-# syscalls, and the compositor child is what dies -- "IPC close /
-# AbnormalShutdown" a few seconds after the window maps.  The sandbox is
-# for a multi-user desktop; this session is one local client on a private
-# X server with no network listener.
 export MOZ_DISABLE_CONTENT_SANDBOX=1
 export MOZ_DISABLE_GMP_SANDBOX=1
 export MOZ_DISABLE_RDD_SANDBOX=1
@@ -13449,9 +13442,9 @@ export QT_QPA_PLATFORM=xcb
 # `j36-browser` must not depend on the session file being the same build.
 export MOZ_CRASHREPORTER_DISABLE=1
 export MOZ_CRASHREPORTER_NO_REPORT=1
+export MOZ_DISABLE_GLX_TEST=1
 export MOZ_WEBRENDER=0
 export MOZ_WEBRENDER_SOFTWARE=1
-export MOZ_FORCE_DISABLE_E10S=1
 export MOZ_DISABLE_CONTENT_SANDBOX=1
 export MOZ_DISABLE_GMP_SANDBOX=1
 export MOZ_DISABLE_RDD_SANDBOX=1
@@ -13580,9 +13573,8 @@ firefox_profile() {
 user_pref("fission.autostart", false);
 user_pref("dom.ipc.processCount", 1);
 user_pref("dom.ipc.processCount.webIsolated", 1);
-user_pref("browser.tabs.remote.autostart", false);
-user_pref("browser.tabs.remote.autostart.2", false);
-user_pref("browser.tabs.remote.autostart.force-disable", true);
+user_pref("browser.tabs.remote.autostart", true);
+user_pref("browser.tabs.remote.autostart.2", true);
 user_pref("layers.gpu-process.enabled", false);
 user_pref("layers.gpu-process.force-enabled", false);
 user_pref("gfx.gpu-process.allow-software", false);
@@ -13704,6 +13696,7 @@ case "${J36_BROWSER##*/}" in
         # Software-only: do not inherit the session's j36-eglx preload or
         # MOZ_X11_EGL.  glxtest forks with LD_PRELOAD and dies on this stack.
         unset MOZ_X11_EGL LD_PRELOAD
+        export MOZ_DISABLE_GLX_TEST=1
         export MOZ_AVOID_OPENGL_ALTOGETHER=1
         export LIBGL_ALWAYS_SOFTWARE=1
         run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" --no-remote \
