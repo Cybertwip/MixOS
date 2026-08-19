@@ -13969,6 +13969,36 @@ case "${J36_BROWSER##*/}" in
         export WEBKIT_FORCE_SANDBOX=0
         run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" "$URL"
         ;;
+    netsurf|netsurf-gtk)
+        # No EGL, no JavaScript, and the default Choices hide the URL
+        # bar.  Rewrite the profile every launch so a toolbar, a find
+        # bar and a 32 MiB memory cache are actually on, and skip
+        # j36-eglx -- it only slows a software engine.
+        unset LD_PRELOAD
+        unset __EGL_VENDOR_LIBRARY_FILENAMES
+        ns_home="${XDG_CONFIG_HOME:-$HOME/.config}/netsurf"
+        mkdir -p "$ns_home" "$HOME/.netsurf" 2>/dev/null
+        cat > "$ns_home/Choices" <<NSCHOICES
+homepage_url:$URL
+memory_cache_size:33554432
+disc_cache_size:16777216
+animate_images:0
+enable_javascript:0
+font_size:140
+font_min_size:110
+max_fetchers:6
+max_fetchers_per_host:3
+toolbar_status:1
+hotlist_toolbar:1
+url_suggestion:1
+downloads_directory:$HOME
+NSCHOICES
+        cp "$ns_home/Choices" "$HOME/.netsurf/Choices" 2>/dev/null || true
+        if [ -n "$RUNUSER" ]; then
+            chown -R virtua:virtua "$ns_home" "$HOME/.netsurf" 2>/dev/null
+        fi
+        run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" "$URL"
+        ;;
     *)
         run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" "$URL"
         ;;
@@ -14019,9 +14049,15 @@ a { text-decoration: underline; }
 
 <h1>MixOS</h1>
 
+<form action="https://html.duckduckgo.com/html/" method="get">
+<p><input type="text" name="q" size="32" value="">
+<input type="submit" value="Search"></p>
+</form>
+
 <p>A graphical browser, on the panel, driven by the pad. The left stick moves the
 pointer and <b>A</b> clicks whatever it is over. The D-pad remains navigation and
-the right stick is a two-axis scroll wheel.</p>
+the right stick is a two-axis scroll wheel. <b>Start</b> jumps to the address bar;
+<b>Select</b> opens the keyboard so you can type a search.</p>
 
 <h2>The pad</h2>
 
@@ -14112,16 +14148,14 @@ at.</p>
 
 <h2>What it can and cannot do</h2>
 
-<p>The browser this image ships is <b>Firefox ESR</b> &mdash; a real Gecko with a
-real JavaScript engine, so modern sites work. It is also a big program on a small
-machine: eight 1&nbsp;GHz cores, 1&nbsp;GB of RAM and no swap. It is set up here
-for that, with one content process instead of one per site, software rendering
-and small caches. Expect it to take a while to start and expect a page with
-thirty adverts on it to be the one that runs out of memory.</p>
+<p>The browser this image prefers is <b>surf</b> (WebKit) when it is installed,
+then <b>NetSurf</b>: CSS and images, no JavaScript, small enough for 1&nbsp;GB.
+NetSurf keeps a URL bar and a find bar on the toolbar. <b>Start</b> focuses the
+address, <b>Select</b> opens the keyboard, <b>X</b> submits. Modern sites that
+need JavaScript will look empty; use the search box above or DuckDuckGo lite.</p>
 
-<p><b>NetSurf</b> is installed alongside it: 4&nbsp;MB, its own engine, CSS and
-images but no JavaScript. It is the one to fall back on when Firefox will not
-start. From the Terminal card:</p>
+<p><b>Firefox ESR</b> is still reachable if you install it. From the Terminal card,
+to force NetSurf:</p>
 
 <p><code>J36_BROWSER=/usr/bin/netsurf-gtk /opt/mixos/bin/j36-browser</code></p>
 

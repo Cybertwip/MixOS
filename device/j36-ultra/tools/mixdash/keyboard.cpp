@@ -499,14 +499,18 @@ bool Keyboard::handleNav(int action)
         }
         return true;
     case Joypad::NavLeft:
-        if (m_row >= 0 && m_row < m_rows.size() && !m_rows[m_row].isEmpty()) {
-            m_col = (m_col - 1 + m_rows[m_row].size()) % m_rows[m_row].size();
+        /* Do not wrap.  Wrapping from the first letter lands on "back",
+         * and a D-pad Left after Up/Down then looked like it deleted the
+         * character that had just been typed. */
+        if (m_row >= 0 && m_row < m_rows.size() && m_col > 0) {
+            --m_col;
             updateCaps(oldRow, oldCol, m_row, m_col);
         }
         return true;
     case Joypad::NavRight:
-        if (m_row >= 0 && m_row < m_rows.size() && !m_rows[m_row].isEmpty()) {
-            m_col = (m_col + 1) % m_rows[m_row].size();
+        if (m_row >= 0 && m_row < m_rows.size() &&
+            m_col < m_rows[m_row].size() - 1) {
+            ++m_col;
             updateCaps(oldRow, oldCol, m_row, m_col);
         }
         return true;
@@ -523,10 +527,10 @@ bool Keyboard::handleNav(int action)
         dismiss(true);
         return true;
     case Joypad::NavPrevPage:
-        backspace();
-        return true;
     case Joypad::NavNextPage:
-        insert(QStringLiteral(" "));
+        /* Shoulders are not edits.  D-pad Up then Left ghosts L1 on this
+         * keypad matrix, and L1 used to be backspace -- that was the
+         * "last character I typed disappeared" report. */
         return true;
     default:
         return true; /* Swallow everything while the keyboard is up. */

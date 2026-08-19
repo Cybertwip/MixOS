@@ -93,13 +93,13 @@
  * that turns a client into a "game" and another into a "browser".  The pad
  * is never EVIOCGRAB'd while X is in front, so every client sees the real
  * joystick, D-pad and buttons.  The X pointer is a second, always-visible
- * device on the RIGHT stick, used to hit a close box:
+ * device on the LEFT stick, used to hit a close box:
  *
- *     Left stick     the client's own analog stick (never XTEST mouse)
- *     Right stick    X pointer, always drawn
- *     D-pad          the client's own hat / arrow keys (also X arrows)
- *     A              left click
- *     B              Back (Alt+Left)
+ *     Left stick     X pointer (same thumb as the dashboard)
+ *     Right stick    scroll wheel, both axes
+ *     D-pad          arrow keys; walks the on-screen keyboard
+ *     A              left click / type the selected key
+ *     B              Back (Alt+Left); closes the keyboard
  *     X              Return
  *     Y              Escape
  *     L1 / R1        wheel up / wheel down, repeating while held
@@ -114,6 +114,15 @@
  * The cursor is never hidden while this process is presenting.  A hidden
  * XFixes cursor is how a window became un-closeable: the close box was
  * there and the pointer was not.
+ *
+ * THE STICKS MATCH THE DASHBOARD AND A NORMAL CONSOLE.  An earlier
+ * revision put the X pointer on the RIGHT stick so a game would still
+ * see the left stick as an analog axis.  On this board the window
+ * service is used as a desktop -- NetSurf, a URL bar, a close box --
+ * and that map read as "the mouse is on the wrong thumb and the
+ * scroll stick does nothing".  MixOS and the start page already
+ * document left = pointer, right = two-axis wheel.  Games still see
+ * the raw evdev axes; only the XTEST pointer and wheel move.
  *
  * Menu is a hold and not a press because it is the only irreversible binding on
  * the pad and it sits under the thumb: a press would close the browser by
@@ -1818,10 +1827,13 @@ static void kbd_move(unsigned bit)
         kbd_col = 0;
         return;
     }
-    if (bit == DIR_LEFT)
-        kbd_col = (kbd_col + kbd_count[kbd_row] - 1) % kbd_count[kbd_row];
-    else if (bit == DIR_RIGHT)
-        kbd_col = (kbd_col + 1) % kbd_count[kbd_row];
+    if (bit == DIR_LEFT) {
+        if (kbd_col > 0)
+            kbd_col--;
+    } else if (bit == DIR_RIGHT) {
+        if (kbd_col < kbd_count[kbd_row] - 1)
+            kbd_col++;
+    }
     else {
         int target = kbd_row + (bit == DIR_UP ? -1 : 1);
         int centre, distance = 0x7fffffff;
@@ -2150,19 +2162,17 @@ static double axis_norm(int slot, int role, int raw)
     return (t < 0.0 ? t + d : t - d) / (1.0 - d);
 }
 
-/* Right stick is the X pointer.  The left stick is left to the client as
- * a real analog axis -- mapping it to the mouse is what made every FPS
- * spin, and guessing "this window is a game" is not a policy. */
+/* Left stick is the X pointer -- same hand as the dashboard. */
 static void pointer_rate(double *rx, double *ry)
 {
     int i;
 
     for (i = 0; i < MAX_PADS; i++) {
         double x, y, mag, curved;
-        if (ax_code[i][AX_RX] < 0 || ax_code[i][AX_RY] < 0)
+        if (ax_code[i][AX_LX] < 0 || ax_code[i][AX_LY] < 0)
             continue;
-        x = ax_val[i][AX_RX];
-        y = ax_val[i][AX_RY];
+        x = ax_val[i][AX_LX];
+        y = ax_val[i][AX_LY];
         mag = sqrt(x * x + y * y);
         if (mag > 1.0) {
             x /= mag;
@@ -2181,11 +2191,33 @@ static void pointer_rate(double *rx, double *ry)
     *rx = *ry = 0.0;
 }
 
-/* Wheel is L1/R1 only.  The right stick is the pointer, so it must not
- * also accumulate scroll notches. */
+/* Right stick is the wheel, both axes.  L1/R1 still notch as well. */
 static void scroll_rate(double *rx, double *ry)
 {
+    int i;
+
     *rx = *ry = 0.0;
+    if (kbd_visible)
+        return;
+    for (i = 0; i < MAX_PADS; i++) {
+        double x, y, mag, curved;
+        if (ax_code[i][AX_RX] < 0 || ax_code[i][AX_RY] < 0)
+            continue;
+        x = ax_val[i][AX_RX];
+        y = ax_val[i][AX_RY];
+        mag = sqrt(x * x + y * y);
+        if (mag > 1.0) {
+            x /= mag;
+            y /= mag;
+            mag = 1.0;
+        }
+        if (mag <= 0.0)
+            return;
+        curved = pow(mag, 1.0 + stick_acceleration * 0.015);
+        *rx = x / mag * SCROLL_MAX * curved;
+        *ry = y / mag * SCROLL_MAX * curved;
+        return;
+    }
 }
 
 static int sticks_active(void)
