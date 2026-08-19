@@ -1409,13 +1409,19 @@ void Dashboard::applyChrome()
 {
     PageWidget *page = current();
     const bool full = page && page->wantsFullscreen();
+    /* Pages must not extend under the keyboard.  linuxfb has no compositor:
+     * a D-pad step that dirties the field plus a distant cap makes a tall
+     * rectangle, the page paints into it, and the typed text is gone. */
+    const int kb = (m_keyboard && m_keyboard->isVisible()) ? qMin(300, height()) : 0;
 
     m_bar->setVisible(!full);
 
     const QRect normal(0, Theme::StatusH, width(),
-                       qMax(0, height() - Theme::StatusH));
+                       qMax(0, height() - Theme::StatusH - kb));
     if (page)
-        page->setGeometry(full ? rect() : normal);
+        page->setGeometry(full
+                          ? QRect(0, 0, width(), qMax(0, height() - kb))
+                          : normal);
 
     if (page)
         m_bar->setTitle(page->title());
@@ -1470,15 +1476,16 @@ void Dashboard::resizeEvent(QResizeEvent *event)
 {
     m_bar->setGeometry(0, 0, width(), Theme::StatusH);
 
+    const int kb = (m_keyboard && m_keyboard->isVisible()) ? qMin(300, height()) : 0;
     const QRect normal(0, Theme::StatusH, width(),
-                       qMax(0, height() - Theme::StatusH));
+                       qMax(0, height() - Theme::StatusH - kb));
     for (PageWidget *page : m_all)
         page->setGeometry(normal);
 
     /* The keyboard is an overlay over the bottom of the screen rather than a page:
      * what is being typed into stays visible above it. */
-    const int kb = qMin(300, height());
-    m_keyboard->setGeometry(0, height() - kb, width(), kb);
+    m_keyboard->setGeometry(0, height() - qMin(300, height()), width(),
+                            qMin(300, height()));
 
     /* The volume bar is given the WHOLE panel and not `normal', because it has to
      * be placeable over a page that took the status bar away -- the Media player
@@ -1665,6 +1672,9 @@ void Dashboard::onTextRequested(const QString &prompt, const QString &initial, b
     }
     m_textTarget = target;
     m_keyboard->open(prompt, initial, password);
+    /* Shrink the page off the keyboard before the first key is drawn, otherwise
+     * the page's last frame is still sitting in those pixels. */
+    applyChrome();
     m_keyboard->raise();
     m_pointer->raise();
     syncInputMode();
@@ -1675,6 +1685,7 @@ void Dashboard::onKeyboardFinished(const QString &text, bool accepted)
     PageWidget *target = m_textTarget.data();
     m_textTarget.clear();
     syncInputMode();
+    applyChrome();
     if (target)
         target->textEntered(text, accepted);
     update();

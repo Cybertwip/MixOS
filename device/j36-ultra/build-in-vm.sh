@@ -13951,6 +13951,24 @@ case "${J36_BROWSER##*/}" in
             --password-store=basic --window-size=640,480 \
             --window-position=0,0 "$URL"
         ;;
+    surf|luakit|epiphany|epiphany-browser)
+        # WebKitGTK's default path is DMA-BUF + EGL.  This X server is
+        # software ShadowFB (DRI is off on j36lima) and the session
+        # LD_PRELOADs j36-eglx -- the same preload that stack-smashed
+        # Firefox's glxtest.  The WebProcess inherits both, dies, and
+        # surf logs waitid(pid) failed / "the browser crashes".
+        unset LD_PRELOAD
+        unset __EGL_VENDOR_LIBRARY_FILENAMES
+        unset MESA_LOADER_DRIVER_OVERRIDE
+        unset GALLIUM_DRIVER
+        export LIBGL_ALWAYS_SOFTWARE=1
+        export GSK_RENDERER=cairo
+        export WEBKIT_DISABLE_COMPOSITING_MODE=1
+        export WEBKIT_DISABLE_DMABUF_RENDERER=1
+        export WEBKIT_SKIA_ENABLE_CPU_RENDERING=1
+        export WEBKIT_FORCE_SANDBOX=0
+        run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" "$URL"
+        ;;
     *)
         run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" "$URL"
         ;;

@@ -828,6 +828,11 @@ JLimaShadowWindow(ScreenPtr pScreen, CARD32 row, CARD32 offset, int mode,
 
 	(void)mode;
 	(void)closure;
+	if (!p || !p->fb || p->fix.line_length == 0 ||
+	    row >= (CARD32)pScrn->virtualY) {
+		*size = 0;
+		return NULL;
+	}
 	*size = p->fix.line_length;
 	return (void *)(p->fb + (size_t)row * p->fix.line_length + offset);
 }
@@ -838,6 +843,7 @@ JLimaCreateScreenResources(ScreenPtr pScreen)
 	ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
 	JLimaPtr p = JLIMAPTR(pScrn);
 	PixmapPtr pPixmap;
+	void *bits;
 	Bool ret;
 
 	pScreen->CreateScreenResources = p->CreateScreenResources;
@@ -847,8 +853,33 @@ JLimaCreateScreenResources(ScreenPtr pScreen)
 	if (!ret)
 		return FALSE;
 
+	/*
+	 * fbScreenInit was given the shadow (or the mmap) so the pixmap
+	 * header already names that buffer.  Re-attach after the server's
+	 * CreateScreenResources anyway: miCreateScreenResources can wrap a
+	 * 0x0 pixmap around a NULL pointer when the driver hands it no
+	 * bits, and shadowUpdatePacked then memcpy's 640x480 off a tiny
+	 * allocation -- the `malloc(): invalid size (unsorted)' that
+	 * aborted Xorg before xinit could connect.
+	 */
 	pPixmap = pScreen->GetScreenPixmap(pScreen);
-	if (!shadowAdd(pScreen, pPixmap, shadowUpdatePacked,
+	if (!pPixmap)
+		return FALSE;
+	bits = p->shadow ? p->shadowFB : p->fb;
+	if (!bits)
+		return FALSE;
+	if (!pScreen->ModifyPixmapHeader(pPixmap, pScrn->virtualX,
+					 pScrn->virtualY, pScrn->depth,
+					 pScrn->bitsPerPixel,
+					 p->fix.line_length, bits)) {
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+			   "could not attach the %s framebuffer to the screen pixmap\n",
+			   p->shadow ? "shadow" : "hardware");
+		return FALSE;
+	}
+
+	if (p->shadow &&
+	    !shadowAdd(pScreen, pPixmap, shadowUpdatePacked,
 		       JLimaShadowWindow, 0, 0))
 		return FALSE;
 
@@ -910,19 +941,51 @@ static Bool JLimaScreenInit(ScreenPtr pScreen, int argc, char **argv)
 	if (displayWidth == 0)
 		displayWidth = pScrn->virtualX;
 
+	/*
+	 * Same order as xf86-video-fbdev: allocate the shadow, hand that
+	 * buffer to fbScreenInit, then wrap CreateScreenResources so the
+	 * pixmap stays pointed at it.  Passing NULL here used to leave the
+	 * screen pixmap as a 0x0 scratch; the first root-window paint then
+	 * walked 640x480 pixels off that allocation and aborted with
+	 * `malloc(): invalid size (unsorted)' -- which is why
+	 * j36-xdesktop.service never came up.
+	 */
+	if (p->shadow) {
+		const size_t bytes = (size_t)p->fix.line_length *
+				     (size_t)pScrn->virtualY;
+
+		if (bytes == 0) {
+			xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+				   "shadow framebuffer size is zero\n");
+			return FALSE;
+		}
+		p->shadowFB = calloc(1, bytes);
+		if (!p->shadowFB) {
+			xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+				   "failed to allocate %zu-byte shadow framebuffer\n",
+				   bytes);
+			return FALSE;
+		}
+	}
+
 	miClearVisualTypes();
 	if (!miSetVisualTypes(pScrn->depth,
 			      TrueColorMask | DirectColorMask,
-			      pScrn->rgbBits, TrueColor))
+			      pScrn->rgbBits, TrueColor) ||
+	    !miSetPixmapDepths()) {
+		free(p->shadowFB);
+		p->shadowFB = NULL;
 		return FALSE;
-	if (!miSetPixmapDepths())
-		return FALSE;
+	}
 
-	if (!fbScreenInit(pScreen, p->shadow ? NULL : p->fb,
+	if (!fbScreenInit(pScreen, p->shadow ? p->shadowFB : p->fb,
 			  pScrn->virtualX, pScrn->virtualY,
 			  pScrn->xDpi, pScrn->yDpi,
-			  displayWidth, pScrn->bitsPerPixel))
+			  displayWidth, pScrn->bitsPerPixel)) {
+		free(p->shadowFB);
+		p->shadowFB = NULL;
 		return FALSE;
+	}
 
 	if (pScrn->bitsPerPixel > 8) {
 		visual = pScreen->visuals + pScreen->numVisuals;
@@ -941,16 +1004,13 @@ static Bool JLimaScreenInit(ScreenPtr pScreen, int argc, char **argv)
 	fbPictureInit(pScreen, 0, 0);
 	xf86SetBlackWhitePixels(pScreen);
 
-	if (p->shadow) {
-		p->shadowFB = calloc(1, (size_t)displayWidth * (size_t)pScrn->virtualY *
-				     (size_t)((pScrn->bitsPerPixel + 7) / 8));
-		if (!p->shadowFB)
-			return FALSE;
-		if (!shadowSetup(pScreen))
-			return FALSE;
-		p->CreateScreenResources = pScreen->CreateScreenResources;
-		pScreen->CreateScreenResources = JLimaCreateScreenResources;
+	if (p->shadow && !shadowSetup(pScreen)) {
+		free(p->shadowFB);
+		p->shadowFB = NULL;
+		return FALSE;
 	}
+	p->CreateScreenResources = pScreen->CreateScreenResources;
+	pScreen->CreateScreenResources = JLimaCreateScreenResources;
 
 	xf86SetBackingStore(pScreen);
 	miDCInitialize(pScreen, xf86GetPointerScreenFuncs());

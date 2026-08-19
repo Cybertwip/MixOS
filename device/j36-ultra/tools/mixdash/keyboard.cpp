@@ -150,15 +150,15 @@ void Keyboard::saveSharedState() const
 
 void Keyboard::updateCaps(int oldRow, int oldCol, int newRow, int newCol)
 {
-    QRegion damage;
-    if (oldRow >= 0 && oldRow < m_rows.size() &&
-        oldCol >= 0 && oldCol < m_rows[oldRow].size())
-        damage += m_rows[oldRow][oldCol].rect.adjusted(-2, -2, 2, 2).toAlignedRect();
-    if (newRow >= 0 && newRow < m_rows.size() &&
-        newCol >= 0 && newCol < m_rows[newRow].size())
-        damage += m_rows[newRow][newCol].rect.adjusted(-2, -2, 2, 2).toAlignedRect();
-    if (!damage.isEmpty())
-        update(damage);
+    (void)oldRow;
+    (void)oldCol;
+    (void)newRow;
+    (void)newCol;
+    /* Full widget, not a pair of caps.  Up/down then left dirties the field
+     * plus two distant keys; linuxfb unions that into a tall rectangle, the
+     * page underneath paints into it, and a partial update cannot put the
+     * typed text back.  The keyboard is opaque, so a complete fill is cheap. */
+    update();
 }
 
 void Keyboard::open(const QString &prompt, const QString &initial, bool password)
@@ -661,13 +661,15 @@ void Keyboard::paintEvent(QPaintEvent *event)
     p.setRenderHint(QPainter::Antialiasing, true);
     const QRegion dirty = event->region();
 
-    /* The panel itself: solid enough to read a passphrase against whatever the
-     * page underneath happens to be. */
+    /* The panel itself.  Clip the fill to the dirty rect so a partial
+     * event cannot paint background over the field and then skip it. */
     const QColor back = Theme::window();
     p.setPen(Qt::NoPen);
     p.setBrush(back);
+    p.setClipRegion(dirty);
     p.drawRoundedRect(QRectF(0, 0, width(), height() + Theme::Radius), Theme::Radius,
                       Theme::Radius);
+    p.setClipping(false);
     p.setBrush(Qt::NoBrush);
     p.setPen(QPen(Theme::border(), 1.0));
     p.drawLine(QPointF(0, 0.5), QPointF(width(), 0.5));
@@ -679,48 +681,47 @@ void Keyboard::paintEvent(QPaintEvent *event)
         p.drawText(promptRect, Qt::AlignLeft | Qt::AlignVCenter, m_prompt);
     }
 
-    /* The field. */
+    /* The field.  Always redrawn: linuxfb clips poorly, and the background
+     * fill above would otherwise leave an empty box after a D-pad step. */
     const QRectF field = fieldRect();
-    if (dirty.intersects(field.adjusted(-2, -2, 2, 2).toAlignedRect())) {
-        Theme::vgrad(p, field, Theme::glass().lighter(140),
-                     Theme::glass().lighter(120), 8);
-        p.setBrush(Qt::NoBrush);
-        p.setPen(QPen(Theme::blue(), 1.4));
-        p.drawRoundedRect(field.adjusted(0.5, 0.5, -0.5, -0.5), 8, 8);
+    Theme::vgrad(p, field, Theme::glass().lighter(140),
+                 Theme::glass().lighter(120), 8);
+    p.setBrush(Qt::NoBrush);
+    p.setPen(QPen(Theme::blue(), 1.4));
+    p.drawRoundedRect(field.adjusted(0.5, 0.5, -0.5, -0.5), 8, 8);
 
-        const QString shown = m_password ? QString(m_text.size(), QChar(0x2022)) : m_text;
-        const QFont fieldFont = Theme::font(14);
-        const QFontMetrics ffm(fieldFont);
-        p.setFont(fieldFont);
-        p.setPen(Theme::ink());
+    const QString shown = m_password ? QString(m_text.size(), QChar(0x2022)) : m_text;
+    const QFont fieldFont = Theme::font(14);
+    const QFontMetrics ffm(fieldFont);
+    p.setFont(fieldFont);
+    p.setPen(Theme::ink());
 
-        /* Scrolled so the caret is always on screen, which for a 63-character key
-         * is the difference between usable and not. */
-        const qreal inner = qMax(1.0, field.width() - 20);
-        const int safeCaret = qBound(0, m_caret, shown.size());
-        qreal caretX = ffm.horizontalAdvance(shown.left(safeCaret));
-        qreal offset = 0;
-        if (caretX > inner)
-            offset = caretX - inner;
-        p.save();
-        p.setClipRect(field.adjusted(8, 0, -8, 0));
-        p.drawText(QRectF(field.x() + 10 - offset, field.y(),
-                          qMax(inner, caretX + 20), field.height()),
-                   Qt::AlignLeft | Qt::AlignVCenter, shown);
-        p.setPen(QPen(Theme::blue(), 1.6));
-        p.drawLine(QPointF(field.x() + 10 - offset + caretX, field.y() + 6),
-                   QPointF(field.x() + 10 - offset + caretX, field.bottom() - 6));
-        p.restore();
-    }
+    /* Scrolled so the caret is always on screen, which for a 63-character key
+     * is the difference between usable and not. */
+    const qreal inner = qMax(1.0, field.width() - 20);
+    const int safeCaret = qBound(0, m_caret, shown.size());
+    qreal caretX = ffm.horizontalAdvance(shown.left(safeCaret));
+    qreal offset = 0;
+    if (caretX > inner)
+        offset = caretX - inner;
+    p.save();
+    p.setClipRect(field.adjusted(8, 0, -8, 0));
+    p.drawText(QRectF(field.x() + 10 - offset, field.y(),
+                      qMax(inner, caretX + 20), field.height()),
+               Qt::AlignLeft | Qt::AlignVCenter, shown);
+    p.setPen(QPen(Theme::blue(), 1.6));
+    p.drawLine(QPointF(field.x() + 10 - offset + caretX, field.y() + 6),
+               QPointF(field.x() + 10 - offset + caretX, field.bottom() - 6));
+    p.restore();
 
-    /* The caps. */
+    /* The caps.  Always drawn: a clip-only skip after a tall D-pad update
+     * left blank keys, and the next Left then looked like the field had
+     * been erased because the strip above it was gone too. */
     const QFont capFont = Theme::font(15, true);
     const QFont wideFont = Theme::font(12, true);
     for (int r = 0; r < m_rows.size(); ++r) {
         for (int c = 0; c < m_rows[r].size(); ++c) {
             const Cap &cap = m_rows[r][c];
-            if (!dirty.intersects(cap.rect.adjusted(-2, -2, 2, 2).toAlignedRect()))
-                continue;
             const bool focused = (r == m_row && c == m_col);
             const bool down = (m_pressed == r * 100 + c);
             const bool accent = (cap.special == KeyAccept);
