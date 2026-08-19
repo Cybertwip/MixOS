@@ -13966,7 +13966,16 @@ case "${J36_BROWSER##*/}" in
         export WEBKIT_DISABLE_COMPOSITING_MODE=1
         export WEBKIT_DISABLE_DMABUF_RENDERER=1
         export WEBKIT_SKIA_ENABLE_CPU_RENDERING=1
-        export WEBKIT_FORCE_SANDBOX=0
+        # Debian's WebKitGTK ignores WEBKIT_FORCE_SANDBOX=0 and the
+        # sandboxed WebProcess then dies (pw.conf missing, D-Bus name
+        # release failed) -- that is the crash after a few minutes.
+        unset WEBKIT_FORCE_SANDBOX
+        export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
+        # Do not load GStreamer/PipeWire.  The WebProcess logged
+        # "pw.conf: can't load config" then the connection closed.
+        export GST_PLUGIN_SYSTEM_PATH_1_0=
+        export GST_PLUGIN_PATH_1_0=
+        export GST_REGISTRY_1_0=/tmp/gst-empty.bin
         run_browser ${DBUS:+$DBUS --} "$J36_BROWSER" "$URL"
         ;;
     netsurf|netsurf-gtk)

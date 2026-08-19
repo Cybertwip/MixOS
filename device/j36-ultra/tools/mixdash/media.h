@@ -439,6 +439,9 @@ private:
     /* Video and pictures only.  Music has its own, because the two have opposite
      * lifetimes: see the header comment. */
     void stopVideo();
+    /* Sound starts with the first video frame, not with ffmpeg's spawn, so a
+     * two-second libavcodec load cannot make every picture frame look late. */
+    void launchVideoAudio();
     /*
      * Let go of the picture -- the QImage, the planes the GPU was drawing from,
      * and the strip texture.  NOT part of stopVideo(), and that is the point: a
@@ -671,6 +674,9 @@ private:
     /* The `-ss' this decoder run was started with, so frame numbers can be turned
      * into positions in the film rather than in the run. */
     double m_videoStart = 0.0;
+    /* False until pump() has presented frame 0.  The wall clock and the
+     * audio process both start then, not when ffmpeg is spawned. */
+    bool m_videoPaced = false;
     /* Fires when the frame already sitting in the buffer becomes due.  Single
      * shot and re-armed by pump(): a frame arriving early has to be held, and
      * readyRead will not fire again to remind us. */

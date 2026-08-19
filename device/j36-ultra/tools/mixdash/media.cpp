@@ -2158,12 +2158,14 @@ void MediaPage::openVideoNow(const Entry &entry, double startAt)
      * already decoded it.
      */
     QStringList args;
-    args << "-nostdin" << "-hide_banner" << "-loglevel" << "error" << "-re";
+    args << "-nostdin" << "-hide_banner" << "-loglevel" << "error"
+         << "-readrate" << "1" << "-re";
     if (startAt > 0.0)
         args << "-ss" << QString::number(startAt, 'f', 2);
     args << "-i" << item.path
          << "-map" << "0:v:0"
          << "-vf" << filter
+         << "-fps_mode" << "cfr"
          << "-vsync" << "cfr"
          << "-r" << QString::number(m_videoFps, 'f', 3)
          << "-f" << "rawvideo" << "-pix_fmt" << (m_gl ? "yuv420p" : "bgra")
@@ -2176,7 +2178,6 @@ void MediaPage::openVideoNow(const Entry &entry, double startAt)
      * either as the other is what sends someone rebuilding the wrong half.
      */
     m_device = alsaDevice();
-    const bool alsa = !m_device.isEmpty() && ffmpegHasAlsa();
 
     m_decoder = new QProcess(this);
     m_decoder->setReadChannel(QProcess::StandardOutput);
@@ -2186,74 +2187,30 @@ void MediaPage::openVideoNow(const Entry &entry, double startAt)
     m_decoder->start(ffmpegPath(), args);
 
     /*
-     * ── THE SOUND IS ITS OWN PROCESS, AND THAT IS THE FIX FOR CHOPPY FILMS ──
-     *
-     * It used to be the same ffmpeg: one command with two outputs, rawvideo on
-     * pipe:1 and the sound on `-f alsa'.  That reads well and it starves the DAC.
-     *
-     * A frame here is 640x480x4 -- 1.2 MB -- and a pipe holds 64 KiB, so ffmpeg is
-     * blocked in write(2) for almost the whole of every frame, waiting for this
-     * process to come round the event loop and drain it.  A muxer is one thread:
-     * while it is blocked on the pipe it is not calling snd_pcm_writei either.  The
-     * card's ring is 64 KiB, which at 48 kHz stereo is 341 ms, so any single stall
-     * longer than that -- one full-screen repaint that runs long, one directory
-     * listing, one page of the card read cold -- is a hole in the sound.  That is
-     * exactly what "the audio is extremely choppy" sounds like, and it gets worse
-     * the more the picture costs, which is backwards.
-     *
-     * Two processes cannot do that to each other.  The decoder blocks on the pipe
-     * as before and nothing else is behind it; the sound has its own demux, its own
-     * decode -- cheap, `-vn' and one stream -- and blocks only on the card.
-     *
-     * WHAT IT COSTS is a shared clock: the picture is paced by ffmpeg's `-re' off
-     * the wall clock and the sound by the AFE's own 48 kHz, so they drift by
-     * whatever those two disagree by.  That is parts per million on this SoC, it
-     * starts from the same timestamp because both are given the same `startAt', and
-     * every seek restarts both.  A few milliseconds an hour against a hole in the
-     * sound every few seconds is not a close call.
+     * Do not start the sound or the presentation clock here.  ffmpeg spends
+     * a visible moment loading libavcodec; if the clock is already running
+     * then, every frame that finally arrives is "late" and pump() draws it
+     * at decode speed -- the film races while ALSA keeps real time.
+     * launchVideoAudio() and the clock both start on frame 0.
      */
-    if (m_device.isEmpty()) {
-        /*
-         * Nothing to play into, so no sound chain is started at all -- an ffmpeg
-         * that cannot open a device is a process failing in the background while
-         * the screen says nothing.  The note is the whole of the response.
-         */
+    m_videoPaced = false;
+    if (m_device.isEmpty())
         m_note = tr("no sound card on this device");
-    } else if (!m_videoHasAudio) {
-        m_note.clear();                 /* a silent clip, and that is not a fault */
-        refreshMixerNote();
-    } else if (alsa) {
-        m_videoAudio = new QProcess(this);
-        connect(m_videoAudio, &QProcess::readyReadStandardError,
-                this, &MediaPage::onChildStderr);
-        m_videoAudio->start(ffmpegPath(), audioDecodeArgs(item.path, startAt, m_device));
+    else if (!m_videoHasAudio) {
         m_note.clear();
         refreshMixerNote();
-    } else {
-        /*
-         * No alsa outdev in this ffmpeg, so the sound goes down a pipe into aplay
-         * instead.  Same shape, one more process, and the same drift.
-         */
+    } else if (!ffmpegHasAlsa()) {
         const QString aplay = aplayPath();
-        if (!aplay.isEmpty()) {
-            m_videoAudio = new QProcess(this);
-            m_videoAplay = new QProcess(this);
-            m_videoAudio->setStandardOutputProcess(m_videoAplay);
-            connect(m_videoAplay, &QProcess::readyReadStandardError,
-                    this, &MediaPage::onChildStderr);
-            m_videoAudio->start(ffmpegPath(), audioDecodeArgs(item.path, startAt, QString()));
-            m_videoAplay->start(aplay, QStringList()
-                                           << "-q" << "-D" << m_device
-                                           << "-t" << "raw" << "-f" << "S16_LE"
-                                           << "-r" << QString::number(kRate) << "-c" << "2"
-                                           << "-");
-            m_note = tr("audio through aplay -- no alsa muxer in ffmpeg");
-        } else {
+        if (aplay.isEmpty())
             m_note = tr("aplay is not installed (alsa-utils)");
-        }
+        else
+            m_note = tr("audio through aplay -- no alsa muxer in ffmpeg");
+    } else {
+        m_note.clear();
+        refreshMixerNote();
     }
 
-    m_clock.restart();
+    m_clock.invalidate();
     m_pausedAt = (qint64)(startAt * 1000.0);
     setView(ViewVideo);
     refresh();
@@ -2306,9 +2263,46 @@ void MediaPage::fill()
     m_framesDropped += over;
 }
 
+void MediaPage::launchVideoAudio()
+{
+    if (!m_videoHasAudio || m_device.isEmpty() || m_showing.path.isEmpty())
+        return;
+    if (m_videoAudio)
+        return;
+
+    const double startAt = m_videoStart;
+    if (ffmpegHasAlsa()) {
+        m_videoAudio = new QProcess(this);
+        connect(m_videoAudio, &QProcess::readyReadStandardError,
+                this, &MediaPage::onChildStderr);
+        m_videoAudio->start(ffmpegPath(), audioDecodeArgs(m_showing.path, startAt, m_device));
+        return;
+    }
+
+    const QString aplay = aplayPath();
+    if (aplay.isEmpty())
+        return;
+    m_videoAudio = new QProcess(this);
+    m_videoAplay = new QProcess(this);
+    m_videoAudio->setStandardOutputProcess(m_videoAplay);
+    connect(m_videoAplay, &QProcess::readyReadStandardError,
+            this, &MediaPage::onChildStderr);
+    m_videoAudio->start(ffmpegPath(), audioDecodeArgs(m_showing.path, startAt, QString()));
+    m_videoAplay->start(aplay, QStringList()
+                                   << "-q" << "-D" << m_device
+                                   << "-t" << "raw" << "-f" << "S16_LE"
+                                   << "-r" << QString::number(kRate) << "-c" << "2"
+                                   << "-");
+}
+
 void MediaPage::readFrames()
 {
     fill();
+    /* A wait already armed means this frame is early.  Drain only -- calling
+     * pump() would cancel the timer and, with one late frame in the pipe,
+     * draw at decode speed. */
+    if (m_pace && m_pace->isActive())
+        return;
     pump();
 }
 
@@ -2347,6 +2341,16 @@ void MediaPage::pump()
         return;
 
     const double rate = m_videoFps > 0.0 ? m_videoFps : 25.0;
+
+    if (!m_videoPaced) {
+        if (m_buffer.size() < bytes)
+            return;
+        /* Frame 0 defines t=0 for the picture AND the sound. */
+        m_videoPaced = true;
+        m_clock.restart();
+        m_pausedAt = (qint64)(m_videoStart * 1000.0);
+        launchVideoAudio();
+    }
 
     for (;;) {
         if (m_buffer.size() < bytes)
@@ -2830,6 +2834,7 @@ void MediaPage::stopVideo()
     m_framesShown = 0;
     m_framesDropped = 0;
     m_framesDecoded = 0;
+    m_videoPaced = false;
     if (m_pace)
         m_pace->stop();
     m_seekTimer->stop();
@@ -2992,7 +2997,7 @@ double MediaPage::position() const
 {
     /* The shell's pause stops the clock the same way the user's does: the
      * picture and the sound are both frozen while the panel is gone. */
-    const bool frozen = m_paused || m_panelHidden;
+    const bool frozen = m_paused || m_panelHidden || !m_clock.isValid();
     return (m_pausedAt + (frozen ? 0 : m_clock.elapsed())) / 1000.0;
 }
 
