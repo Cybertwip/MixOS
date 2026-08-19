@@ -819,22 +819,71 @@ static Bool JLimaSaveScreen(ScreenPtr pScreen, int mode)
 	return TRUE;
 }
 
-static void *
-JLimaShadowWindow(ScreenPtr pScreen, CARD32 row, CARD32 offset, int mode,
-		  CARD32 *size, void *closure)
+/*
+ * Copy damaged boxes from the shadow pixmap into the mmap.  Do not use
+ * shadowUpdatePacked + a window callback: a callback that returns NULL
+ * (the "safety" check this driver used to have) is a memcpy(NULL) in
+ * this xserver, which is the empty (EE) Backtrace one second after
+ * PadX reports ready -- X comes up, then j36-xdesktop dies and the
+ * dashboard says the window system is not running.
+ */
+static void
+JLimaUpdatePacked(ScreenPtr pScreen, shadowBufPtr pBuf)
 {
 	ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
 	JLimaPtr p = JLIMAPTR(pScrn);
+	RegionPtr damage;
+	BoxPtr box;
+	int nbox, i, y;
+	int dst_stride, src_stride, bpp;
+	unsigned char *src, *dst;
 
-	(void)mode;
-	(void)closure;
-	if (!p || !p->fb || p->fix.line_length == 0 ||
-	    row >= (CARD32)pScrn->virtualY) {
-		*size = 0;
-		return NULL;
+	if (!p || !p->fb || !pBuf || !pBuf->pPixmap)
+		return;
+	src = pBuf->pPixmap->devPrivate.ptr;
+	src_stride = pBuf->pPixmap->devKind;
+	dst_stride = p->fix.line_length;
+	bpp = (p->var.bits_per_pixel + 7) / 8;
+	if (!src || src_stride <= 0 || dst_stride <= 0 || bpp <= 0)
+		return;
+
+	damage = DamageRegion(pBuf->pDamage);
+	nbox = RegionNumRects(damage);
+	box = RegionRects(damage);
+	dst = p->fb;
+
+	for (i = 0; i < nbox; i++) {
+		int x1 = box[i].x1;
+		int y1 = box[i].y1;
+		int x2 = box[i].x2;
+		int y2 = box[i].y2;
+		int bytes;
+
+		if (x1 < 0)
+			x1 = 0;
+		if (y1 < 0)
+			y1 = 0;
+		if (x2 > pScrn->virtualX)
+			x2 = pScrn->virtualX;
+		if (y2 > pScrn->virtualY)
+			y2 = pScrn->virtualY;
+		if (x2 <= x1 || y2 <= y1)
+			continue;
+		bytes = (x2 - x1) * bpp;
+		if (bytes <= 0)
+			continue;
+		if ((size_t)x1 * bpp + (size_t)bytes > (size_t)src_stride ||
+		    (size_t)x1 * bpp + (size_t)bytes > (size_t)dst_stride)
+			continue;
+		if ((size_t)(y2 - 1) * dst_stride + (size_t)x1 * bpp +
+		    (size_t)bytes > p->fb_len)
+			continue;
+
+		for (y = y1; y < y2; y++)
+			memcpy(dst + (size_t)y * dst_stride + (size_t)x1 * bpp,
+			       src + (size_t)y * src_stride + (size_t)x1 * bpp,
+			       (size_t)bytes);
 	}
-	*size = p->fix.line_length;
-	return (void *)(p->fb + (size_t)row * p->fix.line_length + offset);
 }
 
 static Bool
@@ -853,35 +902,27 @@ JLimaCreateScreenResources(ScreenPtr pScreen)
 	if (!ret)
 		return FALSE;
 
-	/*
-	 * fbScreenInit was given the shadow (or the mmap) so the pixmap
-	 * header already names that buffer.  Re-attach after the server's
-	 * CreateScreenResources anyway: miCreateScreenResources can wrap a
-	 * 0x0 pixmap around a NULL pointer when the driver hands it no
-	 * bits, and shadowUpdatePacked then memcpy's 640x480 off a tiny
-	 * allocation -- the `malloc(): invalid size (unsorted)' that
-	 * aborted Xorg before xinit could connect.
-	 */
 	pPixmap = pScreen->GetScreenPixmap(pScreen);
 	if (!pPixmap)
 		return FALSE;
 	bits = p->shadow ? p->shadowFB : p->fb;
 	if (!bits)
 		return FALSE;
-	if (!pScreen->ModifyPixmapHeader(pPixmap, pScrn->virtualX,
-					 pScrn->virtualY, pScrn->depth,
-					 pScrn->bitsPerPixel,
-					 p->fix.line_length, bits)) {
+	/* Only the pointer.  Passing width/height/bpp again made this
+	 * xserver rebuild the pixmap header and left shadowUpdatePacked
+	 * walking a row the window callback then rejected. */
+	if (!pScreen->ModifyPixmapHeader(pPixmap, -1, -1, -1, -1, -1, bits)) {
 		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
 			   "could not attach the %s framebuffer to the screen pixmap\n",
 			   p->shadow ? "shadow" : "hardware");
 		return FALSE;
 	}
 
-	if (p->shadow &&
-	    !shadowAdd(pScreen, pPixmap, shadowUpdatePacked,
-		       JLimaShadowWindow, 0, 0))
-		return FALSE;
+	if (p->shadow) {
+		shadowRemove(pScreen, pPixmap);
+		if (!shadowAdd(pScreen, pPixmap, JLimaUpdatePacked, NULL, 0, 0))
+			return FALSE;
+	}
 
 	return TRUE;
 }
