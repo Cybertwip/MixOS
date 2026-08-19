@@ -576,6 +576,17 @@ static Bool jlima_egl_import_pixmap(JLimaPtr p, PixmapPtr pix,
 
 	dst = pix->devPrivate.ptr;
 	dst_stride = pix->devKind;
+	/* glReadPixels writes width*4 bytes for every row whatever the destination
+	 * row holds; a pixmap whose row pitch is smaller than that would be written
+	 * past its end row by row.  The caller now only imports depth 24/32 (row
+	 * pitch width*4) so this cannot fire, but refusing beats trusting it. */
+	if (!dst || dst_stride < (int)width * 4) {
+		jl_glBindFramebuffer(JL_GL_FRAMEBUFFER, 0);
+		jl_glDeleteFramebuffers(1, &fbo);
+		jl_glDeleteTextures(1, &tex);
+		jl_eglDestroyImageKHR(p->egl_dpy, img);
+		return FALSE;
+	}
 	if (jl_glPixelStorei)
 		jl_glPixelStorei(0x0D05, 1); /* GL_PACK_ALIGNMENT */
 	if (dst_stride == (int)width * 4) {
@@ -627,6 +638,7 @@ static PixmapPtr jlima_pixmap_from_fds(ScreenPtr screen, CARD8 num_fds,
 	PixmapPtr pix;
 	char *dst;
 	unsigned char *src;
+	size_t munmap_len = 0;
 	int i, stride, bytes;
 
 	if (num_fds != 1 || !fds || fds[0] < 0)
@@ -634,6 +646,25 @@ static PixmapPtr jlima_pixmap_from_fds(ScreenPtr screen, CARD8 num_fds,
 	if (modifier != 0 && modifier != DRM_FORMAT_MOD_LINEAR)
 		return NullPixmap;
 	if (width == 0 || height == 0 || strides[0] == 0)
+		return NullPixmap;
+
+	/*
+	 * width/height/depth/bpp all arrive from the X client.  Xorg's DRI3
+	 * dispatcher validates width/height and most depths, but it does NOT
+	 * validate `bpp` at all, and it accepts depth 1 unconditionally, and
+	 * this screen's allowedDepths include 1/4/8/15/16 because of
+	 * miSetPixmapDepths().  The server backs only depth 24 and 32 with
+	 * 32-bit storage (PixmapBytePad(width, depth) == width*4); any other
+	 * depth is backed with fewer bytes per row than the client's `bpp` may
+	 * ask the copy below to write, which writes past the end of every row
+	 * and corrupts the heap -- the `malloc(): invalid size (unsorted)' that
+	 * took Xorg down.  Refuse everything but the two depths we can hold.
+	 */
+	if (depth != 24 && depth != 32)
+		return NullPixmap;
+	/* bpp comes from the client too; anything above 32 bits/pixel cannot be
+	 * a format this screen understands. */
+	if (bpp == 0 || bpp > 32)
 		return NullPixmap;
 
 	pix = screen->CreatePixmap(screen, width, height, depth,
@@ -645,6 +676,13 @@ static PixmapPtr jlima_pixmap_from_fds(ScreenPtr screen, CARD8 num_fds,
 	bytes = (bpp + 7) / 8;
 	dst = pix->devPrivate.ptr;
 	if (!dst) {
+		screen->DestroyPixmap(pix);
+		return NullPixmap;
+	}
+	/* Belt-and-braces against the same class of bug: a row cannot copy more
+	 * than the destination row holds.  With depth 24/32 stride is width*4, so
+	 * this can only fire if bpp lied; refusing is the only safe answer. */
+	if (bytes == 0 || (size_t)width * bytes > (size_t)stride) {
 		screen->DestroyPixmap(pix);
 		return NullPixmap;
 	}
@@ -661,11 +699,29 @@ static PixmapPtr jlima_pixmap_from_fds(ScreenPtr screen, CARD8 num_fds,
 			return pix;
 	}
 
-	src = mmap(NULL, (size_t)strides[0] * height + offsets[0],
-		   PROT_READ, MAP_SHARED, fds[0], 0);
-	if (src == MAP_FAILED) {
+	/*
+	 * The source row must actually hold the bytes the copy reads, and on this
+	 * 32-bit board `(size_t)strides[0] * height + offsets[0]' can wrap modulo
+	 * 2^32 -- a wrapped-to-small length makes mmap succeed with a short mapping
+	 * and the row loop then reads far past it.  Validate in a width that cannot
+	 * wrap before trusting either number.
+	 */
+	if (strides[0] < (CARD32)(width * bytes)) {
 		screen->DestroyPixmap(pix);
 		return NullPixmap;
+	}
+	{
+		uint64_t maplen = (uint64_t)strides[0] * height + offsets[0];
+		if (maplen > SIZE_MAX) {
+			screen->DestroyPixmap(pix);
+			return NullPixmap;
+		}
+		src = mmap(NULL, (size_t)maplen, PROT_READ, MAP_SHARED, fds[0], 0);
+		if (src == MAP_FAILED) {
+			screen->DestroyPixmap(pix);
+			return NullPixmap;
+		}
+		munmap_len = (size_t)maplen;
 	}
 
 	{
@@ -682,10 +738,10 @@ static PixmapPtr jlima_pixmap_from_fds(ScreenPtr screen, CARD8 num_fds,
 
 	{
 		struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_END |
-						      DMA_BUF_SYNC_READ };
+					      DMA_BUF_SYNC_READ };
 		(void)ioctl(fds[0], DMA_BUF_IOCTL_SYNC, &sync);
 	}
-	munmap(src, (size_t)strides[0] * height + offsets[0]);
+	munmap(src, munmap_len);
 	return pix;
 }
 
