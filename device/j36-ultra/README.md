@@ -184,6 +184,13 @@ does not update LK in the device's eMMC. The batteryless LK disables and reads
 back the charger watchdog before SD access; Linux preserves that state. Merely
 kicking the four-second timer leaves kernel decompression and early boot without
 a service routine. The normal battery build still services its charging timer.
+Batteryless Linux also keeps the class-D speaker amplifier disabled, including
+attempts by ALSA restore or the dashboard to re-enable it. Headphone audio and
+Wi-Fi remain available. The shared `j36_pwrap.ko` transport must travel with the
+input, audio and PMIC modules; the builder stages it in the initramfs and each
+payload's dependency list. All three clients use the same transaction lock.
+The Wi-Fi PMIC fallback preserves `external_power=1` if an earlier load failed.
+
 The diagnostic message is `charger watchdog OFF (verified)`; a failed PMIC
 transaction is logged and retried. This does not establish that a supply can
 sustain the board's load; the change still needs a boot test on the device.

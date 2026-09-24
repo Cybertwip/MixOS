@@ -185,6 +185,7 @@
 #include <linux/math64.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include "j36_pwrap.h"
 #include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -969,45 +970,7 @@ struct j36_pmic {
 static int j36_pwrap_xfer_locked(struct j36_pmic *p, bool write, u32 adr,
 				 u32 wdata, u32 *rdata)
 {
-	unsigned int i;
-	u32 value;
-
-	if (adr & ~0xffffu || wdata & ~0xffffu)
-		return -EINVAL;
-	if (!write && !rdata)
-		return -EINVAL;
-
-	value = readl(p->pwrap + J36_PWRAP_WACS2_RDATA);
-	if (((value >> J36_PWRAP_STATE_SHIFT) & J36_PWRAP_STATE_MASK) ==
-	    J36_PWRAP_FSM_WFVLDCLR)
-		writel(1, p->pwrap + J36_PWRAP_WACS2_VLDCLR);
-
-	for (i = 0; i < J36_PWRAP_POLL_LIMIT; ++i) {
-		value = readl(p->pwrap + J36_PWRAP_WACS2_RDATA);
-		if (((value >> J36_PWRAP_STATE_SHIFT) & J36_PWRAP_STATE_MASK) ==
-		    J36_PWRAP_FSM_IDLE)
-			break;
-		cpu_relax();
-	}
-	if (i == J36_PWRAP_POLL_LIMIT)
-		return -ETIMEDOUT;
-
-	writel(((u32)write << 31) | ((adr >> 1) << 16) | wdata,
-	       p->pwrap + J36_PWRAP_WACS2_CMD);
-	if (write)
-		return 0;
-
-	for (i = 0; i < J36_PWRAP_POLL_LIMIT; ++i) {
-		value = readl(p->pwrap + J36_PWRAP_WACS2_RDATA);
-		if (((value >> J36_PWRAP_STATE_SHIFT) & J36_PWRAP_STATE_MASK) ==
-		    J36_PWRAP_FSM_WFVLDCLR) {
-			*rdata = value & 0xffff;
-			writel(1, p->pwrap + J36_PWRAP_WACS2_VLDCLR);
-			return 0;
-		}
-		cpu_relax();
-	}
-	return -ETIMEDOUT;
+	return j36_pwrap_transfer(p->pwrap, write, adr, wdata, rdata);
 }
 
 static int j36_pmic_read(struct j36_pmic *p, u32 adr, u32 *rdata)
@@ -1065,32 +1028,8 @@ static int j36_pmic_write(struct j36_pmic *p, u32 adr, u32 wdata)
  */
 static int j36_pmic_update(struct j36_pmic *p, u32 adr, u32 clr, u32 set)
 {
-	unsigned long flags;
-	u32 old, new, ro = j36_pmic_ro_bits(adr);
-	int ret;
-
-	spin_lock_irqsave(&p->lock, flags);
-	ret = j36_pwrap_xfer_locked(p, false, adr, 0, &old);
-	if (ret)
-		goto out;
-	new = ((old & ~(clr | set)) | set) & ~ro;
-	/*
-	 * Compared against the writable half of what was read, not against the
-	 * whole word.  A plain `new == old' would differ on every pass the moment
-	 * a comparator was set -- turning the skip into a write every second, and
-	 * turning this function's 1/0 return into a permanent "something moved"
-	 * for the log lines that key on it.
-	 */
-	if (new == (old & ~ro)) {
-		ret = 0;
-		goto out;
-	}
-	ret = j36_pwrap_xfer_locked(p, true, adr, new, NULL);
-	if (!ret)
-		ret = 1;
-out:
-	spin_unlock_irqrestore(&p->lock, flags);
-	return ret;
+	return j36_pwrap_update_bits(p->pwrap, adr, clr, set,
+				     j36_pmic_ro_bits(adr));
 }
 
 /* A field write: clear the mask, set the shifted value.  The BC1.2 registers are

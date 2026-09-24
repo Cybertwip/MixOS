@@ -1519,6 +1519,9 @@ verify_arm_elf "$USB_PHY_MODULE" "the USB PHY module"
 PMIC_MODULE="$MODULE_SRC/j36_mt6592_pmic.ko"
 [[ -s "$PMIC_MODULE" ]] || die "PMIC module was not produced"
 verify_arm_elf "$PMIC_MODULE" "the PMIC module"
+PWRAP_MODULE="$MODULE_SRC/j36_pwrap.ko"
+[[ -s "$PWRAP_MODULE" ]] || die "shared PWRAP module was not produced"
+verify_arm_elf "$PWRAP_MODULE" "the shared PWRAP module"
 # And the backlight, which rides along in the same power payload.  It is the only
 # module here that the user can see working without reading a log: it is what puts
 # /sys/class/backlight/j36-backlight on the board, and therefore what the
@@ -1751,6 +1754,7 @@ for applet in "${INIT_APPLETS[@]}"; do
     ln -sf busybox "$INITROOT/bin/$applet"
 done
 cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
+cp "$PWRAP_MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 # And the PMIC, which is ALSO staged into j36/power/ on the card and is the only
 # module in this build that is deliberately in two places.  The payload copy is the
 # one that owns the gauge, the backlight ordering and the poweroff handler; this
@@ -2140,6 +2144,7 @@ say ""
 say "J36 Ultra ARMv7 bring-up initramfs"
 say "Display: the LK's framebuffer on /dev/fb0 until something opens /dev/dri/card0."
 progress 4
+insmod /lib/modules/*/extra/j36_pwrap.ko || say "shared PWRAP module load failed"
 insmod /lib/modules/*/extra/j36_mt6592_input.ko || say "input module load failed"
 
 # ── Hand over to the rootfs on the card, if there is one ─────────────────────
@@ -4091,9 +4096,17 @@ run_audio() {
     fi
     while IFS= read -r ko; do
         case "$ko" in ''|'#'*) continue ;; esac
+        mod=$(printf '%s' "${ko%.ko}" | tr '-' '_')
+        if [ -d "/sys/module/$mod" ]; then
+            say "audio: $ko is already loaded"
+            continue
+        fi
         params=""
         if [ "$audio_speaker" = 1 ]; then
             case "$ko" in j36_mt6592_audio.ko) params="speaker=1" ;; esac
+        fi
+        if [ "$power_external" = 1 ]; then
+            case "$ko" in j36_mt6592_audio.ko) params="speaker=0 external_power=1" ;; esac
         fi
         # Named on the panel before it is loaded and not after, which is the only
         # ordering that says anything: a module that takes a long time to probe is
@@ -4122,7 +4135,9 @@ run_audio() {
     else
         say "audio: no /dev/snd; the card did not register"
     fi
-    if [ "$audio_speaker" = 1 ]; then
+    if [ "$power_external" = 1 ]; then
+        say "audio: batteryless supply; speaker amp disabled, headphone output available"
+    elif [ "$audio_speaker" = 1 ]; then
         say "audio: speaker amp armed; it powers up when the DL1 cursor first moves"
         say "audio: if the board cuts out in playback: amixer -c0 set \"Speaker Amp\" off"
     else
@@ -4437,8 +4452,19 @@ run_wifi() {
             say "wifi: $ko is already loaded"
             continue
         fi
+        # Preserve the selected policy even if both earlier PMIC loads failed.
+        args=""
+        case "$ko" in
+            j36_mt6592_pmic.ko)
+                if [ "$power_external" = 1 ]; then
+                    args="external_power=1"
+                elif [ "$power_charge" != 1 ]; then
+                    args="charge=0"
+                fi
+                ;;
+        esac
         watch_say "$ko"
-        if insmod "$payload/wifi/$ko" >/tmp/insmod.log 2>&1; then
+        if insmod "$payload/wifi/$ko" $args >/tmp/insmod.log 2>&1; then
             say "wifi: loaded $ko"
         else
             say "wifi: FAILED to load $ko"
@@ -9737,11 +9763,14 @@ fi
 # the charger watchdog, matching the batteryless LK across kernel startup.
 if [[ "$WITHOUT_BATTERY" == 1 ]]; then
     sed -i -e 's/ j36\.usb=1 / j36.usb=novbus /' \
+           -e 's/ j36\.audio=speaker / j36.audio=1 /' \
            -e 's/ j36\.power=1 / j36.power=external /' "$SDBOOT/mvii/boot.conf"
     grep -q ' j36\.usb=novbus ' "$SDBOOT/mvii/boot.conf" || \
         die "J36_WITHOUT_BATTERY=1 but boot.conf still sources OTG VBUS"
     grep -q ' j36\.power=external ' "$SDBOOT/mvii/boot.conf" || \
         die "J36_WITHOUT_BATTERY=1 but boot.conf still arms the charger"
+    grep -q ' j36\.audio=1 ' "$SDBOOT/mvii/boot.conf" || \
+        die "J36_WITHOUT_BATTERY=1 but boot.conf still enables the speaker"
     log "batteryless: OTG VBUS off; PMIC disables the charger watchdog and leaves its mode alone"
 fi
 

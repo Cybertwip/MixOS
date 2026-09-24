@@ -77,6 +77,7 @@
 #include <linux/kernel.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include "j36_pwrap.h"
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -126,12 +127,8 @@
 #define J36_INFRACFG_PDN_CLR		0x0044
 #define J36_INFRACFG_PDN_AUDIO		BIT(5)
 
-/* ---- PWRAP WACS2, the same channel and the same recovery as the input
- *      adapter. The two never overlap in practice: j36_mt6592_input touches the
- *      PMIC once, in its probe, to ungate the keypad's 32 kHz clock, and this
- *      driver's PMIC traffic all happens later -- at prepare, at close, and on
- *      the tick that first sees the DMA cursor move.
- */
+/* ---- PWRAP readiness. Transactions and register updates use j36_pwrap's
+ * shared lock, including traffic from the gauge and Wi-Fi rail controls. */
 #define J36_PWRAP_WACS2_CMD		0x009c
 #define J36_PWRAP_WACS2_RDATA		0x00a0
 #define J36_PWRAP_WACS2_VLDCLR		0x00a4
@@ -212,6 +209,11 @@ MODULE_PARM_DESC(codec, "program the MT6323 ABB downlink over PWRAP (default on)
 
 static bool speaker;
 module_param(speaker, bool, 0444);
+/* An ALSA restore or jack policy may turn Speaker Amp back on after probe.
+ * Enforce batteryless policy at the control as well as its initial value. */
+static bool external_power;
+module_param(external_power, bool, 0444);
+MODULE_PARM_DESC(external_power, "batteryless supply: keep the class-D speaker disabled");
 MODULE_PARM_DESC(speaker,
 		 "initial state of the \"Speaker Amp\" control: power the class-D "
 		 "amp once the DL1 DMA is proven live. With no cell fitted the amp "
@@ -309,52 +311,11 @@ static void j36_afe_rmw(struct j36_afe *afe, u32 off, u32 value, u32 mask)
 	writel((readl(afe->afe + off) & ~mask) | (value & mask), afe->afe + off);
 }
 
-/*
- * One WACS2 transaction, including the leftover-state recovery: a read whose
- * caller timed out before collecting RDATA leaves the FSM parked in WFVLDCLR,
- * and without a VLDCLR write it never returns to IDLE, so every later PMIC
- * transaction times out. This is the same code the input adapter runs, for the
- * same reason, and neither claims the register window.
- */
+/* Transactions are serialized with every other PMIC client. */
 static int j36_pwrap_xfer(struct j36_afe *afe, bool write, u32 adr, u32 wdata,
 			  u32 *rdata)
 {
-	unsigned int i;
-	u32 value;
-
-	if (adr & ~0xffffu || wdata & ~0xffffu)
-		return -EINVAL;
-	if (!write && !rdata)
-		return -EINVAL;
-
-	value = readl(afe->pwrap + J36_PWRAP_WACS2_RDATA);
-	if (((value >> 16) & 0x7) == J36_PWRAP_FSM_WFVLDCLR)
-		writel(1, afe->pwrap + J36_PWRAP_WACS2_VLDCLR);
-
-	for (i = 0; i < J36_PWRAP_POLL_LIMIT; ++i) {
-		value = readl(afe->pwrap + J36_PWRAP_WACS2_RDATA);
-		if (((value >> 16) & 0x7) == J36_PWRAP_FSM_IDLE)
-			break;
-		cpu_relax();
-	}
-	if (i == J36_PWRAP_POLL_LIMIT)
-		return -ETIMEDOUT;
-
-	writel(((u32)write << 31) | ((adr >> 1) << 16) | wdata,
-	       afe->pwrap + J36_PWRAP_WACS2_CMD);
-	if (write)
-		return 0;
-
-	for (i = 0; i < J36_PWRAP_POLL_LIMIT; ++i) {
-		value = readl(afe->pwrap + J36_PWRAP_WACS2_RDATA);
-		if (((value >> 16) & 0x7) == J36_PWRAP_FSM_WFVLDCLR) {
-			*rdata = value & 0xffff;
-			writel(1, afe->pwrap + J36_PWRAP_WACS2_VLDCLR);
-			return 0;
-		}
-		cpu_relax();
-	}
-	return -ETIMEDOUT;
+	return j36_pwrap_transfer(afe->pwrap, write, adr, wdata, rdata);
 }
 
 static int j36_pmic_read(struct j36_afe *afe, u32 adr, u32 *value)
@@ -369,13 +330,9 @@ static int j36_pmic_write(struct j36_afe *afe, u32 adr, u32 value)
 
 static int j36_pmic_rmw(struct j36_afe *afe, u32 adr, u32 value, u32 mask)
 {
-	u32 current_value;
-	int ret;
+	int ret = j36_pwrap_update_bits(afe->pwrap, adr, mask, value & mask, 0);
 
-	ret = j36_pmic_read(afe, adr, &current_value);
-	if (ret)
-		return ret;
-	return j36_pmic_write(afe, adr, (current_value & ~mask) | (value & mask));
+	return ret < 0 ? ret : 0;
 }
 
 /* INIT_DONE0 only refreshes after a transaction, so a cold read right after the
@@ -1210,6 +1167,9 @@ static int j36_amp_put(struct snd_kcontrol *kcontrol,
 	struct j36_afe *afe = snd_kcontrol_chip(kcontrol);
 	bool allowed = ucontrol->value.integer.value[0];
 
+	if (external_power && allowed)
+		return -EPERM;
+
 	if (allowed == afe->amp_allowed)
 		return 0;
 
@@ -1363,7 +1323,7 @@ static int j36_afe_probe(struct platform_device *pdev)
 	afe->rate = 48000;
 	afe->frame_bytes = 4;
 	afe->level = clamp(spk_level, J36_SPK_LEVEL_MIN, J36_SPK_LEVEL_MAX);
-	afe->amp_allowed = speaker;
+	afe->amp_allowed = speaker && !external_power;
 	afe->hp_allowed = headphone;
 	mutex_init(&afe->pmic_lock);
 	INIT_DELAYED_WORK(&afe->poll_work, j36_afe_poll);
@@ -1437,6 +1397,7 @@ static int j36_afe_probe(struct platform_device *pdev)
 	dev_info(dev,
 		 "playback on DL1, %u KiB ring, speaker amp %s, headphone %s, downlink %s\n",
 		 J36_AFE_BUFFER_BYTES / 1024,
+		 external_power ? "OFF (batteryless supply)" :
 		 speaker ? "enabled" : "OFF (speaker=1 asks for it)",
 		 headphone ? "enabled" : "OFF (headphone=1 asks for it)",
 		 codec ? "on" : "off");

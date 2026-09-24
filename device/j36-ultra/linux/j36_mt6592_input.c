@@ -41,6 +41,7 @@
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include "j36_pwrap.h"
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
@@ -573,42 +574,7 @@ static int j36_apply_pads(struct j36_input *j36, struct device_node *node,
 static int j36_pwrap_xfer(struct j36_input *j36, bool write, u32 adr, u32 wdata,
 			  u32 *rdata)
 {
-	unsigned int i;
-	u32 value;
-
-	if (adr & ~0xffffu || wdata & ~0xffffu)
-		return -EINVAL;
-	if (!write && !rdata)
-		return -EINVAL;
-
-	value = readl(j36->pwrap + J36_PWRAP_WACS2_RDATA);
-	if (((value >> 16) & 0x7) == J36_PWRAP_FSM_WFVLDCLR)
-		writel(1, j36->pwrap + J36_PWRAP_WACS2_VLDCLR);
-
-	for (i = 0; i < J36_PWRAP_POLL_LIMIT; ++i) {
-		value = readl(j36->pwrap + J36_PWRAP_WACS2_RDATA);
-		if (((value >> 16) & 0x7) == J36_PWRAP_FSM_IDLE)
-			break;
-		cpu_relax();
-	}
-	if (i == J36_PWRAP_POLL_LIMIT)
-		return -ETIMEDOUT;
-
-	writel(((u32)write << 31) | ((adr >> 1) << 16) | wdata,
-	       j36->pwrap + J36_PWRAP_WACS2_CMD);
-	if (write)
-		return 0;
-
-	for (i = 0; i < J36_PWRAP_POLL_LIMIT; ++i) {
-		value = readl(j36->pwrap + J36_PWRAP_WACS2_RDATA);
-		if (((value >> 16) & 0x7) == J36_PWRAP_FSM_WFVLDCLR) {
-			*rdata = value & 0xffff;
-			writel(1, j36->pwrap + J36_PWRAP_WACS2_VLDCLR);
-			return 0;
-		}
-		cpu_relax();
-	}
-	return -ETIMEDOUT;
+	return j36_pwrap_transfer(j36->pwrap, write, adr, wdata, rdata);
 }
 
 static int j36_pwrap_read(struct j36_input *j36, u32 adr, u32 *rdata)
@@ -616,10 +582,6 @@ static int j36_pwrap_read(struct j36_input *j36, u32 adr, u32 *rdata)
 	return j36_pwrap_xfer(j36, false, adr, 0, rdata);
 }
 
-static int j36_pwrap_write(struct j36_input *j36, u32 adr, u32 wdata)
-{
-	return j36_pwrap_xfer(j36, true, adr, wdata, NULL);
-}
 
 /* INIT_DONE0 is bit 21 of WACS2_RDATA, and it only refreshes after a transaction,
  * so a cold read of it right after hand-off can be stale. */
@@ -651,9 +613,9 @@ static void j36_kpd_clock_ungate(struct j36_input *j36)
 		dev_info(dev, "KPD clock already ungated (PMIC 0x40 = 0x%04x)\n", value);
 		return;
 	}
-	ret = j36_pwrap_write(j36, J36_PMIC_KPD_CLK_GATE_REG,
-			      value & ~J36_PMIC_KPD_CLK_GATE_BIT);
-	if (ret) {
+	ret = j36_pwrap_update_bits(j36->pwrap, J36_PMIC_KPD_CLK_GATE_REG,
+				    J36_PMIC_KPD_CLK_GATE_BIT, 0, 0);
+	if (ret < 0) {
 		dev_warn(dev, "KPD clock ungate: PMIC write failed (%d)\n", ret);
 		return;
 	}

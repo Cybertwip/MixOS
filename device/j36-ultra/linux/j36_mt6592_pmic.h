@@ -7,8 +7,9 @@
  * poll with no hardware arbitration between them.  A second driver holding a
  * second lock over a second ioremap of the same window is not a second lock, it is
  * none: one transaction collects the other's result, clears the valid flag under
- * it, and both come away with a number that looks fine.  So there is exactly one
- * owner of that FSM in this kernel, and everyone else comes through here.
+ * it, and both come away with a number that looks fine.  The j36_pwrap transport owns
+ * the shared transaction lock for the PMIC, audio and input drivers. Wi-Fi
+ * uses the policy driver API here for its rail controls.
  *
  * The caller today is j36_mt6592_wifi, which needs the four MT6323 connectivity
  * rails (VCN_1V8, VCN28 and the two halves of VCN33) and nothing else from the
