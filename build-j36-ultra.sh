@@ -167,9 +167,12 @@ J36 Ultra layer on top of it in the same Multipass VM: $VM_NAME
                                       that mode deliberately produces no image.
 
     ./build-j36-ultra.sh --without-battery
-                                      configure the J36 OTG data port not to source
-                                      5 V (j36.usb=novbus). Keep the PMIC charger
-                                      path active for power from the DC inlet.
+                                      no cell. Writes j36.usb=novbus and
+                                      j36.power=external. Linux disables the
+                                      charger watchdog and widens UVLO, and
+                                      does not rewrite the preloader charger
+                                      mode. The matching LK is
+                                      tools/mediatek/build.sh --without-battery.
                                       Combines with --mix-only or --compress.
 
 The first J36 run creates the persistent ARMv7 Linux 6.12 LTS workspace.  Later

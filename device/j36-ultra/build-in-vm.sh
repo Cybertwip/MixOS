@@ -2165,6 +2165,7 @@ want_usb=0
 usb_vbus=1
 want_power=0
 power_charge=1
+power_external=0
 want_wifi=0
 # The only j36 word that defaults to ON, and the reason is that it is the word you
 # cannot ask for after the fact: it writes the file that says why the boot went
@@ -2295,6 +2296,12 @@ for arg in $(cat /proc/cmdline); do
         j36.power=nocharge)
             want_power=1
             power_charge=0
+            ;;
+        # No cell.  Disable the charger watchdog and widen UVLO.  Do not rewrite
+        # the preloader's charger mode: that latched the PMIC off before splash.
+        j36.power=external)
+            want_power=1
+            power_external=1
             ;;
         # The radio: MT6323 rails, the CONSYS power domain, the BTIF link, the
         # two ROM patches, the WLAN firmware and wlan0.  Behind its own word for
@@ -2475,9 +2482,17 @@ fi
 # later -- which is why the failure is worth one line rather than a stop.
 if [ "$want_power" = 1 ]; then
     pmic_args=""
-    [ "$power_charge" = 1 ] || pmic_args="charge=0"
+    if [ "$power_external" = 1 ]; then
+        pmic_args="external_power=1"
+    elif [ "$power_charge" != 1 ]; then
+        pmic_args="charge=0"
+    fi
     if insmod /lib/modules/*/extra/j36_mt6592_pmic.ko $pmic_args 2>/dev/null; then
-        say "power: PMIC loaded early${pmic_args:+ ($pmic_args)} -- the charger watchdog is being kicked before the card work starts"
+        if [ "$power_external" = 1 ]; then
+            say "power: PMIC loaded early (external_power=1); kernel log reports the watchdog hold result"
+        else
+            say "power: PMIC loaded early${pmic_args:+ ($pmic_args)} -- the charger watchdog is being kicked before the card work starts"
+        fi
     else
         say "power: the initramfs PMIC would not load; the charger stays as the LK left it until j36/power/ is reached"
     fi
@@ -4297,7 +4312,11 @@ run_power() {
         args=""
         case "$ko" in
             j36_mt6592_pmic.ko)
-                [ "$power_charge" = 1 ] || args="charge=0"
+                if [ "$power_external" = 1 ]; then
+                    args="external_power=1"
+                elif [ "$power_charge" != 1 ]; then
+                    args="charge=0"
+                fi
                 ;;
         esac
         watch_say "$ko"
@@ -4332,7 +4351,9 @@ run_power() {
         say "power: battery reads $(cat /sys/class/power_supply/battery/capacity 2>/dev/null)%"
     fi
 
-    if [ "$power_charge" != 1 ]; then
+    if [ "$power_external" = 1 ]; then
+        say "power: external supply policy requested; kernel log reports the watchdog hold result"
+    elif [ "$power_charge" != 1 ]; then
         say "power: charger left as the LK set it by j36.power=nocharge"
     fi
 
@@ -9711,13 +9732,17 @@ if [[ "${J36_SPLASH:-1}" == 0 ]]; then
 fi
 
 # The DC inlet feeds the PMIC; the OTG port is a separate data connector whose
-# 5 V switch draws from VBAT/VSYS. With no cell, leave that switch off. Keep
-# j36.power=1 so the PMIC continues servicing the charger watchdog after LK.
+# 5 V switch draws from VBAT/VSYS. With no cell, leave that switch off, and
+# tell the PMIC driver not to rerun the charge-arm sequence. It disables
+# the charger watchdog, matching the batteryless LK across kernel startup.
 if [[ "$WITHOUT_BATTERY" == 1 ]]; then
-    sed -i 's/ j36\.usb=1 / j36.usb=novbus /' "$SDBOOT/mvii/boot.conf"
+    sed -i -e 's/ j36\.usb=1 / j36.usb=novbus /' \
+           -e 's/ j36\.power=1 / j36.power=external /' "$SDBOOT/mvii/boot.conf"
     grep -q ' j36\.usb=novbus ' "$SDBOOT/mvii/boot.conf" || \
         die "J36_WITHOUT_BATTERY=1 but boot.conf still sources OTG VBUS"
-    log "batteryless: OTG VBUS off; PMIC charger handling remains enabled"
+    grep -q ' j36\.power=external ' "$SDBOOT/mvii/boot.conf" || \
+        die "J36_WITHOUT_BATTERY=1 but boot.conf still arms the charger"
+    log "batteryless: OTG VBUS off; PMIC disables the charger watchdog and leaves its mode alone"
 fi
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
@@ -10759,6 +10784,15 @@ j36.power=nocharge
     its CV, its current-sense threshold and its enable bits across a warm reset,
     so a boot without the word starts from whatever the last boot with it left
     behind, not from a clean slate.
+
+j36.power=external
+    The batteryless word, written by ./build-j36-ultra.sh --without-battery
+    together with j36.usb=novbus.  The gauge still samples.  Linux disables the
+    charger watchdog and widens the brownout limit.  It does not leave the
+    preloader's hardware-charging mode and does not rewrite charge current or
+    charge voltage: doing that before the splash latched this PMIC off.  This
+    does not change the stock preloader.  The supply still has to carry the
+    board.
 
 j36.wifi=1
     The radio, and wlan0.  Three modules -- cfg80211.ko, rfkill.ko and
@@ -14296,7 +14330,9 @@ SD cards.
                        wins.  j36.usb=1
   j36/power            the MT6592 PMIC -- battery gauge, charger and a poweroff
                        that cuts the rail -- and the panel backlight.  j36.power=1;
-                       j36.power=nocharge keeps the charger as the LK set it.
+                       j36.power=nocharge keeps the charger as the LK set it;
+                       j36.power=external disables the charger watchdog and
+                       widens UVLO, and leaves the preloader charger mode alone.
   j36/wifi             the radio, and wlan0: the CONSYS MCU's rails, the BTIF
                        link, wifi/firmware/ holding the two ROM patches and the
                        WLAN firmware, and cfg80211 on top.  2.4 GHz WPA2-PSK,

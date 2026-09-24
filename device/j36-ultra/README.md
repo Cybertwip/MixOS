@@ -155,7 +155,7 @@ There are two things to build, and they are two commands.
 ```sh
 ./build-j36-ultra.sh --mix-only     # the board specifics.  This is the iteration loop.
 ./build-j36-ultra.sh                # the finished card: one flashable image.
-./build-j36-ultra.sh --without-battery  # DC inlet power, OTG 5 V output off.
+./build-j36-ultra.sh --without-battery  # DC inlet power, no charge-arm.
 ```
 
 This is an extension of `build-r36-ultra.sh` rather than a second build system.
@@ -168,12 +168,25 @@ runs rebuild only changed kernel, DTB, input-module, initramfs and `boot.img`
 files.
 
 `--without-battery` also works with `--mix-only`. It writes `j36.usb=novbus`
-instead of `j36.usb=1` in `mvii/boot.conf`, so the OTG data port does not
-source 5 V from VBAT/VSYS. It keeps `j36.power=1`: the PMIC driver must service
-the charger watchdog for continued power from the separate DC inlet. Use a
-supply on that inlet that can carry the board's load; this build option cannot
-change the preloader's power checks or the board's wiring. A device on the OTG
-port needs its own power in this mode.
+and `j36.power=external` into `mvii/boot.conf`. The OTG data port does not
+source 5 V. The bootloader and the PMIC driver disable the charger watchdog and
+widen the brownout limit, and they leave the preloader's charger mode, charge
+current, and charge voltage alone. Rewriting those before the splash has
+latched this PMIC off. The matching bootloader is
+`tools/mediatek/build.sh --without-battery`, and it skips the charge screen.
+The supply still has to carry the board's load. This option cannot change the
+stock preloader or the board's wiring. A device on the OTG port needs its own
+power.
+
+Update **both** the installed LK (`lk-release.bin` from that firmware build)
+and the card's Linux payload. Writing the MixOS `.img` to a removable drive
+does not update LK in the device's eMMC. The batteryless LK disables and reads
+back the charger watchdog before SD access; Linux preserves that state. Merely
+kicking the four-second timer leaves kernel decompression and early boot without
+a service routine. The normal battery build still services its charging timer.
+The diagnostic message is `charger watchdog OFF (verified)`; a failed PMIC
+transaction is logged and retried. This does not establish that a supply can
+sustain the board's load; the change still needs a boot test on the device.
 
 **The full build ships one file**, and it is not in this directory:
 

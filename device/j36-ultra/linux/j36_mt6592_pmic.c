@@ -197,6 +197,7 @@
 #include <linux/workqueue.h>
 
 #include "j36_battery_curve.h"
+#include "j36_external_power.h"
 #include "j36_mt6592_pmic.h"
 
 /* ── module parameters ───────────────────────────────────────────────────────
@@ -214,6 +215,15 @@ MODULE_PARM_DESC(poll_ms, "gauge poll interval in ms (0 = use the device tree)")
 static bool charge = true;
 module_param(charge, bool, 0444);
 MODULE_PARM_DESC(charge, "arm the charger (0 = read-only gauge, no charger writes)");
+
+/* Batteryless boards: the charger output is VSYS, so the arm sequence below
+ * (CV, current, CHR_EN) can cut power the moment it runs. Leave that policy
+ * as the preloader and LK left it. Disable the charger watchdog so the rail
+ * does not depend on a workqueue deadline or the duration of kernel startup. */
+static bool external_power;
+module_param(external_power, bool, 0444);
+MODULE_PARM_DESC(external_power,
+		 "batteryless: disable the charger watchdog and widen UVLO; preserve the preloader charger mode");
 
 static bool bc11 = true;
 module_param(bc11, bool, 0444);
@@ -1915,6 +1925,29 @@ static int j36_charger_cv_set(struct j36_pmic *p, int uv)
 	return 0;
 }
 
+static int j36_ext_read(void *ctx, unsigned int reg, unsigned int *value)
+{
+	return j36_pmic_read(ctx, reg, value);
+}
+
+static int j36_ext_write(void *ctx, unsigned int reg, unsigned int value)
+{
+	return j36_pmic_write(ctx, reg, value);
+}
+
+static void j36_external_keepalive(struct j36_pmic *p)
+{
+	int ret = j36_external_power_hold(p, j36_ext_read, j36_ext_write);
+
+	if (ret)
+		dev_warn_ratelimited(p->dev,
+			      "external power: hold failed (%d); will retry\n",
+			      ret);
+	else
+		dev_info_once(p->dev,
+			      "external power: charger watchdog OFF (verified), UVLO widened, preloader charger mode left alone\n");
+}
+
 /*
  * stock's charging_hw_init() plus the enable, in stock's order, every poll.
  *
@@ -2797,6 +2830,10 @@ static void j36_pmic_poll(struct work_struct *work)
 		goto again;
 	}
 
+	/* Retry a failed hold before ADC work or a failed CHRDET read can delay it. */
+	if (external_power)
+		j36_external_keepalive(p);
+
 	j36_hw_ocv_prime(p);
 
 	online = j36_charger_online(p, &con0);
@@ -2955,7 +2992,8 @@ static void j36_pmic_poll(struct work_struct *work)
 		j36_ring_forget(&p->vchr);
 		j36_ring_forget(&p->delta);
 		j36_bc11_forget(p);
-		if (online && bc11 && p->usbphy && p->pericfg && !sourcing)
+		if (online && bc11 && !external_power && p->usbphy && p->pericfg &&
+		    !sourcing)
 			j36_bc11_run(p);
 		else if (online && sourcing)
 			dev_info(p->dev,
@@ -3053,7 +3091,8 @@ static void j36_pmic_poll(struct work_struct *work)
 				 J36_CHR_HOLDOFF_POLLS);
 	}
 
-	j36_charger_arm(p, chrdet && !p->chr_held_off);
+	if (!external_power)
+		j36_charger_arm(p, chrdet && !p->chr_held_off);
 
 	/* AFTER the arm, not before: charge_step_ma is read back out of CHR_CON4
 	 * inside it, so sampling it above would publish the previous second's
@@ -3568,6 +3607,12 @@ static int j36_pmic_probe(struct platform_device *pdev)
 	if (IS_ERR(base))
 		return dev_err_probe(dev, PTR_ERR(base), "map PWRAP\n");
 	p->pwrap = base;
+
+	/* Take over before supply registration and the first delayed ADC poll.
+	 * LK must already have held the rail through decompression; this also
+	 * handles an inherited timer as soon as Linux can reach the PMIC. */
+	if (external_power)
+		j36_external_keepalive(p);
 
 	/*
 	 * The optional three, and what each one costs to be without.
