@@ -33,6 +33,9 @@ EXPORT_DIR="${J36_EXPORT_DIR:-$WORK/export}"
 # reimplemented: same build, same artifacts, one step fewer.  The full build (no flag)
 # is what produces the flashable image, and it is the only thing that should.
 MIX_ONLY="${J36_MIX_ONLY:-0}"
+WITHOUT_BATTERY="${J36_WITHOUT_BATTERY:-0}"
+[[ "$WITHOUT_BATTERY" == 0 || "$WITHOUT_BATTERY" == 1 ]] || \
+    { printf 'J36_WITHOUT_BATTERY must be 0 or 1\n' >&2; exit 2; }
 KERNEL_URL="${J36_KERNEL_URL:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
 KERNEL_BRANCH="${J36_KERNEL_BRANCH:-linux-6.12.y}"
 KERNEL_SRC="$WORK/linux"
@@ -9705,6 +9708,16 @@ if [[ "${J36_SPLASH:-1}" == 0 ]]; then
     grep -q ' j36\.splash=0' "$SDBOOT/mvii/boot.conf" || \
         die "J36_SPLASH=0 but boot.conf still asks for the splash; the bootargs line has changed shape"
     log "splash: boot.conf says j36.splash=0 loglevel=7 (--no-splash); this card boots to text"
+fi
+
+# The DC inlet feeds the PMIC; the OTG port is a separate data connector whose
+# 5 V switch draws from VBAT/VSYS. With no cell, leave that switch off. Keep
+# j36.power=1 so the PMIC continues servicing the charger watchdog after LK.
+if [[ "$WITHOUT_BATTERY" == 1 ]]; then
+    sed -i 's/ j36\.usb=1 / j36.usb=novbus /' "$SDBOOT/mvii/boot.conf"
+    grep -q ' j36\.usb=novbus ' "$SDBOOT/mvii/boot.conf" || \
+        die "J36_WITHOUT_BATTERY=1 but boot.conf still sources OTG VBUS"
+    log "batteryless: OTG VBUS off; PMIC charger handling remains enabled"
 fi
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently

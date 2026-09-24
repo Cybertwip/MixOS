@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+cd "$ROOT"
+export MVII_FLASH_ROOT="$ROOT"
+exec go run ./mvii-flash "$@"

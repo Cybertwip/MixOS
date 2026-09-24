@@ -155,6 +155,7 @@ There are two things to build, and they are two commands.
 ```sh
 ./build-j36-ultra.sh --mix-only     # the board specifics.  This is the iteration loop.
 ./build-j36-ultra.sh                # the finished card: one flashable image.
+./build-j36-ultra.sh --without-battery  # DC inlet power, OTG 5 V output off.
 ```
 
 This is an extension of `build-r36-ultra.sh` rather than a second build system.
@@ -165,6 +166,14 @@ the checkpointed R36 base build (already finished ones cost seconds;
 VM. The first J36 run creates a persistent ARMv7 Linux 6.12 LTS workspace; later
 runs rebuild only changed kernel, DTB, input-module, initramfs and `boot.img`
 files.
+
+`--without-battery` also works with `--mix-only`. It writes `j36.usb=novbus`
+instead of `j36.usb=1` in `mvii/boot.conf`, so the OTG data port does not
+source 5 V from VBAT/VSYS. It keeps `j36.power=1`: the PMIC driver must service
+the charger watchdog for continued power from the separate DC inlet. Use a
+supply on that inlet that can carry the board's load; this build option cannot
+change the preloader's power checks or the board's wiring. A device on the OTG
+port needs its own power in this mode.
 
 **The full build ships one file**, and it is not in this directory:
 
