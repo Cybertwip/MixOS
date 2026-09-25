@@ -3278,8 +3278,42 @@ static ssize_t vbus_sourcing_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(vbus_sourcing);
 
+/* Diagnostic reads only. Values are sequential snapshots, not an atomic
+ * sample; voltages come from the last gauge poll. Preserve transport errors
+ * so an unreadable register cannot be mistaken for a disabled charger. */
+static ssize_t power_snapshot_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	static const u32 regs[] = { 0x0000, 0x0004, 0x0006, 0x0008,
+				    0x001a, 0x001e, 0x0020, 0x002e };
+	struct power_supply *psy = dev_get_drvdata(dev);
+	struct j36_pmic *p = power_supply_get_drvdata(psy);
+	struct j36_pub pub;
+	unsigned long flags;
+	unsigned int i;
+	ssize_t len;
+	u32 value;
+	int ret;
+
+	spin_lock_irqsave(&p->lock, flags);
+	pub = p->pub;
+	spin_unlock_irqrestore(&p->lock, flags);
+	len = sysfs_emit(buf, "external_power=%u cached_vsys_uv=%d cached_chrin_uv=%d\n",
+			 external_power, pub.voltage_uv, pub.charger_uv);
+	for (i = 0; i < ARRAY_SIZE(regs); ++i) {
+		ret = j36_pmic_read(p, regs[i], &value);
+		if (ret)
+			len += sysfs_emit_at(buf, len, "%04x=error:%d\n", regs[i], ret);
+		else
+			len += sysfs_emit_at(buf, len, "%04x=%04x\n", regs[i], value);
+	}
+	return len;
+}
+static DEVICE_ATTR_RO(power_snapshot);
+
 static struct attribute *j36_usb_attrs[] = {
 	&dev_attr_vbus_sourcing.attr,
+	&dev_attr_power_snapshot.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(j36_usb);

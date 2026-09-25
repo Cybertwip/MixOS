@@ -1755,6 +1755,7 @@ for applet in "${INIT_APPLETS[@]}"; do
 done
 cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 cp "$PWRAP_MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
+cp "$ROOT/device/j36-ultra/power-diagnostic.sh" "$INITROOT/power-diagnostic.sh"
 # And the PMIC, which is ALSO staged into j36/power/ on the card and is the only
 # module in this build that is deliberately in two places.  The payload copy is the
 # one that owns the gauge, the backlight ordering and the poweroff handler; this
@@ -1890,7 +1891,12 @@ if grep -q '^tty0 .*C' /proc/consoles 2>/dev/null; then panel_is_console=1; fi
 # it is called, so an unset variable would be a silent empty string in the first
 # comparison rather than an error anyone would notice.
 splash_on=0
+power_diag=""
+. /power-diagnostic.sh
 say() {
+    if [ "$power_diag" = power ]; then
+        echo "$(cat /proc/uptime) $*" >> /dev/j36-init-trace
+    fi
     echo "$@"
     if [ "$panel_is_console" = 0 ] && [ -c /dev/tty1 ]; then echo "$@" >/dev/tty1; fi
     # With console=tty0 last, the line above went to the panel and nowhere else --
@@ -1964,6 +1970,7 @@ fi
 stage() {
     say "$1"
     if [ "$splash_on" = 1 ]; then echo "stage:$1" >> "$splash_chan"; fi
+    power_diag_checkpoint "$1"
     return 0
 }
 detail() {
@@ -2102,6 +2109,7 @@ watch_run() {
         return 126
     fi
     watch_mark "$1"
+    power_diag_checkpoint "before $1"
     : > "$watch_status"
     : > "$watch_result"
     watch_say "$watch_label"
@@ -2127,6 +2135,9 @@ watch_run() {
         watch_step=""
         if [ -s "$watch_status" ]; then read -r watch_step < "$watch_status"; fi
         if [ -z "$watch_step" ]; then watch_step="$watch_label"; fi
+        if [ "$((watch_waited % 5))" = 0 ]; then
+            power_diag_checkpoint "$watch_label: $watch_step (${watch_waited}s)"
+        fi
         detail "$watch_step -- ${watch_waited}s"
         watch_waited=$((watch_waited + 1))
         sleep 1
@@ -2137,6 +2148,7 @@ watch_run() {
     # `return' wants a number and the file is written by a shell that could in
     # principle have been killed mid-write.  125 is "the child did not say".
     case "$watch_rc" in ''|*[!0-9]*) watch_rc=125 ;; esac
+    power_diag_checkpoint "after $1 rc=$watch_rc"
     return "$watch_rc"
 }
 
@@ -2171,6 +2183,9 @@ usb_vbus=1
 want_power=0
 power_charge=1
 power_external=0
+case " $(cat /proc/cmdline) " in
+    *" j36.diag=power "*) power_diag=power ;;
+esac
 want_wifi=0
 # The only j36 word that defaults to ON, and the reason is that it is the word you
 # cannot ask for after the fact: it writes the file that says why the boot went
@@ -3792,6 +3807,8 @@ mount_bootfs() {
     say "no FAT partition on this card carries mvii/ or j36/"
     return 1
 }
+
+power_diag_start
 
 # Set once, read by run_lima, run_mtkdrm, run_audio and setup_gl.  Empty means
 # "not looked for yet"; find_payload is called by each of them and is idempotent.

@@ -195,6 +195,17 @@ The diagnostic message is `charger watchdog OFF (verified)`; a failed PMIC
 transaction is logged and retried. This does not establish that a supply can
 sustain the board's load; the change still needs a boot test on the device.
 
+For a shutdown that still occurs after expansion, add `j36.diag=power` to the
+`bootargs=` line in `mvii/boot.conf`. This requires the current initramfs and
+adds a 60-second idle check after expansion, before the update and peripheral
+startup. It then saves checkpoints before each startup stage and while waiting
+for modules, including PMIC registers, cached supply voltages, boot arguments,
+and kernel messages. The two alternating files, `j36-power-0.txt` and
+`j36-power-1.txt`, are on BOOT so a PC can read them after power is lost. Keep
+both files; their boot IDs, sequence numbers and completion markers distinguish
+the newest complete checkpoint. Logging remounts BOOT writable only for each
+checkpoint. Remove `j36.diag=power` to restore normal startup timing.
+
 **The full build ships one file**, and it is not in this directory:
 
 ```text
