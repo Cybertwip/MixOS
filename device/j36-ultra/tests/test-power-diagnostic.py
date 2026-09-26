@@ -57,4 +57,32 @@ rootfs_type=ext2
         assert all("unavailable" in log for log in logs)
         assert ("umount " in ops) == (existing == "0")
         assert ops.count("remount,ro") == 15
-print("Power diagnostic: opt-in, idle interval, rotation and mount cleanup passed")
+builder = (helper.parent / "build-in-vm.sh").read_text()
+start = builder.index('power_diag=""\n')
+mode = builder[start:builder.index('say() {', start)]
+start = builder.index('if [ "$power_diag" = power ]; then\n    # Do not wait')
+bypass = builder[start:builder.index('\nfi\n', start) + 4]
+with tempfile.TemporaryDirectory(prefix="j36-diagnostic-mode-") as tmp:
+    root = Path(tmp)
+    marker = root / "marker"
+    cmdline = root / "cmdline"
+    empty = root / "helper"
+    empty.write_text("")
+    mode = mode.replace('/proc/cmdline', str(cmdline))
+    mode = mode.replace('/etc/j36-power-diagnostic', str(marker))
+    mode = mode.replace('/power-diagnostic.sh', str(empty))
+    for embedded, argument, expected in [(False, "", "retry"),
+                                         (False, "j36.diag=power", "0"),
+                                         (True, "", "0")]:
+        if embedded:
+            marker.write_text("v2\n")
+        elif marker.exists():
+            marker.unlink()
+        cmdline.write_text(argument + "\n")
+        result = subprocess.run(["sh", "-c", 'stage() { :; }; detail() { :; }; sleep() { :; };\n'
+                                 + mode + '\nwant_expand=retry\n' + bypass
+                                 + '\necho "$want_expand"'], text=True,
+                                capture_output=True, check=True)
+        assert result.stdout.strip() == expected
+assert builder.index('stage "J36 DIAG v2: resize skipped"') < builder.index('\nexpand_root\n')
+print("Power diagnostic: opt-in, embedded mode, resize bypass, idle interval, rotation and mount cleanup passed")
