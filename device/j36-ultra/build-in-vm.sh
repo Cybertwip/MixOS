@@ -34,6 +34,9 @@ EXPORT_DIR="${J36_EXPORT_DIR:-$WORK/export}"
 # is what produces the flashable image, and it is the only thing that should.
 MIX_ONLY="${J36_MIX_ONLY:-0}"
 WITHOUT_BATTERY="${J36_WITHOUT_BATTERY:-0}"
+POWER_DIAGNOSTIC="${J36_POWER_DIAGNOSTIC:-0}"
+[[ "$POWER_DIAGNOSTIC" == 0 || "$POWER_DIAGNOSTIC" == 1 ]] || \
+    { printf 'J36_POWER_DIAGNOSTIC must be 0 or 1\n' >&2; exit 2; }
 [[ "$WITHOUT_BATTERY" == 0 || "$WITHOUT_BATTERY" == 1 ]] || \
     { printf 'J36_WITHOUT_BATTERY must be 0 or 1\n' >&2; exit 2; }
 KERNEL_URL="${J36_KERNEL_URL:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
@@ -1756,6 +1759,9 @@ done
 cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 cp "$PWRAP_MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 cp "$ROOT/device/j36-ultra/power-diagnostic.sh" "$INITROOT/power-diagnostic.sh"
+if [[ "$POWER_DIAGNOSTIC" == 1 ]]; then
+    printf 'v2\n' > "$INITROOT/etc/j36-power-diagnostic"
+fi
 # And the PMIC, which is ALSO staged into j36/power/ on the card and is the only
 # module in this build that is deliberately in two places.  The payload copy is the
 # one that owns the gauge, the backlight ordering and the poweroff handler; this
@@ -1892,6 +1898,12 @@ if grep -q '^tty0 .*C' /proc/consoles 2>/dev/null; then panel_is_console=1; fi
 # comparison rather than an error anyone would notice.
 splash_on=0
 power_diag=""
+case " $(cat /proc/cmdline) " in
+    *" j36.diag=power "*) power_diag=power ;;
+esac
+# The explicit diagnostic build carries its own mode marker, so stale or
+# overridden bootargs cannot silently disable this test.
+if [ -f /etc/j36-power-diagnostic ]; then power_diag=power; fi
 . /power-diagnostic.sh
 say() {
     if [ "$power_diag" = power ]; then
@@ -2154,6 +2166,9 @@ watch_run() {
 
 say ""
 say "J36 Ultra ARMv7 bring-up initramfs"
+if [ "$power_diag" = power ]; then
+    stage "J36 DIAG v2: initramfs loaded"
+fi
 say "Display: the LK's framebuffer on /dev/fb0 until something opens /dev/dri/card0."
 progress 4
 insmod /lib/modules/*/extra/j36_pwrap.ko || say "shared PWRAP module load failed"
@@ -2516,6 +2531,15 @@ if [ "$want_power" = 1 ]; then
     else
         say "power: the initramfs PMIC would not load; the charger stays as the LK left it until j36/power/ is reached"
     fi
+fi
+
+if [ "$power_diag" = power ]; then
+    # Do not wait before the early PMIC load: an old LK may leave a timer armed.
+    # Isolate expansion on this diagnostic boot, even if bootargs request it.
+    want_expand=0
+    stage "J36 DIAG v2: resize skipped"
+    detail "Diagnostic initramfs active; card size stays unchanged"
+    sleep 5
 fi
 
 # ── Swap, in RAM, before anything has allocated ──────────────────────────────

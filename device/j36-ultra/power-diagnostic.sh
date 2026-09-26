@@ -17,7 +17,7 @@ power_diag_checkpoint() {
     # Alternate files so a cut during this write does not truncate the last
     # checkpoint. Sequence and boot ID distinguish old boots and partial files.
     {
-        echo "J36 power diagnostic v1"
+        echo "J36 power diagnostic v2 (resize bypassed)"
         echo "sequence=$power_diag_seq stage=$*"
         echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
         echo "uptime=$(cat /proc/uptime)"
@@ -57,8 +57,8 @@ power_diag_start() {
     # Expansion needs all sibling partitions unmounted for its table reread.
     # This is called only AFTER expand_root has returned.
     power_diag_ready=1
-    stage "Power diagnostic: 60-second idle check"
-    say "Expansion has returned. Peripheral startup begins after this check."
+    stage "J36 DIAG v2: 60-second idle check"
+    say "Resize was bypassed for diagnosis. Peripheral startup begins after this check."
     power_diag_waited=0
     while [ "$power_diag_waited" -lt 60 ]; do
         power_diag_checkpoint "post-expansion idle $power_diag_waited/60s"
