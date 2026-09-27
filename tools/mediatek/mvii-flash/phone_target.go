@@ -123,6 +123,12 @@ func refusePhoneWrite(cfg config, phone *phoneRoot) error {
 		if j36OnlyVerb(cfg) == "" && hasRawAddress(cfg) && cfg.upload == "" {
 			return nil
 		}
+		// Staged phone BROM (step 6 groundwork): every staging file is
+		// named, so run() validates the plan host-side instead of feeding
+		// the j36 flow. No device I/O happens on that path yet.
+		if isPhoneBROMShape(cfg) {
+			return nil
+		}
 		return fmt.Errorf("phone target %s: serial VCOM without a raw-exec shape selects the j36 BROM feed "+
 			"(MT6592 DA, j36 scatter). For BROM add -address 0x... [payload] with no -upload and no feed flags "+
 			"(raw exec jumps only what it is given); for flashing use -backend fastboot -partition <LK name "+
