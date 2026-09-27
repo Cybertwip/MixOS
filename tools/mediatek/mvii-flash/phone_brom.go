@@ -533,7 +533,15 @@ func crashPhonePreloader(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts)
 	}
 	for i, mode := range modes {
 		fmt.Printf("Crash attempt %d/3 (%s)...\n", i+1, mode.name)
-		_ = mode.fire()
+		// The result is the diagnosis: a status hex means the secured
+		// preloader clean-refused the mode, a device-gone error means it
+		// took the mode down with it, and nil means the mode was
+		// accepted (watch the landing check below).
+		if err := mode.fire(); err != nil {
+			fmt.Printf("  result: %v\n", err)
+		} else {
+			fmt.Println("  result: accepted")
+		}
 		time.Sleep(time.Second)
 		if _, err := probePhoneBROMOnce(c, phone, facts, true); err == nil && c.isBROM {
 			fmt.Println("Crash landed BROM.")

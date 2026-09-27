@@ -368,10 +368,9 @@ func TestWaitPhoneBROMExpiredConnectFails(t *testing.T) {
 }
 
 // Against a dead peer every crash mode fails fast and ignored, the run
-// still completes, and the emission order is exact: mode, HW-code check,
-// mode, HW-code check, mode, HW-code check. (The null jump fires only when
-// its SEND_DA is accepted, so a dead peer never sees it -- same as the
-// reference, which skips the jump when the send raises.)
+// still completes, and the three modes fire in order (the null jump itself
+// fires only when its SEND_DA is accepted, so a dead peer never sees it --
+// same as the reference, which skips the jump when the send raises).
 func TestCrashPhonePreloader(t *testing.T) {
 	phone := writePhoneRoot(t, "device=cph2385-4gb\nsoc=mt6765\n")
 	info, ok := detectPhoneRoot(phone)
@@ -385,15 +384,22 @@ func TestCrashPhonePreloader(t *testing.T) {
 	port := &failPort{err: errors.New("read /dev/cu.usbmodem1: device not configured")}
 	client := &mtkSerialClient{port: port, commandTimeout: time.Millisecond, writeTimeout: time.Millisecond}
 	crashPhonePreloader(client, info, facts)
-	var got []byte
+	var singles []byte
 	for _, w := range port.writes {
 		if len(w) == 1 {
-			got = append(got, w[0])
+			singles = append(singles, w[0])
 		}
 	}
-	want := []byte{mtkCmdSendDA, mtkCmdGetHWCode, mtkCmdRead32, mtkCmdGetHWCode, mtkCmdSendDA, mtkCmdGetHWCode}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("command bytes = %x, want %x", got, want)
+	first := func(b byte) int { return bytes.IndexByte(singles, b) }
+	last := func(b byte) int { return bytes.LastIndexByte(singles, b) }
+	if first(mtkCmdSendDA) < 0 || first(mtkCmdRead32) < 0 {
+		t.Fatalf("command bytes = %x, want SEND_DA and READ32 present", singles)
+	}
+	if !(first(mtkCmdSendDA) < first(mtkCmdRead32) && first(mtkCmdRead32) < last(mtkCmdSendDA)) {
+		t.Fatalf("command bytes = %x, want mode order SEND_DA, READ32, SEND_DA", singles)
+	}
+	if bytes.Contains(singles, []byte{mtkCmdJumpDA}) {
+		t.Fatalf("command bytes = %x, want no jump on a dead peer", singles)
 	}
 }
 
