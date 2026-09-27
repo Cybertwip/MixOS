@@ -214,31 +214,23 @@ func printPhoneUnlockPlan(plan *phoneUnlockPlan) {
 	}
 }
 
-// resolveUnlockPhone names the target: a phone -root when one is given,
-// else one handshake to read the hw code off the wire.
-func resolveUnlockPhone(cfg config) (*phoneRoot, phoneFacts, error) {
+// acquireUnlockSession opens one phone session: rooted flows use the
+// build-info soc, rootless flows learn it off the wire mid-handshake.
+// Either way there is exactly one hello; a throwaway pre-probe handshake
+// wedges observed phones for every session after the close.
+func acquireUnlockSession(cfg config, emi *mtkPreloaderEMI) (*mtkSerialClient, mtkTargetConfig, *phoneRoot, phoneFacts, error) {
 	if phone, ok := detectPhoneRoot(cfg.root); ok {
 		facts, err := phoneFactsFor(phone.soc)
 		if err != nil {
-			return nil, phoneFacts{}, err
+			return nil, mtkTargetConfig{}, nil, phoneFacts{}, err
 		}
-		return phone, facts, nil
+		client, target, err := acquirePhoneBROM(cfg, phone, facts, emi)
+		if err != nil {
+			return nil, mtkTargetConfig{}, nil, phoneFacts{}, err
+		}
+		return client, target, phone, facts, nil
 	}
-	client, err := connectMTKSerialWithOptions(cfg.device, mtkSerialConnectOptions{handshakeWake: true})
-	if err != nil {
-		return nil, phoneFacts{}, err
-	}
-	hw, _, hwErr := client.getHWCode()
-	_ = client.port.Close()
-	if hwErr != nil {
-		return nil, phoneFacts{}, hwErr
-	}
-	soc, facts, err := phoneFactsForHWCode(hw)
-	if err != nil {
-		return nil, phoneFacts{}, err
-	}
-	fmt.Printf("Target identifies as %s (hw code 0x%04x).\n", soc, hw)
-	return &phoneRoot{device: soc, soc: soc, family: phoneFamilyForSoc(soc)}, facts, nil
+	return acquirePhoneBROMAuto(cfg, emi)
 }
 
 func confirmUnlockWrite(destination, image string, yes bool) error {
@@ -332,11 +324,11 @@ func runUnlockCommand(cfg config) error {
 			return err
 		}
 	}
-	phone, facts, err := resolveUnlockPhone(cfg)
+	emi, err := resolvePhoneEMI(cfg)
 	if err != nil {
 		return err
 	}
-	emi, err := resolvePhoneEMI(cfg)
+	client, target, phone, facts, err := acquireUnlockSession(cfg, emi)
 	if err != nil {
 		return err
 	}
@@ -356,7 +348,7 @@ func runUnlockCommand(cfg config) error {
 	fmt.Printf("Using DA loader: %s (hw code 0x%04x)\n", loader.Path, loader.HWCode)
 	fmt.Printf("Using device preloader EMI: %s (version 0x%x, length 0x%x)\n", emi.Path, emi.Version, len(emi.Data))
 	fmt.Printf("Using MTK serial packet size: 0x%x\n", packetSize)
-	client, _, err := startPhoneDA(cfg, phone, facts, emi, loader, plan.auth)
+	client, target, err = bringUpPhoneDA(cfg, phone, facts, emi, loader, plan.auth, client, target)
 	if err != nil {
 		return err
 	}
@@ -458,7 +450,7 @@ func runPhoneWriteBoot1(cfg config, file string) error {
 	if err != nil {
 		return err
 	}
-	phone, facts, err := resolveUnlockPhone(cfg)
+	client, target, phone, facts, err := acquireUnlockSession(cfg, emi)
 	if err != nil {
 		return err
 	}
@@ -475,7 +467,7 @@ func runPhoneWriteBoot1(cfg config, file string) error {
 	if err != nil {
 		return fmt.Errorf("phone target %s: DA %s: %w", phone.device, plan.daPath, err)
 	}
-	client, _, err := startPhoneDA(cfg, phone, facts, emi, loader, plan.auth)
+	client, target, err = bringUpPhoneDA(cfg, phone, facts, emi, loader, plan.auth, client, target)
 	if err != nil {
 		return err
 	}
