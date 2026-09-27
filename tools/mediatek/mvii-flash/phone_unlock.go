@@ -85,7 +85,10 @@ func patchUnlockPreloader(data []byte) ([]byte, unlockPatchReport, error) {
 	if rawEnd <= codeOffset {
 		return nil, report, fmt.Errorf("image too small (%d bytes) for code at %#x", len(data), codeOffset)
 	}
+	// Snapshot both blobs before zeroing: the flag block usually sits
+	// inside the zeroed range (0xaec in the stock image).
 	raw := bytes.Clone(out[codeOffset:rawEnd])
+	flag := bytes.Clone(out[flagAt : flagAt+unlockFlagLen])
 	for i := codeOffset; i < len(out); i++ {
 		out[i] = 0
 	}
@@ -93,7 +96,7 @@ func patchUnlockPreloader(data []byte) ([]byte, unlockPatchReport, error) {
 	for _, p := range unlockBRLYT {
 		out[p[0]] = byte(p[1])
 	}
-	copy(out[0x1000:], out[flagAt:flagAt+unlockFlagLen])
+	copy(out[0x1000:], flag)
 	out[0x1000+unlockFlagLockOff] = 0x00
 	return out, report, nil
 }
