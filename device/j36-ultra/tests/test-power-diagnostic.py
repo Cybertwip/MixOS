@@ -48,15 +48,15 @@ rootfs_type=ext2
         if fail == "1":
             assert not list((root / "bootfs").glob("*.txt"))
             continue
-        assert ops.count("sleep 5") == 12
+        assert "sleep " not in ops
         assert result.stdout.strip() == "mounted=" + existing
         logs = [f.read_text() for f in (root / "bootfs").glob("*.txt")]
         assert len(logs) == 2
-        assert any("stage=final" in log and "checkpoint_complete=15" in log for log in logs)
+        assert any("stage=final" in log and "checkpoint_complete=2" in log for log in logs)
         assert all("boot_id=test-boot" in log and "test kernel message" in log for log in logs)
         assert all("unavailable" in log for log in logs)
         assert ("umount " in ops) == (existing == "0")
-        assert ops.count("remount,ro") == 15
+        assert ops.count("remount,ro") == 2
 builder = (helper.parent / "build-in-vm.sh").read_text()
 start = builder.index('power_diag=""\n')
 mode = builder[start:builder.index('say() {', start)]
@@ -79,10 +79,10 @@ with tempfile.TemporaryDirectory(prefix="j36-diagnostic-mode-") as tmp:
         elif marker.exists():
             marker.unlink()
         cmdline.write_text(argument + "\n")
-        result = subprocess.run(["sh", "-c", 'stage() { :; }; detail() { :; }; sleep() { :; };\n'
+        result = subprocess.run(["sh", "-c", 'stage() { :; }; detail() { :; }; sleep() { :; }; power_diag_checkpoint() { [ \"$want_expand\" = 0 ] && [ \"$power_diag_ready\" = 1 ] || exit 73; };\n'
                                  + mode + '\nwant_expand=retry\n' + bypass
                                  + '\necho "$want_expand"'], text=True,
                                 capture_output=True, check=True)
         assert result.stdout.strip() == expected
-assert builder.index('stage "J36 DIAG v2: resize skipped"') < builder.index('\nexpand_root\n')
-print("Power diagnostic: opt-in, embedded mode, resize bypass, idle interval, rotation and mount cleanup passed")
+assert builder.index('stage "J36 DIAG v3: resize skipped"') < builder.index('\nexpand_root\n')
+print("Power diagnostic: opt-in, embedded mode, resize bypass, no idle delay, rotation and mount cleanup passed")

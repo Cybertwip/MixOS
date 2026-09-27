@@ -1,0 +1,43 @@
+OPPO MT6877 board extracts: provenance and maintenance
+=========================================================
+
+These files are small, hand-maintained extracts from the vendor reference
+kernel at reference/android_kernel_oppo_mt6877 (OPPO MT6877, Linux 4.14.186).
+They are the whole input to generate_dts_oppo.py, the same way
+device/j36-ultra/mvii-board/ is the whole input to generate_dts.py.
+
+Why extracts and not the reference tree itself: the reference kernel is a
+full 4.14 vendor tree that the Debian build never compiles. The MixOS kernel
+is mainline 6.12 LTS. What the bring-up needs from 4.14 is facts -- base
+addresses, IRQ numbers, panel init sequences, touch geometry -- and facts
+rot silently when they are re-parsed from 60,000 files on every build. So
+each fact is copied here once, with the path it came from, and the generator
+asserts on the copy.
+
+Files
+-----
+mt6877_addrs.h   SoC base addresses + IRQ lines, from
+                 arch/arm64/boot/dts/mediatek/mt6877.dts
+panel_td4330.h   TD4330 FHD+ DSI command-mode init sequence (AUO panel,
+                 Richtek backlight/bias), from
+                 drivers/misc/mediatek/lcm/td4330_fhdp_dsi_cmd_auo_rt5081/
+                 and the chosen/lcmname line of
+                 arch/arm64/boot/dts/mediatek/oplus6877_20181.dts
+                 ("td4330_fhdp_dsi_cmd_auo_rt4831_drv")
+touch_nt36672.h  Novatek NT36672 geometry + SPI wiring, from
+                 arch/arm64/boot/dts/mediatek/cust_mt6877_touch_nt36672.dtsi
+                 and the protocol in
+                 drivers/input/touchscreen/mediatek/NT36xxx/nt36xxx.c
+msdc_mt6877.h    eMMC/SD timing caps, from
+                 arch/arm64/boot/dts/mediatek/cust_mt6877_msdc.dtsi
+modem_md.h       modem (ECCCI) power/boot register outline, from
+                 drivers/misc/mediatek/eccci/modem_sys3.c and the
+                 mt6877 modem clock/reset bits it touches
+wifi_consys.h    CONSYS register outline for Wi-Fi bring-up, from the
+                 consys@18000000 node of mt6877.dts and
+                 drivers/misc/mediatek/connectivity/
+
+Maintenance rule: when a new OPPO device lands in devices.sh, its deltas go
+in a new panel_*.h / touch_*.h here with the same provenance comment style,
+and the generator picks them by OPPO_PANEL / OPPO_TOUCH. The reference tree
+is read by a human, once, at that moment -- never by the build.

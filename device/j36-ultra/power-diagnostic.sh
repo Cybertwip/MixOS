@@ -1,7 +1,8 @@
 #!/bin/sh
 # SPDX-License-Identifier: MPL-2.0 OR GPL-2.0-or-later
 # Sourced by /init. Opt-in with j36.diag=power; no register writes here.
-# mount_bootfs must be defined, and expansion finished, before start is called.
+# mount_bootfs must be defined. Enable writes only after expansion is disabled
+# or has returned; every borrowed BOOT mount is released after its checkpoint.
 power_diag_ready=0
 power_diag_seq=0
 
@@ -17,7 +18,7 @@ power_diag_checkpoint() {
     # Alternate files so a cut during this write does not truncate the last
     # checkpoint. Sequence and boot ID distinguish old boots and partial files.
     {
-        echo "J36 power diagnostic v2 (resize bypassed)"
+        echo "J36 power diagnostic v3 (resize bypassed)"
         echo "sequence=$power_diag_seq stage=$*"
         echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
         echo "uptime=$(cat /proc/uptime)"
@@ -54,18 +55,7 @@ power_diag_checkpoint() {
 
 power_diag_start() {
     [ "$power_diag" = power ] || return 0
-    # Expansion needs all sibling partitions unmounted for its table reread.
-    # This is called only AFTER expand_root has returned.
+    # Called after expand_root returns; continue directly to peripheral startup.
     power_diag_ready=1
-    stage "J36 DIAG v2: 60-second idle check"
-    say "Resize was bypassed for diagnosis. Peripheral startup begins after this check."
-    power_diag_waited=0
-    while [ "$power_diag_waited" -lt 60 ]; do
-        power_diag_checkpoint "post-expansion idle $power_diag_waited/60s"
-        detail "Idle $power_diag_waited/60s; saving BOOT:/j36-power-*.txt"
-        sleep 5
-        power_diag_waited=$((power_diag_waited + 5))
-    done
-    say "Power diagnostic: idle check complete; continuing startup"
-    power_diag_checkpoint "idle complete"
+    power_diag_checkpoint "root ready; continuing startup"
 }

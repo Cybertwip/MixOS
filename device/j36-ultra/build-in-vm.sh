@@ -1760,7 +1760,7 @@ cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 cp "$PWRAP_MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 cp "$ROOT/device/j36-ultra/power-diagnostic.sh" "$INITROOT/power-diagnostic.sh"
 if [[ "$POWER_DIAGNOSTIC" == 1 ]]; then
-    printf 'v2\n' > "$INITROOT/etc/j36-power-diagnostic"
+    printf 'v3\n' > "$INITROOT/etc/j36-power-diagnostic"
 fi
 # And the PMIC, which is ALSO staged into j36/power/ on the card and is the only
 # module in this build that is deliberately in two places.  The payload copy is the
@@ -2167,7 +2167,7 @@ watch_run() {
 say ""
 say "J36 Ultra ARMv7 bring-up initramfs"
 if [ "$power_diag" = power ]; then
-    stage "J36 DIAG v2: initramfs loaded"
+    stage "J36 DIAG v3: initramfs loaded"
 fi
 say "Display: the LK's framebuffer on /dev/fb0 until something opens /dev/dri/card0."
 progress 4
@@ -2533,13 +2533,50 @@ if [ "$want_power" = 1 ]; then
     fi
 fi
 
+# Defined before root discovery so diagnostic boots can record early failures.
+# Normal boots still first call this after expansion has returned.
+bootfs_mounted=0
+# Remembered so that the data-partition automount below can leave the BOOT partition
+# alone: it is already reachable, it is the one partition the operator edits from a
+# PC, and it is not what "show me the card" means.
+bootdev=""
+mount_bootfs() {
+    if [ "$bootfs_mounted" = 1 ]; then return 0; fi
+    mkdir -p /bootfs
+    for dev in /dev/mmcblk*p*; do
+        if [ ! -b "$dev" ]; then continue; fi
+        if ! mount -t vfat -o ro "$dev" /bootfs 2>/dev/null; then continue; fi
+        # mvii/ identifies it now, not j36/: boot.conf is the file the LK itself
+        # reads and the one thing BOOT always carries, whereas j36/ is exactly what
+        # moved off this partition.  j36/ is still accepted, because on a card from
+        # an older build that is what is there.
+        if [ -d /bootfs/mvii ] || [ -d /bootfs/j36 ]; then
+            bootfs_mounted=1
+            bootdev="$dev"
+            say "boot partition: $dev"
+            return 0
+        fi
+        umount /bootfs
+    done
+    say "no FAT partition on this card carries mvii/ or j36/"
+    return 1
+}
+
 if [ "$power_diag" = power ]; then
     # Do not wait before the early PMIC load: an old LK may leave a timer armed.
     # Isolate expansion on this diagnostic boot, even if bootargs request it.
     want_expand=0
-    stage "J36 DIAG v2: resize skipped"
+    # Early BOOT writes are safe only after expansion is explicitly disabled.
+    power_diag_ready=1
+    stage "J36 DIAG v3: resize skipped"
     detail "Diagnostic initramfs active; card size stays unchanged"
-    sleep 5
+    # Retry as the MMC partitions appear; retain the original five-second pause.
+    power_diag_early_wait=0
+    while [ "$power_diag_early_wait" -lt 5 ]; do
+        sleep 1
+        power_diag_checkpoint "early boot before root scan ($power_diag_early_wait)"
+        power_diag_early_wait=$((power_diag_early_wait + 1))
+    done
 fi
 
 # ── Swap, in RAM, before anything has allocated ──────────────────────────────
@@ -3805,32 +3842,6 @@ expand_root
 # try_root() finds the rootfs -- by mounting candidates and looking inside, because
 # partition numbering follows whichever MMC host attached first and this initramfs
 # has no blkid.  Read-only, since nothing here writes to the card.
-bootfs_mounted=0
-# Remembered so that the data-partition automount below can leave the BOOT partition
-# alone: it is already reachable, it is the one partition the operator edits from a
-# PC, and it is not what "show me the card" means.
-bootdev=""
-mount_bootfs() {
-    if [ "$bootfs_mounted" = 1 ]; then return 0; fi
-    mkdir -p /bootfs
-    for dev in /dev/mmcblk*p*; do
-        if [ ! -b "$dev" ]; then continue; fi
-        if ! mount -t vfat -o ro "$dev" /bootfs 2>/dev/null; then continue; fi
-        # mvii/ identifies it now, not j36/: boot.conf is the file the LK itself
-        # reads and the one thing BOOT always carries, whereas j36/ is exactly what
-        # moved off this partition.  j36/ is still accepted, because on a card from
-        # an older build that is what is there.
-        if [ -d /bootfs/mvii ] || [ -d /bootfs/j36 ]; then
-            bootfs_mounted=1
-            bootdev="$dev"
-            say "boot partition: $dev"
-            return 0
-        fi
-        umount /bootfs
-    done
-    say "no FAT partition on this card carries mvii/ or j36/"
-    return 1
-}
 
 power_diag_start
 
