@@ -358,7 +358,9 @@ void mt6592_pmic_charger_service(void);
 
 /* Stop the charger watchdog timer. The kernel owns charger policy once it is
  * up and re-arms per its own rules; nothing can feed the timer across the
- * jump, so a handoff that leaves it armed is a reset a few seconds in. */
+ * jump, so a handoff that leaves it armed is a reset a few seconds in. Call
+ * this immediately before the jump: any eMMC traffic after it re-arms the
+ * timer via power_hold(). */
 void mt6592_pmic_charger_watchdog_disarm(void);
 
 /*
