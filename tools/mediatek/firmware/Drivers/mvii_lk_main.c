@@ -35,6 +35,7 @@
 #include "backlight.h"
 #include "dsi_drv.h"
 #include "lcd_drv.h"
+#include "lk_bootmenu.h"
 #include "mt6592_bootstatus.h"
 #include "mt6592_dbgflag.h"
 #include "mt6592_delay.h"
@@ -437,14 +438,12 @@ static uint32_t lk_kpd_menu_down(void) {
     return ((word >> LK_KPD_MENU_BIT) & 1u) ? 0u : 1u;
 }
 
-#ifndef MVII_MT6592_LK_RELEASE
 /* One scan of the five matrix words. Returns nonzero if any bit is low, and
  * leaves the words in `out` so the caller can log the baseline exactly once
  * rather than once per poll.
  *
- * This and lk_debug_combo_held() below exist only to open the debug console, so
- * the release bootloader does not compile them. That also gives the release
- * build back the two-second scan window every normal boot pays for here. */
+ * Shared: the debug combo below reads it in debug builds and the boot-choice
+ * menu reads it wherever the SD hand-off exists, so it is compiled in both. */
 static uint32_t lk_kpd_scan(uint32_t out[LK_KPD_NUM_MEMS]) {
     uint32_t held = 0u;
     uint32_t i;
@@ -459,6 +458,7 @@ static uint32_t lk_kpd_scan(uint32_t out[LK_KPD_NUM_MEMS]) {
     return held;
 }
 
+#ifndef MVII_MT6592_LK_RELEASE
 /*
  * ── A WINDOW, NOT AN INSTANT ──
  *
@@ -897,7 +897,7 @@ static const mvii_debug_console_hooks_t kConsoleHooks = {
  * There is deliberately no general alphabet here. The detail screen says what a
  * gauge measures with an ICON -- a plug or a battery -- and only the unit needs
  * letters, so this is five shapes rather than a font nobody asked for. */
-static const uint8_t kGlyphs[17][5] = {
+static const uint8_t kGlyphs[30][5] = {
     {7u, 5u, 5u, 5u, 7u}, /* 0 */
     {2u, 6u, 2u, 2u, 7u}, /* 1 */
     {7u, 1u, 7u, 4u, 7u}, /* 2 */
@@ -915,6 +915,21 @@ static const uint8_t kGlyphs[17][5] = {
     {0u, 5u, 7u, 7u, 5u}, /* m — two stems and a shared top                   */
     {5u, 5u, 5u, 5u, 2u}, /* V                                                */
     {2u, 5u, 7u, 5u, 5u}, /* A                                                */
+    /* The boot-choice prompt below is set in caps out of these. S is drawn
+     * round ({6,4,2,1,6}) so it never reads as the square 5 above it. */
+    {6u, 5u, 6u, 5u, 6u}, /* B                                                */
+    {6u, 5u, 5u, 5u, 6u}, /* D                                                */
+    {7u, 4u, 6u, 4u, 7u}, /* E                                                */
+    {7u, 2u, 2u, 2u, 7u}, /* I                                                */
+    {5u, 7u, 7u, 5u, 5u}, /* N                                                */
+    {2u, 5u, 5u, 5u, 2u}, /* O                                                */
+    {6u, 5u, 6u, 4u, 4u}, /* P                                                */
+    {6u, 5u, 6u, 5u, 5u}, /* R                                                */
+    {6u, 4u, 2u, 1u, 6u}, /* S                                                */
+    {7u, 2u, 2u, 2u, 2u}, /* T                                                */
+    {5u, 5u, 5u, 5u, 7u}, /* U                                                */
+    {5u, 5u, 2u, 5u, 5u}, /* X                                                */
+    {5u, 5u, 2u, 2u, 2u}, /* Y                                                */
 };
 
 #define LK_GLYPH_PERCENT 10u
@@ -924,6 +939,19 @@ static const uint8_t kGlyphs[17][5] = {
 #define LK_GLYPH_M 14u
 #define LK_GLYPH_V 15u
 #define LK_GLYPH_A 16u
+#define LK_GLYPH_B 17u
+#define LK_GLYPH_D 18u
+#define LK_GLYPH_E 19u
+#define LK_GLYPH_I 20u
+#define LK_GLYPH_N 21u
+#define LK_GLYPH_O 22u
+#define LK_GLYPH_P 23u
+#define LK_GLYPH_R 24u
+#define LK_GLYPH_S 25u
+#define LK_GLYPH_T 26u
+#define LK_GLYPH_U 27u
+#define LK_GLYPH_X 28u
+#define LK_GLYPH_Y 29u
 
 /*
  * ══════════════════════════════════════════════════════════════════════════
@@ -1159,6 +1187,63 @@ static void lk_fb_percent(uint32_t pct, uint32_t y, uint32_t scale, uint32_t arg
     }
     lk_fb_glyph(LK_GLYPH_PERCENT, x + n * 4u * scale, y, scale, argb);
 }
+
+#ifdef MVII_MT6592_LK_SD_HANDOFF
+/* Plain words out of the table above, for the boot-choice banner. Lowercase
+ * folds to caps; a space advances one cell and draws nothing; anything with no
+ * cell vanishes without advancing, so a stray character can never shift the
+ * centring. Only the menu uses these, which is what the guard is for. */
+static uint32_t lk_glyph_for_char(char c, uint32_t* advance) {
+    *advance = 1u;
+    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    switch (c) {
+    case ' ': return 255u;
+    case '%': return LK_GLYPH_PERCENT;
+    case '.': return LK_GLYPH_DOT;
+    case '-': return LK_GLYPH_MINUS;
+    case 'A': return LK_GLYPH_A;
+    case 'B': return LK_GLYPH_B;
+    case 'D': return LK_GLYPH_D;
+    case 'E': return LK_GLYPH_E;
+    case 'I': return LK_GLYPH_I;
+    case 'M': return LK_GLYPH_M;
+    case 'N': return LK_GLYPH_N;
+    case 'O': return LK_GLYPH_O;
+    case 'P': return LK_GLYPH_P;
+    case 'R': return LK_GLYPH_R;
+    case 'S': return LK_GLYPH_S;
+    case 'T': return LK_GLYPH_T;
+    case 'U': return LK_GLYPH_U;
+    case 'V': return LK_GLYPH_V;
+    case 'X': return LK_GLYPH_X;
+    case 'Y': return LK_GLYPH_Y;
+    default: break;
+    }
+    if (c >= '0' && c <= '9') return (uint32_t)(c - '0');
+    *advance = 0u;
+    return 255u;
+}
+
+static uint32_t lk_text_width(const char* s, uint32_t scale) {
+    uint32_t n = 0u;
+    while (*s != 0) {
+        uint32_t advance;
+        (void)lk_glyph_for_char(*s++, &advance);
+        n += advance;
+    }
+    return (n == 0u) ? 0u : n * 4u * scale - scale;
+}
+
+static void lk_fb_text(const char* s, uint32_t x, uint32_t y, uint32_t scale,
+                       uint32_t argb) {
+    while (*s != 0) {
+        uint32_t advance;
+        const uint32_t g = lk_glyph_for_char(*s++, &advance);
+        if (g != 255u) lk_fb_glyph(g, x, y, scale, argb);
+        x += advance * 4u * scale;
+    }
+}
+#endif /* MVII_MT6592_LK_SD_HANDOFF */
 
 /*
  * A RUN OF GLYPH CELLS, MEASURED BEFORE IT IS DRAWN.
@@ -3476,6 +3561,233 @@ failed:
  * Try to boot the card. Returns 0 only when it is about to jump — it does not
  * return on success, because there is nowhere left to return to.
  */
+#ifdef MVII_MT6592_LK_SD_HANDOFF
+/*
+ * ── FIVE SECONDS, ANY BUTTON, ANDROID ──
+ *
+ * The release image boots two systems -- MixOS off the SD card, Android out of
+ * the eMMC BOOTIMG slot -- and until now the choice between them was silent:
+ * a card that hands off boots MixOS, anything else falls through to Android.
+ * This window makes the choice visible and hands it to the operator. It runs
+ * after the display lights the splash and before anything paints on top of it,
+ * so the prompt and its countdown sit on the logo itself: a banner along the
+ * bottom, the prompt blinking above a bar that drains green-amber-red, and the
+ * whole seconds left in a digit at the bar's right end.
+ *
+ * A press anywhere in the window tags the eMMC Android image and the SD
+ * hand-off below is skipped; silence tags MixOS and the hand-off runs as it
+ * always has. Afterwards the banner is repainted once as the tag -- BOOTING
+ * ANDROID or BOOTING MIXOS -- which is what stays on the panel through the
+ * load. Nothing here needs the asset slot: rectangles and the 3x5 table only,
+ * so a board that never took an `-assets` flash gets the same window.
+ *
+ * Edges, not levels. A button held from power-on -- the debug console's whole
+ * vocabulary -- must not read as a fresh press, so the first scan is the
+ * baseline and only a high-to-low transition after it counts. The matrix gives
+ * the face buttons, the pad and the side keys; MENU is muxed in like the
+ * console does. SELECT and START stay dead for the same reason they are dead
+ * there: their pads want the OS keypad driver's mux table, which is not in
+ * this image.
+ *
+ * The slices are the park's 20 ms ones: lk_park_hold_ms() feeds the watchdog
+ * and services the charger through the wait, which a bare delay would not.
+ * The window itself is measured on the GPT rather than counted in slices,
+ * because a visible five seconds has to BE five seconds -- service overhead
+ * stretching the slices must cost animation frames, never timer honesty.
+ */
+enum {
+    LK_BOOTMENU_POLL_MS = 20u,
+    LK_BOOTMENU_POLLS_MAX = 1000u,
+    LK_BOOTMENU_BANNER_X = 16u,
+    LK_BOOTMENU_BANNER_Y = 388u,
+    LK_BOOTMENU_BANNER_W = 608u,
+    LK_BOOTMENU_BANNER_H = 84u,
+    LK_BOOTMENU_TEXT_SCALE = 3u,
+    LK_BOOTMENU_TEXT_Y = 398u,
+    LK_BOOTMENU_BAR_X = 60u,
+    LK_BOOTMENU_BAR_Y = 428u,
+    LK_BOOTMENU_BAR_W = 480u,
+    LK_BOOTMENU_BAR_H = 14u,
+    LK_BOOTMENU_DIGIT_X = 556u,
+    LK_BOOTMENU_DIGIT_Y = 404u,
+    LK_BOOTMENU_DIGIT_SCALE = 6u,
+    LK_BOOTMENU_BADGE_SCALE = 4u
+};
+
+#define LK_BOOTMENU_BG 0xff0c1420u
+#define LK_BOOTMENU_FRAME 0xff2a3f55u
+#define LK_BOOTMENU_INK 0xffffffffu
+#define LK_BOOTMENU_DIM 0xff5a6a7au
+#define LK_BOOTMENU_BAR_BG 0xff1a2432u
+#define LK_BOOTMENU_BAR_GOOD 0xff2fae5fu
+#define LK_BOOTMENU_BAR_WARN 0xffe0a030u
+#define LK_BOOTMENU_BAR_LOW 0xffd23c3cu
+#define LK_BOOTMENU_BADGE_ANDROID 0xff2fae5fu
+#define LK_BOOTMENU_BADGE_MIXOS 0xff3f7fd0u
+#define LK_BOOTMENU_BEACON_ANDROID 0xff004030u
+#define LK_BOOTMENU_BEACON_MIXOS 0xff203050u
+
+static const char kBootmenuPrompt[] = "PRESS ANY BUTTON TO BOOT INTO ANDROID";
+
+static void lk_bootmenu_bar(uint32_t elapsed_ms) {
+    const uint32_t permille = lk_bootmenu_bar_permille(elapsed_ms);
+    const uint32_t fill = (LK_BOOTMENU_BAR_W * permille) / 1000u;
+    const uint32_t color = permille > 500u ? LK_BOOTMENU_BAR_GOOD
+        : (permille > 200u ? LK_BOOTMENU_BAR_WARN : LK_BOOTMENU_BAR_LOW);
+
+    lk_fb_rect(LK_BOOTMENU_BAR_X, LK_BOOTMENU_BAR_Y, LK_BOOTMENU_BAR_W,
+               LK_BOOTMENU_BAR_H, LK_BOOTMENU_BAR_BG);
+    if (fill > 0u) {
+        lk_fb_rect(LK_BOOTMENU_BAR_X, LK_BOOTMENU_BAR_Y, fill,
+                   LK_BOOTMENU_BAR_H, color);
+    }
+}
+
+static void lk_bootmenu_digit(uint32_t elapsed_ms) {
+    const uint32_t s = lk_bootmenu_remaining_s(elapsed_ms);
+
+    lk_fb_rect(LK_BOOTMENU_DIGIT_X, LK_BOOTMENU_DIGIT_Y,
+               3u * LK_BOOTMENU_DIGIT_SCALE, 5u * LK_BOOTMENU_DIGIT_SCALE,
+               LK_BOOTMENU_BG);
+    if (s > 0u) lk_fb_glyph(s, LK_BOOTMENU_DIGIT_X, LK_BOOTMENU_DIGIT_Y,
+                            LK_BOOTMENU_DIGIT_SCALE, LK_BOOTMENU_INK);
+}
+
+static void lk_bootmenu_prompt(int lit) {
+    const uint32_t w = lk_text_width(kBootmenuPrompt, LK_BOOTMENU_TEXT_SCALE);
+    const uint32_t x = ((uint32_t)MVII_MT6592_LK_FB_WIDTH - w) / 2u;
+
+    lk_fb_text(kBootmenuPrompt, x, LK_BOOTMENU_TEXT_Y, LK_BOOTMENU_TEXT_SCALE,
+               lit ? LK_BOOTMENU_INK : LK_BOOTMENU_DIM);
+}
+
+static void lk_bootmenu_frame(void) {
+    lk_fb_rect(LK_BOOTMENU_BANNER_X, LK_BOOTMENU_BANNER_Y, LK_BOOTMENU_BANNER_W,
+               LK_BOOTMENU_BANNER_H, LK_BOOTMENU_BG);
+    lk_fb_rect(LK_BOOTMENU_BANNER_X, LK_BOOTMENU_BANNER_Y, LK_BOOTMENU_BANNER_W,
+               2u, LK_BOOTMENU_FRAME);
+    lk_fb_rect(LK_BOOTMENU_BANNER_X,
+               LK_BOOTMENU_BANNER_Y + LK_BOOTMENU_BANNER_H - 2u,
+               LK_BOOTMENU_BANNER_W, 2u, LK_BOOTMENU_FRAME);
+    lk_fb_rect(LK_BOOTMENU_BANNER_X, LK_BOOTMENU_BANNER_Y, 2u,
+               LK_BOOTMENU_BANNER_H, LK_BOOTMENU_FRAME);
+    lk_fb_rect(LK_BOOTMENU_BANNER_X + LK_BOOTMENU_BANNER_W - 2u,
+               LK_BOOTMENU_BANNER_Y, 2u, LK_BOOTMENU_BANNER_H,
+               LK_BOOTMENU_FRAME);
+    lk_bootmenu_prompt(1);
+    lk_bootmenu_bar(0u);
+    lk_bootmenu_digit(0u);
+    lk_fb_present(LK_BOOTMENU_BANNER_X, LK_BOOTMENU_BANNER_Y,
+                  LK_BOOTMENU_BANNER_W, LK_BOOTMENU_BANNER_H);
+}
+
+/* The tag, repainted over the banner once the choice is made -- and again
+ * after the charge park, which paints its gauge on top on battery builds.
+ * MIXOS sets its M from the table's lowercase cell, the only M it has. */
+static void lk_bootmenu_badge(uint32_t android) {
+    const char* text = android != 0u ? "BOOTING ANDROID" : "BOOTING MIXOS";
+    const uint32_t color = android != 0u ? LK_BOOTMENU_BADGE_ANDROID
+                                         : LK_BOOTMENU_BADGE_MIXOS;
+    const uint32_t w = lk_text_width(text, LK_BOOTMENU_BADGE_SCALE);
+    const uint32_t x = ((uint32_t)MVII_MT6592_LK_FB_WIDTH - w) / 2u;
+    const uint32_t y = LK_BOOTMENU_BANNER_Y + 20u;
+
+    lk_fb_rect(LK_BOOTMENU_BANNER_X, LK_BOOTMENU_BANNER_Y, LK_BOOTMENU_BANNER_W,
+               LK_BOOTMENU_BANNER_H, LK_BOOTMENU_BG);
+    lk_fb_rect(LK_BOOTMENU_BANNER_X, LK_BOOTMENU_BANNER_Y, LK_BOOTMENU_BANNER_W,
+               2u, color);
+    lk_fb_rect(LK_BOOTMENU_BANNER_X,
+               LK_BOOTMENU_BANNER_Y + LK_BOOTMENU_BANNER_H - 2u,
+               LK_BOOTMENU_BANNER_W, 2u, color);
+    lk_fb_text(text, x, y, LK_BOOTMENU_BADGE_SCALE, LK_BOOTMENU_INK);
+    lk_fb_rect(x, y + 5u * LK_BOOTMENU_BADGE_SCALE + 6u, w, 6u, color);
+    lk_fb_present(LK_BOOTMENU_BANNER_X, LK_BOOTMENU_BANNER_Y,
+                  LK_BOOTMENU_BANNER_W, LK_BOOTMENU_BANNER_H);
+}
+
+static uint32_t lk_bootmenu_edge(const uint32_t cur[LK_KPD_NUM_MEMS],
+                                 const uint32_t prev[LK_KPD_NUM_MEMS],
+                                 uint32_t menu, uint32_t prev_menu) {
+    uint32_t i;
+
+    if (menu != 0u && prev_menu == 0u) return 1u;
+    for (i = 0u; i < LK_KPD_NUM_MEMS; ++i) {
+        const uint32_t valid = (i == LK_KPD_NUM_MEMS - 1u) ? 0x00ffu : 0xffffu;
+        if ((((~cur[i]) & prev[i]) & valid) != 0u) return 1u;
+    }
+    return 0u;
+}
+
+static uint32_t lk_bootmenu_run(void) {
+    volatile uint16_t* const en =
+        (volatile uint16_t*)(uintptr_t)(LK_KPD_BASE + LK_KPD_EN);
+    volatile uint16_t* const deb =
+        (volatile uint16_t*)(uintptr_t)(LK_KPD_BASE + LK_KPD_DEBOUNCE);
+    uint32_t prev[LK_KPD_NUM_MEMS];
+    uint32_t cur[LK_KPD_NUM_MEMS];
+    uint32_t prev_menu;
+    uint32_t elapsed_ms = 0u;
+    uint32_t last_lit = 1u;
+    uint32_t last_s = 5u;
+    uint32_t polls = 0u;
+    uint32_t pressed = 0u;
+    uint32_t i;
+    uint32_t t0;
+
+    /* The block may never have scanned: force it on, take one slice so the mem
+     * words hold a real scan, and only then read the baseline the edges below
+     * are measured against. Same prologue as the debug combo. */
+    *deb = (uint16_t)LK_KPD_DEBOUNCE_DEFAULT;
+    *en = 1u;
+    lk_kpd_menu_arm();
+    lk_park_hold_ms(LK_BOOTMENU_POLL_MS);
+    (void)lk_kpd_scan(prev);
+    prev_menu = lk_kpd_menu_down();
+
+    lk_bootmenu_frame();
+    t0 = mt6592_delay_gpt_ticks();
+    for (polls = 0u; polls < LK_BOOTMENU_POLLS_MAX; ++polls) {
+        uint32_t lit;
+        uint32_t s;
+
+        lk_park_hold_ms(LK_BOOTMENU_POLL_MS);
+        elapsed_ms = lk_ms_since(t0);
+        (void)lk_kpd_scan(cur);
+        if (lk_bootmenu_edge(cur, prev, lk_kpd_menu_down(), prev_menu)) {
+            pressed = 1u;
+            break;
+        }
+        for (i = 0u; i < LK_KPD_NUM_MEMS; ++i) prev[i] = cur[i];
+        prev_menu = lk_kpd_menu_down();
+        if (elapsed_ms >= LK_BOOTMENU_WINDOW_MS) break;
+
+        /* The bar moves every slice; the blink and the digit only repaint on
+         * change, because every repaint is an uncached blit. */
+        lit = ((elapsed_ms / 250u) % 2u == 0u) ? 1u : 0u;
+        s = lk_bootmenu_remaining_s(elapsed_ms);
+        lk_bootmenu_bar(elapsed_ms);
+        if (lit != last_lit) {
+            lk_bootmenu_prompt((int)lit);
+            last_lit = lit;
+        }
+        if (s != last_s) {
+            lk_bootmenu_digit(elapsed_ms);
+            last_s = s;
+        }
+        lk_fb_present(LK_BOOTMENU_BANNER_X, LK_BOOTMENU_BANNER_Y,
+                      LK_BOOTMENU_BANNER_W, LK_BOOTMENU_BANNER_H);
+    }
+
+    lk_bootmenu_badge(lk_bootmenu_pick(pressed));
+    lk_log("lk: bootmenu kpd");
+    for (i = 0u; i < LK_KPD_NUM_MEMS; ++i) lk_log_hex(" mem=", cur[i]);
+    lk_log_hex(" menu=", lk_kpd_menu_down());
+    lk_log_hex(" after_ms=", elapsed_ms);
+    lk_log(pressed != 0u ? " pick=android\n" : " pick=mixos-sd\n");
+    return lk_bootmenu_pick(pressed);
+}
+#endif /* MVII_MT6592_LK_SD_HANDOFF */
+
 static int lk_sd_boot(void) {
     sd_boot_conf_t conf;
     sd_conf_origin_t from_script;
@@ -3621,6 +3933,9 @@ void mvii_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
     int storage_rc;
     int display_rc;
     int boot_rc;
+#ifdef MVII_MT6592_LK_SD_HANDOFF
+    uint32_t boot_android;
+#endif
 
     (void)r0;
     (void)r1;
@@ -3784,6 +4099,26 @@ void mvii_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
                 0u);
     }
 
+#ifdef MVII_MT6592_LK_SD_HANDOFF
+    /*
+     * The boot choice, over the splash and before anything paints on top of
+     * it. Five seconds, any button: a press tags the eMMC Android image, a
+     * timeout tags the SD MixOS hand-off. Headless boots skip it -- without a
+     * panel there is nothing to read the prompt on -- and the default below is
+     * the historical behavior. Debug builds skip it too: they have no SD
+     * hand-off, so there is only one target and no choice to offer.
+     */
+    boot_android = 0u;
+    if (display_rc == 0) {
+        boot_android = lk_bootmenu_run();
+        lk_mark(MT6592_BOOT_STATUS_STAGE_LK_BOOT_SELECT,
+                boot_android != 0u ? "lk: boot tagged android (button press)\n"
+                                   : "lk: boot tagged mixos-sd (timeout)\n",
+                boot_android != 0u ? LK_BOOTMENU_BEACON_ANDROID
+                                   : LK_BOOTMENU_BEACON_MIXOS);
+    }
+#endif
+
     /*
      * Charge park, before the boot.img load rather than after it.
      *
@@ -3818,6 +4153,13 @@ void mvii_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
     }
 
 #ifdef MVII_MT6592_LK_SD_HANDOFF
+    /* The park painted its gauge over the tag on battery builds; put the tag
+     * back so the panel names the target through the load. On batteryless
+     * builds this repaints identical pixels and costs one blit. */
+    if (display_rc == 0) lk_bootmenu_badge(boot_android);
+#endif
+
+#ifdef MVII_MT6592_LK_SD_HANDOFF
     /*
      * The card gets first refusal, and only here — after the console, after the
      * display, after the charge park. Those three are what makes a board
@@ -3833,9 +4175,19 @@ void mvii_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
      * that is the cell itself. Same reasoning as the bracket around
      * lk_display_on() below; see lk_park_handoff().
      */
-    mt6592_pmic_power_hold();
-    (void)lk_sd_boot();
-    lk_log("lk: SD hand-off declined; falling back to the eMMC boot image\n");
+    if (boot_android == 0u) {
+        mt6592_pmic_power_hold();
+        (void)lk_sd_boot();
+        /* Declined: the card is absent or unbootable, so the eMMC image below
+         * is what boots. Re-tag honestly -- the badge said MixOS until now. */
+        boot_android = 1u;
+        if (display_rc == 0) lk_bootmenu_badge(boot_android);
+        lk_mark(MT6592_BOOT_STATUS_STAGE_LK_BOOT_SELECT,
+                "lk: SD hand-off declined; boot re-tagged android (eMMC fallback)\n",
+                LK_BOOTMENU_BEACON_ANDROID);
+    } else {
+        lk_log("lk: SD hand-off skipped; boot tagged android\n");
+    }
 #endif
 
     boot_rc = storage_rc == MT6592_MSDC_OK ? lk_load_boot_image(&img) : storage_rc;
