@@ -75,15 +75,32 @@ func stagedConfig(t *testing.T, root string) config {
 	}
 }
 
-func TestPhoneHWCode(t *testing.T) {
+func TestPhoneDACode(t *testing.T) {
 	for soc, want := range map[string]uint16{"mt6765": 0x6765, "mt6739": 0x6739, "mt6833": 0x6833} {
-		got, err := phoneHWCode(soc)
+		got, err := phoneDACode(soc)
 		if err != nil || got != want {
-			t.Errorf("phoneHWCode(%q) = 0x%x, %v; want 0x%x", soc, got, err, want)
+			t.Errorf("phoneDACode(%q) = 0x%x, %v; want 0x%x", soc, got, err, want)
 		}
 	}
-	if _, err := phoneHWCode("exynos"); err == nil {
-		t.Error("phoneHWCode(exynos) = nil, want error")
+	if _, err := phoneDACode("exynos"); err == nil {
+		t.Error("phoneDACode(exynos) = nil, want error")
+	}
+}
+
+// BROM codes are observed per soc (mt6765 reports 0x0766 on a retail
+// CPH2385); unobserved socs fall back to the model number and fail safe at
+// probe time, where the mismatch teaches the next override.
+func TestPhoneBROMCode(t *testing.T) {
+	got, err := phoneBROMCode("mt6765")
+	if err != nil || got != 0x0766 {
+		t.Fatalf("phoneBROMCode(mt6765) = 0x%x, %v; want 0x0766", got, err)
+	}
+	got, err = phoneBROMCode("mt6833")
+	if err != nil || got != 0x6833 {
+		t.Fatalf("phoneBROMCode(mt6833) = 0x%x, %v; want model-number fallback 0x6833", got, err)
+	}
+	if _, err := phoneBROMCode("exynos"); err == nil {
+		t.Error("phoneBROMCode(exynos) = nil, want error")
 	}
 }
 
@@ -98,8 +115,8 @@ func TestPlanPhoneBROMValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planPhoneBROM = %v, want a valid plan", err)
 	}
-	if plan.hwCode != 0x6765 || plan.offset != 0x2ef00000 || plan.slotSize != 0x500000 || plan.partition != "lk_a" {
-		t.Fatalf("plan = %+v, want hw 0x6765 lk_a at 0x2ef00000 size 0x500000", plan)
+	if plan.hwCode != 0x0766 || plan.daCode != 0x6765 || plan.offset != 0x2ef00000 || plan.slotSize != 0x500000 || plan.partition != "lk_a" {
+		t.Fatalf("plan = %+v, want BROM 0x0766 / DA 0x6765 lk_a at 0x2ef00000 size 0x500000", plan)
 	}
 }
 
@@ -166,8 +183,11 @@ func TestRefusePhoneSLA(t *testing.T) {
 	if err := refusePhoneSLA(phone, mtkTargetConfig{SLA: true}); err == nil || !strings.Contains(err.Error(), "SLA") {
 		t.Fatalf("refusePhoneSLA(SLA) = %v, want the SLA refusal", err)
 	}
-	if err := refusePhoneSLA(phone, mtkTargetConfig{DAA: true}); err == nil || !strings.Contains(err.Error(), "DAA") {
-		t.Fatalf("refusePhoneSLA(DAA) = %v, want the DAA refusal", err)
+	// DAA alone proceeds: it is verified against the DA image, and the
+	// vendor-signed DA may pass with no host exchange. Observed on a
+	// retail CPH2385 (SBC+DAA, no SLA).
+	if err := refusePhoneSLA(phone, mtkTargetConfig{DAA: true}); err != nil {
+		t.Fatalf("refusePhoneSLA(DAA) = %v, want nil", err)
 	}
 }
 

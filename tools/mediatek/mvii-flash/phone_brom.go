@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ── PHONE BROM FLASH (Oppo / LG, no fastboot) ──
@@ -21,10 +23,18 @@ import (
 // probe time, before anything moves, because the tool speaks no auth
 // exchange and the stock auth file has no consumer here.
 
+// mtkCmdSendAuth is the BROM command that uploads the vendor auth blob
+// (auth_sv5.auth) on targets enforcing DAA. The exchange -- echo, big-endian
+// length round-trip, blob, crc, status -- follows the wire shape every
+// MediaTek flasher speaks; the tool learns it needs this step from the
+// target-config DAA bit at probe time.
+const mtkCmdSendAuth = 0xE2
+
 type phoneBROMPlan struct {
 	device    string
 	soc       string
 	hwCode    uint16
+	daCode    uint16
 	partition string
 	offset    uint64
 	slotSize  uint64
@@ -37,9 +47,26 @@ type phoneBROMPlan struct {
 	auth      string
 }
 
-// phoneHWCode derives the BROM DA hw code from the soc in build-info.txt.
-// MediaTek hw codes track the model number (mt6765 -> 0x6765).
-func phoneHWCode(soc string) (uint16, error) {
+// phoneDACode derives the DA loader entry tag from the soc in
+// build-info.txt. DA bundles tag entries by model number (the vendored
+// MT6765 entry carries hw 0x6765).
+func phoneDACode(soc string) (uint16, error) {
+	return phoneModelCode(soc)
+}
+
+// phoneBROMCode is the code BROM itself reports via get_hw_code -- a
+// different namespace from the DA entry tags. Observed values win; anything
+// unobserved falls back to the model number and fails safe at probe time,
+// where the mismatch names both codes and teaches the next override.
+func phoneBROMCode(soc string) (uint16, error) {
+	switch strings.ToLower(strings.TrimSpace(soc)) {
+	case "mt6765":
+		return 0x0766, nil // observed 2026-09-27 on a retail CPH2385
+	}
+	return phoneModelCode(soc)
+}
+
+func phoneModelCode(soc string) (uint16, error) {
 	digits := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(soc)), "mt")
 	if digits == "" {
 		return 0, fmt.Errorf("soc %q names no MediaTek model", soc)
@@ -92,7 +119,11 @@ func planPhoneBROM(cfg config, phone *phoneRoot) (*phoneBROMPlan, error) {
 		return nil, fmt.Errorf("-upload %s: phone BROM stages lk.bin only until LK-BRINGUP step 6 grows a second policy; use -upload lk",
 			effectiveUploadTarget(cfg))
 	}
-	hwCode, err := phoneHWCode(phone.soc)
+	hwCode, err := phoneBROMCode(phone.soc)
+	if err != nil {
+		return nil, err
+	}
+	daCode, err := phoneDACode(phone.soc)
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +178,7 @@ func planPhoneBROM(cfg config, phone *phoneRoot) (*phoneBROMPlan, error) {
 		}
 		offset = off
 	}
-	loader, err := parseMTKDALoader(cfg.daLoader, hwCode, 0, 0)
+	loader, err := parseMTKDALoader(cfg.daLoader, daCode, 0, 0)
 	if err != nil {
 		return nil, fmt.Errorf("phone target %s: DA %s: %w", phone.device, cfg.daLoader, err)
 	}
@@ -169,6 +200,7 @@ func planPhoneBROM(cfg config, phone *phoneRoot) (*phoneBROMPlan, error) {
 		device:    phone.device,
 		soc:       phone.soc,
 		hwCode:    hwCode,
+		daCode:    daCode,
 		partition: partition,
 		offset:    offset,
 		slotSize:  slotSize,
@@ -183,7 +215,7 @@ func planPhoneBROM(cfg config, phone *phoneRoot) (*phoneBROMPlan, error) {
 }
 
 func printPhoneBROMPlan(plan *phoneBROMPlan) {
-	fmt.Printf("Phone BROM flash for %s (%s, hw code 0x%04x):\n", plan.device, plan.soc, plan.hwCode)
+	fmt.Printf("Phone BROM flash for %s (%s, BROM hw code 0x%04x, DA entry 0x%04x):\n", plan.device, plan.soc, plan.hwCode, plan.daCode)
 	slot := fmt.Sprintf("0x%x", plan.slotSize)
 	if plan.scatter == "" {
 		slot = "unknown (-raw-offset carries no slot size)"
@@ -217,22 +249,18 @@ func resolvePhoneEMI(cfg config) (*mtkPreloaderEMI, error) {
 	return readMTKPreloaderEMI(cfg.preloader)
 }
 
-// refusePhoneSLA fails fast when the target enforces authentication: the
-// tool speaks no SLA/DAA exchange, so proceeding would only die at SEND_DA
-// with 0x1D0D. Checked at probe time, before anything moves.
+// refusePhoneSLA fails fast when the target enforces SLA: the tool speaks
+// no SLA exchange, so proceeding would only die at SEND_DA with 0x1D0D.
+// Checked at probe time, before anything moves. DAA alone is not refused:
+// it is verified against the DA image itself, and a vendor-signed DA may
+// pass with no host exchange; if it does not, SEND_DA or the stage-1 sync
+// fails cleanly with no eMMC touched.
 func refusePhoneSLA(phone *phoneRoot, target mtkTargetConfig) error {
-	if !target.SLA && !target.DAA {
+	if !target.SLA {
 		return nil
 	}
-	which := "SLA"
-	switch {
-	case target.SLA && target.DAA:
-		which = "SLA/DAA"
-	case target.DAA:
-		which = "DAA"
-	}
-	return fmt.Errorf("phone target %s: BROM enforces %s authentication and this tool speaks no auth exchange; "+
-		"flash this unit with SP Flash Tool (or mtkclient) and the stock auth_sv5.auth per LK-BRINGUP step 2", phone.device, which)
+	return fmt.Errorf("phone target %s: BROM enforces SLA authentication and this tool speaks no SLA exchange; "+
+		"flash this unit with SP Flash Tool (or mtkclient) and the stock auth_sv5.auth per LK-BRINGUP step 2", phone.device)
 }
 
 // probePhoneBROM is the phone sibling of probeMT6592: same reconnect loop,
@@ -277,6 +305,9 @@ func probePhoneBROMOnce(c *mtkSerialClient, phone *phoneRoot, hwCode uint16) err
 	if err := refusePhoneSLA(phone, target); err != nil {
 		return err
 	}
+	if target.DAA {
+		fmt.Println("BROM enforces DAA; attempting the vendor-signed DA upload (a rejection stops here, before any eMMC write).")
+	}
 	blver, isBROM, err := c.getBLVersion()
 	if err != nil {
 		return err
@@ -311,7 +342,7 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 		return err
 	}
 	printPhoneBROMPlan(plan)
-	loader, err := parseMTKDALoader(plan.daPath, plan.hwCode, 0, 0)
+	loader, err := parseMTKDALoader(plan.daPath, plan.daCode, 0, 0)
 	if err != nil {
 		return fmt.Errorf("phone target %s: DA %s: %w", phone.device, plan.daPath, err)
 	}
