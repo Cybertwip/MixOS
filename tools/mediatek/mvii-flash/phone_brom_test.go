@@ -318,6 +318,23 @@ func TestPhoneUSBDLReg(t *testing.T) {
 	}
 }
 
+func TestParsePhoneWait(t *testing.T) {
+	d, err := parsePhoneWait("")
+	if err != nil || d != 0 {
+		t.Fatalf("parsePhoneWait(\"\") = %v, %v; want 0, nil", d, err)
+	}
+	d, err = parsePhoneWait("90s")
+	if err != nil || d != 90*time.Second {
+		t.Fatalf("parsePhoneWait(90s) = %v, %v; want 90s", d, err)
+	}
+	if _, err := parsePhoneWait("junk"); err == nil {
+		t.Fatal("parsePhoneWait(junk) = nil, want error")
+	}
+	if _, err := parsePhoneWait("-5s"); err == nil {
+		t.Fatal("parsePhoneWait(-5s) = nil, want error")
+	}
+}
+
 func TestFlagFailureAdvice(t *testing.T) {
 	err := flagFailureAdvice(errors.New("unlock BOOT_MISC: write32(0x1001a100) initial status 0x1001"))
 	if err == nil || !strings.Contains(err.Error(), "0x1001") || !strings.Contains(err.Error(), "Vol-down") {

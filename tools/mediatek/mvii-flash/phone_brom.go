@@ -264,6 +264,57 @@ func resolvePhoneEMI(cfg config) (*mtkPreloaderEMI, error) {
 	return readMTKPreloaderEMI(cfg.preloader)
 }
 
+// parsePhoneWait parses the -wait supplicant window. Empty means one
+// acquisition attempt (the historical behavior); anything else must be a
+// Go duration like 90s or 5m.
+func parsePhoneWait(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("-wait %q: %w", s, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("-wait %q: must not be negative", s)
+	}
+	return d, nil
+}
+
+// acquirePhoneBROM connects and probes until the phone answers or the -wait
+// window expires: the supplicant loop, so one invocation survives replugs,
+// port renumbering, and preloader boot timeouts instead of forcing re-runs.
+// With no -wait it makes exactly one attempt. The caller owns the returned
+// client (preloaderEMI already attached) and closes it.
+func acquirePhoneBROM(cfg config, phone *phoneRoot, facts phoneFacts, emi *mtkPreloaderEMI) (*mtkSerialClient, mtkTargetConfig, error) {
+	window, err := parsePhoneWait(cfg.waitFlag)
+	if err != nil {
+		return nil, mtkTargetConfig{}, err
+	}
+	deadline := time.Now().Add(window)
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		client, err := connectMTKSerial(cfg.device)
+		if err == nil {
+			client.preloaderEMI = emi
+			target, err := probePhoneBROM(client, phone, facts)
+			if err == nil {
+				return client, target, nil
+			}
+			_ = client.port.Close()
+			lastErr = err
+		} else {
+			lastErr = err
+		}
+		if window == 0 || !time.Now().Before(deadline) {
+			return nil, mtkTargetConfig{}, lastErr
+		}
+		fmt.Printf("Phone not acquired (attempt %d): %v; waiting for the VCOM, replug with keys held.\n", attempt, lastErr)
+		time.Sleep(2 * time.Second)
+	}
+}
+
 // refusePhoneSLA fails fast when the target enforces SLA: the tool speaks
 // no SLA exchange, so proceeding would only die at SEND_DA with 0x1D0D.
 // Checked at probe time, before anything moves. DAA alone is not refused:
@@ -553,14 +604,8 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 	if err != nil {
 		return err
 	}
-	client, err := connectMTKSerial(cfg.device)
+	client, target, err := acquirePhoneBROM(cfg, phone, facts, emi)
 	if err != nil {
-		return err
-	}
-	client.preloaderEMI = emi
-	target, err := probePhoneBROM(client, phone, facts)
-	if err != nil {
-		_ = client.port.Close()
 		return err
 	}
 	if !client.isBROM {
