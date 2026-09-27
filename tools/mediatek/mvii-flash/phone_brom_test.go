@@ -280,13 +280,18 @@ func TestSendAuth(t *testing.T) {
 
 func TestNeedsPhoneAuth(t *testing.T) {
 	daa := mtkTargetConfig{DAA: true}
-	if send, _ := needsPhoneAuth(daa, true); !send {
-		t.Error("needsPhoneAuth(DAA, auth) = false, want the SEND_AUTH step")
+	if send, _ := needsPhoneAuth(daa, true, true); !send {
+		t.Error("needsPhoneAuth(DAA, BROM, auth) = false, want the SEND_AUTH step")
 	}
-	if send, _ := needsPhoneAuth(daa, false); send {
-		t.Error("needsPhoneAuth(DAA, no auth) = true, want skip")
+	if send, _ := needsPhoneAuth(daa, true, false); send {
+		t.Error("needsPhoneAuth(DAA, BROM, no auth) = true, want skip")
 	}
-	if send, msg := needsPhoneAuth(mtkTargetConfig{}, true); send || msg != "" {
+	// Preloader mode skips SEND_AUTH: the preloader verifies the vendor DA
+	// signature at SEND_DA (0x7024 on unsigned payloads, observed live).
+	if send, msg := needsPhoneAuth(daa, false, true); send || !strings.Contains(msg, "SEND_DA") {
+		t.Errorf("needsPhoneAuth(DAA, preloader, auth) = %v %q, want skip with reason", send, msg)
+	}
+	if send, msg := needsPhoneAuth(mtkTargetConfig{}, true, true); send || msg != "" {
 		t.Errorf("needsPhoneAuth(clear) = %v %q, want silent skip", send, msg)
 	}
 }
