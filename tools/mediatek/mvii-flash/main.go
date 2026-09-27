@@ -1407,14 +1407,16 @@ func listBackends(cfg config) error {
 }
 
 func flashWithFastboot(cfg config, image string) error {
-	tool, err := resolveFastboot(cfg)
-	if err != nil {
-		return err
-	}
 	_, isPhone := detectPhoneRoot(cfg.root)
+	// Before the toolchain lookup: a usage error should fail the same way
+	// with or without fastboot installed.
 	if isPhone && !cfg.partitionExplicit {
 		return fmt.Errorf("phone target: pass -partition explicitly (the LK slot name from the stock scatter); "+
 			"the %q default is the J36's, and flashing lk.bin at it would miss the slot", cfg.partition)
+	}
+	tool, err := resolveFastboot(cfg)
+	if err != nil {
+		return err
 	}
 	partition := effectivePartition(cfg, "fastboot")
 	devices, err := fastbootDevices(cfg)
