@@ -1143,7 +1143,7 @@ func (c *mtkSerialClient) uploadLegacyDA(loader mtkDALoader) error {
 		return err
 	}
 	if info.Storage != "emmc" {
-		return fmt.Errorf("DA stage 2 reports %s storage; the J36 Ultra raw writer expects eMMC", info.Storage)
+		return fmt.Errorf("DA stage 2 reports %s storage; the raw writer expects eMMC", info.Storage)
 	}
 	c.flashInfo = info
 	fmt.Printf("DA stage 2 connected: eMMC user area 0x%x (%s)\n", info.EMMCUserSize, formatBytes(info.EMMCUserSize))

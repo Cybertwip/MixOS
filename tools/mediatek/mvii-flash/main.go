@@ -164,7 +164,7 @@ func run() error {
 	// bootloader layout onto it. See phone_target.go.
 	if phone, ok := detectPhoneRoot(cfg.root); ok {
 		if isPhoneBROMShape(cfg) {
-			return runPhoneBROMPlan(cfg, phone)
+			return flashPhoneBROM(cfg, phone)
 		}
 		if err := refusePhoneWrite(cfg, phone); err != nil {
 			return err

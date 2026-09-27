@@ -101,11 +101,88 @@ func TestPlanPhoneBROMValid(t *testing.T) {
 	if plan.hwCode != 0x6765 || plan.offset != 0x2ef00000 || plan.slotSize != 0x500000 || plan.partition != "lk_a" {
 		t.Fatalf("plan = %+v, want hw 0x6765 lk_a at 0x2ef00000 size 0x500000", plan)
 	}
-	// A valid plan still ends the run: the wire write is step 6, so the
-	// return must stay non-nil and state that nothing was written.
-	err = runPhoneBROMPlan(cfg, info)
-	if err == nil || !strings.Contains(err.Error(), "nothing was written") {
-		t.Fatalf("runPhoneBROMPlan = %v, want the not-implemented refusal", err)
+}
+
+// Auth is recorded, not required: the tool speaks no SLA exchange, so
+// demanding the file would promise authentication that does not exist.
+// Targets that enforce SLA/DAA are refused at probe time instead.
+func TestPlanPhoneBROMAuthOptional(t *testing.T) {
+	phone := writePhoneRoot(t, "device=cph2385-4gb\nsoc=mt6765\n")
+	info, ok := detectPhoneRoot(phone)
+	if !ok {
+		t.Fatal("fixture not detected")
+	}
+	cfg := stagedConfig(t, phone)
+	cfg.authFile = ""
+	plan, err := planPhoneBROM(cfg, info)
+	if err != nil {
+		t.Fatalf("planPhoneBROM without auth = %v, want a valid plan", err)
+	}
+	if plan.auth != "" {
+		t.Fatalf("plan.auth = %q, want empty", plan.auth)
+	}
+	if !isPhoneBROMShape(cfg) {
+		t.Fatal("isPhoneBROMShape = false without auth, want the staged shape")
+	}
+}
+
+func TestPlanPhoneBROMRawOffset(t *testing.T) {
+	phone := writePhoneRoot(t, "device=cph2385-4gb\nsoc=mt6765\n")
+	info, ok := detectPhoneRoot(phone)
+	if !ok {
+		t.Fatal("fixture not detected")
+	}
+	cfg := stagedConfig(t, phone)
+	cfg.mtkScatter = ""
+	cfg.rawOffset = "0x2ef00000"
+	if !isPhoneBROMShape(cfg) {
+		t.Fatal("isPhoneBROMShape = false for raw-offset form, want the staged shape")
+	}
+	plan, err := planPhoneBROM(cfg, info)
+	if err != nil {
+		t.Fatalf("planPhoneBROM = %v, want a valid plan", err)
+	}
+	if plan.offset != 0x2ef00000 || plan.slotSize != 0 || plan.partition != "lk_a" {
+		t.Fatalf("plan = %+v, want offset 0x2ef00000 with unknown slot", plan)
+	}
+	cfg.rawOffset = "not-a-number"
+	if _, err := planPhoneBROM(cfg, info); err == nil {
+		t.Fatal("planPhoneBROM(bad offset) = nil, want the parse error")
+	}
+	cfg.rawOffset = ""
+	if isPhoneBROMShape(cfg) {
+		t.Fatal("isPhoneBROMShape = true with neither scatter nor raw-offset")
+	}
+	if _, err := planPhoneBROM(cfg, info); err == nil {
+		t.Fatal("planPhoneBROM(no placement) = nil, want an error")
+	}
+}
+
+func TestRefusePhoneSLA(t *testing.T) {
+	phone := &phoneRoot{device: "cph2385-4gb", soc: "mt6765"}
+	if err := refusePhoneSLA(phone, mtkTargetConfig{}); err != nil {
+		t.Fatalf("refusePhoneSLA(clear) = %v, want nil", err)
+	}
+	if err := refusePhoneSLA(phone, mtkTargetConfig{SLA: true}); err == nil || !strings.Contains(err.Error(), "SLA") {
+		t.Fatalf("refusePhoneSLA(SLA) = %v, want the SLA refusal", err)
+	}
+	if err := refusePhoneSLA(phone, mtkTargetConfig{DAA: true}); err == nil || !strings.Contains(err.Error(), "DAA") {
+		t.Fatalf("refusePhoneSLA(DAA) = %v, want the DAA refusal", err)
+	}
+}
+
+func TestResolvePhoneEMI(t *testing.T) {
+	if _, err := resolvePhoneEMI(config{}); err == nil || !strings.Contains(err.Error(), "-preloader") {
+		t.Fatalf("resolvePhoneEMI(empty) = %v, want the -preloader demand", err)
+	}
+	pre := append([]byte("xxMTK_BLOADER_INFO_v17xxMTK_BIN\x00\x00\x00\x00\x00"), []byte("EMIPAYLOAD")...)
+	path := writeStagedFile(t, "preloader.bin", pre)
+	emi, err := resolvePhoneEMI(config{preloader: path})
+	if err != nil {
+		t.Fatalf("resolvePhoneEMI = %v, want parsed EMI", err)
+	}
+	if emi.Version != 0x11 || string(emi.Data) != "EMIPAYLOAD" {
+		t.Fatalf("emi = version 0x%x data %q, want 0x11 EMIPAYLOAD", emi.Version, emi.Data)
 	}
 }
 
