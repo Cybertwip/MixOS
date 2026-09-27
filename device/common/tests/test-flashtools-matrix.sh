@@ -64,15 +64,29 @@ if ! grep -q 'go build -o "$ROOT/build/flash" ./mvii-flash' "$ROOT/build-flashto
 else
     echo "  build/flash placement: ok"
 fi
-if grep -q 'go build -o "$OUTPUT/boot/flash"' "$ROOT/tools/mediatek/build.sh"; then
+if grep -q 'go build -o "$OUTPUT/boot/flash"' "$ROOT/tools/mediatek/mt65xx/build.sh"; then
     echo "FAIL: per-mode flash copy reintroduced"; fail=1
 else
     echo "  no per-mode flash: ok"
 fi
-if ! grep -q 'rm -f "$OUTPUT/boot/flash"' "$ROOT/tools/mediatek/build.sh"; then
+if ! grep -q 'rm -f "$OUTPUT/boot/flash"' "$ROOT/tools/mediatek/mt65xx/build.sh"; then
     echo "FAIL: stale per-mode flash cleanup missing"; fail=1
 else
     echo "  stale flash cleanup: ok"
+fi
+# The j36 LK lives in the mt65xx family: a top-level build.sh or firmware/
+# resurrects the pre-family layout the move removed.
+if [ -e "$ROOT/tools/mediatek/build.sh" ] || [ -e "$ROOT/tools/mediatek/firmware" ]; then
+    echo "FAIL: top-level j36 LK back outside mt65xx"; fail=1
+else
+    echo "  mt65xx home: ok"
+fi
+# The family builder shares the phone interface: --device takes j36-ultra
+# only, and refuses anything else before touching the filesystem.
+if "$ROOT/tools/mediatek/mt65xx/build.sh" --device bogus >/dev/null 2>&1; then
+    echo "FAIL: mt65xx --device bogus accepted"; fail=1
+else
+    echo "  mt65xx device guard: ok"
 fi
 # Power modes are j36-only: narrowing them for a phone must fail fast.
 if "$ROOT/build-flashtools.sh" --device oppo-mt6833 --battery-only >/dev/null 2>&1; then

@@ -14,7 +14,7 @@ HERE="$(cd -- "$(dirname -- "$0")" && pwd)"
 ROOT="$(cd -- "$HERE/../../.." && pwd)"
 INVM="$ROOT/device/j36-ultra/build-in-vm.sh"
 README="$ROOT/device/j36-ultra/README.md"
-LKMAIN="$ROOT/tools/mediatek/firmware/Drivers/mvii_lk_main.c"
+LKMAIN="$ROOT/tools/mediatek/mt65xx/firmware/Drivers/mvii_lk_main.c"
 
 fail=0
 

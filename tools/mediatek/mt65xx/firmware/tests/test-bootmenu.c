@@ -3,7 +3,7 @@
  * The header is pure logic -- no registers, no DRAM -- so the target and
  * the workstation compile the same code. Run with:
  *
- *     cc -std=c99 -Wall -Wextra -Werror tools/mediatek/firmware/tests/test-bootmenu.c \
+ *     cc -std=c99 -Wall -Wextra -Werror tools/mediatek/mt65xx/firmware/tests/test-bootmenu.c \
  *         -o /tmp/j36-bootmenu-test && /tmp/j36-bootmenu-test
  */
 #include <assert.h>
