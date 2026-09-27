@@ -296,6 +296,18 @@ func TestNeedsPhoneAuth(t *testing.T) {
 	}
 }
 
+func TestDAUploadReportsSignatureRejection(t *testing.T) {
+	port := &scriptPort{pending: append(be16(0), be16(0x7024)...)}
+	client := &mtkSerialClient{port: port, commandTimeout: time.Second, writeTimeout: time.Second}
+	err := client.uploadData([]byte{0x12, 0x34}, 0)
+	if err == nil || !strings.Contains(err.Error(), "DAA_SIG_VERIFY_FAILED") || !strings.Contains(err.Error(), "no eMMC write") {
+		t.Fatalf("uploadData status 0x7024 = %v, want a signature rejection before any eMMC write", err)
+	}
+	if len(port.writes) != 1 || !bytes.Equal(port.writes[0], []byte{0x12, 0x34}) {
+		t.Fatalf("uploadData writes = %x, want only the DA bytes", port.writes)
+	}
+}
+
 func TestPhoneFactsFor(t *testing.T) {
 	want := map[string]phoneFacts{
 		"mt6765": {bromCode: 0x0766, daCode: 0x6765, watchdog: 0x10007000, watchdogOff: 0x22000064, miscLock: 0x1001a100},
