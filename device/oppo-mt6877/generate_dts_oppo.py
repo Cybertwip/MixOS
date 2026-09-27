@@ -304,8 +304,9 @@ def generate(sources: dict[str, str], device: str, cmdline_extra: str = "") -> s
 
 \tsound {{
 \t\tcompatible = "oppo,mt6877-sound";
+\t\tcpu = <&afe>;
 \t\tstatus = "okay";
-\t}};
+\t\t}};
 
 \tpower {{
 \t\tcompatible = "oppo,mt6877-power";

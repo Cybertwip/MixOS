@@ -22,18 +22,24 @@
 #include <linux/platform_device.h>
 #include <sound/soc.h>
 
+/* The codec half is the PMI8950's internal WCD block, which has no
+ * mainline driver yet -- the names below are the reservation its port will
+ * register under. The platform slot stays empty: the CPU DAI's component
+ * carries the PCM ops (see soc-component.c), and the sound node is
+ * disabled until the LPASS clock controller lands anyway. */
+SND_SOC_DAILINK_DEFS(primary,
+	DAILINK_COMP_ARRAY(COMP_CPU("Primary MI2S")),
+	DAILINK_COMP_ARRAY(COMP_CODEC("lge-lv517-codec",
+				      "lge-lv517-codec-dai")),
+	DAILINK_COMP_ARRAY(COMP_EMPTY()));
+
 static struct snd_soc_dai_link lv517_links[] = {
 	{
 		.name = "Primary MI2S",
 		.stream_name = "Primary",
-		.cpu_dai_name = "Primary MI2S",
-		.codec_dai_name = "lge-lv517-codec-dai",
-		.codec_name = "lge-lv517-codec",
+		SND_SOC_DAILINK_REG(primary),
 		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
 			   SND_SOC_DAIFMT_CBS_CFS,
-		/* The codec half is the PMI8950's internal WCD block, which
-		 * has no mainline driver yet -- the names above are the
-		 * reservation its port will register under. */
 	},
 };
 

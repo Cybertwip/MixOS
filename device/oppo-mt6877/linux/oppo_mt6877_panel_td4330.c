@@ -378,7 +378,10 @@ static int td4330_probe(struct mipi_dsi_device *dsi)
 	if (IS_ERR(t->bl))
 		return PTR_ERR(t->bl);
 	t->panel.backlight = t->bl;
-	return drm_panel_add(&t->panel);
+	/* drm_panel_add() returns void: the panel is on the list or it
+	 * oopses trying, there is no failure to propagate. */
+	drm_panel_add(&t->panel);
+	return 0;
 }
 
 static void td4330_remove(struct mipi_dsi_device *dsi)
