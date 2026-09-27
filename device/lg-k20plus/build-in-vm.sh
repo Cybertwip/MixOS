@@ -4,19 +4,15 @@
 #
 # Same architecture as the OPPO build (see device/oppo-mt6877/build-in-vm.sh
 # for the shape): kernel + generated DTB + out-of-tree modules + initramfs +
-# payload, incremental and checkpointed. The deliverable is the same trio:
-#
-#   boot.img          `fastboot flash boot` (LK hands over, panel already on)
-#   trixie.img        the same arm64 Debian as an ext4 filesystem image for
-#                     the phone's ROOTFS partition (PARTLABEL=ROOTFS). A
-#                     filesystem image, not a disk image: the eMMC already
-#                     holds the bootloader's partition table, and a disk image
-#                     written to it would brick the phone.
-#   rootfs.tar.gz     the unpack-once alternative to trixie.img.
+# payload, incremental and checkpointed. The deliverable is the same single
+# MixOS_<arch>_<debian>_<commit>.img: a GPT container with the boot.img
+# bytes (p1) and the ext4 rootfs bytes (p2), split on the workstation and
+# flashed part by part, never written to the eMMC whole.
 #
 # Environment (all set by build-lg.sh): LG_BUILD_DIR, LG_WORK_DIR,
-# LG_EXPORT_DIR, LG_DEVICE (default lv517), LG_MIX_ONLY, LG_JOBS,
-# LG_KERNEL_BRANCH/URL, LG_FIRMWARE_DIR, DEBIAN_CODE_NAME.
+# LG_EXPORT_DIR, LG_DEVICE (default lv517), LG_FULL_IMAGE_NAME (computed on
+# the host: the VM has no .git to read the commit from), LG_MIX_ONLY,
+# LG_JOBS, LG_KERNEL_BRANCH/URL, LG_FIRMWARE_DIR, DEBIAN_CODE_NAME.
 
 set -Eeuo pipefail
 
@@ -27,6 +23,7 @@ ROOT="${LG_BUILD_DIR:?set by build-lg.sh}"
 WORK="${LG_WORK_DIR:?set by build-lg.sh}"
 EXPORT="${LG_EXPORT_DIR:?set by build-lg.sh}"
 DEVICE="${LG_DEVICE:-lv517}"
+FULL_IMAGE_NAME="${LG_FULL_IMAGE_NAME:?set by build-lg.sh}"
 MIX_ONLY="${LG_MIX_ONLY:-0}"
 JOBS="${LG_JOBS:-$(nproc)}"
 KERNEL_BRANCH="${LG_KERNEL_BRANCH:-linux-6.12.y}"
@@ -214,8 +211,8 @@ python3 "$ROOT/device/common/mkbootimg.py" \
 log "boot.img: $(stat -c %s "$BOOTIMG") bytes"
 
 # ── the Debian rootfs (full builds only; checkpointed) ──────────────────────
-ROOTFS_TGZ="$ART/lg-$DEVICE-rootfs.tar.gz"
 TRIXIE_IMG="$ART/lg-$DEVICE-trixie.img"
+FULLIMG="$ART/$FULL_IMAGE_NAME"
 if [[ "$MIX_ONLY" == 1 ]]; then
     log "--mix-only: boot.img + payload only, no rootfs"
 else
@@ -250,35 +247,30 @@ else
     fi
     sudo chroot "$WORK/rootfs" systemctl enable lg-telephony.service \
         2>/dev/null || true
-    ( cd "$WORK/rootfs" && sudo tar -czf "$ROOTFS_TGZ" . )
-    log "rootfs: $(stat -c %s "$ROOTFS_TGZ") bytes"
-    # Under sudo like the tar: the tree is root-owned and mke2fs -d reads it.
+    # Under sudo: the tree is root-owned and mke2fs -d reads it.
     sudo bash "$ROOT/device/common/make-trixie-img.sh" \
         "$WORK/rootfs" "$TRIXIE_IMG" ROOTFS
+    # The deliverable: boot.img + trixie.img folded into the one MixOS image.
+    # The parts stay in the work dir as intermediates; only the container is
+    # exported. full-image.txt is the handover the wrapper reads (J36 pattern:
+    # out of the work dir, never out of the artifact dir).
+    {
+        echo "image=$FULL_IMAGE_NAME"
+        python3 "$ROOT/device/common/make_full_img.py" \
+            --boot "$BOOTIMG" --rootfs "$TRIXIE_IMG" --output "$FULLIMG"
+    } > "$ART/full-image.txt"
+    log "full image: $FULL_IMAGE_NAME ($(stat -c %s "$FULLIMG") bytes)"
 fi
 
-# ── hand-over ────────────────────────────────────────────────────────────────
-{
-    echo "device=$DEVICE"
-    echo "panel=$LG_PANEL"
-    echo "bootimg=lg-$DEVICE-boot.img"
-    if [[ "$MIX_ONLY" == 1 ]]; then
-        echo "rootfs=none"
-        echo "trixieimg=none"
-    else
-        echo "rootfs=lg-$DEVICE-rootfs.tar.gz"
-        echo "trixieimg=lg-$DEVICE-trixie.img"
-    fi
-} > "$ART/lg-$DEVICE-manifest.txt"
-
+# ── hand-over: the one image, and nothing else ──────────────────────────────
 if [[ "$MIX_ONLY" == 1 ]]; then
     mkdir -p "$EXPORT/boot" "$EXPORT/root"
     cp "$BOOTIMG" "$DTB" "$EXPORT/boot/"
     cp -r "$INITRD/opt/mixos" "$EXPORT/root/opt-mixos"
-    cp "$ART/lg-$DEVICE-manifest.txt" "$EXPORT/"
+    log "Exported to $EXPORT"
 else
     mkdir -p "$EXPORT"
-    cp "$BOOTIMG" "$TRIXIE_IMG" "$ROOTFS_TGZ" \
-        "$ART/lg-$DEVICE-manifest.txt" "$EXPORT/"
+    cp "$FULLIMG" "$EXPORT/"
+    log "Exported to $EXPORT"
 fi
 log "LG $DEVICE done"

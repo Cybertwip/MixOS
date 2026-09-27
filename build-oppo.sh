@@ -9,9 +9,9 @@
 # deliverable is a phone boot image, not an SD card image, so there is no R36
 # base to resume:
 #
-#   ./build-oppo.sh              boot.img + trixie.img + rootfs tarball,
-#                                one model dir per device, into
-#                                MixOS-Artifacts/oppo/<device>/
+#   ./build-oppo.sh              one MixOS_<arch>_<debian>_<commit>.img
+#                                per device (boot.img + rootfs folded in),
+#                                into MixOS-Artifacts/oppo/<device>/
 #   ./build-oppo.sh --mix-only   board specifics only (boot/ + root/ dirs)
 #   OPPO_DEVICE=20183 ./build-oppo.sh
 #   ./build-oppo.sh --list-devices
@@ -64,7 +64,7 @@ Usage: ./build-oppo.sh [--mix-only | --compress] [--device CODENAME] [--list-dev
 
 Builds the OPPO phone layer for one device (default: $DEVICE) in the $VM_NAME VM.
 
-    ./build-oppo.sh              boot.img + trixie.img + rootfs tarball into $ARTIFACT_DIR
+    ./build-oppo.sh              one MixOS_<arch>_<debian>_<commit>.img into $ARTIFACT_DIR
     ./build-oppo.sh --mix-only   board specifics only, into $ARTIFACT_DIR:
                                      boot/   boot.img + DTB (fastboot + inspection)
                                      root/   /opt/mixos payload + manifest
@@ -128,12 +128,19 @@ if [[ -n "${OPPO_FIRMWARE_DIR:-}" && -d "${OPPO_FIRMWARE_DIR:-}" ]]; then
 fi
 
 darkos_log "Building the OPPO $DEVICE layer"
+# Computed on the host: the VM's checkout has no .git to read the commit from.
+FULL_IMAGE_NAME="$(darkos_image_name "$ROOT" arm64 "${DEBIAN_CODE_NAME:-trixie}")"
+# Cleared before the build, not after (J36 pattern): the handover lives in
+# the work dir, which survives runs, so a stale one would otherwise pass as
+# this run's.
+multipass exec "$VM_NAME" -- rm -f "$VM_WORK_DIR-$DEVICE/artifacts/full-image.txt"
 BUILD_RC=0
 multipass exec "$VM_NAME" -- env \
     OPPO_BUILD_DIR="$VM_BUILD_DIR" \
     OPPO_WORK_DIR="$VM_WORK_DIR-$DEVICE" \
     OPPO_EXPORT_DIR="$VM_EXPORT_DIR" \
     OPPO_DEVICE="$DEVICE" \
+    OPPO_FULL_IMAGE_NAME="$FULL_IMAGE_NAME" \
     OPPO_MIX_ONLY="$MIX_ONLY" \
     OPPO_JOBS="${OPPO_JOBS:-}" \
     OPPO_KERNEL_BRANCH="${OPPO_KERNEL_BRANCH:-linux-6.12.y}" \

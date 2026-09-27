@@ -38,7 +38,7 @@ HEADER_SIZE = 92
 # Linux filesystem partition type, mixed-endian on disk (bytes_le).
 LINUX_FS_GUID = uuid.UUID("0fc63daf-8483-4772-8e79-3d69d8477de4").bytes_le
 
-PMBR_FMT = "<446sB3sB3sIIH"
+PMBR_FMT = "<446sB3sB3sII48sH"
 HEADER_FMT = "<8sIIIIQQQQ16sQIII"
 ENTRY_FMT = "<16s16sQQQ72s"
 
@@ -52,7 +52,7 @@ def protective_mbr(total_sectors: int) -> bytes:
     return struct.pack(
         PMBR_FMT, b"\x00" * 446,
         0x00, b"\x00\x02\x00", 0xEE, b"\xff\xff\xff",
-        1, size32, 0xAA55,
+        1, size32, b"\x00" * 48, 0xAA55,
     )
 
 
@@ -100,9 +100,11 @@ def main() -> int:
         return 1
 
     boot_start = ALIGN_SECTORS
-    boot_count = round_up(round_up(len(boot), SECTOR), ALIGN_SECTORS)
+    # Sectors first, then alignment: rounding the byte count to a multiple
+    # of 2048 and calling it sectors inflates a 3 MiB part to 1.6 GiB.
+    boot_count = round_up((len(boot) + SECTOR - 1) // SECTOR, ALIGN_SECTORS)
     rootfs_start = boot_start + boot_count
-    rootfs_count = round_up(round_up(len(rootfs), SECTOR), ALIGN_SECTORS)
+    rootfs_count = round_up((len(rootfs) + SECTOR - 1) // SECTOR, ALIGN_SECTORS)
     total = rootfs_start + rootfs_count + ALIGN_SECTORS
 
     disk_guid = uuid.uuid4().bytes_le

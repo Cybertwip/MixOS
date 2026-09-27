@@ -4,26 +4,21 @@
 #
 # THIS IS THE J36 BUILD'S YOUNGER SIBLING, NOT A COPY OF IT. It follows the
 # same architecture -- kernel + generated DTB + out-of-tree modules +
-# initramfs + payload, all incremental and checkpointed -- but its deliverable
-# is a phone boot image, not an SD card image:
-#
-#   boot.img          Android boot image (kernel + ramdisk + DTB), flashed
-#                     with `fastboot flash boot`. The LK loads it the way the
-#                     MVII LK loads the J36 kernel: framebuffer already on.
-#   trixie.img        the same arm64 Debian (trixie) as an ext4 filesystem
-#                     image, written with dd onto the phone's ROOTFS partition
-#                     (PARTLABEL=ROOTFS) or flashed with fastboot. A filesystem
-#                     image, not a disk image: the eMMC already has a partition
-#                     table holding the bootloader, and a disk image written to
-#                     it would brick the phone.
-#   rootfs.tar.gz     the unpack-once alternative to trixie.img, for installs
-#                     from a rooted shell or recovery.
+# initramfs + payload, all incremental and checkpointed -- and its deliverable
+# is the same shape as the J36's: one MixOS_<arch>_<debian>_<commit>.img,
+# a GPT container holding the Android boot.img bytes (p1, BOOT) and the
+# ext4 trixie rootfs bytes (p2, ROOTFS). Split it on the workstation and
+# flash the parts: boot.img with `fastboot flash boot`, the rootfs onto a
+# PARTLABEL=ROOTFS partition. Never write the container to the eMMC whole;
+# the phone keeps its stock partition table and bootloader.
 #
 # Environment (all set by build-oppo.sh):
 #   OPPO_BUILD_DIR   synced checkout in the VM
 #   OPPO_WORK_DIR    persistent work dir (kernel tree, rootfs, artifacts)
-#   OPPO_EXPORT_DIR  where --mix-only artifacts go (a mount in that mode)
+#   OPPO_EXPORT_DIR  where the finished image goes (a host mount)
 #   OPPO_DEVICE      codename from devices.sh (default 20181)
+#   OPPO_FULL_IMAGE_NAME  MixOS_<arch>_<debian>_<commit>.img, computed on the
+#                      host (the VM has no .git to read the commit from)
 #   OPPO_MIX_ONLY    1 = boot.img + modules + payload only, no rootfs
 #   OPPO_JOBS        parallelism (default nproc)
 #   OPPO_KERNEL_BRANCH / OPPO_KERNEL_URL (defaults: linux-6.12.y, kernel.org)
@@ -39,6 +34,7 @@ ROOT="${OPPO_BUILD_DIR:?set by build-oppo.sh}"
 WORK="${OPPO_WORK_DIR:?set by build-oppo.sh}"
 EXPORT="${OPPO_EXPORT_DIR:?set by build-oppo.sh}"
 DEVICE="${OPPO_DEVICE:-20181}"
+FULL_IMAGE_NAME="${OPPO_FULL_IMAGE_NAME:?set by build-oppo.sh}"
 MIX_ONLY="${OPPO_MIX_ONLY:-0}"
 JOBS="${OPPO_JOBS:-$(nproc)}"
 KERNEL_BRANCH="${OPPO_KERNEL_BRANCH:-linux-6.12.y}"
@@ -237,8 +233,8 @@ python3 "$ROOT/device/common/mkbootimg.py" \
 log "boot.img: $(stat -c %s "$BOOTIMG") bytes"
 
 # ── the Debian rootfs (full builds only; checkpointed) ──────────────────────
-ROOTFS_TGZ="$ART/oppo-$DEVICE-rootfs.tar.gz"
 TRIXIE_IMG="$ART/oppo-$DEVICE-trixie.img"
+FULLIMG="$ART/$FULL_IMAGE_NAME"
 if [[ "$MIX_ONLY" == 1 ]]; then
     log "--mix-only: boot.img + payload only, no rootfs"
 else
@@ -272,36 +268,30 @@ else
     fi
     sudo chroot "$WORK/rootfs" systemctl enable oppo-telephony.service \
         2>/dev/null || true
-    ( cd "$WORK/rootfs" && sudo tar -czf "$ROOTFS_TGZ" . )
-    log "rootfs: $(stat -c %s "$ROOTFS_TGZ") bytes"
-    # Under sudo like the tar: the tree is root-owned and mke2fs -d reads it.
+    # Under sudo: the tree is root-owned and mke2fs -d reads it.
     sudo bash "$ROOT/device/common/make-trixie-img.sh" \
         "$WORK/rootfs" "$TRIXIE_IMG" ROOTFS
+    # The deliverable: boot.img + trixie.img folded into the one MixOS image.
+    # The parts stay in the work dir as intermediates; only the container is
+    # exported. full-image.txt is the handover the wrapper reads (J36 pattern:
+    # out of the work dir, never out of the artifact dir).
+    {
+        echo "image=$FULL_IMAGE_NAME"
+        python3 "$ROOT/device/common/make_full_img.py" \
+            --boot "$BOOTIMG" --rootfs "$TRIXIE_IMG" --output "$FULLIMG"
+    } > "$ART/full-image.txt"
+    log "full image: $FULL_IMAGE_NAME ($(stat -c %s "$FULLIMG") bytes)"
 fi
 
-# ── hand-over ────────────────────────────────────────────────────────────────
-{
-    echo "device=$DEVICE"
-    echo "bootimg=oppo-$DEVICE-boot.img"
-    if [[ "$MIX_ONLY" == 1 ]]; then
-        echo "rootfs=none"
-        echo "trixieimg=none"
-    else
-        echo "rootfs=oppo-$DEVICE-rootfs.tar.gz"
-        echo "trixieimg=oppo-$DEVICE-trixie.img"
-    fi
-} > "$ART/oppo-$DEVICE-manifest.txt"
-
+# ── hand-over: the one image, and nothing else ──────────────────────────────
 if [[ "$MIX_ONLY" == 1 ]]; then
     mkdir -p "$EXPORT/boot" "$EXPORT/root"
     cp "$BOOTIMG" "$DTB" "$EXPORT/boot/"
     cp -r "$INITRD/opt/mixos" "$EXPORT/root/opt-mixos"
-    cp "$ART/oppo-$DEVICE-manifest.txt" "$EXPORT/"
     log "Exported to $EXPORT"
 else
     mkdir -p "$EXPORT"
-    cp "$BOOTIMG" "$TRIXIE_IMG" "$ROOTFS_TGZ" \
-        "$ART/oppo-$DEVICE-manifest.txt" "$EXPORT/"
+    cp "$FULLIMG" "$EXPORT/"
     log "Exported to $EXPORT"
 fi
 log "OPPO $DEVICE done"
