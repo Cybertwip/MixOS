@@ -144,7 +144,7 @@ J36 Ultra layer on top of it in the same Multipass VM: $VM_NAME
 
     ./build-j36-ultra.sh --no-splash  the same build, with the boot picture off:
                                       writes j36.splash=0 loglevel=7 into
-                                      mvii/boot.conf instead of j36.splash=1
+                                      boot.conf instead of j36.splash=1
                                       loglevel=4.  The panel then shows the
                                       kernel console for the whole boot, which is
                                       what to use when something goes wrong
@@ -601,4 +601,4 @@ elif [[ "$FLASH_PAYLOAD" == "in-image" ]]; then
 fi
 darkos_log "The card's two partitions: p1 BOOT vfat (launcher only), p2 ROOTFS ext2 (Debian, /opt/mixos, and your home at /home/virtua). p2 is last on the disk and /init grows it to the card's size on the first boot"
 darkos_log "Check the build log for the 'image:' lines -- they say whether the fold into the image succeeded, and on which partitions"
-darkos_warn "The R36 base image kernel is arm64 and this SoC is ARMv7; only the armhf rootfs is shared. sd-boot/mvii/boot.conf is what points the MVII LK at the 32-bit kernel."
+darkos_warn "The R36 base image kernel is arm64 and this SoC is ARMv7; only the armhf rootfs is shared. sd-boot/boot.conf is what points the MVII LK at the 32-bit kernel."

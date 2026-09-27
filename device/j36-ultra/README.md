@@ -168,7 +168,7 @@ runs rebuild only changed kernel, DTB, input-module, initramfs and `boot.img`
 files.
 
 `--without-battery` also works with `--mix-only`. It writes `j36.usb=novbus`,
-`j36.audio=1` and `j36.power=nocharge` into `mvii/boot.conf`. The OTG data
+`j36.audio=1` and `j36.power=nocharge` into `boot.conf`. The OTG data
 port does not source 5 V, and the speaker amp starts off. The matching
 bootloader is `tools/mediatek/build.sh --without-battery`, and it skips the
 charge screen. The supply still has to carry the board's load. This option
@@ -184,7 +184,7 @@ back the charger watchdog before SD access; Linux preserves that state.
 
 For a boot that dies before the first `mixos-log.txt` (twenty seconds after
 the login target), add `j36.trail=1` to the `bootargs=` line of
-`mvii/boot.conf` -- no rebuild to toggle it. Every splash tick from early
+`boot.conf` -- no rebuild to toggle it. Every splash tick from early
 systemd then appends the uptime and the kernel's last twenty lines to
 `j36-trail.txt` on BOOT, truncating the file once at the first tick so one
 boot is one trail. The last tick in the file is how far the boot got.
@@ -223,14 +223,14 @@ macOS and the next boot has the new payload — `sd-root.tar.gz` rides along in 
 `boot/` above, and `sd-boot/` inside the build. A card flashed from the full
 build carries it alone on `BOOT`: no `Image`, no `uInitrd`, no rk3326 trees, no
 `boot.ini`. An older card updated by hand from `boot/` may still have those
-R36S files sitting beside the launcher; the MVII LK reads `mvii/boot.conf` and
+R36S files sitting beside the launcher; the MVII LK reads `boot.conf` and
 ignores them.
 
 ```text
 zImage                 plain ARMv7 kernel, no appended tree
 mt6592-j36-ultra.dtb   the tree the LK loads separately and patches
 initrd.img             bring-up initramfs (busybox + the input module)
-mvii/boot.conf         filenames and command line for the MVII LK
+boot.conf         filenames and command line for the MVII LK
 j36/mfgpower           powers the Mali-450 and reads its ID back (j36.lima=1)
 j36/modules/           lima.ko and its dependencies, plus load.order
 j36/mtkdrm/            the MT6592 display set, plus load.order (j36.mtkdrm=1)
@@ -253,7 +253,7 @@ matching word from `bootargs`, restores the previous boot exactly, from any
 machine that can read an SD card and with no reflash. `/init` says on the panel
 what it found and carries on either way.
 
-`mvii/boot.conf` names the kernel, the tree, the initramfs and the command line.
+`boot.conf` names the kernel, the tree, the initramfs and the command line.
 The LK parses the card's `boot.ini` first when one is present -- an older card
 updated by hand may still carry the R36S one, naming the arm64 `Image` -- and
 this file second, so these words get the last word; without it the LK would load
@@ -357,7 +357,7 @@ the kernel: `rdinit=/init` keeps the kernel out of root mounting entirely, so a
 candidate read-only, looks for `/sbin/init`, and only then remounts it writable
 and `switch_root`s in. Failing that it scans the other `mmcblk` partitions, and
 failing *that* it prints `/proc/partitions` and gives you a shell. Delete `root=`
-from `mvii/boot.conf` and the card stops at the initramfs exactly as it used to.
+from `boot.conf` and the card stops at the initramfs exactly as it used to.
 
 ## Where the shell appears, and why the boot went quiet
 
@@ -383,7 +383,7 @@ over it stops. Everything after 26 s went to the journal and to `/dev/console`,
 which was the UART. The last kernel line on the panel is simply the last thing
 the *kernel* said.
 
-So `mvii/boot.conf` now puts `console=tty0` last and adds
+So `boot.conf` now puts `console=tty0` last and adds
 `systemd.journald.forward_to_console=1`. Both consoles still receive every
 `printk` — only `/dev/console` moved — and the service log follows it onto the
 panel. Drop the forward once there is a shell or a network to read the journal

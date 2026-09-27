@@ -1235,7 +1235,7 @@ def generate(sources: dict[str, str]) -> str:
 \t * points at the cause.
 \t *
 \t * always-on/boot-on because the rail is genuinely already up: MT6323's
-\t * VMC/VMCH were switched on by the LK before it read /mvii/boot.conf off
+\t * VMC/VMCH were switched on by the LK before it read /boot.conf off
 \t * this same card. There is no MT6323 regulator driver in this profile to
 \t * turn it off, and describing it as switchable would be a lie.
 \t */

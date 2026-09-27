@@ -75,7 +75,7 @@ staged_ok=0
 for member in 'cp "$ZIMAGE" "$SDBOOT/zImage"' \
         'cp "$DTB_OUT/mt6592-j36-ultra.dtb" "$SDBOOT/"' \
         'cp "$ARTIFACTS/initramfs-j36-ultra.cpio.xz" "$SDBOOT/initrd.img"' \
-        'cat > "$SDBOOT/mvii/boot.conf"' \
+        'cat > "$SDBOOT/boot.conf"' \
         'cat > "$SDBOOT/README.txt"' \
         'cat > "$SDBOOT/LICENSE.txt"' \
         'cp "$ARTIFACTS/sd-root.tar.gz" "$SDBOOT/sd-root.tar.gz"'; do

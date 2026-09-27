@@ -3027,7 +3027,7 @@ static void lk_build_atags(const lk_boot_image_t* img) {
  * bootloader you can leave installed and one you have to re-flash to recover.
  *
  * THE CONTRACT WITH THE CARD is deliberately small enough to satisfy by hand:
- * a FAT partition with a zImage and a DTB on it boots. /mvii/boot.conf is how
+ * a FAT partition with a zImage and a DTB on it boots. /boot.conf is how
  * you say anything else — filenames, the kernel command line, load addresses.
  * The volume is found by parsing BPBs rather than by trusting a partition type
  * byte, so a card partitioned by any tool works.
@@ -3086,7 +3086,7 @@ static void lk_build_atags(const lk_boot_image_t* img) {
 #define MVII_MT6592_LK_SD_INITRD_MAX 0x06000000u
 #endif
 
-#define SD_CONF_PATH "/mvii/boot.conf"
+#define SD_CONF_PATH "/boot.conf"
 #define SD_CONF_MAX 2048u
 
 /* The card's own loader script, and the label of the volume it lives on. Both
@@ -3497,7 +3497,7 @@ static void sd_conf_parse(sd_boot_conf_t* c, char* text, uint32_t len, sd_conf_o
  * variable it is loaded into: a name ending in `.dtb` is the tree, one containing
  * "initr" is the initramfs, and the first of anything else is the kernel. That
  * reads every boot.ini this has been pointed at without a symbol table for
- * somebody else's environment, and /mvii/boot.conf is parsed afterwards so an
+ * somebody else's environment, and /boot.conf is parsed afterwards so an
  * operator has the last word over any of it.
  *
  * Returns non-zero when it found something usable, so the caller can tell "the

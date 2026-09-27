@@ -2195,7 +2195,7 @@ want_zram=auto
 # So it gets the switch every one of those has, for the case none of them have to
 # handle: a board that will not come up, and an operator who needs to know whether
 # THIS is why, with nothing but a Mac and the FAT partition.  Put j36.expand=0 in
-# mvii/boot.conf and the step is skipped entirely -- the card keeps the size it has,
+# boot.conf and the step is skipped entirely -- the card keeps the size it has,
 # which is exactly what it did before this ever worked, and the boot carries on.
 # Take the word back out and the next boot grows it, because nothing about the
 # decision is remembered: both ends are read off the card every time.
@@ -2465,7 +2465,7 @@ fi
 # STILL BEHIND j36.power, which is the whole of what that word ever promised.  The
 # module writes MT6323 charger registers that survive a warm reset, so it stays
 # rulable-out from a card reader -- take the word out of the bootargs in
-# mvii/boot.conf and the register bank is left exactly as the LK set it, on this
+# boot.conf and the register bank is left exactly as the LK set it, on this
 # path the same as on the old one.  j36.power=nocharge is passed through here too,
 # and means here what it means there: the gauge and the poweroff handler, no
 # CHR_CON writes.  Nothing is skipped by loading it early; it is only earlier.
@@ -3097,7 +3097,7 @@ expand_root() {
     # rather have the device.
     #
     # The count lives on the ext2 partition and a Mac cannot reach it, so
-    # `j36.expand=retry' in mvii/boot.conf clears it from the FAT one -- the same place
+    # `j36.expand=retry' in boot.conf clears it from the FAT one -- the same place
     # `j36.expand=0' is typed, for the same reason.
     #
     # `:>' and not `rm', here and at the bottom, and it is not a style choice: this
@@ -3120,7 +3120,7 @@ expand_root() {
     fi
     if [ "$ex_tries" -ge 3 ]; then
         expand_note "the grow has been started $ex_tries times and the board went off before it finished each time, so it is not being started again -- the card keeps the size it has and the boot carries on"
-        expand_note "put j36.expand=retry in the bootargs in mvii/boot.conf to try once more, or empty ${ex_tries_file#/newroot} on the OS partition"
+        expand_note "put j36.expand=retry in the bootargs in boot.conf to try once more, or empty ${ex_tries_file#/newroot} on the OS partition"
         # Three interrupted grows is not three failed grows.  Each of them stopped with
         # the partition unmounted and resize2fs partway through moving blocks, so the
         # thing this is standing down from has already been done to this card three
@@ -3757,11 +3757,10 @@ mount_bootfs() {
     for dev in /dev/mmcblk*p*; do
         if [ ! -b "$dev" ]; then continue; fi
         if ! mount -t vfat -o ro "$dev" /bootfs 2>/dev/null; then continue; fi
-        # mvii/ identifies it now, not j36/: boot.conf is the file the LK itself
-        # reads and the one thing BOOT always carries, whereas j36/ is exactly what
-        # moved off this partition.  j36/ is still accepted, because on a card from
-        # an older build that is what is there.
-        if [ -d /bootfs/mvii ] || [ -d /bootfs/j36 ]; then
+        # boot.conf at the root identifies it now: it is the file the LK itself
+        # reads and the one thing BOOT always carries.  mvii/ and j36/ are still
+        # accepted, because on a card from an older build that is what is there.
+        if [ -f /bootfs/boot.conf ] || [ -d /bootfs/mvii ] || [ -d /bootfs/j36 ]; then
             bootfs_mounted=1
             bootdev="$dev"
             say "boot partition: $dev"
@@ -3769,7 +3768,7 @@ mount_bootfs() {
         fi
         umount /bootfs
     done
-    say "no FAT partition on this card carries mvii/ or j36/"
+    say "no FAT partition on this card carries boot.conf, mvii/ or j36/"
     return 1
 }
 
@@ -3929,8 +3928,8 @@ stage_from_boot() {
 # a framebuffer Doom, staged as boot payload and started by /init.  It is gone, and
 # what it left behind is the layout the rest of the payload follows.  A 26 MiB IWAD
 # was the first thing that obviously did not belong on a 100 MB vfat launcher
-# partition shared with an R36S card's own boot files, and moving userland software
-# off BOOT and into /opt/mixos on the ext2 OS partition is the rule everything staged
+# partition, and moving userland software off BOOT and into /opt/mixos on the
+# ext2 OS partition is the rule everything staged
 # below now obeys.  MixOS ships a base operating system; games are something the
 # operator installs, from the dashboard's Packages page or by hand.
 
@@ -5473,7 +5472,7 @@ done_flag=/dev/.mixsplash-done
 # kernel command line, every tick below also appends the uptime plus the
 # kernel's last twenty lines to j36-trail.txt on BOOT, so a reset still
 # leaves the trail behind.  The file is truncated once here, at the first
-# tick, so one boot is one trail.  A word on the card (mvii/boot.conf)
+# tick, so one boot is one trail.  A word on the card (boot.conf)
 # turns it off again; no rebuild either way.
 trail_on=0
 for _w in $(cat /proc/cmdline 2>/dev/null); do
@@ -5482,7 +5481,8 @@ done
 trail_mnt=/run/j36/trailmnt
 trail_mount_boot() {
     # BOOT is found by content, not partition number: numbering follows
-    # whichever MMC host attached first.  mvii/ is what the LK reads.
+    # whichever MMC host attached first.  boot.conf at the root is what the
+    # LK reads; mvii/ and j36/ are what older cards carry instead.
     # Mounting a device that is already mounted elsewhere shares the
     # superblock, so no check for that is needed.  J36_TRAIL_DEVS names
     # stand-in devices for the host-side test, where no MMC exists.
@@ -5490,7 +5490,7 @@ trail_mount_boot() {
     for _d in ${J36_TRAIL_DEVS:-/dev/mmcblk*p*}; do
         [ -b "$_d" ] || [ -n "${J36_TRAIL_DEVS:-}" ] || continue
         mount -t vfat -o rw,noatime "$_d" "$trail_mnt" 2>/dev/null || continue
-        if [ -d "$trail_mnt/mvii" ] || [ -d "$trail_mnt/j36" ]; then return 0; fi
+        if [ -f "$trail_mnt/boot.conf" ] || [ -d "$trail_mnt/mvii" ] || [ -d "$trail_mnt/j36" ]; then return 0; fi
         umount "$trail_mnt" 2>/dev/null || true
     done
     return 1
@@ -6560,7 +6560,7 @@ setup_logdump() {
     mkdir -p /newroot/run/j36/bin /newroot/run/systemd/system
 
     # The one thing the rootfs cannot work out as cheaply as we can: this partition
-    # has already been mounted and looked inside for mvii/, so hand the answer over
+    # has already been mounted and looked inside for boot.conf, so hand the answer over
     # rather than making the script repeat the search.  It still knows how to search
     # -- bootdev is empty on a boot where mount_bootfs never ran -- and an empty
     # file is a legitimate value that means exactly that.
@@ -6611,9 +6611,9 @@ BOOTDEV=""
 # ── finding and mounting BOOT ─────────────────────────────────────────────────
 #
 # Identified by looking inside it, not by partition number: numbering here follows
-# whichever MMC host attached first.  mvii/ is what the LK reads and the one
-# directory BOOT always carries; j36/ is accepted because that is what a card from
-# an older layout has.
+# whichever MMC host attached first.  boot.conf at the root is what the LK reads
+# and the one file BOOT always carries; mvii/ and j36/ are accepted because that
+# is what a card from an older layout has.
 #
 # Mounting a block device that is already mounted elsewhere is safe on Linux -- the
 # second mount finds the existing superblock and shares it rather than making a
@@ -6628,7 +6628,7 @@ mount_boot() {
     for _d in $_saved /dev/mmcblk*p*; do
         [ -b "$_d" ] || continue
         mount -t vfat -o rw,noatime "$_d" "$MNT" 2>/dev/null || continue
-        if [ -d "$MNT/mvii" ] || [ -d "$MNT/j36" ]; then
+        if [ -f "$MNT/boot.conf" ] || [ -d "$MNT/mvii" ] || [ -d "$MNT/j36" ]; then
             BOOTDEV="$_d"
             return 0
         fi
@@ -7095,7 +7095,7 @@ dump() {
 
 write_once() {
     if ! mount_boot; then
-        echo "j36-logdump: no FAT partition on this card carries mvii/ or j36/"
+        echo "j36-logdump: no FAT partition on this card carries boot.conf, mvii/ or j36/"
         return 1
     fi
     dump "$1" > "$MNT/$TMP" 2>&1
@@ -7459,7 +7459,7 @@ if [ "$want_dash" = 1 ]; then
 else
     say "dash: j36.dash is not in the kernel command line, so no shell is staged"
     say "      and whatever the rootfs starts by itself is what you get.  Add"
-    say "      j36.dash=1 to bootargs in mvii/boot.conf on the BOOT partition."
+    say "      j36.dash=1 to bootargs in boot.conf on the BOOT partition."
 fi
 
 # Outside every want_ block above, and last, which is the only placement that makes
@@ -9453,11 +9453,12 @@ fi
 # ── The SD BOOT payload: the launcher, and nothing else ───────────────────────
 #
 # Copy this tree onto the FAT partition labelled BOOT and the MVII LK boots the
-# card instead of the eMMC.  /mvii/boot.conf is written because an R36S card
-# already carries a boot.ini, and that boot.ini names the RK3326's arm64 `Image`
-# and an rk3326 device tree.  The LK parses boot.ini first and boot.conf second
-# precisely so this file gets the last word; without it the LK would load the
-# arm64 kernel, refuse it at the magic check, and fall back to the eMMC.
+# card instead of the eMMC.  boot.conf sits at the root: the mvii/ directory it
+# used to live in is kept working by the LK as a fallback, for cards written by
+# older builds, and is otherwise gone.  The LK parses a boot.ini first when one
+# is present and boot.conf second precisely so this file gets the last word;
+# without it the LK would load the arm64 kernel, refuse it at the magic check,
+# and fall back to the eMMC.
 #
 # Load addresses are deliberately absent.  They are the LK's business -- it knows
 # this SoC's DRAM map and the address of the framebuffer the DTB hands to
@@ -9476,7 +9477,7 @@ fi
 log "Staging the SD card BOOT payload"
 SDBOOT="$ARTIFACTS/sd-boot"
 rm -rf "$SDBOOT"
-mkdir -p "$SDBOOT/mvii"
+mkdir -p "$SDBOOT"
 
 # The OS-partition tree, declared here because the j36/ payload below now goes into it
 # and the staging has to be able to write to it before the /opt/mixos section further
@@ -9704,11 +9705,11 @@ fi
 # silently truncated bootargs line, and it prints the size so the next one says
 # by how much.  A comment here costs the same as a boot argument -- keep them
 # terse, and put the explanation in README.txt, which nothing parses.
-cat > "$SDBOOT/mvii/boot.conf" <<'CONF'
+cat > "$SDBOOT/boot.conf" <<'CONF'
 # MVII LK SD hand-off, J36 Ultra (MT6592, ARMv7).
 #
 # No boot.ini on this card: BOOT carries the J36 launcher only.  Keep it short
-# -- a fixed 2 KiB buffer.  ../README.txt explains every word below.
+# -- a fixed 2 KiB buffer.  README.txt explains every word below.
 kernel=zImage
 dtb=mt6592-j36-ultra.dtb
 initrd=initrd.img
@@ -9755,8 +9756,8 @@ CONF
 # below is measuring the same file either way.
 if [[ "${J36_SPLASH:-1}" == 0 ]]; then
     sed -i -e 's/ j36\.splash=1/ j36.splash=0/' \
-           -e 's/ loglevel=4 / loglevel=7 /' "$SDBOOT/mvii/boot.conf"
-    grep -q ' j36\.splash=0' "$SDBOOT/mvii/boot.conf" || \
+           -e 's/ loglevel=4 / loglevel=7 /' "$SDBOOT/boot.conf"
+    grep -q ' j36\.splash=0' "$SDBOOT/boot.conf" || \
         die "J36_SPLASH=0 but boot.conf still asks for the splash; the bootargs line has changed shape"
     log "splash: boot.conf says j36.splash=0 loglevel=7 (--no-splash); this card boots to text"
 fi
@@ -9768,12 +9769,12 @@ fi
 if [[ "$WITHOUT_BATTERY" == 1 ]]; then
     sed -i -e 's/ j36\.usb=1 / j36.usb=novbus /' \
            -e 's/ j36\.audio=speaker / j36.audio=1 /' \
-           -e 's/ j36\.power=1 / j36.power=nocharge /' "$SDBOOT/mvii/boot.conf"
-    grep -q ' j36\.usb=novbus ' "$SDBOOT/mvii/boot.conf" || \
+           -e 's/ j36\.power=1 / j36.power=nocharge /' "$SDBOOT/boot.conf"
+    grep -q ' j36\.usb=novbus ' "$SDBOOT/boot.conf" || \
         die "J36_WITHOUT_BATTERY=1 but boot.conf still sources OTG VBUS"
-    grep -q ' j36\.power=nocharge ' "$SDBOOT/mvii/boot.conf" || \
+    grep -q ' j36\.power=nocharge ' "$SDBOOT/boot.conf" || \
         die "J36_WITHOUT_BATTERY=1 but boot.conf still arms the charger"
-    grep -q ' j36\.audio=1 ' "$SDBOOT/mvii/boot.conf" || \
+    grep -q ' j36\.audio=1 ' "$SDBOOT/boot.conf" || \
         die "J36_WITHOUT_BATTERY=1 but boot.conf still enables the speaker"
     log "batteryless: OTG VBUS and speaker off; Linux preserves the charger state from the batteryless LK"
 fi
@@ -9782,7 +9783,7 @@ fi
 # truncated mid-line.  The size goes in the message: "too big" sends a reader
 # hunting through a file where every line looks necessary, and "by 11 bytes"
 # points straight at whichever comment was last touched.
-boot_conf_bytes="$(stat -c %s "$SDBOOT/mvii/boot.conf")"
+boot_conf_bytes="$(stat -c %s "$SDBOOT/boot.conf")"
 (( boot_conf_bytes <= 2048 )) || \
     die "boot.conf is ${boot_conf_bytes} bytes, $(( boot_conf_bytes - 2048 )) over the LK's 2048-byte read buffer; shorten a comment in the CONF heredoc"
 log "boot.conf: ${boot_conf_bytes} bytes, $(( 2048 - boot_conf_bytes )) to spare in the LK's buffer"
@@ -9795,13 +9796,13 @@ Copy the contents of this directory into the root of the FAT partition labelled
 BOOT.  A card flashed from the full J36 image carries this launcher only: no
 Image, no uInitrd, no rk3326 trees, no boot.ini.  An older card updated by hand
 may still have those R36S files sitting beside it; the MVII LK reads
-mvii/boot.conf and ignores them.
+boot.conf and ignores them.
 
   zImage                    plain 32-bit ARM kernel, no appended device tree
   mt6592-j36-ultra.dtb      the tree the LK loads separately and patches
   initrd.img                bring-up initramfs (busybox, the input module, and
                             the boot splash with its picture)
-  mvii/boot.conf            filenames and command line for the MVII LK
+  boot.conf            filenames and command line for the MVII LK
   LICENSE.txt               which licence covers which file above, and where the
                             GPL-2.0-only source is; keep it with the payload
 
@@ -9869,7 +9870,7 @@ microSD host, is driven by mtk-sd through a mediatek,mt6592-mmc node, and ext2 -
 which is what the rootfs is -- is built in, along with ext4 and btrfs for the
 cards earlier builds wrote.  /init verifies a candidate partition by mounting it
 read-only and looking for /sbin/init, then switch_roots into it.  If nothing
-qualifies -- or if you delete root= from mvii/boot.conf -- it stops at a busybox
+qualifies -- or if you delete root= from boot.conf -- it stops at a busybox
 shell on the panel and on the serial port instead, and prints /proc/partitions so
 you can see what the kernel did find.
 
@@ -9918,7 +9919,7 @@ into a trail: every five seconds from early systemd it appends the uptime and
 the kernel's last twenty lines to j36-trail.txt beside it, truncating the file
 once at the first tick so one boot is one trail.  The last tick in the file is
 how far the boot got, and its dmesg tail is what the kernel last said.  No
-rebuild to toggle: it is one word in mvii/boot.conf either way.
+rebuild to toggle: it is one word in boot.conf either way.
 
 The command line, word by word
 ------------------------------
@@ -10059,7 +10060,7 @@ systemd.mask=firstboot.service
     clean.
 
     AND IT HAS AN OFF SWITCH, WHICH NOTHING ELSE IN /init NEEDED ONE FOR.  Put
-    j36.expand=0 in the bootargs in mvii/boot.conf and this step does not happen
+    j36.expand=0 in the bootargs in boot.conf and this step does not happen
     at all: no unmount, no partition table written, no e2fsck, no resize2fs.  The
     card keeps the size it has and the boot carries straight on.
 
@@ -10305,7 +10306,7 @@ j36.audio=speaker
     board switches off a few seconds into playback.  The driver opens at level 8 of
     11 rather than at the vendor's maximum for the same reason.  Recovery from a
     board that will not stay up is to delete j36/audio from the card, or this word
-    from mvii/boot.conf, from any machine that reads SD cards.
+    from boot.conf, from any machine that reads SD cards.
 
     WHAT `default' WAS ON THIS CARD.  The shared rootfs links /etc/asound.conf to
     /home/virtua/.asoundrc -- see finishing_touches.sh -- and that file is the
@@ -11903,7 +11904,7 @@ it covers everything MixOS put on the card.  Two partitions carry it, and BOOT
 is FAT because the MVII LK reads FAT32 and nothing else:
 
     BOOT, FAT32   the launcher, and only that: zImage, mt6592-j36-ultra.dtb,
-                  initrd.img, mvii/boot.conf, README.txt and this file.
+                  initrd.img, boot.conf, README.txt and this file.
     ROOTFS, ext2  Debian, and MixOS's own tree at /opt/mixos -- unpacked there
                   from sd-root.tar.gz.  Every "bin/", "qt/" and "j36/" path below
                   means /opt/mixos/... on this partition.  Your home directory,
@@ -11923,7 +11924,7 @@ appended in full at the end of this file:
     bin/j36-mixmirror       the panel-to-USB-HDMI mirror
     j36/eglprobe            the EGL/GBM/DRM scanout probe
     j36/mfgpower            the MFG power-domain bring-up probe
-    mvii/boot.conf          the MVII LK hand-off
+    boot.conf          the MVII LK hand-off
     README.txt on either partition, and this file -- the documentation
 
 GNU General Public License, version 2 only:
@@ -14297,7 +14298,7 @@ MixOS -- J36 Ultra (MediaTek MT6592, ARMv7) OS-partition payload.
 This is everything the card carries that is not the launcher.  The BOOT partition is
 FAT32 because the MVII LK reads FAT32 and nothing else, and it holds only the four
 files the LK itself reads -- zImage, mt6592-j36-ultra.dtb, initrd.img and
-mvii/boot.conf.  Once /init has the rootfs mounted, nothing is loading off FAT any
+boot.conf.  Once /init has the rootfs mounted, nothing is loading off FAT any
 more, so the rest lives here, on the ext2 OS partition, where symlinks and execute
 bits survive and where 50 MB is not competing with an R36S card's own boot files.
 
@@ -14389,7 +14390,7 @@ any unit the rootfs happens to have installed or enabled.  Delete this directory
 it is not written: instead the console gets mixdash-missing.service, saying which
 partitions were searched.  Nothing is started in the dashboard's place either way;
 to hand the boot back to the rootfs's own shell, drop j36.dash=1 from the bootargs
-in mvii/boot.conf on the BOOT partition.
+in boot.conf on the BOOT partition.
 
 Licence: the MixOS work here -- bin/mixdash, bin/j36-mixmirror, j36/mfgpower and
 j36/eglprobe -- is dual licensed, MPL-2.0 or GPL-2.0-or-later at your option; both
@@ -14450,7 +14451,7 @@ fi
     # an error, so it is named only when it was staged.
     sums=(boot.img zImage zImage-j36-ultra mt6592-j36-ultra.dtb
           j36_mt6592_input.ko initramfs-j36-ultra.cpio.xz
-          sd-boot/zImage sd-boot/mvii/boot.conf)
+          sd-boot/zImage sd-boot/boot.conf)
     if [[ -f sd-root/opt/mixos/bin/mixdash ]]; then
         sums+=(sd-root/opt/mixos/bin/mixdash)
     fi
@@ -14506,10 +14507,10 @@ fi
         echo "dtb_sha256=$(sha256sum mt6592-j36-ultra.dtb | awk '{print $1}')"
         echo "bootimg_size=$(stat -c %s boot.img) (slot 0x900000)"
         echo "storage=msdc1 mtk-sd mediatek,mt6592-mmc (ext2, ext4, btrfs, exfat, vfat)"
-        echo "card_layout=p1 BOOT vfat = launcher only (zImage, dtb, initrd.img, mvii/boot.conf, LICENSE.txt, README.txt); p2 ROOTFS ext2 = the OS, /opt/mixos included, and the login user's home at ${DATA_MOUNT_POINT:-/home/virtua} as an ordinary directory in it.  Two partitions: there is no p3, and p2 is last on the disk so /init can grow it to the card's size on the first boot"
+        echo "card_layout=p1 BOOT vfat = launcher only (zImage, dtb, initrd.img, boot.conf, LICENSE.txt, README.txt); p2 ROOTFS ext2 = the OS, /opt/mixos included, and the login user's home at ${DATA_MOUNT_POINT:-/home/virtua} as an ordinary directory in it.  Two partitions: there is no p3, and p2 is last on the disk so /init can grow it to the card's size on the first boot"
         echo "card_expand=/init's expand_root, before switch_root: sfdisk -N extends p2 to the end of the disk, e2fsck -fp if the filesystem needs it, then resize2fs -f with no size argument.  ext2 has no online resize, so this is the only moment in the boot it can happen; the three tools and their libraries are copied out of the rootfs before it is unmounted, and a copy that will not run leaves the card alone"
         echo "card_expand_fsck=the check is skipped when dumpe2fs says 'Filesystem state: clean', which on a card this same function unmounted a second earlier is the normal case.  resize2fs is given -f, which drops only the last-checked-versus-last-mounted test and still refuses a filesystem the superblock does not call valid.  That check is the first sustained read of the card in the boot, it runs with the root unmounted and before anything that could carry the board through it, and on a big card it is most of the minutes this step costs.  j36.expand=fsck in the bootargs runs it anyway"
-        echo "card_expand_off=j36.expand=0 in the bootargs in mvii/boot.conf skips the whole step -- no unmount, no partition table write, no e2fsck, no resize2fs.  It is the only destructive thing /init does and the only one that is still working after an operator has decided the board is dead, so it is the one step that has to be rulable-out from a card reader alone.  Nothing remembers the word: take it out and the next boot grows the card"
+        echo "card_expand_off=j36.expand=0 in the bootargs in boot.conf skips the whole step -- no unmount, no partition table write, no e2fsck, no resize2fs.  It is the only destructive thing /init does and the only one that is still working after an operator has decided the board is dead, so it is the one step that has to be rulable-out from a card reader alone.  Nothing remembers the word: take it out and the next boot grows the card"
         echo "card_expand_trip=three boots that start the grow and do not finish it stand the step down for good: the count is /var/lib/mixos/expand-tries on the OS partition, written just before the unmount and removed the moment the resize answers anything at all, so it counts resets and not outcomes.  It exists because a board that goes off partway leaves the card in the state that makes the next boot start the same work, which is a boot loop and not a failed resize.  j36.expand=retry starts the count again from the FAT partition; deleting the file does it from the OS"
         echo "card_expand_reset=a restart during the grow is power and not software: CONFIG_PANIC_TIMEOUT=0, so a panic here halts rather than reboots, and mtk_wdt disarms the TOPRGU at probe.  The grow is the only stretch of the boot that holds the card at full write current for minutes, which is what made it the step that showed the fault; what the fault was is card_expand_power"
         echo "card_expand_power=CHR_CON13's charger watchdog is a four-second window the preloader arms and LK kicks, and nothing kicked it across the hand-over to Linux -- so the charge stopped four seconds into every boot, and with no power-path FET on this PMIC family VBAT is VSYS and the whole machine ran off the cell from there.  CHR_CON16's UVLO stayed at the loader's threshold for just as long, and a UVLO trip on this board is not a warning about a brownout, it is the power cut.  j36_mt6592_pmic.ko is now staged into the initramfs as well as into j36/power/ and /init loads it before the card scan, so the driver's one-second poll is feeding the timer and UVLO is at its widest ride-through before expand_root draws anything.  Still behind j36.power, and j36.power=nocharge is passed through; run_power skips the payload copy when it finds this one in /sys/module"
@@ -14577,7 +14578,7 @@ fi
             echo "audio_modules=$(tr '\n' ' ' < $PAYREL/audio/load.order)"
             echo "audio_core=CONFIG_SOUND=y (soundcore only); snd, snd-timer, snd-pcm are =m and staged here"
             echo "audio_snd_pcm=selected by SND_DUMMY=m, which is built and deliberately not staged"
-            echo "audio_start=$(grep -o 'j36\.audio=[a-z0-9]*' sd-boot/mvii/boot.conf)"
+            echo "audio_start=$(grep -o 'j36\.audio=[a-z0-9]*' sd-boot/boot.conf)"
             echo "audio_clock=first ungate of AFE_CG on this board; dmesg reports whether DL1_CUR advances on the first stream"
             echo "audio_outputs=headphone jack (on by default) and class-D speaker; two mixer switches, moved by the plug only when j36_mt6592_input has a jack line configured"
             echo "audio_volume=analog on both: SPK_CON9 level and AUDTOP_CON5 gain under one Master element, no softvol"
@@ -14592,7 +14593,7 @@ fi
             echo "gl_reason=the shared rootfs points libEGL.so, libgbm.so{,.1,.1.0.0} and libGLESv1_CM.so at the RK3326 Mali blob"
             echo "gl_load_bearing=libgbm.so.1 -- libEGL_mesa.so.0 needs it, so mesa's own EGL cannot load without this payload"
             echo "gl_install=tmpfs on the rootfs /run, named by LD_LIBRARY_PATH in mixdash.service; nothing is written to the card"
-            echo "gl_boot_word=$(grep -o 'j36\.gl=[a-z0-9]*' sd-boot/mvii/boot.conf)"
+            echo "gl_boot_word=$(grep -o 'j36\.gl=[a-z0-9]*' sd-boot/boot.conf)"
             echo "gl_users=eglprobe, and through it mixdash's 3D cube card; mixdash itself is Qt on linuxfb and needs no GL at all"
             echo "gl_es1=not available and not a driver bug: Debian's armhf mesa is a -Dgles1=disabled build, so eglCreateContext for an ES1 context is 0x3003 EGL_BAD_ALLOC on lima, on llvmpipe and on softpipe alike. ES2 is what comes up."
             if [[ -f $PAYREL/eglprobe ]]; then
@@ -14812,7 +14813,7 @@ print(p[0]["start"], p[0]["size"], p[1]["start"], p[1]["size"])
     # J36 card carries only this run's payload and nothing the base happened to
     # ship.  The base itself is untouched -- this runs on the copy -- and a card
     # updated by hand from --mix-only keeps whatever it already had; the LK reads
-    # mvii/boot.conf, ignores the rest, and refuses an arm64 Image at the magic
+    # boot.conf, ignores the rest, and refuses an arm64 Image at the magic
     # check, so those leftovers are inert there.
     #
     # The whole of $SDBOOT rather than a list of four filenames, because that list has
@@ -14834,11 +14835,11 @@ print(p[0]["start"], p[0]["size"], p[1]["start"], p[1]["size"])
         if sudo find "$mnt" -mindepth 1 -delete; then
             log "image: p1 (vfat) emptied of the base's R36S boot set; the J36 launcher goes in alone"
         else
-            log "image: p1 clean-out failed, so the R36S boot files stay beside the launcher (inert: the LK reads mvii/boot.conf)"
+            log "image: p1 clean-out failed, so the R36S boot files stay beside the launcher (inert: the LK reads boot.conf)"
         fi
         if sudo cp -r "$SDBOOT/." "$mnt/"; then
             sync
-            log "image: p1 (vfat) now carries the J36 launcher only: $(find "$SDBOOT" -type f | wc -l) files, mvii/boot.conf included"
+            log "image: p1 (vfat) now carries the J36 launcher only: $(find "$SDBOOT" -type f | wc -l) files, boot.conf included"
         else
             log "image: p1 mounted but the launcher copy failed -- is p1 full?  ${SYSTEM_SIZE:-100} MB is the budget"
             rc=1
