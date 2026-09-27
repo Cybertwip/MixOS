@@ -2556,6 +2556,9 @@ func parseMTKDALoader(path string, hwCode uint16, hwVersion uint16, swVersion ui
 	if len(data) < 0x6C {
 		return mtkDALoader{}, fmt.Errorf("%s is too small to be a MediaTek DA loader", path)
 	}
+	if looksLikePatchedPreloaderDA(data) {
+		return mtkDALoader{}, fmt.Errorf("%s looks like a DA file processed by a preloader patcher (ROM_INFO at 0x1000, DA bundle moved to 0x2000); -da-loader needs an unmodified DA bundle, while the preloader patch belongs on a full boot1 dump", path)
+	}
 	bundleOffset := 0
 	count := binary.LittleEndian.Uint32(data[0x68:0x6C])
 	if count == 0 || count > 4096 {
@@ -2622,6 +2625,17 @@ func parseMTKDALoader(path string, hwCode uint16, hwVersion uint16, swVersion ui
 		}
 	}
 	return matches[0], nil
+}
+
+func looksLikePatchedPreloaderDA(data []byte) bool {
+	if len(data) < 0x2000+len("MTK_DOWNLOAD_AGENT") {
+		return false
+	}
+	return data[0x20D] == 0x20 && data[0x21D] == 0x20 &&
+		data[0x211] == 0x10 && data[0x212] == 0x10 &&
+		data[0x221] == 0x10 && data[0x222] == 0x10 &&
+		bytes.HasPrefix(data[0x1000:], []byte("AND_ROMINFO_v")) &&
+		bytes.HasPrefix(data[0x2000:], []byte("MTK_DOWNLOAD_AGENT"))
 }
 
 func parseDAEntry(path string, data []byte, oldLoader bool, v6 bool) (mtkDALoader, bool) {

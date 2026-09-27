@@ -321,6 +321,27 @@ func TestParseMTKDALoaderWrappedBundleOffsets(t *testing.T) {
 	}
 }
 
+func TestParseMTKDALoaderRejectsDAProcessedAsPreloader(t *testing.T) {
+	dir := t.TempDir()
+	loaderPath := filepath.Join(dir, "MTK_DA_Oppo.bin")
+	data := make([]byte, 0x2200)
+	data[0x20d], data[0x21d] = 0x20, 0x20
+	data[0x211], data[0x212] = 0x10, 0x10
+	data[0x221], data[0x222] = 0x10, 0x10
+	copy(data[0x1000:], "AND_ROMINFO_v")
+	copy(data[0x2000:], "MTK_DOWNLOAD_AGENT")
+	binary.LittleEndian.PutUint32(data[0x2068:0x206c], 1)
+	binary.LittleEndian.PutUint16(data[0x206c:0x206e], 0xdada)
+	binary.LittleEndian.PutUint16(data[0x206e:0x2070], 0x6765)
+	if err := os.WriteFile(loaderPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := parseMTKDALoader(loaderPath, 0x6765, 0, 0)
+	if err == nil || !strings.Contains(err.Error(), "preloader patcher") {
+		t.Fatalf("wanted preloader patcher diagnostic, got %v", err)
+	}
+}
+
 func TestPrepareDADataChecksumPadsOddLength(t *testing.T) {
 	checksum, payload := prepareDAData([]byte{0x34, 0x12, 0x78})
 	if !bytes.Equal(payload, []byte{0x34, 0x12, 0x78, 0x00}) {
