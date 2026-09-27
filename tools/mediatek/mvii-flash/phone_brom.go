@@ -612,11 +612,13 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 		// Preloader mode is a dead end for the upload: the DA stage
 		// addresses are BROM SRAM addresses, and the one observed
 		// preloader-mode attempt died mid-upload with a USB drop. Arm
-		// the reset-to-BROM flag and wait for the BROM session.
+		// the reset-to-BROM flag when the unit allows it, then wait
+		// for a BROM session either way: a flag refusal must not abort
+		// the run, because a key-combo replug during the wait lands in
+		// BROM and continues this same invocation.
 		fmt.Println("Phone is in preloader mode; arming the reset-to-BROM flag.")
 		if err := setPhonePreloaderBROMFlag(client, facts); err != nil {
-			_ = client.port.Close()
-			return flagFailureAdvice(err)
+			fmt.Printf("Warning: %v\n", flagFailureAdvice(err))
 		}
 		_ = client.port.Close()
 		client, target, err = waitPhoneBROM(cfg, phone, facts)
