@@ -29,10 +29,35 @@ import (
 // talks to the BROM over its raw bulk IN/OUT endpoints, exactly like mtkclient.
 const mtkUSBVendorID = 0x0e8d
 
+// Retail phones in preloader mode enumerate under their vendor's VID, not
+// MediaTek's: OPPO 0x22d9:0x0006, LG 0x1004:0x6000. BROM itself always
+// reports 0x0e8d. Same ID table every MediaTek flasher scans.
+const (
+	mtkUSBOppoVendorID  = 0x22d9
+	mtkUSBOppoPreloader = 0x0006
+	mtkUSBLGVendorID    = 0x1004
+	mtkUSBLGPreloader   = 0x6000
+)
+
+// isMTKUSBFlashDevice reports whether a USB VID:PID pair is a flashable
+// target: anything MediaTek except the live debug console, plus the
+// vendor-VID preloader modes of retail phones.
+func isMTKUSBFlashDevice(vid, pid uint16) bool {
+	switch vid {
+	case mtkUSBVendorID:
+		return pid != mviiDebugConsolePID
+	case mtkUSBOppoVendorID:
+		return pid == mtkUSBOppoPreloader
+	case mtkUSBLGVendorID:
+		return pid == mtkUSBLGPreloader
+	}
+	return false
+}
+
 var (
 	errMTKUSBTimeout  = errors.New("usb bulk timeout")
 	errMTKUSBClosed   = errors.New("usb port closed")
-	errMTKUSBNotFound = errors.New("no MediaTek USB device found (VID 0x0e8d)")
+	errMTKUSBNotFound = errors.New("no flashable MediaTek USB device found (VID 0x0e8d, 0x22d9, 0x1004)")
 )
 
 var (
@@ -93,11 +118,9 @@ func openMTKUSBPort() (*mtkUSBPort, error) {
 		if rc := C.libusb_get_device_descriptor(dev, &desc); rc != 0 {
 			continue
 		}
-		if uint16(desc.idVendor) != mtkUSBVendorID {
-			continue
-		}
+		vid, pid := uint16(desc.idVendor), uint16(desc.idProduct)
 		// Never the live debug console, even though it is a 0x0e8d device and
-		// "first 0x0e8d wins" would take it.
+		// "first match wins" would take it.
 		//
 		// This is the host half of the bridge magic, and it is the half that
 		// actually caused the damage. A board serving the console is 0x0e8d/
@@ -111,8 +134,11 @@ func openMTKUSBPort() (*mtkUSBPort, error) {
 		// probe bytes and re-waits instead of exiting), but the right fix is
 		// for the host not to knock on that door at all: the console is not a
 		// BROM and no amount of handshaking will make it one.
-		if uint16(desc.idProduct) == mviiDebugConsolePID {
+		if vid == mtkUSBVendorID && pid == mviiDebugConsolePID {
 			sawConsole = true
+			continue
+		}
+		if !isMTKUSBFlashDevice(vid, pid) {
 			continue
 		}
 		port, err := openMTKUSBDevice(dev)
