@@ -39,6 +39,7 @@ type config struct {
 	tool                 string
 	mtkclientRoot        string
 	daLoader             string
+	probeDA              bool
 	authFile             string
 	waitFlag             string
 	preloader            string
@@ -165,11 +166,17 @@ func run() error {
 	// bootloader layout onto it. See phone_target.go.
 	if phone, ok := detectPhoneRoot(cfg.root); ok {
 		if isPhoneBROMShape(cfg) {
+			if cfg.probeDA {
+				return probePhoneDASignature(cfg, phone)
+			}
 			return flashPhoneBROM(cfg, phone)
 		}
 		if err := refusePhoneWrite(cfg, phone); err != nil {
 			return err
 		}
+	}
+	if cfg.probeDA {
+		return errors.New("-probe-da requires a phone boot root, serial -device, -upload lk, -partition, -raw-offset or -scatter, -da-loader, and -preloader")
 	}
 	// The live console is checked before every serial path below because it needs
 	// no -device at all: it finds its own USB device by VID:PID, and the board it
@@ -507,6 +514,7 @@ func parseFlags() (config, error) {
 	flag.StringVar(&cfg.rawLength, "raw-length", "", "raw transfer length; for feed, auto/minimal rounds image up to 512B")
 	flag.StringVar(&cfg.preloader, "preloader", "", "optional preloader for DRAM init in some serial paths")
 	flag.StringVar(&cfg.daLoader, "da-loader", "", "legacy DA loader (only for -backend=mtk-serial without feed)")
+	flag.BoolVar(&cfg.probeDA, "probe-da", false, "probe a phone DA stage-1 signature via SEND_DA; stop before JUMP_DA or any eMMC access")
 	flag.StringVar(&cfg.authFile, "auth", "", "vendor auth file (e.g. auth_sv5.auth), uploaded via SEND_AUTH when phone BROM enforces DAA")
 	flag.StringVar(&cfg.waitFlag, "wait", "", "wait for phone VCOM and, when DAA requires -auth, a BROM replug (e.g. 5m, 90s); unset means one attempt")
 	flag.StringVar(&cfg.mtkDRAM, "mtk-dram", "", "legacy DA DRAM profile: auto, preloader, mt6592-standard, mt6592-lpddr2, mt6592-lpddr3, or mt6592-da-default")

@@ -10,16 +10,12 @@ import (
 
 // ── PHONE BROM FLASH (Oppo / LG, no fastboot) ──
 //
-// The same legacy DA stack the J36 Ultra flashes through, parameterized for
-// phone roots: the DA loader entry is selected by the soc in build-info.txt,
-// DRAM/EMI comes from the operator's stock preloader (never the mt6592
-// built-ins), and the eMMC offset comes from the validated stock scatter
-// slot -- never a J36 default. The wire itself reuses the exercised J36
-// functions unchanged (handshake, SEND_DA, stage-1 sync, stage-2 upload, EMI
-// config, sdmmc_write_data); this file adds no new protocol bytes. What it
-// cannot do is authenticate: a BROM that enforces SLA/DAA is refused at
-// probe time, before anything moves, because the tool speaks no auth
-// exchange and the stock auth file has no consumer here.
+// This path reuses the J36 legacy DA transport for phone roots. The DA entry
+// comes from the soc in build-info.txt, DRAM/EMI from the stock preloader, and
+// the eMMC offset from the stock scatter or an explicit raw offset. BROM can
+// receive a vendor auth blob through SEND_AUTH; a secured preloader instead
+// verifies the DA signature when it receives SEND_DA. A phone requiring the
+// XFLASH DA protocol needs additional support after the initial DA upload.
 
 // mtkCmdSendAuth is the BROM command that uploads the vendor auth blob
 // (auth_sv5.auth) on targets enforcing DAA. The exchange -- echo, big-endian
@@ -98,9 +94,8 @@ func phoneBROMCode(soc string) (uint16, error) {
 // flags are the working fastboot path), an explicit LK partition, and the
 // staging files named. Raw exec (operator -address, no -upload) and any
 // j36-only verb keep their existing meaning and never match here. The auth
-// file is deliberately not required: the tool cannot consume it, so demanding
-// it would promise an SLA exchange that does not exist; SLA/DAA targets are
-// refused at probe time instead.
+// file is optional because a preloader can verify a vendor-signed DA at
+// SEND_DA without a separate BROM auth exchange.
 func isPhoneBROMShape(cfg config) bool {
 	if !isSerialDevicePath(cfg.device) {
 		return false
@@ -649,6 +644,59 @@ func (c *mtkSerialClient) sendAuth(auth []byte) error {
 		return fmt.Errorf("SEND_AUTH final status 0x%x", status)
 	}
 	fmt.Println("Auth blob accepted.")
+	return nil
+}
+
+// probePhoneDASignature sends only DA stage 1 to RAM. It never jumps to the
+// agent, issues a DA storage command, or accesses eMMC. This lets an operator
+// distinguish a model-accepted signed DA from a 0x7024 signature rejection
+// before considering any flash command.
+func probePhoneDASignature(cfg config, phone *phoneRoot) error {
+	plan, err := planPhoneBROM(cfg, phone)
+	if err != nil {
+		return err
+	}
+	loader, err := parseMTKDALoader(plan.daPath, plan.daCode, 0, 0)
+	if err != nil {
+		return err
+	}
+	if len(loader.Regions) < 2 {
+		return fmt.Errorf("DA loader %s has no stage-1 region", loader.Path)
+	}
+	stage1, err := readDARegion(loader, 1)
+	if err != nil {
+		return err
+	}
+	facts, err := phoneFactsFor(phone.soc)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Probing DA stage-1 signature for %s with %s; no eMMC access will be attempted.\n", phone.device, loader.Path)
+	client, target, err := acquirePhoneBROM(cfg, phone, facts, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.port.Close() }()
+	if target.DAA && client.isBROM {
+		if plan.auth == "" {
+			return errors.New("BROM enforces DAA: pass the vendor -auth file to probe this DA")
+		}
+		authBlob, err := os.ReadFile(plan.auth)
+		if err != nil {
+			return fmt.Errorf("read auth file %s: %w", plan.auth, err)
+		}
+		if err := client.sendAuth(authBlob); err != nil {
+			return err
+		}
+	} else if target.DAA && plan.auth != "" && !client.isBROM {
+		fmt.Println("Preloader mode: -auth is not sent; testing the DA signature at SEND_DA.")
+	}
+	region := loader.Regions[1]
+	fmt.Printf("Sending DA stage 1 to RAM: addr=0x%x length=0x%x signature=0x%x\n", region.StartAddr, len(stage1), region.SignatureLen)
+	if err := client.sendDA(region.StartAddr, region.SignatureLen, stage1); err != nil {
+		return fmt.Errorf("DA stage-1 signature probe: %w", err)
+	}
+	fmt.Println("DA stage 1 accepted; stopped before JUMP_DA and any eMMC command. This does not verify later DA stages or flash support.")
 	return nil
 }
 
