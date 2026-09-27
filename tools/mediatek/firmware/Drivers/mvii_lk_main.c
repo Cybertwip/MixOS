@@ -4096,9 +4096,13 @@ static uint32_t lk_bootmenu_run(void) {
         prev_menu = lk_kpd_menu_down();
         if (elapsed_ms >= LK_BOOTMENU_WINDOW_MS) break;
 
-        /* The bar and the ring move every slice; the prompt breathes and the
-         * detail counts down, repainted only on change over a snapshot of
-         * their own rows. */
+        /* The pad scans every slice, but the screen repaints every fourth:
+         * twelve frames a second is smooth for a two-second ring and a
+         * five-second bar, and each repaint is tens of thousands of uncached
+         * words the CPU would otherwise spend as heat before the kernel even
+         * starts. The blink and the countdown ride the repaint slices; a
+         * sixty-millisecond delay on either is invisible. */
+        if ((polls % 4u) != 0u) continue;
         lit = ((elapsed_ms / 250u) % 2u == 0u) ? 1u : 0u;
         s = lk_bootmenu_remaining_s(elapsed_ms);
         lk_menu_bar(elapsed_ms);
@@ -4141,6 +4145,9 @@ static uint32_t lk_bootmenu_run(void) {
         for (i = 0u; i < LK_KPD_NUM_MEMS; ++i) prev[i] = cur[i];
         prev_menu = lk_kpd_menu_down();
         if (dwell_ms >= (uint32_t)LK_BOOTMENU_BADGE_MS) break;
+        /* Same throttle as the window: the ring keeps its twelve frames and
+         * the pad keeps its twenty milliseconds. */
+        if ((polls % 4u) != 0u) continue;
         lk_menu_spinner(elapsed_ms + dwell_ms);
         lk_fb_present(spin.x, spin.y, spin.w, spin.h);
     }
@@ -4565,7 +4572,16 @@ void mvii_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
         lk_mark(MT6592_BOOT_STATUS_STAGE_LK_BOOTIMG_FAILED, "lk: no bootable image; halting\n",
                 LK_BEACON_FAILED);
         for (;;) {
-            __asm__ volatile("wfi");
+            /* A bare wfi here is a reboot in disguise: the preloader leaves
+             * the charger's watchdog armed, and nothing in a sleep loop feeds
+             * it, so the PMIC resets the board a few seconds in -- every "no
+             * image" looks like a boot loop. Service the charger instead and
+             * blink the red channel, so a halted board reads as halted: tag
+             * frozen on the panel, heartbeat on the LED. */
+            lk_park_hold_ms(500u);
+            (void)mt6592_led_set(MT6592_LED_RED);
+            lk_park_hold_ms(500u);
+            (void)mt6592_led_set(MT6592_LED_OFF);
         }
     }
 
