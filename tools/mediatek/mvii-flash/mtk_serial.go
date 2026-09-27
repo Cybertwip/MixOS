@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -782,6 +783,52 @@ func connectMTKSerialWithOptions(device string, options mtkSerialConnectOptions)
 		lastErr = errors.New("no handshake response")
 	}
 	return nil, fmt.Errorf("MTK serial handshake timed out on %s: %w", strings.Join(devices, ", "), lastErr)
+}
+
+// serialPortGlob expands one /dev glob. It is filepath.Glob in production;
+// tests stub it to sweep a fake device tree without touching the host's /dev.
+var serialPortGlob = filepath.Glob
+
+// serialPortSweepGlobs lists every USB-serial node family a MediaTek download
+// target (or a UART adapter in front of it) can appear under on this host.
+// Direct-attached CDC-ACM boards show up as usbmodem, but FTDI adapters are
+// usbserial, WCH/CH340 adapters are wchusbserial and CP210x adapters are
+// SLAB_USBtoUART; sweeping only usbmodem silently misses boards behind the
+// other three. Bluetooth call-in ports are deliberately absent: no flash
+// target lives there.
+func serialPortSweepGlobs() []string {
+	switch runtime.GOOS {
+	case "darwin":
+		return []string{
+			"/dev/cu.usbmodem*", "/dev/tty.usbmodem*",
+			"/dev/cu.usbserial*", "/dev/tty.usbserial*",
+			"/dev/cu.wchusbserial*", "/dev/tty.wchusbserial*",
+			"/dev/cu.SLAB_USBtoUART*", "/dev/tty.SLAB_USBtoUART*",
+		}
+	case "linux":
+		return []string{"/dev/ttyACM*", "/dev/ttyUSB*"}
+	default:
+		return nil
+	}
+}
+
+// sweepSerialPorts returns every USB-serial node currently on this host,
+// sorted and de-duplicated. It is the shared "port sweep" behind candidate
+// expansion, reconnect recovery and `-list`.
+func sweepSerialPorts() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, pattern := range serialPortSweepGlobs() {
+		matches, _ := serialPortGlob(pattern)
+		for _, match := range matches {
+			if !seen[match] {
+				seen[match] = true
+				out = append(out, match)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func mtkSerialDeviceCandidates(device string) []string {

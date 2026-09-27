@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -1355,6 +1356,169 @@ func TestHasSpecificUsbModemDigits(t *testing.T) {
 	}
 	if hasSpecificUsbModemDigits("cu.usbmodemFOO") {
 		t.Fatal("usbmodemFOO (no digits) should not be specific")
+	}
+}
+
+// stubSerialPortGlob replaces the /dev glob behind the port sweep with a fake
+// device tree for the duration of one test.
+func stubSerialPortGlob(t *testing.T, nodes map[string][]string) {
+	t.Helper()
+	orig := serialPortGlob
+	serialPortGlob = func(pattern string) ([]string, error) {
+		return append([]string(nil), nodes[pattern]...), nil
+	}
+	t.Cleanup(func() { serialPortGlob = orig })
+}
+
+func fakeSweepTree() map[string][]string {
+	nodes := map[string][]string{}
+	for _, pattern := range serialPortSweepGlobs() {
+		base := strings.TrimSuffix(pattern, "*")
+		nodes[pattern] = []string{base + "0"}
+	}
+	return nodes
+}
+
+func containsString(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSerialPortSweepGlobsCoverAllUSBSerialFamilies(t *testing.T) {
+	globs := serialPortSweepGlobs()
+	if len(globs) == 0 {
+		t.Skipf("no sweep globs on %s", runtime.GOOS)
+	}
+	joined := strings.Join(globs, " ")
+	var want []string
+	switch runtime.GOOS {
+	case "darwin":
+		want = []string{"usbmodem", "usbserial", "wchusbserial", "SLAB_USBtoUART"}
+	case "linux":
+		want = []string{"ttyACM", "ttyUSB"}
+	default:
+		t.Skipf("no family contract on %s", runtime.GOOS)
+	}
+	for _, family := range want {
+		if !strings.Contains(joined, family) {
+			t.Fatalf("sweep globs missing family %s: %v", family, globs)
+		}
+	}
+	if strings.Contains(joined, "Bluetooth") {
+		t.Fatalf("sweep must never include Bluetooth ports: %v", globs)
+	}
+}
+
+func TestSweepSerialPortsUnionsFamiliesSorted(t *testing.T) {
+	globs := serialPortSweepGlobs()
+	if len(globs) == 0 {
+		t.Skipf("no sweep globs on %s", runtime.GOOS)
+	}
+	nodes := fakeSweepTree()
+	// Duplicate one node across two patterns to prove dedupe.
+	nodes[globs[0]] = append(nodes[globs[0]], nodes[globs[len(globs)-1]][0])
+	stubSerialPortGlob(t, nodes)
+	got := sweepSerialPorts()
+	if len(got) != len(globs) {
+		t.Fatalf("sweepSerialPorts() = %v, want %d deduped nodes", got, len(globs))
+	}
+	if !sort.StringsAreSorted(got) {
+		t.Fatalf("sweepSerialPorts() not sorted: %v", got)
+	}
+}
+
+func bareSweepDevice() string {
+	if runtime.GOOS == "linux" {
+		return "/dev/ttyACM"
+	}
+	return "/dev/cu.usbmodem"
+}
+
+func TestMTKSerialDeviceCandidatesSweepsFamiliesForBareName(t *testing.T) {
+	if len(serialPortSweepGlobs()) == 0 {
+		t.Skipf("no sweep globs on %s", runtime.GOOS)
+	}
+	nodes := fakeSweepTree()
+	stubSerialPortGlob(t, nodes)
+	cands := mtkSerialDeviceCandidates(bareSweepDevice())
+	for _, matches := range nodes {
+		for _, want := range matches {
+			if !containsString(cands, want) {
+				t.Fatalf("bare-name candidates %v missing swept port %s", cands, want)
+			}
+		}
+	}
+}
+
+func TestMTKSerialDeviceCandidatesSweepsForBareAdapterName(t *testing.T) {
+	if len(serialPortSweepGlobs()) == 0 {
+		t.Skipf("no sweep globs on %s", runtime.GOOS)
+	}
+	bare := "/dev/cu.usbserial"
+	if runtime.GOOS == "linux" {
+		bare = "/dev/ttyUSB"
+	}
+	stubSerialPortGlob(t, fakeSweepTree())
+	cands := mtkSerialDeviceCandidates(bare)
+	if len(cands) <= 1 {
+		t.Fatalf("bare adapter name %s swept nothing: %v", bare, cands)
+	}
+}
+
+func TestMTKSerialDeviceCandidatesHonorsSpecificAdapterNode(t *testing.T) {
+	if len(serialPortSweepGlobs()) == 0 {
+		t.Skipf("no sweep globs on %s", runtime.GOOS)
+	}
+	specific := "/dev/cu.usbserial-1410"
+	if runtime.GOOS == "linux" {
+		specific = "/dev/ttyUSB0"
+	}
+	stubSerialPortGlob(t, fakeSweepTree())
+	cands := mtkSerialDeviceCandidates(specific)
+	if len(cands) != 1 || cands[0] != specific {
+		t.Fatalf("specific node %s must stay exact, got %v", specific, cands)
+	}
+}
+
+func TestMTKSerialDeviceCandidatesEmptySweeps(t *testing.T) {
+	globs := serialPortSweepGlobs()
+	if len(globs) == 0 {
+		t.Skipf("no sweep globs on %s", runtime.GOOS)
+	}
+	stubSerialPortGlob(t, fakeSweepTree())
+	got := mtkSerialDeviceCandidates("")
+	if len(got) != len(globs) {
+		t.Fatalf("empty device swept %v, want all %d fake nodes", got, len(globs))
+	}
+}
+
+func TestMTKSerialReconnectCandidatesSweepAllFamilies(t *testing.T) {
+	globs := serialPortSweepGlobs()
+	if len(globs) == 0 {
+		t.Skipf("no sweep globs on %s", runtime.GOOS)
+	}
+	// A specific adapter node that renumbered after DA handoff: recovery must
+	// still find the board under whatever family it came back on.
+	specific := "/dev/cu.usbserial-1410"
+	if runtime.GOOS == "linux" {
+		specific = "/dev/ttyUSB0"
+	}
+	nodes := fakeSweepTree()
+	stubSerialPortGlob(t, nodes)
+	cands := mtkSerialReconnectCandidates(specific)
+	if !containsString(cands, specific) {
+		t.Fatalf("reconnect candidates %v dropped the original node %s", cands, specific)
+	}
+	for _, matches := range nodes {
+		for _, want := range matches {
+			if !containsString(cands, want) {
+				t.Fatalf("reconnect candidates %v missing swept port %s", cands, want)
+			}
+		}
 	}
 }
 
