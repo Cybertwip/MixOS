@@ -1,19 +1,22 @@
 package main
 
-// -unlock: OPPO MTK fastboot unlock through a preloader patch.
+// -unlock: OPPO MTK fastboot unlock through a preloader patch, and
+// -mtk-phone-write-boot1: raw boot1 restore. Both run the native phone
+// BROM/DA transport in this tool; no external flasher is involved.
 //
 // The patch is pattern-anchored (magic + BRLYT offsets + ROMINFO search),
 // following path_preloader.py: relocate the 0x800 code blob to 0x2000,
 // repoint the BRLYT layout bytes at it, plant the ROMINFO flag block at
 // 0x1000, and clear the fastboot lock byte (0x22 -> 0x00).
 //
-//   ./flash -unlock -preloader boot1.bin [-device /dev/cu.usbmodemXXXX] [-yes]
+//   ./flash -unlock -preloader boot1.bin -device /dev/cu.usbmodemXXXX \
+//       -da-loader DA.bin [-auth auth_sv5.auth] [-yes]
 //
 // Without -device this only writes the patched image next to the input and
-// prints the mtkclient commands to run by hand. With -device it backs up
-// boot1/boot2 via mtkclient (the proven transport on secured phones),
-// patches the dump when its flag data differs from the input file, and
-// writes the patched image back. The write needs -yes or typed consent.
+// prints the device command to re-run. With -device it backs up boot1/boot2
+// over the DA, patches the dump when its flag data differs from the input
+// file, and writes the patched image back. The write needs -yes or typed
+// consent, and never runs without a fresh boot1 backup in hand.
 
 import (
 	"bufio"
@@ -21,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -41,7 +43,10 @@ const (
 	unlockNewCodeOff  = 0x2000
 	unlockTailDrop    = 0x3000
 	unlockROMINFO     = "AND_ROMINFO_v"
-	unlockConfirmWord = "UNLOCK BOOT1"
+	unlockConfirmWord = "WRITE BOOT1"
+	// unlockBootDumpLength is the full boot1/boot2 hardware area. Backups
+	// stay restorable byte-for-byte and dumps patch without resizing.
+	unlockBootDumpLength = 0x400000
 )
 
 type unlockPatchReport struct {
@@ -120,46 +125,116 @@ func defaultUnlockOutput(src string) string {
 	return filepath.Join(dir, stem+"-patched.bin")
 }
 
-func resolveUnlockMTK(cfg config) (script, python string, err error) {
-	if env := strings.TrimSpace(os.Getenv("MTKCLIENT_DIR")); env != "" {
-		cand := filepath.Join(env, "mtk.py")
-		if !fileExists(cand) {
-			return "", "", fmt.Errorf("MTKCLIENT_DIR=%s has no mtk.py", env)
-		}
-		script = cand
-	} else if s, ok := resolveBundledMTKClient(cfg); ok {
-		script = s
-	} else {
-		return "", "", errors.New("no mtkclient checkout found; set MTKCLIENT_DIR or pass -mtkclient-root <dir>")
-	}
-	if env := strings.TrimSpace(os.Getenv("MTK_PYTHON")); env != "" {
-		if resolved, lerr := exec.LookPath(env); lerr == nil {
-			return script, resolved, nil
-		} else if fileExists(env) {
-			return script, env, nil
-		}
-		return "", "", fmt.Errorf("MTK_PYTHON=%s not found", env)
-	}
-	python, err = pythonForMTKScript(script)
-	if err != nil {
-		return "", "", err
-	}
-	return script, python, nil
+func padToSerialBlock(data []byte) []byte {
+	out := make([]byte, alignUp(uint64(len(data)), mtkSerialBlockSize))
+	copy(out, data)
+	return out
 }
 
-func runUnlockMTK(dir, python, script string, args ...string) error {
-	cmd := exec.Command(python, append([]string{script}, args...)...)
-	cmd.Dir = dir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	return cmd.Run()
+type phoneUnlockPlan struct {
+	device    string
+	soc       string
+	hwCode    uint16
+	daCode    uint16
+	source    string
+	patched   string
+	daPath    string
+	daRegions int
+	emiPath   string
+	auth      string
+}
+
+// planPhoneUnlock validates the staging files for a phone boot1 operation.
+// It reads host files only and never touches a device.
+func planPhoneUnlock(cfg config, phone *phoneRoot, srcPath, patchedPath, emiPath string) (*phoneUnlockPlan, error) {
+	hwCode, err := phoneBROMCode(phone.soc)
+	if err != nil {
+		return nil, err
+	}
+	daCode, err := phoneDACode(phone.soc)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(srcPath)
+	if err != nil || info.IsDir() {
+		return nil, fmt.Errorf("phone target %s: image not found: %s", phone.device, srcPath)
+	}
+	if strings.TrimSpace(cfg.daLoader) == "" {
+		return nil, fmt.Errorf("phone target %s: boot1 access needs -da-loader /path/to/DA.bin (DRAM + eMMC come from the download agent)", phone.device)
+	}
+	loader, err := parseMTKDALoader(cfg.daLoader, daCode, 0, 0)
+	if err != nil {
+		return nil, fmt.Errorf("phone target %s: DA %s: %w", phone.device, cfg.daLoader, err)
+	}
+	if len(loader.Regions) <= 2 {
+		return nil, fmt.Errorf("DA loader %s has %d regions; the legacy DA stack needs stage 1 and stage 2",
+			loader.Path, len(loader.Regions))
+	}
+	if !fileExists(emiPath) {
+		return nil, fmt.Errorf("phone target %s: EMI source not found: %s (DRAM EMI comes from the stock preloader)", phone.device, emiPath)
+	}
+	auth := ""
+	if a := strings.TrimSpace(cfg.authFile); a != "" {
+		if !fileExists(a) {
+			return nil, fmt.Errorf("phone target %s: auth file not found: %s", phone.device, a)
+		}
+		auth = a
+	}
+	return &phoneUnlockPlan{
+		device: phone.device, soc: phone.soc, hwCode: hwCode, daCode: daCode,
+		source: srcPath, patched: patchedPath,
+		daPath: cfg.daLoader, daRegions: len(loader.Regions),
+		emiPath: emiPath, auth: auth,
+	}, nil
+}
+
+func printPhoneUnlockPlan(plan *phoneUnlockPlan) {
+	fmt.Printf("Phone unlock for %s (%s, BROM hw code 0x%04x, DA entry 0x%04x):\n", plan.device, plan.soc, plan.hwCode, plan.daCode)
+	if plan.patched == "" {
+		fmt.Printf("  Image:     %s (verbatim boot1 write, no patch)\n", plan.source)
+	} else {
+		fmt.Printf("  Source:    %s -> %s\n", plan.source, plan.patched)
+	}
+	fmt.Printf("  DA:        %s (%d regions)\n", plan.daPath, plan.daRegions)
+	fmt.Printf("  Preloader: %s (DRAM EMI)\n", plan.emiPath)
+	if plan.auth != "" {
+		fmt.Printf("  Auth:      %s (sent via SEND_AUTH when BROM enforces DAA)\n", plan.auth)
+	} else {
+		fmt.Printf("  Auth:      none provided (DAA targets are attempted without it)\n")
+	}
+}
+
+// resolveUnlockPhone names the target: a phone -root when one is given,
+// else one handshake to read the hw code off the wire.
+func resolveUnlockPhone(cfg config) (*phoneRoot, phoneFacts, error) {
+	if phone, ok := detectPhoneRoot(cfg.root); ok {
+		facts, err := phoneFactsFor(phone.soc)
+		if err != nil {
+			return nil, phoneFacts{}, err
+		}
+		return phone, facts, nil
+	}
+	client, err := connectMTKSerialWithOptions(cfg.device, mtkSerialConnectOptions{handshakeWake: true})
+	if err != nil {
+		return nil, phoneFacts{}, err
+	}
+	hw, _, hwErr := client.getHWCode()
+	_ = client.port.Close()
+	if hwErr != nil {
+		return nil, phoneFacts{}, hwErr
+	}
+	soc, facts, err := phoneFactsForHWCode(hw)
+	if err != nil {
+		return nil, phoneFacts{}, err
+	}
+	fmt.Printf("Target identifies as %s (hw code 0x%04x).\n", soc, hw)
+	return &phoneRoot{device: soc, soc: soc, family: phoneFamilyForSoc(soc)}, facts, nil
 }
 
 func confirmUnlockWrite(destination, image string, yes bool) error {
 	fmt.Println()
 	fmt.Printf("About to write %s to %s.\n", image, destination)
-	fmt.Println("A bad boot1 image stops the phone booting until the backup is written back.")
+	fmt.Println("A bad boot1 image stops the phone booting until a good image is written back.")
 	if yes {
 		return nil
 	}
@@ -174,23 +249,30 @@ func confirmUnlockWrite(destination, image string, yes bool) error {
 	return nil
 }
 
-func printUnlockManual(python, script, dir, patched, backup1, backup2 string) {
+func printUnlockOfflineSteps(src string) {
 	fmt.Println()
-	fmt.Println("Manual equivalent (one phone connection per command; replug between them):")
-	fmt.Printf("  cd %q && %q %q r boot1 %q\n", dir, python, script, backup1)
-	fmt.Printf("  cd %q && %q %q r boot2 %q\n", dir, python, script, backup2)
-	fmt.Printf("  cd %q && %q %q w boot1 %q\n", dir, python, script, patched)
-	fmt.Println("Append --preloader <stock> --auth <auth_sv5.auth> if your recipe needs them.")
+	fmt.Println("No -device: patched image only. To back up and write on a phone, re-run:")
+	fmt.Printf("  ./flash -unlock -preloader %q -device /dev/cu.usbmodemXXXX -da-loader <DA.bin> [-auth <auth>] [-yes]\n", src)
+	fmt.Println("Re-running re-patches deterministically; the write needs -yes or typed consent.")
 }
 
-func printUnlockNextSteps(backup1 string) {
+func printUnlockNextSteps(restoreImage, dev, daLoader, preloader, auth string) {
 	fmt.Println()
 	fmt.Println("Next: enable OEM unlocking in developer settings, then:")
 	fmt.Println("  adb reboot bootloader")
 	fmt.Println("  fastboot flashing unlock   (confirm with a volume key on the phone)")
-	if backup1 != "" {
-		fmt.Printf("Recovery if it fails to boot: write the backup back over boot1 (%s).\n", backup1)
+	if restoreImage == "" {
+		return
 	}
+	if dev == "" {
+		dev = "/dev/cu.usbmodemXXXX"
+	}
+	authFlag := ""
+	if strings.TrimSpace(auth) != "" {
+		authFlag = fmt.Sprintf(" -auth %q", auth)
+	}
+	fmt.Printf("Recovery: ./flash -mtk-phone-write-boot1 %q -device %q -da-loader %q -preloader %q%s -yes\n",
+		restoreImage, dev, daLoader, preloader, authFlag)
 }
 
 func runUnlockCommand(cfg config) error {
@@ -221,51 +303,70 @@ func runUnlockCommand(cfg config) error {
 	fmt.Printf("wrote %s (%d bytes, %d bytes differ)\n", outPath, len(patched), differ)
 
 	dev := strings.TrimSpace(cfg.device)
-	python, script := "python3", "mtk.py"
-	if resolved, py, rerr := resolveUnlockMTK(cfg); rerr == nil {
-		script, python = resolved, py
-	}
-	dir := filepath.Dir(outPath)
-	backup1 := filepath.Join(dir, "boot1-stock.bin")
-	backup2 := filepath.Join(dir, "boot2-stock.bin")
 	if dev == "" {
-		printUnlockManual(python, script, dir, outPath, backup1, backup2)
-		printUnlockNextSteps("")
+		printUnlockOfflineSteps(src)
+		printUnlockNextSteps(src, "", cfg.daLoader, src, cfg.authFile)
 		return nil
 	}
 	if !isSerialDevicePath(dev) {
 		return fmt.Errorf("-unlock -device %s is not a serial VCOM path", dev)
 	}
-	if _, err := os.Stat(dev); err != nil {
-		return fmt.Errorf("-device %s not present: power the phone off, plug it in download mode, then retry", dev)
-	}
-	script, python, err = resolveUnlockMTK(cfg)
+	phone, facts, err := resolveUnlockPhone(cfg)
 	if err != nil {
-		printUnlockManual(python, script, dir, outPath, backup1, backup2)
 		return err
 	}
-	authArgs := []string{}
-	if strings.TrimSpace(cfg.authFile) != "" {
-		authArgs = append(authArgs, "--auth", cfg.authFile)
+	emi, err := resolvePhoneEMI(cfg)
+	if err != nil {
+		return err
 	}
-	fmt.Println("mtkclient waits for the phone itself: plug the powered-off phone in")
-	fmt.Println("download mode now, and replug it between stages if it disconnects.")
-	fmt.Printf("Backup: reading boot1 -> %s\n", backup1)
-	rArgs := append([]string{"r", "boot1", backup1}, authArgs...)
-	if err := runUnlockMTK(dir, python, script, rArgs...); err != nil {
-		printUnlockManual(python, script, dir, outPath, backup1, backup2)
+	plan, err := planPhoneUnlock(cfg, phone, src, outPath, cfg.preloader)
+	if err != nil {
+		return err
+	}
+	printPhoneUnlockPlan(plan)
+	packetSize, err := mtkSerialPacketSize(cfg)
+	if err != nil {
+		return err
+	}
+	loader, err := parseMTKDALoader(plan.daPath, plan.daCode, 0, 0)
+	if err != nil {
+		return fmt.Errorf("phone target %s: DA %s: %w", phone.device, plan.daPath, err)
+	}
+	fmt.Printf("Using DA loader: %s (hw code 0x%04x)\n", loader.Path, loader.HWCode)
+	fmt.Printf("Using device preloader EMI: %s (version 0x%x, length 0x%x)\n", emi.Path, emi.Version, len(emi.Data))
+	fmt.Printf("Using MTK serial packet size: 0x%x\n", packetSize)
+	client, _, err := startPhoneDA(cfg, phone, facts, emi, loader, plan.auth)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if client != nil && client.port != nil {
+			_ = client.port.Close()
+		}
+	}()
+
+	dir := filepath.Dir(outPath)
+	backup1 := filepath.Join(dir, "boot1-stock.bin")
+	backup2 := filepath.Join(dir, "boot2-stock.bin")
+	fmt.Printf("Backup: reading boot1 (0x%x bytes) -> %s\n", unlockBootDumpLength, backup1)
+	dump, err := client.readLegacyEMMC(mtkLegacyEMMCPartBoot1, 0, unlockBootDumpLength, packetSize)
+	if err != nil {
 		return fmt.Errorf("boot1 backup failed (refusing to write without one): %w", err)
 	}
-	fmt.Printf("Backup: reading boot2 -> %s (best effort)\n", backup2)
-	if err := runUnlockMTK(dir, python, script, append([]string{"r", "boot2", backup2}, authArgs...)...); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(backup1, dump, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("Backup: reading boot2 (best effort) -> %s\n", backup2)
+	if dump2, err := client.readLegacyEMMC(mtkLegacyEMMCPartBoot2, 0, unlockBootDumpLength, packetSize); err != nil {
 		fmt.Printf("warn: boot2 backup failed: %v; continuing (boot2 is untouched)\n", err)
+	} else if err := os.WriteFile(backup2, dump2, 0o644); err != nil {
+		fmt.Printf("warn: write %s: %v; continuing (boot2 is untouched)\n", backup2, err)
 	}
 
-	chosen := outPath
-	dump, err := os.ReadFile(backup1)
-	if err != nil {
-		return fmt.Errorf("read back %s: %w", backup1, err)
-	}
+	chosenPath, chosenBytes := outPath, patched
 	dumpFlag, derr := unlockFlagFingerprint(dump)
 	fileFlag, ferr := unlockFlagFingerprint(data)
 	switch {
@@ -278,24 +379,90 @@ func runUnlockCommand(cfg config) error {
 		if err != nil {
 			return fmt.Errorf("patch %s: %w", backup1, err)
 		}
-		chosen = filepath.Join(dir, "boot1-patched.bin")
-		if err := os.WriteFile(chosen, redone, 0644); err != nil {
+		chosenPath = filepath.Join(dir, "boot1-patched.bin")
+		if err := os.WriteFile(chosenPath, redone, 0o644); err != nil {
 			return err
 		}
-		fmt.Printf("dump flag data differs from %s; patched the dump instead -> %s\n", src, chosen)
+		chosenBytes = redone
+		fmt.Printf("dump flag data differs from %s; patched the dump instead -> %s\n", src, chosenPath)
 	default:
-		fmt.Printf("dump matches %s; writing %s\n", src, chosen)
+		fmt.Printf("dump matches %s; writing %s\n", src, chosenPath)
 	}
 
-	if err := confirmUnlockWrite("boot1 on "+dev, chosen, cfg.yes); err != nil {
+	destination := fmt.Sprintf("boot1 on %s", dev)
+	if err := confirmUnlockWrite(destination, chosenPath, cfg.yes); err != nil {
 		return err
 	}
-	wArgs := append([]string{"w", "boot1", chosen}, authArgs...)
-	if err := runUnlockMTK(dir, python, script, wArgs...); err != nil {
-		printUnlockManual(python, script, dir, chosen, backup1, backup2)
+	padded := padToSerialBlock(chosenBytes)
+	if err := client.writeLegacyEMMCPartition(mtkLegacyEMMCPartBoot1, 0, padded, packetSize); err != nil {
+		return fmt.Errorf("boot1 write failed (restore with %s): %w", backup1, err)
+	}
+	fmt.Printf("wrote %s to %s\n", chosenPath, destination)
+	printUnlockNextSteps(backup1, dev, plan.daPath, plan.emiPath, plan.auth)
+	return nil
+}
+
+// runPhoneWriteBoot1 writes an image verbatim to phone eMMC BOOT1: the
+// native restore path for -unlock backups (and stock preloaders). DRAM EMI
+// comes from -preloader when given, else from the image itself, which for
+// boot1 dumps carries the same EMI record.
+func runPhoneWriteBoot1(cfg config, file string) error {
+	dev := strings.TrimSpace(cfg.device)
+	if dev == "" {
+		return errors.New("-mtk-phone-write-boot1 requires -device /dev/cu.usbmodem... or another MTK VCOM serial device")
+	}
+	if !isSerialDevicePath(dev) {
+		return errors.New("-mtk-phone-write-boot1 -device is not a serial VCOM path")
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return err
+	}
+	emiPath := strings.TrimSpace(cfg.preloader)
+	var emi *mtkPreloaderEMI
+	if emiPath == "" {
+		emiPath = file
+		emi, err = readMTKPreloaderEMI(file)
+	} else {
+		emi, err = resolvePhoneEMI(cfg)
+	}
+	if err != nil {
+		return err
+	}
+	phone, facts, err := resolveUnlockPhone(cfg)
+	if err != nil {
+		return err
+	}
+	plan, err := planPhoneUnlock(cfg, phone, file, "", emiPath)
+	if err != nil {
+		return err
+	}
+	printPhoneUnlockPlan(plan)
+	packetSize, err := mtkSerialPacketSize(cfg)
+	if err != nil {
+		return err
+	}
+	loader, err := parseMTKDALoader(plan.daPath, plan.daCode, 0, 0)
+	if err != nil {
+		return fmt.Errorf("phone target %s: DA %s: %w", phone.device, plan.daPath, err)
+	}
+	client, _, err := startPhoneDA(cfg, phone, facts, emi, loader, plan.auth)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if client != nil && client.port != nil {
+			_ = client.port.Close()
+		}
+	}()
+
+	destination := fmt.Sprintf("boot1 on %s", dev)
+	if err := confirmUnlockWrite(destination, file, cfg.yes); err != nil {
+		return err
+	}
+	if err := client.writeLegacyEMMCPartition(mtkLegacyEMMCPartBoot1, 0, padToSerialBlock(data), packetSize); err != nil {
 		return fmt.Errorf("boot1 write failed: %w", err)
 	}
-	fmt.Printf("wrote %s to boot1 on %s\n", chosen, dev)
-	printUnlockNextSteps(backup1)
+	fmt.Printf("wrote %s to %s\n", file, destination)
 	return nil
 }
