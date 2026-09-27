@@ -269,48 +269,45 @@ func refusePhoneSLA(phone *phoneRoot, target mtkTargetConfig) error {
 // risks worse than the watchdog itself. A mid-session BROM reset fails the
 // run loudly; the LK slot stays reflashable because the preloader is never
 // touched.
-func probePhoneBROM(c *mtkSerialClient, phone *phoneRoot, hwCode uint16) error {
+func probePhoneBROM(c *mtkSerialClient, phone *phoneRoot, hwCode uint16) (mtkTargetConfig, error) {
 	const maxReconnect = 8
 	for attempt := 0; ; attempt++ {
-		err := probePhoneBROMOnce(c, phone, hwCode)
+		target, err := probePhoneBROMOnce(c, phone, hwCode)
 		if err == nil {
-			return nil
+			return target, nil
 		}
 		if !isDeviceGoneError(err) || attempt >= maxReconnect {
-			return err
+			return mtkTargetConfig{}, err
 		}
 		fmt.Printf("MTK device dropped during probe (%v); the BROM re-enumerated USB. Reconnecting...\n", err)
 		if rerr := c.reopenBROMHandshake(); rerr != nil {
-			return fmt.Errorf("%w; reconnect after device drop failed: %v", err, rerr)
+			return mtkTargetConfig{}, fmt.Errorf("%w; reconnect after device drop failed: %v", err, rerr)
 		}
 	}
 }
 
-func probePhoneBROMOnce(c *mtkSerialClient, phone *phoneRoot, hwCode uint16) error {
+func probePhoneBROMOnce(c *mtkSerialClient, phone *phoneRoot, hwCode uint16) (mtkTargetConfig, error) {
 	got, hwVer, err := c.getHWCode()
 	if err != nil {
-		return err
+		return mtkTargetConfig{}, err
 	}
 	fmt.Printf("MTK HW code: 0x%04x, HW version: 0x%04x\n", got, hwVer)
 	if got != hwCode {
-		return fmt.Errorf("connected MediaTek target is 0x%04x, expected %s (%s, hw code 0x%04x)",
+		return mtkTargetConfig{}, fmt.Errorf("connected MediaTek target is 0x%04x, expected %s (%s, hw code 0x%04x)",
 			got, phone.device, phone.soc, hwCode)
 	}
 	fmt.Println("Phone BROM: leaving the watchdog alone (no grounded TOPRGU base on phones).")
 	target, err := c.getTargetConfig()
 	if err != nil {
-		return err
+		return mtkTargetConfig{}, err
 	}
 	fmt.Printf("Target config: 0x%08x (SBC=%t SLA=%t DAA=%t)\n", target.Raw, target.SBC, target.SLA, target.DAA)
 	if err := refusePhoneSLA(phone, target); err != nil {
-		return err
-	}
-	if target.DAA {
-		fmt.Println("BROM enforces DAA; attempting the vendor-signed DA upload (a rejection stops here, before any eMMC write).")
+		return mtkTargetConfig{}, err
 	}
 	blver, isBROM, err := c.getBLVersion()
 	if err != nil {
-		return err
+		return mtkTargetConfig{}, err
 	}
 	mode := "preloader"
 	if isBROM {
@@ -318,7 +315,7 @@ func probePhoneBROMOnce(c *mtkSerialClient, phone *phoneRoot, hwCode uint16) err
 	}
 	bromver, err := c.getBROMVersion()
 	if err != nil {
-		return err
+		return mtkTargetConfig{}, err
 	}
 	c.blVersion = blver
 	c.bromVersion = bromver
@@ -329,6 +326,72 @@ func probePhoneBROMOnce(c *mtkSerialClient, phone *phoneRoot, hwCode uint16) err
 	} else {
 		fmt.Printf("Warning: could not read HW/SW version tuple: %v\n", err)
 	}
+	return target, nil
+}
+
+// prepareAuthData pads the vendor auth blob to even length; BROM reads the
+// transfer back as 16-bit words.
+func prepareAuthData(auth []byte) []byte {
+	if len(auth)%2 != 0 {
+		out := make([]byte, len(auth)+1)
+		copy(out, auth)
+		return out
+	}
+	return auth
+}
+
+// sendAuth uploads the vendor auth blob (auth_sv5.auth) over SEND_AUTH. This
+// is the DAA step: it runs after the probe, before the DA upload, and only
+// when the target-config DAA bit says the target wants it. A 0x1D0C status
+// means BROM declines the blob ("no auth needed") and is not an error.
+func (c *mtkSerialClient) sendAuth(auth []byte) error {
+	data := prepareAuthData(auth)
+	if err := c.echo([]byte{mtkCmdSendAuth}); err != nil {
+		return fmt.Errorf("SEND_AUTH echo: %w", err)
+	}
+	if err := c.writeRaw(uint32Bytes(uint32(len(data)))); err != nil {
+		return fmt.Errorf("send auth length: %w", err)
+	}
+	rlen, err := c.readUint32(c.commandTimeout)
+	if err != nil {
+		return fmt.Errorf("read auth length reply: %w", err)
+	}
+	if rlen != uint32(len(data)) {
+		return fmt.Errorf("auth length reply 0x%x, want 0x%x", rlen, len(data))
+	}
+	status, err := c.readUint16(c.commandTimeout)
+	if err != nil {
+		return fmt.Errorf("read auth status: %w", err)
+	}
+	if status == 0x1D0C {
+		fmt.Println("BROM reports no auth needed.")
+		return nil
+	}
+	if status > 0xFF {
+		return fmt.Errorf("SEND_AUTH status 0x%x", status)
+	}
+	const chunkSize = 0x400
+	for pos := 0; pos < len(data); pos += chunkSize {
+		end := pos + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		if err := c.port.WriteAll(data[pos:end], c.writeTimeout); err != nil {
+			return fmt.Errorf("write auth blob at 0x%x: %w", pos, err)
+		}
+	}
+	time.Sleep(35 * time.Millisecond)
+	if _, err := c.readUint16(c.commandTimeout); err != nil {
+		return fmt.Errorf("read auth crc: %w", err)
+	}
+	status, err = c.readUint16(c.commandTimeout)
+	if err != nil {
+		return fmt.Errorf("read auth final status: %w", err)
+	}
+	if status > 0xFF {
+		return fmt.Errorf("SEND_AUTH final status 0x%x", status)
+	}
+	fmt.Println("Auth blob accepted.")
 	return nil
 }
 
