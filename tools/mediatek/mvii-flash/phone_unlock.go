@@ -118,6 +118,16 @@ func unlockFlagFingerprint(data []byte) ([]byte, error) {
 	return flag, nil
 }
 
+func requireUnlockFile(kind, path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("phone unlock needs %s (DRAM + eMMC come from the download agent)", kind)
+	}
+	if !fileExists(path) {
+		return fmt.Errorf("%s not found: %s", kind, path)
+	}
+	return nil
+}
+
 func defaultUnlockOutput(src string) string {
 	dir := filepath.Dir(src)
 	base := filepath.Base(src)
@@ -267,6 +277,9 @@ func printUnlockNextSteps(restoreImage, dev, daLoader, preloader, auth string) {
 	if dev == "" {
 		dev = "/dev/cu.usbmodemXXXX"
 	}
+	if daLoader == "" {
+		daLoader = "<DA.bin>"
+	}
 	authFlag := ""
 	if strings.TrimSpace(auth) != "" {
 		authFlag = fmt.Sprintf(" -auth %q", auth)
@@ -310,6 +323,14 @@ func runUnlockCommand(cfg config) error {
 	}
 	if !isSerialDevicePath(dev) {
 		return fmt.Errorf("-unlock -device %s is not a serial VCOM path", dev)
+	}
+	if err := requireUnlockFile("-da-loader /path/to/DA.bin", cfg.daLoader); err != nil {
+		return err
+	}
+	if a := strings.TrimSpace(cfg.authFile); a != "" {
+		if err := requireUnlockFile("auth file", a); err != nil {
+			return err
+		}
 	}
 	phone, facts, err := resolveUnlockPhone(cfg)
 	if err != nil {
@@ -417,6 +438,14 @@ func runPhoneWriteBoot1(cfg config, file string) error {
 	data, err := os.ReadFile(file)
 	if err != nil {
 		return err
+	}
+	if err := requireUnlockFile("-da-loader /path/to/DA.bin", cfg.daLoader); err != nil {
+		return err
+	}
+	if a := strings.TrimSpace(cfg.authFile); a != "" {
+		if err := requireUnlockFile("auth file", a); err != nil {
+			return err
+		}
 	}
 	emiPath := strings.TrimSpace(cfg.preloader)
 	var emi *mtkPreloaderEMI
