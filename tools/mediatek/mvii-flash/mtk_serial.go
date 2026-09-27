@@ -107,6 +107,12 @@ type mtkSerialClient struct {
 type mtkSerialConnectOptions struct {
 	recoverFeedPayload bool
 	reuseFeedPayload   bool
+	// handshakeWake pre-sends a lone 0xA0 before the handshake on USB
+	// transports. The reference flasher does this for non-BROM PIDs; the
+	// stray echo self-aligns into the loop, so it is harmless where
+	// unneeded and wakes preloaders that ignore a cold 4-byte sequence
+	// on reopened handles.
+	handshakeWake bool
 }
 
 type mtkTargetConfig struct {
@@ -919,6 +925,11 @@ func hasSpecificUsbModemDigits(name string) bool {
 
 func (c *mtkSerialClient) handshake(deadline time.Time) error {
 	_ = c.port.DiscardInput(20 * time.Millisecond)
+	if c.handshakeWake {
+		// Fire and forget: the echo, if any, is consumed as the first
+		// loop echo below, which expects exactly this byte's complement.
+		_ = c.port.WriteAll([]byte{0xA0}, 100*time.Millisecond)
+	}
 	start := []byte{0xA0, 0x0A, 0x50, 0x05}
 	expect := []byte{0x5F, 0xF5, 0xAF, 0xFA}
 	index := 0
