@@ -9707,7 +9707,7 @@ cat > "$SDBOOT/mvii/boot.conf" <<'CONF'
 # MVII LK SD hand-off, J36 Ultra (MT6592, ARMv7).
 #
 # Read after the card's own boot.ini, so these override it: an R36S boot.ini
-# names the RK3326 arm64 kernel, which this SoC cannot execute.  Keep it short
+# names an arm64 kernel this SoC cannot execute.  Keep it short
 # -- a fixed 2 KiB buffer.  ../README.txt explains every word below.
 kernel=zImage
 dtb=mt6592-j36-ultra.dtb
