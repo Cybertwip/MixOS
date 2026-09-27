@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MPL-2.0 OR GPL-2.0-or-later */
 /* mt68xx UART: the 16550-compatible MediaTek port, derived from
- * tools/mediatek/firmware/Drivers/mt6592_uart.h. Same register layout
+ * tools/mediatek/mt65xx/firmware/Drivers/mt6592_uart.h. Same register layout
  * (stable MediaTek IP [mt6877][mt6735][mt6592]), same divisor math, same lossy
  * mode. The character tap is gone: its only consumer was the j36 USB
  * console, and this tree has no second console to mirror to.

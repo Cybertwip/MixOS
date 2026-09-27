@@ -1,6 +1,6 @@
 /* Host test for the mt68xx LK UI core (lk_bootmenu.h + lk_menu_ui.h).
  *
- * Derived from tools/mediatek/firmware/tests/test-bootmenu.c. The headers
+ * Derived from tools/mediatek/mt65xx/firmware/tests/test-bootmenu.c. The headers
  * are pure logic -- no registers, no DRAM -- so the target and the
  * workstation compile the same code. Two deliberate deltas against the j36
  * test: the payload sniff asserts the phone mark ("mixos-" image name)

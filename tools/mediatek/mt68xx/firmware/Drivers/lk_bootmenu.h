@@ -1,6 +1,6 @@
 /* Boot selection: MixOS by default; a debounced key press selects Android.
  *
- * Derived from tools/mediatek/firmware/Drivers/lk_bootmenu.h. The debounce,
+ * Derived from tools/mediatek/mt65xx/firmware/Drivers/lk_bootmenu.h. The debounce,
  * the pick and the pixel blend are that file's logic unchanged; the payload
  * sniff is retargeted. The j36 needs two marks (board name AND cmdline word)
  * because its packer writes both; the phone packer

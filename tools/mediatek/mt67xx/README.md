@@ -2,7 +2,7 @@
 
 MixOS's Little Kernel replacement for the mt67xx family (MT6739 in the
 LG K20, MT6765 in the OPPO CPH2385), derived from the proven j36 tree
-(`tools/mediatek/firmware`). **This builds but does not boot anything
+(`tools/mediatek/mt65xx/firmware`). **This builds but does not boot anything
 yet**: v1 is serial hello + watchdog off where grounded + proven-ticking
 clock + heartbeat park. eMMC, display, keys and the kernel handoff land
 as staged LK-BRINGUP steps, each with its own grounding. Read

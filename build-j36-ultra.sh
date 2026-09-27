@@ -172,7 +172,7 @@ J36 Ultra layer on top of it in the same Multipass VM: $VM_NAME
                                       the charger state. The batteryless LK
                                       disables the charger watchdog before
                                       handing over to Linux. The matching LK is
-                                      tools/mediatek/build.sh --without-battery.
+                                      tools/mediatek/mt65xx/build.sh --without-battery.
                                       Combines with --mix-only or --compress.
 
 

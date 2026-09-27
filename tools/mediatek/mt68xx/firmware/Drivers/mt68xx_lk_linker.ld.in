@@ -1,7 +1,7 @@
 /*
  * mt68xx_lk_linker.ld -- mt68xx minimal LK, UBOOT/LK slot image.
  *
- * Derived from tools/mediatek/firmware/Drivers/mvii_lk_linker.ld. The
+ * Derived from tools/mediatek/mt65xx/firmware/Drivers/mvii_lk_linker.ld. The
  * preloader reads the MTK header at the top of the UBOOT slot and copies
  * `size` bytes to MT68XX_MEMBASE before branching there, so this image is
  * linked exactly where the stock LK used to run.

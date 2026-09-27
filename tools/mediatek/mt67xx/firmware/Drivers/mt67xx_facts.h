@@ -13,7 +13,7 @@
  *   [mt6755]  Mainline mt6755.dtsi (direct predecessor of mt6765, same
  *             Helio P line). The strongest ground for mt6765 UART facts.
  *   [mt6592]  Old witness: the proven j36 tree runs this value on real
- *             MediaTek hardware (tools/mediatek/firmware).
+ *             MediaTek hardware (tools/mediatek/mt65xx/firmware).
  *   [todo]    No ground yet. Values marked [todo] are NOT in this header:
  *             their drivers do not exist until LK-BRINGUP lands the fact.
  *

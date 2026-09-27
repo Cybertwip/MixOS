@@ -16,7 +16,7 @@
  *             between the lines (compare PWRAP below) -- so every [mt6735]
  *             value without an [mt6877] twin is WEAK here.
  *   [mt6592]  Oldest witness: the proven j36 tree runs this value on real
- *             MediaTek hardware (tools/mediatek/firmware).
+ *             MediaTek hardware (tools/mediatek/mt65xx/firmware).
  *   [conv]    MTK-conventional: stable across every line so far, but no
  *             Dimensity witness. Weakest; compiled OUT, never trusted.
  *   [todo]    No ground yet. Values marked [todo] are NOT in this header:

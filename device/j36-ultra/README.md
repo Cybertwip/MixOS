@@ -170,7 +170,7 @@ files.
 `--without-battery` also works with `--mix-only`. It writes `j36.usb=novbus`,
 `j36.audio=1` and `j36.power=nocharge` into `boot.conf`. The OTG data
 port does not source 5 V, and the speaker amp starts off. The matching
-bootloader is `tools/mediatek/build.sh --without-battery`, and it skips the
+bootloader is `tools/mediatek/mt65xx/build.sh --without-battery`, and it skips the
 charge screen. The supply still has to carry the board's load. This option
 cannot change the stock preloader or the board's wiring. A device on the OTG
 port needs its own power.

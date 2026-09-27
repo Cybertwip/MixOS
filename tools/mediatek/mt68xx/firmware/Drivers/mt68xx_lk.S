@@ -1,7 +1,7 @@
 /*
  * mt68xx_lk.S -- mt68xx minimal LK entry, running from the UBOOT/LK slot.
  *
- * Derived from tools/mediatek/firmware/Drivers/mvii_lk.S. Same contract:
+ * Derived from tools/mediatek/mt65xx/firmware/Drivers/mvii_lk.S. Same contract:
  * the preloader loads this image to MT68XX_MEMBASE and branches here with
  * its boot arguments in r0-r3. Same sequence: mask interrupts, raise the
  * abort and SVC stacks, take the MMU and caches off (LK runs

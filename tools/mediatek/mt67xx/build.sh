@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MPL-2.0 OR GPL-2.0-or-later
 # Build the mt67xx minimal LK for one device (a row in
-# device/lg-k20/devices.sh). Derived from tools/mediatek/build.sh: same
+# device/lg-k20/devices.sh). Derived from tools/mediatek/mt65xx/build.sh: same
 # host-side LLVM/CMake build, but no power modes (phones always have a
 # battery) and --device is required (the codename is baked into the banner
 # and build-info.txt, so a serial log names the image that printed it).

@@ -1,7 +1,7 @@
 # mt68xx minimal LK -- bring-up instrument (v1)
 
 MixOS's Little Kernel replacement for the mt68xx family (today: MT6833 in
-the OPPO A77 5G), derived from the proven j36 tree (`tools/mediatek/firmware`).
+the OPPO A77 5G), derived from the proven j36 tree (`tools/mediatek/mt65xx/firmware`).
 **This builds but does not boot anything yet**: v1 is serial hello +
 proven-ticking clock + heartbeat park. The watchdog write and the GPT
 fallback are compiled OUT (Dimensity bases ungrounded -- see below), and
