@@ -608,8 +608,13 @@ func flagFailureAdvice(err error) error {
 // lands invisible; the wait loop then expires cleanly). Secured
 // preloaders may clean-refuse individual modes instead of crashing;
 // every error here is expected and ignored. Stops at the first BROM.
+// nullJumpPayload is the tiny ARM return stub uploaded to address 0 by the
+// null jump: eight bytes of code (return) plus padding.
+func nullJumpPayload() []byte {
+	return append([]byte{0x00, 0x01, 0x9F, 0xE5, 0x10, 0xFF, 0x2F, 0xE1}, make([]byte, 0x110)...)
+}
+
 func crashPhonePreloader(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts) {
-	armReturn := []byte{0x00, 0x01, 0x9F, 0xE5, 0x10, 0xFF, 0x2F, 0xE1}
 	modes := []struct {
 		name string
 		fire func() error
@@ -617,8 +622,7 @@ func crashPhonePreloader(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts)
 		{"malformed DA download", func() error { return c.sendDA(0, 0x100, make([]byte, 0x100)) }},
 		{"malformed register read", func() error { _, err := c.read32(0, 0x100); return err }},
 		{"null jump", func() error {
-			payload := append(append([]byte(nil), armReturn...), make([]byte, 0x110)...)
-			if err := c.sendDA(0x0, 0x0, payload); err != nil {
+			if err := c.sendDA(0x0, 0x0, nullJumpPayload()); err != nil {
 				return err
 			}
 			return c.jumpDA(0x0)
@@ -707,6 +711,45 @@ func countdownCrashKeys(w io.Writer, sleep func(time.Duration)) {
 		fmt.Fprintf(w, "Crash in %ds; keys held?\n", left)
 		sleep(5 * time.Second)
 	}
+}
+
+// unsignedJumpMTKPreloader is the -mtk-unsigned-jump verb: acquire the
+// phone and fire ONLY the unsigned null jump (crash mode 3), reporting the
+// send status, the jump status, and the landing separately. SEND_DA with a
+// zero signature length is the last untested RAM-write path on secured
+// preloaders: signed sends die with 0x7024, register writes with 0x1001,
+// and reads fault USB. RAM/protocol only: no eMMC command is ever issued.
+func unsignedJumpMTKPreloader(cfg config) error {
+	client, target, phone, facts, err := acquirePhoneBROMAuto(cfg, nil)
+	if err != nil {
+		return err
+	}
+	if client.isBROM {
+		fmt.Printf("Target is already BROM (config 0x%08x); nothing to jump. Run -unlock now without unplugging.\n", target.Raw)
+		_ = client.port.Close()
+		return nil
+	}
+	fmt.Printf("Preloader session on %s (config 0x%08x); sending unsigned stub to 0x0 and jumping there.\n", phone.device, target.Raw)
+	if err := client.sendDA(0x0, 0x0, nullJumpPayload()); err != nil {
+		fmt.Printf("  send result: %v\n", err)
+	} else {
+		fmt.Println("  send result: accepted")
+		fmt.Println("Jumping to 0x0 (the transfer address)...")
+		if err := client.jumpDA(0x0); err != nil {
+			fmt.Printf("  jump result: %v\n", err)
+		} else {
+			fmt.Println("  jump result: accepted")
+		}
+	}
+	time.Sleep(time.Second)
+	landed, err := probePhoneBROMOnce(client, phone, facts, true)
+	_ = client.port.Close()
+	msg, verr := crashLandingVerdict(err, client.isBROM, landed.Raw)
+	if verr != nil {
+		return verr
+	}
+	fmt.Println(msg)
+	return nil
 }
 
 // needsPhoneAuth decides whether the SEND_AUTH step runs. In BROM it runs
