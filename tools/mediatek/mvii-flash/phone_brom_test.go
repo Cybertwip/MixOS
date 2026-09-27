@@ -367,9 +367,11 @@ func TestWaitPhoneBROMExpiredConnectFails(t *testing.T) {
 	}
 }
 
-// The crash sequence must run to completion against a dead peer (every
-// error ignored) and emit the three mode shapes: SEND_DA, register read,
-// then SEND_DA plus the null jump.
+// Against a dead peer every crash mode fails fast and ignored, the run
+// still completes, and the emission order is exact: mode, HW-code check,
+// mode, HW-code check, mode, HW-code check. (The null jump fires only when
+// its SEND_DA is accepted, so a dead peer never sees it -- same as the
+// reference, which skips the jump when the send raises.)
 func TestCrashPhonePreloader(t *testing.T) {
 	phone := writePhoneRoot(t, "device=cph2385-4gb\nsoc=mt6765\n")
 	info, ok := detectPhoneRoot(phone)
@@ -383,14 +385,15 @@ func TestCrashPhonePreloader(t *testing.T) {
 	port := &failPort{err: errors.New("read /dev/cu.usbmodem1: device not configured")}
 	client := &mtkSerialClient{port: port, commandTimeout: time.Millisecond, writeTimeout: time.Millisecond}
 	crashPhonePreloader(client, info, facts)
-	var joined []byte
+	var got []byte
 	for _, w := range port.writes {
-		joined = append(joined, w...)
-	}
-	for _, want := range [][]byte{{mtkCmdSendDA}, {mtkCmdRead32}, {mtkCmdJumpDA}} {
-		if !bytes.Contains(joined, want) {
-			t.Fatalf("writes = %x, want command byte %x", joined, want)
+		if len(w) == 1 {
+			got = append(got, w[0])
 		}
+	}
+	want := []byte{mtkCmdSendDA, mtkCmdGetHWCode, mtkCmdRead32, mtkCmdGetHWCode, mtkCmdSendDA, mtkCmdGetHWCode}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("command bytes = %x, want %x", got, want)
 	}
 }
 
