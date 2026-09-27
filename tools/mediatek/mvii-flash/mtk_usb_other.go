@@ -25,3 +25,9 @@ func tryReconnectMTKUSBBROM(string, time.Duration, time.Duration) (*mtkSerialCli
 func openMVIIDebugPort() (mviiDebugPort, error) {
 	return nil, errors.New("the MVII live debug console needs the libusb transport, which is only built on macOS in this tool")
 }
+
+// listMTKUSBDevices is the non-macOS stub: without the libusb transport the
+// `-list` port sweep covers tty nodes only.
+func listMTKUSBDevices() []string {
+	return nil
+}

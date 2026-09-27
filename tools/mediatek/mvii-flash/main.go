@@ -537,7 +537,7 @@ func parseFlags() (config, error) {
 	flag.BoolVar(&cfg.yes, "yes", false, "skip interactive confirmation")
 	flag.BoolVar(&cfg.prepare, "prepare", cfg.prepare, "auto-run sibling ./prepare when default image missing")
 	flag.BoolVar(&cfg.reboot, "reboot", false, "reboot after fastboot flash")
-	flag.BoolVar(&cfg.listOnly, "list", false, "list backends and fastboot devices")
+	flag.BoolVar(&cfg.listOnly, "list", false, "list backends, fastboot devices, MTK USB devices and serial ports")
 	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
 		return config{}, err
 	}
@@ -1371,6 +1371,22 @@ func listBackends(cfg config) error {
 
 	fmt.Println("mtkclient: removed from this package")
 	fmt.Println("raw-block: available with -backend=raw-block -device /dev/diskN")
+	if usbDevs := listMTKUSBDevices(); len(usbDevs) > 0 {
+		fmt.Println("mtk-usb (libusb, VID 0x0e8d):")
+		for _, dev := range usbDevs {
+			fmt.Printf("  device: %s\n", dev)
+		}
+	} else if runtime.GOOS == "darwin" {
+		fmt.Println("mtk-usb (libusb, VID 0x0e8d): none")
+	}
+	if ports := sweepSerialPorts(); len(ports) == 0 {
+		fmt.Println("serial ports (port sweep): none")
+	} else {
+		fmt.Println("serial ports (port sweep):")
+		for _, port := range ports {
+			fmt.Printf("  port: %s\n", port)
+		}
+	}
 	fmt.Println("mtk-serial (native feed): primary path for J36 Ultra")
 	fmt.Println("  ./flash lk-or-img.bin -device /dev/cu.usbmodemXXXX   # feed via auto MVIIFlash payload")
 	fmt.Println("  ./flash run -address 0x110000 [payload.bin] -device /dev/cu.usbmodemXXXX   # raw load+jump, or bare jump+bridge output if no payload")

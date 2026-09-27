@@ -346,16 +346,11 @@ func guiFlashDevice(log *guiLog) (string, error) {
 	}
 }
 
-// guiSerialGlobs lists where this host's VCOM node shows up. Only the Linux pair
-// is ever consulted -- on macOS guiFlashDevice answers over libusb and never
-// looks at a path -- but the macOS pair belongs with its platform rather than in
-// the caller, so that a build which does use the tty path there does not have to
-// go looking for where the names went.
+// guiSerialGlobs lists where this host's VCOM node shows up. It delegates to the
+// shared port sweep so the window waits on exactly the families the command
+// line would flash.
 func guiSerialGlobs() []string {
-	if runtime.GOOS == "darwin" {
-		return []string{"/dev/cu.usbmodem*", "/dev/tty.usbmodem*"}
-	}
-	return []string{"/dev/ttyACM*", "/dev/ttyUSB*"}
+	return serialPortSweepGlobs()
 }
 
 // guiTransportLine is the window's subtitle: the board, and how this build

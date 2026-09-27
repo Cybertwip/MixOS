@@ -12,6 +12,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -488,9 +489,87 @@ func mtkUSBTransportEnabled() bool {
 	return true
 }
 
+// mtkUSBFlashDevicePresent reports whether a flashable MediaTek USB device
+// (VID 0x0e8d, anything but the live debug console) is currently on the bus.
+// Unlike openMTKUSBPort it never opens or claims anything, so it is safe to
+// call as a cheap presence probe before deciding between the libusb and the
+// legacy tty transports.
+func mtkUSBFlashDevicePresent() bool {
+	if err := libusbInit(); err != nil {
+		return false
+	}
+	var list **C.libusb_device
+	n := C.libusb_get_device_list(libusbCtx, &list)
+	if n < 0 {
+		return false
+	}
+	defer C.libusb_free_device_list(list, 1)
+	for _, dev := range unsafe.Slice(list, int(n)) {
+		var desc C.struct_libusb_device_descriptor
+		if rc := C.libusb_get_device_descriptor(dev, &desc); rc != 0 {
+			continue
+		}
+		if uint16(desc.idVendor) != mtkUSBVendorID {
+			continue
+		}
+		if uint16(desc.idProduct) == mviiDebugConsolePID {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// listMTKUSBDevices names every MediaTek USB device currently on the bus, for
+// the `-list` port sweep. Entries are "vid:pid (bus B, addr A)" with a
+// "debug console" tag where it applies.
+func listMTKUSBDevices() []string {
+	if err := libusbInit(); err != nil {
+		return nil
+	}
+	var list **C.libusb_device
+	n := C.libusb_get_device_list(libusbCtx, &list)
+	if n < 0 {
+		return nil
+	}
+	defer C.libusb_free_device_list(list, 1)
+	var out []string
+	for _, dev := range unsafe.Slice(list, int(n)) {
+		var desc C.struct_libusb_device_descriptor
+		if rc := C.libusb_get_device_descriptor(dev, &desc); rc != 0 {
+			continue
+		}
+		if uint16(desc.idVendor) != mtkUSBVendorID {
+			continue
+		}
+		entry := fmt.Sprintf("0x%04x:0x%04x (bus %d, addr %d)",
+			uint16(desc.idVendor), uint16(desc.idProduct),
+			int(C.libusb_get_bus_number(dev)), int(C.libusb_get_device_address(dev)))
+		if uint16(desc.idProduct) == mviiDebugConsolePID {
+			entry += " [MVII debug console, not a BROM]"
+		}
+		out = append(out, entry)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func tryConnectMTKUSB(device string, options mtkSerialConnectOptions) (*mtkSerialClient, bool, error) {
 	if !mtkUSBTransportEnabled() {
 		return nil, false, nil
+	}
+	// Port sweep: when no MediaTek USB device is on the bus at all but
+	// USB-serial tty nodes exist, the board is behind a UART adapter (or
+	// enumerating outside VID 0x0e8d) — fall through to the tty sweep
+	// instead of waiting out the whole timeout on libusb. When nothing is
+	// plugged in anywhere the libusb wait below is kept, so starting the
+	// tool before connecting a direct-attached board still works.
+	if !mtkUSBFlashDevicePresent() {
+		if swept := sweepSerialPorts(); len(swept) > 0 {
+			fmt.Printf("No MediaTek USB device (VID 0x%04x) on the bus; falling back to serial ports: %s\n",
+				mtkUSBVendorID, strings.Join(swept, ", "))
+			return nil, false, nil
+		}
 	}
 	client, err := connectMTKUSB(device, options)
 	return client, true, err
