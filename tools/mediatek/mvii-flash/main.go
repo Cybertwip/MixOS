@@ -506,7 +506,7 @@ func parseFlags() (config, error) {
 	flag.StringVar(&cfg.rawLength, "raw-length", "", "raw transfer length; for feed, auto/minimal rounds image up to 512B")
 	flag.StringVar(&cfg.preloader, "preloader", "", "optional preloader for DRAM init in some serial paths")
 	flag.StringVar(&cfg.daLoader, "da-loader", "", "legacy DA loader (only for -backend=mtk-serial without feed)")
-	flag.StringVar(&cfg.authFile, "auth", "", "SLA/DAA auth file (e.g. auth_sv5.auth) for phone BROM staging; validated only, no wire use yet")
+	flag.StringVar(&cfg.authFile, "auth", "", "vendor auth file (e.g. auth_sv5.auth), uploaded via SEND_AUTH when phone BROM enforces DAA")
 	flag.StringVar(&cfg.mtkDRAM, "mtk-dram", "", "legacy DA DRAM profile: auto, preloader, mt6592-standard, mt6592-lpddr2, mt6592-lpddr3, or mt6592-da-default")
 	flag.StringVar(&cfg.mtkPacketSize, "mtk-packet-size", "", "legacy DA packet size override")
 	flag.StringVar(&cfg.mtkDumpPreloader, "mtk-dump-preloader", "", "dump eMMC BOOT1 preloader to a file or directory; use 'auto' for the default path")

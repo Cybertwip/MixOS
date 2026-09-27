@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -230,9 +229,9 @@ func printPhoneBROMPlan(plan *phoneBROMPlan) {
 	fmt.Printf("  DA:        %s (%d regions)\n", plan.daPath, plan.daRegions)
 	fmt.Printf("  Preloader: %s (DRAM EMI)\n", plan.preloader)
 	if plan.auth != "" {
-		fmt.Printf("  Auth:      %s (recorded; the tool speaks no SLA exchange)\n", plan.auth)
+		fmt.Printf("  Auth:      %s (sent via SEND_AUTH when BROM enforces DAA)\n", plan.auth)
 	} else {
-		fmt.Printf("  Auth:      none provided (proceeds only if BROM enforces no SLA/DAA)\n")
+		fmt.Printf("  Auth:      none provided (DAA targets are attempted without it)\n")
 	}
 }
 
@@ -448,8 +447,23 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 		_ = client.port.Close()
 	}()
 
-	if err := probePhoneBROM(client, phone, plan.hwCode); err != nil {
+	target, err := probePhoneBROM(client, phone, plan.hwCode)
+	if err != nil {
 		return err
+	}
+	if target.DAA {
+		if plan.auth == "" {
+			fmt.Println("Warning: BROM enforces DAA but no -auth file was given; attempting the DA upload without it.")
+		} else {
+			authBlob, err := os.ReadFile(plan.auth)
+			if err != nil {
+				return fmt.Errorf("phone target %s: read auth file %s: %w", phone.device, plan.auth, err)
+			}
+			fmt.Printf("Uploading auth blob: %s (0x%x bytes)\n", plan.auth, len(authBlob))
+			if err := client.sendAuth(authBlob); err != nil {
+				return err
+			}
+		}
 	}
 	if err := client.uploadLegacyDA(loader); err != nil {
 		return err
