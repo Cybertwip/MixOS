@@ -41,6 +41,7 @@ type config struct {
 	daLoader             string
 	probeDA              bool
 	unlock               bool
+	mtkPhoneWriteBoot1   string
 	authFile             string
 	waitFlag             string
 	preloader            string
@@ -252,6 +253,9 @@ func run() error {
 	}
 	if cfg.unlock {
 		return runUnlockCommand(cfg)
+	}
+	if cfg.mtkPhoneWriteBoot1 != "" {
+		return runPhoneWriteBoot1(cfg, cfg.mtkPhoneWriteBoot1)
 	}
 	if cfg.mtkFlashScatter != "" {
 		if cfg.device == "" {
@@ -519,8 +523,8 @@ func parseFlags() (config, error) {
 	flag.StringVar(&cfg.preloader, "preloader", "", "optional preloader for DRAM init in some serial paths")
 	flag.StringVar(&cfg.daLoader, "da-loader", "", "MediaTek DA loader bundle for phone BROM/preloader or legacy mtk-serial")
 	flag.BoolVar(&cfg.probeDA, "probe-da", false, "probe a phone DA stage-1 signature via SEND_DA; stop before JUMP_DA or any eMMC access")
-	flag.StringVar(&cfg.mtkclientRoot, "mtkclient-root", "", "mtkclient source checkout dir (mtk.py runs from it)")
-	flag.BoolVar(&cfg.unlock, "unlock", false, "OPPO MTK fastboot unlock: patch the -preloader image and, with -device, back up boot1/boot2 and write the patched image via mtkclient; the write needs -yes")
+	flag.BoolVar(&cfg.unlock, "unlock", false, "OPPO MTK fastboot unlock: patch the -preloader image and, with -device and -da-loader, back up boot1/boot2 and write the patched image over BROM/DA; the write needs -yes")
+	flag.StringVar(&cfg.mtkPhoneWriteBoot1, "mtk-phone-write-boot1", "", "write FILE to phone eMMC BOOT1 over BROM/DA (boot1 restore); -preloader supplies DRAM EMI, else FILE itself does")
 	flag.StringVar(&cfg.authFile, "auth", "", "vendor auth file (e.g. auth_sv5.auth), uploaded via SEND_AUTH when phone BROM enforces DAA")
 	flag.StringVar(&cfg.waitFlag, "wait", "", "wait for phone VCOM and, when DAA requires -auth, a BROM replug (e.g. 5m, 90s); unset means one attempt")
 	flag.StringVar(&cfg.mtkDRAM, "mtk-dram", "", "legacy DA DRAM profile: auto, preloader, mt6592-standard, mt6592-lpddr2, mt6592-lpddr3, or mt6592-da-default")

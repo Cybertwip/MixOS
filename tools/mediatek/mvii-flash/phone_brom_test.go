@@ -622,3 +622,18 @@ func TestRefusePhoneWriteAllowsStagedBROM(t *testing.T) {
 		t.Fatal("isPhoneBROMShape = true for bare serial+upload")
 	}
 }
+
+func TestPhoneFactsForHWCode(t *testing.T) {
+	for hw, soc := range map[uint16]string{0x0766: "mt6765", 0x0699: "mt6739", 0x0989: "mt6833"} {
+		got, facts, err := phoneFactsForHWCode(hw)
+		if err != nil {
+			t.Fatalf("hw %#04x: %v", hw, err)
+		}
+		if got != soc || facts.bromCode != hw || facts.daCode == 0 {
+			t.Fatalf("hw %#04x = %s/%#04x/%#04x, want %s/%#04x/nonzero", hw, got, facts.bromCode, facts.daCode, soc, hw)
+		}
+	}
+	if _, _, err := phoneFactsForHWCode(0x0000); err == nil {
+		t.Fatal("unknown hw code accepted, want refusal")
+	}
+}

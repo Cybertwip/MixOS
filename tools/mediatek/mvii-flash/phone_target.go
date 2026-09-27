@@ -62,11 +62,18 @@ func detectPhoneRoot(root string) (*phoneRoot, bool) {
 		return nil, false
 	}
 	phone := &phoneRoot{device: device, soc: strings.ToLower(soc)}
-	digits := strings.TrimPrefix(phone.soc, "mt")
-	if len(digits) >= 2 && isASCIIDigits(digits[:2]) {
-		phone.family = "mt" + digits[:2] + "xx"
-	}
+	phone.family = phoneFamilyForSoc(phone.soc)
 	return phone, true
+}
+
+// phoneFamilyForSoc derives the LK tree family (mt67xx, mt68xx, ...) from a
+// soc codename; shared by root detection and rootless phone flows.
+func phoneFamilyForSoc(soc string) string {
+	digits := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(soc)), "mt")
+	if len(digits) >= 2 && isASCIIDigits(digits[:2]) {
+		return "mt" + digits[:2] + "xx"
+	}
+	return ""
 }
 
 func isASCIIDigits(s string) bool {
@@ -102,8 +109,9 @@ func confirmWord(cfg config) string {
 // refusePhoneWrite gates every device-touching run with a phone -root.
 // It returns nil only for the honest phone paths (fastboot with an
 // explicit partition and no -device; BROM raw exec with explicit address
-// and no feed/-upload flags; -unlock with its own mtkclient-backed flow
-// and consent); anything else fails with the reason and the
+// and no feed/-upload flags; -unlock and -mtk-phone-write-boot1 with
+// their own native phone-DA flow and consent); anything else fails with
+// the reason and the
 // alternative. Pure over cfg + the root dir, so the Go suite pins the
 // whole matrix.
 func refusePhoneWrite(cfg config, phone *phoneRoot) error {
@@ -124,9 +132,10 @@ func refusePhoneWrite(cfg config, phone *phoneRoot) error {
 		if j36OnlyVerb(cfg) == "" && hasRawAddress(cfg) && cfg.upload == "" {
 			return nil
 		}
-		// -unlock is phone-explicit (mtkclient-backed boot1 backup/patch/
-		// write with its own consent); it never selects the j36 feed.
-		if cfg.unlock {
+		// -unlock and -mtk-phone-write-boot1 are phone-explicit (native
+		// phone-DA boot1 backup/patch/write with their own consent); they
+		// never select the j36 feed.
+		if cfg.unlock || cfg.mtkPhoneWriteBoot1 != "" {
 			return nil
 		}
 		// Staged phone BROM (step 6 groundwork): every staging file is

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 )
 
 func makeUnlockTestImage(t *testing.T, lock byte, withFlag bool) []byte {
@@ -94,5 +95,68 @@ func TestPatchUnlockPreloaderRefuses(t *testing.T) {
 
 	if _, _, err := patchUnlockPreloader(make([]byte, 0x1000)); err == nil || !strings.Contains(err.Error(), "too small") {
 		t.Fatalf("short image = %v, want too-small error", err)
+	}
+}
+
+func TestUnlockBoot1ReadFramesPart(t *testing.T) {
+	data := make([]byte, 0x200)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	pending := []byte{mtkLegacyACK, mtkLegacyACK, mtkLegacyACK}
+	pending = append(pending, data...)
+	pending = append(pending, be16(sum16(data))...)
+	port := &scriptPort{pending: pending}
+	client := &mtkSerialClient{port: port, commandTimeout: time.Second, writeTimeout: time.Second}
+	got, err := client.readLegacyEMMC(mtkLegacyEMMCPartBoot1, 0, 0x200, 0x200)
+	if err != nil {
+		t.Fatalf("readLegacyEMMC: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("read data mismatch")
+	}
+	if len(port.pending) != 0 {
+		t.Fatalf("%d scripted bytes unconsumed", len(port.pending))
+	}
+	// Switch cmd, part, six read-header fields, per-packet ACK.
+	if len(port.writes) != 2+6+1 {
+		t.Fatalf("writes = %d, want 9", len(port.writes))
+	}
+	if !bytes.Equal(port.writes[0], []byte{mtkLegacySDMMCSwitchPart}) || !bytes.Equal(port.writes[1], []byte{mtkLegacyEMMCPartBoot1}) {
+		t.Fatalf("switch writes = %x %x, want 60 01", port.writes[0], port.writes[1])
+	}
+	if !bytes.Equal(port.writes[2], []byte{mtkLegacyEMMCRead}) {
+		t.Fatalf("read cmd = %x, want d6", port.writes[2])
+	}
+	if _, err := client.readLegacyEMMC(mtkLegacyEMMCPartBoot1, 0, 0x100, 0x200); err == nil {
+		t.Fatal("unaligned length accepted, want refusal")
+	}
+}
+
+func TestUnlockBoot1WriteFramesPart(t *testing.T) {
+	data := make([]byte, 0x200)
+	for i := range data {
+		data[i] = byte(0xFF - i)
+	}
+	port := &scriptPort{pending: []byte{mtkLegacyACK, mtkLegacyACK, mtkLegacyACK, mtkLegacyCONT}}
+	client := &mtkSerialClient{port: port, commandTimeout: time.Second, writeTimeout: time.Second}
+	if err := client.writeLegacyEMMCPartition(mtkLegacyEMMCPartBoot1, 0, data, 0x200); err != nil {
+		t.Fatalf("writeLegacyEMMCPartition: %v", err)
+	}
+	// Switch cmd, part, six header fields, chunk ACK, chunk, checksum.
+	if len(port.writes) != 2+6+3 {
+		t.Fatalf("writes = %d, want 11", len(port.writes))
+	}
+	if !bytes.Equal(port.writes[4], []byte{mtkLegacyEMMCPartBoot1}) {
+		t.Fatalf("header part = %x, want 01", port.writes[4])
+	}
+	if !bytes.Equal(port.writes[9], data) {
+		t.Fatal("chunk bytes mismatch")
+	}
+	if !bytes.Equal(port.writes[10], be16(sum16(data))) {
+		t.Fatal("chunk checksum mismatch")
+	}
+	if err := client.writeLegacyEMMCPartition(mtkLegacyEMMCPartBoot1, 0, data[:0x100], 0x200); err == nil {
+		t.Fatal("unaligned length accepted, want refusal")
 	}
 }
