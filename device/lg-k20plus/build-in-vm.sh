@@ -37,7 +37,8 @@ ART="$WORK/artifacts"
 
 # shellcheck source=device/lg-k20plus/devices.sh
 source "$DEVDIR/devices.sh"
-eval "$(lg_device_info "$DEVICE")" || exit 1
+DEVICE_INFO="$(lg_device_info "$DEVICE")" || exit 1
+eval "$DEVICE_INFO"
 [[ "$LG_ARCH" == "arm64" ]] || die "$DEVICE is $LG_ARCH, this build is arm64"
 log "LG $LG_DEVICE ($LG_NOTES)"
 

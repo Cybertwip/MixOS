@@ -50,7 +50,8 @@ ART="$WORK/artifacts"
 # ── the device, first, so a typo fails in a second ──────────────────────────
 # shellcheck source=device/oppo-mt6877/devices.sh
 source "$DEVDIR/devices.sh"
-eval "$(oppo_device_info "$DEVICE")" || exit 1
+DEVICE_INFO="$(oppo_device_info "$DEVICE")" || exit 1
+eval "$DEVICE_INFO"
 [[ "$OPPO_ARCH" == "arm64" ]] || die "$DEVICE is $OPPO_ARCH, this build is arm64"
 log "OPPO $OPPO_DEVICE ($OPPO_NOTES)"
 

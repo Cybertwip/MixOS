@@ -92,7 +92,8 @@ done
 if [[ "$MIX_ONLY" == 1 && "$COMPRESS" == 1 ]]; then
     darkos_die "--compress cannot be combined with --mix-only."
 fi
-eval "$(lg_device_info "$DEVICE")" || exit 1
+DEVICE_INFO="$(lg_device_info "$DEVICE")" || exit 1
+eval "$DEVICE_INFO"
 ARTIFACT_DIR="$BASE_ARTIFACT_DIR/lg-$DEVICE"
 
 [[ "$(uname -s)" == "Darwin" ]] || darkos_die "run this wrapper on macOS"
