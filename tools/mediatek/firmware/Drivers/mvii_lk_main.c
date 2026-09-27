@@ -3088,6 +3088,10 @@ static void lk_build_atags(const lk_boot_image_t* img) {
 
 #define SD_CONF_PATH "/boot.conf"
 #define SD_CONF_MAX 2048u
+/* Where boot.conf lived on cards written before the flattening. Tried only
+ * when the root has none, so an old card keeps booting and a card carrying
+ * both answers with the new file. */
+#define SD_CONF_FALLBACK "/mvii/boot.conf"
 
 /* The card's own loader script, and the label of the volume it lives on. Both
  * are what a dArkOS image writes; both are optional. */
@@ -4082,6 +4086,10 @@ static int lk_sd_boot(void) {
     if (mvii_fat_read_file(&g_sd_fs, SD_CONF_PATH, g_sd_conf, SD_CONF_MAX, &conf_len) == MVII_FAT_OK) {
         sd_conf_parse(&conf, g_sd_conf, conf_len, &from_script);
         lk_log("sd: " SD_CONF_PATH " applied\n");
+    } else if (mvii_fat_read_file(&g_sd_fs, SD_CONF_FALLBACK, g_sd_conf, SD_CONF_MAX, &conf_len) ==
+               MVII_FAT_OK) {
+        sd_conf_parse(&conf, g_sd_conf, conf_len, &from_script);
+        lk_log("sd: " SD_CONF_FALLBACK " applied (legacy path)\n");
     } else if (from_script.kernel == 0 && from_script.bootargs == 0) {
         lk_log("sd: no boot script on the card; using the built-in defaults\n");
     }

@@ -5,13 +5,16 @@
 # only. The image's p1 is emptied before the launcher goes in (the base image
 # itself is untouched -- the injection runs on a copy), so Image, uInitrd,
 # rk3326/rg351mp trees, boot.ini and the R36S helpers never reach a J36 card.
-# Static: greps the in-VM script, so it runs on the workstation with no VM.
+# boot.conf sits at the BOOT root; the LK reads it there first and falls back
+# to the legacy mvii/ path for cards written by older builds.
+# Static: greps the scripts, so it runs on the workstation with no VM.
 set -u
 
 HERE="$(cd -- "$(dirname -- "$0")" && pwd)"
 ROOT="$(cd -- "$HERE/../../.." && pwd)"
 INVM="$ROOT/device/j36-ultra/build-in-vm.sh"
 README="$ROOT/device/j36-ultra/README.md"
+LKMAIN="$ROOT/tools/mediatek/firmware/Drivers/mvii_lk_main.c"
 
 fail=0
 
@@ -93,6 +96,34 @@ if grep -E -q '"\$SDBOOT/([^"]*/)?(Image|uInitrd|boot\.ini|logo\.bmp|rk3326[^"/]
     fail=1
 else
     echo "  no R36S names staged into SDBOOT: ok"
+fi
+
+# 7. The LK reads boot.conf at the root first, mvii/ as the legacy fallback.
+if grep -q -F '#define SD_CONF_PATH "/boot.conf"' "$LKMAIN" \
+    && grep -q -F '#define SD_CONF_FALLBACK "/mvii/boot.conf"' "$LKMAIN"; then
+    echo "  LK conf paths (root + legacy fallback): ok"
+else
+    echo "FAIL: LK does not read /boot.conf with an /mvii/boot.conf fallback"
+    fail=1
+fi
+root_line="$(grep -n -F 'mvii_fat_read_file(&g_sd_fs, SD_CONF_PATH' "$LKMAIN" | cut -d: -f1 || true)"
+fb_line="$(grep -n -F 'mvii_fat_read_file(&g_sd_fs, SD_CONF_FALLBACK' "$LKMAIN" | cut -d: -f1 || true)"
+if [[ -z "$root_line" || -z "$fb_line" ]]; then
+    echo "FAIL: LK does not try both conf paths in lk_sd_boot"
+    fail=1
+elif [[ "$root_line" -gt "$fb_line" ]]; then
+    echo "FAIL: LK tries the legacy mvii/ path before /boot.conf (root=$root_line fallback=$fb_line)"
+    fail=1
+else
+    echo "  LK tries root before legacy: ok (root=$root_line fallback=$fb_line)"
+fi
+
+# 8. No stale shared-partition wording survives anywhere in the J36 notes.
+if grep -q -F "shared with an R36S card's own boot files" "$INVM"; then
+    echo "FAIL: stale shared-partition wording still in $INVM"
+    fail=1
+else
+    echo "  no stale shared-partition wording: ok"
 fi
 
 [ "$fail" -eq 0 ] && echo "PASS: J36-only BOOT"

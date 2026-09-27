@@ -9802,7 +9802,7 @@ boot.conf and ignores them.
   mt6592-j36-ultra.dtb      the tree the LK loads separately and patches
   initrd.img                bring-up initramfs (busybox, the input module, and
                             the boot splash with its picture)
-  boot.conf            filenames and command line for the MVII LK
+  boot.conf                 filenames and command line for the MVII LK
   LICENSE.txt               which licence covers which file above, and where the
                             GPL-2.0-only source is; keep it with the payload
 
@@ -11924,7 +11924,7 @@ appended in full at the end of this file:
     bin/j36-mixmirror       the panel-to-USB-HDMI mirror
     j36/eglprobe            the EGL/GBM/DRM scanout probe
     j36/mfgpower            the MFG power-domain bring-up probe
-    boot.conf          the MVII LK hand-off
+    boot.conf               the MVII LK hand-off
     README.txt on either partition, and this file -- the documentation
 
 GNU General Public License, version 2 only:
