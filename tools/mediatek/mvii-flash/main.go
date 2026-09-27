@@ -40,6 +40,7 @@ type config struct {
 	mtkclientRoot        string
 	daLoader             string
 	probeDA              bool
+	mtkProbeJump         bool
 	unlock               bool
 	mtkPhoneWriteBoot1   string
 	authFile             string
@@ -162,6 +163,9 @@ func run() error {
 	}
 	if cfg.listOnly {
 		return listBackends(cfg)
+	}
+	if cfg.mtkProbeJump {
+		return probePhoneJump(cfg)
 	}
 	// Phone boot dirs (-root at build/mt67xx|mt68xx/<device>/boot) take the
 	// fastboot path or nothing: the BROM feed and block offsets below are
@@ -530,6 +534,7 @@ func parseFlags() (config, error) {
 	flag.StringVar(&cfg.preloader, "preloader", "", "optional preloader for DRAM init in some serial paths")
 	flag.StringVar(&cfg.daLoader, "da-loader", "", "MediaTek DA loader bundle for phone BROM/preloader or legacy mtk-serial")
 	flag.BoolVar(&cfg.probeDA, "probe-da", false, "probe a phone DA stage-1 signature via SEND_DA; stop before JUMP_DA or any eMMC access")
+	flag.BoolVar(&cfg.mtkProbeJump, "mtk-probe-jump", false, "MT6765: probe one bare JUMP_DA to the supplied preloader's entry; may reset/hang the phone; no upload or storage commands")
 	flag.BoolVar(&cfg.unlock, "unlock", false, "OPPO MTK fastboot unlock: patch the -preloader image and, with -device and -da-loader, back up boot1/boot2 and write the patched image over BROM/DA; the write needs -yes")
 	flag.StringVar(&cfg.mtkPhoneWriteBoot1, "mtk-phone-write-boot1", "", "write FILE to phone eMMC BOOT1 over BROM/DA (boot1 restore); -preloader supplies DRAM EMI, else FILE itself does")
 	flag.StringVar(&cfg.authFile, "auth", "", "vendor auth file (e.g. auth_sv5.auth), uploaded via SEND_AUTH when phone BROM enforces DAA")
