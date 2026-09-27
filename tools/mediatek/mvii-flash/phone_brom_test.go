@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Fake DA loader with one entry for hwCode carrying payload.
@@ -173,6 +176,106 @@ func TestPlanPhoneBROMRawOffset(t *testing.T) {
 	if _, err := planPhoneBROM(cfg, info); err == nil {
 		t.Fatal("planPhoneBROM(no placement) = nil, want an error")
 	}
+}
+
+// scriptPort is a canned mtkPort: reads drain the queued replies, writes are
+// recorded for assertion. It pins our framing (echo, big-endian length
+// round-trip, status words), not the peer's behavior.
+type scriptPort struct {
+	writes  [][]byte
+	pending []byte
+}
+
+func (p *scriptPort) WriteAll(data []byte, _ time.Duration) error {
+	p.writes = append(p.writes, append([]byte(nil), data...))
+	return nil
+}
+
+func (p *scriptPort) DiscardInput(_ time.Duration) error { return nil }
+
+func (p *scriptPort) ReadExact(n int, _ time.Duration) ([]byte, error) {
+	if len(p.pending) < n {
+		return nil, errors.New("script exhausted")
+	}
+	out := append([]byte(nil), p.pending[:n]...)
+	p.pending = p.pending[n:]
+	return out, nil
+}
+
+func be16(v uint16) []byte { return []byte{byte(v >> 8), byte(v)} }
+
+func be32(v uint32) []byte {
+	return []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
+}
+
+func TestPrepareAuthData(t *testing.T) {
+	even := []byte{0x01, 0x02}
+	if got := prepareAuthData(even); !bytes.Equal(got, even) {
+		t.Fatalf("prepareAuthData(even) = %x, want unchanged", got)
+	}
+	if got := prepareAuthData([]byte{0x01}); !bytes.Equal(got, []byte{0x01, 0x00}) {
+		t.Fatalf("prepareAuthData(odd) = %x, want zero-padded", got)
+	}
+}
+
+func TestSendAuth(t *testing.T) {
+	newClient := func(replies []byte) (*mtkSerialClient, *scriptPort) {
+		port := &scriptPort{pending: replies}
+		return &mtkSerialClient{port: port, commandTimeout: time.Second, writeTimeout: time.Second}, port
+	}
+	blob := []byte{0xAA, 0xBB}
+
+	t.Run("accepted", func(t *testing.T) {
+		var replies []byte
+		replies = append(replies, mtkCmdSendAuth)      // echo
+		replies = append(replies, be32(2)...)          // length round-trip
+		replies = append(replies, be16(0x0000)...)     // status: proceed
+		replies = append(replies, be16(0x1234)...)     // crc (informational)
+		replies = append(replies, be16(0x0000)...)     // final status
+		client, port := newClient(replies)
+		if err := client.sendAuth(blob); err != nil {
+			t.Fatalf("sendAuth = %v, want nil", err)
+		}
+		var joined []byte
+		for _, w := range port.writes {
+			joined = append(joined, w...)
+		}
+		if !bytes.Contains(joined, append([]byte{mtkCmdSendAuth}, be32(2)...)) {
+			t.Fatalf("writes = %x, want echo + big-endian length", joined)
+		}
+		if !bytes.Contains(joined, blob) {
+			t.Fatalf("writes = %x, want the blob", joined)
+		}
+	})
+	t.Run("no auth needed", func(t *testing.T) {
+		var replies []byte
+		replies = append(replies, mtkCmdSendAuth)
+		replies = append(replies, be32(2)...)
+		replies = append(replies, be16(0x1D0C)...)
+		client, _ := newClient(replies)
+		if err := client.sendAuth(blob); err != nil {
+			t.Fatalf("sendAuth(0x1D0C) = %v, want nil", err)
+		}
+	})
+	t.Run("length mismatch", func(t *testing.T) {
+		var replies []byte
+		replies = append(replies, mtkCmdSendAuth)
+		replies = append(replies, be32(99)...)
+		client, _ := newClient(replies)
+		if err := client.sendAuth(blob); err == nil || !strings.Contains(err.Error(), "length reply") {
+			t.Fatalf("sendAuth = %v, want the length complaint", err)
+		}
+	})
+	t.Run("status refusal", func(t *testing.T) {
+		var replies []byte
+		replies = append(replies, mtkCmdSendAuth)
+		replies = append(replies, be32(2)...)
+		replies = append(replies, be16(0x1D0D)...)
+		client, _ := newClient(replies)
+		if err := client.sendAuth(blob); err == nil || !strings.Contains(err.Error(), "SEND_AUTH status") {
+			t.Fatalf("sendAuth = %v, want the status refusal", err)
+		}
+	})
 }
 
 func TestRefusePhoneSLA(t *testing.T) {
