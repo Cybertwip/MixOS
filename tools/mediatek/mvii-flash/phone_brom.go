@@ -428,11 +428,7 @@ func setPhonePreloaderBROMFlag(c *mtkSerialClient, facts phoneFacts) error {
 	if err := c.write32(facts.miscLock, mtkMiscLockKeyMagic); err != nil {
 		return fmt.Errorf("unlock BOOT_MISC: %w", err)
 	}
-	resetControl := uint32(1)
-	if current, err := c.read32(facts.miscLock+0x08, 1); err == nil && len(current) != 0 {
-		resetControl = current[0] | 1
-	}
-	if err := c.write32(facts.miscLock+0x08, resetControl); err != nil {
+	if err := c.write32(facts.miscLock+0x08, 1); err != nil {
 		return fmt.Errorf("mark USBDL flag watchdog-resettable: %w", err)
 	}
 	if err := c.write32(facts.miscLock, 0); err != nil {
@@ -440,6 +436,29 @@ func setPhonePreloaderBROMFlag(c *mtkSerialClient, facts phoneFacts) error {
 	}
 	if err := c.write32(facts.miscLock-0x20, usbdlReg); err != nil {
 		return fmt.Errorf("write USBDL flag: %w", err)
+	}
+	return nil
+}
+
+// resetPhonePreloaderToBROM uses the MT6765 BOOT_MISC and watchdog addresses
+// from phoneFacts. It changes only SoC registers and leaves eMMC untouched.
+// The last write may drop USB before the preloader can acknowledge it.
+func resetPhonePreloaderToBROM(c *mtkSerialClient, facts phoneFacts) error {
+	if c.isBROM {
+		return nil
+	}
+	if err := setPhonePreloaderBROMFlag(c, facts); err != nil {
+		return err
+	}
+	fmt.Println("Triggering phone watchdog reset toward BROM.")
+	if err := c.write32(facts.watchdog+0x08, mtkWatchdogRestart); err != nil {
+		return fmt.Errorf("restart phone watchdog before BROM reset: %w", err)
+	}
+	if err := c.write32(facts.watchdog, mtkWatchdogRebootMode); err != nil {
+		return fmt.Errorf("arm phone watchdog reset mode: %w", err)
+	}
+	if err := c.write32(facts.watchdog+0x14, mtkWatchdogSoftwareRst); err != nil {
+		fmt.Printf("Watchdog reset command lost its ACK as USB dropped: %v\n", err)
 	}
 	return nil
 }
@@ -702,7 +721,15 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 		if window == 0 {
 			return errors.New("phone is in preloader mode with DAA enabled; -auth can only be sent in BROM mode. Power off, enter BROM with the download key combo, and retry (or pass -wait to allow a replug)")
 		}
-		fmt.Printf("DAA-enabled preloader acquired; waiting up to %s for BROM so -auth can be sent. Power off and replug with the download key combo held.\n", window)
+		fmt.Printf("DAA-enabled preloader acquired; requesting reset to BROM so -auth can be sent.\n")
+		if err := resetPhonePreloaderToBROM(client, facts); err != nil {
+			fmt.Printf("Automatic BROM reset was refused: %v\n", flagFailureAdvice(err))
+			fmt.Printf("Waiting up to %s for a BROM replug with the download key combo held.\n", window)
+		} else {
+			_ = client.port.Close()
+			client = nil
+			fmt.Printf("Reset requested; waiting up to %s for BROM to enumerate.\n", window)
+		}
 		client, target, err = waitPhoneBROM(cfg, phone, facts, client, window, func(device string) (*mtkSerialClient, error) {
 			return connectMTKSerialWithOptions(device, mtkSerialConnectOptions{handshakeWake: true})
 		})
