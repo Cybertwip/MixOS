@@ -60,7 +60,7 @@ func patchUnlockPreloader(data []byte) ([]byte, unlockPatchReport, error) {
 		!bytes.HasPrefix(data, []byte("COMBO_BOOT")) {
 		fmt.Printf("warn: unknown magic %q; continuing anyway\n", data[:min(len(data), 16)])
 	}
-	if len(data) < unlockNewCodeOff+unlockTailDrop+0x800 {
+	if len(data) < unlockNewCodeOff+1 {
 		return nil, report, fmt.Errorf("image too small (%d bytes) to relocate code", len(data))
 	}
 	out := bytes.Clone(data)
@@ -77,8 +77,15 @@ func patchUnlockPreloader(data []byte) ([]byte, unlockPatchReport, error) {
 	if flagAt < 0 {
 		return nil, report, errors.New("AND_ROMINFO_v flag block not found")
 	}
+	if flagAt+unlockFlagLen > len(out) {
+		return nil, report, errors.New("AND_ROMINFO_v flag block truncated")
+	}
 	report = unlockPatchReport{CodeOffset: codeOffset, FlagOffset: flagAt, LockBefore: out[flagAt+unlockFlagLockOff]}
-	raw := bytes.Clone(out[codeOffset : len(out)-unlockTailDrop])
+	rawEnd := len(out) - unlockTailDrop
+	if rawEnd <= codeOffset {
+		return nil, report, fmt.Errorf("image too small (%d bytes) for code at %#x", len(data), codeOffset)
+	}
+	raw := bytes.Clone(out[codeOffset:rawEnd])
 	for i := codeOffset; i < len(out); i++ {
 		out[i] = 0
 	}
