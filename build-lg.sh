@@ -9,9 +9,9 @@
 # deliverable is a phone boot image, not an SD card image, so there is no R36
 # base to resume:
 #
-#   ./build-lg.sh              boot.img + trixie.img + rootfs tarball,
-#                                one model dir per device, into
-#                                MixOS-Artifacts/lg/<device>/
+#   ./build-lg.sh              one MixOS_<arch>_<debian>_<commit>.img
+#                                per device (boot.img + rootfs folded in),
+#                                into MixOS-Artifacts/lg/<device>/
 #   ./build-lg.sh --mix-only   board specifics only (boot/ + root/ dirs)
 #   LG_DEVICE=lv517-rev0 ./build-lg.sh
 #   ./build-lg.sh --list-devices
@@ -64,7 +64,7 @@ Usage: ./build-lg.sh [--mix-only | --compress] [--device CODENAME] [--list-devic
 
 Builds the LG phone layer for one device (default: $DEVICE) in the $VM_NAME VM.
 
-    ./build-lg.sh              boot.img + trixie.img + rootfs tarball into $ARTIFACT_DIR
+    ./build-lg.sh              one MixOS_<arch>_<debian>_<commit>.img into $ARTIFACT_DIR
     ./build-lg.sh --mix-only   board specifics only, into $ARTIFACT_DIR:
                                      boot/   boot.img + DTB (fastboot + inspection)
                                      root/   /opt/mixos payload + manifest
@@ -128,12 +128,19 @@ if [[ -n "${LG_FIRMWARE_DIR:-}" && -d "${LG_FIRMWARE_DIR:-}" ]]; then
 fi
 
 darkos_log "Building the LG $DEVICE layer"
+# Computed on the host: the VM's checkout has no .git to read the commit from.
+FULL_IMAGE_NAME="$(darkos_image_name "$ROOT" arm64 "${DEBIAN_CODE_NAME:-trixie}")"
+# Cleared before the build, not after (J36 pattern): the handover lives in
+# the work dir, which survives runs, so a stale one would otherwise pass as
+# this run's.
+multipass exec "$VM_NAME" -- rm -f "$VM_WORK_DIR-$DEVICE/artifacts/full-image.txt"
 BUILD_RC=0
 multipass exec "$VM_NAME" -- env \
     LG_BUILD_DIR="$VM_BUILD_DIR" \
     LG_WORK_DIR="$VM_WORK_DIR-$DEVICE" \
     LG_EXPORT_DIR="$VM_EXPORT_DIR" \
     LG_DEVICE="$DEVICE" \
+    LG_FULL_IMAGE_NAME="$FULL_IMAGE_NAME" \
     LG_MIX_ONLY="$MIX_ONLY" \
     LG_JOBS="${LG_JOBS:-}" \
     LG_KERNEL_BRANCH="${LG_KERNEL_BRANCH:-linux-6.12.y}" \
@@ -148,46 +155,83 @@ if [[ "$BUILD_RC" != 0 ]]; then
 fi
 darkos_warn_layout_strays "$BASE_ARTIFACT_DIR"
 
-# ── Handing over: the VM wrote into the mounted artifact dir, so verify ─────
-# from this side of the mount (same lesson as the J36 wrapper: a copy that
-# succeeded in the VM and left nothing here is a real failure mode).
-MANIFEST="$ARTIFACT_DIR/lg-$DEVICE-manifest.txt"
-[[ -f "$MANIFEST" ]] || darkos_die "the build reported success but wrote no manifest"
-BOOTIMG=""
-TRIXIEIMG=""
-ROOTFS=""
-while IFS='=' read -r key value; do
-    case "$key" in
-        bootimg) BOOTIMG="$value" ;;
-        trixieimg) TRIXIEIMG="$value" ;;
-        rootfs) ROOTFS="$value" ;;
-    esac
-done < "$MANIFEST"
+# ── Handing over: the image crossed the mount, so verify from this side ────
+# (same lesson as the J36 wrapper: a copy that succeeded in the VM and left
+# nothing here is a real failure mode). The handover is read out of the VM
+# work dir, never out of the artifact dir: the model dir holds the image.
+FULLIMG=""
+BOOT_SKIP=""
+BOOT_COUNT=""
+ROOTFS_SKIP=""
+ROOTFS_COUNT=""
+if [[ "$MIX_ONLY" != 1 ]]; then
+    # Through a temporary file and not `done < <(multipass ...)' (J36 pattern):
+    # macOS /bin/sh rejects process substitution at parse time.
+    HANDOVER="$(mktemp -t lg-full-image)"
+    multipass exec "$VM_NAME" -- \
+        cat "$VM_WORK_DIR-$DEVICE/artifacts/full-image.txt" > "$HANDOVER" 2>/dev/null || true
+    while IFS='=' read -r key value; do
+        case "$key" in
+            image) FULLIMG="$value" ;;
+            boot_skip) BOOT_SKIP="$value" ;;
+            boot_count) BOOT_COUNT="$value" ;;
+            rootfs_skip) ROOTFS_SKIP="$value" ;;
+            rootfs_count) ROOTFS_COUNT="$value" ;;
+        esac
+    done < "$HANDOVER"
+    rm -f "$HANDOVER"
+fi
 
 if [[ "$MIX_ONLY" == 1 ]]; then
-    [[ -f "$ARTIFACT_DIR/boot/$BOOTIMG" ]] \
-        || darkos_die "missing $ARTIFACT_DIR/boot/$BOOTIMG"
+    [[ -f "$ARTIFACT_DIR/boot/lg-$DEVICE-boot.img" ]] \
+        || darkos_die "missing $ARTIFACT_DIR/boot/lg-$DEVICE-boot.img"
+    [[ -f "$ARTIFACT_DIR/boot/lg-$DEVICE.dtb" ]] \
+        || darkos_die "missing $ARTIFACT_DIR/boot/lg-$DEVICE.dtb"
     darkos_log "LG $DEVICE board artifacts are ready: $ARTIFACT_DIR"
     printf '  %s\n' \
         "$ARTIFACT_DIR/boot/   -> boot.img + DTB (fastboot flash boot)" \
         "$ARTIFACT_DIR/root/   -> /opt/mixos payload for the ROOTFS partition"
-    darkos_log "No rootfs was built. Run ./build-lg.sh with no flag for that."
+    darkos_log "No image was built. Run ./build-lg.sh with no flag for that."
 else
-    [[ -f "$ARTIFACT_DIR/$BOOTIMG" ]] || darkos_die "missing $ARTIFACT_DIR/$BOOTIMG"
-    [[ -f "$ARTIFACT_DIR/$TRIXIEIMG" ]] || darkos_die "missing $ARTIFACT_DIR/$TRIXIEIMG"
-    [[ "$ROOTFS" == none || -f "$ARTIFACT_DIR/$ROOTFS" ]] \
-        || darkos_die "missing $ARTIFACT_DIR/$ROOTFS"
+    if [[ -d "$ARTIFACT_DIR/boot" ]]; then
+        darkos_warn "$ARTIFACT_DIR/boot is from an earlier --mix-only run and is NOT being refreshed."
+    fi
+    [[ -n "$FULLIMG" && -n "$BOOT_SKIP" && -n "$BOOT_COUNT" \
+        && -n "$ROOTFS_SKIP" && -n "$ROOTFS_COUNT" ]] \
+        || darkos_die "the build reported success but the handover is missing or incomplete"
+    VM_IMAGE_SIZE="$(multipass exec "$VM_NAME" -- stat -c %s "$VM_WORK_DIR-$DEVICE/artifacts/$FULLIMG")"
+    HOST_IMAGE_SIZE=0
+    if [[ -f "$ARTIFACT_DIR/$FULLIMG" ]]; then
+        HOST_IMAGE_SIZE="$(stat -f %z "$ARTIFACT_DIR/$FULLIMG" 2>/dev/null \
+            || stat -c %s "$ARTIFACT_DIR/$FULLIMG")"
+    fi
+    if [[ "$HOST_IMAGE_SIZE" == 0 || "$HOST_IMAGE_SIZE" != "$VM_IMAGE_SIZE" ]]; then
+        darkos_die "the image was built but did not reach $ARTIFACT_DIR ($HOST_IMAGE_SIZE of $VM_IMAGE_SIZE bytes)"
+    fi
+    printf '%s\n' "$FULLIMG" > "$ARTIFACT_DIR/latest-image.txt"
+    # The part files from before the single-image layout are intermediates now;
+    # leaving them would look like parallel deliverables. Exact names only.
+    for obsolete in "lg-$DEVICE-boot.img" "lg-$DEVICE-trixie.img" \
+            "lg-$DEVICE-rootfs.tar.gz" "lg-$DEVICE-manifest.txt" "lg-$DEVICE.zip"; do
+        if [[ -e "$ARTIFACT_DIR/$obsolete" ]]; then
+            darkos_log "Removing superseded $obsolete (its bytes are inside $FULLIMG)"
+            rm -f "$ARTIFACT_DIR/$obsolete"
+        fi
+    done
     if [[ "$COMPRESS" == 1 ]]; then
-        (cd -- "$ARTIFACT_DIR" && rm -f "lg-$DEVICE.part.zip" \
-            && zip -9 -q "lg-$DEVICE.part.zip" "$BOOTIMG" "$TRIXIEIMG" "$ROOTFS" \
-            && unzip -tqq "lg-$DEVICE.part.zip" \
-            && mv -f "lg-$DEVICE.part.zip" "lg-$DEVICE.zip") \
+        (cd -- "$ARTIFACT_DIR" && rm -f "$FULLIMG.part.zip" \
+            && zip -9 -q "$FULLIMG.part.zip" "$FULLIMG" \
+            && unzip -tqq "$FULLIMG.part.zip" \
+            && mv -f "$FULLIMG.part.zip" "$FULLIMG.zip") \
             || darkos_die "compression failed"
-        darkos_log "Compressed copy: $ARTIFACT_DIR/lg-$DEVICE.zip"
+        darkos_log "Compressed copy: $ARTIFACT_DIR/$FULLIMG.zip (unzip it before flashing)"
     fi
-    darkos_log "Flash this: fastboot flash boot $ARTIFACT_DIR/$BOOTIMG"
-    darkos_log "Write this onto the phone's ROOTFS partition (PARTLABEL=ROOTFS, must hold $(du -h "$ARTIFACT_DIR/$TRIXIEIMG" | awk '{print $1}')): $ARTIFACT_DIR/$TRIXIEIMG"
-    if [[ "$ROOTFS" != none ]]; then
-        darkos_log "Unpack-once alternative for a rooted shell or recovery: $ARTIFACT_DIR/$ROOTFS"
-    fi
+    darkos_report_stale_images "$ARTIFACT_DIR" "$FULLIMG"
+    SIZE="$(ls -lh "$ARTIFACT_DIR/$FULLIMG" | awk '{print $5}')"
+    darkos_log "Full OS image ($SIZE): $ARTIFACT_DIR/$FULLIMG"
+    darkos_log "  p1 BOOT holds the Android boot.img bytes; p2 ROOTFS the ext4 rootfs"
+    darkos_log "  Split it with (sectors, bs=512):"
+    darkos_log "    dd if=$ARTIFACT_DIR/$FULLIMG of=lg-$DEVICE-boot.img bs=512 skip=$BOOT_SKIP count=$BOOT_COUNT"
+    darkos_log "    dd if=$ARTIFACT_DIR/$FULLIMG of=lg-$DEVICE-rootfs.img bs=512 skip=$ROOTFS_SKIP count=$ROOTFS_COUNT"
+    darkos_log "  Then: fastboot flash boot lg-$DEVICE-boot.img; dd the rootfs onto a PARTLABEL=ROOTFS partition"
 fi

@@ -41,26 +41,26 @@ wired build-lg.sh lg
 wired build-j36-ultra.sh qbuy
 wired build-r36-ultra.sh qbuy
 
-# The VM half and the wrapper half must agree on the manifest contract:
-# every key the wrapper reads is written by the VM script, under the same
-# manifest filename on both sides.
-manifest_keys() { # $1 = device dir, $2 = wrapper, $3 = file prefix
-    local dir=$1 wrapper=$2 prefix=$3 k
-    for k in bootimg trixieimg rootfs; do
-        grep -q "echo \"$k=" "$ROOT/$dir/build-in-vm.sh" \
-            || { echo "FAIL: $dir/build-in-vm.sh never writes manifest key $k"; fail=1; }
+# The VM half and the wrapper half must agree on the handover contract:
+# the VM writes full-image.txt (image= plus make_full_img.py's offsets) and
+# the wrapper reads that same file back out of the VM work dir.
+handover_keys() { # $1 = device dir, $2 = wrapper, $3 = family
+    local dir=$1 wrapper=$2 family=$3 k
+    grep -q "full-image.txt" "$ROOT/$dir/build-in-vm.sh" \
+        || { echo "FAIL: $dir/build-in-vm.sh never writes full-image.txt"; fail=1; }
+    grep -q "make_full_img.py" "$ROOT/$dir/build-in-vm.sh" \
+        || { echo "FAIL: $dir/build-in-vm.sh never assembles the full image"; fail=1; }
+    grep -q "full-image.txt" "$ROOT/$wrapper" \
+        || { echo "FAIL: $wrapper never reads full-image.txt"; fail=1; }
+    for k in image boot_skip boot_count rootfs_skip rootfs_count; do
         grep -q "[[:space:]]$k)" "$ROOT/$wrapper" \
-            || { echo "FAIL: $wrapper never reads manifest key $k"; fail=1; }
+            || { echo "FAIL: $wrapper never reads handover key $k"; fail=1; }
     done
-    grep -q "$prefix-\\\$DEVICE-manifest.txt" "$ROOT/$dir/build-in-vm.sh" \
-        || { echo "FAIL: $dir/build-in-vm.sh manifest filename drifted"; fail=1; }
-    grep -q "$prefix-\\\$DEVICE-manifest.txt" "$ROOT/$wrapper" \
-        || { echo "FAIL: $wrapper manifest filename drifted"; fail=1; }
-    echo "  $prefix manifest contract: ok"
+    echo "  $family handover contract: ok"
 }
 
-manifest_keys device/oppo-mt6877 build-oppo.sh oppo
-manifest_keys device/lg-k20plus build-lg.sh lg
+handover_keys device/oppo-mt6877 build-oppo.sh oppo
+handover_keys device/lg-k20plus build-lg.sh lg
 
 [ "$fail" -eq 0 ] && echo "PASS: artifact layout"
 exit "$fail"

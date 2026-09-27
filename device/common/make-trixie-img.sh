@@ -37,5 +37,8 @@ mke2fs -q -F -t ext4 -L "$LABEL" -d "$ROOTFS" "$OUTPUT" "${img_kb}k"
 if command -v e2fsck >/dev/null; then
     e2fsck -n -f "$OUTPUT" >/dev/null
 fi
-bytes="$(stat -f %z "$OUTPUT" 2>/dev/null || stat -c %s "$OUTPUT")"
+# GNU first: on Linux `stat -f' means filesystem mode and SUCCEEDS, printing
+# a filesystem dump instead of the size. (BSD `stat -c' fails, so macOS
+# still falls through to the second spelling.)
+bytes="$(stat -c %s "$OUTPUT" 2>/dev/null || stat -f %z "$OUTPUT")"
 echo "make-trixie-img: $OUTPUT ($bytes bytes, rootfs used ${used_kb}k, label $LABEL)"

@@ -49,9 +49,11 @@ lists the family.
 
 ## Boot
 
-`fastboot flash boot lg-lv517-boot.img`, with `lg-lv517-trixie.img`
-written (dd/fastboot) onto a `ROOTFS`-labelled partition big enough to
-hold it (`lg-lv517-rootfs.tar.gz` is the unpack-once alternative).
+One `MixOS_arm64_trixie_<commit>.img` per device: a GPT container with
+the Android boot.img bytes (p1, BOOT) and the ext4 rootfs (p2, ROOTFS).
+Split it with the `dd` lines the build prints, `fastboot flash boot` the
+boot part, and `dd` the rootfs onto a `ROOTFS`-labelled partition big
+enough to hold it. Never write the container to the eMMC whole.
 Command-line words (default on):
 
 - `lg.audio=1` / `lg.wifi=1` / `lg.modem=1` / `lg.power=1`

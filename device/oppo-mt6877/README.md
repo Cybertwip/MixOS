@@ -40,9 +40,11 @@ adding a device is one row there plus its panel/touch extracts in `board/`.
 
 ## Boot
 
-`fastboot flash boot oppo-20181-boot.img`, with `oppo-20181-trixie.img`
-written (dd/fastboot) onto a `ROOTFS`-labelled partition big enough to
-hold it (`oppo-20181-rootfs.tar.gz` is the unpack-once alternative).
+One `MixOS_arm64_trixie_<commit>.img` per device: a GPT container with
+the Android boot.img bytes (p1, BOOT) and the ext4 rootfs (p2, ROOTFS).
+Split it with the `dd` lines the build prints, `fastboot flash boot` the
+boot part, and `dd` the rootfs onto a `ROOTFS`-labelled partition big
+enough to hold it. Never write the container to the eMMC whole.
 The LK hands over with the panel lit;
 `simple-framebuffer` adopts it, `/init` loads the `oppo.*` payload and
 switches root. Command-line words (all default on in `boot.img`):
