@@ -80,7 +80,12 @@
 /* General-purpose timer [mt6735] APXGPT_BASE + mt_gpt.h offsets. GPT4 runs
  * the menu clock at 13 MHz sys clock, powered by PERICFG bit 13
  * ([mt6735] mt_gpt.c gpt_power_on). Second choice after the ARM arch
- * timer, which needs no SoC facts at all -- see mt67xx_timer.c. */
+ * timer, which needs no SoC facts at all -- see mt67xx_timer.c. The HAS
+ * flag below compiles the GPT attempt out on families whose GPT base is
+ * still ungrounded (a power-bit write to the wrong PERICFG address is
+ * clock chaos, not a clean miss): same structure everywhere, per-family
+ * facts. */
+#define MT67XX_HAS_GPT 1
 #define MT67XX_APXGPT_BASE 0x10004000u
 #define MT67XX_GPT4_CON (MT67XX_APXGPT_BASE + 0x40u)
 #define MT67XX_GPT4_CLK (MT67XX_APXGPT_BASE + 0x44u)
@@ -93,9 +98,13 @@
 /* Watchdog [mt6735] platform.c:70-71 writes 0x22000000 to TOPRGU_BASE to
  * disable it. The K20 LK parks with a heartbeat instead of kicking, so a
  * live watchdog would reset-loop the board -- this write is what makes
- * silence mean "UART wrong" rather than "resetting too fast to print". */
+ * silence mean "UART wrong" rather than "resetting too fast to print".
+ * HAS_WDT 0 (see the mt68xx tree) compiles the write out where the base
+ * is ungrounded: a blind write to a reset-adjacent register is worse than
+ * the diagnosable reset loop it avoids. */
 #define MT67XX_TOPRGU_BASE 0x10212000u
 #define MT67XX_WDT_DISABLE_KEY 0x22000000u
+#define MT67XX_HAS_WDT 1
 
 /* Where the preloader loads this image and branches to it [mt6735] target
  * MEMBASE. Preloader-defined per device, so this is the load-bearing prior:

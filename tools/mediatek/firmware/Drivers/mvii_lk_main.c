@@ -4472,10 +4472,5 @@ void mvii_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
      */
     lk_power_telemetry("emmc-jump");
     lk_mark(MT6592_BOOT_STATUS_STAGE_LK_HANDOFF, "lk: jumping to the boot.img kernel\n", LK_BEACON_HANDOFF);
-    /* After the last eMMC write and with nothing after it: the stock kernel
-     * cannot feed the 4 s charger timer across decompression and driver
-     * probe, so leaving it armed is a reset a few seconds past the jump.
-     * The kernel re-arms per its own charging policy once it is up. */
-    mt6592_pmic_charger_watchdog_disarm();
     mvii_lk_jump_to_kernel(img.kernel_entry, (uint32_t)MVII_MT6592_LK_MACHTYPE, img.tags_addr);
 }

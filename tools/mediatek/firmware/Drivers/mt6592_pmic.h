@@ -356,13 +356,6 @@ void mt6592_pmic_service(void);
  * they all mean "service the PMIC"; it is a straight alias, not a subset. */
 void mt6592_pmic_charger_service(void);
 
-/* Stop the charger watchdog timer. The kernel owns charger policy once it is
- * up and re-arms per its own rules; nothing can feed the timer across the
- * jump, so a handoff that leaves it armed is a reset a few seconds in. Call
- * this immediately before the jump: any eMMC traffic after it re-arms the
- * timer via power_hold(). */
-void mt6592_pmic_charger_watchdog_disarm(void);
-
 /*
  * Called by the heavy paths on the way IN — a card read, an app launch, a Wi-Fi
  * scan — each of which steps the board's draw up sharply, with nothing between

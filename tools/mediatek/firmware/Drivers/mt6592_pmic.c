@@ -3406,15 +3406,6 @@ void mt6592_pmic_charger_service(void) {
     mt6592_pmic_service();
 }
 
-void mt6592_pmic_charger_watchdog_disarm(void) {
-    /* Log FIRST: any eMMC traffic after the write -- telemetry, a stage
-     * mark, even this line's own flush -- re-arms the timer behind our
-     * back, because every eMMC transfer opens with power_hold(). The
-     * register write below must be the last PMIC touch before the jump. */
-    plog("pmic: disarming charger watchdog for the kernel handoff\n");
-    charger_watchdog_disarm();
-}
-
 /*
  * The load-step hook. Card reads, app launches, Wi-Fi scans: each steps the
  * board's draw up sharply, and with no cell fitted there is nothing between that
