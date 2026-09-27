@@ -7,7 +7,7 @@
 # MixOS image), but with NO out-of-tree drivers, NO subsystem DTS nodes
 # and NO firmware staging yet: every hardware fact those need is still
 # unknown, and this script emits nothing it cannot source. It builds; it
-# does not boot. The wrapper refuses to run it without OPPO_A77_4G_4G_BRINGUP_ACK=1.
+# does not boot. The wrapper refuses to run it without OPPO_A77_4G_BRINGUP_ACK=1.
 #
 # Environment (all set by build-oppo-a77-4g.sh): A77_4G_BUILD_DIR, A77_4G_WORK_DIR,
 # A77_4G_EXPORT_DIR, A77_4G_DEVICE (default cph2385), A77_4G_FULL_IMAGE_NAME,

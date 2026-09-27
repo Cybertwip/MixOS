@@ -8,7 +8,7 @@ set -u
 
 ROOT="$(cd -- "$(dirname -- "$0")/../../.." && pwd)"
 fail=0
-if ! grep -q "OPPO_A77_4G_4G_BRINGUP_ACK" "$ROOT/build-oppo-a77-4g.sh"; then
+if ! grep -q "OPPO_A77_4G_BRINGUP_ACK" "$ROOT/build-oppo-a77-4g.sh"; then
     echo "FAIL: ACK gate missing"; fail=1
 else
     echo "  ACK gate: ok"

@@ -12,7 +12,7 @@ fail=0
 for d in $(a77_4g_devices); do
     info="$(a77_4g_device_info "$d")" || { echo "FAIL: $d rejected"; fail=1; continue; }
     eval "$info"
-    want="$(printf '%s\n' "$OPPO_A77_4G_4G_DEVICES" | grep -m1 "^${d}|" | cut -d'|' -f8)"
+    want="$(printf '%s\n' "$OPPO_A77_4G_DEVICES" | grep -m1 "^${d}|" | cut -d'|' -f8)"
     if [ "${A77_4G_DEVICE:-}" != "$d" ] || [ "${A77_4G_NOTES:-}" != "$want" ]; then
         echo "FAIL: $d mangled through eval (got: $A77_4G_NOTES)"
         fail=1

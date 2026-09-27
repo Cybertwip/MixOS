@@ -5,7 +5,7 @@ MixOS for the CPH2385 (Helio G35 / MT6765, 6.56in 720x1612 60Hz,
 yet**: every hardware fact the drivers and subsystem nodes need is
 still unknown, and nothing here invents any. Read `BRINGUP.md` before
 anything else; the wrapper refuses to build without
-`OPPO_A77_4G_4G_BRINGUP_ACK=1`.
+`OPPO_A77_4G_BRINGUP_ACK=1`.
 
 ## Status
 
@@ -30,7 +30,7 @@ same-vendor expectations), `tests/`, `BRINGUP.md` (the playbook).
 
 ## Build
 
-`OPPO_A77_4G_4G_BRINGUP_ACK=1 sh ./build-oppo-a77-4g.sh` -- lands one
+`OPPO_A77_4G_BRINGUP_ACK=1 sh ./build-oppo-a77-4g.sh` -- lands one
 `MixOS_arm64_trixie_<commit>.img` in
 `MixOS-Artifacts/oppo/<device>/`. `--mix-only` exports `boot/`
 (boot.img + DTB + DTS source) for inspection and `fastboot boot`

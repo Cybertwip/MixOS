@@ -97,4 +97,4 @@ if [[ "${#MISSING[@]}" -gt 0 ]]; then
 fi
 echo
 echo "All blobs extracted. Build with:"
-echo "  A77_4G_FIRMWARE_DIR=$OUT OPPO_A77_4G_4G_BRINGUP_ACK=1 sh ./build-oppo-a77-4g.sh"
+echo "  A77_4G_FIRMWARE_DIR=$OUT OPPO_A77_4G_BRINGUP_ACK=1 sh ./build-oppo-a77-4g.sh"

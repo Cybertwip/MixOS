@@ -5,17 +5,19 @@
 #         a77_4g_devices                    # prints supported codenames, one per line
 #
 # Columns: codename|soc|pmic|arch|mem_mb|width|height|notes
-#   mem_mb/width/height come from retail specs (GSMArena + launch coverage:
-#   6.56in 720x1612 60Hz, Helio G35, 4 or 6GB RAM, Android 12), NOT from
-#   hardware. Two rows because RAM ships in two sizes: the 4GB row is the
-#   default (safe direction -- describing less RAM than exists only wastes
-#   it; describing more crashes). Confirm your unit in Settings > About
-#   (BRINGUP.md step 0) and pick the matching row. Panel/touch models are
-#   still unknown (BRINGUP.md step 2 resolves them from the stock DTB).
+#   mem_mb/width/height come from retail specs (seller listings + launch
+#   coverage: 6.56in 720x1612 60Hz, Helio G35 (MT6765), 3 or 4GB RAM,
+#   Android 12 ColorOS 12.1), NOT from hardware. Two rows because RAM ships
+#   in two sizes: the 3GB row is the default (safe direction -- describing
+#   less RAM than exists only wastes it; describing more crashes). Confirm
+#   your unit in Settings > About (BRINGUP.md step 0) and pick the matching
+#   row. PMIC is the standard MT6765 pairing (confirm from stock DTB).
+#   Panel/touch models are still unknown (BRINGUP.md step 2 resolves them
+#   from the stock DTB).
 
-OPPO_A77_4G_4G_DEVICES='
-cph2385|mt6765|unknown|arm64|4096|720|1612|OPPO A77 4G (CPH2385) 4GB: Helio G35 (MT6765), 6.56in 720x1612, 4GB/64GB, Android 12 (default row: safe on 6GB units too, wastes 2GB)
-cph2385-4gb|mt6765|unknown|arm64|6144|720|1612|OPPO A77 4G (CPH2385) 6GB: same phone, 6GB/128GB (use only if Settings > About says 6GB)
+OPPO_A77_4G_DEVICES='
+cph2385|mt6765|mt6357|arm64|3072|720|1612|OPPO A77 4G (CPH2385) 3GB: Helio G35 (MT6765), 6.56in 720x1612, 3GB/64GB, Android 12 (default row: safe on 4GB units too, wastes 1GB)
+cph2385-4gb|mt6765|mt6357|arm64|4096|720|1612|OPPO A77 4G (CPH2385) 4GB: same phone, 4GB/64-128GB (use only if Settings > About says 4GB)
 '
 
 # Single-quote one value for eval consumption. Works in POSIX sh and bash.
@@ -24,7 +26,7 @@ _a77_4g_quote() {
 }
 
 a77_4g_devices() {
-    printf '%s\n' "$OPPO_A77_4G_4G_DEVICES" | grep '|' | cut -d'|' -f1
+    printf '%s\n' "$OPPO_A77_4G_DEVICES" | grep '|' | cut -d'|' -f1
 }
 
 a77_4g_default_device() {
@@ -33,7 +35,7 @@ a77_4g_default_device() {
 
 a77_4g_device_info() {
     local want="$1" row
-    row="$(printf '%s\n' "$OPPO_A77_4G_4G_DEVICES" | grep -m1 "^${want}|")"
+    row="$(printf '%s\n' "$OPPO_A77_4G_DEVICES" | grep -m1 "^${want}|")"
     if [ -z "$row" ]; then
         echo "unknown A77 device '$want' (supported: $(a77_4g_devices | tr '\n' ' '))" >&2
         return 1

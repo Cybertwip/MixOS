@@ -5,7 +5,7 @@
 # modem.img, dsp.img, WIFI_RAM_CODE and WMT_SOC.cfg out of the vendor image
 # into ./stock/ (git-ignored). Usage:
 #   ./fetch-ofp.sh /path/to/CPH2385.ofp
-#   A77_4G_FIRMWARE_DIR=device/oppo-a77-4g/firmware/stock OPPO_A77_4G_4G_BRINGUP_ACK=1 sh ./build-oppo-a77-4g.sh
+#   A77_4G_FIRMWARE_DIR=device/oppo-a77-4g/firmware/stock OPPO_A77_4G_BRINGUP_ACK=1 sh ./build-oppo-a77-4g.sh
 #
 # The .ofp is OPPO's property (several GB, from the official firmware
 # downloads or a community mirror), so the download itself is a browser
@@ -89,4 +89,4 @@ fi
     done
 } > "$OUT/MANIFEST.txt"
 echo "-- $found files into $OUT"
-echo "Build with: A77_4G_FIRMWARE_DIR=$OUT OPPO_A77_4G_4G_BRINGUP_ACK=1 sh ./build-oppo-a77-4g.sh"
+echo "Build with: A77_4G_FIRMWARE_DIR=$OUT OPPO_A77_4G_BRINGUP_ACK=1 sh ./build-oppo-a77-4g.sh"

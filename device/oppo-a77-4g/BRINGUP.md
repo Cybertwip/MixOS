@@ -68,7 +68,7 @@ full image until login.
 
 ## Step 6 -- promote
 
-When login works: remove the `OPPO_A77_4G_4G_BRINGUP_ACK` gate, promote
+When login works: remove the `OPPO_A77_4G_BRINGUP_ACK` gate, promote
 the family into `build-mixos.sh`'s default plan (it is `--only`
 opt-in today), extend the wifi-bringup-style checks, and update this
 file into history (what each fact turned out to be, with sources).
