@@ -193,6 +193,8 @@ func (p *scriptPort) WriteAll(data []byte, _ time.Duration) error {
 
 func (p *scriptPort) DiscardInput(_ time.Duration) error { return nil }
 
+func (p *scriptPort) Close() error { return nil }
+
 func (p *scriptPort) ReadExact(n int, _ time.Duration) ([]byte, error) {
 	if len(p.pending) < n {
 		return nil, errors.New("script exhausted")
@@ -227,11 +229,11 @@ func TestSendAuth(t *testing.T) {
 
 	t.Run("accepted", func(t *testing.T) {
 		var replies []byte
-		replies = append(replies, mtkCmdSendAuth)      // echo
-		replies = append(replies, be32(2)...)          // length round-trip
-		replies = append(replies, be16(0x0000)...)     // status: proceed
-		replies = append(replies, be16(0x1234)...)     // crc (informational)
-		replies = append(replies, be16(0x0000)...)     // final status
+		replies = append(replies, mtkCmdSendAuth)  // echo
+		replies = append(replies, be32(2)...)      // length round-trip
+		replies = append(replies, be16(0x0000)...) // status: proceed
+		replies = append(replies, be16(0x1234)...) // crc (informational)
+		replies = append(replies, be16(0x0000)...) // final status
 		client, port := newClient(replies)
 		if err := client.sendAuth(blob); err != nil {
 			t.Fatalf("sendAuth = %v, want nil", err)
