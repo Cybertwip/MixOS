@@ -115,6 +115,18 @@ darkos_artifact_dir() {
     printf '%s\n' "$current"
 }
 
+# darkos_model_artifact_dir BASE FAMILY MODEL
+#
+# One directory per model, so no two builds share a filename: every family
+# wrapper lands its deliverables in MixOS-Artifacts/<family>/<model>/ and
+# nowhere else. The families are oppo and lg (MODEL is the device codename:
+# 20181, lv517, ...) and qbuy (MODEL is the console: j36-ultra, r36-ultra).
+# A single function rather than four spellings, because the fourth spelling
+# is the one that drifts out of the layout.
+darkos_model_artifact_dir() {
+    printf '%s/%s/%s\n' "$1" "$2" "$3"
+}
+
 # darkos_report_stale_images DIR KEEP_NAME
 #
 # One image per commit means the artifact directory grows by another 8 GB every time a
@@ -137,6 +149,27 @@ darkos_report_stale_images() {
     done
     if (( n )); then
         darkos_warn "$n older image(s) in $dir; delete the ones you no longer flash"
+    fi
+    return 0
+}
+
+# darkos_warn_layout_strays BASE
+#
+# Leftovers from before the <family>/<model>/ layout -- root-level card
+# images, oppo-<device>/ and lg-<device>/ directories, the old j36-ultra/
+# mix-only dir -- are inert: new builds neither read nor write them. But
+# they look like current outputs, which is exactly the confusion the layout
+# exists to end, so they get named once and the operator moves or deletes
+# them. New family dirs (oppo/, lg/, qbuy/) never match the globs below.
+darkos_warn_layout_strays() {
+    local base=$1 stray n=0
+    for stray in "$base"/MixOS_*.img "$base"/oppo-* "$base"/lg-* "$base"/j36-ultra; do
+        [[ -e "$stray" ]] || continue
+        n=$((n + 1))
+        darkos_log "  pre-layout leftover: $(basename "$stray")"
+    done
+    if (( n )); then
+        darkos_warn "$n file(s) in $base predate the <family>/<model>/ layout and are ignored by new builds; move or delete them."
     fi
     return 0
 }

@@ -49,8 +49,10 @@ lists the family.
 
 ## Boot
 
-`fastboot flash boot lg-lv517-boot.img`, rootfs unpacked once onto a
-`ROOTFS`-labelled partition. Command-line words (default on):
+`fastboot flash boot lg-lv517-boot.img`, with `lg-lv517-trixie.img`
+written (dd/fastboot) onto a `ROOTFS`-labelled partition big enough to
+hold it (`lg-lv517-rootfs.tar.gz` is the unpack-once alternative).
+Command-line words (default on):
 
 - `lg.audio=1` / `lg.wifi=1` / `lg.modem=1` / `lg.power=1`
 - `lg.device=lv517` / `lg.panel=lg4894` (informational)

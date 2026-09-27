@@ -40,8 +40,10 @@ adding a device is one row there plus its panel/touch extracts in `board/`.
 
 ## Boot
 
-`fastboot flash boot oppo-20181-boot.img`, with the rootfs unpacked once
-onto a `ROOTFS`-labelled partition. The LK hands over with the panel lit;
+`fastboot flash boot oppo-20181-boot.img`, with `oppo-20181-trixie.img`
+written (dd/fastboot) onto a `ROOTFS`-labelled partition big enough to
+hold it (`oppo-20181-rootfs.tar.gz` is the unpack-once alternative).
+The LK hands over with the panel lit;
 `simple-framebuffer` adopts it, `/init` loads the `oppo.*` payload and
 switches root. Command-line words (all default on in `boot.img`):
 

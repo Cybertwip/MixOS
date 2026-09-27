@@ -9,8 +9,9 @@
 # deliverable is a phone boot image, not an SD card image, so there is no R36
 # base to resume:
 #
-#   ./build-lg.sh              boot.img + Debian rootfs tarball, one per
-#                                device, into MixOS-Artifacts/
+#   ./build-lg.sh              boot.img + trixie.img + rootfs tarball,
+#                                one model dir per device, into
+#                                MixOS-Artifacts/lg/<device>/
 #   ./build-lg.sh --mix-only   board specifics only (boot/ + root/ dirs)
 #   LG_DEVICE=lv517-rev0 ./build-lg.sh
 #   ./build-lg.sh --list-devices
@@ -49,7 +50,7 @@ VM_DISK="${DARKOS_VM_DISK:-160G}"
 UBUNTU_IMAGE="${DARKOS_UBUNTU_IMAGE:-24.04}"
 BASE_ARTIFACT_DIR="${MIXOS_ARTIFACT_DIR:-${DARKOS_ARTIFACT_DIR:-$(darkos_artifact_dir "$ROOT")}}"
 DEVICE="${LG_DEVICE:-$(lg_default_device)}"
-ARTIFACT_DIR="$BASE_ARTIFACT_DIR/lg-$DEVICE"
+ARTIFACT_DIR="$(darkos_model_artifact_dir "$BASE_ARTIFACT_DIR" lg "$DEVICE")"
 MIX_ONLY=0
 COMPRESS=0
 VM_SOURCE_MOUNT="/mnt/darkos-host"
@@ -63,7 +64,7 @@ Usage: ./build-lg.sh [--mix-only | --compress] [--device CODENAME] [--list-devic
 
 Builds the LG phone layer for one device (default: $DEVICE) in the $VM_NAME VM.
 
-    ./build-lg.sh              boot.img + rootfs tarball into $BASE_ARTIFACT_DIR
+    ./build-lg.sh              boot.img + trixie.img + rootfs tarball into $ARTIFACT_DIR
     ./build-lg.sh --mix-only   board specifics only, into $ARTIFACT_DIR:
                                      boot/   boot.img + DTB (fastboot + inspection)
                                      root/   /opt/mixos payload + manifest
@@ -94,7 +95,7 @@ if [[ "$MIX_ONLY" == 1 && "$COMPRESS" == 1 ]]; then
 fi
 DEVICE_INFO="$(lg_device_info "$DEVICE")" || exit 1
 eval "$DEVICE_INFO"
-ARTIFACT_DIR="$BASE_ARTIFACT_DIR/lg-$DEVICE"
+ARTIFACT_DIR="$(darkos_model_artifact_dir "$BASE_ARTIFACT_DIR" lg "$DEVICE")"
 
 [[ "$(uname -s)" == "Darwin" ]] || darkos_die "run this wrapper on macOS"
 if [[ "$COMPRESS" == 1 ]]; then
@@ -109,6 +110,14 @@ darkos_vm_remount "$VM_NAME" "$ROOT:$VM_SOURCE_MOUNT"
 darkos_vm_refuse_concurrent_build "$VM_NAME"
 darkos_vm_sync_checkout "$VM_NAME" "$VM_SOURCE_MOUNT" "$VM_BUILD_DIR"
 
+# Layout migration, same rule as darkos_artifact_dir: this device's old
+# lg-<device>/ dir follows the build to lg/<device>/ instead of being
+# left behind to look like a current output.
+if [[ ! -d "$ARTIFACT_DIR" && -d "$BASE_ARTIFACT_DIR/lg-$DEVICE" ]]; then
+    darkos_log "Moving $BASE_ARTIFACT_DIR/lg-$DEVICE to $ARTIFACT_DIR"
+    mkdir -p "$BASE_ARTIFACT_DIR/lg"
+    mv -- "$BASE_ARTIFACT_DIR/lg-$DEVICE" "$ARTIFACT_DIR"
+fi
 mkdir -p "$ARTIFACT_DIR"
 darkos_vm_remount "$VM_NAME" "$ARTIFACT_DIR:$VM_ARTIFACT_MOUNT"
 VM_EXPORT_DIR="$VM_ARTIFACT_MOUNT"
@@ -137,6 +146,7 @@ if [[ "$BUILD_RC" != 0 ]]; then
     darkos_warn "The LG $DEVICE layer FAILED (exit $BUILD_RC). NOTHING WAS HANDED OVER."
     exit "$BUILD_RC"
 fi
+darkos_warn_layout_strays "$BASE_ARTIFACT_DIR"
 
 # ── Handing over: the VM wrote into the mounted artifact dir, so verify ─────
 # from this side of the mount (same lesson as the J36 wrapper: a copy that
@@ -144,10 +154,12 @@ fi
 MANIFEST="$ARTIFACT_DIR/lg-$DEVICE-manifest.txt"
 [[ -f "$MANIFEST" ]] || darkos_die "the build reported success but wrote no manifest"
 BOOTIMG=""
+TRIXIEIMG=""
 ROOTFS=""
 while IFS='=' read -r key value; do
     case "$key" in
         bootimg) BOOTIMG="$value" ;;
+        trixieimg) TRIXIEIMG="$value" ;;
         rootfs) ROOTFS="$value" ;;
     esac
 done < "$MANIFEST"
@@ -162,18 +174,20 @@ if [[ "$MIX_ONLY" == 1 ]]; then
     darkos_log "No rootfs was built. Run ./build-lg.sh with no flag for that."
 else
     [[ -f "$ARTIFACT_DIR/$BOOTIMG" ]] || darkos_die "missing $ARTIFACT_DIR/$BOOTIMG"
+    [[ -f "$ARTIFACT_DIR/$TRIXIEIMG" ]] || darkos_die "missing $ARTIFACT_DIR/$TRIXIEIMG"
     [[ "$ROOTFS" == none || -f "$ARTIFACT_DIR/$ROOTFS" ]] \
         || darkos_die "missing $ARTIFACT_DIR/$ROOTFS"
     if [[ "$COMPRESS" == 1 ]]; then
         (cd -- "$ARTIFACT_DIR" && rm -f "lg-$DEVICE.part.zip" \
-            && zip -9 -q "lg-$DEVICE.part.zip" "$BOOTIMG" "$ROOTFS" \
+            && zip -9 -q "lg-$DEVICE.part.zip" "$BOOTIMG" "$TRIXIEIMG" "$ROOTFS" \
             && unzip -tqq "lg-$DEVICE.part.zip" \
             && mv -f "lg-$DEVICE.part.zip" "lg-$DEVICE.zip") \
             || darkos_die "compression failed"
         darkos_log "Compressed copy: $ARTIFACT_DIR/lg-$DEVICE.zip"
     fi
     darkos_log "Flash this: fastboot flash boot $ARTIFACT_DIR/$BOOTIMG"
+    darkos_log "Write this onto the phone's ROOTFS partition (PARTLABEL=ROOTFS, must hold $(du -h "$ARTIFACT_DIR/$TRIXIEIMG" | awk '{print $1}')): $ARTIFACT_DIR/$TRIXIEIMG"
     if [[ "$ROOTFS" != none ]]; then
-        darkos_log "Unpack once onto the phone's ROOTFS partition: $ARTIFACT_DIR/$ROOTFS"
+        darkos_log "Unpack-once alternative for a rooted shell or recovery: $ARTIFACT_DIR/$ROOTFS"
     fi
 fi

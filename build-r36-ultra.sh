@@ -55,8 +55,17 @@ UBUNTU_IMAGE="${DARKOS_UBUNTU_IMAGE:-24.04}"
 # failure mode of dropping it is silent -- the build would write to the default and the
 # override would simply not happen.  darkos_artifact_dir supplies the default and moves
 # an older *-artifacts directory to it; see the note there for why moving matters.
-ARTIFACT_DIR="${MIXOS_ARTIFACT_DIR:-${DARKOS_ARTIFACT_DIR:-$(darkos_artifact_dir "$SCRIPT_DIR")}}"
+BASE_ARTIFACT_DIR="${MIXOS_ARTIFACT_DIR:-${DARKOS_ARTIFACT_DIR:-$(darkos_artifact_dir "$SCRIPT_DIR")}}"
+ARTIFACT_DIR="$(darkos_model_artifact_dir "$BASE_ARTIFACT_DIR" qbuy r36-ultra)"
 BOOT_PAYLOAD_DIR="${DARKOS_R36_BOOT_PAYLOAD:-${ARTIFACT_DIR}/Reference/BOOT}"
+# The reference payload moved with the model dir, and a rename migrates
+# rather than orphans (see darkos_artifact_dir): an existing Reference/ at
+# the artifacts root follows the build to its new home.
+if [[ ! -d "$ARTIFACT_DIR/Reference" && -d "$BASE_ARTIFACT_DIR/Reference" ]]; then
+    darkos_log "Moving $BASE_ARTIFACT_DIR/Reference to $ARTIFACT_DIR/Reference"
+    mkdir -p "$ARTIFACT_DIR"
+    mv -- "$BASE_ARTIFACT_DIR/Reference" "$ARTIFACT_DIR/Reference"
+fi
 DEBIAN_RELEASE="${DEBIAN_CODE_NAME:-trixie}"
 USERSPACE_ARCH="${USERSPACE_ARCH:-armhf}"
 BUILD_JOBS="${BUILD_JOBS:-8}"
@@ -264,5 +273,6 @@ darkos_log "Artifacts: ${ARTIFACT_DIR}"
 if [[ "$DEFER_IMAGE_COPY" == 0 ]]; then
     darkos_log "Flash this: ${ARTIFACT_DIR}/${BASE_IMAGE_NAME}"
     darkos_report_stale_images "$ARTIFACT_DIR" "$BASE_IMAGE_NAME"
+    darkos_warn_layout_strays "$BASE_ARTIFACT_DIR"
 fi
 darkos_warn "This is the RG351MP/RK3326 base image. It does not yet contain the R36 Ultra-specific DTB layer."

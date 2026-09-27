@@ -212,7 +212,7 @@ of `mvii/boot.conf`; remove that word to turn off diagnostics in a normal build.
 **The full build ships one file**, and it is not in this directory:
 
 ```text
-../MixOS-Artifacts/MixOS_armhf_trixie_<commit>.img
+../MixOS-Artifacts/qbuy/j36-ultra/MixOS_armhf_trixie_<commit>.img
 ```
 
 Both payloads are already folded into it — the launcher into the vfat `BOOT`
@@ -228,8 +228,8 @@ already contains, and having them sit next to a flashable image is how a stale o
 gets picked up:
 
 ```text
-../MixOS-Artifacts/j36-ultra/boot/   -> the card's BOOT partition (vfat)
-../MixOS-Artifacts/j36-ultra/root/   -> the card's OS partition (ext2)
+../MixOS-Artifacts/qbuy/j36-ultra/boot/   -> the card's BOOT partition (vfat)
+../MixOS-Artifacts/qbuy/j36-ultra/root/   -> the card's OS partition (ext2)
 ```
 
 `--mix-only` builds no base image and touches none, which is the whole point of it:

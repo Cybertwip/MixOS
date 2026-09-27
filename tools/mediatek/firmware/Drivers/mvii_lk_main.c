@@ -232,10 +232,49 @@ static void lk_log_hex(const char* label, uint32_t value) {
     static const char kHex[] = "0123456789abcdef";
     buf[0] = '0';
     buf[1] = 'x';
-    for (uint32_t i = 0; i < 8u; ++i) buf[2u + i] = kHex[(value >> (28u - 4u * i)) & 0xfu];
+    for (uint32_t i = 0u; i < 8u; ++i) buf[2u + i] = kHex[(value >> (28u - 4u * i)) & 0xfu];
     buf[10] = 0;
     lk_log(label);
     lk_log(buf);
+    lk_log("\n");
+}
+
+static void lk_log_u16hex(uint32_t value) {
+    char buf[5];
+    static const char kHex[] = "0123456789abcdef";
+    buf[0] = kHex[(value >> 12u) & 0xfu];
+    buf[1] = kHex[(value >> 8u) & 0xfu];
+    buf[2] = kHex[(value >> 4u) & 0xfu];
+    buf[3] = kHex[value & 0xfu];
+    buf[4] = 0;
+    lk_log(buf);
+}
+
+/* One power line in the boot log at each stage that can cut the rail:
+ * `lk: pwr <stage> <vbat> <ma> <vchr> <online> <pct>`, each four hex digits,
+ * negatives wrapped to 16 bits. When a boot loops with the splash flashing,
+ * the last of these lines says whether the rail sagged (mV diving, current
+ * flowing out) or held (the hang is software). One published-state read; if
+ * the driver has nothing yet the line says so and costs nothing. */
+static void lk_power_telemetry(const char* stage) {
+    mt6592_pmic_battery_t bat;
+
+    lk_log("lk: pwr ");
+    lk_log(stage);
+    if (mt6592_pmic_battery_read(&bat) != 0) {
+        lk_log(" ??\n");
+        return;
+    }
+    lk_log(" ");
+    lk_log_u16hex((uint32_t)bat.battery_mv);
+    lk_log(" ");
+    lk_log_u16hex((uint32_t)bat.current_ma);
+    lk_log(" ");
+    lk_log_u16hex((uint32_t)bat.charger_mv);
+    lk_log(" ");
+    lk_log_u16hex((uint32_t)bat.charger_online);
+    lk_log(" ");
+    lk_log_u16hex((uint32_t)bat.battery_percent);
     lk_log("\n");
 }
 
@@ -1175,13 +1214,16 @@ static void lk_fb_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t 
     }
 }
 
+#ifdef MVII_MT6592_LK_SD_HANDOFF
 /* Snapshot one box from the live canvas into the shadow, so a translucent
  * compose blends over the real picture instead of stale DRAM. The reverse of
  * lk_fb_blit_live(), clipped the same way, and -- like the blit -- it names
  * both ends explicitly rather than following g_draw_base: it IS the transfer.
  * Repaints reuse it as an eraser: the live box already holds the last
  * presented composite, so re-snapshotting a text row restores the blended
- * background under it without the painter remembering any color. */
+ * background under it without the painter remembering any color. Only the
+ * boot-choice menu uses this and the blend below, which is what the guard
+ * is for. */
 static void lk_fb_snapshot_live(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     const uint32_t stride = (uint32_t)MVII_MT6592_LK_FB_PITCH / 4u;
     const volatile uint32_t* src = (const volatile uint32_t*)(uintptr_t)MVII_MT6592_LK_FB_ADDR;
@@ -1220,6 +1262,7 @@ static void lk_fb_blend_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uin
         }
     }
 }
+#endif /* MVII_MT6592_LK_SD_HANDOFF */
 
 static void lk_fb_glyph(uint32_t index, uint32_t x, uint32_t y, uint32_t scale, uint32_t argb) {
     for (uint32_t row = 0; row < 5u; ++row) {
@@ -2124,11 +2167,28 @@ static uint32_t lk_ms_since(uint32_t ticks) {
  * frozen there through the load and the kernel's own bring-up.
  */
 static void lk_park_handoff(int clear) {
+    uint32_t pct;
+
+    lk_power_telemetry("handoff-pre");
     if (clear) lk_fb_fill(0xff000000u);
     mt6592_pmic_power_hold();
+    /* Ramp, not step, from the resting level the splash, menu and park all
+     * share. The jump to full is the largest single load this loader makes,
+     * and on a weak cell or a marginal cable the step is a UVLO cut -- a
+     * reboot that looks exactly like a boot loop. Twenty points at a time
+     * with the PMIC held and the charger serviced between them costs a sixth
+     * of a second and lets the rail follow instead of falling; the key press
+     * still gets its brightening, just smoothly. */
+    for (pct = (uint32_t)MVII_MT6592_LK_PARK_BACKLIGHT_PCT + 20u;
+         pct < (uint32_t)MVII_MT6592_LK_HANDOFF_BACKLIGHT_PCT; pct += 20u) {
+        mt6592_backlight_reassert(pct);
+        lk_park_hold_ms(50u);
+        mt6592_pmic_power_hold();
+    }
     mt6592_backlight_reassert(MVII_MT6592_LK_HANDOFF_BACKLIGHT_PCT);
     mt6592_pmic_power_hold();
     mt6592_led_battery_indicate();
+    lk_power_telemetry("handoff-post");
 }
 
 /*
@@ -2182,6 +2242,7 @@ static void lk_charge_park(void) {
      * truthy, so a plain `!bat.charger_online' would read "not determined yet" as
      * "plugged in" and park on it.
      */
+    lk_power_telemetry("park-enter");
     if (mt6592_pmic_battery_read(&bat) != 0 || bat.charger_online != 1) {
         /* Not plugged (or the PMIC cannot say). Boot straight through — this is
          * the "not plugged and battery" case and also the only safe thing to do
@@ -3994,6 +4055,7 @@ static uint32_t lk_bootmenu_run(void) {
     lk_park_hold_ms(LK_BOOTMENU_POLL_MS);
     (void)lk_kpd_scan(prev);
     prev_menu = lk_kpd_menu_down();
+    lk_power_telemetry("menu-enter");
 
     /* The dismiss restores exactly the save buffer; if the box ever outgrew
      * it the menu bows out instead of painting past the restore. */
@@ -4090,6 +4152,7 @@ static uint32_t lk_bootmenu_run(void) {
     lk_log_hex(" menu=", lk_kpd_menu_down());
     lk_log_hex(" after_ms=", elapsed_ms);
     lk_log(pressed != 0u ? " pick=android\n" : " pick=mixos-sd\n");
+    lk_power_telemetry("menu-exit");
     /* After the last live matrix read above: the loads below see pristine pads. */
     lk_bootmenu_quiesce();
     return pick;
@@ -4116,11 +4179,13 @@ static int lk_sd_boot(void) {
     from_script.initrd = 0;
     from_script.bootargs = 0;
 
+    lk_power_telemetry("sd-enter");
     if (mt6592_sd_probe() != MT6592_MSDC_OK) {
         lk_log("sd: no card in the slot; booting eMMC\n");
         return -1;
     }
     lk_log_hex("sd: card ready, sectors=", (uint32_t)mt6592_sd_capacity_sectors());
+    lk_power_telemetry("sd-probed");
 
     /*
      * The volume labelled BOOT first. On a dArkOS card the first FAT volume that
@@ -4220,6 +4285,7 @@ static int lk_sd_boot(void) {
     mt6592_pmic_power_hold();
     mt6592_pmic_charger_service();
 
+    lk_power_telemetry("sd-jump");
     lk_mark(MT6592_BOOT_STATUS_STAGE_LK_HANDOFF, "lk: jumping to the SD card kernel\n", LK_BEACON_HANDOFF);
 
     /*
@@ -4492,6 +4558,7 @@ void mvii_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
     }
 #endif
 
+    lk_power_telemetry("bootimg-enter");
     boot_rc = storage_rc == MT6592_MSDC_OK ? lk_load_boot_image(&img) : storage_rc;
     if (boot_rc != MT6592_MSDC_OK) {
         mt6592_bootstatus_set_error((uint32_t)boot_rc);
@@ -4522,6 +4589,7 @@ void mvii_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
      * the message field wholesale either: a board that stops downstream still
      * has this LK's entire boot log in the record, ending with the hand-off.
      */
+    lk_power_telemetry("emmc-jump");
     lk_mark(MT6592_BOOT_STATUS_STAGE_LK_HANDOFF, "lk: jumping to the boot.img kernel\n", LK_BEACON_HANDOFF);
     mvii_lk_jump_to_kernel(img.kernel_entry, (uint32_t)MVII_MT6592_LK_MACHTYPE, img.tags_addr);
 }

@@ -4,11 +4,15 @@
 #
 # Same architecture as the OPPO build (see device/oppo-mt6877/build-in-vm.sh
 # for the shape): kernel + generated DTB + out-of-tree modules + initramfs +
-# payload, incremental and checkpointed. The deliverable is the same pair:
+# payload, incremental and checkpointed. The deliverable is the same trio:
 #
 #   boot.img          `fastboot flash boot` (LK hands over, panel already on)
-#   rootfs.tar.gz     arm64 Debian with the QMI telephony userspace and
-#                     /opt/mixos/lg/<device>/, unpacked once onto PARTLABEL=ROOTFS
+#   trixie.img        the same arm64 Debian as an ext4 filesystem image for
+#                     the phone's ROOTFS partition (PARTLABEL=ROOTFS). A
+#                     filesystem image, not a disk image: the eMMC already
+#                     holds the bootloader's partition table, and a disk image
+#                     written to it would brick the phone.
+#   rootfs.tar.gz     the unpack-once alternative to trixie.img.
 #
 # Environment (all set by build-lg.sh): LG_BUILD_DIR, LG_WORK_DIR,
 # LG_EXPORT_DIR, LG_DEVICE (default lv517), LG_MIX_ONLY, LG_JOBS,
@@ -48,7 +52,7 @@ command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || {
     sudo apt-get update -qq
     sudo apt-get install -y -qq gcc-aarch64-linux-gnu make bc bison flex \
         libssl-dev libelf-dev dwarves python3 device-tree-compiler git \
-        debootstrap abootimg busybox-static 2>&1 | tail -n 2
+        debootstrap busybox-static cpio e2fsprogs 2>&1 | tail -n 2
 }
 
 # ── the device tree, first ──────────────────────────────────────────────────
@@ -211,6 +215,7 @@ log "boot.img: $(stat -c %s "$BOOTIMG") bytes"
 
 # ── the Debian rootfs (full builds only; checkpointed) ──────────────────────
 ROOTFS_TGZ="$ART/lg-$DEVICE-rootfs.tar.gz"
+TRIXIE_IMG="$ART/lg-$DEVICE-trixie.img"
 if [[ "$MIX_ONLY" == 1 ]]; then
     log "--mix-only: boot.img + payload only, no rootfs"
 else
@@ -247,6 +252,9 @@ else
         2>/dev/null || true
     ( cd "$WORK/rootfs" && sudo tar -czf "$ROOTFS_TGZ" . )
     log "rootfs: $(stat -c %s "$ROOTFS_TGZ") bytes"
+    # Under sudo like the tar: the tree is root-owned and mke2fs -d reads it.
+    sudo bash "$ROOT/device/common/make-trixie-img.sh" \
+        "$WORK/rootfs" "$TRIXIE_IMG" ROOTFS
 fi
 
 # ── hand-over ────────────────────────────────────────────────────────────────
@@ -256,8 +264,10 @@ fi
     echo "bootimg=lg-$DEVICE-boot.img"
     if [[ "$MIX_ONLY" == 1 ]]; then
         echo "rootfs=none"
+        echo "trixieimg=none"
     else
         echo "rootfs=lg-$DEVICE-rootfs.tar.gz"
+        echo "trixieimg=lg-$DEVICE-trixie.img"
     fi
 } > "$ART/lg-$DEVICE-manifest.txt"
 
@@ -268,6 +278,7 @@ if [[ "$MIX_ONLY" == 1 ]]; then
     cp "$ART/lg-$DEVICE-manifest.txt" "$EXPORT/"
 else
     mkdir -p "$EXPORT"
-    cp "$BOOTIMG" "$ROOTFS_TGZ" "$ART/lg-$DEVICE-manifest.txt" "$EXPORT/"
+    cp "$BOOTIMG" "$TRIXIE_IMG" "$ROOTFS_TGZ" \
+        "$ART/lg-$DEVICE-manifest.txt" "$EXPORT/"
 fi
 log "LG $DEVICE done"

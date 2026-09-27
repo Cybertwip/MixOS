@@ -89,7 +89,7 @@ BASE_ARTIFACT_DIR="${MIXOS_ARTIFACT_DIR:-${DARKOS_ARTIFACT_DIR:-$(darkos_artifac
 # Only --mix-only writes here, and it holds exactly two directories: boot/ and root/.
 # See the MIX_ONLY block below for why a full build leaves this untouched.  Hung off the
 # base directory rather than computed again, so an operator who moves one moves both.
-ARTIFACT_DIR="${J36_ARTIFACT_DIR:-${BASE_ARTIFACT_DIR}/j36-ultra}"
+ARTIFACT_DIR="${J36_ARTIFACT_DIR:-$(darkos_model_artifact_dir "$BASE_ARTIFACT_DIR" qbuy j36-ultra)}"
 RESUME_R36="${J36_RESUME_R36:-1}"
 MIX_ONLY=0
 # A full image can optionally be archived after it has crossed the VM boundary and
@@ -122,7 +122,7 @@ J36 Ultra layer on top of it in the same Multipass VM: $VM_NAME
 
     ./build-j36-ultra.sh              the finished article: one flashable image,
                                       both payloads folded into it, written to
-                                      $BASE_ARTIFACT_DIR
+                                      $ARTIFACT_DIR
 
     ./build-j36-ultra.sh --mix-only   the board specifics only -- kernel, DTB,
                                       modules, drivers, the mixdash dashboard,
@@ -160,7 +160,7 @@ J36 Ultra layer on top of it in the same Multipass VM: $VM_NAME
 
     ./build-j36-ultra.sh --compress   full build only.  After the final .img has
                                       both payloads folded in, has been copied to
-                                      $BASE_ARTIFACT_DIR and has passed the host
+                                      $ARTIFACT_DIR and has passed the host
                                       size check, also writes <image>.zip there
                                       using ZIP's maximum compression level (-9).
                                       The raw .img is retained for direct flashing.
@@ -284,13 +284,20 @@ fi
 # PowerEngine drivers; vendoring them removed both.
 #
 # WHY THE OUTPUT MOUNT IS --mix-only's ALONE.  A full build ships one file, the image,
-# and it goes to $BASE_ARTIFACT_DIR next to latest-image.txt.  It used to also rsync
-# twenty-odd intermediates into a j36-ultra/ directory -- boot.img, the bare zImage,
+# and it goes to $ARTIFACT_DIR next to latest-image.txt.  It used to also rsync
+# twenty-odd intermediates into the model directory -- boot.img, the bare zImage,
 # the cpio, the checksums -- all of which are already inside the image and none of
 # which anyone copies anywhere.  Having them sit next to a flashable image is how a
-# stale one gets picked up.  So the directory exists only when it is the deliverable,
-# and the mount only then too.
+# stale one gets picked up.  So boot/ and root/ exist only when they are the
+# deliverable, and the mount only then too.
 if [[ "$MIX_ONLY" == 1 ]]; then
+    # Layout migration, same rule as darkos_artifact_dir -- but only onto the
+    # default: with J36_ARTIFACT_DIR set, the old dir is the operator's to move.
+    if [[ -z "${J36_ARTIFACT_DIR:-}" && ! -d "$ARTIFACT_DIR" && -d "$BASE_ARTIFACT_DIR/j36-ultra" ]]; then
+        darkos_log "Moving $BASE_ARTIFACT_DIR/j36-ultra to $ARTIFACT_DIR"
+        mkdir -p "$BASE_ARTIFACT_DIR/qbuy"
+        mv -- "$BASE_ARTIFACT_DIR/j36-ultra" "$ARTIFACT_DIR"
+    fi
     mkdir -p "$ARTIFACT_DIR"
     darkos_vm_remount "$VM_NAME" "$ARTIFACT_DIR:$VM_ARTIFACT_MOUNT"
     VM_EXPORT_DIR="$VM_ARTIFACT_MOUNT"
@@ -356,7 +363,7 @@ multipass exec "$VM_NAME" -- env \
 
 if [[ "$BUILD_RC" != 0 ]]; then
     darkos_warn "The J36 Ultra layer FAILED (exit $BUILD_RC).  NOTHING WAS HANDED OVER."
-    darkos_warn "$BASE_ARTIFACT_DIR has not been written to by this run.  If an image is"
+    darkos_warn "$ARTIFACT_DIR has not been written to by this run.  If an image is"
     darkos_warn "sitting there it is from an earlier build and carries none of this checkout."
     darkos_warn "The failure itself is above; the build stops at the first command that fails."
     exit "$BUILD_RC"
@@ -371,13 +378,15 @@ fi
 # wrong way round is not a cosmetic bug: it is a card that boots to a Debian with no
 # /opt/mixos on it, and nothing in the log to say why.
 #
-# Into $BASE_ARTIFACT_DIR and not $ARTIFACT_DIR on purpose: latest-image.txt and the
-# per-file copy stamps are there, and one image in one place is the whole point -- two
-# images of which only one boots is the mistake being fixed.  Sharing copy_artifacts.sh's
-# stamp directory with the base wrapper is also what keeps this to one transfer per run.
+# Into $ARTIFACT_DIR -- the qbuy/j36-ultra model dir -- and not the artifacts root,
+# next to latest-image.txt: one model, one directory, one image in one place. Two
+# images of which only one boots is the mistake being fixed, and scattering them
+# across the root is how it happened. The copy stamps live in $DEST/.copy-stamps,
+# so the base wrapper keeping its own model dir costs no extra transfer; the one
+# transfer per run comes from DARKOS_DEFER_IMAGE_COPY, not from sharing a stamp dir.
 #
 # The manifest is read out of the VM rather than the artifact directory because in this
-# mode there is no artifact directory: nothing is exported except the image itself.
+# mode nothing is exported except the image itself.
 FLASH_IMAGE=""
 FLASH_PAYLOAD=""
 COMPRESSED_ARCHIVE=""
@@ -432,8 +441,8 @@ fi
 if [[ "$MIX_ONLY" == 1 ]]; then
     :
 elif [[ "$FLASH_PAYLOAD" == "in-image" && -n "$FLASH_IMAGE" && "$FLASH_IMAGE" != none ]]; then
-    mkdir -p "$BASE_ARTIFACT_DIR"
-    darkos_vm_remount "$VM_NAME" "$BASE_ARTIFACT_DIR:$VM_BASE_ARTIFACT_MOUNT"
+    mkdir -p "$ARTIFACT_DIR"
+    darkos_vm_remount "$VM_NAME" "$ARTIFACT_DIR:$VM_BASE_ARTIFACT_MOUNT"
     darkos_log "Copying $FLASH_IMAGE out: the image with both payloads folded in"
     multipass exec "$VM_NAME" -- bash -lc '
 set -Eeuo pipefail
@@ -459,23 +468,23 @@ sync "$DEST"
     # GNU stat on a Linux one.  The VM is always Ubuntu, so its side is GNU only.
     VM_IMAGE_SIZE="$(multipass exec "$VM_NAME" -- stat -c %s "$VM_BUILD_DIR/$FLASH_IMAGE")"
     HOST_IMAGE_SIZE=0
-    if [[ -f "$BASE_ARTIFACT_DIR/$FLASH_IMAGE" ]]; then
-        HOST_IMAGE_SIZE="$(stat -f %z "$BASE_ARTIFACT_DIR/$FLASH_IMAGE" 2>/dev/null \
-            || stat -c %s "$BASE_ARTIFACT_DIR/$FLASH_IMAGE")"
+    if [[ -f "$ARTIFACT_DIR/$FLASH_IMAGE" ]]; then
+        HOST_IMAGE_SIZE="$(stat -f %z "$ARTIFACT_DIR/$FLASH_IMAGE" 2>/dev/null \
+            || stat -c %s "$ARTIFACT_DIR/$FLASH_IMAGE")"
     fi
     if [[ "$HOST_IMAGE_SIZE" != "$VM_IMAGE_SIZE" ]]; then
-        darkos_warn "The copy reported success in the VM but $BASE_ARTIFACT_DIR/$FLASH_IMAGE"
+        darkos_warn "The copy reported success in the VM but $ARTIFACT_DIR/$FLASH_IMAGE"
         darkos_warn "is $HOST_IMAGE_SIZE bytes and the image in the VM is $VM_IMAGE_SIZE."
         darkos_warn "The image itself is fine and is still at $VM_BUILD_DIR/$FLASH_IMAGE in"
         darkos_warn "the VM; what failed is the hand-over across the Multipass mount."
-        darkos_warn "Check that $BASE_ARTIFACT_DIR is mounted at $VM_BASE_ARTIFACT_MOUNT:"
+        darkos_warn "Check that $ARTIFACT_DIR is mounted at $VM_BASE_ARTIFACT_MOUNT:"
         darkos_warn "  multipass info $VM_NAME"
         darkos_warn "and that the workstation has room for another $VM_IMAGE_SIZE bytes."
-        darkos_die "the image was built but did not reach $BASE_ARTIFACT_DIR"
+        darkos_die "the image was built but did not reach $ARTIFACT_DIR"
     fi
 
     if [[ "$COMPRESS" == 1 ]]; then
-        compress_flash_image "$BASE_ARTIFACT_DIR/$FLASH_IMAGE"
+        compress_flash_image "$ARTIFACT_DIR/$FLASH_IMAGE"
     fi
 
     # ── and only now, the ones this run superseded ────────────────────────────
@@ -587,15 +596,17 @@ if [[ "$MIX_ONLY" == 1 ]]; then
         darkos_log "  From a Linux box: sudo rsync -a $ARTIFACT_DIR/root/ /path/to/the/mounted/ROOTFS/"
     fi
     darkos_log "No image was built or modified.  Run ./build-j36-ultra.sh with no flag for that."
+    darkos_warn_layout_strays "$BASE_ARTIFACT_DIR"
 elif [[ "$FLASH_PAYLOAD" == "in-image" ]]; then
-    darkos_log "Flash this, and nothing else has to be copied: $BASE_ARTIFACT_DIR/$FLASH_IMAGE"
+    darkos_log "Flash this, and nothing else has to be copied: $ARTIFACT_DIR/$FLASH_IMAGE"
     if [[ -n "$COMPRESSED_ARCHIVE" ]]; then
         darkos_log "Compressed copy: $COMPRESSED_ARCHIVE (unzip it before flashing)"
     fi
-    darkos_log "  sudo dd if=$BASE_ARTIFACT_DIR/$FLASH_IMAGE of=/dev/rdiskN bs=4m status=progress"
+    darkos_log "  sudo dd if=$ARTIFACT_DIR/$FLASH_IMAGE of=/dev/rdiskN bs=4m status=progress"
     darkos_log "  The launcher is already on BOOT and /opt/mixos on the OS partition; no copying afterwards"
     darkos_log "  Iterating on the board specifics after this?  ./build-j36-ultra.sh --mix-only, then copy boot/ onto BOOT"
-    darkos_report_stale_images "$BASE_ARTIFACT_DIR" "$FLASH_IMAGE"
+    darkos_report_stale_images "$ARTIFACT_DIR" "$FLASH_IMAGE"
+    darkos_warn_layout_strays "$BASE_ARTIFACT_DIR"
 fi
 darkos_log "The card's two partitions: p1 BOOT vfat (launcher only), p2 ROOTFS ext2 (Debian, /opt/mixos, and your home at /home/virtua). p2 is last on the disk and /init grows it to the card's size on the first boot"
 darkos_log "Check the build log for the 'image:' lines -- they say whether the fold into the image succeeded, and on which partitions"
