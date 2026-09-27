@@ -59,7 +59,7 @@ DTS="$WORK/a77-$DEVICE.dts"
 DTB="$ART/a77-$DEVICE.dtb"
 # Geometry comes from devices.sh inside the generator; --fb-base stays empty
 # until BRINGUP step 2 measures the LK framebuffer.
-python3 "$DEVDIR/generate_dts_a77.py" --device "$DEVICE" \
+python3 "$DEVDIR/generate_dts_a77_4g.py" --device "$DEVICE" \
     --fb-base "$FB_BASE" --out "$DTS"
 dtc -I dts -O dtb -o "$DTB" "$DTS"
 
@@ -102,20 +102,20 @@ cat > "$INITRD/init" <<'INIT_EOF'
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
-echo "a77-init: waiting for PARTLABEL=ROOTFS"
+echo "a77-4g-init: waiting for PARTLABEL=ROOTFS"
 for _ in $(seq 1 30); do
     root="$(findfs PARTLABEL=ROOTFS 2>/dev/null)" && break
     sleep 1
 done
 if [ -z "${root:-}" ]; then
-    echo "a77-init: no PARTLABEL=ROOTFS; rescue shell"
+    echo "a77-4g-init: no PARTLABEL=ROOTFS; rescue shell"
     exec /bin/sh
 fi
-mount -o ro "$root" /newroot || { echo "a77-init: cannot mount $root"; exec /bin/sh; }
+mount -o ro "$root" /newroot || { echo "a77-4g-init: cannot mount $root"; exec /bin/sh; }
 mount --move /proc /newroot/proc
 mount --move /sys /newroot/sys
 mount --move /dev /newroot/dev
-echo "a77-init: switching root to $root"
+echo "a77-4g-init: switching root to $root"
 exec switch_root /newroot /sbin/init
 INIT_EOF
 chmod +x "$INITRD/init"
@@ -159,9 +159,9 @@ else
     else
         log "Reusing the checkpointed rootfs"
     fi
-    sudo mkdir -p "$WORK/rootfs/opt/mixos/a77/$DEVICE"
+    sudo mkdir -p "$WORK/rootfs/opt/mixos/a77-4g/$DEVICE"
     echo "bring-up scaffold: payload lands here (BRINGUP.md step 3)" \
-        | sudo tee "$WORK/rootfs/opt/mixos/a77/$DEVICE/BRINGUP-SCAFFOLD.txt" >/dev/null
+        | sudo tee "$WORK/rootfs/opt/mixos/a77-4g/$DEVICE/BRINGUP-SCAFFOLD.txt" >/dev/null
     sudo bash "$ROOT/device/common/make-trixie-img.sh" \
         "$WORK/rootfs" "$TRIXIE_IMG" ROOTFS
     {

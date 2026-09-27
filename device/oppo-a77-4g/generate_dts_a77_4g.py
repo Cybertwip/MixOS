@@ -69,7 +69,7 @@ def generate(sources: dict, device: str, fb_base: str = "") -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate the OPPO A77 bring-up DTS")
+    parser = argparse.ArgumentParser(description="Generate the OPPO A77 4G bring-up DTS")
     parser.add_argument("--device", default="cph2385", help="OPPO codename (devices.sh)")
     parser.add_argument("--fb-base", default="",
                         help="LK framebuffer phys base, e.g. 0x5c000000 (BRINGUP step 2)")

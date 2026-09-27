@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from generate_dts_a77 import (  # noqa: E402
+from generate_dts_a77_4g import (  # noqa: E402
     COMPATIBLES, REQUIRED_BOOTARGS, generate, read_sources)
 
 

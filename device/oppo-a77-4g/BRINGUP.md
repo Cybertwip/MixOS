@@ -12,7 +12,8 @@ testable and flashing is a brick risk.
 ## Step 0 -- which RAM row
 
 Settings > About phone > RAM (or `adb shell grep MemTotal
-/proc/meminfo`): 4GB means the default `cph2385` row, 6GB means
+/proc/meminfo`: roughly 2900000 kB means 3GB, roughly 3800000 kB means
+4GB): 3GB is the default `cph2385` row, 4GB means
 `A77_4G_DEVICE=cph2385-4gb`. When in doubt stay on the default -- it is
 the safe direction.
 
@@ -40,14 +41,14 @@ model, touch IC (I2C bus/address), LK framebuffer base (enables
 simplefb via `A77_4G_FB_BASE`).
 
 Fill: `devices.sh` rows (PMIC/panel/touch/model columns),
-`generate_dts_a77.py` (new nodes -- extend via
+`generate_dts_a77_4g.py` (new nodes -- extend via
 `device/common/mtk_bringup_dts.py` if two families need the shape),
 `tests/test-dts.py` (assert the new nodes).
 
-## Step 3 -- first drivers (mt68xx-family modules)
+## Step 3 -- first drivers (mt67xx-family modules)
 
 Panel first (visible proof of life), then touch, then MMC/serial if
-mainline's `mtk-sd`/`8250_mtk` don't bind as-is. Rules: `mt68xx_*`
+mainline's `mtk-sd`/`8250_mtk` don't bind as-is. Rules: `mt67xx_*`
 prefix, SoC specifics via DTS match data, exact-SoC compatibles only.
 Wire each into `linux/Makefile`, `build-in-vm.sh` module+payload
 staging, and the `/init` insmod list.
