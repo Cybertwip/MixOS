@@ -36,4 +36,20 @@ static inline uint32_t lk_bootmenu_pick(uint32_t pressed) {
     return pressed != 0u ? LK_BOOTMENU_ANDROID : LK_BOOTMENU_MIXOS;
 }
 
+/* One src-over pixel blend for the overlay: the banner background carries an
+ * alpha and composites over the splashed snapshot underneath, while the ink,
+ * frame and bar stay opaque and short-circuit to a plain write. The composite
+ * is always opaque -- the panel never sees the alpha, only the blend. */
+static inline uint32_t lk_blend_pixel(uint32_t dst, uint32_t src) {
+    const uint32_t a = (src >> 24u) & 0xffu;
+    uint32_t r, g, b;
+
+    if (a >= 0xffu) return src;
+    if (a == 0u) return dst;
+    r = (((src >> 16u) & 0xffu) * a + ((dst >> 16u) & 0xffu) * (255u - a) + 127u) / 255u;
+    g = (((src >> 8u) & 0xffu) * a + ((dst >> 8u) & 0xffu) * (255u - a) + 127u) / 255u;
+    b = ((src & 0xffu) * a + (dst & 0xffu) * (255u - a) + 127u) / 255u;
+    return 0xff000000u | ((r & 0xffu) << 16u) | ((g & 0xffu) << 8u) | (b & 0xffu);
+}
+
 #endif /* MVII_LK_BOOTMENU_H */

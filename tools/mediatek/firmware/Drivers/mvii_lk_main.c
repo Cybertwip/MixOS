@@ -3705,6 +3705,24 @@ static void lk_bootmenu_badge(uint32_t android) {
                   LK_BOOTMENU_BANNER_W, LK_BOOTMENU_BANNER_H);
 }
 
+/* The choice is made: leave the keypad exactly as the menu found it. The SD and
+ * eMMC loads below -- and both kernels after them -- must see the same
+ * hardware whether the menu ran or the boot was headless: the scanner that a
+ * release LK never used to touch goes back off, and MENU's two pads go back
+ * to the boot chain's parked mode-0 inputs with the sense pull off. The
+ * charge park re-arms MENU itself when it needs it. */
+static void lk_bootmenu_quiesce(void) {
+    volatile uint16_t* const en =
+        (volatile uint16_t*)(uintptr_t)(LK_KPD_BASE + LK_KPD_EN);
+
+    *en = 0u;
+    mtk_gpio_set_mode(LK_KPD_MENU_ROW_PAD, 0u);
+    mtk_gpio_set_mode(LK_KPD_MENU_COL_PAD, 0u);
+    lk_gpio_val_bit(MTK_GPIO_DIR_BASE, LK_KPD_MENU_ROW_PAD, 0u);
+    lk_gpio_val_bit(MTK_GPIO_DIR_BASE, LK_KPD_MENU_COL_PAD, 0u);
+    lk_gpio_val_bit(LK_KPD_PULLEN_BASE, LK_KPD_MENU_COL_PAD, 0u);
+}
+
 static uint32_t lk_bootmenu_edge(const uint32_t cur[LK_KPD_NUM_MEMS],
                                  const uint32_t prev[LK_KPD_NUM_MEMS],
                                  uint32_t menu, uint32_t prev_menu) {
@@ -3784,6 +3802,8 @@ static uint32_t lk_bootmenu_run(void) {
     lk_log_hex(" menu=", lk_kpd_menu_down());
     lk_log_hex(" after_ms=", elapsed_ms);
     lk_log(pressed != 0u ? " pick=android\n" : " pick=mixos-sd\n");
+    /* After the last live matrix read above: the loads below see pristine pads. */
+    lk_bootmenu_quiesce();
     return lk_bootmenu_pick(pressed);
 }
 #endif /* MVII_MT6592_LK_SD_HANDOFF */
