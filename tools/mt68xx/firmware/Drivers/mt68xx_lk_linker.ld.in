@@ -1,0 +1,73 @@
+/*
+ * mt68xx_lk_linker.ld -- mt68xx minimal LK, UBOOT/LK slot image.
+ *
+ * Derived from tools/mediatek/firmware/Drivers/mvii_lk_linker.ld. The
+ * preloader reads the MTK header at the top of the UBOOT slot and copies
+ * `size` bytes to MT68XX_MEMBASE before branching there, so this image is
+ * linked exactly where the stock LK used to run.
+ *
+ * One region, one budget: 512 KiB against a (prior) 2 MiB slot. The v1
+ * image is tens of KiB; the handoff step (LK-BRINGUP step 5) extends this
+ * map with the kernel load address, the ramdisk address and the LK
+ * framebuffer canvas once those are facts rather than wishes. Until then
+ * there is deliberately no scratch window here -- an address this image
+ * scribbles on is an address it has proven.
+ *
+ * This file is configured, not copied: CMake fills @MT68XX_MEMBASE@ from
+ * the same -DMT68XX_MEMBASE the C facts header reads, so the link address
+ * and the reported address cannot disagree.
+ */
+OUTPUT_ARCH(arm)
+ENTRY(_start)
+
+MEMORY
+{
+    ram (rwx) : ORIGIN = @MT68XX_MEMBASE@, LENGTH = 512K
+}
+
+SECTIONS
+{
+    __image_base = ORIGIN(ram);
+    . = ORIGIN(ram);
+
+    .text : ALIGN(16)
+    {
+        KEEP(*(.text.start))
+        *(.text .text.*)
+        *(.rodata .rodata.*)
+    } > ram
+
+    .data : ALIGN(16)
+    {
+        *(.data .data.*)
+    } > ram
+
+    /* Zeroed by _start: the preloader hands us DRAM that a previous boot
+     * wrote, and objcopy -O binary does not carry NOLOAD sections into the
+     * slot image. */
+    .bss (NOLOAD) : ALIGN(16)
+    {
+        __bss_start = .;
+        *(.bss .bss.*)
+        *(COMMON)
+        . = ALIGN(4);
+        __bss_end = .;
+    } > ram
+
+    . = ALIGN(2048);
+    __image_end = .;
+
+    . = ALIGN(16);
+    __stack_top = ORIGIN(ram) + LENGTH(ram) - 0x1000;
+
+    ASSERT(__bss_end < (__stack_top - 0x2000), "mt68xx minimal LK exceeds its UBOOT-slot budget")
+
+    /DISCARD/ :
+    {
+        *(.comment)
+        *(.note)
+        *(.note.*)
+        *(.ARM.exidx*)
+        *(.ARM.extab*)
+    }
+}
