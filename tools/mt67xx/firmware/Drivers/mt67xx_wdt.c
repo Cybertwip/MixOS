@@ -4,5 +4,11 @@
 #include "mt67xx_facts.h"
 
 void mt67xx_wdt_disable(void) {
+#if MT67XX_HAS_WDT
     *(volatile uint32_t*)(uintptr_t)MT67XX_TOPRGU_BASE = MT67XX_WDT_DISABLE_KEY;
+#else
+    /* Compiled out: the TOPRGU base is ungrounded on this family, and a
+     * blind write to a reset-adjacent register is worse than the
+     * diagnosable reset loop it avoids (see the facts header). */
+#endif
 }

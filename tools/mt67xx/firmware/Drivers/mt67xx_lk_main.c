@@ -106,6 +106,11 @@ void mt67xx_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
     mt67xx_uart_puts(" timer=");
     mt67xx_uart_puts(mt67xx_timer_source_name());
     mt67xx_uart_puts(mt67xx_timer_hw_ok() ? "(hw)" : "(SOFT: delays uncalibrated)");
+#if MT67XX_HAS_WDT
+    mt67xx_uart_puts(" wdt=off");
+#else
+    mt67xx_uart_puts(" wdt=UNTOUCHED(expect reset loop: LK-BRINGUP step 2b)");
+#endif
     mt67xx_uart_puts("\n[mt67xx-lk] preloader args:");
     put_label_hex(" r0=", r0);
     put_label_hex(" r1=", r1);

@@ -7,7 +7,9 @@
  *          the preloader programs CNTFRQ and the counter runs. Preferred
  *          everywhere, and the only source the mt68xx tree trusts blind.
  *   gpt4   APXGPT GPT4 free-run at 13 MHz ([mt6735] mt_gpt.c pattern).
- *          Needs the prior bases, so it is second, not first.
+ *          Needs the prior bases, so it is second, not first -- and it is
+ *          compiled out entirely (MT67XX_HAS_GPT 0) where the GPT base is
+ *          still ungrounded.
  *   soft   A per-call counter plus an uncalibrated spin. Monotonic, wrong
  *          rate, loudly reported -- delays still terminate, timestamps
  *          still order, and the banner says not to trust either.

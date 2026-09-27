@@ -15,17 +15,18 @@ enum {
     TIMER_SRC_SOFT = 3,
 };
 
+static int g_src = TIMER_SRC_NONE;
+static uint32_t g_arch_mhz = 0u;
+static uint32_t g_start = 0u;
+static uint32_t g_soft = 0u;
+
+#if MT67XX_HAS_GPT
 enum {
     GPT_CON_EN = 0x0001u,
     GPT_CON_FREERUN = 0x0030u,
     GPT_CON_CLEAR = 0x0002u,
     GPT_CLK_SYS = 0x0000u,
 };
-
-static int g_src = TIMER_SRC_NONE;
-static uint32_t g_arch_mhz = 0u;
-static uint32_t g_start = 0u;
-static uint32_t g_soft = 0u;
 
 static uint32_t reg_read(uint32_t addr) {
     return *(volatile uint32_t*)(uintptr_t)addr;
@@ -34,6 +35,7 @@ static uint32_t reg_read(uint32_t addr) {
 static void reg_write(uint32_t addr, uint32_t value) {
     *(volatile uint32_t*)(uintptr_t)addr = value;
 }
+#endif
 
 static uint32_t arch_cntfrq(void) {
     uint32_t v = 0u;
@@ -73,6 +75,7 @@ static int arch_try(void) {
     return 1;
 }
 
+#if MT67XX_HAS_GPT
 static void gpt4_power(int on) {
     const uint32_t addr = MT67XX_PERICFG_BASE + 0x10u;
     uint32_t v = reg_read(addr);
@@ -107,11 +110,14 @@ static int gpt4_try(void) {
     g_src = TIMER_SRC_GPT4;
     return 1;
 }
+#endif
 
 void mt67xx_timer_init(void) {
     if (g_src != TIMER_SRC_NONE) return;
     if (arch_try()) return;
+#if MT67XX_HAS_GPT
     if (gpt4_try()) return;
+#endif
     g_src = TIMER_SRC_SOFT;
     g_start = 0u;
     g_soft = 0u;
@@ -125,10 +131,12 @@ uint32_t mt67xx_timer_microseconds(void) {
     case TIMER_SRC_ARCH:
         now = arch_cntpct_lo();
         return (now - g_start) / g_arch_mhz;
+#if MT67XX_HAS_GPT
     case TIMER_SRC_GPT4:
         now = reg_read(MT67XX_GPT4_DAT);
         return (now - g_start + MT67XX_GPT_TICKS_PER_US / 2u) /
                MT67XX_GPT_TICKS_PER_US;
+#endif
     default:
         /* Monotonic and wrong-rate: each call is one more tick, and the
          * banner said "soft" so nobody mistakes it for time. */
