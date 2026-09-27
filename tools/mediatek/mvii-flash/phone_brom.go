@@ -295,7 +295,7 @@ func acquirePhoneBROM(cfg config, phone *phoneRoot, facts phoneFacts, emi *mtkPr
 	deadline := time.Now().Add(window)
 	var lastErr error
 	for attempt := 1; ; attempt++ {
-		client, err := connectMTKSerial(cfg.device)
+		client, err := connectMTKSerialWithOptions(cfg.device, mtkSerialConnectOptions{handshakeWake: true})
 		if err == nil {
 			client.preloaderEMI = emi
 			target, err := probePhoneBROM(client, phone, facts)
@@ -482,7 +482,7 @@ func waitPhoneBROM(cfg config, phone *phoneRoot, facts phoneFacts, client *mtkSe
 		// waits out its own window, so a key-combo replug lands here.
 		_ = client.port.Close()
 		fmt.Println("Device re-enumerated; reopening.")
-		client, err = connectMTKSerial(cfg.device)
+		client, err = connectMTKSerialWithOptions(cfg.device, mtkSerialConnectOptions{handshakeWake: true})
 		if err != nil {
 			if !time.Now().Before(deadline) {
 				break

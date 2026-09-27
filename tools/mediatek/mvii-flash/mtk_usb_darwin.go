@@ -719,6 +719,7 @@ func connectMTKUSB(device string, options mtkSerialConnectOptions) (*mtkSerialCl
 			device:         mtkUSBDeviceLabel(device),
 			commandTimeout: commandTimeout,
 			writeTimeout:   writeTimeout,
+			handshakeWake:  options.handshakeWake,
 		}
 		_ = client.port.DiscardInput(10 * time.Millisecond)
 		fmt.Println("Opened MediaTek USB device. Performing BROM handshake.")
