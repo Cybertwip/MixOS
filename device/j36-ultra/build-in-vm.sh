@@ -9724,18 +9724,17 @@ initrd=initrd.img
 # connectivity MCU up and registers wlan0 -- and it implies j36.power, because
 # the radio's rails come off the PMIC.
 #
-# Only the four files the LK reads are on BOOT; the rest is in sd-root.tar.gz,
-# unpacked as /opt/mixos on the ext2 OS partition.
+# Only what the LK reads sits on BOOT; the rest arrives in sd-root.tar.gz,
+# unpacked as /opt/mixos on the OS partition.
 #
-# j36.audio=speaker powers the class-D amp off VBAT, the system node: if the board
-# cuts out in playback, `amixer -c0 set "Speaker Amp" off' -- no reboot needed.
+# j36.audio=speaker powers the class-D amp off VBAT: on cut-out in playback,
+# amixer -c0 set "Speaker Amp" off.
 # j36.usb=1 sources 5 V on the OTG port off that same rail: j36.usb=novbus with no
 # cell.  It is not the connector that charges -- that is the DC inlet beside it.
 # j36.gl=debug adds Mesa's EGL trace.  j36.splash=0 loglevel=7 boots to text.
 # j36.expand=0 skips growing p2 if a resize wedged the boot; =retry re-arms it.
 # Each boot writes mixos-log.txt at the top of this partition; j36.log=0 stops it.
-# j36.trail=1 adds j36-trail.txt: uptime plus the last kernel lines every five
-# seconds from early systemd, for boots that die before the first mixos-log.txt.
+# j36.trail=1: per-tick dmesg tail to j36-trail.txt; for deaths before mixos-log.txt.
 bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=speaker j36.usb=1 j36.power=1 j36.wifi=1 j36.splash=1
 CONF
 
