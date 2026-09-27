@@ -28,6 +28,11 @@ wget-log*
 # Python bytecode.  The build runs its helpers as scripts, which writes none of
 # this, but py_compile and a stray `import' from a debugging session do.
 __pycache__/
+
+# Extracted stock firmware.  The blobs under device/*/firmware/stock/ are the
+# phone vendors' proprietary binaries (see the firmware READMEs); they must
+# never be committed, only read from their extraction directory by the builds.
+device/*/firmware/stock/
 *.py[cod]
 
 # The device tree's three build products.  They were written here by default until

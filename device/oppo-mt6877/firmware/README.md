@@ -14,10 +14,11 @@ Debian rootfs by the build's firmware stage (`FIRMWARE_DIR`).
 | `WIFI_RAM_CODE` | CONSYS Wi-Fi RAM code | `/vendor/firmware/WIFI_RAM_CODE_*` |
 | `WMT_SOC.cfg` | WMT coexistence config | `/vendor/firmware/WMT_SOC.cfg` |
 
-`extract-stock.sh` pulls them over adb from a rooted stock device. OPPO
-factory images (`.ofp`) are encrypted; there is no offline unpack path, so
-extraction needs the phone itself -- which the person building a phone image
-has.
+`extract-stock.sh` pulls them over adb from the phone itself and writes a
+`MANIFEST.txt` with sizes and hashes next to them. Stock firmware directories
+are usually world-readable, so root is only needed if your build hid them.
+OPPO factory images (`.ofp`) are encrypted; there is no offline unpack path,
+so extraction needs the phone -- which the person building a phone image has.
 
 ## Why the tree does not vendor them
 
