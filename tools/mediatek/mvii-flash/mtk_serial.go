@@ -130,6 +130,7 @@ type mtkTargetConfig struct {
 
 type mtkDALoader struct {
 	Path             string
+	BundleOffset     uint64
 	V6               bool
 	Old              bool
 	HWCode           uint16
@@ -2555,21 +2556,37 @@ func parseMTKDALoader(path string, hwCode uint16, hwVersion uint16, swVersion ui
 	if len(data) < 0x6C {
 		return mtkDALoader{}, fmt.Errorf("%s is too small to be a MediaTek DA loader", path)
 	}
+	bundleOffset := 0
 	count := binary.LittleEndian.Uint32(data[0x68:0x6C])
+	if count == 0 || count > 4096 {
+		// Some OPPO DA files prepend a 0x2000-byte ROM_INFO wrapper. DA
+		// records and their buffer offsets are relative to the embedded
+		// MTK_DOWNLOAD_AGENT header, not the start of the outer file.
+		const wrappedOffset = 0x2000
+		if len(data) >= wrappedOffset+0x6C && bytes.HasPrefix(data[wrappedOffset:], []byte("MTK_DOWNLOAD_AGENT")) {
+			wrappedCount := binary.LittleEndian.Uint32(data[wrappedOffset+0x68 : wrappedOffset+0x6C])
+			if wrappedCount > 0 && wrappedCount <= 4096 &&
+				len(data) >= wrappedOffset+0x6C+int(wrappedCount)*0xD8 &&
+				bytes.Equal(data[wrappedOffset+0x6C:wrappedOffset+0x6E], []byte{0xDA, 0xDA}) {
+				bundleOffset = wrappedOffset
+				count = wrappedCount
+			}
+		}
+	}
 	if count == 0 || count > 4096 {
 		return mtkDALoader{}, fmt.Errorf("%s has invalid DA entry count %d", path, count)
 	}
-	v6 := bytes.Contains(data[:0x68], []byte("MTK_DA_v6"))
+	v6 := bytes.Contains(data[bundleOffset:bundleOffset+0x68], []byte("MTK_DA_v6"))
 	recordSize := 0xDC
 	oldLoader := false
-	if len(data) >= 0x6C+0xD8+2 && bytes.Equal(data[0x6C+0xD8:0x6C+0xD8+2], []byte{0xDA, 0xDA}) {
+	if len(data) >= bundleOffset+0x6C+0xD8+2 && bytes.Equal(data[bundleOffset+0x6C+0xD8:bundleOffset+0x6C+0xD8+2], []byte{0xDA, 0xDA}) {
 		recordSize = 0xD8
 		oldLoader = true
 	}
 
 	var matches []mtkDALoader
 	for i := uint32(0); i < count; i++ {
-		pos := 0x6C + int(i)*recordSize
+		pos := bundleOffset + 0x6C + int(i)*recordSize
 		if pos+recordSize > len(data) {
 			break
 		}
@@ -2577,6 +2594,7 @@ func parseMTKDALoader(path string, hwCode uint16, hwVersion uint16, swVersion ui
 		if !ok || entry.HWCode != hwCode {
 			continue
 		}
+		entry.BundleOffset = uint64(bundleOffset)
 		if hwVersion != 0 && entry.HWVersion > hwVersion {
 			continue
 		}
@@ -2661,7 +2679,7 @@ func readDARegion(loader mtkDALoader, index int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	start := uint64(region.BufferOffset)
+	start := loader.BundleOffset + uint64(region.BufferOffset)
 	end := start + uint64(region.Length)
 	if end < start || end > uint64(len(data)) {
 		return nil, fmt.Errorf("DA region %d points outside %s: offset=0x%x length=0x%x", index, loader.Path, region.BufferOffset, region.Length)

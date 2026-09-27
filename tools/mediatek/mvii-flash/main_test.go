@@ -285,6 +285,42 @@ func TestParseMTKDALoaderFindsMT6765Entry(t *testing.T) {
 	}
 }
 
+func TestParseMTKDALoaderWrappedBundleOffsets(t *testing.T) {
+	dir := t.TempDir()
+	loaderPath := filepath.Join(dir, "MTK_DA_Oppo.bin")
+	const bundleOffset = 0x2000
+	const regionOffset = 0x6c + 0xdc
+	data := make([]byte, bundleOffset+regionOffset+8)
+	copy(data[bundleOffset:], "MTK_DOWNLOAD_AGENT")
+	binary.LittleEndian.PutUint32(data[bundleOffset+0x68:bundleOffset+0x6c], 1)
+	entry := data[bundleOffset+0x6c : bundleOffset+regionOffset]
+	binary.LittleEndian.PutUint16(entry[0:2], 0xdada)
+	binary.LittleEndian.PutUint16(entry[2:4], 0x6765)
+	binary.LittleEndian.PutUint16(entry[16:18], 1)
+	binary.LittleEndian.PutUint16(entry[18:20], 1)
+	binary.LittleEndian.PutUint32(entry[20:24], regionOffset)
+	binary.LittleEndian.PutUint32(entry[24:28], 8)
+	binary.LittleEndian.PutUint32(entry[28:32], 0x200000)
+	copy(data[bundleOffset+regionOffset:], "WRAPPED!")
+	if err := os.WriteFile(loaderPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loader, err := parseMTKDALoader(loaderPath, 0x6765, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loader.BundleOffset != bundleOffset {
+		t.Fatalf("bundle offset = 0x%x, want 0x%x", loader.BundleOffset, bundleOffset)
+	}
+	region, err := readDARegion(loader, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(region) != "WRAPPED!" {
+		t.Fatalf("region = %q", region)
+	}
+}
+
 func TestPrepareDADataChecksumPadsOddLength(t *testing.T) {
 	checksum, payload := prepareDAData([]byte{0x34, 0x12, 0x78})
 	if !bytes.Equal(payload, []byte{0x34, 0x12, 0x78, 0x00}) {
