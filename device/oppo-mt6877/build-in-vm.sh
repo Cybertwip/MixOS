@@ -21,7 +21,7 @@
 #   OPPO_EXPORT_DIR  where --mix-only artifacts go (a mount in that mode)
 #   OPPO_DEVICE      codename from devices.sh (default 20181)
 #   OPPO_MIX_ONLY    1 = boot.img + modules + payload only, no rootfs
-#   OPPO_JOBS        parallelism (default nproc)
+#   OPPO_JOBS        parallelism (default: half the cores, minimum 1)
 #   OPPO_KERNEL_BRANCH / OPPO_KERNEL_URL (defaults: linux-6.12.y, kernel.org)
 #   OPPO_FIRMWARE_DIR  host-side blobs (modem.img, WIFI_RAM_CODE, ...); empty
 #                      skips the firmware stage with a warning
@@ -36,7 +36,20 @@ WORK="${OPPO_WORK_DIR:?set by build-oppo.sh}"
 EXPORT="${OPPO_EXPORT_DIR:?set by build-oppo.sh}"
 DEVICE="${OPPO_DEVICE:-20181}"
 MIX_ONLY="${OPPO_MIX_ONLY:-0}"
-JOBS="${OPPO_JOBS:-$(nproc)}"
+# Half the machine's processors, or 1: a kernel build at full nproc would
+# starve the host the VM runs on.  OPPO_JOBS overrides; anything that is
+# not a positive integer collapses to 1, never to a bare `-j' (make's
+# "unlimited", which is how a build box runs out of memory).
+_default_jobs() {
+    local n
+    n="$(nproc 2>/dev/null || echo 2)"
+    [[ "$n" =~ ^[1-9][0-9]*$ ]] || n=2
+    n=$(( n / 2 ))
+    [[ "$n" -ge 1 ]] || n=1
+    printf '%s' "$n"
+}
+JOBS="${OPPO_JOBS:-$(_default_jobs)}"
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || JOBS=1
 KERNEL_BRANCH="${OPPO_KERNEL_BRANCH:-linux-6.12.y}"
 KERNEL_URL="${OPPO_KERNEL_URL:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
 FIRMWARE_DIR="${OPPO_FIRMWARE_DIR:-}"
@@ -53,7 +66,7 @@ source "$DEVDIR/devices.sh"
 DEVICE_INFO="$(oppo_device_info "$DEVICE")" || exit 1
 eval "$DEVICE_INFO"
 [[ "$OPPO_ARCH" == "arm64" ]] || die "$DEVICE is $OPPO_ARCH, this build is arm64"
-log "OPPO $OPPO_DEVICE ($OPPO_NOTES)"
+log "OPPO $OPPO_DEVICE ($OPPO_NOTES), $JOBS parallel jobs"
 
 mkdir -p "$WORK" "$ART"
 command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || {
