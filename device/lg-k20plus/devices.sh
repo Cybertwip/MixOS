@@ -17,6 +17,11 @@ lv517-rev0|msm8917|arm64|lg4894|lg4894|q6v5-mss|0|LG K20 Plus rev-0 (GPIO91 read
 lv517-tovis|msm8917|arm64|td4100|td4100|q6v5-mss|b|LG K20 Plus with Tovis TD4100 panel + Synaptics touch
 '
 
+# Single-quote one value for eval consumption. Works in POSIX sh and bash.
+_lg_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 lg_devices() {
     printf '%s\n' "$LG_DEVICES" | grep '|' | cut -d'|' -f1
 }
@@ -32,12 +37,12 @@ lg_device_info() {
         echo "unknown LG device '$want' (supported: $(lg_devices | tr '\n' ' '))" >&2
         return 1
     fi
-    printf 'LG_DEVICE=%s\n' "$(printf '%s' "$row" | cut -d'|' -f1)"
-    printf 'LG_SOC=%s\n' "$(printf '%s' "$row" | cut -d'|' -f2)"
-    printf 'LG_ARCH=%s\n' "$(printf '%s' "$row" | cut -d'|' -f3)"
-    printf 'LG_PANEL=%s\n' "$(printf '%s' "$row" | cut -d'|' -f4)"
-    printf 'LG_TOUCH=%s\n' "$(printf '%s' "$row" | cut -d'|' -f5)"
-    printf 'LG_MODEM=%s\n' "$(printf '%s' "$row" | cut -d'|' -f6)"
-    printf 'LG_REV=%s\n' "$(printf '%s' "$row" | cut -d'|' -f7)"
-    printf 'LG_NOTES=%s\n' "$(printf '%s' "$row" | cut -d'|' -f8)"
+    printf 'LG_DEVICE=%s\n' "$(_lg_quote "$(printf '%s' "$row" | cut -d'|' -f1)")"
+    printf 'LG_SOC=%s\n' "$(_lg_quote "$(printf '%s' "$row" | cut -d'|' -f2)")"
+    printf 'LG_ARCH=%s\n' "$(_lg_quote "$(printf '%s' "$row" | cut -d'|' -f3)")"
+    printf 'LG_PANEL=%s\n' "$(_lg_quote "$(printf '%s' "$row" | cut -d'|' -f4)")"
+    printf 'LG_TOUCH=%s\n' "$(_lg_quote "$(printf '%s' "$row" | cut -d'|' -f5)")"
+    printf 'LG_MODEM=%s\n' "$(_lg_quote "$(printf '%s' "$row" | cut -d'|' -f6)")"
+    printf 'LG_REV=%s\n' "$(_lg_quote "$(printf '%s' "$row" | cut -d'|' -f7)")"
+    printf 'LG_NOTES=%s\n' "$(_lg_quote "$(printf '%s' "$row" | cut -d'|' -f8)")"
 }

@@ -19,6 +19,11 @@ OPPO_DEVICES='
 20355|mt6877|arm64|sfb|nt36672|eccci|oplus6877_20355, panel TBD from its dts; boots on simple-framebuffer
 '
 
+# Single-quote one value for eval consumption. Works in POSIX sh and bash.
+_oppo_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 oppo_devices() {
     printf '%s\n' "$OPPO_DEVICES" | grep '|' | cut -d'|' -f1
 }
@@ -35,11 +40,11 @@ oppo_device_info() {
         echo "unknown OPPO device '$want' (supported: $(oppo_devices | tr '\n' ' '))" >&2
         return 1
     fi
-    printf 'OPPO_DEVICE=%s\n' "$(printf '%s' "$row" | cut -d'|' -f1)"
-    printf 'OPPO_SOC=%s\n' "$(printf '%s' "$row" | cut -d'|' -f2)"
-    printf 'OPPO_ARCH=%s\n' "$(printf '%s' "$row" | cut -d'|' -f3)"
-    printf 'OPPO_PANEL=%s\n' "$(printf '%s' "$row" | cut -d'|' -f4)"
-    printf 'OPPO_TOUCH=%s\n' "$(printf '%s' "$row" | cut -d'|' -f5)"
-    printf 'OPPO_MODEM=%s\n' "$(printf '%s' "$row" | cut -d'|' -f6)"
-    printf 'OPPO_NOTES=%s\n' "$(printf '%s' "$row" | cut -d'|' -f7)"
+    printf 'OPPO_DEVICE=%s\n' "$(_oppo_quote "$(printf '%s' "$row" | cut -d'|' -f1)")"
+    printf 'OPPO_SOC=%s\n' "$(_oppo_quote "$(printf '%s' "$row" | cut -d'|' -f2)")"
+    printf 'OPPO_ARCH=%s\n' "$(_oppo_quote "$(printf '%s' "$row" | cut -d'|' -f3)")"
+    printf 'OPPO_PANEL=%s\n' "$(_oppo_quote "$(printf '%s' "$row" | cut -d'|' -f4)")"
+    printf 'OPPO_TOUCH=%s\n' "$(_oppo_quote "$(printf '%s' "$row" | cut -d'|' -f5)")"
+    printf 'OPPO_MODEM=%s\n' "$(_oppo_quote "$(printf '%s' "$row" | cut -d'|' -f6)")"
+    printf 'OPPO_NOTES=%s\n' "$(_oppo_quote "$(printf '%s' "$row" | cut -d'|' -f7)")"
 }
