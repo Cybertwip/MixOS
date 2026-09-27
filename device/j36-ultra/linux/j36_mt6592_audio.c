@@ -212,6 +212,11 @@ MODULE_PARM_DESC(codec, "program the MT6323 ABB downlink over PWRAP (default on)
 
 static bool speaker;
 module_param(speaker, bool, 0444);
+/* An ALSA restore or jack policy may turn Speaker Amp back on after probe.
+ * Enforce batteryless policy at the control as well as its initial value. */
+static bool external_power;
+module_param(external_power, bool, 0444);
+MODULE_PARM_DESC(external_power, "batteryless supply: keep the class-D speaker disabled");
 MODULE_PARM_DESC(speaker,
 		 "initial state of the \"Speaker Amp\" control: power the class-D "
 		 "amp once the DL1 DMA is proven live. With no cell fitted the amp "
@@ -1210,6 +1215,9 @@ static int j36_amp_put(struct snd_kcontrol *kcontrol,
 	struct j36_afe *afe = snd_kcontrol_chip(kcontrol);
 	bool allowed = ucontrol->value.integer.value[0];
 
+	if (external_power && allowed)
+		return -EPERM;
+
 	if (allowed == afe->amp_allowed)
 		return 0;
 
@@ -1363,7 +1371,7 @@ static int j36_afe_probe(struct platform_device *pdev)
 	afe->rate = 48000;
 	afe->frame_bytes = 4;
 	afe->level = clamp(spk_level, J36_SPK_LEVEL_MIN, J36_SPK_LEVEL_MAX);
-	afe->amp_allowed = speaker;
+	afe->amp_allowed = speaker && !external_power;
 	afe->hp_allowed = headphone;
 	mutex_init(&afe->pmic_lock);
 	INIT_DELAYED_WORK(&afe->poll_work, j36_afe_poll);
@@ -1437,6 +1445,7 @@ static int j36_afe_probe(struct platform_device *pdev)
 	dev_info(dev,
 		 "playback on DL1, %u KiB ring, speaker amp %s, headphone %s, downlink %s\n",
 		 J36_AFE_BUFFER_BYTES / 1024,
+		 external_power ? "OFF (batteryless supply)" :
 		 speaker ? "enabled" : "OFF (speaker=1 asks for it)",
 		 headphone ? "enabled" : "OFF (headphone=1 asks for it)",
 		 codec ? "on" : "off");

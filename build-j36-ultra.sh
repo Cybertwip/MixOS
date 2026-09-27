@@ -168,10 +168,10 @@ J36 Ultra layer on top of it in the same Multipass VM: $VM_NAME
 
     ./build-j36-ultra.sh --without-battery
                                       no cell. Writes j36.usb=novbus and
-                                      j36.power=nocharge. Linux preserves
-                                      the charger state. The batteryless LK
-                                      disables the charger watchdog before
-                                      handing over to Linux. The matching LK is
+                                      j36.power=external. Linux disables the
+                                      charger watchdog and widens UVLO, and
+                                      does not rewrite the preloader charger
+                                      mode. The matching LK is
                                       tools/mediatek/mt65xx/build.sh --without-battery.
                                       Combines with --mix-only or --compress.
 

@@ -168,19 +168,17 @@ runs rebuild only changed kernel, DTB, input-module, initramfs and `boot.img`
 files.
 
 `--without-battery` also works with `--mix-only`. It writes `j36.usb=novbus`,
-`j36.audio=1` and `j36.power=nocharge` into `boot.conf`. The OTG data
+`j36.audio=1` and `j36.power=external` into `boot.conf`. The OTG data
 port does not source 5 V, and the speaker amp starts off. The matching
 bootloader is `tools/mediatek/mt65xx/build.sh --without-battery`, and it skips the
-charge screen. The supply still has to carry the board's load. This option
-cannot change the stock preloader or the board's wiring. A device on the OTG
-port needs its own power.
+charge screen. Linux disables the charger watchdog and widens UVLO without
+rewriting the preloader's charger mode. The supply still has to carry the
+board's load. This option cannot change the stock preloader or the board's
+wiring. A device on the OTG port needs its own power.
 
 Update **both** the installed LK (`lk-release.bin` from that firmware build)
 and the card's Linux payload. Writing the MixOS `.img` to a removable drive
-does not update LK in the device's eMMC. The batteryless LK disables and reads
-back the charger watchdog before SD access; Linux preserves that state.
-`j36.power=external` is accepted as a compatibility alias for
-`j36.power=nocharge`.
+does not update LK in the device's eMMC.
 
 For a boot that dies before the first `mixos-log.txt` (twenty seconds after
 the login target), add `j36.trail=1` to the `bootargs=` line of
