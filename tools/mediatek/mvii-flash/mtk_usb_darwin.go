@@ -113,8 +113,8 @@ type mtkUSBPort struct {
 // overflow the request buffer; a short packet ends the transfer early.
 const usbReadChunk = 16384
 
-// openMTKUSBPort finds the first MediaTek (VID 0x0e8d) device, claims its bulk
-// data interface (detaching the kernel CDC driver) and returns a transport.
+// openMTKUSBPort finds a MediaTek BROM or known preloader USB device, claims its
+// bulk data interface and returns a transport. BROM does not need a tty node.
 func openMTKUSBPort() (*mtkUSBPort, error) {
 	if err := libusbInit(); err != nil {
 		return nil, err
@@ -127,6 +127,21 @@ func openMTKUSBPort() (*mtkUSBPort, error) {
 	defer C.libusb_free_device_list(list, 1)
 
 	devs := unsafe.Slice(list, int(n))
+	// A BROM device has no modem node and may coexist briefly with a stale
+	// preloader enumeration. Take its exact VID:PID before the broader scan.
+	for _, dev := range devs {
+		var desc C.struct_libusb_device_descriptor
+		if rc := C.libusb_get_device_descriptor(dev, &desc); rc != 0 ||
+			uint16(desc.idVendor) != mtkUSBVendorID || uint16(desc.idProduct) != mtkUSBBROMPID {
+			continue
+		}
+		port, err := openMTKUSBDevice(dev)
+		if err != nil {
+			return nil, fmt.Errorf("open BROM USB %04x:%04x: %w", mtkUSBVendorID, mtkUSBBROMPID, err)
+		}
+		port.vid, port.pid = mtkUSBVendorID, mtkUSBBROMPID
+		return port, nil
+	}
 	var lastErr error
 	sawConsole := false
 	for _, dev := range devs {
@@ -162,6 +177,7 @@ func openMTKUSBPort() (*mtkUSBPort, error) {
 			lastErr = err
 			continue
 		}
+		port.vid, port.pid = vid, pid
 		return port, nil
 	}
 	if lastErr != nil {
@@ -178,8 +194,8 @@ func openMTKUSBPort() (*mtkUSBPort, error) {
 // openMVIIDebugPort finds the MVII live debug console specifically, by VID:PID.
 //
 // It cannot share openMTKUSBPort's "first 0x0e8d device wins" rule, because in
-// practice both devices are 0x0e8d: 0x0e8d/0x2000-ish is the board sitting in
-// BROM, and 0x0e8d/0x4d56 is the board booted and serving the console. Matching
+// practice both devices are 0x0e8d: the boot path uses 0x0003 (BROM) or a
+// preloader PID, and 0x4d56 is the board booted and serving the console. Matching
 // on the PID is what makes "you are still in BROM" a clear diagnostic instead of
 // a confusing framing error.
 func openMVIIDebugPort() (*mtkUSBPort, error) {
@@ -219,12 +235,9 @@ func openMVIIDebugPort() (*mtkUSBPort, error) {
 		return nil, lastErr
 	}
 	if sawBROM {
-		// Reporting the observed PID matters: 0x0e8d/0x2000 is the BROM, and a
-		// board that has *just been flashed* is sitting in the resident
-		// MVIIFlash payload on that same PID, which looks identical here but
-		// needs a completely different response from the operator. Naming the
-		// number lets them tell which one they are looking at.
-		return nil, errors.New("found a MediaTek device but not the MVII console (0x0e8d:0x4d56) — the board is in BROM or still running the resident flash payload; power-cycle it while holding down any face or shoulder button, then retry")
+		// A non-console MTK device may be BROM, preloader or a resident flash
+		// payload; the console selector must leave it alone.
+		return nil, errors.New("found a MediaTek device but not the MVII console (0x0e8d:0x4d56) — the board is in BROM, preloader, or still running the resident flash payload; power-cycle it while holding down any face or shoulder button, then retry")
 	}
 	return nil, errMVIIDebugNotFound
 }
@@ -531,9 +544,8 @@ func mtkUSBTransportEnabled() bool {
 	return true
 }
 
-// mtkUSBFlashDevicePresent reports whether a flashable USB device (MediaTek
-// 0x0e8d anything but the live debug console, or a vendor-VID phone
-// preloader) is currently on the bus. Unlike openMTKUSBPort it never opens
+// mtkUSBFlashDevicePresent reports whether a known BROM/preloader USB device
+// is currently on the bus. Unlike openMTKUSBPort it never opens
 // or claims anything, so it is safe to call as a cheap presence probe
 // before deciding between the libusb and the legacy tty transports.
 func mtkUSBFlashDevicePresent() bool {
@@ -589,10 +601,14 @@ func listMTKUSBDevices() []string {
 		entry := fmt.Sprintf("0x%04x:0x%04x (bus %d, addr %d)",
 			vid, pid, int(C.libusb_get_bus_number(dev)), int(C.libusb_get_device_address(dev)))
 		switch {
+		case vid == mtkUSBVendorID && pid == mtkUSBBROMPID:
+			entry += " [BROM; raw USB]"
 		case vid == mtkUSBOppoVendorID:
 			entry += " [OPPO preloader]"
 		case vid == mtkUSBLGVendorID:
 			entry += " [LG preloader]"
+		default:
+			entry += " [MediaTek preloader]"
 		}
 		out = append(out, entry)
 	}
@@ -602,6 +618,9 @@ func listMTKUSBDevices() []string {
 
 func tryConnectMTKUSB(device string, options mtkSerialConnectOptions) (*mtkSerialClient, bool, error) {
 	if !mtkUSBTransportEnabled() {
+		if options.waitForUSB {
+			return nil, true, errors.New("phone BROM discovery requires libusb on macOS; unset MVII_MTK_TTY=1 (BROM 0x0e8d:0x0003 may expose no modem node)")
+		}
 		return nil, false, nil
 	}
 	// Port sweep: when no flashable USB device is on the bus at all but
@@ -610,7 +629,7 @@ func tryConnectMTKUSB(device string, options mtkSerialConnectOptions) (*mtkSeria
 	// timeout on libusb. When nothing is plugged in anywhere the libusb
 	// wait below is kept, so starting the tool before connecting a
 	// direct-attached board still works.
-	if !mtkUSBFlashDevicePresent() {
+	if !options.waitForUSB && !mtkUSBFlashDevicePresent() {
 		if swept := sweepSerialPorts(); len(swept) > 0 {
 			fmt.Printf("No flashable USB device (VID 0x%04x, 0x%04x, 0x%04x) on the bus; falling back to serial ports: %s\n",
 				mtkUSBVendorID, mtkUSBOppoVendorID, mtkUSBLGVendorID, strings.Join(swept, ", "))
@@ -618,7 +637,7 @@ func tryConnectMTKUSB(device string, options mtkSerialConnectOptions) (*mtkSeria
 		}
 	}
 	client, err := connectMTKUSB(device, options)
-	if err != nil && isMTKUSBAccessError(err) {
+	if err != nil && !options.waitForUSB && isMTKUSBAccessError(err) {
 		// The device is there but macOS won't let this uid claim it
 		// (no sudo). A tty node for the same target still works —
 		// prefer limping on over failing outright.
@@ -711,8 +730,11 @@ func connectMTKUSB(device string, options mtkSerialConnectOptions) (*mtkSerialCl
 	commandTimeout := envDuration("MVII_MTK_SERIAL_TIMEOUT", mtkSerialCommandTimeout)
 	writeTimeout := envDuration("MVII_MTK_SERIAL_WRITE_TIMEOUT", envDuration("MVII_MTK_USB_WRITE_TIMEOUT", mtkSerialWriteTimeout))
 	openHandshake := envDuration("MVII_MTK_SERIAL_OPEN_HANDSHAKE_TIMEOUT", mtkSerialOpenHandshake)
-	fmt.Printf("Opening MediaTek USB device via libusb (VID 0x%04x, 0x%04x, 0x%04x, timeout %s)\n",
-		mtkUSBVendorID, mtkUSBOppoVendorID, mtkUSBLGVendorID, timeout)
+	fmt.Printf("Opening MediaTek USB via libusb (BROM 0x%04x:0x%04x; preloader VID 0x%04x/0x%04x/0x%04x; timeout %s)\n",
+		mtkUSBVendorID, mtkUSBBROMPID, mtkUSBVendorID, mtkUSBOppoVendorID, mtkUSBLGVendorID, timeout)
+	if strings.HasPrefix(device, "/dev/") {
+		fmt.Printf("Raw USB discovery ignores the old modem path %s; BROM is selected by USB VID:PID.\n", device)
+	}
 	var lastErr error
 	lastReport := time.Time{}
 	for time.Now().Before(deadline) {
@@ -738,7 +760,8 @@ func connectMTKUSB(device string, options mtkSerialConnectOptions) (*mtkSerialCl
 			handshakeWake:  options.handshakeWake,
 		}
 		_ = client.port.DiscardInput(10 * time.Millisecond)
-		fmt.Println("Opened MediaTek USB device. Performing BROM handshake.")
+		fmt.Printf("Opened MediaTek USB %04x:%04x (%s); performing MTK handshake.\n",
+			port.vid, port.pid, mtkUSBModeLabel(port.vid, port.pid))
 		handshakeDeadline := time.Now().Add(openHandshake)
 		if handshakeDeadline.After(deadline) {
 			handshakeDeadline = deadline

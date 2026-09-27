@@ -8,6 +8,9 @@ func TestIsMTKUSBFlashDevice(t *testing.T) {
 	allow := [][2]uint16{
 		{0x0e8d, 0x0003}, // MTK BROM
 		{0x0e8d, 0x2000}, // MTK preloader
+		{0x0e8d, 0x2001}, // MTK preloader
+		{0x0e8d, 0x20ff}, // MTK preloader
+		{0x0e8d, 0x3000}, // MTK preloader
 		{0x0e8d, 0x6000}, // MTK preloader
 		{0x22d9, 0x0006}, // OPPO preloader
 		{0x1004, 0x6000}, // LG preloader
@@ -19,6 +22,7 @@ func TestIsMTKUSBFlashDevice(t *testing.T) {
 	}
 	deny := [][2]uint16{
 		{0x0e8d, 0x4d56}, // MVII debug console, never a BROM
+		{0x0e8d, 0x1234}, // unrelated MediaTek product
 		{0x22d9, 0x0003}, // OPPO, wrong PID
 		{0x1004, 0x0006}, // LG, wrong PID
 		{0x1234, 0x5678}, // stranger
@@ -26,6 +30,17 @@ func TestIsMTKUSBFlashDevice(t *testing.T) {
 	for _, id := range deny {
 		if isMTKUSBFlashDevice(id[0], id[1]) {
 			t.Errorf("isMTKUSBFlashDevice(0x%04x:0x%04x) = true, want false", id[0], id[1])
+		}
+	}
+}
+
+func TestMTKUSBModeLabel(t *testing.T) {
+	if got := mtkUSBModeLabel(0x0e8d, 0x0003); got != "BROM" {
+		t.Fatalf("BROM label = %q", got)
+	}
+	for _, id := range [][2]uint16{{0x0e8d, 0x2000}, {0x22d9, 0x0006}} {
+		if got := mtkUSBModeLabel(id[0], id[1]); got != "preloader" {
+			t.Errorf("preloader label for %04x:%04x = %q", id[0], id[1], got)
 		}
 	}
 }
