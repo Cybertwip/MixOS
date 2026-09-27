@@ -89,6 +89,28 @@ func phoneBROMCode(soc string) (uint16, error) {
 	return facts.bromCode, nil
 }
 
+// phoneFactsForHWCode resolves a handshake-observed BROM hw code to its soc
+// and facts, for rootless flows that learn the target from the wire instead
+// of build-info.txt. Keep the codes in sync with phoneFactsFor.
+func phoneFactsForHWCode(hw uint16) (string, phoneFacts, error) {
+	var soc string
+	switch hw {
+	case 0x0766:
+		soc = "mt6765"
+	case 0x0699:
+		soc = "mt6739"
+	case 0x0989:
+		soc = "mt6833"
+	default:
+		return "", phoneFacts{}, fmt.Errorf("hw code 0x%04x is not a supported phone soc (known: mt6765, mt6739, mt6833)", hw)
+	}
+	facts, err := phoneFactsFor(soc)
+	if err != nil {
+		return "", phoneFacts{}, err
+	}
+	return soc, facts, nil
+}
+
 // isPhoneBROMShape reports whether this invocation flashes a phone over
 // BROM: phone root, serial VCOM (the BROM selector -- without it the same
 // flags are the working fastboot path), an explicit LK partition, and the
@@ -700,6 +722,82 @@ func probePhoneDASignature(cfg config, phone *phoneRoot) error {
 	return nil
 }
 
+// startPhoneDA acquires the phone, performs the BROM/preloader DAA dance,
+// sends the vendor auth blob when the target requires it, and uploads and
+// starts the DA. It returns a live DA session; the caller closes
+// client.port and runs eMMC commands on it.
+func startPhoneDA(cfg config, phone *phoneRoot, facts phoneFacts, emi *mtkPreloaderEMI, loader mtkDALoader, authPath string) (*mtkSerialClient, mtkTargetConfig, error) {
+	client, target, err := acquirePhoneBROM(cfg, phone, facts, emi)
+	if err != nil {
+		return nil, mtkTargetConfig{}, err
+	}
+	failed := true
+	defer func() {
+		if failed && client != nil && client.port != nil {
+			_ = client.port.Close()
+		}
+	}()
+
+	// An auth file is sent only by BROM. Acquiring the preloader must not
+	// consume the operator's -wait window and silently skip that file before
+	// trying a DA which this secured preloader may reject with 0x7024.
+	if target.DAA && authPath != "" && !client.isBROM {
+		window, err := parsePhoneWait(cfg.waitFlag)
+		if err != nil {
+			return nil, mtkTargetConfig{}, err
+		}
+		if window == 0 {
+			return nil, mtkTargetConfig{}, errors.New("phone is in preloader mode with DAA enabled; -auth can only be sent in BROM mode. Power off, enter BROM with the download key combo, and retry (or pass -wait to allow a replug)")
+		}
+		fmt.Println("DAA-enabled preloader acquired; requesting reset to BROM so -auth can be sent.")
+		if err := resetPhonePreloaderToBROM(client, facts); err != nil {
+			if strings.Contains(err.Error(), "unlock BOOT_MISC:") && strings.Contains(err.Error(), "status 0x1001") {
+				return nil, mtkTargetConfig{}, fmt.Errorf("this preloader blocks reset to BROM (0x1001); -auth cannot be sent in preloader mode, so no DA or eMMC write was attempted: %w", err)
+			}
+			fmt.Printf("Automatic BROM reset was refused: %v\n", flagFailureAdvice(err))
+			fmt.Printf("Waiting up to %s for a BROM replug with the download key combo held.\n", window)
+		} else {
+			_ = client.port.Close()
+			client = nil
+			fmt.Printf("Reset requested; waiting up to %s for BROM to enumerate.\n", window)
+		}
+		client, target, err = waitPhoneBROM(cfg, phone, facts, client, window, func(device string) (*mtkSerialClient, error) {
+			return connectMTKSerialWithOptions(device, mtkSerialConnectOptions{handshakeWake: true})
+		})
+		if err != nil {
+			return nil, mtkTargetConfig{}, err
+		}
+		client.preloaderEMI = emi
+	}
+	if !client.isBROM {
+		// Preloader mode is a first-class upload path, not a dead end:
+		// the secured preloader verifies the vendor DA signature at
+		// SEND_DA (unsigned payloads die with 0x7024) and runs the DA
+		// itself. The one observed preloader-mode drop has the exact
+		// signature of the macOS CDC-ACM flake (tty transport, deep in
+		// bulk transfer); over libusb that vector is gone. Past the DA
+		// jump the mode distinction evaporates -- the DA owns the CPU.
+		fmt.Println("Phone is in preloader mode; uploading the vendor DA through it.")
+	}
+	if send, msg := needsPhoneAuth(target, client.isBROM, authPath != ""); send {
+		authBlob, err := os.ReadFile(authPath)
+		if err != nil {
+			return nil, mtkTargetConfig{}, fmt.Errorf("phone target %s: read auth file %s: %w", phone.device, authPath, err)
+		}
+		fmt.Printf("Uploading auth blob: %s (0x%x bytes)\n", authPath, len(authBlob))
+		if err := client.sendAuth(authBlob); err != nil {
+			return nil, mtkTargetConfig{}, err
+		}
+	} else if msg != "" {
+		fmt.Println(msg)
+	}
+	if err := client.uploadLegacyDA(loader); err != nil {
+		return nil, mtkTargetConfig{}, err
+	}
+	failed = false
+	return client, target, nil
+}
+
 // flashPhoneBROM validates the staging plan, then runs the legacy DA stack
 // against the phone: probe, stage-1/2 DA upload, DRAM init from the stock
 // preloader EMI, and the sdmmc write of lk.bin at the scatter slot offset.
@@ -748,7 +846,7 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 	if err != nil {
 		return err
 	}
-	client, target, err := acquirePhoneBROM(cfg, phone, facts, emi)
+	client, _, err := startPhoneDA(cfg, phone, facts, emi, loader, plan.auth)
 	if err != nil {
 		return err
 	}
@@ -758,62 +856,6 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 		}
 	}()
 
-	// An auth file is sent only by BROM. Acquiring the preloader must not
-	// consume the operator's -wait window and silently skip that file before
-	// trying a DA which this secured preloader may reject with 0x7024.
-	if target.DAA && plan.auth != "" && !client.isBROM {
-		window, err := parsePhoneWait(cfg.waitFlag)
-		if err != nil {
-			return err
-		}
-		if window == 0 {
-			return errors.New("phone is in preloader mode with DAA enabled; -auth can only be sent in BROM mode. Power off, enter BROM with the download key combo, and retry (or pass -wait to allow a replug)")
-		}
-		fmt.Println("DAA-enabled preloader acquired; requesting reset to BROM so -auth can be sent.")
-		if err := resetPhonePreloaderToBROM(client, facts); err != nil {
-			if strings.Contains(err.Error(), "unlock BOOT_MISC:") && strings.Contains(err.Error(), "status 0x1001") {
-				return fmt.Errorf("this preloader blocks reset to BROM (0x1001); -auth cannot be sent in preloader mode, so no DA or eMMC write was attempted: %w", err)
-			}
-			fmt.Printf("Automatic BROM reset was refused: %v\n", flagFailureAdvice(err))
-			fmt.Printf("Waiting up to %s for a BROM replug with the download key combo held.\n", window)
-		} else {
-			_ = client.port.Close()
-			client = nil
-			fmt.Printf("Reset requested; waiting up to %s for BROM to enumerate.\n", window)
-		}
-		client, target, err = waitPhoneBROM(cfg, phone, facts, client, window, func(device string) (*mtkSerialClient, error) {
-			return connectMTKSerialWithOptions(device, mtkSerialConnectOptions{handshakeWake: true})
-		})
-		if err != nil {
-			return err
-		}
-		client.preloaderEMI = emi
-	}
-	if !client.isBROM {
-		// Preloader mode is a first-class upload path, not a dead end:
-		// the secured preloader verifies the vendor DA signature at
-		// SEND_DA (unsigned payloads die with 0x7024) and runs the DA
-		// itself. The one observed preloader-mode drop has the exact
-		// signature of the macOS CDC-ACM flake (tty transport, deep in
-		// bulk transfer); over libusb that vector is gone. Past the DA
-		// jump the mode distinction evaporates -- the DA owns the CPU.
-		fmt.Println("Phone is in preloader mode; uploading the vendor DA through it.")
-	}
-	if send, msg := needsPhoneAuth(target, client.isBROM, plan.auth != ""); send {
-		authBlob, err := os.ReadFile(plan.auth)
-		if err != nil {
-			return fmt.Errorf("phone target %s: read auth file %s: %w", phone.device, plan.auth, err)
-		}
-		fmt.Printf("Uploading auth blob: %s (0x%x bytes)\n", plan.auth, len(authBlob))
-		if err := client.sendAuth(authBlob); err != nil {
-			return err
-		}
-	} else if msg != "" {
-		fmt.Println(msg)
-	}
-	if err := client.uploadLegacyDA(loader); err != nil {
-		return err
-	}
 	if err := client.writeLegacyEMMCRaw(image, plan.offset, rawLength, packetSize); err != nil {
 		return err
 	}

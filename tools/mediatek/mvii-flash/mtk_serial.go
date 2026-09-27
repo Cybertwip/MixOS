@@ -44,6 +44,7 @@ const (
 	mtkLegacyHWStorageEMMC    = 0x02
 	mtkLegacyEMMCStorage      = 0x01
 	mtkLegacyEMMCPartBoot1    = 0x01
+	mtkLegacyEMMCPartBoot2    = 0x02
 	mtkLegacyEMMCPartUser     = 0x08
 	mtkLegacyNeedDRAMConfig   = 0x0BC3
 	mtkLegacyDRAMInfo         = 0x0BC4
