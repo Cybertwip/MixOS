@@ -721,7 +721,7 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 		if window == 0 {
 			return errors.New("phone is in preloader mode with DAA enabled; -auth can only be sent in BROM mode. Power off, enter BROM with the download key combo, and retry (or pass -wait to allow a replug)")
 		}
-		fmt.Printf("DAA-enabled preloader acquired; requesting reset to BROM so -auth can be sent.\n")
+		fmt.Println("DAA-enabled preloader acquired; requesting reset to BROM so -auth can be sent.")
 		if err := resetPhonePreloaderToBROM(client, facts); err != nil {
 			fmt.Printf("Automatic BROM reset was refused: %v\n", flagFailureAdvice(err))
 			fmt.Printf("Waiting up to %s for a BROM replug with the download key combo held.\n", window)

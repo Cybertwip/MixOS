@@ -427,6 +427,47 @@ func TestFlagFailureAdvice(t *testing.T) {
 	}
 }
 
+func TestResetPhonePreloaderToBROM(t *testing.T) {
+	facts, err := phoneFactsFor("mt6765")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writes := []struct{ addr, value uint32 }{
+		{0x1001a100, mtkMiscLockKeyMagic},
+		{0x1001a108, 1},
+		{0x1001a100, 0},
+		{0x1001a0e0, phoneUSBDLReg()},
+		{0x10007008, mtkWatchdogRestart},
+		{0x10007000, mtkWatchdogRebootMode},
+		{0x10007014, mtkWatchdogSoftwareRst},
+	}
+	port := &scriptPort{}
+	var want []byte
+	for _, w := range writes {
+		port.pending = append(port.pending, mtkCmdWrite32)
+		port.pending = append(port.pending, be32(w.addr)...)
+		port.pending = append(port.pending, be32(1)...)
+		port.pending = append(port.pending, be16(0)...)
+		port.pending = append(port.pending, be32(w.value)...)
+		port.pending = append(port.pending, be16(0)...)
+		want = append(want, mtkCmdWrite32)
+		want = append(want, be32(w.addr)...)
+		want = append(want, be32(1)...)
+		want = append(want, be32(w.value)...)
+	}
+	client := &mtkSerialClient{port: port, commandTimeout: time.Second, writeTimeout: time.Second}
+	if err := resetPhonePreloaderToBROM(client, facts); err != nil {
+		t.Fatalf("resetPhonePreloaderToBROM = %v", err)
+	}
+	var got []byte
+	for _, part := range port.writes {
+		got = append(got, part...)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("reset commands = %x, want %x", got, want)
+	}
+}
+
 func TestHandshakeWake(t *testing.T) {
 	echoes := []byte{0x5F, 0xF5, 0xAF, 0xFA}
 	port := &scriptPort{pending: append([]byte(nil), echoes...)}
