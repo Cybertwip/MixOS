@@ -338,7 +338,7 @@ func refusePhoneSLA(phone *phoneRoot, target mtkTargetConfig) error {
 func probePhoneBROM(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts) (mtkTargetConfig, error) {
 	const maxReconnect = 8
 	for attempt := 0; ; attempt++ {
-		target, err := probePhoneBROMOnce(c, phone, facts)
+		target, err := probePhoneBROMOnce(c, phone, facts, false)
 		if err == nil {
 			return target, nil
 		}
@@ -352,12 +352,17 @@ func probePhoneBROM(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts) (mtk
 	}
 }
 
-func probePhoneBROMOnce(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts) (mtkTargetConfig, error) {
+func probePhoneBROMOnce(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts, quiet bool) (mtkTargetConfig, error) {
+	say := func(format string, args ...any) {
+		if !quiet {
+			fmt.Printf(format, args...)
+		}
+	}
 	got, hwVer, err := c.getHWCode()
 	if err != nil {
 		return mtkTargetConfig{}, err
 	}
-	fmt.Printf("MTK HW code: 0x%04x, HW version: 0x%04x\n", got, hwVer)
+	say("MTK HW code: 0x%04x, HW version: 0x%04x\n", got, hwVer)
 	if got != facts.bromCode {
 		return mtkTargetConfig{}, fmt.Errorf("connected MediaTek target is 0x%04x, expected %s (%s, hw code 0x%04x)",
 			got, phone.device, phone.soc, facts.bromCode)
@@ -366,13 +371,13 @@ func probePhoneBROMOnce(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts) 
 	// register write, in which case the session runs inside the watchdog
 	// window and a drop fails the run loudly (the slot stays reflashable).
 	if err := c.write32(facts.watchdog, facts.watchdogOff); err != nil {
-		fmt.Printf("Warning: could not disable the phone watchdog (%v); mid-session resets will fail the run.\n", err)
+		say("Warning: could not disable the phone watchdog (%v); mid-session resets will fail the run.\n", err)
 	}
 	target, err := c.getTargetConfig()
 	if err != nil {
 		return mtkTargetConfig{}, err
 	}
-	fmt.Printf("Target config: 0x%08x (SBC=%t SLA=%t DAA=%t MemRead=%t MemWrite=%t)\n",
+	say("Target config: 0x%08x (SBC=%t SLA=%t DAA=%t MemRead=%t MemWrite=%t)\n",
 		target.Raw, target.SBC, target.SLA, target.DAA, target.MemRead, target.MemWrite)
 	if err := refusePhoneSLA(phone, target); err != nil {
 		return mtkTargetConfig{}, err
@@ -392,11 +397,11 @@ func probePhoneBROMOnce(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts) 
 	c.blVersion = blver
 	c.bromVersion = bromver
 	c.isBROM = isBROM
-	fmt.Printf("MTK mode: %s, BL version: 0x%02x, BROM version: 0x%02x\n", mode, blver, bromver)
+	say("MTK mode: %s, BL version: 0x%02x, BROM version: 0x%02x\n", mode, blver, bromver)
 	if _, _, _, err := c.getHWSWVersion(); err == nil {
 		// Best-effort metadata, as on the J36 path.
 	} else {
-		fmt.Printf("Warning: could not read HW/SW version tuple: %v\n", err)
+		say("Warning: could not read HW/SW version tuple: %v\n", err)
 	}
 	return target, nil
 }
@@ -439,34 +444,54 @@ func setPhonePreloaderBROMFlag(c *mtkSerialClient, facts phoneFacts) error {
 	return nil
 }
 
-// waitPhoneBROM closes a preloader-mode session and waits for the phone to
-// re-enumerate in BROM after the reset-to-BROM flag was armed. The reset
-// itself comes from the preloader's own idle timeout; no trigger sequence
-// is grounded for phones, so if the window expires the run says so and
-// names the key combo. Returns the fresh BROM session on success.
-func waitPhoneBROM(cfg config, phone *phoneRoot, facts phoneFacts) (*mtkSerialClient, mtkTargetConfig, error) {
-	const attempts = 12
-	for i := 0; i < attempts; i++ {
-		time.Sleep(5 * time.Second)
-		client, err := connectMTKSerial(cfg.device)
+// waitPhoneBROM takes a live preloader-mode session and waits for BROM: it
+// polls the live handle (closing and reopening mid-session wedges the
+// preloader handshake), and only opens a fresh session after a genuine
+// reset or replug drops the old one. The caller hands over its client;
+// success returns the BROM session (caller-owned), failure closes
+// everything and reports. Bounded by an overall deadline, not an attempt
+// count, because a fresh connect already waits out its own window.
+func waitPhoneBROM(cfg config, phone *phoneRoot, facts phoneFacts, client *mtkSerialClient) (*mtkSerialClient, mtkTargetConfig, error) {
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		target, err := probePhoneBROMOnce(client, phone, facts, true)
+		if err == nil {
+			if client.isBROM {
+				fmt.Printf("BROM session acquired: target config 0x%08x (SBC=%t SLA=%t DAA=%t).\n",
+					target.Raw, target.SBC, target.SLA, target.DAA)
+				return client, target, nil
+			}
+			if !time.Now().Before(deadline) {
+				break
+			}
+			fmt.Printf("Waiting for BROM (%s left): preloader session alive; replug with Vol-down held to switch modes.\n",
+				time.Until(deadline).Round(time.Second))
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if !isDeviceGoneError(err) {
+			if !time.Now().Before(deadline) {
+				break
+			}
+			fmt.Printf("Waiting for BROM (%s left): preloader not answering (%v).\n",
+				time.Until(deadline).Round(time.Second), err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		// Reset or replug dropped the handle: fresh session. The connect
+		// waits out its own window, so a key-combo replug lands here.
+		_ = client.port.Close()
+		fmt.Println("Device re-enumerated; reopening.")
+		client, err = connectMTKSerial(cfg.device)
 		if err != nil {
-			fmt.Printf("BROM wait %d/%d: %v\n", i+1, attempts, err)
+			if !time.Now().Before(deadline) {
+				break
+			}
 			continue
 		}
-		target, err := probePhoneBROMOnce(client, phone, facts)
-		if err != nil {
-			_ = client.port.Close()
-			fmt.Printf("BROM wait %d/%d: %v\n", i+1, attempts, err)
-			continue
-		}
-		if !client.isBROM {
-			_ = client.port.Close()
-			fmt.Printf("BROM wait %d/%d: still in preloader mode.\n", i+1, attempts)
-			continue
-		}
-		return client, target, nil
 	}
-	return nil, mtkTargetConfig{}, errors.New("phone stayed in preloader mode; power off, hold Vol-down (or Vol-up+Vol-down), replug for BROM mode, and rerun")
+	_ = client.port.Close()
+	return nil, mtkTargetConfig{}, errors.New("BROM wait expired; power off, hold Vol-down (or Vol-up+Vol-down), replug for BROM mode, and rerun")
 }
 
 // flagFailureAdvice wraps a reset-to-BROM flag failure: on secured units
@@ -620,8 +645,7 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 		if err := setPhonePreloaderBROMFlag(client, facts); err != nil {
 			fmt.Printf("Warning: %v\n", flagFailureAdvice(err))
 		}
-		_ = client.port.Close()
-		client, target, err = waitPhoneBROM(cfg, phone, facts)
+		client, target, err = waitPhoneBROM(cfg, phone, facts, client)
 		if err != nil {
 			return err
 		}
