@@ -34,9 +34,6 @@ EXPORT_DIR="${J36_EXPORT_DIR:-$WORK/export}"
 # is what produces the flashable image, and it is the only thing that should.
 MIX_ONLY="${J36_MIX_ONLY:-0}"
 WITHOUT_BATTERY="${J36_WITHOUT_BATTERY:-0}"
-POWER_DIAGNOSTIC="${J36_POWER_DIAGNOSTIC:-0}"
-[[ "$POWER_DIAGNOSTIC" == 0 || "$POWER_DIAGNOSTIC" == 1 ]] || \
-    { printf 'J36_POWER_DIAGNOSTIC must be 0 or 1\n' >&2; exit 2; }
 [[ "$WITHOUT_BATTERY" == 0 || "$WITHOUT_BATTERY" == 1 ]] || \
     { printf 'J36_WITHOUT_BATTERY must be 0 or 1\n' >&2; exit 2; }
 KERNEL_URL="${J36_KERNEL_URL:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
@@ -1522,9 +1519,6 @@ verify_arm_elf "$USB_PHY_MODULE" "the USB PHY module"
 PMIC_MODULE="$MODULE_SRC/j36_mt6592_pmic.ko"
 [[ -s "$PMIC_MODULE" ]] || die "PMIC module was not produced"
 verify_arm_elf "$PMIC_MODULE" "the PMIC module"
-PWRAP_MODULE="$MODULE_SRC/j36_pwrap.ko"
-[[ -s "$PWRAP_MODULE" ]] || die "shared PWRAP module was not produced"
-verify_arm_elf "$PWRAP_MODULE" "the shared PWRAP module"
 # And the backlight, which rides along in the same power payload.  It is the only
 # module here that the user can see working without reading a log: it is what puts
 # /sys/class/backlight/j36-backlight on the board, and therefore what the
@@ -1757,11 +1751,6 @@ for applet in "${INIT_APPLETS[@]}"; do
     ln -sf busybox "$INITROOT/bin/$applet"
 done
 cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
-cp "$PWRAP_MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
-cp "$ROOT/device/j36-ultra/power-diagnostic.sh" "$INITROOT/power-diagnostic.sh"
-if [[ "$POWER_DIAGNOSTIC" == 1 ]]; then
-    printf 'v6\n' > "$INITROOT/etc/j36-power-diagnostic"
-fi
 # And the PMIC, which is ALSO staged into j36/power/ on the card and is the only
 # module in this build that is deliberately in two places.  The payload copy is the
 # one that owns the gauge, the backlight ordering and the poweroff handler; this
@@ -1897,18 +1886,7 @@ if grep -q '^tty0 .*C' /proc/consoles 2>/dev/null; then panel_is_console=1; fi
 # it is called, so an unset variable would be a silent empty string in the first
 # comparison rather than an error anyone would notice.
 splash_on=0
-power_diag=""
-case " $(cat /proc/cmdline) " in
-    *" j36.diag=power "*) power_diag=power ;;
-esac
-# The explicit diagnostic build carries its own mode marker, so stale or
-# overridden bootargs cannot silently disable this test.
-if [ -f /etc/j36-power-diagnostic ]; then power_diag=power; fi
-. /power-diagnostic.sh
 say() {
-    if [ "$power_diag" = power ]; then
-        echo "$(cat /proc/uptime) $*" >> /dev/j36-init-trace
-    fi
     echo "$@"
     if [ "$panel_is_console" = 0 ] && [ -c /dev/tty1 ]; then echo "$@" >/dev/tty1; fi
     # With console=tty0 last, the line above went to the panel and nowhere else --
@@ -1982,7 +1960,6 @@ fi
 stage() {
     say "$1"
     if [ "$splash_on" = 1 ]; then echo "stage:$1" >> "$splash_chan"; fi
-    power_diag_checkpoint "$1"
     return 0
 }
 detail() {
@@ -2100,51 +2077,14 @@ watch_mark() {
 # Read once, and cleared in the same breath, so the answer can only ever be acted
 # on by this boot.  A mark that survived being read would skip its stage on every
 # boot from here to the end of the card.
-#
-# The mark carries a step after a colon when a per-module mark wrote it
-# ("run_usb:mediatek.ko") and names the stage alone otherwise ("run_usb").
-# The skip below matches the stage either way; the report says the step.
 watch_recall() {
     if [ "$watch_recalled" = 1 ]; then return 0; fi
     watch_recalled=1
     if [ -s "$watch_markfile" ]; then read -r watch_wedge < "$watch_markfile"; fi
     if [ -n "$watch_wedge" ]; then
-        watch_wedge_stage="${watch_wedge%%:*}"
-        case "$watch_wedge" in
-            *:*)
-                watch_wedge_where="inside $watch_wedge_stage at ${watch_wedge#*:}"
-                ;;
-            *)
-                watch_wedge_where="inside $watch_wedge_stage"
-                ;;
-        esac
-        if [ "$power_diag" = power ]; then
-            # An attended diagnostic boot retries the wedged stage with step
-            # logging instead of skipping it: the retry is the test, and the
-            # per-module marks will say where it stops this time.  The stale
-            # mark is kept beside the live one, synced, so the evidence
-            # survives whatever the retry does.  Normal boots keep the
-            # skip-once protection below.
-            say "diag retry: the last boot stopped dead $watch_wedge_where -- running it again with step logging (a boot without j36.diag=power skips it once instead)"
-            cp "$watch_markfile" "$watch_markfile.prev" 2>/dev/null
-            sync
-            watch_wedge=""
-        else
-            say "the last boot stopped dead $watch_wedge_where -- it is skipped this time and tried again on the next boot"
-            watch_wedge="$watch_wedge_stage"
-        fi
+        say "the last boot stopped dead inside $watch_wedge -- it is skipped this time and tried again on the next boot"
     fi
     watch_mark ""
-    return 0
-}
-# The mark, per module.  watch_mark() names the stage in flight; this names the
-# module inside it ("run_usb:mediatek.ko"), synced, so a board that dies
-# between two checkpoints still leaves the step behind on the OS partition.
-# Diagnostic boots only: a normal boot's protection is the stage-level mark,
-# and it pays no per-module sync for diagnosis it did not ask for.
-watch_step_mark() {
-    [ "$power_diag" = power ] || return 0
-    watch_mark "$1:$2"
     return 0
 }
 watch_run() {
@@ -2158,7 +2098,6 @@ watch_run() {
         return 126
     fi
     watch_mark "$1"
-    power_diag_checkpoint "before $1"
     : > "$watch_status"
     : > "$watch_result"
     watch_say "$watch_label"
@@ -2184,9 +2123,6 @@ watch_run() {
         watch_step=""
         if [ -s "$watch_status" ]; then read -r watch_step < "$watch_status"; fi
         if [ -z "$watch_step" ]; then watch_step="$watch_label"; fi
-        if [ "$((watch_waited % 5))" = 0 ]; then
-            power_diag_checkpoint "$watch_label: $watch_step (${watch_waited}s)"
-        fi
         detail "$watch_step -- ${watch_waited}s"
         watch_waited=$((watch_waited + 1))
         sleep 1
@@ -2197,18 +2133,13 @@ watch_run() {
     # `return' wants a number and the file is written by a shell that could in
     # principle have been killed mid-write.  125 is "the child did not say".
     case "$watch_rc" in ''|*[!0-9]*) watch_rc=125 ;; esac
-    power_diag_checkpoint "after $1 rc=$watch_rc"
     return "$watch_rc"
 }
 
 say ""
 say "J36 Ultra ARMv7 bring-up initramfs"
-if [ "$power_diag" = power ]; then
-    stage "J36 DIAG v6: initramfs loaded"
-fi
 say "Display: the LK's framebuffer on /dev/fb0 until something opens /dev/dri/card0."
 progress 4
-insmod /lib/modules/*/extra/j36_pwrap.ko || say "shared PWRAP module load failed"
 insmod /lib/modules/*/extra/j36_mt6592_input.ko || say "input module load failed"
 
 # ── Hand over to the rootfs on the card, if there is one ─────────────────────
@@ -2234,10 +2165,6 @@ want_usb=0
 usb_vbus=1
 want_power=0
 power_charge=1
-power_external=0
-case " $(cat /proc/cmdline) " in
-    *" j36.diag=power "*) power_diag=power ;;
-esac
 want_wifi=0
 # The only j36 word that defaults to ON, and the reason is that it is the word you
 # cannot ask for after the fact: it writes the file that says why the boot went
@@ -2273,10 +2200,6 @@ want_zram=auto
 # Take the word back out and the next boot grows it, because nothing about the
 # decision is remembered: both ends are read off the card every time.
 want_expand=1
-# Hand over to systemd unless told not to.  j36.switchroot=0 stays in the
-# initramfs with a shell instead, for the boot where the question is whether
-# the reset lives before switch_root or after it.
-want_switchroot=1
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         j36.audio|j36.audio=1)
@@ -2369,15 +2292,9 @@ for arg in $(cat /proc/cmdline); do
         # LK left it with.  This is the word to reach for on a board with no cell
         # fitted, and the one to compare against when something about charging
         # behaves differently after this driver landed.
-        j36.power=nocharge)
+        j36.power=nocharge|j36.power=external)
             want_power=1
             power_charge=0
-            ;;
-        # No cell.  Disable the charger watchdog and widen UVLO.  Do not rewrite
-        # the preloader's charger mode: that latched the PMIC off before splash.
-        j36.power=external)
-            want_power=1
-            power_external=1
             ;;
         # The radio: MT6323 rails, the CONSYS power domain, the BTIF link, the
         # two ROM patches, the WLAN firmware and wlan0.  Behind its own word for
@@ -2465,14 +2382,6 @@ for arg in $(cat /proc/cmdline); do
         # other one here, it lives where a Mac can reach it.
         j36.expand=fsck)
             want_expand=fsck
-            ;;
-        # Stay in the initramfs instead of switching root: no systemd, no units,
-        # just the post-mortem below and a shell on each console.  For the boot
-        # where the question is whether the reset lives before switch_root or
-        # after it.  Per-boot like the rest: take the word out and the next boot
-        # hands over again.
-        j36.switchroot=0|noswitchroot)
-            want_switchroot=0
             ;;
         # Swap off entirely, for the boot where the question is whether zram is
         # what is making the board feel slow.  It is a fair question and it has a
@@ -2566,66 +2475,12 @@ fi
 # later -- which is why the failure is worth one line rather than a stop.
 if [ "$want_power" = 1 ]; then
     pmic_args=""
-    if [ "$power_external" = 1 ]; then
-        pmic_args="external_power=1"
-    elif [ "$power_charge" != 1 ]; then
-        pmic_args="charge=0"
-    fi
+    [ "$power_charge" = 1 ] || pmic_args="charge=0"
     if insmod /lib/modules/*/extra/j36_mt6592_pmic.ko $pmic_args 2>/dev/null; then
-        if [ "$power_external" = 1 ]; then
-            say "power: PMIC loaded early (external_power=1); kernel log reports the watchdog hold result"
-        else
-            say "power: PMIC loaded early${pmic_args:+ ($pmic_args)} -- the charger watchdog is being kicked before the card work starts"
-        fi
+        say "power: PMIC loaded early${pmic_args:+ ($pmic_args)} -- the charger watchdog is being kicked before the card work starts"
     else
         say "power: the initramfs PMIC would not load; the charger stays as the LK left it until j36/power/ is reached"
     fi
-fi
-
-# Defined before root discovery so diagnostic boots can record early failures.
-# Normal boots still first call this after expansion has returned.
-bootfs_mounted=0
-# Remembered so that the data-partition automount below can leave the BOOT partition
-# alone: it is already reachable, it is the one partition the operator edits from a
-# PC, and it is not what "show me the card" means.
-bootdev=""
-mount_bootfs() {
-    if [ "$bootfs_mounted" = 1 ]; then return 0; fi
-    mkdir -p /bootfs
-    for dev in /dev/mmcblk*p*; do
-        if [ ! -b "$dev" ]; then continue; fi
-        if ! mount -t vfat -o ro "$dev" /bootfs 2>/dev/null; then continue; fi
-        # mvii/ identifies it now, not j36/: boot.conf is the file the LK itself
-        # reads and the one thing BOOT always carries, whereas j36/ is exactly what
-        # moved off this partition.  j36/ is still accepted, because on a card from
-        # an older build that is what is there.
-        if [ -d /bootfs/mvii ] || [ -d /bootfs/j36 ]; then
-            bootfs_mounted=1
-            bootdev="$dev"
-            say "boot partition: $dev"
-            return 0
-        fi
-        umount /bootfs
-    done
-    say "no FAT partition on this card carries mvii/ or j36/"
-    return 1
-}
-
-if [ "$power_diag" = power ]; then
-    # Do not wait before the early PMIC load: an old LK may leave a timer armed.
-    # Isolate expansion on this diagnostic boot, even if bootargs request it.
-    want_expand=0
-    # Early BOOT writes are safe only after expansion is explicitly disabled.
-    power_diag_ready=1
-    stage "J36 DIAG v6: resize skipped"
-    detail "Diagnostic initramfs active; card size stays unchanged"
-    # Retry as the MMC partitions appear; retain the original five-second pause.
-    power_diag_early_wait=0
-    while [ "$power_diag_early_wait" -lt 5 ]; do
-        sleep 1
-        power_diag_checkpoint "early boot before root scan ($power_diag_early_wait)"
-        power_diag_early_wait=$((power_diag_early_wait + 1))
-    done
 fi
 
 # ── Swap, in RAM, before anything has allocated ──────────────────────────────
@@ -3891,8 +3746,32 @@ expand_root
 # try_root() finds the rootfs -- by mounting candidates and looking inside, because
 # partition numbering follows whichever MMC host attached first and this initramfs
 # has no blkid.  Read-only, since nothing here writes to the card.
-
-power_diag_start
+bootfs_mounted=0
+# Remembered so that the data-partition automount below can leave the BOOT partition
+# alone: it is already reachable, it is the one partition the operator edits from a
+# PC, and it is not what "show me the card" means.
+bootdev=""
+mount_bootfs() {
+    if [ "$bootfs_mounted" = 1 ]; then return 0; fi
+    mkdir -p /bootfs
+    for dev in /dev/mmcblk*p*; do
+        if [ ! -b "$dev" ]; then continue; fi
+        if ! mount -t vfat -o ro "$dev" /bootfs 2>/dev/null; then continue; fi
+        # mvii/ identifies it now, not j36/: boot.conf is the file the LK itself
+        # reads and the one thing BOOT always carries, whereas j36/ is exactly what
+        # moved off this partition.  j36/ is still accepted, because on a card from
+        # an older build that is what is there.
+        if [ -d /bootfs/mvii ] || [ -d /bootfs/j36 ]; then
+            bootfs_mounted=1
+            bootdev="$dev"
+            say "boot partition: $dev"
+            return 0
+        fi
+        umount /bootfs
+    done
+    say "no FAT partition on this card carries mvii/ or j36/"
+    return 1
+}
 
 # Set once, read by run_lima, run_mtkdrm, run_audio and setup_gl.  Empty means
 # "not looked for yet"; find_payload is called by each of them and is idempotent.
@@ -4104,7 +3983,6 @@ run_lima() {
         # that takes a long time to probe is the one whose name should be on the
         # screen while it does, not once it has finished.
         watch_say "$ko"
-        watch_step_mark run_lima "$ko"
         if insmod "$payload/modules/$ko" >/tmp/insmod.log 2>&1; then
             say "lima: loaded $ko"
         else
@@ -4157,7 +4035,6 @@ run_mtkdrm() {
     while IFS= read -r ko; do
         case "$ko" in ''|'#'*) continue ;; esac
         watch_say "$ko"
-        watch_step_mark run_mtkdrm "$ko"
         if insmod "$payload/mtkdrm/$ko" >/tmp/insmod.log 2>&1; then
             say "mtkdrm: loaded $ko"
         else
@@ -4199,17 +4076,9 @@ run_audio() {
     fi
     while IFS= read -r ko; do
         case "$ko" in ''|'#'*) continue ;; esac
-        mod=$(printf '%s' "${ko%.ko}" | tr '-' '_')
-        if [ -d "/sys/module/$mod" ]; then
-            say "audio: $ko is already loaded"
-            continue
-        fi
         params=""
         if [ "$audio_speaker" = 1 ]; then
             case "$ko" in j36_mt6592_audio.ko) params="speaker=1" ;; esac
-        fi
-        if [ "$power_external" = 1 ]; then
-            case "$ko" in j36_mt6592_audio.ko) params="speaker=0 external_power=1" ;; esac
         fi
         # Named on the panel before it is loaded and not after, which is the only
         # ordering that says anything: a module that takes a long time to probe is
@@ -4225,7 +4094,6 @@ run_audio() {
         # overwritten by the next tick anyway.  The status file is how the child
         # gets a word into that line.
         watch_say "$ko"
-        watch_step_mark run_audio "$ko"
         if insmod "$payload/audio/$ko" $params >/tmp/insmod.log 2>&1; then
             say "audio: loaded $ko $params"
         else
@@ -4239,9 +4107,7 @@ run_audio() {
     else
         say "audio: no /dev/snd; the card did not register"
     fi
-    if [ "$power_external" = 1 ]; then
-        say "audio: batteryless supply; speaker amp disabled, headphone output available"
-    elif [ "$audio_speaker" = 1 ]; then
+    if [ "$audio_speaker" = 1 ]; then
         say "audio: speaker amp armed; it powers up when the DL1 cursor first moves"
         say "audio: if the board cuts out in playback: amixer -c0 set \"Speaker Amp\" off"
     else
@@ -4313,7 +4179,6 @@ run_usb() {
                 ;;
         esac
         watch_say "$ko"
-        watch_step_mark run_usb "$ko"
         if insmod "$payload/usb/$ko" $args >/tmp/insmod.log 2>&1; then
             say "usb: loaded $ko${args:+ $args}"
         else
@@ -4432,15 +4297,10 @@ run_power() {
         args=""
         case "$ko" in
             j36_mt6592_pmic.ko)
-                if [ "$power_external" = 1 ]; then
-                    args="external_power=1"
-                elif [ "$power_charge" != 1 ]; then
-                    args="charge=0"
-                fi
+                [ "$power_charge" = 1 ] || args="charge=0"
                 ;;
         esac
         watch_say "$ko"
-        watch_step_mark run_power "$ko"
         if insmod "$payload/power/$ko" $args >/tmp/insmod.log 2>&1; then
             say "power: loaded $ko${args:+ $args}"
         else
@@ -4472,9 +4332,7 @@ run_power() {
         say "power: battery reads $(cat /sys/class/power_supply/battery/capacity 2>/dev/null)%"
     fi
 
-    if [ "$power_external" = 1 ]; then
-        say "power: external supply policy requested; kernel log reports the watchdog hold result"
-    elif [ "$power_charge" != 1 ]; then
+    if [ "$power_charge" != 1 ]; then
         say "power: charger left as the LK set it by j36.power=nocharge"
     fi
 
@@ -4558,20 +4416,8 @@ run_wifi() {
             say "wifi: $ko is already loaded"
             continue
         fi
-        # Preserve the selected policy even if both earlier PMIC loads failed.
-        args=""
-        case "$ko" in
-            j36_mt6592_pmic.ko)
-                if [ "$power_external" = 1 ]; then
-                    args="external_power=1"
-                elif [ "$power_charge" != 1 ]; then
-                    args="charge=0"
-                fi
-                ;;
-        esac
         watch_say "$ko"
-        watch_step_mark run_wifi "$ko"
-        if insmod "$payload/wifi/$ko" $args >/tmp/insmod.log 2>&1; then
+        if insmod "$payload/wifi/$ko" >/tmp/insmod.log 2>&1; then
             say "wifi: loaded $ko"
         else
             say "wifi: FAILED to load $ko"
@@ -7282,111 +7128,6 @@ UNITLOG
     return 0
 }
 
-# ── the first seconds of systemd, sampled every two seconds ──────────────────
-#
-# j36-logdump's first pass lands twenty seconds in, which is twenty seconds of
-# systemd nobody sees when the board dies in services.  This stages a second
-# unit that starts with the very first transaction and writes a small rotating
-# pair -- BOOT:/j36-early-0.txt and j36-early-1.txt -- every two seconds until
-# mixdash is up or three minutes pass, whichever comes first.  Each file carries
-# the boot ID (the same /proc instance moves across switch_root, so it matches
-# the initramfs checkpoints), the PMIC snapshot, the load average and what
-# systemd itself says about the boot.  A death in services then leaves evidence
-# no more than two seconds old.
-#
-# Diagnostic boots only: a normal boot stages nothing and pays nothing.  The
-# mount logic is logdump's, duplicated rather than shared, so that either unit
-# stands alone; mounting a FAT that is already mounted elsewhere shares the
-# superblock, so the two units stepping on each other is safe.  The script never
-# stops early on purpose -- no `set -e' -- and every external command degrades
-# to a word saying so, because a tracer that goes quiet is the failure.
-#
-# The closing braces below carry comments, which is load-bearing in an unusual
-# place: the test extracts this function by its first lone `}' line, so a bare
-# one inside the staged script would cut the extraction short.
-setup_earlytrace() {
-    [ "$power_diag" = power ] || return 0
-    if [ -z "$rootdev" ]; then return 1; fi
-    if ! ensure_run_tmpfs; then return 1; fi
-    mkdir -p /newroot/run/j36/bin /newroot/run/systemd/system
-    cat > /newroot/run/j36/bin/j36-early-trace <<'EARLYTRACE'
-#!/bin/sh
-# j36-early-trace -- sample early systemd progress onto the FAT BOOT partition.
-#
-# Written by the J36 Ultra initramfs into /run, and started by
-# j36-early-trace.service in the first transaction.  Diagnostic boots only.
-set -u
-MNT=/run/j36/bootmnt
-SEQ=0
-# Identified by looking inside it, like j36-logdump: mvii/ is what the LK reads.
-mount_boot() {
-    mkdir -p "$MNT"
-    for _d in /dev/mmcblk*p*; do
-        [ -b "$_d" ] || continue
-        mount -t vfat -o rw,noatime "$_d" "$MNT" 2>/dev/null || continue
-        if [ -d "$MNT/mvii" ] || [ -d "$MNT/j36" ]; then
-            return 0
-        fi
-        umount "$MNT" 2>/dev/null || true
-    done
-    return 1
-} # mount_boot
-sample() {
-    mount_boot || return 0
-    SEQ=$((SEQ + 1))
-    {
-        echo "J36 early trace"
-        echo "sequence=$SEQ"
-        echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
-        echo "uptime=$(cat /proc/uptime 2>/dev/null)"
-        echo "loadavg=$(cat /proc/loadavg 2>/dev/null)"
-        echo "system=$(systemctl --no-pager is-system-running 2>/dev/null || echo unknown)"
-        for _f in /sys/class/power_supply/usb/power_snapshot \
-            /sys/class/power_supply/usb/online \
-            /sys/class/power_supply/usb/voltage_now \
-            /sys/class/power_supply/battery/voltage_now; do
-            echo "$_f:"
-            cat "$_f" 2>/dev/null || echo unavailable
-        done
-        echo "failed_units:"
-        systemctl --no-pager list-units --failed --no-legend 2>/dev/null || echo unknown
-        echo "trace_complete=$SEQ"
-    } > "$MNT/j36-early-$((SEQ % 2)).txt" 2>/dev/null
-    sync
-    umount "$MNT" 2>/dev/null || true
-} # sample
-n=0
-while [ "$n" -lt 90 ]; do
-    sample
-    if [ "$(systemctl is-active mixdash.service 2>/dev/null)" = active ]; then
-        exit 0
-    fi
-    sleep 2
-    n=$((n + 1))
-done
-exit 0
-EARLYTRACE
-    chmod 0755 /newroot/run/j36/bin/j36-early-trace
-    cat > /newroot/run/systemd/system/j36-early-trace.service <<'UNITEARLY'
-# Written by the J36 Ultra initramfs, into a tmpfs.  See setup_earlytrace in /init.
-[Unit]
-Description=Sample early systemd progress onto BOOT (diagnostic)
-DefaultDependencies=no
-Before=sysinit.target
-
-[Service]
-Type=simple
-ExecStart=/bin/sh /run/j36/bin/j36-early-trace
-StandardOutput=journal
-StandardError=journal
-UNITEARLY
-    mkdir -p /newroot/run/systemd/system/sysinit.target.wants
-    ln -sf ../j36-early-trace.service \
-           /newroot/run/systemd/system/sysinit.target.wants/j36-early-trace.service
-    say "logdump: BOOT:/j36-early-0.txt, sampled every 2 s until mixdash is up"
-    return 0
-}
-
 # ── the restart loop that paints over the picture ─────────────────────────────
 #
 # batt_led.service comes from the shared RG351MP rootfs and runs
@@ -7695,20 +7436,9 @@ if [ -n "$rootdev" ] && [ "$want_log" = 1 ]; then
     progress 86
     tame_batt_led
     setup_logdump
-    setup_earlytrace
 fi
 
-# The hand-over, as a function so the no-switch-root word has something to
-# gate -- and so the test can run it without a rootfs.  Falling off the end
-# lands in the post-mortem and the shells below, which is the right place for
-# both a refused hand-over and a declined one.
-do_switchroot() {
-    if [ -z "$rootdev" ]; then return 1; fi
-    if [ "$want_switchroot" = 0 ]; then
-        say "j36.switchroot=0: staying in the initramfs with a shell instead of starting systemd"
-        stage "Shell without systemd"
-        return 0
-    fi
+if [ -n "$rootdev" ]; then
     say "switching root into $rootdev"
     stage "Starting MixOS"
     detail "$rootdev"
@@ -7733,10 +7463,6 @@ do_switchroot() {
     mount -t proc proc /proc 2>/dev/null
     mount -t sysfs sysfs /sys 2>/dev/null
     say "switch_root failed; staying in the initramfs"
-    return 0
-}
-if [ -n "$rootdev" ]; then
-    do_switchroot
 fi
 
 # Everything from here down is a post-mortem, and a post-mortem behind a picture
@@ -9986,19 +9712,19 @@ fi
 
 # The DC inlet feeds the PMIC; the OTG port is a separate data connector whose
 # 5 V switch draws from VBAT/VSYS. With no cell, leave that switch off, and
-# tell the PMIC driver not to rerun the charge-arm sequence. It disables
-# the charger watchdog, matching the batteryless LK across kernel startup.
+# use the established read-only charger policy. The matching batteryless LK
+# disables its charger watchdog before handing over to Linux.
 if [[ "$WITHOUT_BATTERY" == 1 ]]; then
     sed -i -e 's/ j36\.usb=1 / j36.usb=novbus /' \
            -e 's/ j36\.audio=speaker / j36.audio=1 /' \
-           -e 's/ j36\.power=1 / j36.power=external /' "$SDBOOT/mvii/boot.conf"
+           -e 's/ j36\.power=1 / j36.power=nocharge /' "$SDBOOT/mvii/boot.conf"
     grep -q ' j36\.usb=novbus ' "$SDBOOT/mvii/boot.conf" || \
         die "J36_WITHOUT_BATTERY=1 but boot.conf still sources OTG VBUS"
-    grep -q ' j36\.power=external ' "$SDBOOT/mvii/boot.conf" || \
+    grep -q ' j36\.power=nocharge ' "$SDBOOT/mvii/boot.conf" || \
         die "J36_WITHOUT_BATTERY=1 but boot.conf still arms the charger"
     grep -q ' j36\.audio=1 ' "$SDBOOT/mvii/boot.conf" || \
         die "J36_WITHOUT_BATTERY=1 but boot.conf still enables the speaker"
-    log "batteryless: OTG VBUS off; PMIC disables the charger watchdog and leaves its mode alone"
+    log "batteryless: OTG VBUS and speaker off; Linux preserves the charger state from the batteryless LK"
 fi
 
 # The LK reads boot.conf into a fixed 2 KiB buffer and a longer file is silently
@@ -11042,13 +10768,10 @@ j36.power=nocharge
     behind, not from a clean slate.
 
 j36.power=external
-    The batteryless word, written by ./build-j36-ultra.sh --without-battery
-    together with j36.usb=novbus.  The gauge still samples.  Linux disables the
-    charger watchdog and widens the brownout limit.  It does not leave the
-    preloader's hardware-charging mode and does not rewrite charge current or
-    charge voltage: doing that before the splash latched this PMIC off.  This
-    does not change the stock preloader.  The supply still has to carry the
-    board.
+    Compatibility alias for j36.power=nocharge. The batteryless build disables
+    OTG VBUS and the initial speaker amp, and leaves Linux charger writes off.
+    Use the matching batteryless LK, which disables the charger watchdog before
+    kernel startup. Normal builds use the c983f6f charger and startup policy.
 
 j36.wifi=1
     The radio, and wlan0.  Three modules -- cfg80211.ko, rfkill.ko and
@@ -14586,9 +14309,7 @@ SD cards.
                        wins.  j36.usb=1
   j36/power            the MT6592 PMIC -- battery gauge, charger and a poweroff
                        that cuts the rail -- and the panel backlight.  j36.power=1;
-                       j36.power=nocharge keeps the charger as the LK set it;
-                       j36.power=external disables the charger watchdog and
-                       widens UVLO, and leaves the preloader charger mode alone.
+                       j36.power=nocharge (also =external) preserves the LK charger state.
   j36/wifi             the radio, and wlan0: the CONSYS MCU's rails, the BTIF
                        link, wifi/firmware/ holding the two ROM patches and the
                        WLAN firmware, and cfg80211 on top.  2.4 GHz WPA2-PSK,

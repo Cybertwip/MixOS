@@ -179,6 +179,14 @@ stage_payload() {
 }
 stage_payload "$INITRD/opt/mixos/lg/$DEVICE"
 
+# The prima config set rides from the tree (see firmware/README.md): the
+# generic default from the reference drop. A per-unit NV file extracted
+# from the phone's /persist overlays it below whenever it exists.
+mkdir -p "$INITRD/lib/firmware/wlan/prima"
+cp "$DEVDIR"/firmware/wlan/prima/WCNSS_qcom_wlan_nv.bin \
+   "$DEVDIR"/firmware/wlan/prima/WCNSS_qcom_cfg.ini \
+   "$DEVDIR"/firmware/wlan/prima/WCNSS_cfg.dat \
+   "$INITRD/lib/firmware/wlan/prima/"
 if [[ -n "$FIRMWARE_DIR" && -d "$FIRMWARE_DIR" ]]; then
     mkdir -p "$INITRD/lib/firmware/lg/lv517"
     cp "$FIRMWARE_DIR"/modem.mdt "$FIRMWARE_DIR"/modem.b* \
@@ -190,8 +198,13 @@ if [[ -n "$FIRMWARE_DIR" && -d "$FIRMWARE_DIR" ]]; then
         segs="$(ls "$INITRD/lib/firmware/lg/lv517/$base.b"* 2>/dev/null | wc -l)"
         log "Firmware set $base: $segs segments"
     done
+    if [[ -f "$FIRMWARE_DIR/WCNSS_qcom_wlan_nv.bin" ]]; then
+        cp "$FIRMWARE_DIR/WCNSS_qcom_wlan_nv.bin" \
+            "$INITRD/lib/firmware/wlan/prima/"
+        log "Per-unit WLAN NV from $FIRMWARE_DIR (overrides the vendored default)"
+    fi
 else
-    log "WARNING: no LG_FIRMWARE_DIR; modem/wifi will report missing blobs"
+    log "WARNING: no LG_FIRMWARE_DIR; modem/wcnss PIL sets missing (WLAN config rides vendored)"
 fi
 
 CPIO="$ART/lg-$DEVICE.cpio"
@@ -231,6 +244,7 @@ else
     sudo mkdir -p "$WORK/rootfs/opt/mixos/lg/$DEVICE" \
         "$WORK/rootfs/opt/mixos/lg/telephony" \
         "$WORK/rootfs/lib/firmware/lg/lv517" \
+        "$WORK/rootfs/lib/firmware/wlan/prima" \
         "$WORK/rootfs/etc/udev/rules.d" "$WORK/rootfs/etc/systemd/system"
     sudo cp -r "$INITRD/opt/mixos/lg/$DEVICE" "$WORK/rootfs/opt/mixos/lg/"
     sudo cp "$DEVDIR"/telephony/modem-boot.sh "$DEVDIR"/telephony/check-telephony.sh \
@@ -240,10 +254,18 @@ else
         "$WORK/rootfs/etc/systemd/system/"
     sudo cp "$DEVDIR"/telephony/apn.conf.template \
         "$WORK/rootfs/opt/mixos/lg/telephony/"
+    sudo cp "$DEVDIR"/firmware/wlan/prima/WCNSS_qcom_wlan_nv.bin \
+        "$DEVDIR"/firmware/wlan/prima/WCNSS_qcom_cfg.ini \
+        "$DEVDIR"/firmware/wlan/prima/WCNSS_cfg.dat \
+        "$WORK/rootfs/lib/firmware/wlan/prima/"
     if [[ -n "$FIRMWARE_DIR" && -d "$FIRMWARE_DIR" ]]; then
         sudo cp "$FIRMWARE_DIR"/modem.mdt "$FIRMWARE_DIR"/modem.b* \
             "$FIRMWARE_DIR"/wcnss.mdt "$FIRMWARE_DIR"/wcnss.b* \
             "$WORK/rootfs/lib/firmware/lg/lv517/" 2>/dev/null || true
+        if [[ -f "$FIRMWARE_DIR/WCNSS_qcom_wlan_nv.bin" ]]; then
+            sudo cp "$FIRMWARE_DIR/WCNSS_qcom_wlan_nv.bin" \
+                "$WORK/rootfs/lib/firmware/wlan/prima/"
+        fi
     fi
     sudo chroot "$WORK/rootfs" systemctl enable lg-telephony.service \
         2>/dev/null || true

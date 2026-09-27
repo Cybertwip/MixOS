@@ -20,6 +20,11 @@ are usually world-readable, so root is only needed if your build hid them.
 OPPO factory images (`.ofp`) are encrypted; there is no offline unpack path,
 so extraction needs the phone -- which the person building a phone image has.
 
+Nothing here is vendored: the reference kernel tree
+(`reference/android_kernel_oppo_mt6877`) is a kernel-only drop -- it carries
+no Wi-Fi driver, no modem image, and no `WIFI_RAM_CODE` under any name, so
+there was nothing to pick. Do not re-search it; extract from the phone.
+
 ## Why the tree does not vendor them
 
 The J36 tree vendors its MT6592 Wi-Fi firmware because that blob is

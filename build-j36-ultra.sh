@@ -101,7 +101,6 @@ COMPRESS=0
 SPLASH=1
 # A DC-powered board without a cell must not source 5 V on the OTG data port.
 WITHOUT_BATTERY=0
-POWER_DIAGNOSTIC=0
 VM_SOURCE_MOUNT="/mnt/darkos-host"
 VM_ARTIFACT_MOUNT="/mnt/j36-artifacts"
 VM_BASE_ARTIFACT_MOUNT="/mnt/mixos-artifacts"
@@ -115,7 +114,7 @@ VM_R36_STATE_DIR="/home/ubuntu/darkos-r36-state"
 
 usage() {
     cat <<USAGE
-Usage: ./build-j36-ultra.sh [--mix-only | --compress] [--no-splash] [--without-battery] [--power-diagnostic]
+Usage: ./build-j36-ultra.sh [--mix-only | --compress] [--no-splash] [--without-battery]
 
 Resumes the R36 Ultra build (build-r36-ultra.sh, checkpointed) and then adds the
 J36 Ultra layer on top of it in the same Multipass VM: $VM_NAME
@@ -169,19 +168,13 @@ J36 Ultra layer on top of it in the same Multipass VM: $VM_NAME
 
     ./build-j36-ultra.sh --without-battery
                                       no cell. Writes j36.usb=novbus and
-                                      j36.power=external. Linux disables the
-                                      charger watchdog and widens UVLO, and
-                                      does not rewrite the preloader charger
-                                      mode. The matching LK is
+                                      j36.power=nocharge. Linux preserves
+                                      the charger state. The batteryless LK
+                                      disables the charger watchdog before
+                                      handing over to Linux. The matching LK is
                                       tools/mediatek/build.sh --without-battery.
                                       Combines with --mix-only or --compress.
 
-    ./build-j36-ultra.sh --power-diagnostic
-                                      embed diagnostic mode in the initramfs;
-                                      show J36 DIAG v2 early, skip resizing,
-                                      then save PMIC and startup checkpoints
-                                      on BOOT. Combine with --without-battery
-                                      for a board without a cell.
 
 The first J36 run creates the persistent ARMv7 Linux 6.12 LTS workspace.  Later
 runs reuse it and rebuild only changed kernel, DTB, input-module, initramfs and
@@ -208,7 +201,6 @@ while [[ $# -gt 0 ]]; do
         --compress) COMPRESS=1; shift ;;
         --no-splash) SPLASH=0; shift ;;
         --without-battery) WITHOUT_BATTERY=1; shift ;;
-        --power-diagnostic) POWER_DIAGNOSTIC=1; shift ;;
         *) usage >&2; exit 2 ;;
     esac
 done
@@ -357,7 +349,6 @@ multipass exec "$VM_NAME" -- env \
     J36_MIXDASH="${J36_MIXDASH:-1}" \
     J36_SPLASH="$SPLASH" \
     J36_WITHOUT_BATTERY="$WITHOUT_BATTERY" \
-    J36_POWER_DIAGNOSTIC="$POWER_DIAGNOSTIC" \
     J36_PAYLOAD_ON="${J36_PAYLOAD_ON:-root}" \
     bash "$VM_BUILD_DIR/device/j36-ultra/build-in-vm.sh" || BUILD_RC=$?
 

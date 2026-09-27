@@ -1,29 +1,45 @@
-# LG K20 Plus firmware
+# Pronto/WLAN config, LG K20 Plus
 
-Same rule as the OPPO tree: the drivers are open, the blobs are LG's and
-are NOT vendored. Place them under `/lib/firmware/lg/lv517/` via
-`LG_FIRMWARE_DIR`.
+Three files, all Qualcomm's, all taken from the reference kernel drop at
+`reference/NetHunter_K20plus_arm64_Kernel-Source/drivers/staging/prima/firmware_bin/`.
+They are the calibration and default configuration the WCNSS WLAN stack
+reads: `wcn36xx` asks `request_firmware()` for the NV item table by the
+path below, and the prima `wlan` driver (when it lands) parses the config
+pair the same way stock does.
 
-## Needed files
+| file | size | sha256 |
+| --- | --- | --- |
+| `wlan/prima/WCNSS_qcom_wlan_nv.bin` | 29816 | `93fc87d8233ffb0244037ba165efdfcdc8851e4e7345fc646f5d628d29d703d8` |
+| `wlan/prima/WCNSS_qcom_cfg.ini` | 9850 | `a8a748e831b510e3d60f8fb46796ec770e7546560aabc35432ce602b696f7583` |
+| `wlan/prima/WCNSS_cfg.dat` | 11514 | `66d8aa043111f6bdce04cfb5c8d09d43f65f853506f996da357d89122e0ac1ae` |
 
-| File | Used by | Stock location |
-|---|---|---|
-| `modem.mdt` + `modem.bXX` | MSS remoteproc (X6 boot) | `/firmware/image/modem.*` |
-| `wcnss.mdt` + `wcnss.bXX` | Pronto PIL (Wi-Fi boot) | `/firmware/image/wcnss.*` |
-| `wlan/prima/WCNSS_qcom_wlan_nv.bin` | WCNSS NV config | `/persist/WCNSS_qcom_wlan_nv.bin` |
+The path under `wlan/prima/` is the name the driver asks
+`request_firmware()` for, so the layout here is the layout on the phone:
+`build-in-vm.sh` copies this directory into `lib/firmware/wlan/prima/`
+both in the initramfs and on the rootfs.
 
-`extract-stock.sh` pulls them over adb from the phone itself, discovering
-every `.bXX` segment by listing rather than assuming a count, and writes a
-`MANIFEST.txt` with sizes and hashes next to them. Only the `/persist` NV
-file needs root. Unlike the OPPO `.ofp` images, LG `.kdz` firmware can be
-unpacked offline (several open tools do it); either source works as long as
-the `.mdt` and all its `.bXX`
-segments arrive together -- a partial set fails PIL auth with an error that
-looks exactly like a driver bug, which is why the build checks the set.
+## The NV file here is the generic default
 
-## Why `.mdt` sets fail
+A phone carries its own per-unit calibration at `/persist/WCNSS_qcom_wlan_nv.bin`,
+tuned for that unit's RF front end; this copy is the reference default that
+boots the radio without it. `extract-stock.sh` pulls the per-unit file when
+the phone is rooted, and the build overlays it onto the vendored one -- the
+extracted file wins whenever it exists, the vendored one covers every other
+case. A WLAN that associates but performs badly is the signature of the
+default standing in for the tuning, not of a driver bug.
 
-PIL authenticates the whole chain: the `.mdt` header names every segment
-and TrustZone verifies each hash. One missing `.bXX` file aborts the boot
-with `-EIO` from `qcom_scm_pas_auth_and_reset`. When Wi-Fi or the modem
-fails at that call, count the segments before suspecting the driver.
+## What is not here
+
+`modem.mdt` + `modem.bXX` and `wcnss.mdt` + `wcnss.bXX` -- the PIL sets the
+modem and Pronto boot from -- are not in the reference tree (it is a
+kernel-only drop; the images ship on the phone's `/firmware` partition).
+`extract-stock.sh` pulls them over adb, discovering every `.bXX` segment
+by listing, and the build counts each set because one missing segment
+fails PIL auth with an error that looks exactly like a driver bug.
+
+## Licence
+
+These are Qualcomm's, redistributed here as they were shipped in the
+reference drop, with no modification and no reverse engineering of their
+contents. They are not covered by this repository's licence. Everything
+under `device/lg-k20plus/linux/` is original work and is GPL-2.0 as marked.

@@ -185,7 +185,6 @@
 #include <linux/math64.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
-#include "j36_pwrap.h"
 #include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -198,7 +197,6 @@
 #include <linux/workqueue.h>
 
 #include "j36_battery_curve.h"
-#include "j36_external_power.h"
 #include "j36_mt6592_pmic.h"
 
 /* ── module parameters ───────────────────────────────────────────────────────
@@ -216,15 +214,6 @@ MODULE_PARM_DESC(poll_ms, "gauge poll interval in ms (0 = use the device tree)")
 static bool charge = true;
 module_param(charge, bool, 0444);
 MODULE_PARM_DESC(charge, "arm the charger (0 = read-only gauge, no charger writes)");
-
-/* Batteryless boards: the charger output is VSYS, so the arm sequence below
- * (CV, current, CHR_EN) can cut power the moment it runs. Leave that policy
- * as the preloader and LK left it. Disable the charger watchdog so the rail
- * does not depend on a workqueue deadline or the duration of kernel startup. */
-static bool external_power;
-module_param(external_power, bool, 0444);
-MODULE_PARM_DESC(external_power,
-		 "batteryless: disable the charger watchdog and widen UVLO; preserve the preloader charger mode");
 
 static bool bc11 = true;
 module_param(bc11, bool, 0444);
@@ -970,7 +959,45 @@ struct j36_pmic {
 static int j36_pwrap_xfer_locked(struct j36_pmic *p, bool write, u32 adr,
 				 u32 wdata, u32 *rdata)
 {
-	return j36_pwrap_transfer(p->pwrap, write, adr, wdata, rdata);
+	unsigned int i;
+	u32 value;
+
+	if (adr & ~0xffffu || wdata & ~0xffffu)
+		return -EINVAL;
+	if (!write && !rdata)
+		return -EINVAL;
+
+	value = readl(p->pwrap + J36_PWRAP_WACS2_RDATA);
+	if (((value >> J36_PWRAP_STATE_SHIFT) & J36_PWRAP_STATE_MASK) ==
+	    J36_PWRAP_FSM_WFVLDCLR)
+		writel(1, p->pwrap + J36_PWRAP_WACS2_VLDCLR);
+
+	for (i = 0; i < J36_PWRAP_POLL_LIMIT; ++i) {
+		value = readl(p->pwrap + J36_PWRAP_WACS2_RDATA);
+		if (((value >> J36_PWRAP_STATE_SHIFT) & J36_PWRAP_STATE_MASK) ==
+		    J36_PWRAP_FSM_IDLE)
+			break;
+		cpu_relax();
+	}
+	if (i == J36_PWRAP_POLL_LIMIT)
+		return -ETIMEDOUT;
+
+	writel(((u32)write << 31) | ((adr >> 1) << 16) | wdata,
+	       p->pwrap + J36_PWRAP_WACS2_CMD);
+	if (write)
+		return 0;
+
+	for (i = 0; i < J36_PWRAP_POLL_LIMIT; ++i) {
+		value = readl(p->pwrap + J36_PWRAP_WACS2_RDATA);
+		if (((value >> J36_PWRAP_STATE_SHIFT) & J36_PWRAP_STATE_MASK) ==
+		    J36_PWRAP_FSM_WFVLDCLR) {
+			*rdata = value & 0xffff;
+			writel(1, p->pwrap + J36_PWRAP_WACS2_VLDCLR);
+			return 0;
+		}
+		cpu_relax();
+	}
+	return -ETIMEDOUT;
 }
 
 static int j36_pmic_read(struct j36_pmic *p, u32 adr, u32 *rdata)
@@ -1028,8 +1055,32 @@ static int j36_pmic_write(struct j36_pmic *p, u32 adr, u32 wdata)
  */
 static int j36_pmic_update(struct j36_pmic *p, u32 adr, u32 clr, u32 set)
 {
-	return j36_pwrap_update_bits(p->pwrap, adr, clr, set,
-				     j36_pmic_ro_bits(adr));
+	unsigned long flags;
+	u32 old, new, ro = j36_pmic_ro_bits(adr);
+	int ret;
+
+	spin_lock_irqsave(&p->lock, flags);
+	ret = j36_pwrap_xfer_locked(p, false, adr, 0, &old);
+	if (ret)
+		goto out;
+	new = ((old & ~(clr | set)) | set) & ~ro;
+	/*
+	 * Compared against the writable half of what was read, not against the
+	 * whole word.  A plain `new == old' would differ on every pass the moment
+	 * a comparator was set -- turning the skip into a write every second, and
+	 * turning this function's 1/0 return into a permanent "something moved"
+	 * for the log lines that key on it.
+	 */
+	if (new == (old & ~ro)) {
+		ret = 0;
+		goto out;
+	}
+	ret = j36_pwrap_xfer_locked(p, true, adr, new, NULL);
+	if (!ret)
+		ret = 1;
+out:
+	spin_unlock_irqrestore(&p->lock, flags);
+	return ret;
 }
 
 /* A field write: clear the mask, set the shifted value.  The BC1.2 registers are
@@ -1862,29 +1913,6 @@ static int j36_charger_cv_set(struct j36_pmic *p, int uv)
 	dev_info(p->dev, "CV set to %d mV by hand; the re-arm will leave it alone for %d s\n",
 		 j36_cv_mv[code], J36_CV_HOLD_LINGER_MS / 1000);
 	return 0;
-}
-
-static int j36_ext_read(void *ctx, unsigned int reg, unsigned int *value)
-{
-	return j36_pmic_read(ctx, reg, value);
-}
-
-static int j36_ext_write(void *ctx, unsigned int reg, unsigned int value)
-{
-	return j36_pmic_write(ctx, reg, value);
-}
-
-static void j36_external_keepalive(struct j36_pmic *p)
-{
-	int ret = j36_external_power_hold(p, j36_ext_read, j36_ext_write);
-
-	if (ret)
-		dev_warn_ratelimited(p->dev,
-			      "external power: hold failed (%d); will retry\n",
-			      ret);
-	else
-		dev_info_once(p->dev,
-			      "external power: charger watchdog OFF (verified), UVLO widened, preloader charger mode left alone\n");
 }
 
 /*
@@ -2769,10 +2797,6 @@ static void j36_pmic_poll(struct work_struct *work)
 		goto again;
 	}
 
-	/* Retry a failed hold before ADC work or a failed CHRDET read can delay it. */
-	if (external_power)
-		j36_external_keepalive(p);
-
 	j36_hw_ocv_prime(p);
 
 	online = j36_charger_online(p, &con0);
@@ -2931,8 +2955,7 @@ static void j36_pmic_poll(struct work_struct *work)
 		j36_ring_forget(&p->vchr);
 		j36_ring_forget(&p->delta);
 		j36_bc11_forget(p);
-		if (online && bc11 && !external_power && p->usbphy && p->pericfg &&
-		    !sourcing)
+		if (online && bc11 && p->usbphy && p->pericfg && !sourcing)
 			j36_bc11_run(p);
 		else if (online && sourcing)
 			dev_info(p->dev,
@@ -3030,8 +3053,7 @@ static void j36_pmic_poll(struct work_struct *work)
 				 J36_CHR_HOLDOFF_POLLS);
 	}
 
-	if (!external_power)
-		j36_charger_arm(p, chrdet && !p->chr_held_off);
+	j36_charger_arm(p, chrdet && !p->chr_held_off);
 
 	/* AFTER the arm, not before: charge_step_ma is read back out of CHR_CON4
 	 * inside it, so sampling it above would publish the previous second's
@@ -3278,42 +3300,8 @@ static ssize_t vbus_sourcing_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(vbus_sourcing);
 
-/* Diagnostic reads only. Values are sequential snapshots, not an atomic
- * sample; voltages come from the last gauge poll. Preserve transport errors
- * so an unreadable register cannot be mistaken for a disabled charger. */
-static ssize_t power_snapshot_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	static const u32 regs[] = { 0x0000, 0x0004, 0x0006, 0x0008,
-				    0x001a, 0x001e, 0x0020, 0x002e };
-	struct power_supply *psy = dev_get_drvdata(dev);
-	struct j36_pmic *p = power_supply_get_drvdata(psy);
-	struct j36_pub pub;
-	unsigned long flags;
-	unsigned int i;
-	ssize_t len;
-	u32 value;
-	int ret;
-
-	spin_lock_irqsave(&p->lock, flags);
-	pub = p->pub;
-	spin_unlock_irqrestore(&p->lock, flags);
-	len = sysfs_emit(buf, "external_power=%u cached_vsys_uv=%d cached_chrin_uv=%d\n",
-			 external_power, pub.voltage_uv, pub.charger_uv);
-	for (i = 0; i < ARRAY_SIZE(regs); ++i) {
-		ret = j36_pmic_read(p, regs[i], &value);
-		if (ret)
-			len += sysfs_emit_at(buf, len, "%04x=error:%d\n", regs[i], ret);
-		else
-			len += sysfs_emit_at(buf, len, "%04x=%04x\n", regs[i], value);
-	}
-	return len;
-}
-static DEVICE_ATTR_RO(power_snapshot);
-
 static struct attribute *j36_usb_attrs[] = {
 	&dev_attr_vbus_sourcing.attr,
-	&dev_attr_power_snapshot.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(j36_usb);
@@ -3580,12 +3568,6 @@ static int j36_pmic_probe(struct platform_device *pdev)
 	if (IS_ERR(base))
 		return dev_err_probe(dev, PTR_ERR(base), "map PWRAP\n");
 	p->pwrap = base;
-
-	/* Take over before supply registration and the first delayed ADC poll.
-	 * LK must already have held the rail through decompression; this also
-	 * handles an inherited timer as soon as Linux can reach the PMIC. */
-	if (external_power)
-		j36_external_keepalive(p);
 
 	/*
 	 * The optional three, and what each one costs to be without.
