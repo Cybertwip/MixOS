@@ -17,7 +17,6 @@
 #include <linux/bitops.h>
 #include <linux/bits.h>
 #include <linux/input.h>
-#include <linux/input-polldev.h>
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -49,9 +48,9 @@ static bool lv517_key_level(struct lv517_keys *lk, unsigned int gpio)
 	return !(reg & BIT(0));
 }
 
-static void lv517_keys_poll(struct input_polled_dev *polldev)
+static void lv517_keys_poll(struct input_dev *input)
 {
-	struct lv517_keys *lk = polldev->private;
+	struct lv517_keys *lk = input_get_drvdata(input);
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(lk->keys); i++) {
@@ -66,15 +65,15 @@ static void lv517_keys_poll(struct input_polled_dev *polldev)
 			continue;
 		k->pressed = level;
 		k->stable = 0;
-		input_event(polldev->input, k->type, k->code, level);
-		input_sync(polldev->input);
+		input_event(input, k->type, k->code, level);
+		input_sync(input);
 	}
 }
 
 static int lv517_keys_probe(struct platform_device *pdev)
 {
 	struct lv517_keys *lk;
-	struct input_polled_dev *polldev;
+	struct input_dev *input;
 	struct device_node *np = pdev->dev.of_node;
 	u32 pins[2], codes[2];
 	int ret;
@@ -97,23 +96,24 @@ static int lv517_keys_probe(struct platform_device *pdev)
 	lk->keys[1].type = EV_SW;
 	lk->keys[1].code = codes[1];
 
-	polldev = devm_input_allocate_polled_device(&pdev->dev);
-	if (!polldev)
+	input = devm_input_allocate_device(&pdev->dev);
+	if (!input)
 		return -ENOMEM;
-	polldev->private = lk;
-	polldev->poll = lv517_keys_poll;
-	polldev->poll_interval = LV517_KEYS_POLL_MS;
-	polldev->input->name = "LG K20 Plus Keys";
-	polldev->input->id.bustype = BUS_HOST;
-	set_bit(EV_KEY, polldev->input->evbit);
-	set_bit(EV_SW, polldev->input->evbit);
-	set_bit(codes[0], polldev->input->keybit);
-	set_bit(codes[1], polldev->input->swbit);
+	input->name = "LG K20 Plus Keys";
+	input->id.bustype = BUS_HOST;
+	input_set_drvdata(input, lk);
+	set_bit(EV_KEY, input->evbit);
+	set_bit(EV_SW, input->evbit);
+	set_bit(codes[0], input->keybit);
+	set_bit(codes[1], input->swbit);
 
-	ret = input_register_polled_device(polldev);
+	ret = input_setup_polling(input, lv517_keys_poll);
 	if (ret)
 		return ret;
-	platform_set_drvdata(pdev, polldev);
+	input_set_poll_interval(input, LV517_KEYS_POLL_MS);
+	ret = input_register_device(input);
+	if (ret)
+		return ret;
 	dev_info(&pdev->dev, "polling TLMM GPIO%u/GPIO%u\n", pins[0], pins[1]);
 	return 0;
 }
@@ -124,14 +124,8 @@ static const struct of_device_id lv517_keys_match[] = {
 };
 MODULE_DEVICE_TABLE(of, lv517_keys_match);
 
-static void lv517_keys_remove(struct platform_device *pdev)
-{
-	input_unregister_polled_device(platform_get_drvdata(pdev));
-}
-
 static struct platform_driver lv517_keys_driver = {
 	.probe = lv517_keys_probe,
-	.remove_new = lv517_keys_remove,
 	.driver = {
 		.name = "lg-lv517-keys",
 		.of_match_table = lv517_keys_match,

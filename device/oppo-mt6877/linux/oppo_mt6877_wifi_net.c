@@ -18,6 +18,8 @@
 #include <linux/bits.h>
 #include <linux/etherdevice.h>
 #include <linux/module.h>
+#include <linux/netdevice.h>
+#include <linux/slab.h>
 #include <net/cfg80211.h>
 
 #include "oppo_mt6877_wifi.h"

@@ -23,7 +23,6 @@
 #include <linux/bitops.h>
 #include <linux/bits.h>
 #include <linux/input.h>
-#include <linux/input-polldev.h>
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -56,9 +55,9 @@ static bool oppo_key_level(struct oppo_keys *ok, unsigned int gpio)
 	return !(reg & BIT(gpio % OPPO_GPIO_PINS_PER_REG));
 }
 
-static void oppo_keys_poll(struct input_polled_dev *polldev)
+static void oppo_keys_poll(struct input_dev *input)
 {
-	struct oppo_keys *ok = polldev->private;
+	struct oppo_keys *ok = input_get_drvdata(input);
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(ok->keys); i++) {
@@ -73,15 +72,15 @@ static void oppo_keys_poll(struct input_polled_dev *polldev)
 			continue;
 		k->pressed = level;
 		k->stable = 0;
-		input_event(polldev->input, EV_KEY, k->code, level);
-		input_sync(polldev->input);
+		input_event(input, EV_KEY, k->code, level);
+		input_sync(input);
 	}
 }
 
 static int oppo_keys_probe(struct platform_device *pdev)
 {
 	struct oppo_keys *ok;
-	struct input_polled_dev *polldev;
+	struct input_dev *input;
 	struct device_node *np = pdev->dev.of_node;
 	u32 gpios[2];
 	int ret;
@@ -102,22 +101,23 @@ static int oppo_keys_probe(struct platform_device *pdev)
 	ok->keys[1].gpio = gpios[1];
 	ok->keys[1].code = KEY_VOLUMEDOWN;
 
-	polldev = devm_input_allocate_polled_device(&pdev->dev);
-	if (!polldev)
+	input = devm_input_allocate_device(&pdev->dev);
+	if (!input)
 		return -ENOMEM;
-	polldev->private = ok;
-	polldev->poll = oppo_keys_poll;
-	polldev->poll_interval = OPPO_KEYS_POLL_MS;
-	polldev->input->name = "OPPO MT6877 Volume Keys";
-	polldev->input->id.bustype = BUS_HOST;
-	set_bit(EV_KEY, polldev->input->evbit);
-	set_bit(KEY_VOLUMEUP, polldev->input->keybit);
-	set_bit(KEY_VOLUMEDOWN, polldev->input->keybit);
+	input->name = "OPPO MT6877 Volume Keys";
+	input->id.bustype = BUS_HOST;
+	input_set_drvdata(input, ok);
+	set_bit(EV_KEY, input->evbit);
+	set_bit(KEY_VOLUMEUP, input->keybit);
+	set_bit(KEY_VOLUMEDOWN, input->keybit);
 
-	ret = input_register_polled_device(polldev);
+	ret = input_setup_polling(input, oppo_keys_poll);
 	if (ret)
 		return ret;
-	platform_set_drvdata(pdev, polldev);
+	input_set_poll_interval(input, OPPO_KEYS_POLL_MS);
+	ret = input_register_device(input);
+	if (ret)
+		return ret;
 	dev_info(&pdev->dev, "polling GPIO%u/GPIO%u for volume\n",
 		 gpios[0], gpios[1]);
 	return 0;
@@ -129,14 +129,8 @@ static const struct of_device_id oppo_keys_match[] = {
 };
 MODULE_DEVICE_TABLE(of, oppo_keys_match);
 
-static void oppo_keys_remove(struct platform_device *pdev)
-{
-	input_unregister_polled_device(platform_get_drvdata(pdev));
-}
-
 static struct platform_driver oppo_keys_driver = {
 	.probe = oppo_keys_probe,
-	.remove_new = oppo_keys_remove,
 	.driver = {
 		.name = "oppo-mt6877-keys",
 		.of_match_table = oppo_keys_match,

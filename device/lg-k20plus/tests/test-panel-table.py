@@ -33,7 +33,7 @@ def main() -> None:
     m = re.search(r"lg4894_init\[\] = \{(.*?)\n\};", text, re.S)
     assert m, "lg4894_init not found"
     seen = set()
-    for em in re.finditer(r"LG_CMD\((0x[0-9A-Fa-f]+),\s*(\d+)(.*?)\)", m.group(1)):
+    for em in re.finditer(r"LG_CMD0?\((0x[0-9A-Fa-f]+),\s*(\d+)(.*?)\)", m.group(1)):
         cmd, wait, rest = int(em.group(1), 0), int(em.group(2)), em.group(3)
         payload = len([b for b in rest.split(",") if b.strip().startswith("0x")])
         assert cmd in EXPECTED, f"unexpected DCS {cmd:#04x}"
