@@ -11,8 +11,7 @@
 #                     /opt/mixos/lg/<device>/, unpacked once onto PARTLABEL=ROOTFS
 #
 # Environment (all set by build-lg.sh): LG_BUILD_DIR, LG_WORK_DIR,
-# LG_EXPORT_DIR, LG_DEVICE (default lv517), LG_MIX_ONLY, LG_JOBS (default:
-# half the cores, minimum 1),
+# LG_EXPORT_DIR, LG_DEVICE (default lv517), LG_MIX_ONLY, LG_JOBS,
 # LG_KERNEL_BRANCH/URL, LG_FIRMWARE_DIR, DEBIAN_CODE_NAME.
 
 set -Eeuo pipefail
@@ -25,20 +24,7 @@ WORK="${LG_WORK_DIR:?set by build-lg.sh}"
 EXPORT="${LG_EXPORT_DIR:?set by build-lg.sh}"
 DEVICE="${LG_DEVICE:-lv517}"
 MIX_ONLY="${LG_MIX_ONLY:-0}"
-# Half the machine's processors, or 1: a kernel build at full nproc would
-# starve the host the VM runs on.  LG_JOBS overrides; anything that is
-# not a positive integer collapses to 1, never to a bare `-j' (make's
-# "unlimited", which is how a build box runs out of memory).
-_default_jobs() {
-    local n
-    n="$(nproc 2>/dev/null || echo 2)"
-    [[ "$n" =~ ^[1-9][0-9]*$ ]] || n=2
-    n=$(( n / 2 ))
-    [[ "$n" -ge 1 ]] || n=1
-    printf '%s' "$n"
-}
-JOBS="${LG_JOBS:-$(_default_jobs)}"
-[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || JOBS=1
+JOBS="${LG_JOBS:-$(nproc)}"
 KERNEL_BRANCH="${LG_KERNEL_BRANCH:-linux-6.12.y}"
 KERNEL_URL="${LG_KERNEL_URL:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
 FIRMWARE_DIR="${LG_FIRMWARE_DIR:-}"
@@ -54,7 +40,7 @@ source "$DEVDIR/devices.sh"
 DEVICE_INFO="$(lg_device_info "$DEVICE")" || exit 1
 eval "$DEVICE_INFO"
 [[ "$LG_ARCH" == "arm64" ]] || die "$DEVICE is $LG_ARCH, this build is arm64"
-log "LG $LG_DEVICE ($LG_NOTES), $JOBS parallel jobs"
+log "LG $LG_DEVICE ($LG_NOTES)"
 
 mkdir -p "$WORK" "$ART"
 command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || {
