@@ -38,7 +38,24 @@ for mode in $MODES; do
     fi
 done
 
+# Every variant verified: the five artifacts tools/mediatek/build.sh
+# promises, in each mode's boot dir. A developer picks a boot dir as-is,
+# so a silent shortfall here would ship as a broken flash there.
+for mode in $MODES; do
+    dir="$ROOT/build/mediatek/j36-ultra/$mode/boot"
+    for f in lk.bin lk-release.bin MVIIFlash.bin assets.bin flash; do
+        [[ -s "$dir/$f" ]] || { echo "missing $dir/$f after build" >&2; exit 1; }
+    done
+done
+printf '\nAll LK variants are built; pick a boot dir and flash from it:\n'
+for mode in $MODES; do
+    printf '  build/mediatek/j36-ultra/%s/boot/  (lk-release.bin -> LK/UBOOT slot)\n' "$mode"
+done
+
 if [[ "$RUN_TESTS" == 1 ]]; then
+    # The build pins its own GOCACHE per mode; the test gets the shared
+    # default so it never depends on $HOME being writable.
+    export GOCACHE="${GOCACHE:-$ROOT/build/go-cache}"
     (cd "$ROOT/tools/mediatek/mvii-flash" && go test ./)
     cc -std=c99 -Wall -Wextra -Werror \
         "$ROOT/tools/mediatek/firmware/tests/test-bootmenu.c" \
