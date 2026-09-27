@@ -57,8 +57,9 @@ command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || {
 # ── the device tree, second, for the same reason ─────────────────────────────
 DTS="$WORK/k20-$DEVICE.dts"
 DTB="$ART/k20-$DEVICE.dtb"
+# Geometry comes from devices.sh inside the generator; --fb-base stays empty
+# until BRINGUP step 2 measures the LK framebuffer.
 python3 "$DEVDIR/generate_dts_k20.py" --device "$DEVICE" \
-    --mem-mb "$K20_MEM_MB" --width "$K20_WIDTH" --height "$K20_HEIGHT" \
     --fb-base "$FB_BASE" --out "$DTS"
 dtc -I dts -O dtb -o "$DTB" "$DTS"
 
