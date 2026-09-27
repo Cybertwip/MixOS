@@ -44,6 +44,8 @@ DARKOS_LOG_TAG="build-mixos"
 . "$ROOT/device/oppo-a77/devices.sh"
 # shellcheck source=device/lg-k20/devices.sh
 . "$ROOT/device/lg-k20/devices.sh"
+# shellcheck source=device/oppo-a77-4g/devices.sh
+. "$ROOT/device/oppo-a77-4g/devices.sh"
 
 MIX_ONLY=0
 COMPRESS=0
@@ -55,7 +57,7 @@ ONLY=""
 usage() {
     cat <<USAGE
 Usage: ./build-mixos.sh [--mix-only | --compress] [--skip-j36] [--skip-oppo] [--skip-lg]
-                        [--only j36|oppo|lg|oppo-a77|lg-k20] [--list]
+                        [--only j36|oppo|lg|oppo-a77|lg-k20|oppo-a77-4g] [--list]
 
 Builds all families in sequence: J36 Ultra, then every OPPO device, then
 every LG device. Each family runs in the shared Multipass VM with its own
@@ -67,8 +69,9 @@ only what changed.
     ./build-mixos.sh --only oppo   just the OPPO family (all its devices)
 
 Bring-up scaffolds are opt-in only (never in the default plan):
-    ./build-mixos.sh --only oppo-a77   needs OPPO_A77_BRINGUP_ACK=1
-    ./build-mixos.sh --only lg-k20     needs LG_K20_BRINGUP_ACK=1
+    ./build-mixos.sh --only oppo-a77     needs OPPO_A77_BRINGUP_ACK=1
+    ./build-mixos.sh --only lg-k20       needs LG_K20_BRINGUP_ACK=1
+    ./build-mixos.sh --only oppo-a77-4g  needs OPPO_A77_4G_BRINGUP_ACK=1
 
 Anything the family wrappers honour (OPPO_DEVICE is NOT honoured here --
 this script enumerates devices itself; OPPO_FIRMWARE_DIR, LG_FIRMWARE_DIR,
@@ -94,8 +97,8 @@ if [[ "$MIX_ONLY" == 1 && "$COMPRESS" == 1 ]]; then
     darkos_die "--compress cannot be combined with --mix-only."
 fi
 case "$ONLY" in
-    ""|j36|oppo|lg|oppo-a77|lg-k20|list) ;;
-    *) darkos_die "--only takes j36, oppo, lg, oppo-a77 or lg-k20." ;;
+    ""|j36|oppo|lg|oppo-a77|lg-k20|oppo-a77-4g|list) ;;
+    *) darkos_die "--only takes j36, oppo, lg, oppo-a77, lg-k20 or oppo-a77-4g." ;;
 esac
 
 # The plan: (label, command...). OPPO_DEVICE/LG_DEVICE are set per device so
@@ -141,6 +144,13 @@ if [[ "$ONLY" == lg-k20 ]]; then
         PLAN_CMDS+=("K20_DEVICE=$dev $ROOT/build-lg-k20.sh ${EXTRA[*]}")
     done < <(k20_devices)
 fi
+if [[ "$ONLY" == oppo-a77-4g ]]; then
+    while read -r dev; do
+        [[ -n "$dev" ]] || continue
+        PLAN_LABELS+=("oppo-a77-4g:$dev")
+        PLAN_CMDS+=("A77_4G_DEVICE=$dev $ROOT/build-oppo-a77-4g.sh ${EXTRA[*]}")
+    done < <(a77_4g_devices)
+fi
 
 if [[ "$ONLY" == list ]]; then
     echo "j36-ultra"
@@ -149,6 +159,7 @@ if [[ "$ONLY" == list ]]; then
     echo "# bring-up scaffolds (opt-in only, never in the default plan):"
     a77_devices | sed 's/^/oppo-a77:/'
     k20_devices | sed 's/^/lg-k20:/'
+    a77_4g_devices | sed 's/^/oppo-a77-4g:/'
     exit 0
 fi
 

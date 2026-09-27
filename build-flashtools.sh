@@ -20,8 +20,8 @@
 # Usage: ./build-flashtools.sh [--device NAME] [--battery-only | --without-battery] [--tests]
 #
 #   --device NAME      build only one family (j36-ultra, oppo-mt6877, lg-msm8917,
-#                      oppo-mt6833, lg-mt6739). Families without LK sources fail
-#                      loudly with the reason.
+#                      oppo-mt6833, lg-mt6739, oppo-mt6765). Families without LK
+#                      sources fail loudly with the reason.
 #   --list             print the device matrix and exit without building
 #   --battery-only     build only build/mediatek/j36-ultra/battery/boot
 #   --without-battery  build only build/mediatek/j36-ultra/without-battery/boot
@@ -60,6 +60,7 @@ lk_matrix() {
     printf '%-14s %s\n' lg-msm8917 "no LK sources: the MSM8917 boots Qualcomm aboot, not LK; the phone keeps stock aboot (OS image: ./build-lg.sh)"
     printf '%-14s %s\n' oppo-mt6833 "builds: tools/mediatek/mt68xx -> build/mt68xx/<device>/boot (bring-up LK)"
     printf '%-14s %s\n' lg-mt6739 "builds: tools/mediatek/mt67xx -> build/mt67xx/<device>/boot (bring-up LK)"
+    printf '%-14s %s\n' oppo-mt6765 "builds: tools/mediatek/mt67xx -> build/mt67xx/<device>/boot (bring-up LK)"
 }
 # One phone LK family: every devices.sh row gets its own boot dir, and each
 # dir is verified before the next builds -- a developer picks a boot dir
@@ -72,11 +73,14 @@ build_phone_lk() {
     case "$matrix" in
         oppo-mt6833) family="mt68xx"; devices_fn="a77_devices" ;;
         lg-mt6739) family="mt67xx"; devices_fn="k20_devices" ;;
+        oppo-mt6765) family="mt67xx"; devices_fn="a77_4g_devices" ;;
     esac
     # shellcheck disable=SC1090
     . "$ROOT/device/oppo-a77/devices.sh"
     # shellcheck disable=SC1090
     . "$ROOT/device/lg-k20/devices.sh"
+    # shellcheck disable=SC1090
+    . "$ROOT/device/oppo-a77-4g/devices.sh"
     rows="$($devices_fn)"
     for dev in $rows; do
         [[ -n "$dev" ]] || continue
@@ -98,7 +102,7 @@ PHONE_TESTS=""
 if [[ -n "$DEVICE" ]]; then
     case "$DEVICE" in
         j36-ultra) ;;
-        oppo-mt6833|lg-mt6739)
+        oppo-mt6833|lg-mt6739|oppo-mt6765)
             if [[ "$MODES" != "battery without-battery" ]]; then
                 echo "error: --battery-only/--without-battery are j36-only; phone LKs are single-mode" >&2
                 exit 2
@@ -119,13 +123,13 @@ if [[ -n "$DEVICE" ]]; then
             echo "Build its OS image instead: $instead." >&2
             echo "LK sources for it would start as a new tools/<soc>/ tree, not as modes here." >&2
             exit 1 ;;
-        *) echo "Unknown device: $DEVICE (want j36-ultra, oppo-mt6877, lg-msm8917, oppo-mt6833, lg-mt6739)" >&2; exit 2 ;;
+        *) echo "Unknown device: $DEVICE (want j36-ultra, oppo-mt6877, lg-msm8917, oppo-mt6833, lg-mt6739, oppo-mt6765)" >&2; exit 2 ;;
     esac
 else
     DEVICE="j36-ultra"
     echo "NOTE: oppo-mt6877 and lg-msm8917 have no LK sources (stock bootloaders retained). See --list."
-    echo "NOTE: oppo-mt6833 + lg-mt6739 are bring-up LKs (they build; they do not boot anything yet)."
-    DO_PHONES="oppo-mt6833 lg-mt6739"
+    echo "NOTE: oppo-mt6833 + lg-mt6739 + oppo-mt6765 are bring-up LKs (they build; they do not boot anything yet)."
+    DO_PHONES="oppo-mt6833 lg-mt6739 oppo-mt6765"
     PHONE_TESTS="mt67xx mt68xx"
 fi
 
@@ -173,11 +177,14 @@ if [[ -n "${DO_PHONES// /}" ]]; then
     . "$ROOT/device/oppo-a77/devices.sh"
     # shellcheck disable=SC1090
     . "$ROOT/device/lg-k20/devices.sh"
+    # shellcheck disable=SC1090
+    . "$ROOT/device/oppo-a77-4g/devices.sh"
     for matrix in $DO_PHONES; do
         [[ -n "$matrix" ]] || continue
         case "$matrix" in
             oppo-mt6833) family="mt68xx"; rows="$(a77_devices)" ;;
             lg-mt6739) family="mt67xx"; rows="$(k20_devices)" ;;
+            oppo-mt6765) family="mt67xx"; rows="$(a77_4g_devices)" ;;
         esac
         for dev in $rows; do
             [[ -n "$dev" ]] || continue

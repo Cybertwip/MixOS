@@ -200,7 +200,12 @@ add_custom_target(firmware ALL DEPENDS
     "${MT67XX_BOOT_DIR}/lk.bin" "${MT67XX_BOOT_DIR}/lk.elf"
     "${MT67XX_BOOT_DIR}/FACTS.md")
 
-message(STATUS "mt67xx LK for ${MT67XX_DEVICE}: uart${MT67XX_DEBUG_UART} "
+message(STATUS "mt67xx LK for ${MT67XX_DEVICE} (mt${MT67XX_SOC}): uart${MT67XX_DEBUG_UART} "
     "membase=${MT67XX_MEMBASE} slot=${MT67XX_LK_SLOT_SIZE} commit=${MVII_BUILD_COMMIT}")
-message(STATUS "mt67xx LK priors in force: UART/GPT/WDT bases [mt6735], "
-    "MEMBASE [mt6735], slot size UNVERIFIED -- see FACTS.md before flashing")
+if(MT67XX_SOC STREQUAL "6765")
+    message(STATUS "mt67xx LK priors in force: UART [mt6755], GPT+WDT compiled out (steps 2b/2c), "
+        "MEMBASE WEAK, slot size UNVERIFIED -- see FACTS.md before flashing")
+else()
+    message(STATUS "mt67xx LK priors in force: UART/GPT/WDT bases [mt6735], "
+        "MEMBASE [mt6735], slot size UNVERIFIED -- see FACTS.md before flashing")
+endif()

@@ -40,6 +40,7 @@ wired build-oppo.sh oppo
 wired build-lg.sh lg
 wired build-oppo-a77.sh oppo
 wired build-lg-k20.sh lg
+wired build-oppo-a77-4g.sh oppo
 wired build-j36-ultra.sh qbuy
 wired build-r36-ultra.sh qbuy
 
@@ -65,6 +66,7 @@ handover_keys device/oppo-mt6877 build-oppo.sh oppo
 handover_keys device/lg-k20plus build-lg.sh lg
 handover_keys device/oppo-a77 build-oppo-a77.sh oppo-a77
 handover_keys device/lg-k20 build-lg-k20.sh lg-k20
+handover_keys device/oppo-a77-4g build-oppo-a77-4g.sh oppo-a77-4g
 
 # Offline firmware stays wired: each shipped wrapper must honor its ROM
 # env knob by invoking its fetch script into the default stock/ dir.

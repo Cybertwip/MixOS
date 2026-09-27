@@ -1,29 +1,34 @@
 # mt67xx LK bring-up playbook
 
-Companion to `device/lg-k20/BRINGUP.md` (the OS side): several steps share
-facts, and each step below names its OS twin. Work top to bottom; each step
-names the exact files it fills. The standing rule: a driver that would need
-an ungrounded address does not exist yet -- silence and precise breadcrumbs
-beat invented registers in a bootloader.
+Companion to the OS side (`device/lg-k20/BRINGUP.md` for the K20,
+`device/oppo-a77-4g/BRINGUP.md` for the CPH2385): several steps share
+facts, and each step below names its OS twin. This tree serves two SoCs
+(mt6739 + mt6765) from one source base -- per-SoC deltas are marked
+[6739] / [6765]. Work top to bottom; each step names the exact files it
+fills. The standing rule: a driver that would need an ungrounded address
+does not exist yet -- silence and precise breadcrumbs beat invented
+registers in a bootloader.
 
 ## Prerequisites
 
-An LM-X120 with a stock LK backup (SP Flash Tool readback or mtkclient)
-reachable from bootrom, UART wired at 115200, and the recovery path tested
-BEFORE the first flash (read back the slot you are about to write and
-compare hashes). Without those, stop: nothing below is testable and every
-flash is a brick risk. No ACK gate on the LK build itself (building is
-harmless); the gate that matters is this paragraph -- backup + recovery
-path tested before the first flash. (The OS tree's `LG_K20_BRINGUP_ACK=1`
-is separate: it guards the long VM image build, not this one.)
+An LM-X120 or CPH2385 with a stock LK backup (SP Flash Tool readback or
+mtkclient) reachable from bootrom, UART wired at 115200, and the recovery
+path tested BEFORE the first flash (read back the slot you are about to
+write and compare hashes). Without those, stop: nothing below is testable
+and every flash is a brick risk. No ACK gate on the LK build itself
+(building is harmless); the gate that matters is this paragraph -- backup
++ recovery path tested before the first flash. (The OS trees'
+`LG_K20_BRINGUP_ACK=1` / `OPPO_A77_4G_BRINGUP_ACK=1` are separate: they
+guard the long VM image builds, not this one.)
 
 ## Step 0 -- toolchain proof (host only, no phone)
 
-`./build-flashtools.sh --device lg-mt6739` and the host UI
-test (`cc ... tools/mediatek/mt67xx/firmware/tests/test-lk-ui.c`). Success is a boot
-dir with `lk.bin`, `lk.elf`, `FACTS.md`, `build-info.txt`, and PASS. This
-proves the derivation compiles and wraps; it proves nothing about the
-phone.
+`./build-flashtools.sh --device lg-mt6739`, then again with `--device
+oppo-mt6765`, plus the host UI test
+(`cc ... tools/mediatek/mt67xx/firmware/tests/test-lk-ui.c`). Success is a
+boot dir per device with `lk.bin`, `lk.elf`, `FACTS.md`, `build-info.txt`,
+and PASS. This proves the derivation compiles and wraps; it proves
+nothing about the phone.
 
 ## Step 1 -- stock LK + scatter (host only, no flashing)
 
@@ -65,24 +70,39 @@ cd build
 bundled-feed BROM flow jumps an MT6592 DA and stays refused -- phone BROM
 flashing lands at step 6.)
 
-Expect the README's serial log: hello, facts, preloader args, heartbeat.
-Diagnose by the table in `mt67xx_lk_main.c`'s header comment (heartbeat =
-proceed; reset loop = WDT prior wrong; silence = UART index/MEMBASE prior
-wrong; exception = the PC names the liar). Iterate UART index via
-`-DMT67XX_DEBUG_UART=1..3` before doubting MEMBASE (UART has two
-witnesses; MEMBASE has one).
+Expect the README's serial log: hello, facts, preloader args, heartbeat
+[6765: most likely FOLLOWED BY a reset loop, which is the expected result
+-- the WDT write is compiled out until step 2b]. Diagnose by the table in
+`mt67xx_lk_main.c`'s header comment. Iterate UART index via
+`-DMT67XX_DEBUG_UART=1..3` before doubting MEMBASE (UART has three
+witnesses; MEMBASE has one [6765: weak]).
 
-Fill on success: `FACTS.md` (UART + WDT rows to STRONG), OS `BRINGUP.md`
-(console UART -- the OS twin gets its UART for free).
+Fill on success: `FACTS.md` (UART rows to STRONG; WDT row to STRONG on
+[6739] only), OS `BRINGUP.md` (console UART -- the OS twin gets its UART
+for free).
+
+[6765 only] ## Step 2b -- watchdog base
+
+Disassemble the stock LK's early init: it writes the WDT disable/key word
+(usually `0x2200xxxx`) somewhere -- that target is the mt6765 TOPRGU base.
+Fill `MT67XX_TOPRGU_BASE`, set the 6765 `MT67XX_HAS_WDT` to 1, rebuild,
+reflash: the reset loop from step 2 becomes a steady heartbeat.
+
+[6765 only] ## Step 2c -- GPT base (optional)
+
+Only needed if the arch timer ever loses: find GPT in the stock LK init
+or the DTB timer node, fill the GPT block, set the 6765 `MT67XX_HAS_GPT`
+to 1. If the banner keeps saying `timer=arch(hw)`, skip this step --
+unneeded drivers are unneeded risk.
 
 ## Step 3 -- eMMC read
 
-Grounds: MSDC0 base (already a MEDIUM prior) + clock gate + pinmux from the
-stock DTB (OS BRINGUP step 2). Write `mt67xx_msdc.c` (minimal: init + read
-sectors, derived from the j36 `mt6592_msdc.c` structure, NOT its clock
-facts), call it from the NEXT(step 3) marker in main, print the boot.img
-magic. Failure parks with the stage named -- a dead controller must still
-talk.
+Grounds: MSDC0 base (already STRONG: [mt6735] + [mt6797] + [mt6877] agree
+on 0x11230000) + clock gate + pinmux from the stock DTB (OS BRINGUP step
+2). Write `mt67xx_msdc.c` (minimal: init + read sectors, derived from the
+j36 `mt6592_msdc.c` structure, NOT its clock facts), call it from the
+NEXT(step 3) marker in main, print the boot.img magic. Failure parks with
+the stage named -- a dead controller must still talk.
 
 ## Step 4 -- display + menu
 

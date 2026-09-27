@@ -1,21 +1,23 @@
 # mt67xx minimal LK -- bring-up instrument (v1)
 
-MixOS's Little Kernel replacement for the mt67xx family (today: MT6739 in
-the LG K20), derived from the proven j36 tree (`tools/mediatek/firmware`).
-**This builds but does not boot anything yet**: v1 is serial hello +
-watchdog off + proven-ticking clock + heartbeat park. eMMC, display, keys
-and the kernel handoff land as staged LK-BRINGUP steps, each with its own
-grounding. Read `LK-BRINGUP.md` before flashing anything; `FACTS.md`
-lists every address and what it is waiting on.
+MixOS's Little Kernel replacement for the mt67xx family (MT6739 in the
+LG K20, MT6765 in the OPPO CPH2385), derived from the proven j36 tree
+(`tools/mediatek/firmware`). **This builds but does not boot anything
+yet**: v1 is serial hello + watchdog off where grounded + proven-ticking
+clock + heartbeat park. eMMC, display, keys and the kernel handoff land
+as staged LK-BRINGUP steps, each with its own grounding. Read
+`LK-BRINGUP.md` before flashing anything; `FACTS.md` lists every address
+and what it is waiting on.
 
 ## Status
 
 | Part | Status | Grounding |
 |---|---|---|
+| SoCs | mt6739 (full) + mt6765 (GPT/WDT out) | One source base, per-SoC flags |
 | Entry + vectors + linker | Derived from j36, retargeted | j36 tree (runs on MT6592) |
-| UART 115200 | Derived, prior base | mt6735 map + j36 second witness |
-| Timer (arch -> GPT4 -> soft) | New, detection-gated | ARM ARM (arch) + mt6735 GPT (GPT4) |
-| Watchdog off | One write | mt6735 platform.c |
+| UART 115200 | Derived, 3-witness base | mt6735 + mt6755 maps + j36 |
+| Timer (arch -> GPT4? -> soft) | New, detection-gated | ARM ARM (arch); GPT4 on 6739 only |
+| Watchdog off | One write on 6739; out on 6765 | mt6735 platform.c (6765: step 2b) |
 | Bootmenu + menu UI | Derived, host-tested | j36 headers (UI shared by design) |
 | UBOOT-slot wrap | Verbatim j36 script | j36 tree |
 | eMMC read | Not present (step 3) | Waits on clock/pinmux facts |
@@ -31,9 +33,10 @@ main, UI headers), `firmware/scripts/` (slot wrap), `firmware/tests/`
 
 ## Build
 
-`./tools/mediatek/mt67xx/build.sh --device lm-x120` -- or the wired route,
-`./build-flashtools.sh --device lg-mt6739` (no gates: building is harmless,
-same as the j36). Lands `lk.bin`, `lk.elf`, `FACTS.md`,
+`./tools/mediatek/mt67xx/build.sh --device lm-x120` (or `--device
+cph2385` / `cph2385-4gb`) -- or the wired route, `./build-flashtools.sh
+--device lg-mt6739` / `--device oppo-mt6765` (no gates: building is
+harmless, same as the j36). Lands `lk.bin`, `lk.elf`, `FACTS.md`,
 `build-info.txt` in `build/mt67xx/<device>/boot/`. `-DMT67XX_DEBUG_UART=N`
 rebuilds for UART N when silence says UART0 was wrong.
 

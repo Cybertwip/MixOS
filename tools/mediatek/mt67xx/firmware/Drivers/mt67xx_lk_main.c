@@ -1,16 +1,18 @@
 /* SPDX-License-Identifier: MPL-2.0 OR GPL-2.0-or-later */
 /* mt67xx minimal LK: bring-up instrument, step 2 of LK-BRINGUP.md.
  *
- * What this is: serial hello, watchdog off, a clock that proves it ticks,
- * a banner that prints every fact in force (so the log names its own
- * assumptions), then a heartbeat park. What it is not: a bootloader --
- * LK-BRINGUP steps 3-5 (eMMC read, display + menu, AArch64 handoff) land
- * where the markers below say NEXT, each with its own grounding, and not
- * before.
+ * What this is: serial hello, watchdog off where grounded, a clock that
+ * proves it ticks, a banner that prints every fact in force (so the log
+ * names its own assumptions), then a heartbeat park. What it is not: a
+ * bootloader -- LK-BRINGUP steps 2b-5 (WDT, GPT, eMMC read, display +
+ * menu, AArch64 handoff) land where the markers below say NEXT, each with
+ * its own grounding, and not before.
  *
  * How to read a test boot:
  *   hello + heartbeat  UART prior right, MEMBASE right, WDT off. Proceed.
- *   hello then reset   WDT survived: the TOPRGU prior is wrong (LK-BRINGUP 2).
+ *   hello then reset   If the banner says wdt=UNTOUCHED, this is expected
+ *                      until step 2b (mt6765: the write is compiled out).
+ *                      Otherwise the TOPRGU prior is wrong (LK-BRINGUP 2).
  *   silence            UART base wrong (rebuild -DMT67XX_DEBUG_UART=N, N=1..3),
  *                      or MEMBASE wrong (LK-BRINGUP step 1 re-reads it from
  *                      the stock LK). Both are priors; the log cannot tell
@@ -116,8 +118,13 @@ void mt67xx_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
     put_label_hex(" r1=", r1);
     put_label_hex(" r2=", r2);
     put_label_hex(" r3=", r3);
+#if MT67XX_HAS_WDT
     mt67xx_uart_puts("\n[mt67xx-lk] NEXT: LK-BRINGUP step 3 (eMMC read). "
                      "Parking with heartbeat.\n");
+#else
+    mt67xx_uart_puts("\n[mt67xx-lk] NEXT: LK-BRINGUP step 2b (WDT base). "
+                     "Parking with heartbeat.\n");
+#endif
 
     /* NEXT(step 3): read boot.img from eMMC here; failure parks exactly
      * like this, with the breadcrumb naming the stage.

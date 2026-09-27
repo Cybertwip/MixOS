@@ -27,12 +27,30 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ -n "$DEVICE" ]] || { echo 'error: --device is required (e.g. --device lm-x120)' >&2; exit 2; }
-# The device must be a real row: a typo here would bake the wrong name into
-# the banner and the boot dir. mt67xx serves the lg-k20 tree today; a second
-# mt67xx device tree adds its loader next to this one.
+# The device must be a real row in one of the family's device trees: a typo
+# here would bake the wrong name into the banner and the boot dir. First
+# hit wins, and the row's SoC selects the facts row (this is the family
+# design working: one tree, N SoCs, `-DMT67XX_SOC=` from the row).
 # shellcheck source=device/lg-k20/devices.sh
 . "$REPO_ROOT/device/lg-k20/devices.sh"
-k20_device_info "$DEVICE" >/dev/null || exit 1
+# shellcheck source=device/oppo-a77-4g/devices.sh
+. "$REPO_ROOT/device/oppo-a77-4g/devices.sh"
+SOC=""
+if info="$(k20_device_info "$DEVICE" 2>/dev/null)"; then
+    eval "$info"
+    SOC="$K20_SOC"
+elif info="$(a77_4g_device_info "$DEVICE" 2>/dev/null)"; then
+    eval "$info"
+    SOC="$A77_4G_SOC"
+else
+    echo "unknown mt67xx device '$DEVICE' (try: $(k20_devices | tr '\n' ' ')$(a77_4g_devices | tr '\n' ' '))" >&2
+    exit 1
+fi
+case "$SOC" in
+    mt6739) SOC_NUM=6739 ;;
+    mt6765) SOC_NUM=6765 ;;
+    *) echo "mt67xx LK has no facts row for SoC '$SOC' (device $DEVICE)" >&2; exit 1 ;;
+esac
 OUTPUT="${OUTPUT:-$REPO_ROOT/build/mt67xx/$DEVICE}"
 mkdir -p "$OUTPUT"
 OUTPUT="$(cd "$OUTPUT" && pwd -P)"
@@ -56,6 +74,6 @@ COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo nogit)"
 cmake -S "$ROOT/firmware" -B "$OUTPUT/obj" \
     -DMVII_LLVM_ROOT="$LLVM_ROOT" -DMVII_PACKAGE_ROOT="$OUTPUT" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DMT67XX_DEVICE="$DEVICE" -DMVII_BUILD_COMMIT="$COMMIT"
+    -DMT67XX_DEVICE="$DEVICE" -DMT67XX_SOC="$SOC_NUM" -DMVII_BUILD_COMMIT="$COMMIT"
 cmake --build "$OUTPUT/obj" --parallel "$JOBS"
 printf '\nmt67xx LK (%s): %s/boot\n' "$DEVICE" "$OUTPUT"
