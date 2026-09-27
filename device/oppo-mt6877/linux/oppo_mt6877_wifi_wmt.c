@@ -12,6 +12,7 @@
  * missing blob must never look like a dead chip.
  */
 
+#include <linux/bits.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/io.h>

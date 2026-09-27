@@ -23,6 +23,7 @@
  * from mt6877-mt6359.c.
  */
 
+#include <linux/bits.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/module.h>

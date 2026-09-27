@@ -15,6 +15,7 @@
  * exists but does not associate -- and says so in the log.
  */
 
+#include <linux/bits.h>
 #include <linux/etherdevice.h>
 #include <linux/module.h>
 #include <net/cfg80211.h>

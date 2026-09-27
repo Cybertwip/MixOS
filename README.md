@@ -154,6 +154,35 @@ or standalone applications.
 make r36-ultra
 ```
 
+### Phones: OPPO (MediaTek MT6877) and LG K20 Plus (Qualcomm MSM8917)
+
+Builds a 64-bit ARM Linux 6.12 LTS kernel, a generated device tree, the
+GSM/Wi-Fi/display/audio/eMMC/input/touch drivers and the telephony
+userspace (ModemManager/ofono over the modem control path), packaged as a
+`boot.img` plus a Debian rootfs tarball per device. The OPPO tree is
+MediaTek (Dimensity 900, ECCCI modem, CONSYS Wi-Fi); the LG tree is
+Qualcomm (Snapdragon 425, QMI modem, Pronto Wi-Fi) — same build shape,
+each targetting its real SoC.
+
+```bash
+./build-oppo.sh --list-devices   # 20181, 20183, 20355 (more later)
+OPPO_DEVICE=20181 ./build-oppo.sh
+./build-lg.sh --list-devices     # lv517, lv517-rev0, lv517-tovis
+LG_DEVICE=lv517 ./build-lg.sh
+# or
+make oppo
+make lg
+```
+
+### Everything at once
+
+```bash
+./build-mixos.sh --list   # j36 + every oppo + every lg, in build order
+./build-mixos.sh
+# or
+make mixos
+```
+
 The default is four parallel jobs and an armhf-only userspace:
 
 ```bash

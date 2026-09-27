@@ -23,6 +23,7 @@
  * would be claiming a phone that cannot call.
  */
 
+#include <linux/bits.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/io.h>

@@ -14,6 +14,8 @@
  * GPIO12 is the hall sensor (EV_SW/222, the vendor's type+code).
  */
 
+#include <linux/bitops.h>
+#include <linux/bits.h>
 #include <linux/input.h>
 #include <linux/input-polldev.h>
 #include <linux/io.h>
@@ -122,8 +124,14 @@ static const struct of_device_id lv517_keys_match[] = {
 };
 MODULE_DEVICE_TABLE(of, lv517_keys_match);
 
+static void lv517_keys_remove(struct platform_device *pdev)
+{
+	input_unregister_polled_device(platform_get_drvdata(pdev));
+}
+
 static struct platform_driver lv517_keys_driver = {
 	.probe = lv517_keys_probe,
+	.remove_new = lv517_keys_remove,
 	.driver = {
 		.name = "lg-lv517-keys",
 		.of_match_table = lv517_keys_match,

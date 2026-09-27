@@ -19,6 +19,7 @@
  * conn_infra RGU/CFG windows it maps (board/wifi_consys.h).
  */
 
+#include <linux/bits.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/module.h>

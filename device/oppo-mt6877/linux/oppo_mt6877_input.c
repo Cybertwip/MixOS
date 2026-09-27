@@ -20,6 +20,8 @@
  * accident, which is the failure mode a guessed-at power key would have.
  */
 
+#include <linux/bitops.h>
+#include <linux/bits.h>
 #include <linux/input.h>
 #include <linux/input-polldev.h>
 #include <linux/io.h>
@@ -127,8 +129,14 @@ static const struct of_device_id oppo_keys_match[] = {
 };
 MODULE_DEVICE_TABLE(of, oppo_keys_match);
 
+static void oppo_keys_remove(struct platform_device *pdev)
+{
+	input_unregister_polled_device(platform_get_drvdata(pdev));
+}
+
 static struct platform_driver oppo_keys_driver = {
 	.probe = oppo_keys_probe,
+	.remove_new = oppo_keys_remove,
 	.driver = {
 		.name = "oppo-mt6877-keys",
 		.of_match_table = oppo_keys_match,
