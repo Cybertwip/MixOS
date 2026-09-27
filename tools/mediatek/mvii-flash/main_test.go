@@ -1470,3 +1470,19 @@ func TestBootStatusMarkerSeparatesDisplayDiagFromStage1(t *testing.T) {
 		})
 	}
 }
+
+func TestBootStatusStageNameBootSelect(t *testing.T) {
+	cases := []struct {
+		stage uint32
+		want  string
+	}{
+		{0x120c, "MVII minimal LK boot choice tagged (Android on button, MixOS on timeout)"},
+		{0x120b, "MVII minimal LK halted on a CPU exception (see the console ring for vector/PC/DFSR)"},
+		{0x12ff, "unknown"},
+	}
+	for _, tc := range cases {
+		if got := mviiBootStatusStageName(tc.stage); got != tc.want {
+			t.Fatalf("mviiBootStatusStageName(0x%04x) = %q, want %q", tc.stage, got, tc.want)
+		}
+	}
+}

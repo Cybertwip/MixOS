@@ -4404,6 +4404,8 @@ func mviiBootStatusStageName(stage uint32) string {
 		return "MVII minimal LK loaded the ramdisk into DRAM"
 	case 0x120b:
 		return "MVII minimal LK halted on a CPU exception (see the console ring for vector/PC/DFSR)"
+	case 0x120c:
+		return "MVII minimal LK boot choice tagged (Android on button, MixOS on timeout)"
 	case 0x2001:
 		return "MVII ARM stage2 entered"
 	case 0x2002:
