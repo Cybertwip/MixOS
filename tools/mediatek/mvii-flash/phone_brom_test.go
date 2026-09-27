@@ -90,17 +90,15 @@ func TestPhoneDACode(t *testing.T) {
 	}
 }
 
-// BROM codes are observed per soc (mt6765 reports 0x0766 on a retail
-// CPH2385); unobserved socs fall back to the model number and fail safe at
-// probe time, where the mismatch teaches the next override.
+// BROM codes come from the facts table: mt6765 is board-observed
+// (0x0766 on a retail CPH2385), mt6739/mt6833 from the reference flasher's
+// chip table. A wrong one fails safe at probe time.
 func TestPhoneBROMCode(t *testing.T) {
-	got, err := phoneBROMCode("mt6765")
-	if err != nil || got != 0x0766 {
-		t.Fatalf("phoneBROMCode(mt6765) = 0x%x, %v; want 0x0766", got, err)
-	}
-	got, err = phoneBROMCode("mt6833")
-	if err != nil || got != 0x6833 {
-		t.Fatalf("phoneBROMCode(mt6833) = 0x%x, %v; want model-number fallback 0x6833", got, err)
+	for soc, want := range map[string]uint16{"mt6765": 0x0766, "mt6739": 0x0699, "mt6833": 0x0989} {
+		got, err := phoneBROMCode(soc)
+		if err != nil || got != want {
+			t.Errorf("phoneBROMCode(%q) = 0x%x, %v; want 0x%x", soc, got, err, want)
+		}
 	}
 	if _, err := phoneBROMCode("exynos"); err == nil {
 		t.Error("phoneBROMCode(exynos) = nil, want error")
@@ -282,17 +280,41 @@ func TestSendAuth(t *testing.T) {
 
 func TestNeedsPhoneAuth(t *testing.T) {
 	daa := mtkTargetConfig{DAA: true}
-	if send, _ := needsPhoneAuth(daa, true, true); !send {
-		t.Error("needsPhoneAuth(DAA, BROM, auth) = false, want the SEND_AUTH step")
+	if send, _ := needsPhoneAuth(daa, true); !send {
+		t.Error("needsPhoneAuth(DAA, auth) = false, want the SEND_AUTH step")
 	}
-	if send, msg := needsPhoneAuth(daa, false, true); send || !strings.Contains(msg, "preloader mode") {
-		t.Errorf("needsPhoneAuth(DAA, preloader, auth) = %v %q, want skip with BROM guidance", send, msg)
+	if send, _ := needsPhoneAuth(daa, false); send {
+		t.Error("needsPhoneAuth(DAA, no auth) = true, want skip")
 	}
-	if send, _ := needsPhoneAuth(daa, true, false); send {
-		t.Error("needsPhoneAuth(DAA, BROM, no auth) = true, want skip")
-	}
-	if send, msg := needsPhoneAuth(mtkTargetConfig{}, true, true); send || msg != "" {
+	if send, msg := needsPhoneAuth(mtkTargetConfig{}, true); send || msg != "" {
 		t.Errorf("needsPhoneAuth(clear) = %v %q, want silent skip", send, msg)
+	}
+}
+
+func TestPhoneFactsFor(t *testing.T) {
+	want := map[string]phoneFacts{
+		"mt6765": {bromCode: 0x0766, daCode: 0x6765, watchdog: 0x10007000, watchdogOff: 0x22000064, miscLock: 0x1001a100},
+		"mt6739": {bromCode: 0x0699, daCode: 0x6739, watchdog: 0x10007000, watchdogOff: 0x22000064, miscLock: 0x1001a100},
+		"mt6833": {bromCode: 0x0989, daCode: 0x6833, watchdog: 0x10007000, watchdogOff: 0x22000064, miscLock: 0},
+	}
+	for soc, w := range want {
+		got, err := phoneFactsFor(soc)
+		if err != nil || got != w {
+			t.Errorf("phoneFactsFor(%q) = %+v, %v; want %+v", soc, got, err, w)
+		}
+	}
+	if _, err := phoneFactsFor("mt9999"); err == nil {
+		t.Error("phoneFactsFor(mt9999) = nil, want error")
+	}
+}
+
+func TestPhoneUSBDLReg(t *testing.T) {
+	reg := phoneUSBDLReg()
+	if reg&mtkUSBDLMagic != mtkUSBDLMagic || reg&mtkUSBDLBitEnable == 0 || reg&mtkUSBDLByPreloader != 0 {
+		t.Fatalf("phoneUSBDLReg() = 0x%08x, want magic+enabled addressed to BROM", reg)
+	}
+	if reg&^mtkUSBDLTimeoutMask&^(mtkUSBDLMagic|mtkUSBDLBitEnable) != 0 {
+		t.Fatalf("phoneUSBDLReg() = 0x%08x, want no stray bits", reg)
 	}
 }
 

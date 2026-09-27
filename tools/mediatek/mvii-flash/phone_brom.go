@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -46,35 +45,52 @@ type phoneBROMPlan struct {
 	auth      string
 }
 
+// phoneFacts are the per-soc BROM constants: the code BROM reports (a
+// different namespace from the DA entry tags), the DA tag, and the watchdog
+// + BOOT_MISC bases for session care. BROM codes are board-observed where
+// noted, else taken from the reference flasher's chip table -- a wrong one
+// fails safe at probe time, where the mismatch names both codes.
+type phoneFacts struct {
+	bromCode    uint16
+	daCode      uint16
+	watchdog    uint32
+	watchdogOff uint32
+	miscLock    uint32 // 0 when ungrounded: no auto preloader->BROM reset
+}
+
+func phoneFactsFor(soc string) (phoneFacts, error) {
+	switch strings.ToLower(strings.TrimSpace(soc)) {
+	case "mt6765":
+		return phoneFacts{bromCode: 0x0766, daCode: 0x6765, // 0x0766 board-observed 2026-09-27 on a retail CPH2385
+			watchdog: 0x10007000, watchdogOff: 0x22000064, miscLock: 0x1001a100}, nil
+	case "mt6739":
+		return phoneFacts{bromCode: 0x0699, daCode: 0x6739,
+			watchdog: 0x10007000, watchdogOff: 0x22000064, miscLock: 0x1001a100}, nil
+	case "mt6833":
+		return phoneFacts{bromCode: 0x0989, daCode: 0x6833,
+			watchdog: 0x10007000, watchdogOff: 0x22000064, miscLock: 0}, nil
+	}
+	return phoneFacts{}, fmt.Errorf("soc %q is not a known phone soc", soc)
+}
+
 // phoneDACode derives the DA loader entry tag from the soc in
 // build-info.txt. DA bundles tag entries by model number (the vendored
 // MT6765 entry carries hw 0x6765).
 func phoneDACode(soc string) (uint16, error) {
-	return phoneModelCode(soc)
+	facts, err := phoneFactsFor(soc)
+	if err != nil {
+		return 0, err
+	}
+	return facts.daCode, nil
 }
 
-// phoneBROMCode is the code BROM itself reports via get_hw_code -- a
-// different namespace from the DA entry tags. Observed values win; anything
-// unobserved falls back to the model number and fails safe at probe time,
-// where the mismatch names both codes and teaches the next override.
+// phoneBROMCode is the code BROM itself reports via get_hw_code.
 func phoneBROMCode(soc string) (uint16, error) {
-	switch strings.ToLower(strings.TrimSpace(soc)) {
-	case "mt6765":
-		return 0x0766, nil // observed 2026-09-27 on a retail CPH2385
+	facts, err := phoneFactsFor(soc)
+	if err != nil {
+		return 0, err
 	}
-	return phoneModelCode(soc)
-}
-
-func phoneModelCode(soc string) (uint16, error) {
-	digits := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(soc)), "mt")
-	if digits == "" {
-		return 0, fmt.Errorf("soc %q names no MediaTek model", soc)
-	}
-	n, err := strconv.ParseUint(digits, 16, 16)
-	if err != nil || n == 0 {
-		return 0, fmt.Errorf("soc %q is not a MediaTek model number", soc)
-	}
-	return uint16(n), nil
+	return facts.bromCode, nil
 }
 
 // isPhoneBROMShape reports whether this invocation flashes a phone over
@@ -268,10 +284,10 @@ func refusePhoneSLA(phone *phoneRoot, target mtkTargetConfig) error {
 // risks worse than the watchdog itself. A mid-session BROM reset fails the
 // run loudly; the LK slot stays reflashable because the preloader is never
 // touched.
-func probePhoneBROM(c *mtkSerialClient, phone *phoneRoot, hwCode uint16) (mtkTargetConfig, error) {
+func probePhoneBROM(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts) (mtkTargetConfig, error) {
 	const maxReconnect = 8
 	for attempt := 0; ; attempt++ {
-		target, err := probePhoneBROMOnce(c, phone, hwCode)
+		target, err := probePhoneBROMOnce(c, phone, facts)
 		if err == nil {
 			return target, nil
 		}
@@ -285,17 +301,22 @@ func probePhoneBROM(c *mtkSerialClient, phone *phoneRoot, hwCode uint16) (mtkTar
 	}
 }
 
-func probePhoneBROMOnce(c *mtkSerialClient, phone *phoneRoot, hwCode uint16) (mtkTargetConfig, error) {
+func probePhoneBROMOnce(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts) (mtkTargetConfig, error) {
 	got, hwVer, err := c.getHWCode()
 	if err != nil {
 		return mtkTargetConfig{}, err
 	}
 	fmt.Printf("MTK HW code: 0x%04x, HW version: 0x%04x\n", got, hwVer)
-	if got != hwCode {
+	if got != facts.bromCode {
 		return mtkTargetConfig{}, fmt.Errorf("connected MediaTek target is 0x%04x, expected %s (%s, hw code 0x%04x)",
-			got, phone.device, phone.soc, hwCode)
+			got, phone.device, phone.soc, facts.bromCode)
 	}
-	fmt.Println("Phone BROM: leaving the watchdog alone (no grounded TOPRGU base on phones).")
+	// Best-effort watchdog disable: on secured units BROM may refuse the
+	// register write, in which case the session runs inside the watchdog
+	// window and a drop fails the run loudly (the slot stays reflashable).
+	if err := c.write32(facts.watchdog, facts.watchdogOff); err != nil {
+		fmt.Printf("Warning: could not disable the phone watchdog (%v); mid-session resets will fail the run.\n", err)
+	}
 	target, err := c.getTargetConfig()
 	if err != nil {
 		return mtkTargetConfig{}, err
@@ -328,17 +349,81 @@ func probePhoneBROMOnce(c *mtkSerialClient, phone *phoneRoot, hwCode uint16) (mt
 	return target, nil
 }
 
-// needsPhoneAuth decides whether the SEND_AUTH step runs. It runs only in
-// BROM on DAA targets with a blob to send: the preloader does not speak
-// 0xE2 and goes silent (EOF) if asked, so preloader mode skips the step
-// with the way back to BROM instead of failing the run.
-func needsPhoneAuth(target mtkTargetConfig, isBROM, hasAuth bool) (bool, string) {
+// phoneUSBDLReg is the BOOT_MISC download-mode word: magic + max timeout +
+// enabled, addressed to BROM rather than the bootloader. Same word every
+// MediaTek flasher writes; the consts are shared with the J36 path.
+func phoneUSBDLReg() uint32 {
+	timeout := uint32(mtkUSBDLTimeoutMax << 2)
+	timeout &= mtkUSBDLTimeoutMask
+	return (mtkUSBDLMagic | timeout | mtkUSBDLBitEnable) &^ uint32(mtkUSBDLByPreloader)
+}
+
+// setPhonePreloaderBROMFlag arms the preloader so its next reset lands in
+// BROM download mode: unlock BOOT_MISC, mark it watchdog-resettable, relock,
+// write the USBDL word. It needs a grounded misc_lock base, so socs without
+// one (mt6833) cannot take this path and must enter BROM via the key combo.
+func setPhonePreloaderBROMFlag(c *mtkSerialClient, facts phoneFacts) error {
+	if facts.miscLock == 0 {
+		return errors.New("no grounded BOOT_MISC base for this soc; power off, hold Vol-down, replug for BROM mode, and rerun")
+	}
+	usbdlReg := phoneUSBDLReg()
+	fmt.Printf("Setting preloader reset-to-BROM flag: USBDL 0x%08x\n", usbdlReg)
+	if err := c.write32(facts.miscLock, mtkMiscLockKeyMagic); err != nil {
+		return fmt.Errorf("unlock BOOT_MISC: %w", err)
+	}
+	resetControl := uint32(1)
+	if current, err := c.read32(facts.miscLock+0x08, 1); err == nil && len(current) != 0 {
+		resetControl = current[0] | 1
+	}
+	if err := c.write32(facts.miscLock+0x08, resetControl); err != nil {
+		return fmt.Errorf("mark USBDL flag watchdog-resettable: %w", err)
+	}
+	if err := c.write32(facts.miscLock, 0); err != nil {
+		return fmt.Errorf("lock BOOT_MISC: %w", err)
+	}
+	if err := c.write32(facts.miscLock-0x20, usbdlReg); err != nil {
+		return fmt.Errorf("write USBDL flag: %w", err)
+	}
+	return nil
+}
+
+// waitPhoneBROM closes a preloader-mode session and waits for the phone to
+// re-enumerate in BROM after the reset-to-BROM flag was armed. The reset
+// itself comes from the preloader's own idle timeout; no trigger sequence
+// is grounded for phones, so if the window expires the run says so and
+// names the key combo. Returns the fresh BROM session on success.
+func waitPhoneBROM(cfg config, phone *phoneRoot, facts phoneFacts) (*mtkSerialClient, mtkTargetConfig, error) {
+	const attempts = 12
+	for i := 0; i < attempts; i++ {
+		time.Sleep(5 * time.Second)
+		client, err := connectMTKSerial(cfg.device)
+		if err != nil {
+			fmt.Printf("BROM wait %d/%d: %v\n", i+1, attempts, err)
+			continue
+		}
+		target, err := probePhoneBROMOnce(client, phone, facts)
+		if err != nil {
+			_ = client.port.Close()
+			fmt.Printf("BROM wait %d/%d: %v\n", i+1, attempts, err)
+			continue
+		}
+		if !client.isBROM {
+			_ = client.port.Close()
+			fmt.Printf("BROM wait %d/%d: still in preloader mode.\n", i+1, attempts)
+			continue
+		}
+		return client, target, nil
+	}
+	return nil, mtkTargetConfig{}, errors.New("phone stayed in preloader mode; power off, hold Vol-down (or Vol-up+Vol-down), replug for BROM mode, and rerun")
+}
+
+// needsPhoneAuth decides whether the SEND_AUTH step runs: on DAA targets
+// with a blob to send. It is only reached in BROM mode -- flashPhoneBROM
+// transitions out of preloader mode first, because the preloader neither
+// speaks 0xE2 (it goes silent with EOF) nor survives the DA upload.
+func needsPhoneAuth(target mtkTargetConfig, hasAuth bool) (bool, string) {
 	if !target.DAA {
 		return false, ""
-	}
-	if !isBROM {
-		return false, "BROM enforces DAA but the phone is in preloader mode, which does not speak SEND_AUTH; " +
-			"attempting the DA upload without it -- for the auth step, power off, hold Vol-down, replug for BROM mode, and rerun."
 	}
 	if !hasAuth {
 		return false, "Warning: BROM enforces DAA but no -auth file was given; attempting the DA upload without it."
@@ -456,20 +541,42 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 	fmt.Printf("Using device preloader EMI: %s (version 0x%x, length 0x%x)\n", emi.Path, emi.Version, len(emi.Data))
 	fmt.Printf("Using MTK serial packet size: 0x%x\n", packetSize)
 
+	facts, err := phoneFactsFor(phone.soc)
+	if err != nil {
+		return err
+	}
 	client, err := connectMTKSerial(cfg.device)
 	if err != nil {
 		return err
 	}
 	client.preloaderEMI = emi
+	target, err := probePhoneBROM(client, phone, facts)
+	if err != nil {
+		_ = client.port.Close()
+		return err
+	}
+	if !client.isBROM {
+		// Preloader mode is a dead end for the upload: the DA stage
+		// addresses are BROM SRAM addresses, and the one observed
+		// preloader-mode attempt died mid-upload with a USB drop. Arm
+		// the reset-to-BROM flag and wait for the BROM session.
+		fmt.Println("Phone is in preloader mode; arming the reset-to-BROM flag.")
+		if err := setPhonePreloaderBROMFlag(client, facts); err != nil {
+			_ = client.port.Close()
+			return err
+		}
+		_ = client.port.Close()
+		client, target, err = waitPhoneBROM(cfg, phone, facts)
+		if err != nil {
+			return err
+		}
+		client.preloaderEMI = emi
+	}
 	defer func() {
 		_ = client.port.Close()
 	}()
 
-	target, err := probePhoneBROM(client, phone, plan.hwCode)
-	if err != nil {
-		return err
-	}
-	if send, msg := needsPhoneAuth(target, client.isBROM, plan.auth != ""); send {
+	if send, msg := needsPhoneAuth(target, plan.auth != ""); send {
 		authBlob, err := os.ReadFile(plan.auth)
 		if err != nil {
 			return fmt.Errorf("phone target %s: read auth file %s: %w", phone.device, plan.auth, err)
