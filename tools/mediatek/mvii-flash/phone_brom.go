@@ -632,6 +632,10 @@ func crashPhonePreloader(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts)
 		// accepted (watch the landing check below).
 		if err := mode.fire(); err != nil {
 			fmt.Printf("  result: %v\n", err)
+			if isDeviceGoneError(err) {
+				fmt.Println("USB dropped; stopping crash attempts and watching for a BROM re-enumeration.")
+				return
+			}
 		} else {
 			fmt.Println("  result: accepted")
 		}

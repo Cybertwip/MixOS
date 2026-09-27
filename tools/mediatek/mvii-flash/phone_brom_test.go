@@ -384,10 +384,8 @@ func TestWaitPhoneBROMExpiredConnectFails(t *testing.T) {
 	}
 }
 
-// Against a dead peer every crash mode fails fast and ignored, the run
-// still completes, and the three modes fire in order (the null jump itself
-// fires only when its SEND_DA is accepted, so a dead peer never sees it --
-// same as the reference, which skips the jump when the send raises).
+// A dropped USB session must stop crash attempts immediately. The caller
+// then watches for a fresh BROM enumeration using a new libusb handle.
 func TestCrashPhonePreloader(t *testing.T) {
 	phone := writePhoneRoot(t, "device=cph2385-4gb\nsoc=mt6765\n")
 	info, ok := detectPhoneRoot(phone)
@@ -407,16 +405,8 @@ func TestCrashPhonePreloader(t *testing.T) {
 			singles = append(singles, w[0])
 		}
 	}
-	first := func(b byte) int { return bytes.IndexByte(singles, b) }
-	last := func(b byte) int { return bytes.LastIndexByte(singles, b) }
-	if first(mtkCmdSendDA) < 0 || first(mtkCmdRead32) < 0 {
-		t.Fatalf("command bytes = %x, want SEND_DA and READ32 present", singles)
-	}
-	if !(first(mtkCmdSendDA) < first(mtkCmdRead32) && first(mtkCmdRead32) < last(mtkCmdSendDA)) {
-		t.Fatalf("command bytes = %x, want mode order SEND_DA, READ32, SEND_DA", singles)
-	}
-	if bytes.Contains(singles, []byte{mtkCmdJumpDA}) {
-		t.Fatalf("command bytes = %x, want no jump on a dead peer", singles)
+	if !bytes.Equal(singles, []byte{mtkCmdSendDA}) {
+		t.Fatalf("command bytes = %x, want only first SEND_DA after USB drop", singles)
 	}
 }
 
