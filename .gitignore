@@ -33,6 +33,8 @@ __pycache__/
 # phone vendors' proprietary binaries (see the firmware READMEs); they must
 # never be committed, only read from their extraction directory by the builds.
 device/*/firmware/stock/
+# Unpacker checkouts (kdztools, oppo_decrypt) cloned by the fetch scripts.
+device/*/firmware/.tools/
 *.py[cod]
 
 # The device tree's three build products.  They were written here by default until

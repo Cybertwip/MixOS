@@ -33,9 +33,18 @@ default standing in for the tuning, not of a driver bug.
 `modem.mdt` + `modem.bXX` and `wcnss.mdt` + `wcnss.bXX` -- the PIL sets the
 modem and Pronto boot from -- are not in the reference tree (it is a
 kernel-only drop; the images ship on the phone's `/firmware` partition).
-`extract-stock.sh` pulls them over adb, discovering every `.bXX` segment
-by listing, and the build counts each set because one missing segment
-fails PIL auth with an error that looks exactly like a driver bug.
+Two routes fetch them into `stock/`, and they are interchangeable:
+
+- `extract-stock.sh` pulls them over adb from the phone, discovering every
+  `.bXX` segment by listing. Two minutes, exact-match blobs, needs the phone.
+- `fetch-kdz.sh /path/to/stock.kdz` unpacks a stock KDZ offline with
+  [kdztools](https://github.com/ehem/kdztools) and lifts the sets out of
+  the modem partition image with 7z. The KDZ itself (~2 GB, wait-walled)
+  is a browser download -- e.g. the MP26011K_00 build for the LGMP260 at
+  <https://lgrom.com/firmware/LGMP260>.
+
+Either way the build counts each set, because one missing segment fails
+PIL auth with an error that looks exactly like a driver bug.
 
 ## Licence
 

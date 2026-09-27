@@ -14,11 +14,19 @@ Debian rootfs by the build's firmware stage (`FIRMWARE_DIR`).
 | `WIFI_RAM_CODE` | CONSYS Wi-Fi RAM code | `/vendor/firmware/WIFI_RAM_CODE_*` |
 | `WMT_SOC.cfg` | WMT coexistence config | `/vendor/firmware/WMT_SOC.cfg` |
 
-`extract-stock.sh` pulls them over adb from the phone itself and writes a
-`MANIFEST.txt` with sizes and hashes next to them. Stock firmware directories
-are usually world-readable, so root is only needed if your build hid them.
-OPPO factory images (`.ofp`) are encrypted; there is no offline unpack path,
-so extraction needs the phone -- which the person building a phone image has.
+Two routes fetch them into `stock/`, and they are interchangeable:
+
+- `extract-stock.sh` pulls them over adb from the phone itself and writes a
+  `MANIFEST.txt` with sizes and hashes next to them. Stock firmware
+  directories are usually world-readable, so root is only needed if your
+  build hid them. Two minutes, exact-match blobs, needs the phone.
+- `fetch-ofp.sh /path/to/stock.ofp` decrypts a stock `.ofp` offline with
+  [oppo_decrypt](https://github.com/oneseeker279/oppo_decrypt)
+  (`ofp_mtk_decrypt.py`, MIT) and lifts the blobs out of the vendor image
+  with 7z. The `.ofp` (several GB) comes from OPPO's official firmware
+  downloads or a community mirror -- search the CPH2251 build -- and is a
+  browser download. Newer builds rotate the OFP keys; if the decrypter
+  reports unknown keys, extract from the phone instead.
 
 Nothing here is vendored: the reference kernel tree
 (`reference/android_kernel_oppo_mt6877`) is a kernel-only drop -- it carries
