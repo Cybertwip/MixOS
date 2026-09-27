@@ -1,8 +1,10 @@
-# MediaTek flashing tool and J36 firmware
+# MediaTek flashing tool and LK trees
 
-This directory contains a standalone copy of PowerEngine's `Deployment/cmd/mvii-flash` Go source, with its `go.mod` and `go.sum`, for the J36 Ultra MT6592. The original PowerEngine directory was left in place. Run `./tools/mediatek/flash -h` from the dArkOS checkout, or build the CLI with `cd tools/mediatek && go build -o /path/to/flash ./mvii-flash`. Go 1.23 or newer is required. On macOS, install `libusb-1.0` and `pkg-config` for the native USB transport.
+This directory is the shared MediaTek home: a standalone copy of PowerEngine's `Deployment/cmd/mvii-flash` Go source, with its `go.mod` and `go.sum`, plus one LK tree per SoC family. The original PowerEngine directory was left in place. Run `./tools/mediatek/flash -h` from the dArkOS checkout, or build the CLI with `cd tools/mediatek && go build -o /path/to/flash ./mvii-flash` (`./build-flashtools.sh` builds it as `build/flash`). Go 1.23 or newer is required. On macOS, install `libusb-1.0` and `pkg-config` for the native USB transport.
 
-`firmware/` is the J36 LK, the release LK and the in-target flash payload. `./tools/mediatek/build.sh` builds `lk.bin`, `lk-release.bin`, `MVIIFlash.bin` and the flash CLI. `./tools/mediatek/build.sh --without-battery` disables the charger watchdog, widens the brownout limit, skips the charge screen, and does not rewrite the preloader's charger mode. Pair that image with `./build-j36-ultra.sh --without-battery`, which writes `j36.power=external` so Linux does the same after handoff.
+`firmware/` is the J36 LK (MT6592), the release LK and the in-target flash payload. `./tools/mediatek/build.sh` builds `lk.bin`, `lk-release.bin`, `MVIIFlash.bin` and `assets.bin` (the flash CLI it used to build per boot dir is `build/flash` now). `./tools/mediatek/build.sh --without-battery` disables the charger watchdog, widens the brownout limit, skips the charge screen, and does not rewrite the preloader's charger mode. Pair that image with `./build-j36-ultra.sh --without-battery`, which writes `j36.power=external` so Linux does the same after handoff.
+
+`mt67xx/` and `mt68xx/` are the phone LK families (bring-up instruments, not bootloaders yet -- see each tree's `LK-BRINGUP.md`), built per device by `./build-flashtools.sh` the same way as the j36.
 
 The flashing commands require their usual board-specific inputs and a connected device. The first `go run` may download the dependencies in `go.mod`. The firmware build needs CMake, Python 3 and an LLVM that provides `clang` and `ld.lld` (`MVII_LLVM_ROOT` overrides discovery). It does not replace the board's stock preloader.
 

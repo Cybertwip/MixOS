@@ -15,7 +15,7 @@
  *
  * Run with:
  *
- *     cc -std=c99 -Wall -Wextra -Werror tools/mt67xx/firmware/tests/test-lk-ui.c \
+ *     cc -std=c99 -Wall -Wextra -Werror tools/mediatek/mt67xx/firmware/tests/test-lk-ui.c \
  *         -o /tmp/mt67xx-lk-ui-test && /tmp/mt67xx-lk-ui-test
  */
 #include <assert.h>

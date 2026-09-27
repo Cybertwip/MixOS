@@ -20,7 +20,7 @@ is separate: it guards the long VM image build, not this one.)
 ## Step 0 -- toolchain proof (host only, no phone)
 
 `./build-flashtools.sh --device lg-mt6739` and the host UI
-test (`cc ... tools/mt67xx/firmware/tests/test-lk-ui.c`). Success is a boot
+test (`cc ... tools/mediatek/mt67xx/firmware/tests/test-lk-ui.c`). Success is a boot
 dir with `lk.bin`, `lk.elf`, `FACTS.md`, `build-info.txt`, and PASS. This
 proves the derivation compiles and wraps; it proves nothing about the
 phone.
@@ -39,12 +39,38 @@ Fill: `firmware/CMakeLists.txt` default, `Drivers/mt67xx_facts.h` comment,
 
 ## Step 2 -- first light (this v1 image)
 
-Flash the step-0 `lk.bin` to the LK slot. Expect the README's serial log:
-hello, facts, preloader args, heartbeat. Diagnose by the table in
-`mt67xx_lk_main.c`'s header comment (heartbeat = proceed; reset loop = WDT
-prior wrong; silence = UART index/MEMBASE prior wrong; exception = the PC
-names the liar). Iterate UART index via `-DMT67XX_DEBUG_UART=1..3` before
-doubting MEMBASE (UART has two witnesses; MEMBASE has one).
+Flash the step-0 `lk.bin` to the LK slot. Three routes: SP Flash Tool /
+mtkclient per the stock scatter (primary -- works regardless of lock
+state); on an unlocked bootloader, the shared CLI from above the device
+split:
+
+```
+cd build
+./flash -root ./mt67xx/lm-x120/boot -upload lk -backend fastboot \
+    -partition <LK-slot-name-from-scatter> [-serial <fastboot-serial>]
+```
+
+(`-partition` is required and has no default -- the `boot` default is the
+j36's.) Third, BROM raw exec for operator-supplied payloads -- the only
+BROM shape `./flash` allows against phone roots, because it jumps only
+what it is given:
+
+```
+cd build
+./flash -root ./mt67xx/lm-x120/boot -address 0x... [payload.bin] \
+    -device /dev/cu.usbmodemXXXX
+```
+
+(no `-upload`, no feed flags, no defaults: every address is yours. The
+bundled-feed BROM flow jumps an MT6592 DA and stays refused -- phone BROM
+flashing lands at step 6.)
+
+Expect the README's serial log: hello, facts, preloader args, heartbeat.
+Diagnose by the table in `mt67xx_lk_main.c`'s header comment (heartbeat =
+proceed; reset loop = WDT prior wrong; silence = UART index/MEMBASE prior
+wrong; exception = the PC names the liar). Iterate UART index via
+`-DMT67XX_DEBUG_UART=1..3` before doubting MEMBASE (UART has two
+witnesses; MEMBASE has one).
 
 Fill on success: `FACTS.md` (UART + WDT rows to STRONG), OS `BRINGUP.md`
 (console UART -- the OS twin gets its UART for free).

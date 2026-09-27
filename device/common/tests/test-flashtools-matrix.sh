@@ -56,6 +56,24 @@ if ! grep -q 'lk.bin lk.elf FACTS.md build-info.txt' "$ROOT/build-flashtools.sh"
 else
     echo "  phone per-variant check: ok"
 fi
+# One CLI above the device split: every build run must produce build/flash,
+# and no per-mode copy may come back (stale copies predate the phone-root
+# guard, so a resurrected one reopens the j36-DA-against-phones footgun).
+if ! grep -q 'go build -o "$ROOT/build/flash" ./mvii-flash' "$ROOT/build-flashtools.sh"; then
+    echo "FAIL: build/flash not wired"; fail=1
+else
+    echo "  build/flash placement: ok"
+fi
+if grep -q 'go build -o "$OUTPUT/boot/flash"' "$ROOT/tools/mediatek/build.sh"; then
+    echo "FAIL: per-mode flash copy reintroduced"; fail=1
+else
+    echo "  no per-mode flash: ok"
+fi
+if ! grep -q 'rm -f "$OUTPUT/boot/flash"' "$ROOT/tools/mediatek/build.sh"; then
+    echo "FAIL: stale per-mode flash cleanup missing"; fail=1
+else
+    echo "  stale flash cleanup: ok"
+fi
 # Power modes are j36-only: narrowing them for a phone must fail fast.
 if "$ROOT/build-flashtools.sh" --device oppo-mt6833 --battery-only >/dev/null 2>&1; then
     echo "FAIL: --battery-only accepted for a phone"; fail=1

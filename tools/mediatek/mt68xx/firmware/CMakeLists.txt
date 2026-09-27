@@ -5,7 +5,7 @@ set(CMAKE_SYSTEM_PROCESSOR armv7)
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
 set(MINOS_ROOT "${CMAKE_CURRENT_LIST_DIR}")
-get_filename_component(MVII_REPO_ROOT "${MINOS_ROOT}/../../.." ABSOLUTE)
+get_filename_component(MVII_REPO_ROOT "${MINOS_ROOT}/../../../.." ABSOLUTE)
 
 # ── bring-up knobs ──────────────────────────────────────────────────────
 # Every default here is a prior from mt68xx_facts.h; overriding one is how a

@@ -17,16 +17,20 @@ import (
  * pointing them at a phone would write a stranger's bootloader layout onto
  * it. This file is the guard: it recognizes a phone boot dir by the
  * build-info.txt the family build.sh stages next to lk.bin, and refuses
- * every device path except the one that is honest for phones today:
+ * every device path except the two that are honest for phones today:
  *
  *   fastboot, with the partition named explicitly by the operator
  *   (./flash -root <phone-dir> -upload lk -backend fastboot -partition <LK
- *   name from the stock scatter>), on an unlocked bootloader.
+ *   name from the stock scatter>), on an unlocked bootloader; and
+ *   BROM raw exec, with payload bytes and address supplied explicitly by
+ *   the operator (./flash -root <phone-dir> -address 0x... [payload.bin]
+ *   -device /dev/cu.usbmodem...), which jumps only what it is given.
  *
- * Everything else -- BROM feed, raw block, the live console, the MTK read
- * verbs -- stays j36-only until LK-BRINGUP step 6 wires phone backends
- * (phone DA + scatter). The refusal messages say exactly that, plus the
- * working alternative (SP Flash Tool / mtkclient per LK-BRINGUP step 2).
+ * Everything else -- the bundled-feed BROM flow, raw block, the live
+ * console, the MTK read verbs -- stays j36-only until LK-BRINGUP step 6
+ * wires phone backends (phone DA + scatter). The refusal messages say
+ * exactly that, plus the working alternative (SP Flash Tool / mtkclient
+ * per LK-BRINGUP step 2).
  */
 
 // phoneRoot describes a phone LK boot dir.
@@ -80,7 +84,7 @@ func isASCIIDigits(s string) bool {
 // bringupPointer names the playbook that owns this phone's flashing story.
 func (p *phoneRoot) bringupPointer() string {
 	if p.family != "" {
-		return "tools/" + p.family + "/LK-BRINGUP.md"
+		return "tools/mediatek/" + p.family + "/LK-BRINGUP.md"
 	}
 	return "the phone LK tree's LK-BRINGUP.md"
 }
@@ -96,19 +100,34 @@ func confirmWord(cfg config) string {
 }
 
 // refusePhoneWrite gates every device-touching run with a phone -root.
-// It returns nil only for the one honest phone path (explicit fastboot,
-// no -device, no j36-only verbs, -upload resolving to files present in
-// this root); anything else fails with the reason and the alternative.
-// Pure over cfg + the root dir, so the Go suite pins the whole matrix.
+// It returns nil only for the honest phone paths (fastboot with an
+// explicit partition and no -device; BROM raw exec with explicit address
+// and no feed/-upload flags); anything else fails with the reason and the
+// alternative. Pure over cfg + the root dir, so the Go suite pins the
+// whole matrix.
 func refusePhoneWrite(cfg config, phone *phoneRoot) error {
 	if cfg.listOnly {
 		return nil // listing devices touches nothing
 	}
 	if dev := strings.TrimSpace(cfg.device); dev != "" {
-		return fmt.Errorf("phone target %s: -device %s selects the j36 BROM feed / j36 block offsets; "+
-			"./flash reaches phones through fastboot only (-backend fastboot -partition <LK name from the stock scatter>, "+
-			"no -device), or SP Flash Tool / mtkclient per %s step 2",
-			phone.device, dev, phone.bringupPointer())
+		if !isSerialDevicePath(dev) {
+			return fmt.Errorf("phone target %s: -device %s is a block device; raw-block writes take j36 offsets. "+
+				"Flash via fastboot (-backend fastboot -partition <LK name from the stock scatter>, no -device), "+
+				"BROM raw exec (-address 0x... [payload]), or SP Flash Tool / mtkclient per %s step 2",
+				phone.device, dev, phone.bringupPointer())
+		}
+		// Serial VCOM: raw exec iff fully operator-addressed (address set,
+		// no -upload, no feed/j36 flags -- mirroring the dispatch order in
+		// run(), where this shape returns before the auto-feed). Without
+		// -address the same -device would select the j36 BROM feed.
+		if j36OnlyVerb(cfg) == "" && hasRawAddress(cfg) && cfg.upload == "" {
+			return nil
+		}
+		return fmt.Errorf("phone target %s: serial VCOM without a raw-exec shape selects the j36 BROM feed "+
+			"(MT6592 DA, j36 scatter). For BROM add -address 0x... [payload] with no -upload and no feed flags "+
+			"(raw exec jumps only what it is given); for flashing use -backend fastboot -partition <LK name "+
+			"from the stock scatter>, or SP Flash Tool / mtkclient per %s step 2",
+			phone.device, phone.bringupPointer())
 	}
 	if backend := strings.ToLower(strings.TrimSpace(cfg.backend)); backend != "" && backend != "auto" && backend != "fastboot" {
 		return fmt.Errorf("phone target %s: -backend=%s speaks j36 hardware (MT6592 DA, j36 scatter); "+
@@ -134,6 +153,13 @@ func refusePhoneWrite(cfg config, phone *phoneRoot) error {
 		}
 	}
 	return nil
+}
+
+// hasRawAddress reports whether the run names its own BROM address, the
+// shape rawExecutePayload demands (it refuses to run without one, so there
+// is no default address to leak across SoCs).
+func hasRawAddress(cfg config) bool {
+	return strings.TrimSpace(cfg.mtkPayloadAddr) != "" || strings.TrimSpace(cfg.mtkPayloadEntry) != ""
 }
 
 // j36OnlyVerb names the first j36-mechanism flag on this command line, or

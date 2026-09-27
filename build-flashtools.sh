@@ -8,7 +8,7 @@
 # when the firmware gains flags: build.sh owns the power-mode table, this
 # script only enumerates it. The device table lives here: j36-ultra is the
 # proven LK (tools/mediatek/firmware, MT6592), and the mt67xx/mt68xx phone
-# LKs (tools/mt67xx, tools/mt68xx) build the same way -- same command, same
+# LKs (tools/mediatek/mt67xx, tools/mediatek/mt68xx) build the same way -- same command, same
 # boot-dir-pick-and-flash flow, no gates, because building is harmless. The
 # phone images are bring-up instruments that do not boot anything yet (see
 # each tree's LK-BRINGUP.md); the care goes into flashing, not building.
@@ -27,9 +27,15 @@
 #   --without-battery  build only build/mediatek/j36-ultra/without-battery/boot
 #   --tests            also run the flash-tool Go suite and the LK bootmenu C test
 #
-# After a build, flash from the matching boot dir, e.g.:
-#   cd build/mediatek/j36-ultra/without-battery/boot
-#   ./flash -root ./ -upload release -device /dev/cu.usbmodemXXXX -yes
+# After a build, flash from the one CLI above the device split, e.g.:
+#   cd build
+#   ./flash -root ./mediatek/j36-ultra/without-battery/boot -upload release \
+#       -device /dev/cu.usbmodemXXXX -yes
+#   ./flash -root ./mt68xx/cph2381/boot -upload lk -backend fastboot \
+#       -partition <LK-name-from-scatter> [-serial <fastboot-serial>]
+# (phone LKs flash through fastboot, or BROM raw-exec with operator
+# payload+address; the j36 BROM feed is refused against phone roots --
+# see LK-BRINGUP step 2).
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 MODES="battery without-battery"
@@ -52,8 +58,8 @@ lk_matrix() {
     printf '%-14s %s\n' j36-ultra "builds: tools/mediatek/firmware -> build/mediatek/j36-ultra/<mode>/boot"
     printf '%-14s %s\n' oppo-mt6877 "no LK sources: the Dimensity 900 LK is OPPO's closed bootloader; the phone keeps stock LK (OS image: ./build-oppo.sh)"
     printf '%-14s %s\n' lg-msm8917 "no LK sources: the MSM8917 boots Qualcomm aboot, not LK; the phone keeps stock aboot (OS image: ./build-lg.sh)"
-    printf '%-14s %s\n' oppo-mt6833 "builds: tools/mt68xx -> build/mt68xx/<device>/boot (bring-up LK)"
-    printf '%-14s %s\n' lg-mt6739 "builds: tools/mt67xx -> build/mt67xx/<device>/boot (bring-up LK)"
+    printf '%-14s %s\n' oppo-mt6833 "builds: tools/mediatek/mt68xx -> build/mt68xx/<device>/boot (bring-up LK)"
+    printf '%-14s %s\n' lg-mt6739 "builds: tools/mediatek/mt67xx -> build/mt67xx/<device>/boot (bring-up LK)"
 }
 # One phone LK family: every devices.sh row gets its own boot dir, and each
 # dir is verified before the next builds -- a developer picks a boot dir
@@ -74,7 +80,7 @@ build_phone_lk() {
     rows="$($devices_fn)"
     for dev in $rows; do
         [[ -n "$dev" ]] || continue
-        "$ROOT/tools/$family/build.sh" --device "$dev"
+        "$ROOT/tools/mediatek/$family/build.sh" --device "$dev"
         dir="$ROOT/build/$family/$dev/boot"
         for f in lk.bin lk.elf FACTS.md build-info.txt; do
             [[ -s "$dir/$f" ]] || { echo "missing $dir/$f after build" >&2; exit 1; }
@@ -123,8 +129,15 @@ else
     PHONE_TESTS="mt67xx mt68xx"
 fi
 
+# One CLI for every boot dir below: build/flash, used as
+#   cd build && ./flash -root <dir> ...
+# (the j36 per-mode copies stay, so those dirs keep working standalone).
+export GOFLAGS="${GOFLAGS:--mod=mod}"
+export GOCACHE="${GOCACHE:-$ROOT/build/go-cache}"
+(cd "$ROOT/tools/mediatek" && go build -o "$ROOT/build/flash" ./mvii-flash)
+[[ -x "$ROOT/build/flash" ]] || { echo "missing $ROOT/build/flash after build" >&2; exit 1; }
+
 if [[ "$DO_J36" == 1 ]]; then
-    export GOFLAGS="${GOFLAGS:--mod=mod}"
     for mode in $MODES; do
         if [[ "$mode" == "without-battery" ]]; then
             "$ROOT/tools/mediatek/build.sh" --without-battery
@@ -133,12 +146,13 @@ if [[ "$DO_J36" == 1 ]]; then
         fi
     done
 
-    # Every variant verified: the five artifacts tools/mediatek/build.sh
+    # Every variant verified: the four artifacts tools/mediatek/build.sh
     # promises, in each mode's boot dir. A developer picks a boot dir as-is,
-    # so a silent shortfall here would ship as a broken flash there.
+    # so a silent shortfall here would ship as a broken flash there. (The
+    # flash CLI is build/flash now, not a fifth copy per dir.)
     for mode in $MODES; do
         dir="$ROOT/build/mediatek/j36-ultra/$mode/boot"
-        for f in lk.bin lk-release.bin MVIIFlash.bin assets.bin flash; do
+        for f in lk.bin lk-release.bin MVIIFlash.bin assets.bin; do
             [[ -s "$dir/$f" ]] || { echo "missing $dir/$f after build" >&2; exit 1; }
         done
     done
@@ -172,6 +186,8 @@ if [[ -n "${DO_PHONES// /}" ]]; then
     done
 fi
 
+printf 'build/flash  (one CLI for every boot dir above: cd build && ./flash -root <dir> ...)\n'
+
 if [[ "$RUN_TESTS" == 1 ]]; then
     if [[ "$DO_J36" == 1 ]]; then
         # The build pins its own GOCACHE per mode; the test gets the shared
@@ -185,7 +201,7 @@ if [[ "$RUN_TESTS" == 1 ]]; then
     for family in $PHONE_TESTS; do
         [[ -n "$family" ]] || continue
         cc -std=c99 -Wall -Wextra -Werror \
-            "$ROOT/tools/$family/firmware/tests/test-lk-ui.c" \
+            "$ROOT/tools/mediatek/$family/firmware/tests/test-lk-ui.c" \
             -o "/tmp/$family-lk-ui-test" && "/tmp/$family-lk-ui-test"
     done
 fi

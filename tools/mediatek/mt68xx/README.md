@@ -32,7 +32,7 @@ main, UI headers), `firmware/scripts/` (slot wrap), `firmware/tests/`
 
 ## Build
 
-`./tools/mt68xx/build.sh --device cph2381` -- or the wired route,
+`./tools/mediatek/mt68xx/build.sh --device cph2381` -- or the wired route,
 `./build-flashtools.sh --device oppo-mt6833` (no gates: building is harmless,
 same as the j36). Lands `lk.bin`, `lk.elf`, `FACTS.md`,
 `build-info.txt` in `build/mt68xx/<device>/boot/`. `-DMT68XX_DEBUG_UART=N`
@@ -42,7 +42,8 @@ rebuilds for UART N when silence says UART0 was wrong.
 
 Back up the stock LK slot (SP Flash Tool readback or mtkclient) and keep
 the stock image where bootrom can reach it. Flash `lk.bin` to the LK/UBOOT
-slot per the stock scatter, with UART wired at 115200. Success looks like:
+slot per the stock scatter (or unlocked-fastboot via the shared CLI --
+see LK-BRINGUP step 2), with UART wired at 115200. Success looks like:
 
 ```
 [mt68xx-lk] MixOS minimal LK (bring-up) for cph2381 (mt6833), commit abc1234

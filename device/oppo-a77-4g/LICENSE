@@ -1,0 +1,12 @@
+The MixOS work in this directory is dual-licensed MPL-2.0 OR
+GPL-2.0-or-later, at your option:
+
+    SPDX-License-Identifier: MPL-2.0 OR GPL-2.0-or-later
+
+The full licence texts are device/j36-ultra/LICENSE.MPL-2.0 and
+device/j36-ultra/LICENSE.GPL-2. The per-file statements in
+device/j36-ultra/LICENSE apply here with s/j36-ultra/oppo-a77-4g/.
+
+This covers only the MixOS work. There is no vendor reference kernel
+for this tree (bring-up starts from the phone itself; see BRINGUP.md),
+and any stock firmware blobs (firmware/README.md) stay OPPO's.

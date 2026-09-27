@@ -31,7 +31,7 @@ main, UI headers), `firmware/scripts/` (slot wrap), `firmware/tests/`
 
 ## Build
 
-`./tools/mt67xx/build.sh --device lm-x120` -- or the wired route,
+`./tools/mediatek/mt67xx/build.sh --device lm-x120` -- or the wired route,
 `./build-flashtools.sh --device lg-mt6739` (no gates: building is harmless,
 same as the j36). Lands `lk.bin`, `lk.elf`, `FACTS.md`,
 `build-info.txt` in `build/mt67xx/<device>/boot/`. `-DMT67XX_DEBUG_UART=N`
@@ -41,7 +41,8 @@ rebuilds for UART N when silence says UART0 was wrong.
 
 Back up the stock LK slot (SP Flash Tool readback or mtkclient) and keep
 the stock image where bootrom can reach it. Flash `lk.bin` to the LK/UBOOT
-slot per the stock scatter, with UART wired at 115200. Success looks like:
+slot per the stock scatter (or unlocked-fastboot via the shared CLI --
+see LK-BRINGUP step 2), with UART wired at 115200. Success looks like:
 
 ```
 [mt67xx-lk] MixOS minimal LK (bring-up) for lm-x120 (mt6739), commit abc1234
