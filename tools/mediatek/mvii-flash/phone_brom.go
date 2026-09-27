@@ -321,7 +321,8 @@ func probePhoneBROMOnce(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts) 
 	if err != nil {
 		return mtkTargetConfig{}, err
 	}
-	fmt.Printf("Target config: 0x%08x (SBC=%t SLA=%t DAA=%t)\n", target.Raw, target.SBC, target.SLA, target.DAA)
+	fmt.Printf("Target config: 0x%08x (SBC=%t SLA=%t DAA=%t MemRead=%t MemWrite=%t)\n",
+		target.Raw, target.SBC, target.SLA, target.DAA, target.MemRead, target.MemWrite)
 	if err := refusePhoneSLA(phone, target); err != nil {
 		return mtkTargetConfig{}, err
 	}
@@ -415,6 +416,13 @@ func waitPhoneBROM(cfg config, phone *phoneRoot, facts phoneFacts) (*mtkSerialCl
 		return client, target, nil
 	}
 	return nil, mtkTargetConfig{}, errors.New("phone stayed in preloader mode; power off, hold Vol-down (or Vol-up+Vol-down), replug for BROM mode, and rerun")
+}
+
+// flagFailureAdvice wraps a reset-to-BROM flag failure: on secured units
+// the preloader refuses register writes (write32 status 0x1001), so the
+// only way into BROM is the key combo at plug time.
+func flagFailureAdvice(err error) error {
+	return fmt.Errorf("%w; secured preloaders block register writes -- power off, hold Vol-down, replug for BROM mode, and rerun", err)
 }
 
 // needsPhoneAuth decides whether the SEND_AUTH step runs: on DAA targets
@@ -563,7 +571,7 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 		fmt.Println("Phone is in preloader mode; arming the reset-to-BROM flag.")
 		if err := setPhonePreloaderBROMFlag(client, facts); err != nil {
 			_ = client.port.Close()
-			return err
+			return flagFailureAdvice(err)
 		}
 		_ = client.port.Close()
 		client, target, err = waitPhoneBROM(cfg, phone, facts)

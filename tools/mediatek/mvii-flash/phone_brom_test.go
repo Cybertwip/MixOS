@@ -318,6 +318,13 @@ func TestPhoneUSBDLReg(t *testing.T) {
 	}
 }
 
+func TestFlagFailureAdvice(t *testing.T) {
+	err := flagFailureAdvice(errors.New("unlock BOOT_MISC: write32(0x1001a100) initial status 0x1001"))
+	if err == nil || !strings.Contains(err.Error(), "0x1001") || !strings.Contains(err.Error(), "Vol-down") {
+		t.Fatalf("flagFailureAdvice = %v, want cause plus key-combo guidance", err)
+	}
+}
+
 func TestRefusePhoneSLA(t *testing.T) {
 	phone := &phoneRoot{device: "cph2385-4gb", soc: "mt6765"}
 	if err := refusePhoneSLA(phone, mtkTargetConfig{}); err != nil {
