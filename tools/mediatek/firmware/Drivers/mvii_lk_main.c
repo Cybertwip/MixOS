@@ -2852,6 +2852,14 @@ static int lk_load_boot_image(lk_boot_image_t* out) {
         return -1;
     }
 
+    /* A MixOS image answers to the same magic at the same addresses, so it
+     * would load cleanly and then die on the ATAG handoff. Refuse it here,
+     * with a code the caller can put on the panel. */
+    if (lk_bootmenu_is_mixos_payload(g_page)) {
+        lk_log("lk: BOOTIMG holds a MixOS image, not the stock Android one; refusing\n");
+        return -2;
+    }
+
     kernel_size = rd32le(g_page, 8u);
     kernel_addr = rd32le(g_page, 12u);
     ramdisk_size = rd32le(g_page, 16u);
@@ -3926,19 +3934,6 @@ static void lk_menu_restore_splash(void) {
         for (xx = 0u; xx < w; ++xx) dst[(y + yy) * stride + x + xx] = src[yy * w + xx];
 }
 
-/* Keep a failed selection visible rather than silently booting another OS. */
-static void lk_bootmenu_error(const char *message) {
-    const uint32_t w = (uint32_t)MVII_MT6592_LK_FB_WIDTH;
-    const uint32_t h = (uint32_t)MVII_MT6592_LK_FB_HEIGHT;
-    const lk_menu_box_t save = lk_menu_save_box(w, h);
-    if (!g_fb_live) return;
-    lk_fb_target((uint32_t)MVII_MT6592_LK_SHADOW_ADDR);
-    lk_fb_snapshot_live(save.x, save.y, save.w, save.h);
-    lk_menu_text(message, w / 2u, lk_menu_stage_y(h), 2u, LK_BOOTMENU_STAGE_RGB, 255u);
-    lk_fb_present(save.x, save.y, save.w, save.h);
-    lk_fb_target((uint32_t)MVII_MT6592_LK_FB_ADDR);
-}
-
 /* The choice is made: leave the keypad exactly as the menu found it. The SD and
  * eMMC loads below -- and both kernels after them -- must see the same
  * hardware whether the menu ran or the boot was headless: the scanner that a
@@ -4002,6 +3997,21 @@ static uint32_t lk_bootmenu_run(void) {
     return lk_bootmenu_pick(pressed);
 }
 #endif /* MVII_MT6592_LK_SD_HANDOFF */
+
+/* Keep a failed selection visible rather than silently booting another OS.
+ * Outside the SD-hand-off guard: the call sites are unconditional, and the
+ * debug image (built without MVII_MT6592_LK_SD_HANDOFF) uses it too. */
+static void lk_bootmenu_error(const char *message) {
+    const uint32_t w = (uint32_t)MVII_MT6592_LK_FB_WIDTH;
+    const uint32_t h = (uint32_t)MVII_MT6592_LK_FB_HEIGHT;
+    const lk_menu_box_t save = lk_menu_save_box(w, h);
+    if (!g_fb_live) return;
+    lk_fb_target((uint32_t)MVII_MT6592_LK_SHADOW_ADDR);
+    lk_fb_snapshot_live(save.x, save.y, save.w, save.h);
+    lk_menu_text(message, w / 2u, lk_menu_stage_y(h), 2u, LK_BOOTMENU_STAGE_RGB, 255u);
+    lk_fb_present(save.x, save.y, save.w, save.h);
+    lk_fb_target((uint32_t)MVII_MT6592_LK_FB_ADDR);
+}
 
 static int lk_sd_boot(void) {
     sd_boot_conf_t conf;
@@ -4405,8 +4415,19 @@ void mvii_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
     boot_rc = storage_rc == MT6592_MSDC_OK ? lk_load_boot_image(&img) : storage_rc;
     if (boot_rc != MT6592_MSDC_OK) {
         mt6592_bootstatus_set_error((uint32_t)boot_rc);
-        lk_mark(MT6592_BOOT_STATUS_STAGE_LK_BOOTIMG_FAILED, "lk: no bootable image; halting\n",
-                LK_BEACON_FAILED);
+        if (boot_rc == -2) {
+            lk_mark(MT6592_BOOT_STATUS_STAGE_LK_BOOTIMG_FAILED,
+                    "lk: BOOTIMG holds a MixOS image; halting\n", LK_BEACON_FAILED);
+#ifdef MVII_MT6592_LK_SD_HANDOFF
+            lk_bootmenu_error("BOOTIMG HOLDS MIXOS IMAGE");
+#endif
+        } else {
+            lk_mark(MT6592_BOOT_STATUS_STAGE_LK_BOOTIMG_FAILED, "lk: no bootable image; halting\n",
+                    LK_BEACON_FAILED);
+#ifdef MVII_MT6592_LK_SD_HANDOFF
+            lk_bootmenu_error("NO ANDROID IMAGE");
+#endif
+        }
         for (;;) {
             /* A bare wfi here is a reboot in disguise: the preloader leaves
              * the charger's watchdog armed, and nothing in a sleep loop feeds

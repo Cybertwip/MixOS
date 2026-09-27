@@ -7,27 +7,32 @@
  *         -o /tmp/j36-bootmenu-test && /tmp/j36-bootmenu-test
  */
 #include <assert.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "../Drivers/lk_bootmenu.h"
 #include "../Drivers/lk_menu_ui.h"
 
-static const char kTestPrompt[] = "PRESS ANY BUTTON TO BOOT INTO ANDROID";
-static const char kTestDetail[] = "Booting MixOS in 5";
-static const char kTestBadge[] = "BOOTING ANDROID";
+static const char kTestPrompt[] = "PRESS MENU FOR ANDROID";
+static const char kTestErrSd[] = "MIXOS SD BOOT FAILED";
+static const char kTestErrSlot[] = "BOOTIMG HOLDS MIXOS IMAGE";
+static const char kTestErrNone[] = "NO ANDROID IMAGE";
 
 static void check_save_covers(uint32_t w, uint32_t h) {
     lk_menu_box_t save = lk_menu_save_box(w, h);
     lk_menu_box_t spin = lk_menu_spinner_box(w, h);
     lk_menu_box_t stage = lk_menu_text_bounds(w / 2u, lk_menu_stage_y(h), kTestPrompt, 2u);
-    lk_menu_box_t detail = lk_menu_text_bounds(w / 2u, lk_menu_detail_y(h), kTestDetail, 1u);
-    lk_menu_box_t badge = lk_menu_text_bounds(w / 2u, lk_menu_stage_y(h), kTestBadge, 3u);
-    lk_menu_box_t bar = lk_menu_bar_box(w, h);
+    lk_menu_box_t err_sd = lk_menu_text_bounds(w / 2u, lk_menu_stage_y(h), kTestErrSd, 2u);
+    lk_menu_box_t err_slot =
+        lk_menu_text_bounds(w / 2u, lk_menu_stage_y(h), kTestErrSlot, 2u);
+    lk_menu_box_t err_none =
+        lk_menu_text_bounds(w / 2u, lk_menu_stage_y(h), kTestErrNone, 2u);
     assert(lk_menu_box_covers(save, spin));
     assert(lk_menu_box_covers(save, stage));
-    assert(lk_menu_box_covers(save, detail));
-    assert(lk_menu_box_covers(save, badge));
-    assert(lk_menu_box_covers(save, bar));
+    assert(lk_menu_box_covers(save, err_sd));
+    assert(lk_menu_box_covers(save, err_slot));
+    assert(lk_menu_box_covers(save, err_none));
     assert(lk_menu_text_width(kTestPrompt, 2u) < w);
 }
 
@@ -60,6 +65,24 @@ int main(void) {
     /* A press anywhere in the window tags Android; silence tags MixOS. */
     assert(lk_bootmenu_pick(1u) == LK_BOOTMENU_ANDROID);
     assert(lk_bootmenu_pick(0u) == LK_BOOTMENU_MIXOS);
+
+    /* Payload sniff: stock passes, MixOS marks trip. */
+    {
+        uint8_t hdr[1024];
+        uint32_t i;
+
+        for (i = 0u; i < 1024u; ++i) hdr[i] = 0u;
+        memcpy(hdr + 48u, "1778287588", 10u);
+        assert(lk_bootmenu_is_mixos_payload(hdr) == 0u);
+        memcpy(hdr + 48u, "j36-ultra", 9u);
+        assert(lk_bootmenu_is_mixos_payload(hdr) == 1u);
+        for (i = 0u; i < 1024u; ++i) hdr[i] = 0u;
+        memcpy(hdr + 64u, "console=tty0 j36.audio=speaker", 29u);
+        assert(lk_bootmenu_is_mixos_payload(hdr) == 1u);
+        for (i = 0u; i < 1024u; ++i) hdr[i] = 0u;
+        memcpy(hdr + 64u, "console=tty0 j36x", 17u);
+        assert(lk_bootmenu_is_mixos_payload(hdr) == 0u);
+    }
 
     /* The overlay blend: opaque ink wins outright, transparent keeps the
      * splash, and a real alpha lands strictly between the two. */
@@ -161,6 +184,6 @@ int main(void) {
     check_save_covers(1920u, 1080u);
     check_save_covers(1080u, 2400u);
 
-    printf("bootmenu: window, debounce, pick, blend and menu-ui passed\n");
+    printf("bootmenu: window, debounce, pick, payload, blend and menu-ui passed\n");
     return 0;
 }
