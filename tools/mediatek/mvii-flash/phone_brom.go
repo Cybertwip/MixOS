@@ -642,6 +642,46 @@ func crashPhonePreloader(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts)
 	}
 }
 
+// crashMTKPreloaderToBROM is the -mtk-crash-to-brom verb: acquire the
+// phone, fire the crash modes, and report the landing. It exists because
+// unplug/replug never reboots a battery-powered phone: the SoC sits in
+// preloader download across the replug, so BootROM never re-samples the
+// download keys and every combo attempt lands preloader again. A crash
+// reboot keeps the cable captive, so keys held BEFORE running are sampled
+// when BootROM re-runs. RAM/protocol only: no DA runs and no eMMC command
+// is ever issued. A BROM landing means run -unlock next without
+// unplugging; a drop means the phone is rebooting under held keys; a live
+// preloader means the secured unit clean-refused every mode.
+func crashMTKPreloaderToBROM(cfg config) error {
+	client, target, phone, facts, err := acquirePhoneBROMAuto(cfg, nil)
+	if err != nil {
+		return err
+	}
+	if client.isBROM {
+		fmt.Printf("Target is already BROM (config 0x%08x); nothing to crash. Run -unlock now without unplugging.\n", target.Raw)
+		_ = client.port.Close()
+		return nil
+	}
+	fmt.Printf("Preloader session on %s (config 0x%08x); firing 3 crash-to-BROM modes.\n", phone.device, target.Raw)
+	fmt.Println("Keep Vol-up+Vol-down held until USB drops or all 3 modes report.")
+	crashPhonePreloader(client, phone, facts)
+	landed, err := probePhoneBROMOnce(client, phone, facts, true)
+	_ = client.port.Close()
+	switch {
+	case err == nil && client.isBROM:
+		fmt.Printf("BROM landed (config 0x%08x). DO NOT UNPLUG: run -unlock now; it skips straight to SEND_AUTH.\n", landed.Raw)
+		return nil
+	case err != nil && isDeviceGoneError(err):
+		fmt.Println("USB dropped: the phone is rebooting. Keep the keys held and run -unlock -wait 2m to catch the landing.")
+		return nil
+	case err == nil:
+		fmt.Println("Still preloader: the secured unit clean-refused every mode. Remaining path: full power-off, then plug with Vol-up+Vol-down held and rerun -unlock -wait 5m.")
+		return nil
+	default:
+		return fmt.Errorf("probe after crash modes: %w", err)
+	}
+}
+
 // needsPhoneAuth decides whether the SEND_AUTH step runs. In BROM it runs
 // on DAA targets with a blob to send. In preloader mode it is skipped:
 // the preloader does not speak 0xE2 and verifies the DA signature at

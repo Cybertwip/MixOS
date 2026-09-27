@@ -54,6 +54,7 @@ type config struct {
 	mtkScatter           string
 	mtkFeedPayload       string
 	mtkResetToBROM       bool
+	mtkCrashToBROM       bool
 	mtkReadBootStatus    bool
 	mtkSelftestWrite     bool
 	mtkRunStage1         bool
@@ -268,6 +269,12 @@ func run() error {
 			return errors.New("-mtk-reset-to-brom requires -device /dev/cu.usbmodem... or another MTK VCOM serial device")
 		}
 		return resetMTKTargetToBROM(cfg)
+	}
+	if cfg.mtkCrashToBROM {
+		if cfg.device == "" {
+			return errors.New("-mtk-crash-to-brom requires -device /dev/cu.usbmodem... or another MTK VCOM serial device")
+		}
+		return crashMTKPreloaderToBROM(cfg)
 	}
 	if cfg.mtkReadBootStatus {
 		if cfg.device == "" {
@@ -533,6 +540,7 @@ func parseFlags() (config, error) {
 	flag.BoolVar(&cfg.mtkBootPreloader, "mtk-boot-preloader", cfg.mtkBootPreloader, "boot the supplied stock preloader from SRAM without writing eMMC")
 	flag.StringVar(&cfg.mtkWritePreloader, "mtk-write-preloader", "", "write a stock preloader image to eMMC BOOT1 through the native feed payload")
 	flag.BoolVar(&cfg.mtkResetToBROM, "mtk-reset-to-brom", cfg.mtkResetToBROM, "reset a preloader-mode target back into BROM USB-download mode")
+	flag.BoolVar(&cfg.mtkCrashToBROM, "mtk-crash-to-brom", cfg.mtkCrashToBROM, "crash a preloader-mode phone toward BROM (captive-cable reboot; hold Vol-up+Vol-down before running); RAM/protocol only, no eMMC access")
 	flag.BoolVar(&cfg.mtkReadBootStatus, "mtk-read-boot-status", cfg.mtkReadBootStatus, "read the MVII boot-status sector through the native feed payload")
 	flag.BoolVar(&cfg.mtkSelftestWrite, "mtk-selftest-write", cfg.mtkSelftestWrite, "write/read/restore the MVII boot-status sector to verify feed eMMC writes")
 	flag.BoolVar(&cfg.mtkReadPartitions, "mtk-read-partitions", cfg.mtkReadPartitions, "read live MTK/GPT/MBR partition information through the native feed payload")
