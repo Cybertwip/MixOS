@@ -552,9 +552,8 @@ func crashPhonePreloader(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts)
 
 // needsPhoneAuth decides whether the SEND_AUTH step runs. In BROM it runs
 // on DAA targets with a blob to send. In preloader mode it is skipped:
-// the preloader neither speaks 0xE2 (it goes silent with EOF) nor needs
-// it -- it verifies the vendor DA signature at SEND_DA time instead
-// (0x7024 DAA_SIG_VERIFY_FAILED on unsigned payloads).
+// the preloader does not speak 0xE2 and verifies the DA signature at
+// SEND_DA time instead. A rejected signature returns 0x7024.
 func needsPhoneAuth(target mtkTargetConfig, isBROM, hasAuth bool) (bool, string) {
 	if !target.DAA {
 		return false, ""
@@ -686,6 +685,32 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if client != nil && client.port != nil {
+			_ = client.port.Close()
+		}
+	}()
+
+	// An auth file is sent only by BROM. Acquiring the preloader must not
+	// consume the operator's -wait window and silently skip that file before
+	// trying a DA which this secured preloader may reject with 0x7024.
+	if target.DAA && plan.auth != "" && !client.isBROM {
+		window, err := parsePhoneWait(cfg.waitFlag)
+		if err != nil {
+			return err
+		}
+		if window == 0 {
+			return errors.New("phone is in preloader mode with DAA enabled; -auth can only be sent in BROM mode. Power off, enter BROM with the download key combo, and retry (or pass -wait to allow a replug)")
+		}
+		fmt.Printf("DAA-enabled preloader acquired; waiting up to %s for BROM so -auth can be sent. Power off and replug with the download key combo held.\n", window)
+		client, target, err = waitPhoneBROM(cfg, phone, facts, client, window, func(device string) (*mtkSerialClient, error) {
+			return connectMTKSerialWithOptions(device, mtkSerialConnectOptions{handshakeWake: true})
+		})
+		if err != nil {
+			return err
+		}
+		client.preloaderEMI = emi
+	}
 	if !client.isBROM {
 		// Preloader mode is a first-class upload path, not a dead end:
 		// the secured preloader verifies the vendor DA signature at
@@ -696,10 +721,6 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 		// jump the mode distinction evaporates -- the DA owns the CPU.
 		fmt.Println("Phone is in preloader mode; uploading the vendor DA through it.")
 	}
-	defer func() {
-		_ = client.port.Close()
-	}()
-
 	if send, msg := needsPhoneAuth(target, client.isBROM, plan.auth != ""); send {
 		authBlob, err := os.ReadFile(plan.auth)
 		if err != nil {

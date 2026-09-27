@@ -2156,6 +2156,9 @@ func (c *mtkSerialClient) uploadData(data []byte, expectedChecksum uint16) error
 	if checksum != expectedChecksum && checksum != 0 {
 		fmt.Printf("Warning: DA upload checksum 0x%04x did not match host checksum 0x%04x\n", checksum, expectedChecksum)
 	}
+	if status == 0x7024 {
+		return errors.New("DA upload status 0x7024 (DAA_SIG_VERIFY_FAILED): the phone rejected this download agent's signature; no eMMC write occurred")
+	}
 	if status > 0xFF {
 		return fmt.Errorf("DA upload status 0x%x", status)
 	}
