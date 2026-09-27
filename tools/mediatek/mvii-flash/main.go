@@ -513,7 +513,7 @@ func parseFlags() (config, error) {
 	flag.StringVar(&cfg.rawOffset, "raw-offset", "", "raw offset for eMMC writes (feed path defaults LK->UBOOT, arm.img->BOOTIMG)")
 	flag.StringVar(&cfg.rawLength, "raw-length", "", "raw transfer length; for feed, auto/minimal rounds image up to 512B")
 	flag.StringVar(&cfg.preloader, "preloader", "", "optional preloader for DRAM init in some serial paths")
-	flag.StringVar(&cfg.daLoader, "da-loader", "", "legacy DA loader (only for -backend=mtk-serial without feed)")
+	flag.StringVar(&cfg.daLoader, "da-loader", "", "MediaTek DA loader bundle for phone BROM/preloader or legacy mtk-serial")
 	flag.BoolVar(&cfg.probeDA, "probe-da", false, "probe a phone DA stage-1 signature via SEND_DA; stop before JUMP_DA or any eMMC access")
 	flag.StringVar(&cfg.authFile, "auth", "", "vendor auth file (e.g. auth_sv5.auth), uploaded via SEND_AUTH when phone BROM enforces DAA")
 	flag.StringVar(&cfg.waitFlag, "wait", "", "wait for phone VCOM and, when DAA requires -auth, a BROM replug (e.g. 5m, 90s); unset means one attempt")
