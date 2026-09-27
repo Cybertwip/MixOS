@@ -335,6 +335,38 @@ func TestParsePhoneWait(t *testing.T) {
 	}
 }
 
+// failPort is a transport that is already gone: every read fails with a
+// device-gone error, pinning the wait loop's reconnect path.
+type failPort struct {
+	scriptPort
+	err error
+}
+
+func (p *failPort) ReadExact(_ int, _ time.Duration) ([]byte, error) {
+	return nil, p.err
+}
+
+// A dead session plus a failing reconnect must expire cleanly, never probe
+// a nil client (the SIGSEGV seen live when the 45s reopen found nothing).
+func TestWaitPhoneBROMExpiredConnectFails(t *testing.T) {
+	phone := writePhoneRoot(t, "device=cph2385-4gb\nsoc=mt6765\n")
+	info, ok := detectPhoneRoot(phone)
+	if !ok {
+		t.Fatal("fixture not detected")
+	}
+	facts, err := phoneFactsFor("mt6765")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := &failPort{err: errors.New("read /dev/cu.usbmodem1: device not configured")}
+	client := &mtkSerialClient{port: port, commandTimeout: time.Millisecond, writeTimeout: time.Millisecond}
+	connect := func(string) (*mtkSerialClient, error) { return nil, errors.New("nope") }
+	_, _, err = waitPhoneBROM(config{device: "/dev/cu.usbmodem1"}, info, facts, client, 50*time.Millisecond, connect)
+	if err == nil || !strings.Contains(err.Error(), "BROM wait expired") {
+		t.Fatalf("waitPhoneBROM = %v, want the clean expiry", err)
+	}
+}
+
 func TestFlagFailureAdvice(t *testing.T) {
 	err := flagFailureAdvice(errors.New("unlock BOOT_MISC: write32(0x1001a100) initial status 0x1001"))
 	if err == nil || !strings.Contains(err.Error(), "0x1001") || !strings.Contains(err.Error(), "Vol-down") {

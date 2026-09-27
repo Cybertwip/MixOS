@@ -450,10 +450,19 @@ func setPhonePreloaderBROMFlag(c *mtkSerialClient, facts phoneFacts) error {
 // reset or replug drops the old one. The caller hands over its client;
 // success returns the BROM session (caller-owned), failure closes
 // everything and reports. Bounded by an overall deadline, not an attempt
-// count, because a fresh connect already waits out its own window.
-func waitPhoneBROM(cfg config, phone *phoneRoot, facts phoneFacts, client *mtkSerialClient) (*mtkSerialClient, mtkTargetConfig, error) {
-	deadline := time.Now().Add(3 * time.Minute)
-	for {
+// count, because a fresh connect already waits out its own window. The
+// client is never nil at probe time: a failed reconnect loops back to the
+// deadline check, never into the probe.
+func waitPhoneBROM(cfg config, phone *phoneRoot, facts phoneFacts, client *mtkSerialClient, window time.Duration, connect func(string) (*mtkSerialClient, error)) (*mtkSerialClient, mtkTargetConfig, error) {
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		if client == nil {
+			var err error
+			client, err = connect(cfg.device)
+			if err != nil {
+				continue
+			}
+		}
 		target, err := probePhoneBROMOnce(client, phone, facts, true)
 		if err == nil {
 			if client.isBROM {
@@ -461,36 +470,27 @@ func waitPhoneBROM(cfg config, phone *phoneRoot, facts phoneFacts, client *mtkSe
 					target.Raw, target.SBC, target.SLA, target.DAA)
 				return client, target, nil
 			}
-			if !time.Now().Before(deadline) {
-				break
-			}
 			fmt.Printf("Waiting for BROM (%s left): preloader session alive; replug with Vol-down held to switch modes.\n",
 				time.Until(deadline).Round(time.Second))
 			time.Sleep(5 * time.Second)
 			continue
 		}
 		if !isDeviceGoneError(err) {
-			if !time.Now().Before(deadline) {
-				break
-			}
 			fmt.Printf("Waiting for BROM (%s left): preloader not answering (%v).\n",
 				time.Until(deadline).Round(time.Second), err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		// Reset or replug dropped the handle: fresh session. The connect
-		// waits out its own window, so a key-combo replug lands here.
+		// Reset or replug dropped the handle: fresh session next pass.
+		// The connect waits out its own window, so a key-combo replug
+		// lands here.
 		_ = client.port.Close()
+		client = nil
 		fmt.Println("Device re-enumerated; reopening.")
-		client, err = connectMTKSerialWithOptions(cfg.device, mtkSerialConnectOptions{handshakeWake: true})
-		if err != nil {
-			if !time.Now().Before(deadline) {
-				break
-			}
-			continue
-		}
 	}
-	_ = client.port.Close()
+	if client != nil {
+		_ = client.port.Close()
+	}
 	return nil, mtkTargetConfig{}, errors.New("BROM wait expired; power off, hold Vol-down (or Vol-up+Vol-down), replug for BROM mode, and rerun")
 }
 
@@ -645,7 +645,10 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 		if err := setPhonePreloaderBROMFlag(client, facts); err != nil {
 			fmt.Printf("Warning: %v\n", flagFailureAdvice(err))
 		}
-		client, target, err = waitPhoneBROM(cfg, phone, facts, client)
+		client, target, err = waitPhoneBROM(cfg, phone, facts, client, 3*time.Minute,
+			func(device string) (*mtkSerialClient, error) {
+				return connectMTKSerialWithOptions(device, mtkSerialConnectOptions{handshakeWake: true})
+			})
 		if err != nil {
 			return err
 		}
