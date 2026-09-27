@@ -1522,6 +1522,22 @@ func TestMTKSerialReconnectCandidatesSweepAllFamilies(t *testing.T) {
 	}
 }
 
+func TestUntriedSerialPortHint(t *testing.T) {
+	globs := serialPortSweepGlobs()
+	if len(globs) == 0 {
+		t.Skipf("no sweep globs on %s", runtime.GOOS)
+	}
+	stubSerialPortGlob(t, fakeSweepTree())
+	want := strings.TrimSuffix(globs[0], "*") + "0"
+	hint := untriedSerialPortHint(nil)
+	if !strings.Contains(hint, want) || !strings.Contains(hint, "-device") {
+		t.Fatalf("hint for untried ports = %q, want it to name %s with -device", hint, want)
+	}
+	if got := untriedSerialPortHint(sweepSerialPorts()); got != "" {
+		t.Fatalf("hint when everything was tried = %q, want empty", got)
+	}
+}
+
 func TestIsMTKScatterFile(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "MT6572_Android_scatter.txt")

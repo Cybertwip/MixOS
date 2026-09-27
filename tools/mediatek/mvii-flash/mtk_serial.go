@@ -782,7 +782,7 @@ func connectMTKSerialWithOptions(device string, options mtkSerialConnectOptions)
 	if lastErr == nil {
 		lastErr = errors.New("no handshake response")
 	}
-	return nil, fmt.Errorf("MTK serial handshake timed out on %s: %w", strings.Join(devices, ", "), lastErr)
+	return nil, fmt.Errorf("MTK serial handshake timed out on %s: %w%s", strings.Join(devices, ", "), lastErr, untriedSerialPortHint(devices))
 }
 
 // serialPortGlob expands one /dev glob. It is filepath.Glob in production;
@@ -831,10 +831,32 @@ func sweepSerialPorts() []string {
 	return out
 }
 
+// bareSerialFamilyNodes names the adapter family roots that carry no instance
+// suffix. Anything longer (/dev/cu.usbserial-1410, /dev/ttyUSB0) is a specific
+// node and stays exact, mirroring the usbmodem digit rule below.
+var bareSerialFamilyNodes = []string{
+	"/dev/cu.usbserial", "/dev/tty.usbserial",
+	"/dev/cu.wchusbserial", "/dev/tty.wchusbserial",
+	"/dev/cu.SLAB_USBtoUART", "/dev/tty.SLAB_USBtoUART",
+	"/dev/ttyACM", "/dev/ttyUSB",
+}
+
+func isBareSerialFamilyNode(device string) bool {
+	for _, bare := range bareSerialFamilyNodes {
+		if device == bare {
+			return true
+		}
+	}
+	return false
+}
+
 func mtkSerialDeviceCandidates(device string) []string {
 	device = strings.TrimSpace(device)
 	if device == "" {
-		return nil
+		// No -device given (GUI auto-detect, bare CLI): sweep everything.
+		// The BROM magic handshake still gates every node, so unrelated
+		// serial ports just fail the handshake and are skipped.
+		return sweepSerialPorts()
 	}
 	added := map[string]bool{}
 	var devices []string
@@ -857,25 +879,27 @@ func mtkSerialDeviceCandidates(device string) []string {
 			add(cuTwin)
 		}
 	}
-	addGlob := func(pattern string) {
-		matches, _ := filepath.Glob(pattern)
-		sort.Strings(matches)
-		for _, match := range matches {
-			add(match)
+	addSweep := func() {
+		for _, swept := range sweepSerialPorts() {
+			add(swept)
 		}
 	}
-	if strings.Contains(filepath.Base(device), "usbmodem") {
-		// Only glob every usbmodem node when the provided device string does not
-		// name a specific instance (e.g. /dev/cu.usbmodem141300). Specific IDs
+	base := filepath.Base(device)
+	if strings.Contains(base, "usbmodem") {
+		// Only sweep when the provided device string does not name a
+		// specific instance (e.g. /dev/cu.usbmodem141300). Specific IDs
 		// must be honored exactly (plus the cu<->tty twin) so the tool does not
 		// silently select a different attached VCOM. Renumbering after DA stage 1
 		// or high-speed re-enum is handled by the reconnect* helpers which force
-		// globs regardless of how specific the original name was.
-		base := filepath.Base(device)
+		// a sweep regardless of how specific the original name was.
 		if !hasSpecificUsbModemDigits(base) {
-			addGlob("/dev/cu.usbmodem*")
-			addGlob("/dev/tty.usbmodem*")
+			addSweep()
 		}
+	} else if isBareSerialFamilyNode(device) {
+		// A bare adapter family name (/dev/cu.usbserial, /dev/ttyACM) names
+		// no instance, so like a bare usbmodem it is a discovery request:
+		// sweep every family.
+		addSweep()
 	}
 	return devices
 }
@@ -2301,21 +2325,38 @@ func mtkSerialReconnectCandidates(device string) []string {
 	for _, candidate := range devices {
 		added[candidate] = true
 	}
-	addGlob := func(pattern string) {
-		matches, _ := filepath.Glob(pattern)
-		sort.Strings(matches)
-		for _, match := range matches {
-			if !added[match] {
-				added[match] = true
-				devices = append(devices, match)
-			}
+	// Recovery always sweeps every family: after DA handoff or a high-speed
+	// re-enum the board can come back under a different node or even a
+	// different family (usbmodem direct today, usbserial behind an adapter
+	// tomorrow), whatever the original -device named.
+	for _, swept := range sweepSerialPorts() {
+		if !added[swept] {
+			added[swept] = true
+			devices = append(devices, swept)
 		}
 	}
-	if strings.Contains(device, "usbmodem") {
-		addGlob("/dev/cu.usbmodem*")
-		addGlob("/dev/tty.usbmodem*")
-	}
 	return devices
+}
+
+// untriedSerialPortHint names swept ports the handshake never tried, so a
+// stale -device (renumbered node) fails with the fix attached instead of a
+// bare timeout.
+func untriedSerialPortHint(tried []string) string {
+	seen := map[string]bool{}
+	for _, device := range tried {
+		seen[device] = true
+	}
+	var untried []string
+	for _, swept := range sweepSerialPorts() {
+		if !seen[swept] {
+			untried = append(untried, swept)
+		}
+	}
+	if len(untried) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("; other serial ports present but not tried: %s (pass one with -device)",
+		strings.Join(untried, ", "))
 }
 
 // tryReopenForOngoingDA attempts to find a live serial node (using the
