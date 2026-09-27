@@ -75,6 +75,7 @@ Builds the OPPO phone layer for one device (default: $DEVICE) in the $VM_NAME VM
 Overrides:
   OPPO_DEVICE=20183 ./build-oppo.sh
   OPPO_FIRMWARE_DIR=/path/to/blobs ./build-oppo.sh   (modem.img, WIFI_RAM_CODE, ...)
+  OPPO_OFP=/path/to/stock.ofp ./build-oppo.sh        (decrypt offline into firmware/stock/; ignored when OPPO_FIRMWARE_DIR is set)
   OPPO_KERNEL_BRANCH=linux-6.12.y ./build-oppo.sh
 USAGE
 }
@@ -101,6 +102,22 @@ ARTIFACT_DIR="$(darkos_model_artifact_dir "$BASE_ARTIFACT_DIR" oppo "$DEVICE")"
 if [[ "$COMPRESS" == 1 ]]; then
     command -v zip >/dev/null 2>&1 || darkos_die "--compress needs 'zip'."
     command -v unzip >/dev/null 2>&1 || darkos_die "--compress needs 'unzip'."
+fi
+
+# Offline firmware, opt-in and preflighted: with OPPO_OFP pointing at a
+# stock .ofp, the blobs are decrypted into firmware/stock/ (reused when a
+# previous fetch left modem.img there) and used exactly as if
+# OPPO_FIRMWARE_DIR had been set. Before the VM work, so a missing 7z or
+# a bad path fails in seconds, not after the kernel build.
+if [[ -z "${OPPO_FIRMWARE_DIR:-}" && -n "${OPPO_OFP:-}" ]]; then
+    OPPO_STOCK_DIR="$ROOT/device/oppo-mt6877/firmware/stock"
+    if [[ -f "$OPPO_STOCK_DIR/modem.img" ]]; then
+        darkos_log "Reusing firmware in $OPPO_STOCK_DIR"
+    else
+        bash "$ROOT/device/oppo-mt6877/firmware/fetch-ofp.sh" "$OPPO_OFP" \
+            || darkos_die "firmware fetch from $OPPO_OFP failed"
+    fi
+    OPPO_FIRMWARE_DIR="$OPPO_STOCK_DIR"
 fi
 
 darkos_log "OPPO $OPPO_DEVICE ($OPPO_NOTES)"

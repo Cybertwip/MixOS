@@ -75,6 +75,7 @@ Builds the LG phone layer for one device (default: $DEVICE) in the $VM_NAME VM.
 Overrides:
   LG_DEVICE=lv517-rev0 ./build-lg.sh
   LG_FIRMWARE_DIR=/path/to/blobs ./build-lg.sh   (modem.mdt, wcnss.mdt, ...)
+  LG_KDZ=/path/to/stock.kdz ./build-lg.sh        (unpack offline into firmware/stock/; ignored when LG_FIRMWARE_DIR is set)
   LG_KERNEL_BRANCH=linux-6.12.y ./build-lg.sh
 USAGE
 }
@@ -101,6 +102,22 @@ ARTIFACT_DIR="$(darkos_model_artifact_dir "$BASE_ARTIFACT_DIR" lg "$DEVICE")"
 if [[ "$COMPRESS" == 1 ]]; then
     command -v zip >/dev/null 2>&1 || darkos_die "--compress needs 'zip'."
     command -v unzip >/dev/null 2>&1 || darkos_die "--compress needs 'unzip'."
+fi
+
+# Offline firmware, opt-in and preflighted: with LG_KDZ pointing at a
+# stock .kdz, the PIL sets are unpacked into firmware/stock/ (reused when
+# a previous fetch left modem.mdt there) and used exactly as if
+# LG_FIRMWARE_DIR had been set. Before the VM work, so a missing 7z or
+# a bad path fails in seconds, not after the kernel build.
+if [[ -z "${LG_FIRMWARE_DIR:-}" && -n "${LG_KDZ:-}" ]]; then
+    LG_STOCK_DIR="$ROOT/device/lg-k20plus/firmware/stock"
+    if [[ -f "$LG_STOCK_DIR/modem.mdt" ]]; then
+        darkos_log "Reusing firmware in $LG_STOCK_DIR"
+    else
+        bash "$ROOT/device/lg-k20plus/firmware/fetch-kdz.sh" "$LG_KDZ" \
+            || darkos_die "firmware fetch from $LG_KDZ failed"
+    fi
+    LG_FIRMWARE_DIR="$LG_STOCK_DIR"
 fi
 
 darkos_log "LG $LG_DEVICE ($LG_NOTES)"

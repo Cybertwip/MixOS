@@ -28,6 +28,10 @@ Two routes fetch them into `stock/`, and they are interchangeable:
   browser download. Newer builds rotate the OFP keys; if the decrypter
   reports unknown keys, extract from the phone instead.
 
+Set `OPPO_OFP=/path/to/stock.ofp` when invoking `./build-oppo.sh` to run
+the OFP route as build preflight (reused when `stock/` already holds the
+blobs; ignored when `OPPO_FIRMWARE_DIR` is set).
+
 Nothing here is vendored: the reference kernel tree
 (`reference/android_kernel_oppo_mt6877`) is a kernel-only drop -- it carries
 no Wi-Fi driver, no modem image, and no `WIFI_RAM_CODE` under any name, so

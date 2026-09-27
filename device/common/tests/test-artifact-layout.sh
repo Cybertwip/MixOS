@@ -62,5 +62,18 @@ handover_keys() { # $1 = device dir, $2 = wrapper, $3 = family
 handover_keys device/oppo-mt6877 build-oppo.sh oppo
 handover_keys device/lg-k20plus build-lg.sh lg
 
+# Offline firmware stays wired: each wrapper must honor its ROM env knob
+# by invoking its fetch script into the default stock/ dir.
+firmware_wired() { # $1 = wrapper, $2 = env knob, $3 = fetch script
+    grep -q "$2" "$ROOT/$1" \
+        || { echo "FAIL: $1 ignores $2"; fail=1; }
+    grep -q "$3" "$ROOT/$1" \
+        || { echo "FAIL: $1 never invokes $3"; fail=1; }
+    echo "  $2 -> $3: ok"
+}
+
+firmware_wired build-oppo.sh OPPO_OFP firmware/fetch-ofp.sh
+firmware_wired build-lg.sh LG_KDZ firmware/fetch-kdz.sh
+
 [ "$fail" -eq 0 ] && echo "PASS: artifact layout"
 exit "$fail"

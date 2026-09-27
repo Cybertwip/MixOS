@@ -41,7 +41,10 @@ Two routes fetch them into `stock/`, and they are interchangeable:
   [kdztools](https://github.com/ehem/kdztools) and lifts the sets out of
   the modem partition image with 7z. The KDZ itself (~2 GB, wait-walled)
   is a browser download -- e.g. the MP26011K_00 build for the LGMP260 at
-  <https://lgrom.com/firmware/LGMP260>.
+  <https://lgrom.com/firmware/LGMP260>. Set `LG_KDZ=/path/to/stock.kdz`
+  when invoking `./build-lg.sh` to run this step as build preflight
+  (reused when `stock/` already holds the sets; ignored when
+  `LG_FIRMWARE_DIR` is set).
 
 Either way the build counts each set, because one missing segment fails
 PIL auth with an error that looks exactly like a driver bug.
