@@ -168,11 +168,11 @@
 #define MVII_MT6592_LK_DRAM_SIZE (DRAM_LIMIT - DRAM_BASE)
 #endif
 
-/* Stock LK default (lk.bin:0x350d0) and the stock kernel's CONFIG_CMDLINE.
- * Used when boot.img's own cmdline field is empty, which the stock image is. */
+/* Stock LK default (lk.bin:0x350d0), byte for byte. Used when boot.img's own
+ * cmdline field is empty, which the stock image is. The stock kernel runs
+ * under exactly these words; anything appended is a deviation it never saw. */
 #ifndef MVII_MT6592_LK_STOCK_CMDLINE
-#define MVII_MT6592_LK_STOCK_CMDLINE \
-    "console=tty0 console=ttyMT3,921600n1 root=/dev/ram vmalloc=496M slub_max_order=0 slub_debug=O"
+#define MVII_MT6592_LK_STOCK_CMDLINE "console=tty0 console=ttyMT3,921600n1 root=/dev/ram"
 #endif
 
 #define MTK_IMG_MAGIC 0x58881688u
@@ -4450,9 +4450,13 @@ void mvii_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
     lk_log("\n");
 
     /* Last thing before the load steps the kernel is about to make: force the
-     * charger service past its rate limiter and re-arm. */
+     * charger service past its rate limiter and re-arm -- then stop the
+     * watchdog itself. The stock kernel cannot feed it across decompression
+     * and driver probe, and a 4 s timer armed here is a reset a few seconds
+     * past the jump. The kernel re-arms per its own charging policy. */
     mt6592_pmic_power_hold();
     mt6592_pmic_charger_service();
+    mt6592_pmic_charger_watchdog_disarm();
 
     /*
      * The hand-off milestone goes after the last log line, not before it. With

@@ -38,7 +38,7 @@ def main():
         assert f"lg.device={dev}" in dts, f"{dev}: bootargs missing device word"
         assert 'compatible = "simple-framebuffer"' not in dts, \
             f"{dev}: invented a framebuffer"
-        assert "0x40000000" in dts and "prior" in dts, \
+        assert "0x40000000" in dts and "MTK_DRAM_BASE_PRIOR" in dts, \
             f"{dev}: DRAM prior not marked as a prior"
         # With a measured base the framebuffer appears, honestly sized.
         fb = generate(sources, dev, fb_base="0x5c000000")

@@ -220,10 +220,11 @@ macOS and the next boot has the new payload — `sd-root.tar.gz` rides along in 
 
 ## The SD BOOT payload
 
-`boot/` above, and `sd-boot/` inside the build. Copy it into the root of the FAT
-partition labelled `BOOT` and the MVII LK boots the card instead of the eMMC.
-Nothing already there is disturbed: an R36S card keeps its `Image`, `uInitrd`,
-rk3326 trees and `boot.ini`.
+`boot/` above, and `sd-boot/` inside the build. A card flashed from the full
+build carries it alone on `BOOT`: no `Image`, no `uInitrd`, no rk3326 trees, no
+`boot.ini`. An older card updated by hand from `boot/` may still have those
+R36S files sitting beside the launcher; the MVII LK reads `mvii/boot.conf` and
+ignores them.
 
 ```text
 zImage                 plain ARMv7 kernel, no appended tree
@@ -252,13 +253,14 @@ matching word from `bootargs`, restores the previous boot exactly, from any
 machine that can read an SD card and with no reflash. `/init` says on the panel
 what it found and carries on either way.
 
-`mvii/boot.conf` exists because an R36S card already carries a `boot.ini`, and
-that `boot.ini` names the arm64 `Image` and an rk3326 tree. The LK parses
-`boot.ini` first and `/mvii/boot.conf` second precisely so this file gets the
-last word; without it the LK would load the arm64 kernel, refuse it at the magic
-check, and fall back to the eMMC. Load addresses are deliberately absent from
-it: those are the LK's business, and it knows this SoC's DRAM map and the
-address of the framebuffer the DTB hands to `simple-framebuffer`.
+`mvii/boot.conf` names the kernel, the tree, the initramfs and the command line.
+The LK parses the card's `boot.ini` first when one is present -- an older card
+updated by hand may still carry the R36S one, naming the arm64 `Image` -- and
+this file second, so these words get the last word; without it the LK would load
+the arm64 kernel, refuse it at the magic check, and fall back to the eMMC. Load
+addresses are deliberately absent from it: those are the LK's business, and it
+knows this SoC's DRAM map and the address of the framebuffer the DTB hands to
+`simple-framebuffer`.
 
 ## Storage: mounting the shared armhf rootfs
 

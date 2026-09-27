@@ -12,9 +12,12 @@ register addresses, no framebuffer until BRINGUP step 2 measures one.
 import argparse
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 TREE = Path(__file__).resolve().parent
+sys.path.insert(0, str(TREE.parent / "common"))
+from mtk_bringup_dts import generate_bringup_dts  # noqa: E402
 
 # Exact-SoC compatibles claimed per device (bring-up prosthetic; the real
 # mt6739.dtsi does not exist in mainline 6.12 yet).
@@ -24,17 +27,6 @@ COMPATIBLES = [
 ]
 
 REQUIRED_BOOTARGS = ["earlycon", "lg.device="]
-
-FB_NODE_TMPL = """\
-\tchosen_fb: framebuffer@{fb_base:x} {{
-\t\tcompatible = "simple-framebuffer";
-\t\treg = <0x0 0x{fb_base:x} 0x0 0x{fb_size_bytes:x}>;
-\t\twidth = <{width}>;
-\t\theight = <{height}>;
-\t\tstride = <({width} * 4)>;
-\t\tformat = "a8r8g8b8";
-\t}};
-"""
 
 
 def read_sources(tree: Path = TREE) -> dict:
@@ -51,44 +43,22 @@ def read_sources(tree: Path = TREE) -> dict:
 
 def generate(sources: dict, device: str, fb_base: str = "") -> str:
     spec = sources[device]  # KeyError: unknown device, callers load devices.sh
-    width, height, mem_mb = spec["width"], spec["height"], spec["mem_mb"]
-    mem_bytes = mem_mb * 1024 * 1024
-
-    if fb_base:
-        fb = int(fb_base, 0)
-        fb_size = width * height * 4
-        fb_node = FB_NODE_TMPL.format(fb_base=fb, fb_size_bytes=fb_size,
-                                      width=width, height=height)
-    else:
-        fb_node = ("\t/* No simple-framebuffer node: the LK framebuffer base\n"
-                   "\t * is unknown (BRINGUP step 2). Re-run with --fb-base.\n"
-                   "\t */\n")
-
-    lines = [
-        "/dts-v1/;",
-        "",
-        f"/ {{ /* {device}: {spec['soc']}, {mem_mb} MiB */",
-        f'\tmodel = "LG {device.upper()} (MT6739 bring-up)";',
-        '\tcompatible = "lg,lm-x120", "mediatek,mt6739";',
-        "\t#address-cells = <2>;",
-        "\t#size-cells = <2>;",
-        "",
-        "\tchosen {",
-        f'\t\tbootargs = "earlycon console=ttyS0,115200n8 lg.device={device}";',
-        "\t};",
-        "",
-        f"\tmemory@40000000 {{ /* prior {hex(0x40000000)}: replace with LK value */",
-        '\t\tdevice_type = "memory";',
-        f"\t\treg = <0x0 0x40000000 0x0 {hex(mem_bytes)}>;",
-        "\t};",
-        "",
-        fb_node.rstrip("\n"),
-        "",
-        "\t/* UART/MMC/PMIC/panel/touch/modem nodes land here once the",
-        "\t * phone's own LK/DTB gives us addresses (BRINGUP step 1). */",
-        "};",
-        "",
-    ]
+    body = generate_bringup_dts(
+        model=f"LG {device.upper()} (MT6739 bring-up)",
+        board_compat="lg,lm-x120",
+        soc_compat="mediatek,mt6739",
+        mem_mb=spec["mem_mb"],
+        bootargs=f"earlycon console=ttyS0,115200n8 lg.device={device}",
+        fb_base=int(fb_base, 0) if fb_base else 0,
+        width=spec["width"], height=spec["height"],
+    )
+    # The helper emits a root-children fragment (plus its own header lines);
+    # the root node is this tree's to own.
+    fragment = body.splitlines()[2:]
+    lines = ["/dts-v1;/", "",
+             f"/ {{ /* {device}: {spec['soc']}, {spec['mem_mb']} MiB */"]
+    lines += fragment
+    lines += ["};", ""]
     return "\n".join(lines)
 
 

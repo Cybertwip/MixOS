@@ -9468,8 +9468,9 @@ fi
 # makes it the launcher and only the launcher: zImage, the device tree, initrd.img and
 # boot.conf, the four files something other than Linux has to open.  Everything the
 # LK never touches went to the OS partition, which is ext2 and therefore holds symlinks
-# and execute bits and is not a 100 MB partition an R36S card shares with its own boot
-# files.  vfat's own limits stop being anything to work around at that point: the GL
+# and execute bits.  No RK3326 boot set sits beside them: the full build empties p1
+# before this goes in, so a J36 card carries the launcher only.  vfat's own limits stop
+# being anything to work around at that point: the GL
 # payload's `links' file existed because vfat cannot hold a symlink, and it stays only
 # because a card written by an older build still has its payload on BOOT.
 log "Staging the SD card BOOT payload"
@@ -9706,8 +9707,7 @@ fi
 cat > "$SDBOOT/mvii/boot.conf" <<'CONF'
 # MVII LK SD hand-off, J36 Ultra (MT6592, ARMv7).
 #
-# Read after the card's own boot.ini, so these override it: an R36S boot.ini
-# names an arm64 kernel this SoC cannot execute.  Keep it short
+# No boot.ini on this card: BOOT carries the J36 launcher only.  Keep it short
 # -- a fixed 2 KiB buffer.  ../README.txt explains every word below.
 kernel=zImage
 dtb=mt6592-j36-ultra.dtb
@@ -9792,9 +9792,10 @@ cat > "$SDBOOT/README.txt" <<'README'
 J36 Ultra (MT6592, ARMv7) SD card BOOT payload -- the launcher.
 
 Copy the contents of this directory into the root of the FAT partition labelled
-BOOT.  Existing files are not disturbed: an R36S card keeps its Image,
-uInitrd, rk3326 device trees and boot.ini, and mvii/boot.conf points the MVII LK
-at the ARMv7 payload instead.
+BOOT.  A card flashed from the full J36 image carries this launcher only: no
+Image, no uInitrd, no rk3326 trees, no boot.ini.  An older card updated by hand
+may still have those R36S files sitting beside it; the MVII LK reads
+mvii/boot.conf and ignores them.
 
   zImage                    plain 32-bit ARM kernel, no appended device tree
   mt6592-j36-ultra.dtb      the tree the LK loads separately and patches
@@ -9810,8 +9811,8 @@ below -- and nothing else ever appears here.  The MVII LK reads FAT32 and nothin
 else, so BOOT exists because the loader has to be able to open
 it -- which makes it the launcher and only the launcher: the four files something
 other than Linux has to read.  Everything else went to the OS partition, which is
-ext2, and therefore holds symlinks and execute bits and is not a 100 MB partition
-an R36S card shares with its own boot files.
+ext2, and therefore holds symlinks and execute bits.  No RK3326 boot set sits
+beside them on a card the full build wrote.
 
 THE OTHER HALF: sd-root.tar.gz, beside this directory.  Unpack it into the root of
 the OS partition -- the shared armhf Debian rootfs -- and it adds /opt/mixos and
@@ -14688,6 +14689,10 @@ image_export_signature() {
     local img="$1"
     {
         stat -c 'base %s %Y' "$img"
+        # p1 is emptied before the launcher goes in, so an output written before
+        # the clean-out carries files this run would delete.  The marker below is
+        # what invalidates those outputs; bump it if the clean-out ever changes.
+        echo "p1 j36-only v1"
         if [[ -f "$ARTIFACTS/sd-root.tar.gz" ]]; then
             stat -c 'sd-root %s %Y' "$ARTIFACTS/sd-root.tar.gz"
         else
@@ -14800,8 +14805,15 @@ print(p[0]["start"], p[0]["size"], p[1]["start"], p[1]["size"])
     mnt="$WORK/image-mnt"
     mkdir -p "$mnt"
 
-    # ── p1, the FAT32 launcher.  Added to, never replaced: the R36S's own Image,
-    # uInitrd, rk3326 trees and boot.ini are on this partition and stay there.
+    # ── p1, the FAT32 launcher.  Replaced, never added to: the output image is
+    # the J36 card, not an R36S card with a J36 payload sitting beside the RK3326
+    # one.  The base's Image, uInitrd, rk3326 trees, boot.ini, logo.bmp and
+    # first-boot helpers are deleted below and the launcher goes in alone, so a
+    # J36 card carries only this run's payload and nothing the base happened to
+    # ship.  The base itself is untouched -- this runs on the copy -- and a card
+    # updated by hand from --mix-only keeps whatever it already had; the LK reads
+    # mvii/boot.conf, ignores the rest, and refuses an arm64 Image at the magic
+    # check, so those leftovers are inert there.
     #
     # The whole of $SDBOOT rather than a list of four filenames, because that list has
     # already changed twice in this refactor and a copy that names files is a copy that
@@ -14815,9 +14827,18 @@ print(p[0]["start"], p[0]["size"], p[1]["start"], p[1]["size"])
     loop="$(sudo losetup --find --show \
         --offset $((p1_start * 512)) --sizelimit $((p1_size * 512)) "$img")"
     if sudo mount -t vfat "$loop" "$mnt"; then
+        # -mindepth 1 deletes the contents and never the mountpoint itself; dotfiles
+        # go too.  A failure here is loud but not fatal: the copy below still runs,
+        # and the leftovers it would sit beside are the inert kind from the comment
+        # above, not a second boot chain anything executes.
+        if sudo find "$mnt" -mindepth 1 -delete; then
+            log "image: p1 (vfat) emptied of the base's R36S boot set; the J36 launcher goes in alone"
+        else
+            log "image: p1 clean-out failed, so the R36S boot files stay beside the launcher (inert: the LK reads mvii/boot.conf)"
+        fi
         if sudo cp -r "$SDBOOT/." "$mnt/"; then
             sync
-            log "image: p1 (vfat) now carries $(find "$SDBOOT" -type f | wc -l) launcher files, mvii/boot.conf included"
+            log "image: p1 (vfat) now carries the J36 launcher only: $(find "$SDBOOT" -type f | wc -l) files, mvii/boot.conf included"
         else
             log "image: p1 mounted but the launcher copy failed -- is p1 full?  ${SYSTEM_SIZE:-100} MB is the budget"
             rc=1

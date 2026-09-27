@@ -3406,6 +3406,11 @@ void mt6592_pmic_charger_service(void) {
     mt6592_pmic_service();
 }
 
+void mt6592_pmic_charger_watchdog_disarm(void) {
+    charger_watchdog_disarm();
+    plog("pmic: charger watchdog disarmed for the kernel handoff\n");
+}
+
 /*
  * The load-step hook. Card reads, app launches, Wi-Fi scans: each steps the
  * board's draw up sharply, and with no cell fitted there is nothing between that
