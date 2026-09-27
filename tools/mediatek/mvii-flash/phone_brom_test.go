@@ -342,6 +342,34 @@ func TestFlagFailureAdvice(t *testing.T) {
 	}
 }
 
+func TestHandshakeWake(t *testing.T) {
+	echoes := []byte{0x5F, 0xF5, 0xAF, 0xFA}
+	port := &scriptPort{pending: append([]byte(nil), echoes...)}
+	client := &mtkSerialClient{port: port, commandTimeout: time.Second, writeTimeout: time.Second, handshakeWake: true}
+	if err := client.handshake(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("handshake(wake) = %v, want nil", err)
+	}
+	if len(port.writes) != 5 || !bytes.Equal(port.writes[0], []byte{0xA0}) {
+		t.Fatalf("writes = %x, want lone wake 0xA0 then the 4-byte sequence", port.writes)
+	}
+	var seq []byte
+	for _, w := range port.writes[1:] {
+		seq = append(seq, w...)
+	}
+	if !bytes.Equal(seq, []byte{0xA0, 0x0A, 0x50, 0x05}) {
+		t.Fatalf("sequence = %x, want the handshake bytes", seq)
+	}
+
+	plain := &scriptPort{pending: append([]byte(nil), echoes...)}
+	plainClient := &mtkSerialClient{port: plain, commandTimeout: time.Second, writeTimeout: time.Second}
+	if err := plainClient.handshake(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("handshake(plain) = %v, want nil", err)
+	}
+	if len(plain.writes) != 4 {
+		t.Fatalf("plain writes = %d calls, want exactly 4 (J36 behavior unchanged)", len(plain.writes))
+	}
+}
+
 func TestRefusePhoneSLA(t *testing.T) {
 	phone := &phoneRoot{device: "cph2385-4gb", soc: "mt6765"}
 	if err := refusePhoneSLA(phone, mtkTargetConfig{}); err != nil {
