@@ -2273,6 +2273,10 @@ want_zram=auto
 # Take the word back out and the next boot grows it, because nothing about the
 # decision is remembered: both ends are read off the card every time.
 want_expand=1
+# Hand over to systemd unless told not to.  j36.switchroot=0 stays in the
+# initramfs with a shell instead, for the boot where the question is whether
+# the reset lives before switch_root or after it.
+want_switchroot=1
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         j36.audio|j36.audio=1)
@@ -2461,6 +2465,14 @@ for arg in $(cat /proc/cmdline); do
         # other one here, it lives where a Mac can reach it.
         j36.expand=fsck)
             want_expand=fsck
+            ;;
+        # Stay in the initramfs instead of switching root: no systemd, no units,
+        # just the post-mortem below and a shell on each console.  For the boot
+        # where the question is whether the reset lives before switch_root or
+        # after it.  Per-boot like the rest: take the word out and the next boot
+        # hands over again.
+        j36.switchroot=0|noswitchroot)
+            want_switchroot=0
             ;;
         # Swap off entirely, for the boot where the question is whether zram is
         # what is making the board feel slow.  It is a fair question and it has a
@@ -7686,7 +7698,17 @@ if [ -n "$rootdev" ] && [ "$want_log" = 1 ]; then
     setup_earlytrace
 fi
 
-if [ -n "$rootdev" ]; then
+# The hand-over, as a function so the no-switch-root word has something to
+# gate -- and so the test can run it without a rootfs.  Falling off the end
+# lands in the post-mortem and the shells below, which is the right place for
+# both a refused hand-over and a declined one.
+do_switchroot() {
+    if [ -z "$rootdev" ]; then return 1; fi
+    if [ "$want_switchroot" = 0 ]; then
+        say "j36.switchroot=0: staying in the initramfs with a shell instead of starting systemd"
+        stage "Shell without systemd"
+        return 0
+    fi
     say "switching root into $rootdev"
     stage "Starting MixOS"
     detail "$rootdev"
@@ -7711,6 +7733,10 @@ if [ -n "$rootdev" ]; then
     mount -t proc proc /proc 2>/dev/null
     mount -t sysfs sysfs /sys 2>/dev/null
     say "switch_root failed; staying in the initramfs"
+    return 0
+}
+if [ -n "$rootdev" ]; then
+    do_switchroot
 fi
 
 # Everything from here down is a post-mortem, and a post-mortem behind a picture

@@ -176,4 +176,49 @@ mount() { :; }
             assert needle in text, needle
         assert os.access(prog, os.X_OK)
         subprocess.run(["sh", "-n", str(prog)], check=True)
-print("Power diagnostic: opt-in, embedded mode, resize bypass, no idle delay, rotation, mount cleanup, step marks, diag retry and early trace passed")
+
+with tempfile.TemporaryDirectory(prefix="j36-switchroot-test-") as tmp:
+    root = Path(tmp)
+    fake_switch = root / "switch_root"
+    fake_switch.write_text('#!/bin/sh\necho "switch_root $*"\n')
+    fake_switch.chmod(0o755)
+    script = root / "handover.sh"
+    script.write_text("""
+PATH="$TEST_ROOT:$PATH"
+rootdev="$TEST_ROOTDEV"
+want_switchroot="$TEST_WANT"
+splash_on=0
+splash_chan=/dev/null
+say() { echo "say: $*"; }
+stage() { echo "stage: $*"; }
+detail() { :; }
+progress() { :; }
+mount() { :; }
+sync() { :; }
+""" + function("do_switchroot") + '\ndo_switchroot\necho "returned=$?"\n')
+    for dev, want, present, absent in [
+            ("/dev/mmcblk0p2", "1",
+             ["stage: Starting MixOS", "switch_root /newroot /sbin/init"], ["returned="]),
+            ("/dev/mmcblk0p2", "0",
+             ["staying in the initramfs", "stage: Shell without systemd", "returned=0"],
+             ["switch_root /newroot"]),
+            ("", "1", ["returned=1"],
+             ["switch_root", "switching root", "Shell without systemd"])]:
+        result = subprocess.run(["sh", str(script)], check=True, text=True,
+                                capture_output=True, env=dict(os.environ,
+                                    TEST_ROOT=str(root), TEST_ROOTDEV=dev,
+                                    TEST_WANT=want))
+        for word in present:
+            assert word in result.stdout, (dev, want, word, result.stdout)
+        for word in absent:
+            assert word not in result.stdout, (dev, want, word, result.stdout)
+    branch_start = builder.index("j36.switchroot=0|noswitchroot)")
+    branch = builder[branch_start:builder.index(";;", branch_start) + 2]
+    for word, want in [("j36.switchroot=0", "0"), ("noswitchroot", "0"),
+                       ("j36.audio", "1")]:
+        result = subprocess.run(
+            ["sh", "-c", 'want_switchroot=1; arg="' + word + '"\ncase "$arg" in\n'
+             + branch + '\nesac\necho "want=$want_switchroot"'],
+            check=True, text=True, capture_output=True)
+        assert f"want={want}\n" in result.stdout, (word, result.stdout)
+print("Power diagnostic: opt-in, embedded mode, resize bypass, no idle delay, rotation, mount cleanup, step marks, diag retry, early trace and switchroot gate passed")

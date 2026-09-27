@@ -329,6 +329,14 @@ DARKOS_SYNC_EXCLUDES=(
     'build/'
     '.DS_Store'
     '__pycache__/'
+    # The vendor reference kernels (129k files, ~2.2 GB) are host-side reading
+    # material only: every board fact the builds need was extracted into the
+    # committed board/ headers, and no wrapper, in-VM script or generator
+    # reads reference/ (grep it if that ever stops being true).  Syncing it
+    # over sshfs costs tens of silent minutes on every wrapper invocation.
+    'reference/'
+    # Host-side run logs.  Never a build input.
+    'logs/'
 )
 
 # darkos_vm_prepare_once NAME STAMP PACKAGE...
@@ -386,6 +394,8 @@ darkos_vm_sync_checkout() {
     local name=$1 source_mount=$2 build_dir=$3
     local excludes=""
     local pattern
+
+    darkos_log "Syncing the checkout into $name (rsync, this can take a minute)"
 
     for pattern in "${DARKOS_SYNC_EXCLUDES[@]}"; do
         excludes+=" --exclude='$pattern'"
