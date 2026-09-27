@@ -157,6 +157,15 @@ func run() error {
 	if cfg.listOnly {
 		return listBackends(cfg)
 	}
+	// Phone boot dirs (-root at build/mt67xx|mt68xx/<device>/boot) take the
+	// fastboot path or nothing: the BROM feed and block offsets below are
+	// the j36's, and running them against a phone would write a stranger's
+	// bootloader layout onto it. See phone_target.go.
+	if phone, ok := detectPhoneRoot(cfg.root); ok {
+		if err := refusePhoneWrite(cfg, phone); err != nil {
+			return err
+		}
+	}
 	// The live console is checked before every serial path below because it needs
 	// no -device at all: it finds its own USB device by VID:PID, and the board it
 	// talks to is booted rather than sitting in BROM.
@@ -1402,12 +1411,20 @@ func flashWithFastboot(cfg config, image string) error {
 	if err != nil {
 		return err
 	}
+	_, isPhone := detectPhoneRoot(cfg.root)
+	if isPhone && !cfg.partitionExplicit {
+		return fmt.Errorf("phone target: pass -partition explicitly (the LK slot name from the stock scatter); "+
+			"the %q default is the J36's, and flashing lk.bin at it would miss the slot", cfg.partition)
+	}
 	partition := effectivePartition(cfg, "fastboot")
 	devices, err := fastbootDevices(cfg)
 	if err != nil {
 		return err
 	}
 	if len(devices) == 0 {
+		if isPhone {
+			return errors.New("no fastboot device detected; boot the phone into fastboot (unlocked bootloader) and retry")
+		}
 		return errors.New("no fastboot device detected; boot the J36 Ultra into fastboot or use -backend=raw-block -device /dev/diskN")
 	}
 	if len(devices) > 1 && cfg.serial == "" {
@@ -2727,18 +2744,19 @@ func adbOnlineDevices(adb string) ([]string, error) {
 }
 
 func confirmFlash(cfg config, destination, image, partition string) error {
+	word := confirmWord(cfg)
 	fmt.Println()
 	fmt.Printf("About to flash %s to %s partition %q.\n", image, destination, partition)
 	fmt.Println("This can make the target device unbootable if the destination is wrong.")
 	if cfg.yes {
 		return nil
 	}
-	fmt.Print("Type exactly 'FLASH J36 ULTRA' to continue: ")
+	fmt.Printf("Type exactly '%s' to continue: ", word)
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(line) != "FLASH J36 ULTRA" {
+	if strings.TrimSpace(line) != word {
 		return errors.New("confirmation did not match; leaving the device untouched")
 	}
 	return nil
