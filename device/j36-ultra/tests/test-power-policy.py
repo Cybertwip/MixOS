@@ -24,6 +24,7 @@ find_payload() { payload="$TEST_ROOT"; }
 say() { :; }
 show() { :; }
 watch_say() { :; }
+watch_step_mark() { :; }
 wlan_iface() { echo wlan0; }
 dmesg() { :; }
 insmod() { echo "$*" >> "$TEST_ROOT/calls"; }

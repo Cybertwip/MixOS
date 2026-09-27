@@ -23,11 +23,10 @@
 #define NT36672_COORD_X		1080
 #define NT36672_COORD_Y		2400
 
-/* Novatek SPI report protocol (nt36xxx.c): 0x5A event-map read. */
-#define NT36672_EVT_REPORT	0x5A
-#define NT36672_EVT_CRC		0x5B
+/* Novatek report protocol (nt36xxx.c touch_event_handler): after the IRQ the
+ * host reads a 66-byte frame. Byte 0 is a dummy; each of the 10 fingers owns
+ * 6 bytes at 1+6*i: status+id, X-high, Y-high, nibble halves, W, P. */
 #define NT36672_FINGER_DATA_LEN	6
-#define NT36672_MAX_REPORT_SIZE	\
-	(1 + NT36672_MAX_FINGERS * NT36672_FINGER_DATA_LEN + 2)
+#define NT36672_REPORT_SIZE	66
 
 #endif /* OPPO_TOUCH_NT36672_H */

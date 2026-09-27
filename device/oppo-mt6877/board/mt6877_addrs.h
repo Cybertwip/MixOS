@@ -49,6 +49,21 @@
 #define MT6877_I2C1_BASE	0x11d20000UL
 #define MT6877_I2C_SIZE		0x1000UL
 
+/* GPIO block (Paris layout): DIR 0x000, DOUT 0x100, DIN 0x200, 32 pins
+ * per register, 0x10 stride. Volume keys are EINT-capable GPIOs:
+ * VOL_UP = GPIO120, VOL_DOWN = GPIO114 (oplus6877_20181_v1.dts).
+ * Power is the MT6359 PMIC key. */
+#define MT6877_GPIO_BASE	0x10005000UL
+#define MT6877_GPIO_SIZE	0x1000UL
+#define MT6877_GPIO_DIN_OFF	0x200UL
+#define MT6877_KEY_VOL_UP_GPIO	120
+#define MT6877_KEY_VOL_DOWN_GPIO 114
+
+/* Keypad controller (mediatek,kp), SPI 106. */
+#define MT6877_KP_BASE		0x10010000UL
+#define MT6877_KP_SIZE		0x1000UL
+#define MT6877_IRQ_KP		106
+
 /* Touch wiring on 20181-class boards (cust_mt6877_touch_nt36672.dtsi). */
 #define MT6877_TOUCH_IRQ_GPIO	14
 #define MT6877_TOUCH_SPI_HZ	4800000

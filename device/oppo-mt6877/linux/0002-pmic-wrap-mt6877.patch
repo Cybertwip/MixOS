@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MixOS project <mixos@example.invalid>
+Date: Sat, 27 Sep 2026 00:00:00 +0000
+Subject: [PATCH 2/2] soc: mediatek: pwrap: add MT6877 PMIC wrapper support
+
+The MT6877 PMIC wrapper programs the same way as the MT6873 one (same
+WACS init sequence, same MT6359 device-wrapper registers); the vendor
+pinctrl/pwrap bring-up for the two SoCs differs only in addresses. Reuse
+the mt6873 type data under the mt6877 compatible so the MT6359 MFD
+(regulators, RTC, codec, PMIC keys) can bind on OPPO boards.
+
+CHECK on hardware: confirm the DEW read-test passes and the MT6359
+probes before enabling the charger and audio machine.
+---
+ drivers/soc/mediatek/mtk-pmic-wrap.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/soc/mediatek/mtk-pmic-wrap.c b/drivers/soc/mediatek/mtk-pmic-wrap.c
+index 0000000..0000000 100644
+--- a/drivers/soc/mediatek/mtk-pmic-wrap.c
++++ b/drivers/soc/mediatek/mtk-pmic-wrap.c
+@@ -2450,6 +2450,7 @@ static const struct of_device_id of_pwrap_match_tbl[] = {
+ 	{ .compatible = "mediatek,mt6795-pwrap", .data = &pwrap_mt6795 },
+ 	{ .compatible = "mediatek,mt6797-pwrap", .data = &pwrap_mt6797 },
+ 	{ .compatible = "mediatek,mt6873-pwrap", .data = &pwrap_mt6873 },
++	{ .compatible = "mediatek,mt6877-pwrap", .data = &pwrap_mt6873 },
+ 	{ .compatible = "mediatek,mt7622-pwrap", .data = &pwrap_mt7622 },
+ 	{ .compatible = "mediatek,mt8135-pwrap", .data = &pwrap_mt8135 },
+ 	{ .compatible = "mediatek,mt8173-pwrap", .data = &pwrap_mt8173 },
+-- 
+2.0.0

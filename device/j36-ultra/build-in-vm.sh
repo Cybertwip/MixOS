@@ -1760,7 +1760,7 @@ cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 cp "$PWRAP_MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 cp "$ROOT/device/j36-ultra/power-diagnostic.sh" "$INITROOT/power-diagnostic.sh"
 if [[ "$POWER_DIAGNOSTIC" == 1 ]]; then
-    printf 'v3\n' > "$INITROOT/etc/j36-power-diagnostic"
+    printf 'v4\n' > "$INITROOT/etc/j36-power-diagnostic"
 fi
 # And the PMIC, which is ALSO staged into j36/power/ on the card and is the only
 # module in this build that is deliberately in two places.  The payload copy is the
@@ -2100,14 +2100,51 @@ watch_mark() {
 # Read once, and cleared in the same breath, so the answer can only ever be acted
 # on by this boot.  A mark that survived being read would skip its stage on every
 # boot from here to the end of the card.
+#
+# The mark carries a step after a colon when a per-module mark wrote it
+# ("run_usb:mediatek.ko") and names the stage alone otherwise ("run_usb").
+# The skip below matches the stage either way; the report says the step.
 watch_recall() {
     if [ "$watch_recalled" = 1 ]; then return 0; fi
     watch_recalled=1
     if [ -s "$watch_markfile" ]; then read -r watch_wedge < "$watch_markfile"; fi
     if [ -n "$watch_wedge" ]; then
-        say "the last boot stopped dead inside $watch_wedge -- it is skipped this time and tried again on the next boot"
+        watch_wedge_stage="${watch_wedge%%:*}"
+        case "$watch_wedge" in
+            *:*)
+                watch_wedge_where="inside $watch_wedge_stage at ${watch_wedge#*:}"
+                ;;
+            *)
+                watch_wedge_where="inside $watch_wedge_stage"
+                ;;
+        esac
+        if [ "$power_diag" = power ]; then
+            # An attended diagnostic boot retries the wedged stage with step
+            # logging instead of skipping it: the retry is the test, and the
+            # per-module marks will say where it stops this time.  The stale
+            # mark is kept beside the live one, synced, so the evidence
+            # survives whatever the retry does.  Normal boots keep the
+            # skip-once protection below.
+            say "diag retry: the last boot stopped dead $watch_wedge_where -- running it again with step logging (a boot without j36.diag=power skips it once instead)"
+            cp "$watch_markfile" "$watch_markfile.prev" 2>/dev/null
+            sync
+            watch_wedge=""
+        else
+            say "the last boot stopped dead $watch_wedge_where -- it is skipped this time and tried again on the next boot"
+            watch_wedge="$watch_wedge_stage"
+        fi
     fi
     watch_mark ""
+    return 0
+}
+# The mark, per module.  watch_mark() names the stage in flight; this names the
+# module inside it ("run_usb:mediatek.ko"), synced, so a board that dies
+# between two checkpoints still leaves the step behind on the OS partition.
+# Diagnostic boots only: a normal boot's protection is the stage-level mark,
+# and it pays no per-module sync for diagnosis it did not ask for.
+watch_step_mark() {
+    [ "$power_diag" = power ] || return 0
+    watch_mark "$1:$2"
     return 0
 }
 watch_run() {
@@ -2167,7 +2204,7 @@ watch_run() {
 say ""
 say "J36 Ultra ARMv7 bring-up initramfs"
 if [ "$power_diag" = power ]; then
-    stage "J36 DIAG v3: initramfs loaded"
+    stage "J36 DIAG v4: initramfs loaded"
 fi
 say "Display: the LK's framebuffer on /dev/fb0 until something opens /dev/dri/card0."
 progress 4
@@ -2568,7 +2605,7 @@ if [ "$power_diag" = power ]; then
     want_expand=0
     # Early BOOT writes are safe only after expansion is explicitly disabled.
     power_diag_ready=1
-    stage "J36 DIAG v3: resize skipped"
+    stage "J36 DIAG v4: resize skipped"
     detail "Diagnostic initramfs active; card size stays unchanged"
     # Retry as the MMC partitions appear; retain the original five-second pause.
     power_diag_early_wait=0
@@ -4055,6 +4092,7 @@ run_lima() {
         # that takes a long time to probe is the one whose name should be on the
         # screen while it does, not once it has finished.
         watch_say "$ko"
+        watch_step_mark run_lima "$ko"
         if insmod "$payload/modules/$ko" >/tmp/insmod.log 2>&1; then
             say "lima: loaded $ko"
         else
@@ -4107,6 +4145,7 @@ run_mtkdrm() {
     while IFS= read -r ko; do
         case "$ko" in ''|'#'*) continue ;; esac
         watch_say "$ko"
+        watch_step_mark run_mtkdrm "$ko"
         if insmod "$payload/mtkdrm/$ko" >/tmp/insmod.log 2>&1; then
             say "mtkdrm: loaded $ko"
         else
@@ -4174,6 +4213,7 @@ run_audio() {
         # overwritten by the next tick anyway.  The status file is how the child
         # gets a word into that line.
         watch_say "$ko"
+        watch_step_mark run_audio "$ko"
         if insmod "$payload/audio/$ko" $params >/tmp/insmod.log 2>&1; then
             say "audio: loaded $ko $params"
         else
@@ -4261,6 +4301,7 @@ run_usb() {
                 ;;
         esac
         watch_say "$ko"
+        watch_step_mark run_usb "$ko"
         if insmod "$payload/usb/$ko" $args >/tmp/insmod.log 2>&1; then
             say "usb: loaded $ko${args:+ $args}"
         else
@@ -4387,6 +4428,7 @@ run_power() {
                 ;;
         esac
         watch_say "$ko"
+        watch_step_mark run_power "$ko"
         if insmod "$payload/power/$ko" $args >/tmp/insmod.log 2>&1; then
             say "power: loaded $ko${args:+ $args}"
         else
@@ -4516,6 +4558,7 @@ run_wifi() {
                 ;;
         esac
         watch_say "$ko"
+        watch_step_mark run_wifi "$ko"
         if insmod "$payload/wifi/$ko" $args >/tmp/insmod.log 2>&1; then
             say "wifi: loaded $ko"
         else

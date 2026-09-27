@@ -15,6 +15,7 @@ with tempfile.TemporaryDirectory(prefix="j36-diagnostic-test-") as tmp:
     (root / "proc/cmdline").write_text("j36.power=external j36.diag=power\n")
     (root / "proc/sys/kernel/random/boot_id").write_text("test-boot\n")
     (root / "dev/j36-init-trace").write_text("expansion returned\n")
+    (root / "dev/.watch-status").write_text("mediatek.ko\n")
     source = re.sub(r"/bootfs|/dev/|/proc/|/sys/",
                     lambda match: str(root) + match[0], helper.read_text())
     script = root / "test.sh"
@@ -37,10 +38,12 @@ rootfs_type=ext2
         (root / "ops").write_text("")
         for f in (root / "bootfs").glob("*.txt"):
             f.unlink()
+        (root / "mark").write_text("run_usb:mediatek.ko\n")
         result = subprocess.run(["sh", str(script)], check=True, text=True,
                                 capture_output=True, env=dict(os.environ,
                                     TEST_ROOT=str(root), power_diag=enabled,
-                                    bootfs_mounted=existing, FAIL_MOUNT=fail))
+                                    bootfs_mounted=existing, FAIL_MOUNT=fail,
+                                    watch_markfile=str(root / "mark")))
         ops = (root / "ops").read_text()
         if not enabled:
             assert not ops and not list((root / "bootfs").glob("*.txt"))
@@ -55,6 +58,8 @@ rootfs_type=ext2
         assert any("stage=final" in log and "checkpoint_complete=2" in log for log in logs)
         assert all("boot_id=test-boot" in log and "test kernel message" in log for log in logs)
         assert all("unavailable" in log for log in logs)
+        assert all("watch_step=mediatek.ko" in log for log in logs)
+        assert all("wedge_mark=run_usb:mediatek.ko" in log for log in logs)
         assert ("umount " in ops) == (existing == "0")
         assert ops.count("remount,ro") == 2
 builder = (helper.parent / "build-in-vm.sh").read_text()
@@ -75,7 +80,7 @@ with tempfile.TemporaryDirectory(prefix="j36-diagnostic-mode-") as tmp:
                                          (False, "j36.diag=power", "0"),
                                          (True, "", "0")]:
         if embedded:
-            marker.write_text("v2\n")
+            marker.write_text("v4\n")
         elif marker.exists():
             marker.unlink()
         cmdline.write_text(argument + "\n")
@@ -84,5 +89,50 @@ with tempfile.TemporaryDirectory(prefix="j36-diagnostic-mode-") as tmp:
                                  + '\necho "$want_expand"'], text=True,
                                 capture_output=True, check=True)
         assert result.stdout.strip() == expected
-assert builder.index('stage "J36 DIAG v3: resize skipped"') < builder.index('\nexpand_root\n')
-print("Power diagnostic: opt-in, embedded mode, resize bypass, no idle delay, rotation and mount cleanup passed")
+assert builder.index('stage "J36 DIAG v4: resize skipped"') < builder.index('\nexpand_root\n')
+
+def function(name):
+    start = builder.index(name + "() {\n")
+    return builder[start:builder.index("\n}\n", start) + 3]
+
+with tempfile.TemporaryDirectory(prefix="j36-recall-test-") as tmp:
+    root = Path(tmp)
+    script = root / "recall.sh"
+    script.write_text("""
+watch_markfile="$TEST_ROOT/boot-stage"
+watch_wedge=""
+watch_recalled=0
+say() { echo "say: $*"; }
+detail() { :; }
+sync() { :; }
+""" + function("watch_mark") + function("watch_recall") + """
+watch_recall
+echo "wedge=$watch_wedge"
+echo "mark=$(cat "$watch_markfile" 2>/dev/null)"
+echo "prev=$(cat "$watch_markfile.prev" 2>/dev/null)"
+""")
+    for mode, mark, wedge, prev, words in [
+            ("", "run_usb:mediatek.ko", "run_usb", "",
+             ["inside run_usb at mediatek.ko", "skipped this time"]),
+            ("power", "run_usb:mediatek.ko", "", "run_usb:mediatek.ko",
+             ["diag retry", "mediatek.ko"]),
+            ("", "run_wifi", "run_wifi", "",
+             ["inside run_wifi", "skipped this time"]),
+            ("power", None, "", "", [])]:
+        for f in ("boot-stage", "boot-stage.prev"):
+            if (root / f).exists():
+                (root / f).unlink()
+        if mark is not None:
+            (root / "boot-stage").write_text(mark + "\n")
+        result = subprocess.run(["sh", str(script)], check=True, text=True,
+                                capture_output=True, env=dict(os.environ,
+                                    TEST_ROOT=str(root), power_diag=mode))
+        out = result.stdout
+        assert f"wedge={wedge}\n" in out
+        assert "mark=\n" in out
+        assert f"prev={prev}\n" in out
+        for word in words:
+            assert word in out, (mode, mark, word, out)
+        if not words:
+            assert "stopped dead" not in out
+print("Power diagnostic: opt-in, embedded mode, resize bypass, no idle delay, rotation, mount cleanup, step marks and diag retry passed")

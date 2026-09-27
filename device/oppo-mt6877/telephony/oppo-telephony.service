@@ -1,0 +1,13 @@
+[Unit]
+Description=OPPO MT6877 telephony stack
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+# Stage 1: boot the modem. Stage 2 appends ModemManager dependency here.
+ExecStart=/opt/mixos/oppo/telephony/modem-boot.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -86,10 +86,16 @@ def generate(sources: dict[str, str], device: str, cmdline_extra: str = "") -> s
     spi_size = parse_int(addrs, "MT6877_SPI_SIZE")
     consys = parse_int(addrs, "MT6877_CONSYS_BASE")
     consys_size = parse_int(addrs, "MT6877_CONSYS_SIZE")
+    consys_cfg = parse_int(addrs, "MT6877_CONSYS_CFG")
+    consys_cfg_size = parse_int(addrs, "MT6877_CONSYS_CFG_SIZE")
     afe = parse_int(addrs, "MT6877_AFE_BASE")
     afe_size = parse_int(addrs, "MT6877_AFE_SIZE")
     pwrap = parse_int(addrs, "MT6877_PWRAP_BASE")
     pwrap_size = parse_int(addrs, "MT6877_PWRAP_SIZE")
+    gpio_base = parse_int(addrs, "MT6877_GPIO_BASE")
+    gpio_size = parse_int(addrs, "MT6877_GPIO_SIZE")
+    infra_base = parse_int(addrs, "MT6877_INFRACFG_AO_BASE")
+    infra_size = parse_int(addrs, "MT6877_INFRACFG_AO_SIZE")
     irq_uart0 = parse_int(addrs, "MT6877_IRQ_UART0")
     irq_msdc0 = parse_int(addrs, "MT6877_IRQ_MSDC0")
     irq_msdc1 = parse_int(addrs, "MT6877_IRQ_MSDC1")
@@ -245,15 +251,6 @@ def generate(sources: dict[str, str], device: str, cmdline_extra: str = "") -> s
 \t\t\t}};
 \t\t}};
 
-\t\tpio: pinctrl {{
-\t\t\tcompatible = "mediatek,mt6877-pinctrl";
-\t\t\tgpio-controller;
-\t\t\t#gpio-cells = <2>;
-\t\t\tinterrupt-controller;
-\t\t\t#interrupt-cells = <2>;
-\t\t\tstatus = "okay";
-\t\t}};
-
 \t\tpwrap: pwrap@{pwrap:x} {{
 \t\t\tcompatible = "mediatek,mt6877-pwrap";
 \t\t\treg = <0x0 {pwrap:#x} 0x0 {pwrap_size:#x}>;
@@ -273,29 +270,52 @@ def generate(sources: dict[str, str], device: str, cmdline_extra: str = "") -> s
 \t\t\tstatus = "okay";
 \t\t}};
 
-\t\tmdm: modem {{
-\t\t\tcompatible = "oppo,mt6877-modem";
+\t\twlan: wifi@{consys_cfg:x} {{
+\t\t\tcompatible = "oppo,mt6877-wifi";
+\t\t\treg = <0x0 {consys_cfg:#x} 0x0 {consys_cfg_size:#x}>;
 \t\t\tstatus = "okay";
 \t\t}};
 
-\t\tkeys: gpio-keys {{
-\t\t\tcompatible = "gpio-keys";
+\t\tmdm: modem@{infra_base:x} {{
+\t\t\tcompatible = "oppo,mt6877-modem";
+\t\t\treg = <0x0 {infra_base:#x} 0x0 {infra_size:#x}>;
 \t\t\tstatus = "okay";
+\t\t}};
 
-\t\t\tvol-up {{
-\t\t\t\tlabel = "Volume Up";
-\t\t\t\tlinux,code = <115>;
-\t\t\t\tgpios = <&pio 0 1>;
-\t\t\t}};
-\t\t\tvol-down {{
-\t\t\t\tlabel = "Volume Down";
-\t\t\t\tlinux,code = <114>;
-\t\t\t\tgpios = <&pio 1 1>;
-\t\t\t}};
+\t\tkeys: keys@{gpio_base:x} {{
+\t\t\tcompatible = "oppo,mt6877-keys-polled";
+\t\t\treg = <0x0 {gpio_base:#x} 0x0 {gpio_size:#x}>;
+\t\t\toppo,key-pins = <120 114>;
+\t\t\tstatus = "okay";
 \t\t}};
 \t}};
 
-\tframebuffer0: framebuffer {{
+\t/* Unclaimed until the pinctrl port lands; present so phandle
+\t * references (&pio) resolve. Lives at root because it owns no MMIO
+\t * window of its own yet. */
+\tpio: pinctrl {{
+\t\tcompatible = "mediatek,mt6877-pinctrl";
+\t\tgpio-controller;
+\t\t#gpio-cells = <2>;
+\t\tinterrupt-controller;
+\t\t#interrupt-cells = <2>;
+\t\tstatus = "disabled";
+\t}};
+
+\tsound {{
+\t\tcompatible = "oppo,mt6877-sound";
+\t\tstatus = "okay";
+\t}};
+
+\tpower {{
+\t\tcompatible = "oppo,mt6877-power";
+\t\t/* io-channels = <&mt6359_adc ...>: wired when the MT6359 ADC
+\t\t * driver lands; the driver defers until then rather than
+\t\t * guessing voltages. */
+\t\tstatus = "okay";
+\t}};
+
+\tframebuffer0: framebuffer@{fb_base:x} {{
 \t\tcompatible = "simple-framebuffer";
 \t\treg = <0x0 {fb_base:#x} 0x0 0x1000000>;
 \t\twidth = <{width}>;

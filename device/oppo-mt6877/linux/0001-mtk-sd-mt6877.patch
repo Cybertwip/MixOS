@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MixOS project <mixos@example.invalid>
+Date: Sat, 27 Sep 2026 00:00:00 +0000
+Subject: [PATCH 1/2] mmc: mtk-sd: add MT6877 eMMC/SD support
+
+The MT6877 MSDC block is register-compatible with the MT6779 generation
+already carried by mtk-sd (same HS200/HS400 path, same 8-bit eMMC on
+msdc0). Add the compatible so the OPPO bring-up DTS binds without relying
+on the fallback string; a dedicated entry also reserves the place for
+MT6877-specific tuning if the HS400 eye ever needs it.
+
+eMMC caps (8-bit, HS400 @ 200 MHz, DDR 1.8 V) from
+cust_mt6877_msdc.dtsi in the OPPO reference kernel.
+---
+ drivers/mmc/host/mtk-sd.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/mmc/host/mtk-sd.c b/drivers/mmc/host/mtk-sd.c
+index 0000000..0000000 100644
+--- a/drivers/mmc/host/mtk-sd.c
++++ b/drivers/mmc/host/mtk-sd.c
+@@ -626,6 +626,7 @@ static const struct of_device_id msdc_of_ids[] = {
+ 	{ .compatible = "mediatek,mt2701-mmc", .data = &mt2701_compat},
+ 	{ .compatible = "mediatek,mt2712-mmc", .data = &mt2712_compat},
+ 	{ .compatible = "mediatek,mt6779-mmc", .data = &mt6779_compat},
++	{ .compatible = "mediatek,mt6877-mmc", .data = &mt6779_compat},
+ 	{ .compatible = "mediatek,mt6795-mmc", .data = &mt6795_compat},
+ 	{ .compatible = "mediatek,mt7620-mmc", .data = &mt7620_compat},
+ 	{ .compatible = "mediatek,mt7622-mmc", .data = &mt7622_compat},
+-- 
+2.0.0

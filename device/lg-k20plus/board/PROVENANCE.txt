@@ -1,0 +1,35 @@
+LG K20 Plus board extracts: provenance and maintenance
+=========================================================
+
+These files are small, hand-maintained extracts from the vendor reference
+kernel at reference/NetHunter_K20plus_arm64_Kernel-Source (LG K20 Plus,
+Linux 3.18.31, Qualcomm MSM8917). They are the whole input to
+generate_dts_lg.py, the same way device/j36-ultra/mvii-board/ is the whole
+input to generate_dts.py.
+
+NOTE ON THE SoC. The K20 Plus is a Qualcomm Snapdragon 425 (MSM8917), not a
+MediaTek part: its modem speaks QMI over QRTR, its Wi-Fi is a Pronto
+WCN3660, its PMIC is a PMI8950 over SPMI. The drivers in linux/ target
+that hardware; nothing here is shared with the MTK trees except the shape
+of the directories.
+
+Files
+-----
+msm8917_addrs.h  SoC base addresses + IRQ lines, from
+                 arch/arm/boot/dts/qcom/msm8917.dtsi
+panel_lg4894.h   LGD LG4894 720x1280 DSI video-mode geometry + init, from
+                 arch/arm64/boot/dts/lge/dsi-panel-lv5-lgd-lg4894-hd-video.dtsi
+panel_td4100.h   Tovis TD4100 second-source geometry + init, from
+                 arch/arm64/boot/dts/lge/dsi-panel-lv5-tovis-td4100-hd-video.dtsi
+touch_lg4894.h   SiW LG4894 report protocol + wiring, from
+                 drivers/input/touchscreen/lge/lgsic/touch_lg4894.{c,h} and
+                 msm8917-lv517_gsm_us-touch.dtsi
+keys_lv517.h     volume/hall key wiring, from
+                 msm8917-lv517_gsm_us-misc.dtsi (+ rev-0 override)
+modem_mss.h      modem (MSS/PIL) + WCNSS outline, from msm8917.dtsi
+                 (pronto@a21b000) and the msm8916/q6v5 mainline shape
+
+Maintenance rule: same as the OPPO tree -- a new LG device adds one row to
+devices.sh plus its deltas here, and the generator picks them by LG_PANEL /
+LG_TOUCH / LG_REV. The reference tree is read by a human, once, at that
+moment -- never by the build.

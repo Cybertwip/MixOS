@@ -1,0 +1,9 @@
+# APN template for the stage-2 data scripts (see telephony/README.md).
+# Copy to /etc/mixos/apn.conf on the phone and fill in your carrier.
+# Nothing reads this file in stage 1; it reserves the shape.
+
+# apn=internet
+# username=
+# password=
+# auth=none
+# protocol=IP

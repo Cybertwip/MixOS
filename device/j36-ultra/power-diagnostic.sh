@@ -18,7 +18,7 @@ power_diag_checkpoint() {
     # Alternate files so a cut during this write does not truncate the last
     # checkpoint. Sequence and boot ID distinguish old boots and partial files.
     {
-        echo "J36 power diagnostic v3 (resize bypassed)"
+        echo "J36 power diagnostic v4 (resize bypassed)"
         echo "sequence=$power_diag_seq stage=$*"
         echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
         echo "uptime=$(cat /proc/uptime)"
@@ -32,6 +32,19 @@ power_diag_checkpoint() {
             /sys/class/power_supply/battery/voltage_now; do
             echo "$power_diag_file:"
             cat "$power_diag_file" 2>/dev/null || echo unavailable
+        done
+        # The in-flight module and the wedge mark, so a board that dies
+        # between two checkpoints still left its step behind. Both are empty
+        # before the first stage runs, which reads the same as missing.
+        for power_diag_state in "watch_step:${watch_status:-/dev/.watch-status}" \
+                "wedge_mark:${watch_markfile:-/newroot/opt/mixos/boot-stage}"; do
+            power_diag_key="${power_diag_state%%:*}"
+            power_diag_path="${power_diag_state#*:}"
+            if [ -s "$power_diag_path" ]; then
+                echo "$power_diag_key=$(cat "$power_diag_path")"
+            else
+                echo "$power_diag_key=unavailable"
+            fi
         done
         echo "--- init trace ---"
         cat /dev/j36-init-trace 2>/dev/null

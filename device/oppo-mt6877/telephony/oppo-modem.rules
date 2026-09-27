@@ -1,0 +1,3 @@
+# OPPO MT6877 modem: tag the device and start the telephony stack on READY.
+ACTION=="add", SUBSYSTEM=="platform", DRIVER=="oppo-mt6877-modem", TAG+="systemd", ENV{SYSTEMD_WANTS}="oppo-telephony.service"
+ACTION=="change", SUBSYSTEM=="platform", DRIVER=="oppo-mt6877-modem", ENV{STATE}=="ready", TAG+="systemd", ENV{SYSTEMD_WANTS}="oppo-telephony.service"
