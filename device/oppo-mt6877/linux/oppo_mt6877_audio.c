@@ -166,17 +166,23 @@ static struct platform_driver oppo_afe_driver = {
 		.of_match_table = oppo_afe_match,
 	},
 };
-module_platform_driver(oppo_afe_driver);
 
-/* The machine link. The codec half is mainline mt6359; this only names the
- * card and wires DL1 to it. */
+/* The machine link, in the 6.x component-array form (see sound/soc/qcom/
+ * storm.c, the shape this follows). The CPU side resolves by DT phandle
+ * (`cpu = <&afe>` in the sound node) so no device-name guessing is
+ * involved; the codec side resolves by component name, and the name is
+ * "mt6359-sound" -- the MFD cell in mt6397-core.c, not "mt6359-codec". */
+SND_SOC_DAILINK_DEFS(dl1,
+	DAILINK_COMP_ARRAY(COMP_EMPTY()),
+	DAILINK_COMP_ARRAY(COMP_CODEC("mt6359-sound",
+				      "mt6359-snd-codec-aif1")),
+	DAILINK_COMP_ARRAY(COMP_EMPTY()));
+
 static struct snd_soc_dai_link oppo_mt6877_links[] = {
 	{
 		.name = "DL1",
 		.stream_name = "DL1",
-		.cpu_dai_name = "DL1",
-		.codec_dai_name = "mt6359-snd-codec-aif1",
-		.codec_name = "mt6359-codec",
+		SND_SOC_DAILINK_REG(dl1),
 		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
 			   SND_SOC_DAIFMT_CBS_CFS,
 	},
@@ -191,6 +197,17 @@ static struct snd_soc_card oppo_mt6877_card = {
 
 static int oppo_machine_probe(struct platform_device *pdev)
 {
+	struct snd_soc_dai_link *link = oppo_mt6877_links;
+	struct device_node *np = pdev->dev.of_node;
+
+	link->cpus->of_node = of_parse_phandle(np, "cpu", 0);
+	if (!link->cpus->of_node) {
+		dev_err(&pdev->dev, "missing cpu phandle in sound node\n");
+		return -EINVAL;
+	}
+	link->cpus->dai_name = "DL1";
+	link->platforms->of_node = link->cpus->of_node;
+
 	oppo_mt6877_card.dev = &pdev->dev;
 	return devm_snd_soc_register_card(&pdev->dev, &oppo_mt6877_card);
 }
@@ -208,7 +225,31 @@ static struct platform_driver oppo_machine_driver = {
 		.of_match_table = oppo_machine_match,
 	},
 };
-module_platform_driver(oppo_machine_driver);
+
+/* One module, two platform drivers: a single init/exit registers both.
+ * Two module_platform_driver() calls would redefine init_module (each
+ * expands to its own module_init/module_exit pair). */
+static int __init oppo_audio_init(void)
+{
+	int ret;
+
+	ret = platform_driver_register(&oppo_afe_driver);
+	if (ret)
+		return ret;
+	ret = platform_driver_register(&oppo_machine_driver);
+	if (ret)
+		platform_driver_unregister(&oppo_afe_driver);
+	return ret;
+}
+
+static void __exit oppo_audio_exit(void)
+{
+	platform_driver_unregister(&oppo_machine_driver);
+	platform_driver_unregister(&oppo_afe_driver);
+}
+
+module_init(oppo_audio_init);
+module_exit(oppo_audio_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("MixOS project");

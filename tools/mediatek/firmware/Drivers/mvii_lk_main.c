@@ -1147,6 +1147,52 @@ static void lk_fb_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t 
     }
 }
 
+/* Snapshot one box from the live canvas into the shadow, so a translucent
+ * compose blends over the real picture instead of stale DRAM. The reverse of
+ * lk_fb_blit_live(), clipped the same way, and -- like the blit -- it names
+ * both ends explicitly rather than following g_draw_base: it IS the transfer.
+ * Repaints reuse it as an eraser: the live box already holds the last
+ * presented composite, so re-snapshotting a text row restores the blended
+ * background under it without the painter remembering any color. */
+static void lk_fb_snapshot_live(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    const uint32_t stride = (uint32_t)MVII_MT6592_LK_FB_PITCH / 4u;
+    const volatile uint32_t* src = (const volatile uint32_t*)(uintptr_t)MVII_MT6592_LK_FB_ADDR;
+    volatile uint32_t* dst = (volatile uint32_t*)(uintptr_t)MVII_MT6592_LK_SHADOW_ADDR;
+    uint32_t x1 = x + w;
+    uint32_t y1 = y + h;
+
+    if (x1 > (uint32_t)MVII_MT6592_LK_FB_WIDTH) x1 = (uint32_t)MVII_MT6592_LK_FB_WIDTH;
+    if (y1 > (uint32_t)MVII_MT6592_LK_FB_HEIGHT) y1 = (uint32_t)MVII_MT6592_LK_FB_HEIGHT;
+    if (x >= x1 || y >= y1) return;
+
+    for (uint32_t yy = y; yy < y1; ++yy) {
+        const uint32_t row = yy * stride;
+        for (uint32_t xx = x; xx < x1; ++xx) dst[row + xx] = src[row + xx];
+    }
+}
+
+/* Fill one box blending over what is there, pixel by pixel through
+ * lk_blend_pixel(). Follows g_draw_base like lk_fb_rect(), so a translucent
+ * compose targets the shadow first, paints, and presents -- the same
+ * off-screen round trip as the charge screen, which is what keeps the panel
+ * from showing the compose half-done. */
+static void lk_fb_blend_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t argb) {
+    const uint32_t stride = (uint32_t)MVII_MT6592_LK_FB_PITCH / 4u;
+    volatile uint32_t* px = (volatile uint32_t*)(uintptr_t)g_draw_base;
+    uint32_t x1 = x + w;
+    uint32_t y1 = y + h;
+
+    if (x1 > (uint32_t)MVII_MT6592_LK_FB_WIDTH) x1 = (uint32_t)MVII_MT6592_LK_FB_WIDTH;
+    if (y1 > (uint32_t)MVII_MT6592_LK_FB_HEIGHT) y1 = (uint32_t)MVII_MT6592_LK_FB_HEIGHT;
+
+    for (uint32_t yy = y; yy < y1; ++yy) {
+        for (uint32_t xx = x; xx < x1; ++xx) {
+            const uint32_t i = yy * stride + xx;
+            px[i] = lk_blend_pixel(px[i], argb);
+        }
+    }
+}
+
 static void lk_fb_glyph(uint32_t index, uint32_t x, uint32_t y, uint32_t scale, uint32_t argb) {
     for (uint32_t row = 0; row < 5u; ++row) {
         const uint32_t bits = kGlyphs[index][row];
@@ -3570,16 +3616,18 @@ failed:
  * a card that hands off boots MixOS, anything else falls through to Android.
  * This window makes the choice visible and hands it to the operator. It runs
  * after the display lights the splash and before anything paints on top of it,
- * so the prompt and its countdown sit on the logo itself: a banner along the
- * bottom, the prompt blinking above a bar that drains green-amber-red, and the
- * whole seconds left in a digit at the bar's right end.
+ * so the prompt and its countdown sit on the logo itself: a translucent
+ * banner along the bottom, blended over a snapshot of the splash, the prompt
+ * blinking above a bar that drains green-amber-red, and the whole seconds
+ * left in a digit at the bar's right end.
  *
  * A press anywhere in the window tags the eMMC Android image and the SD
  * hand-off below is skipped; silence tags MixOS and the hand-off runs as it
  * always has. Afterwards the banner is repainted once as the tag -- BOOTING
  * ANDROID or BOOTING MIXOS -- which is what stays on the panel through the
- * load. Nothing here needs the asset slot: rectangles and the 3x5 table only,
- * so a board that never took an `-assets` flash gets the same window.
+ * load. Nothing here needs the asset slot: one splash snapshot, blended
+ * rectangles and the 3x5 table, so a board that never took an `-assets`
+ * flash gets the same window.
  *
  * Edges, not levels. A button held from power-on -- the debug console's whole
  * vocabulary -- must not read as a fresh press, so the first scan is the
@@ -3615,6 +3663,7 @@ enum {
 };
 
 #define LK_BOOTMENU_BG 0xff0c1420u
+#define LK_BOOTMENU_OVERLAY 0xd90c1420u
 #define LK_BOOTMENU_FRAME 0xff2a3f55u
 #define LK_BOOTMENU_INK 0xffffffffu
 #define LK_BOOTMENU_DIM 0xff5a6a7au
@@ -3646,9 +3695,11 @@ static void lk_bootmenu_bar(uint32_t elapsed_ms) {
 static void lk_bootmenu_digit(uint32_t elapsed_ms) {
     const uint32_t s = lk_bootmenu_remaining_s(elapsed_ms);
 
-    lk_fb_rect(LK_BOOTMENU_DIGIT_X, LK_BOOTMENU_DIGIT_Y,
-               3u * LK_BOOTMENU_DIGIT_SCALE, 5u * LK_BOOTMENU_DIGIT_SCALE,
-               LK_BOOTMENU_BG);
+    /* Erase by re-snapshotting the cell: the banner behind the digit is a
+     * blend, not a flat color, so only the presented composite restores it. */
+    lk_fb_snapshot_live(LK_BOOTMENU_DIGIT_X, LK_BOOTMENU_DIGIT_Y,
+                        3u * LK_BOOTMENU_DIGIT_SCALE,
+                        5u * LK_BOOTMENU_DIGIT_SCALE);
     if (s > 0u) lk_fb_glyph(s, LK_BOOTMENU_DIGIT_X, LK_BOOTMENU_DIGIT_Y,
                             LK_BOOTMENU_DIGIT_SCALE, LK_BOOTMENU_INK);
 }
@@ -3657,13 +3708,25 @@ static void lk_bootmenu_prompt(int lit) {
     const uint32_t w = lk_text_width(kBootmenuPrompt, LK_BOOTMENU_TEXT_SCALE);
     const uint32_t x = ((uint32_t)MVII_MT6592_LK_FB_WIDTH - w) / 2u;
 
+    /* Same eraser as the digit: without it the blink's bright phase never
+     * leaves the canvas and the text strobes instead of breathing. */
+    lk_fb_snapshot_live(x, LK_BOOTMENU_TEXT_Y, w,
+                        5u * LK_BOOTMENU_TEXT_SCALE);
     lk_fb_text(kBootmenuPrompt, x, LK_BOOTMENU_TEXT_Y, LK_BOOTMENU_TEXT_SCALE,
                lit ? LK_BOOTMENU_INK : LK_BOOTMENU_DIM);
 }
 
 static void lk_bootmenu_frame(void) {
-    lk_fb_rect(LK_BOOTMENU_BANNER_X, LK_BOOTMENU_BANNER_Y, LK_BOOTMENU_BANNER_W,
-               LK_BOOTMENU_BANNER_H, LK_BOOTMENU_BG);
+    /* The splash underneath first, then the banner blended over it: the logo
+     * ghosts through the overlay instead of stale DRAM showing around it.
+     * Everything composes on the shadow and lands with one present, so the
+     * panel never catches a half-drawn frame -- the stutter the old live
+     * drawing had, painting pixels the very next present overwrote. */
+    lk_fb_snapshot_live(LK_BOOTMENU_BANNER_X, LK_BOOTMENU_BANNER_Y,
+                        LK_BOOTMENU_BANNER_W, LK_BOOTMENU_BANNER_H);
+    lk_fb_blend_rect(LK_BOOTMENU_BANNER_X, LK_BOOTMENU_BANNER_Y,
+                     LK_BOOTMENU_BANNER_W, LK_BOOTMENU_BANNER_H,
+                     LK_BOOTMENU_OVERLAY);
     lk_fb_rect(LK_BOOTMENU_BANNER_X, LK_BOOTMENU_BANNER_Y, LK_BOOTMENU_BANNER_W,
                2u, LK_BOOTMENU_FRAME);
     lk_fb_rect(LK_BOOTMENU_BANNER_X,
@@ -3683,6 +3746,8 @@ static void lk_bootmenu_frame(void) {
 
 /* The tag, repainted over the banner once the choice is made -- and again
  * after the charge park, which paints its gauge on top on battery builds.
+ * The banner is a translucent overlay; the tag is opaque, because it has to
+ * read over anything -- the gauge, the splash -- through the whole load.
  * MIXOS sets its M from the table's lowercase cell, the only M it has. */
 static void lk_bootmenu_badge(uint32_t android) {
     const char* text = android != 0u ? "BOOTING ANDROID" : "BOOTING MIXOS";
@@ -3762,6 +3827,10 @@ static uint32_t lk_bootmenu_run(void) {
     (void)lk_kpd_scan(prev);
     prev_menu = lk_kpd_menu_down();
 
+    /* Off-screen for the whole window: compose on the shadow, land with a
+     * present. Restored before the return so the badge calls in the dispatch
+     * below, which wrap themselves the same way, cannot nest it. */
+    lk_fb_target((uint32_t)MVII_MT6592_LK_SHADOW_ADDR);
     lk_bootmenu_frame();
     t0 = mt6592_delay_gpt_ticks();
     for (polls = 0u; polls < LK_BOOTMENU_POLLS_MAX; ++polls) {
@@ -3797,6 +3866,7 @@ static uint32_t lk_bootmenu_run(void) {
     }
 
     lk_bootmenu_badge(lk_bootmenu_pick(pressed));
+    lk_fb_target((uint32_t)MVII_MT6592_LK_FB_ADDR);
     lk_log("lk: bootmenu kpd");
     for (i = 0u; i < LK_KPD_NUM_MEMS; ++i) lk_log_hex(" mem=", cur[i]);
     lk_log_hex(" menu=", lk_kpd_menu_down());
@@ -4176,7 +4246,11 @@ void mvii_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
     /* The park painted its gauge over the tag on battery builds; put the tag
      * back so the panel names the target through the load. On batteryless
      * builds this repaints identical pixels and costs one blit. */
-    if (display_rc == 0) lk_bootmenu_badge(boot_android);
+    if (display_rc == 0) {
+        lk_fb_target((uint32_t)MVII_MT6592_LK_SHADOW_ADDR);
+        lk_bootmenu_badge(boot_android);
+        lk_fb_target((uint32_t)MVII_MT6592_LK_FB_ADDR);
+    }
 #endif
 
 #ifdef MVII_MT6592_LK_SD_HANDOFF
@@ -4201,7 +4275,11 @@ void mvii_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
         /* Declined: the card is absent or unbootable, so the eMMC image below
          * is what boots. Re-tag honestly -- the badge said MixOS until now. */
         boot_android = 1u;
-        if (display_rc == 0) lk_bootmenu_badge(boot_android);
+        if (display_rc == 0) {
+            lk_fb_target((uint32_t)MVII_MT6592_LK_SHADOW_ADDR);
+            lk_bootmenu_badge(boot_android);
+            lk_fb_target((uint32_t)MVII_MT6592_LK_FB_ADDR);
+        }
         lk_mark(MT6592_BOOT_STATUS_STAGE_LK_BOOT_SELECT,
                 "lk: SD hand-off declined; boot re-tagged android (eMMC fallback)\n",
                 LK_BOOTMENU_BEACON_ANDROID);
