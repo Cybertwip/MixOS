@@ -682,3 +682,19 @@ func TestCountdownCrashKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestNullJumpPayload(t *testing.T) {
+	p := nullJumpPayload()
+	want := []byte{0x00, 0x01, 0x9F, 0xE5, 0x10, 0xFF, 0x2F, 0xE1}
+	if len(p) != len(want)+0x110 {
+		t.Fatalf("nullJumpPayload length = %#x, want %#x", len(p), len(want)+0x110)
+	}
+	if !bytes.Equal(p[:len(want)], want) {
+		t.Fatalf("nullJumpPayload stub = %x, want %x", p[:len(want)], want)
+	}
+	for i, b := range p[len(want):] {
+		if b != 0 {
+			t.Fatalf("nullJumpPayload padding byte %d = %#02x, want 0", i, b)
+		}
+	}
+}
