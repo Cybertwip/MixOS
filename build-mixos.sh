@@ -12,7 +12,12 @@
 # tables, this script only enumerates them. New OPPO or LG device rows are
 # picked up with no edits here.
 #
-# Sequential, not parallel: all three families share the one Multipass VM,
+# The two bring-up scaffolds (device/oppo-a77, device/lg-k20) are wired
+# but OPT-IN ONLY (--only oppo-a77 / --only lg-k20): they build images
+# that will not boot yet, and their ACK gates would fail a default run.
+# Promotion into the default plan is each tree's BRINGUP step 6.
+#
+# Sequential, not parallel: all families share the one Multipass VM,
 # and the VM refuses concurrent builds on purpose.
 
 if [ -z "${BASH_VERSION:-}" ] || [ -z "${MIXOS_SNAPSHOT:-}" ]; then
@@ -35,6 +40,10 @@ DARKOS_LOG_TAG="build-mixos"
 . "$ROOT/device/oppo-mt6877/devices.sh"
 # shellcheck source=device/lg-k20plus/devices.sh
 . "$ROOT/device/lg-k20plus/devices.sh"
+# shellcheck source=device/oppo-a77/devices.sh
+. "$ROOT/device/oppo-a77/devices.sh"
+# shellcheck source=device/lg-k20/devices.sh
+. "$ROOT/device/lg-k20/devices.sh"
 
 MIX_ONLY=0
 COMPRESS=0
@@ -46,7 +55,7 @@ ONLY=""
 usage() {
     cat <<USAGE
 Usage: ./build-mixos.sh [--mix-only | --compress] [--skip-j36] [--skip-oppo] [--skip-lg]
-                        [--only j36|oppo|lg] [--list]
+                        [--only j36|oppo|lg|oppo-a77|lg-k20] [--list]
 
 Builds all families in sequence: J36 Ultra, then every OPPO device, then
 every LG device. Each family runs in the shared Multipass VM with its own
@@ -56,6 +65,10 @@ only what changed.
     ./build-mixos.sh --list        show the build plan without building
     ./build-mixos.sh --mix-only    board specifics only, per family
     ./build-mixos.sh --only oppo   just the OPPO family (all its devices)
+
+Bring-up scaffolds are opt-in only (never in the default plan):
+    ./build-mixos.sh --only oppo-a77   needs OPPO_A77_BRINGUP_ACK=1
+    ./build-mixos.sh --only lg-k20     needs LG_K20_BRINGUP_ACK=1
 
 Anything the family wrappers honour (OPPO_DEVICE is NOT honoured here --
 this script enumerates devices itself; OPPO_FIRMWARE_DIR, LG_FIRMWARE_DIR,
@@ -81,8 +94,8 @@ if [[ "$MIX_ONLY" == 1 && "$COMPRESS" == 1 ]]; then
     darkos_die "--compress cannot be combined with --mix-only."
 fi
 case "$ONLY" in
-    ""|j36|oppo|lg|list) ;;
-    *) darkos_die "--only takes j36, oppo or lg." ;;
+    ""|j36|oppo|lg|oppo-a77|lg-k20|list) ;;
+    *) darkos_die "--only takes j36, oppo, lg, oppo-a77 or lg-k20." ;;
 esac
 
 # The plan: (label, command...). OPPO_DEVICE/LG_DEVICE are set per device so
@@ -112,11 +125,30 @@ if [[ "$ONLY" == "" || "$ONLY" == lg ]] && [[ "$SKIP_LG" == 0 ]]; then
         PLAN_CMDS+=("LG_DEVICE=$dev $ROOT/build-lg.sh ${EXTRA[*]}")
     done < <(lg_devices)
 fi
+# Bring-up scaffolds: explicit --only, never the default plan (their ACK
+# gates would fail it, and their images do not boot yet).
+if [[ "$ONLY" == oppo-a77 ]]; then
+    while read -r dev; do
+        [[ -n "$dev" ]] || continue
+        PLAN_LABELS+=("oppo-a77:$dev")
+        PLAN_CMDS+=("A77_DEVICE=$dev $ROOT/build-oppo-a77.sh ${EXTRA[*]}")
+    done < <(a77_devices)
+fi
+if [[ "$ONLY" == lg-k20 ]]; then
+    while read -r dev; do
+        [[ -n "$dev" ]] || continue
+        PLAN_LABELS+=("lg-k20:$dev")
+        PLAN_CMDS+=("K20_DEVICE=$dev $ROOT/build-lg-k20.sh ${EXTRA[*]}")
+    done < <(k20_devices)
+fi
 
 if [[ "$ONLY" == list ]]; then
     echo "j36-ultra"
     oppo_devices | sed 's/^/oppo:/'
     lg_devices | sed 's/^/lg:/'
+    echo "# bring-up scaffolds (opt-in only, never in the default plan):"
+    a77_devices | sed 's/^/oppo-a77:/'
+    k20_devices | sed 's/^/lg-k20:/'
     exit 0
 fi
 

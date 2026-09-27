@@ -20,7 +20,7 @@ else
 fi
 # --list names every family and its status without building anything.
 listing="$("$ROOT/build-flashtools.sh" --list)" || { echo "FAIL: --list exits nonzero"; fail=1; }
-for d in j36-ultra oppo-mt6877 lg-msm8917; do
+for d in j36-ultra oppo-mt6877 lg-msm8917 oppo-mt6833 lg-mt6739; do
     printf '%s\n' "$listing" | grep -q "$d" \
         || { echo "FAIL: --list omits $d"; fail=1; }
 done
@@ -32,6 +32,11 @@ if "$ROOT/build-flashtools.sh" --device oppo-mt6877 >/dev/null 2>&1; then
     echo "FAIL: --device oppo-mt6877 built something"; fail=1
 else
     echo "  --device oppo-mt6877: refused ok"
+fi
+if "$ROOT/build-flashtools.sh" --device lg-mt6739 >/dev/null 2>&1; then
+    echo "FAIL: --device lg-mt6739 built something"; fail=1
+else
+    echo "  --device lg-mt6739: refused ok"
 fi
 if "$ROOT/build-flashtools.sh" --device bogus >/dev/null 2>&1; then
     echo "FAIL: --device bogus accepted"; fail=1

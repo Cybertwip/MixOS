@@ -38,6 +38,8 @@ wired() { # $1 = wrapper file, $2 = family
 
 wired build-oppo.sh oppo
 wired build-lg.sh lg
+wired build-oppo-a77.sh oppo
+wired build-lg-k20.sh lg
 wired build-j36-ultra.sh qbuy
 wired build-r36-ultra.sh qbuy
 
@@ -61,9 +63,13 @@ handover_keys() { # $1 = device dir, $2 = wrapper, $3 = family
 
 handover_keys device/oppo-mt6877 build-oppo.sh oppo
 handover_keys device/lg-k20plus build-lg.sh lg
+handover_keys device/oppo-a77 build-oppo-a77.sh oppo-a77
+handover_keys device/lg-k20 build-lg-k20.sh lg-k20
 
-# Offline firmware stays wired: each wrapper must honor its ROM env knob
-# by invoking its fetch script into the default stock/ dir.
+# Offline firmware stays wired: each shipped wrapper must honor its ROM
+# env knob by invoking its fetch script into the default stock/ dir.
+# (The bring-up scaffolds take a staged FIRMWARE_DIR only; their fetch
+# wiring lands at BRINGUP step 4, so they have no rows here yet.)
 firmware_wired() { # $1 = wrapper, $2 = env knob, $3 = fetch script
     grep -q "$2" "$ROOT/$1" \
         || { echo "FAIL: $1 ignores $2"; fail=1; }

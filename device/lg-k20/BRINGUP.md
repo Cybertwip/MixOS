@@ -56,6 +56,7 @@ full image until login.
 
 ## Step 6 -- promote
 
-When login works: remove the `LG_K20_BRINGUP_ACK` gate, wire the family
-into `build-mixos.sh`, extend the wifi-bringup-style checks, and update
-this file into history (what each fact turned out to be, with sources).
+When login works: remove the `LG_K20_BRINGUP_ACK` gate, promote the
+family into `build-mixos.sh`'s default plan (it is `--only` opt-in
+today), extend the wifi-bringup-style checks, and update this file
+into history (what each fact turned out to be, with sources).

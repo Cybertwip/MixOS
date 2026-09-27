@@ -8,14 +8,16 @@
 # when the firmware gains flags: build.sh owns the power-mode table, this
 # script only enumerates it. The device table lives here: j36-ultra is the
 # only family with LK sources (tools/mediatek/firmware, MT6592). The phones
-# keep their stock bootloaders -- OPPO's closed LK on the MT6877, Qualcomm
-# aboot on the MSM8917 -- so there is nothing to build for them until
-# vendor LK sources exist; --list states that per family instead of failing.
+# keep their stock bootloaders -- OPPO's closed LK on the MT6877 and MT6833,
+# LG's closed LK on the MT6739, Qualcomm aboot on the MSM8917 -- so there is
+# nothing to build for them until vendor LK sources exist; --list states
+# that per family instead of failing.
 #
 # Usage: ./build-flashtools.sh [--device NAME] [--battery-only | --without-battery] [--tests]
 #
-#   --device NAME      build only one family (j36-ultra, oppo-mt6877, lg-msm8917).
-#                      Families without LK sources fail loudly with the reason.
+#   --device NAME      build only one family (j36-ultra, oppo-mt6877, lg-msm8917,
+#                      oppo-mt6833, lg-mt6739). Families without LK sources fail
+#                      loudly with the reason.
 #   --list             print the device matrix and exit without building
 #   --battery-only     build only build/mediatek/j36-ultra/battery/boot
 #   --without-battery  build only build/mediatek/j36-ultra/without-battery/boot
@@ -46,6 +48,8 @@ lk_matrix() {
     printf '%-14s %s\n' j36-ultra "builds: tools/mediatek/firmware -> build/mediatek/j36-ultra/<mode>/boot"
     printf '%-14s %s\n' oppo-mt6877 "no LK sources: the Dimensity 900 LK is OPPO's closed bootloader; the phone keeps stock LK (OS image: ./build-oppo.sh)"
     printf '%-14s %s\n' lg-msm8917 "no LK sources: the MSM8917 boots Qualcomm aboot, not LK; the phone keeps stock aboot (OS image: ./build-lg.sh)"
+    printf '%-14s %s\n' oppo-mt6833 "no LK sources: the Dimensity 810 LK is OPPO's closed bootloader; the phone keeps stock LK (OS image: ./build-oppo-a77.sh)"
+    printf '%-14s %s\n' lg-mt6739 "no LK sources: the MT6739 LK is LG's closed bootloader; the phone keeps stock LK (OS image: ./build-lg-k20.sh)"
 }
 if [[ "$LIST_ONLY" == 1 ]]; then
     lk_matrix
@@ -54,23 +58,30 @@ fi
 if [[ -n "$DEVICE" ]]; then
     case "$DEVICE" in
         j36-ultra) ;;
-        oppo-mt6877|lg-msm8917)
-            if [[ "$DEVICE" == oppo-mt6877 ]]; then
-                reason="the MT6877 LK is OPPO's closed bootloader"
-                instead="./build-oppo.sh"
-            else
-                reason="the MSM8917 boots Qualcomm aboot, not LK"
-                instead="./build-lg.sh"
-            fi
+        oppo-mt6877|lg-msm8917|oppo-mt6833|lg-mt6739)
+            case "$DEVICE" in
+                oppo-mt6877)
+                    reason="the MT6877 LK is OPPO's closed bootloader"
+                    instead="./build-oppo.sh" ;;
+                lg-msm8917)
+                    reason="the MSM8917 boots Qualcomm aboot, not LK"
+                    instead="./build-lg.sh" ;;
+                oppo-mt6833)
+                    reason="the MT6833 LK is OPPO's closed bootloader"
+                    instead="./build-oppo-a77.sh" ;;
+                lg-mt6739)
+                    reason="the MT6739 LK is LG's closed bootloader"
+                    instead="./build-lg-k20.sh" ;;
+            esac
             echo "error: no LK sources for $DEVICE -- $reason; the phone keeps its stock bootloader" >&2
             echo "Build its OS image instead: $instead." >&2
             echo "LK sources for it would start as a new tools/<soc>/ tree, not as modes here." >&2
             exit 1 ;;
-        *) echo "Unknown device: $DEVICE (want j36-ultra, oppo-mt6877, lg-msm8917)" >&2; exit 2 ;;
+        *) echo "Unknown device: $DEVICE (want j36-ultra, oppo-mt6877, lg-msm8917, oppo-mt6833, lg-mt6739)" >&2; exit 2 ;;
     esac
 else
     DEVICE="j36-ultra"
-    echo "NOTE: oppo-mt6877 and lg-msm8917 have no LK sources (stock bootloaders retained); building j36-ultra only. See --list."
+    echo "NOTE: oppo-mt6877, lg-msm8917, oppo-mt6833 and lg-mt6739 have no LK sources (stock bootloaders retained); building j36-ultra only. See --list."
 fi
 
 export GOFLAGS="${GOFLAGS:--mod=mod}"
