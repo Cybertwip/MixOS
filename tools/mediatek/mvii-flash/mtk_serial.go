@@ -92,6 +92,7 @@ type mtkSerialClient struct {
 	device           string
 	commandTimeout   time.Duration
 	writeTimeout     time.Duration
+	handshakeWake    bool
 	writeMu          sync.Mutex
 	blVersion        byte
 	bromVersion      byte
