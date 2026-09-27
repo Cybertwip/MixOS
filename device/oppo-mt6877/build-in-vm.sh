@@ -222,10 +222,14 @@ CPIO="$ART/oppo-$DEVICE.cpio"
 # ── boot.img ─────────────────────────────────────────────────────────────────
 BOOTIMG="$ART/oppo-$DEVICE-boot.img"
 CMDLINE="earlycon console=ttyS0,921600n8 root=PARTLABEL=ROOTFS rw rootwait oppo.audio=1 oppo.wifi=1 oppo.modem=1 oppo.power=1 oppo.device=$DEVICE"
-mkbootimg --kernel "$KOUT/arch/arm64/boot/Image" \
-    --ramdisk "$CPIO.gz" --dtb "$DTB" \
+# The device tree rides appended to the kernel -- the header is v1 so the
+# MTK LK bootloader parses it, and it has always found the DTB this way.
+# Packing is device/common/mkbootimg.py: no AOSP host tools required.
+cat "$KOUT/arch/arm64/boot/Image" "$DTB" > "$WORK/Image-dtb"
+python3 "$ROOT/device/common/mkbootimg.py" \
+    --kernel "$WORK/Image-dtb" --ramdisk "$CPIO.gz" \
     --cmdline "$CMDLINE" --base 0x40000000 --pagesize 4096 \
-    -o "$BOOTIMG"
+    --name "mixos-$DEVICE" --output "$BOOTIMG"
 log "boot.img: $(stat -c %s "$BOOTIMG") bytes"
 
 # ── the Debian rootfs (full builds only; checkpointed) ──────────────────────

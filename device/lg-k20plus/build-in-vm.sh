@@ -199,10 +199,14 @@ CPIO="$ART/lg-$DEVICE.cpio"
 # ── boot.img ─────────────────────────────────────────────────────────────────
 BOOTIMG="$ART/lg-$DEVICE-boot.img"
 CMDLINE="earlycon console=ttyMSM0,115200n8 root=PARTLABEL=ROOTFS rw rootwait lg.audio=1 lg.wifi=1 lg.modem=1 lg.power=1 lg.device=$DEVICE lg.panel=$LG_PANEL"
-mkbootimg --kernel "$KOUT/arch/arm64/boot/Image" \
-    --ramdisk "$CPIO.gz" --dtb "$DTB" \
+# The device tree rides appended to the kernel -- the header is v1 so the
+# 2016-era aboot parses it, and it has always found the DTB this way.
+# Packing is device/common/mkbootimg.py: no AOSP host tools required.
+cat "$KOUT/arch/arm64/boot/Image" "$DTB" > "$WORK/Image-dtb"
+python3 "$ROOT/device/common/mkbootimg.py" \
+    --kernel "$WORK/Image-dtb" --ramdisk "$CPIO.gz" \
     --cmdline "$CMDLINE" --base 0x80000000 --pagesize 4096 \
-    -o "$BOOTIMG"
+    --name "mixos-$DEVICE" --output "$BOOTIMG"
 log "boot.img: $(stat -c %s "$BOOTIMG") bytes"
 
 # ── the Debian rootfs (full builds only; checkpointed) ──────────────────────
