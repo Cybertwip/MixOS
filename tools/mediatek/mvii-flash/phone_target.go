@@ -102,7 +102,8 @@ func confirmWord(cfg config) string {
 // refusePhoneWrite gates every device-touching run with a phone -root.
 // It returns nil only for the honest phone paths (fastboot with an
 // explicit partition and no -device; BROM raw exec with explicit address
-// and no feed/-upload flags); anything else fails with the reason and the
+// and no feed/-upload flags; -unlock with its own mtkclient-backed flow
+// and consent); anything else fails with the reason and the
 // alternative. Pure over cfg + the root dir, so the Go suite pins the
 // whole matrix.
 func refusePhoneWrite(cfg config, phone *phoneRoot) error {
@@ -121,6 +122,11 @@ func refusePhoneWrite(cfg config, phone *phoneRoot) error {
 		// run(), where this shape returns before the auto-feed). Without
 		// -address the same -device would select the j36 BROM feed.
 		if j36OnlyVerb(cfg) == "" && hasRawAddress(cfg) && cfg.upload == "" {
+			return nil
+		}
+		// -unlock is phone-explicit (mtkclient-backed boot1 backup/patch/
+		// write with its own consent); it never selects the j36 feed.
+		if cfg.unlock {
 			return nil
 		}
 		// Staged phone BROM (step 6 groundwork): every staging file is

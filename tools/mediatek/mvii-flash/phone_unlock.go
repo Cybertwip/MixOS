@@ -58,7 +58,7 @@ func patchUnlockPreloader(data []byte) ([]byte, unlockPatchReport, error) {
 	if !bytes.HasPrefix(data, []byte("EMMC_BOOT")) &&
 		!bytes.HasPrefix(data, []byte("UFS_BOOT")) &&
 		!bytes.HasPrefix(data, []byte("COMBO_BOOT")) {
-		fmt.Printf("warn: unknown magic %q; continuing anyway\n", data[:minInt(len(data), 16)])
+		fmt.Printf("warn: unknown magic %q; continuing anyway\n", data[:min(len(data), 16)])
 	}
 	if len(data) < unlockNewCodeOff+unlockTailDrop+0x800 {
 		return nil, report, fmt.Errorf("image too small (%d bytes) to relocate code", len(data))
@@ -288,11 +288,4 @@ func runUnlockCommand(cfg config) error {
 	fmt.Printf("wrote %s to boot1 on %s\n", chosen, dev)
 	printUnlockNextSteps(backup1)
 	return nil
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

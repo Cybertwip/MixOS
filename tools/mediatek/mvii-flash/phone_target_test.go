@@ -68,6 +68,7 @@ func TestRefusePhoneWrite(t *testing.T) {
 		{root: phone, device: "/dev/cu.usbmodemXXXX", mtkPayloadAddr: "0x110000"},
 		{root: phone, device: "/dev/cu.usbmodemXXXX", mtkPayloadAddr: "0x110000", image: "stub.bin"},
 		{root: phone, device: "/dev/cu.usbmodemXXXX", mtkPayloadEntry: "0x112000"},
+		{root: phone, unlock: true, device: "/dev/cu.usbmodemXXXX", preloader: "boot1.bin"},
 		{root: phone, listOnly: true},
 	}
 	for i, cfg := range allow {
