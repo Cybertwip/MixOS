@@ -367,6 +367,33 @@ func TestWaitPhoneBROMExpiredConnectFails(t *testing.T) {
 	}
 }
 
+// The crash sequence must run to completion against a dead peer (every
+// error ignored) and emit the three mode shapes: SEND_DA, register read,
+// then SEND_DA plus the null jump.
+func TestCrashPhonePreloader(t *testing.T) {
+	phone := writePhoneRoot(t, "device=cph2385-4gb\nsoc=mt6765\n")
+	info, ok := detectPhoneRoot(phone)
+	if !ok {
+		t.Fatal("fixture not detected")
+	}
+	facts, err := phoneFactsFor("mt6765")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := &failPort{err: errors.New("read /dev/cu.usbmodem1: device not configured")}
+	client := &mtkSerialClient{port: port, commandTimeout: time.Millisecond, writeTimeout: time.Millisecond}
+	crashPhonePreloader(client, info, facts)
+	var joined []byte
+	for _, w := range port.writes {
+		joined = append(joined, w...)
+	}
+	for _, want := range [][]byte{{mtkCmdSendDA}, {mtkCmdRead32}, {mtkCmdJumpDA}} {
+		if !bytes.Contains(joined, want) {
+			t.Fatalf("writes = %x, want command byte %x", joined, want)
+		}
+	}
+}
+
 func TestFlagFailureAdvice(t *testing.T) {
 	err := flagFailureAdvice(errors.New("unlock BOOT_MISC: write32(0x1001a100) initial status 0x1001"))
 	if err == nil || !strings.Contains(err.Error(), "0x1001") || !strings.Contains(err.Error(), "Vol-down") {

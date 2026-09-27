@@ -501,6 +501,47 @@ func flagFailureAdvice(err error) error {
 	return fmt.Errorf("%w; secured preloaders block register writes -- power off, hold Vol-down, replug for BROM mode, and rerun", err)
 }
 
+// crashPhonePreloader tries the generic preloader-to-BROM crash modes in
+// order, checking for a BROM landing between modes so a success is never
+// crashed again:
+//
+//	0: malformed DA download (null address, zero payload)
+//	1: malformed register read (address 0, long count)
+//	2: null jump (tiny ARM return stub at address 0, then jump there;
+//	   on BootROM-mapped address 0 this reboots straight into BROM)
+//
+// All three are RAM/protocol operations only -- no DA runs, no eMMC
+// command is ever issued, so the worst outcome is a reboot (normal boot
+// lands invisible; the wait loop then expires cleanly). Secured
+// preloaders may clean-refuse individual modes instead of crashing;
+// every error here is expected and ignored. Stops at the first BROM.
+func crashPhonePreloader(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts) {
+	armReturn := []byte{0x00, 0x01, 0x9F, 0xE5, 0x10, 0xFF, 0x2F, 0xE1}
+	modes := []struct {
+		name string
+		fire func() error
+	}{
+		{"malformed DA download", func() error { return c.sendDA(0, 0x100, make([]byte, 0x100)) }},
+		{"malformed register read", func() error { _, err := c.read32(0, 0x100); return err }},
+		{"null jump", func() error {
+			payload := append(append([]byte(nil), armReturn...), make([]byte, 0x110)...)
+			if err := c.sendDA(0x0, 0x0, payload); err != nil {
+				return err
+			}
+			return c.jumpDA(0x0)
+		}},
+	}
+	for i, mode := range modes {
+		fmt.Printf("Crash attempt %d/3 (%s)...\n", i+1, mode.name)
+		_ = mode.fire()
+		time.Sleep(time.Second)
+		if _, err := probePhoneBROMOnce(c, phone, facts, true); err == nil && c.isBROM {
+			fmt.Println("Crash landed BROM.")
+			return
+		}
+	}
+}
+
 // needsPhoneAuth decides whether the SEND_AUTH step runs: on DAA targets
 // with a blob to send. It is only reached in BROM mode -- flashPhoneBROM
 // transitions out of preloader mode first, because the preloader neither
@@ -645,6 +686,7 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 		if err := setPhonePreloaderBROMFlag(client, facts); err != nil {
 			fmt.Printf("Warning: %v\n", flagFailureAdvice(err))
 		}
+		crashPhonePreloader(client, phone, facts)
 		client, target, err = waitPhoneBROM(cfg, phone, facts, client, 3*time.Minute,
 			func(device string) (*mtkSerialClient, error) {
 				return connectMTKSerialWithOptions(device, mtkSerialConnectOptions{handshakeWake: true})
