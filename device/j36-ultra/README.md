@@ -167,47 +167,27 @@ VM. The first J36 run creates a persistent ARMv7 Linux 6.12 LTS workspace; later
 runs rebuild only changed kernel, DTB, input-module, initramfs and `boot.img`
 files.
 
-`--without-battery` also works with `--mix-only`. It writes `j36.usb=novbus`
-and `j36.power=external` into `mvii/boot.conf`. The OTG data port does not
-source 5 V. The bootloader and the PMIC driver disable the charger watchdog and
-widen the brownout limit, and they leave the preloader's charger mode, charge
-current, and charge voltage alone. Rewriting those before the splash has
-latched this PMIC off. The matching bootloader is
-`tools/mediatek/build.sh --without-battery`, and it skips the charge screen.
-The supply still has to carry the board's load. This option cannot change the
-stock preloader or the board's wiring. A device on the OTG port needs its own
-power.
+`--without-battery` also works with `--mix-only`. It writes `j36.usb=novbus`,
+`j36.audio=1` and `j36.power=nocharge` into `mvii/boot.conf`. The OTG data
+port does not source 5 V, and the speaker amp starts off. The matching
+bootloader is `tools/mediatek/build.sh --without-battery`, and it skips the
+charge screen. The supply still has to carry the board's load. This option
+cannot change the stock preloader or the board's wiring. A device on the OTG
+port needs its own power.
 
 Update **both** the installed LK (`lk-release.bin` from that firmware build)
 and the card's Linux payload. Writing the MixOS `.img` to a removable drive
 does not update LK in the device's eMMC. The batteryless LK disables and reads
-back the charger watchdog before SD access; Linux preserves that state. Merely
-kicking the four-second timer leaves kernel decompression and early boot without
-a service routine. The normal battery build still services its charging timer.
-Batteryless Linux also keeps the class-D speaker amplifier disabled, including
-attempts by ALSA restore or the dashboard to re-enable it. Headphone audio and
-Wi-Fi remain available. The shared `j36_pwrap.ko` transport must travel with the
-input, audio and PMIC modules; the builder stages it in the initramfs and each
-payload's dependency list. All three clients use the same transaction lock.
-The Wi-Fi PMIC fallback preserves `external_power=1` if an earlier load failed.
+back the charger watchdog before SD access; Linux preserves that state.
+`j36.power=external` is accepted as a compatibility alias for
+`j36.power=nocharge`.
 
-The diagnostic message is `charger watchdog OFF (verified)`; a failed PMIC
-transaction is logged and retried. This does not establish that a supply can
-sustain the board's load; the change still needs a boot test on the device.
-
-For a shutdown around expansion, build with
-`./build-j36-ultra.sh --mix-only --without-battery --power-diagnostic`.
-This embeds diagnostic mode in the initramfs, shows `J36 DIAG v2` before
-expansion, bypasses resizing, and adds a 60-second idle check before the update
-and peripheral startup. It then saves checkpoints before each startup stage and while waiting
-for modules, including PMIC registers, cached supply voltages, boot arguments,
-and kernel messages. The two alternating files, `j36-power-0.txt` and
-`j36-power-1.txt`, are on BOOT so a PC can read them after power is lost. Keep
-both files; their boot IDs, sequence numbers and completion markers distinguish
-the newest complete checkpoint. Logging remounts BOOT writable only for each
-checkpoint. Restore a build without `--power-diagnostic` after testing. The
-current normal initramfs also accepts `j36.diag=power` in the `bootargs=` line
-of `mvii/boot.conf`; remove that word to turn off diagnostics in a normal build.
+For a boot that dies before the first `mixos-log.txt` (twenty seconds after
+the login target), add `j36.trail=1` to the `bootargs=` line of
+`mvii/boot.conf` -- no rebuild to toggle it. Every splash tick from early
+systemd then appends the uptime and the kernel's last twenty lines to
+`j36-trail.txt` on BOOT, truncating the file once at the first tick so one
+boot is one trail. The last tick in the file is how far the boot got.
 
 **The full build ships one file**, and it is not in this directory:
 

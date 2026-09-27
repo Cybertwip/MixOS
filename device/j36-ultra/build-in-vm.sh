@@ -9734,6 +9734,8 @@ initrd=initrd.img
 # j36.gl=debug adds Mesa's EGL trace.  j36.splash=0 loglevel=7 boots to text.
 # j36.expand=0 skips growing p2 if a resize wedged the boot; =retry re-arms it.
 # Each boot writes mixos-log.txt at the top of this partition; j36.log=0 stops it.
+# j36.trail=1 adds j36-trail.txt: uptime plus the last kernel lines every five
+# seconds from early systemd, for boots that die before the first mixos-log.txt.
 bootargs=console=ttyS0,115200n8 console=tty0 earlycon=mtk8250,mmio32,0x11002000 rdinit=/init root=/dev/mmcblk0p2 rw rootwait loglevel=4 vt.global_cursor_default=0 systemd.mask=firstboot.service j36.lima=1 j36.mtkdrm=1 j36.gl=1 j36.dash=1 j36.audio=speaker j36.usb=1 j36.power=1 j36.wifi=1 j36.splash=1
 CONF
 
@@ -9909,6 +9911,14 @@ is complete, so pulling the power mid-write loses the new log and keeps the old
 one rather than leaving a truncated file under the name you were told to read.
 Outside those three windows BOOT is not mounted, which matters on a handheld with
 a physical power switch.  j36.log=0 in the bootargs turns the whole thing off.
+
+A boot that dies before the first pass leaves no mixos-log.txt, and the splash
+tick is already running by then, so j36.trail=1 in the bootargs turns the tick
+into a trail: every five seconds from early systemd it appends the uptime and
+the kernel's last twenty lines to j36-trail.txt beside it, truncating the file
+once at the first tick so one boot is one trail.  The last tick in the file is
+how far the boot got, and its dmesg tail is what the kernel last said.  No
+rebuild to toggle: it is one word in mvii/boot.conf either way.
 
 The command line, word by word
 ------------------------------
