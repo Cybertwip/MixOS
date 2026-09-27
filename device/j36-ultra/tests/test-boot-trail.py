@@ -17,7 +17,8 @@ start += len("cat > /newroot/run/j36/bin/mixos-splash-tick <<'SPLASHTICK'\n")
 splash_tick = builder[start:builder.index("\nSPLASHTICK", start)]
 
 
-def run_case(cmdline, chan_present, done_present, background_done=False):
+def run_case(cmdline, chan_present, done_present, background_done=False,
+             bare_mvii_dir=False):
     with tempfile.TemporaryDirectory(prefix="j36-trail-test-") as tmp:
         root = Path(tmp)
         script = splash_tick.replace("/dev/.mixsplash-done", str(root / "done"))
@@ -33,7 +34,7 @@ def run_case(cmdline, chan_present, done_present, background_done=False):
         harness = """
 sleep() { :; }
 sync() { :; }
-mount() { mkdir -p "$6/mvii"; }
+mount() { mkdir -p "$6/mvii"; if [ "${J36_BARE_MVII:-0}" != 1 ]; then : > "$6/mvii/boot.conf"; fi; }
 umount() { :; }
 dmesg() { echo "fake kernel line"; }
 cat() {
@@ -47,7 +48,8 @@ cut() {
 """ + ("(command sleep 0.3; touch \"" + str(root / "done") + "\") &\n"
             if background_done else "") + script
         env = dict(os.environ, FAKE_CMDLINE=cmdline,
-                   J36_TRAIL_DEVS=str(root / "fakedev"))
+                   J36_TRAIL_DEVS=str(root / "fakedev"),
+                   J36_BARE_MVII="1" if bare_mvii_dir else "0")
         subprocess.run(["sh", "-c", harness], env=env, check=True,
                        timeout=30)
         trail = root / "mnt" / "j36-trail.txt"
@@ -79,4 +81,10 @@ assert "--- trail tick 0: 42.5s up ---" in trail, trail
 assert "--- trail tick 1: 42.5s up ---" in trail, trail
 assert "detail:systemd -- " in chan, chan
 
-print("Boot trail: truncate, gate, headless run and tick appends passed")
+# A bare mvii/ directory is not BOOT: no truncate, no tick, splash unaffected.
+trail, chan = run_case("console=tty0 j36.trail=1 j36.splash=1", True, True,
+                       bare_mvii_dir=True)
+assert trail == "stale trail from an older boot\n", trail
+assert "stage:Starting system services" in chan, chan
+
+print("Boot trail: truncate, gate, headless run, tick appends and bare-dir refusal passed")

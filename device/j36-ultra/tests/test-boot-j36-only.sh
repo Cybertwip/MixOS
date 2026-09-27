@@ -126,5 +126,29 @@ else
     echo "  no stale shared-partition wording: ok"
 fi
 
+# 9. A bare mvii/ directory never identifies BOOT: the only legacy marker is
+# the mvii/boot.conf file, -f tested at the three identification sites
+# (mount_bootfs, the splash-tick trail, j36-logdump).
+if grep -E -q '\[ -d [^]]*mvii' "$INVM"; then
+    echo "FAIL: a bare mvii/ directory still identifies BOOT:"
+    grep -E -n '\[ -d [^]]*mvii' "$INVM"
+    fail=1
+else
+    echo "  no bare-mvii/ directory check: ok"
+fi
+legacy_code="$(grep -n -F "mvii/boot.conf" "$INVM" | grep -v -E ':[[:space:]]*#' | grep -v -E 'say |echo ' || true)"
+legacy_bad="$(printf '%s\n' "$legacy_code" | grep -v -F '[ -f ' || true)"
+legacy_n="$(printf '%s\n' "$legacy_code" | grep -c -F '[ -f ' || true)"
+if [ -n "$legacy_bad" ]; then
+    echo "FAIL: mvii/boot.conf used outside a -f file test:"
+    printf '%s\n' "$legacy_bad"
+    fail=1
+elif [ "$legacy_n" != 3 ]; then
+    echo "FAIL: want the legacy file tested at exactly 3 sites, found $legacy_n"
+    fail=1
+else
+    echo "  legacy file -f tested at 3 sites: ok"
+fi
+
 [ "$fail" -eq 0 ] && echo "PASS: J36-only BOOT"
 exit "$fail"

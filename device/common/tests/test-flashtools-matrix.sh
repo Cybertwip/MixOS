@@ -26,6 +26,10 @@ for d in j36-ultra oppo-mt6877 lg-msm8917 oppo-mt6833 lg-mt6739; do
 done
 printf '%s\n' "$listing" | grep -q "no LK sources" \
     || { echo "FAIL: --list hides the gap"; fail=1; }
+for d in oppo-mt6833 lg-mt6739; do
+    printf '%s\n' "$listing" | grep "$d" | grep -q "builds:" \
+        || { echo "FAIL: --list does not build $d"; fail=1; }
+done
 echo "  --list matrix: ok"
 # Families without sources fail loudly instead of building the wrong LK.
 if "$ROOT/build-flashtools.sh" --device oppo-mt6877 >/dev/null 2>&1; then
@@ -33,10 +37,20 @@ if "$ROOT/build-flashtools.sh" --device oppo-mt6877 >/dev/null 2>&1; then
 else
     echo "  --device oppo-mt6877: refused ok"
 fi
-if "$ROOT/build-flashtools.sh" --device lg-mt6739 >/dev/null 2>&1; then
-    echo "FAIL: --device lg-mt6739 built something"; fail=1
+# Phone LK families build -- but only behind their bring-up ACK. The ACKs
+# are emptied here so a leaked developer environment cannot turn this fast
+# gate check into a real multi-minute build.
+if OPPO_A77_BRINGUP_ACK= LG_K20_BRINGUP_ACK= \
+        "$ROOT/build-flashtools.sh" --device oppo-mt6833 >/dev/null 2>&1; then
+    echo "FAIL: --device oppo-mt6833 built without ACK"; fail=1
 else
-    echo "  --device lg-mt6739: refused ok"
+    echo "  --device oppo-mt6833: ACK gate ok"
+fi
+if OPPO_A77_BRINGUP_ACK= LG_K20_BRINGUP_ACK= \
+        "$ROOT/build-flashtools.sh" --device lg-mt6739 >/dev/null 2>&1; then
+    echo "FAIL: --device lg-mt6739 built without ACK"; fail=1
+else
+    echo "  --device lg-mt6739: ACK gate ok"
 fi
 if "$ROOT/build-flashtools.sh" --device bogus >/dev/null 2>&1; then
     echo "FAIL: --device bogus accepted"; fail=1

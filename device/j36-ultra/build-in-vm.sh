@@ -3757,10 +3757,11 @@ mount_bootfs() {
     for dev in /dev/mmcblk*p*; do
         if [ ! -b "$dev" ]; then continue; fi
         if ! mount -t vfat -o ro "$dev" /bootfs 2>/dev/null; then continue; fi
-        # boot.conf at the root identifies it now: it is the file the LK itself
-        # reads and the one thing BOOT always carries.  mvii/ and j36/ are still
-        # accepted, because on a card from an older build that is what is there.
-        if [ -f /bootfs/boot.conf ] || [ -d /bootfs/mvii ] || [ -d /bootfs/j36 ]; then
+        # boot.conf at the root identifies it: it is the file the LK itself reads
+        # and the one thing BOOT always carries.  The legacy answers are the old
+        # file and the old payload directory -- mvii/boot.conf, never a bare mvii/
+        # directory, which qualifies nothing on its own.
+        if [ -f /bootfs/boot.conf ] || [ -f /bootfs/mvii/boot.conf ] || [ -d /bootfs/j36 ]; then
             bootfs_mounted=1
             bootdev="$dev"
             say "boot partition: $dev"
@@ -3768,7 +3769,7 @@ mount_bootfs() {
         fi
         umount /bootfs
     done
-    say "no FAT partition on this card carries boot.conf, mvii/ or j36/"
+    say "no FAT partition on this card carries boot.conf, mvii/boot.conf or j36/"
     return 1
 }
 
@@ -5482,7 +5483,8 @@ trail_mnt=/run/j36/trailmnt
 trail_mount_boot() {
     # BOOT is found by content, not partition number: numbering follows
     # whichever MMC host attached first.  boot.conf at the root is what the
-    # LK reads; mvii/ and j36/ are what older cards carry instead.
+    # LK reads; older cards carry mvii/boot.conf or j36/ instead, and a bare
+    # mvii/ directory qualifies nothing on its own.
     # Mounting a device that is already mounted elsewhere shares the
     # superblock, so no check for that is needed.  J36_TRAIL_DEVS names
     # stand-in devices for the host-side test, where no MMC exists.
@@ -5490,7 +5492,7 @@ trail_mount_boot() {
     for _d in ${J36_TRAIL_DEVS:-/dev/mmcblk*p*}; do
         [ -b "$_d" ] || [ -n "${J36_TRAIL_DEVS:-}" ] || continue
         mount -t vfat -o rw,noatime "$_d" "$trail_mnt" 2>/dev/null || continue
-        if [ -f "$trail_mnt/boot.conf" ] || [ -d "$trail_mnt/mvii" ] || [ -d "$trail_mnt/j36" ]; then return 0; fi
+        if [ -f "$trail_mnt/boot.conf" ] || [ -f "$trail_mnt/mvii/boot.conf" ] || [ -d "$trail_mnt/j36" ]; then return 0; fi
         umount "$trail_mnt" 2>/dev/null || true
     done
     return 1
@@ -6612,8 +6614,9 @@ BOOTDEV=""
 #
 # Identified by looking inside it, not by partition number: numbering here follows
 # whichever MMC host attached first.  boot.conf at the root is what the LK reads
-# and the one file BOOT always carries; mvii/ and j36/ are accepted because that
-# is what a card from an older layout has.
+# and the one file BOOT always carries; mvii/boot.conf and j36/ are accepted
+# because that is what a card from an older layout has, and a bare mvii/
+# directory qualifies nothing on its own.
 #
 # Mounting a block device that is already mounted elsewhere is safe on Linux -- the
 # second mount finds the existing superblock and shares it rather than making a
@@ -6628,7 +6631,7 @@ mount_boot() {
     for _d in $_saved /dev/mmcblk*p*; do
         [ -b "$_d" ] || continue
         mount -t vfat -o rw,noatime "$_d" "$MNT" 2>/dev/null || continue
-        if [ -f "$MNT/boot.conf" ] || [ -d "$MNT/mvii" ] || [ -d "$MNT/j36" ]; then
+        if [ -f "$MNT/boot.conf" ] || [ -f "$MNT/mvii/boot.conf" ] || [ -d "$MNT/j36" ]; then
             BOOTDEV="$_d"
             return 0
         fi
@@ -7095,7 +7098,7 @@ dump() {
 
 write_once() {
     if ! mount_boot; then
-        echo "j36-logdump: no FAT partition on this card carries boot.conf, mvii/ or j36/"
+        echo "j36-logdump: no FAT partition on this card carries boot.conf, mvii/boot.conf or j36/"
         return 1
     fi
     dump "$1" > "$MNT/$TMP" 2>&1
