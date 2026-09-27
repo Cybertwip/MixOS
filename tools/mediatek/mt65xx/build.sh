@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -- "$ROOT/../../.." && pwd -P)"
 WITHOUT_BATTERY=0
 DEVICE="j36-ultra"
 OUTPUT=""
@@ -23,7 +24,7 @@ done
 [[ "$DEVICE" == j36-ultra ]] || { echo "unknown mt65xx device '$DEVICE' (only j36-ultra)" >&2; exit 2; }
 MODE=battery
 [[ "$WITHOUT_BATTERY" == 0 ]] || MODE=without-battery
-OUTPUT="${OUTPUT:-$ROOT/../../build/mt65xx/j36-ultra/$MODE}"
+OUTPUT="${OUTPUT:-$REPO_ROOT/build/mt65xx/j36-ultra/$MODE}"
 mkdir -p "$OUTPUT"
 OUTPUT="$(cd "$OUTPUT" && pwd -P)"
 # The CLI moved to build/flash: remove the per-mode copy this script used to
