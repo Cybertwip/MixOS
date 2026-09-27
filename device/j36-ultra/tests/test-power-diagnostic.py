@@ -80,7 +80,7 @@ with tempfile.TemporaryDirectory(prefix="j36-diagnostic-mode-") as tmp:
                                          (False, "j36.diag=power", "0"),
                                          (True, "", "0")]:
         if embedded:
-            marker.write_text("v5\n")
+            marker.write_text("v6\n")
         elif marker.exists():
             marker.unlink()
         cmdline.write_text(argument + "\n")
@@ -89,7 +89,7 @@ with tempfile.TemporaryDirectory(prefix="j36-diagnostic-mode-") as tmp:
                                  + '\necho "$want_expand"'], text=True,
                                 capture_output=True, check=True)
         assert result.stdout.strip() == expected
-assert builder.index('stage "J36 DIAG v5: resize skipped"') < builder.index('\nexpand_root\n')
+assert builder.index('stage "J36 DIAG v6: resize skipped"') < builder.index('\nexpand_root\n')
 
 def function(name):
     start = builder.index(name + "() {\n")

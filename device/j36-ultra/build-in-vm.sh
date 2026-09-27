@@ -1760,7 +1760,7 @@ cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 cp "$PWRAP_MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 cp "$ROOT/device/j36-ultra/power-diagnostic.sh" "$INITROOT/power-diagnostic.sh"
 if [[ "$POWER_DIAGNOSTIC" == 1 ]]; then
-    printf 'v5\n' > "$INITROOT/etc/j36-power-diagnostic"
+    printf 'v6\n' > "$INITROOT/etc/j36-power-diagnostic"
 fi
 # And the PMIC, which is ALSO staged into j36/power/ on the card and is the only
 # module in this build that is deliberately in two places.  The payload copy is the
@@ -2204,7 +2204,7 @@ watch_run() {
 say ""
 say "J36 Ultra ARMv7 bring-up initramfs"
 if [ "$power_diag" = power ]; then
-    stage "J36 DIAG v5: initramfs loaded"
+    stage "J36 DIAG v6: initramfs loaded"
 fi
 say "Display: the LK's framebuffer on /dev/fb0 until something opens /dev/dri/card0."
 progress 4
@@ -2617,7 +2617,7 @@ if [ "$power_diag" = power ]; then
     want_expand=0
     # Early BOOT writes are safe only after expansion is explicitly disabled.
     power_diag_ready=1
-    stage "J36 DIAG v5: resize skipped"
+    stage "J36 DIAG v6: resize skipped"
     detail "Diagnostic initramfs active; card size stays unchanged"
     # Retry as the MMC partitions appear; retain the original five-second pause.
     power_diag_early_wait=0
