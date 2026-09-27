@@ -57,6 +57,10 @@ type config struct {
 	mtkResetToBROM       bool
 	mtkCrashToBROM       bool
 	mtkUnsignedJump      bool
+	mtkUARTRead          bool
+	mtkUARTWrite         bool
+	mtkWords             string
+	mtkValue             string
 	mtkReadBootStatus    bool
 	mtkSelftestWrite     bool
 	mtkRunStage1         bool
@@ -286,6 +290,12 @@ func run() error {
 			return errors.New("-mtk-unsigned-jump requires -device /dev/cu.usbmodem... or another MTK VCOM serial device")
 		}
 		return unsignedJumpMTKPreloader(cfg)
+	}
+	if cfg.mtkUARTRead {
+		return runMTKUARTMem(cfg, false)
+	}
+	if cfg.mtkUARTWrite {
+		return runMTKUARTMem(cfg, true)
 	}
 	if cfg.mtkReadBootStatus {
 		if cfg.device == "" {
@@ -554,6 +564,10 @@ func parseFlags() (config, error) {
 	flag.BoolVar(&cfg.mtkResetToBROM, "mtk-reset-to-brom", cfg.mtkResetToBROM, "reset a preloader-mode target back into BROM USB-download mode")
 	flag.BoolVar(&cfg.mtkCrashToBROM, "mtk-crash-to-brom", cfg.mtkCrashToBROM, "crash a preloader-mode phone toward BROM (captive-cable reboot; hold Vol-up+Vol-down before running); RAM/protocol only, no eMMC access")
 	flag.BoolVar(&cfg.mtkUnsignedJump, "mtk-unsigned-jump", cfg.mtkUnsignedJump, "send an unsigned stub to address 0 and JUMP_DA there (crash mode 3 alone); RAM/protocol only, no eMMC access")
+	flag.BoolVar(&cfg.mtkUARTRead, "mtk-uart-read", cfg.mtkUARTRead, "raw read32 over the tty VCOM UART (needs -device VCOM node, -address; -mtk-words count, default 1)")
+	flag.BoolVar(&cfg.mtkUARTWrite, "mtk-uart-write", cfg.mtkUARTWrite, "raw write32 over the tty VCOM UART (needs -device VCOM node, -address, -mtk-value)")
+	flag.StringVar(&cfg.mtkWords, "mtk-words", "", "word count for -mtk-uart-read (1..256)")
+	flag.StringVar(&cfg.mtkValue, "mtk-value", "", "32-bit value for -mtk-uart-write")
 	flag.BoolVar(&cfg.mtkReadBootStatus, "mtk-read-boot-status", cfg.mtkReadBootStatus, "read the MVII boot-status sector through the native feed payload")
 	flag.BoolVar(&cfg.mtkSelftestWrite, "mtk-selftest-write", cfg.mtkSelftestWrite, "write/read/restore the MVII boot-status sector to verify feed eMMC writes")
 	flag.BoolVar(&cfg.mtkReadPartitions, "mtk-read-partitions", cfg.mtkReadPartitions, "read live MTK/GPT/MBR partition information through the native feed payload")
