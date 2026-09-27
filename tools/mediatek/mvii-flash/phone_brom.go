@@ -332,6 +332,62 @@ func acquirePhoneBROM(cfg config, phone *phoneRoot, facts phoneFacts, emi *mtkPr
 	}
 }
 
+// acquirePhoneBROMAuto is acquirePhoneBROM for rootless flows: one session
+// learns the soc off the wire (get_hw_code) instead of build-info.txt,
+// then runs the standard probe on the same live client. Opening a second
+// session just to learn the soc wedges observed phones: the first hello
+// succeeds and every re-handshake after the close fails.
+func acquirePhoneBROMAuto(cfg config, emi *mtkPreloaderEMI) (*mtkSerialClient, mtkTargetConfig, *phoneRoot, phoneFacts, error) {
+	window, err := parsePhoneWait(cfg.waitFlag)
+	if err != nil {
+		return nil, mtkTargetConfig{}, nil, phoneFacts{}, err
+	}
+	deadline := time.Now().Add(window)
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		client, target, phone, facts, err := acquirePhoneBROMAutoOnce(cfg, emi)
+		if err == nil {
+			return client, target, phone, facts, nil
+		}
+		lastErr = err
+		if window == 0 || !time.Now().Before(deadline) {
+			return nil, mtkTargetConfig{}, nil, phoneFacts{}, lastErr
+		}
+		fmt.Printf("Phone not acquired (attempt %d): %v; waiting for the VCOM, replug with keys held.\n", attempt, lastErr)
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func acquirePhoneBROMAutoOnce(cfg config, emi *mtkPreloaderEMI) (*mtkSerialClient, mtkTargetConfig, *phoneRoot, phoneFacts, error) {
+	client, err := connectMTKSerialWithOptions(cfg.device, mtkSerialConnectOptions{handshakeWake: true})
+	if err != nil {
+		return nil, mtkTargetConfig{}, nil, phoneFacts{}, err
+	}
+	client.preloaderEMI = emi
+	closeOnErr := true
+	defer func() {
+		if closeOnErr && client.port != nil {
+			_ = client.port.Close()
+		}
+	}()
+	hw, _, err := client.getHWCode()
+	if err != nil {
+		return nil, mtkTargetConfig{}, nil, phoneFacts{}, err
+	}
+	soc, facts, err := phoneFactsForHWCode(hw)
+	if err != nil {
+		return nil, mtkTargetConfig{}, nil, phoneFacts{}, err
+	}
+	phone := &phoneRoot{device: soc, soc: soc, family: phoneFamilyForSoc(soc)}
+	fmt.Printf("Target identifies as %s (hw code 0x%04x).\n", soc, hw)
+	target, err := probePhoneBROM(client, phone, facts)
+	if err != nil {
+		return nil, mtkTargetConfig{}, nil, phoneFacts{}, err
+	}
+	closeOnErr = false
+	return client, target, phone, facts, nil
+}
+
 // refusePhoneSLA fails fast when the target enforces SLA: the tool speaks
 // no SLA exchange, so proceeding would only die at SEND_DA with 0x1D0D.
 // Checked at probe time, before anything moves. DAA alone is not refused:
@@ -722,15 +778,10 @@ func probePhoneDASignature(cfg config, phone *phoneRoot) error {
 	return nil
 }
 
-// startPhoneDA acquires the phone, performs the BROM/preloader DAA dance,
-// sends the vendor auth blob when the target requires it, and uploads and
-// starts the DA. It returns a live DA session; the caller closes
-// client.port and runs eMMC commands on it.
-func startPhoneDA(cfg config, phone *phoneRoot, facts phoneFacts, emi *mtkPreloaderEMI, loader mtkDALoader, authPath string) (*mtkSerialClient, mtkTargetConfig, error) {
-	client, target, err := acquirePhoneBROM(cfg, phone, facts, emi)
-	if err != nil {
-		return nil, mtkTargetConfig{}, err
-	}
+// bringUpPhoneDA runs the BROM/preloader DAA dance, auth, and DA upload on
+// a live session. On error the client is closed; on success the caller owns
+// it and runs eMMC commands on it.
+func bringUpPhoneDA(cfg config, phone *phoneRoot, facts phoneFacts, emi *mtkPreloaderEMI, loader mtkDALoader, authPath string, client *mtkSerialClient, target mtkTargetConfig) (*mtkSerialClient, mtkTargetConfig, error) {
 	failed := true
 	defer func() {
 		if failed && client != nil && client.port != nil {
@@ -796,6 +847,16 @@ func startPhoneDA(cfg config, phone *phoneRoot, facts phoneFacts, emi *mtkPreloa
 	}
 	failed = false
 	return client, target, nil
+}
+
+// startPhoneDA acquires the phone (soc from its root) and brings up the DA
+// session; see bringUpPhoneDA for ownership.
+func startPhoneDA(cfg config, phone *phoneRoot, facts phoneFacts, emi *mtkPreloaderEMI, loader mtkDALoader, authPath string) (*mtkSerialClient, mtkTargetConfig, error) {
+	client, target, err := acquirePhoneBROM(cfg, phone, facts, emi)
+	if err != nil {
+		return nil, mtkTargetConfig{}, err
+	}
+	return bringUpPhoneDA(cfg, phone, facts, emi, loader, authPath, client, target)
 }
 
 // flashPhoneBROM validates the staging plan, then runs the legacy DA stack
