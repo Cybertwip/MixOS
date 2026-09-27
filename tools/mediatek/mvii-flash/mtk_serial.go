@@ -2077,6 +2077,23 @@ func (c *mtkSerialClient) sendDA(address, sigLen uint32, data []byte) error {
 	return c.sendDAWithSignature(address, sigLen, data)
 }
 
+// sendDAStatusError maps a BROM SEND_DA parameter-phase status to an error,
+// or nil when the upload may proceed. The status is read before a single
+// payload byte moves, so anything above 0xFF is a refusal of the
+// address/length/signature triple, never a transfer failure.
+func sendDAStatusError(status uint16) error {
+	if status == 0x1D0D {
+		return errors.New("target requires SLA authentication before accepting the DA")
+	}
+	if status == 0x1D10 || status == 0x1D12 {
+		return fmt.Errorf("SEND_DA status 0x%x (BROM refused the DA load before any data moved -- address/length is not an accepted RAM window. A scatter linear_start_addr is an eMMC offset, not a load address: write eMMC images with the normal flow / fastboot -partition, and reserve `run -address` for small SRAM stubs -- MT6592 window is 0x110000, 128K max)", status)
+	}
+	if status > 0xFF {
+		return fmt.Errorf("SEND_DA status 0x%x", status)
+	}
+	return nil
+}
+
 func (c *mtkSerialClient) sendDAWithSignature(address, sigLen uint32, data []byte) error {
 	checksum, payload := prepareDAData(data)
 	if err := c.echo([]byte{mtkCmdSendDA}); err != nil {
@@ -2095,14 +2112,8 @@ func (c *mtkSerialClient) sendDAWithSignature(address, sigLen uint32, data []byt
 	if err != nil {
 		return err
 	}
-	if status == 0x1D0D {
-		return errors.New("target requires SLA authentication before accepting the DA")
-	}
-	if status == 0x1D12 {
-		return errors.New("SEND_DA status 0x1d12 (BROM rejected the DA load parameters; check that the payload is linked and loaded into the MT6592 DA SRAM window)")
-	}
-	if status > 0xFF {
-		return fmt.Errorf("SEND_DA status 0x%x", status)
+	if err := sendDAStatusError(status); err != nil {
+		return err
 	}
 	if err := c.uploadData(payload, checksum); err != nil {
 		return err

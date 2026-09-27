@@ -20,5 +20,15 @@ interchangeable:
   duty.
 
 `BRINGUP.md` step 4 turns confirmed results into driver firmware paths.
-No vendored blobs: nothing has been picked from anywhere, and nothing
-will be until a source exists.
+
+`DA/MTK_DA_mt6765.bin` is the MT6765 Download Agent entry (570588 bytes,
+sha256 `156aaf9cdb02bc4fdcd5ee59c740aa3735aa9cc3af2450c64b7e8c308bb84f41`),
+lifted with `extract-mtk-da.py` out of the AllInOne bundle the mtkclient
+reference tree carries (`Loader/MTK_DA_V5.bin`); `fetch-da-mt6765.sh`
+re-derives the same bytes from the pinned third-party copy and is the
+provenance record. Use it with `./flash -da-loader
+device/oppo-a77-4g/firmware/DA/MTK_DA_mt6765.bin ...`. It does not by
+itself enable BROM eMMC writes: a retail phone may still demand SLA
+authentication (the stock package ships `auth_sv5.auth`; the tool stops at
+that wall today), DRAM needs the preloader EMI, and eMMC writes follow the
+stock scatter, not the J36 layout.

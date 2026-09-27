@@ -243,6 +243,48 @@ func TestParseMTKDALoaderFindsMT6592Stages(t *testing.T) {
 	}
 }
 
+func TestParseMTKDALoaderFindsMT6765Entry(t *testing.T) {
+	dir := t.TempDir()
+	loaderPath := filepath.Join(dir, "MTK_DA_mt6765.bin")
+	data := make([]byte, 0x600)
+	binary.LittleEndian.PutUint32(data[0x68:0x6c], 2)
+	writeEntry := func(index int, hw uint16, payload []byte) {
+		entry := data[0x6c+index*0xdc : 0x6c+(index+1)*0xdc]
+		binary.LittleEndian.PutUint16(entry[0:2], 0xdada)
+		binary.LittleEndian.PutUint16(entry[2:4], hw)
+		binary.LittleEndian.PutUint16(entry[12:14], 0x200)
+		binary.LittleEndian.PutUint16(entry[16:18], 1)
+		binary.LittleEndian.PutUint16(entry[18:20], 1)
+		off := uint32(0x6c + 2*0xdc + uint32(index)*uint32(len(payload)))
+		binary.LittleEndian.PutUint32(entry[20:24], off)
+		binary.LittleEndian.PutUint32(entry[24:28], uint32(len(payload)))
+		binary.LittleEndian.PutUint32(entry[28:32], 0x200000)
+		copy(data[off:off+uint32(len(payload))], payload)
+	}
+	writeEntry(0, 0x6592, []byte("DA6592"))
+	writeEntry(1, 0x6765, []byte("DA6765!"))
+	if err := os.WriteFile(loaderPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loader, err := parseMTKDALoader(loaderPath, 0x6765, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loader.HWCode != 0x6765 || len(loader.Regions) != 1 {
+		t.Fatalf("loader = %+v", loader)
+	}
+	da, err := readDARegion(loader, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(da) != "DA6765!" {
+		t.Fatalf("stage = %q", da)
+	}
+	if _, err := parseMTKDALoader(loaderPath, 0x6768, 0, 0); err == nil {
+		t.Fatalf("parseMTKDALoader accepted missing hw code 0x6768")
+	}
+}
+
 func TestPrepareDADataChecksumPadsOddLength(t *testing.T) {
 	checksum, payload := prepareDAData([]byte{0x34, 0x12, 0x78})
 	if !bytes.Equal(payload, []byte{0x34, 0x12, 0x78, 0x00}) {
@@ -1664,5 +1706,32 @@ func TestBootStatusStageNameBootSelect(t *testing.T) {
 		if got := mviiBootStatusStageName(tc.stage); got != tc.want {
 			t.Fatalf("mviiBootStatusStageName(0x%04x) = %q, want %q", tc.stage, got, tc.want)
 		}
+	}
+}
+
+func TestSendDAStatusErrorNamesRefusals(t *testing.T) {
+	for _, ok := range []uint16{0x0000, 0x00FF} {
+		if err := sendDAStatusError(ok); err != nil {
+			t.Fatalf("sendDAStatusError(0x%x) = %v, want nil", ok, err)
+		}
+	}
+	for _, refused := range []uint16{0x1D10, 0x1D12} {
+		err := sendDAStatusError(refused)
+		if err == nil {
+			t.Fatalf("sendDAStatusError(0x%x) = nil, want refusal", refused)
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, fmt.Sprintf("0x%x", refused)) {
+			t.Fatalf("sendDAStatusError(0x%x) = %q, want the hex", refused, msg)
+		}
+		if !strings.Contains(msg, "0x110000") {
+			t.Fatalf("sendDAStatusError(0x%x) = %q, want the SRAM window", refused, msg)
+		}
+	}
+	if err := sendDAStatusError(0x1D0D); err == nil || !strings.Contains(err.Error(), "SLA") {
+		t.Fatalf("sendDAStatusError(0x1d0d) = %v, want SLA refusal", err)
+	}
+	if err := sendDAStatusError(0x1234); err == nil {
+		t.Fatalf("sendDAStatusError(0x1234) = nil, want generic refusal")
 	}
 }
