@@ -328,6 +328,24 @@ func probePhoneBROMOnce(c *mtkSerialClient, phone *phoneRoot, hwCode uint16) (mt
 	return target, nil
 }
 
+// needsPhoneAuth decides whether the SEND_AUTH step runs. It runs only in
+// BROM on DAA targets with a blob to send: the preloader does not speak
+// 0xE2 and goes silent (EOF) if asked, so preloader mode skips the step
+// with the way back to BROM instead of failing the run.
+func needsPhoneAuth(target mtkTargetConfig, isBROM, hasAuth bool) (bool, string) {
+	if !target.DAA {
+		return false, ""
+	}
+	if !isBROM {
+		return false, "BROM enforces DAA but the phone is in preloader mode, which does not speak SEND_AUTH; " +
+			"attempting the DA upload without it -- for the auth step, power off, hold Vol-down, replug for BROM mode, and rerun."
+	}
+	if !hasAuth {
+		return false, "Warning: BROM enforces DAA but no -auth file was given; attempting the DA upload without it."
+	}
+	return true, ""
+}
+
 // prepareAuthData pads the vendor auth blob to even length; BROM reads the
 // transfer back as 16-bit words.
 func prepareAuthData(auth []byte) []byte {
@@ -451,19 +469,17 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 	if err != nil {
 		return err
 	}
-	if target.DAA {
-		if plan.auth == "" {
-			fmt.Println("Warning: BROM enforces DAA but no -auth file was given; attempting the DA upload without it.")
-		} else {
-			authBlob, err := os.ReadFile(plan.auth)
-			if err != nil {
-				return fmt.Errorf("phone target %s: read auth file %s: %w", phone.device, plan.auth, err)
-			}
-			fmt.Printf("Uploading auth blob: %s (0x%x bytes)\n", plan.auth, len(authBlob))
-			if err := client.sendAuth(authBlob); err != nil {
-				return err
-			}
+	if send, msg := needsPhoneAuth(target, client.isBROM, plan.auth != ""); send {
+		authBlob, err := os.ReadFile(plan.auth)
+		if err != nil {
+			return fmt.Errorf("phone target %s: read auth file %s: %w", phone.device, plan.auth, err)
 		}
+		fmt.Printf("Uploading auth blob: %s (0x%x bytes)\n", plan.auth, len(authBlob))
+		if err := client.sendAuth(authBlob); err != nil {
+			return err
+		}
+	} else if msg != "" {
+		fmt.Println(msg)
 	}
 	if err := client.uploadLegacyDA(loader); err != nil {
 		return err
