@@ -5456,14 +5456,63 @@ chan=/dev/.mixsplash
 done_flag=/dev/.mixsplash-done
 
 # A boot with j36.splash=0, or one where mixsplash could not open /dev/fb0, has no
-# channel and nothing to say anything to.  Appending would create the file and tick
-# into it forever.
-[ -e "$chan" ] || exit 0
+# channel and nothing to say anything to.  The splash writes go to /dev/null rather
+# than exiting: the loop below also carries the boot trail, which is wanted most
+# on exactly the boots where the picture is off.
+[ -e "$chan" ] || chan=/dev/null
 
 { echo "stage:Starting system services"
   echo "detail:systemd"
   echo "progress:94"
 } >> "$chan"
+
+# ── the boot trail ────────────────────────────────────────────────────────
+#
+# A board that resets before j36-logdump's first write (20 s after a late
+# unit) leaves no record of how far systemd got.  When j36.trail=1 is on the
+# kernel command line, every tick below also appends the uptime plus the
+# kernel's last twenty lines to j36-trail.txt on BOOT, so a reset still
+# leaves the trail behind.  The file is truncated once here, at the first
+# tick, so one boot is one trail.  A word on the card (mvii/boot.conf)
+# turns it off again; no rebuild either way.
+trail_on=0
+for _w in $(cat /proc/cmdline 2>/dev/null); do
+    [ "$_w" = j36.trail=1 ] && trail_on=1
+done
+trail_mnt=/run/j36/trailmnt
+trail_mount_boot() {
+    # BOOT is found by content, not partition number: numbering follows
+    # whichever MMC host attached first.  mvii/ is what the LK reads.
+    # Mounting a device that is already mounted elsewhere shares the
+    # superblock, so no check for that is needed.  J36_TRAIL_DEVS names
+    # stand-in devices for the host-side test, where no MMC exists.
+    mkdir -p "$trail_mnt"
+    for _d in ${J36_TRAIL_DEVS:-/dev/mmcblk*p*}; do
+        [ -b "$_d" ] || [ -n "${J36_TRAIL_DEVS:-}" ] || continue
+        mount -t vfat -o rw,noatime "$_d" "$trail_mnt" 2>/dev/null || continue
+        if [ -d "$trail_mnt/mvii" ] || [ -d "$trail_mnt/j36" ]; then return 0; fi
+        umount "$trail_mnt" 2>/dev/null || true
+    done
+    return 1
+}
+trail_write() {
+    # One tick, one entry: the tick number, the uptime, then the kernel's
+    # last words.  Appends and syncs through a mount pair so a reset loses
+    # nothing, and unmounts again so a wedged card cannot hold the boot.
+    [ "$trail_on" = 1 ] || return 0
+    trail_mount_boot || return 0
+    { printf -- '--- trail tick %s: %ss up ---\n' "$1" "$(cut -d' ' -f1 /proc/uptime)"
+      dmesg 2>/dev/null | tail -20; } >> "$trail_mnt/j36-trail.txt"
+    sync
+    umount "$trail_mnt" 2>/dev/null || true
+    return 0
+}
+if [ "$trail_on" = 1 ] && trail_mount_boot; then
+    : > "$trail_mnt/j36-trail.txt"
+    sync
+    umount "$trail_mnt" 2>/dev/null || true
+fi
+trail_write 0
 
 # 2400 ticks of five seconds is two hours, and it is a backstop rather than a
 # patience setting: every boot that reaches a dashboard stops this in well under a
@@ -5475,6 +5524,7 @@ while [ "$n" -lt 2400 ]; do
     sleep 5
     n=$((n + 1))
     echo "detail:systemd -- $((n * 5))s" >> "$chan"
+    trail_write "$n"
 done
 exit 0
 SPLASHTICK
