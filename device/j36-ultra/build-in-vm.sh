@@ -1760,7 +1760,7 @@ cp "$MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 cp "$PWRAP_MODULE" "$INITROOT/lib/modules/$KERNEL_RELEASE/extra/"
 cp "$ROOT/device/j36-ultra/power-diagnostic.sh" "$INITROOT/power-diagnostic.sh"
 if [[ "$POWER_DIAGNOSTIC" == 1 ]]; then
-    printf 'v4\n' > "$INITROOT/etc/j36-power-diagnostic"
+    printf 'v5\n' > "$INITROOT/etc/j36-power-diagnostic"
 fi
 # And the PMIC, which is ALSO staged into j36/power/ on the card and is the only
 # module in this build that is deliberately in two places.  The payload copy is the
@@ -2204,7 +2204,7 @@ watch_run() {
 say ""
 say "J36 Ultra ARMv7 bring-up initramfs"
 if [ "$power_diag" = power ]; then
-    stage "J36 DIAG v4: initramfs loaded"
+    stage "J36 DIAG v5: initramfs loaded"
 fi
 say "Display: the LK's framebuffer on /dev/fb0 until something opens /dev/dri/card0."
 progress 4
@@ -2605,7 +2605,7 @@ if [ "$power_diag" = power ]; then
     want_expand=0
     # Early BOOT writes are safe only after expansion is explicitly disabled.
     power_diag_ready=1
-    stage "J36 DIAG v4: resize skipped"
+    stage "J36 DIAG v5: resize skipped"
     detail "Diagnostic initramfs active; card size stays unchanged"
     # Retry as the MMC partitions appear; retain the original five-second pause.
     power_diag_early_wait=0
@@ -7270,6 +7270,111 @@ UNITLOG
     return 0
 }
 
+# ── the first seconds of systemd, sampled every two seconds ──────────────────
+#
+# j36-logdump's first pass lands twenty seconds in, which is twenty seconds of
+# systemd nobody sees when the board dies in services.  This stages a second
+# unit that starts with the very first transaction and writes a small rotating
+# pair -- BOOT:/j36-early-0.txt and j36-early-1.txt -- every two seconds until
+# mixdash is up or three minutes pass, whichever comes first.  Each file carries
+# the boot ID (the same /proc instance moves across switch_root, so it matches
+# the initramfs checkpoints), the PMIC snapshot, the load average and what
+# systemd itself says about the boot.  A death in services then leaves evidence
+# no more than two seconds old.
+#
+# Diagnostic boots only: a normal boot stages nothing and pays nothing.  The
+# mount logic is logdump's, duplicated rather than shared, so that either unit
+# stands alone; mounting a FAT that is already mounted elsewhere shares the
+# superblock, so the two units stepping on each other is safe.  The script never
+# stops early on purpose -- no `set -e' -- and every external command degrades
+# to a word saying so, because a tracer that goes quiet is the failure.
+#
+# The closing braces below carry comments, which is load-bearing in an unusual
+# place: the test extracts this function by its first lone `}' line, so a bare
+# one inside the staged script would cut the extraction short.
+setup_earlytrace() {
+    [ "$power_diag" = power ] || return 0
+    if [ -z "$rootdev" ]; then return 1; fi
+    if ! ensure_run_tmpfs; then return 1; fi
+    mkdir -p /newroot/run/j36/bin /newroot/run/systemd/system
+    cat > /newroot/run/j36/bin/j36-early-trace <<'EARLYTRACE'
+#!/bin/sh
+# j36-early-trace -- sample early systemd progress onto the FAT BOOT partition.
+#
+# Written by the J36 Ultra initramfs into /run, and started by
+# j36-early-trace.service in the first transaction.  Diagnostic boots only.
+set -u
+MNT=/run/j36/bootmnt
+SEQ=0
+# Identified by looking inside it, like j36-logdump: mvii/ is what the LK reads.
+mount_boot() {
+    mkdir -p "$MNT"
+    for _d in /dev/mmcblk*p*; do
+        [ -b "$_d" ] || continue
+        mount -t vfat -o rw,noatime "$_d" "$MNT" 2>/dev/null || continue
+        if [ -d "$MNT/mvii" ] || [ -d "$MNT/j36" ]; then
+            return 0
+        fi
+        umount "$MNT" 2>/dev/null || true
+    done
+    return 1
+} # mount_boot
+sample() {
+    mount_boot || return 0
+    SEQ=$((SEQ + 1))
+    {
+        echo "J36 early trace"
+        echo "sequence=$SEQ"
+        echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+        echo "uptime=$(cat /proc/uptime 2>/dev/null)"
+        echo "loadavg=$(cat /proc/loadavg 2>/dev/null)"
+        echo "system=$(systemctl --no-pager is-system-running 2>/dev/null || echo unknown)"
+        for _f in /sys/class/power_supply/usb/power_snapshot \
+            /sys/class/power_supply/usb/online \
+            /sys/class/power_supply/usb/voltage_now \
+            /sys/class/power_supply/battery/voltage_now; do
+            echo "$_f:"
+            cat "$_f" 2>/dev/null || echo unavailable
+        done
+        echo "failed_units:"
+        systemctl --no-pager list-units --failed --no-legend 2>/dev/null || echo unknown
+        echo "trace_complete=$SEQ"
+    } > "$MNT/j36-early-$((SEQ % 2)).txt" 2>/dev/null
+    sync
+    umount "$MNT" 2>/dev/null || true
+} # sample
+n=0
+while [ "$n" -lt 90 ]; do
+    sample
+    if [ "$(systemctl is-active mixdash.service 2>/dev/null)" = active ]; then
+        exit 0
+    fi
+    sleep 2
+    n=$((n + 1))
+done
+exit 0
+EARLYTRACE
+    chmod 0755 /newroot/run/j36/bin/j36-early-trace
+    cat > /newroot/run/systemd/system/j36-early-trace.service <<'UNITEARLY'
+# Written by the J36 Ultra initramfs, into a tmpfs.  See setup_earlytrace in /init.
+[Unit]
+Description=Sample early systemd progress onto BOOT (diagnostic)
+DefaultDependencies=no
+Before=sysinit.target
+
+[Service]
+Type=simple
+ExecStart=/bin/sh /run/j36/bin/j36-early-trace
+StandardOutput=journal
+StandardError=journal
+UNITEARLY
+    mkdir -p /newroot/run/systemd/system/sysinit.target.wants
+    ln -sf ../j36-early-trace.service \
+           /newroot/run/systemd/system/sysinit.target.wants/j36-early-trace.service
+    say "logdump: BOOT:/j36-early-0.txt, sampled every 2 s until mixdash is up"
+    return 0
+}
+
 # ── the restart loop that paints over the picture ─────────────────────────────
 #
 # batt_led.service comes from the shared RG351MP rootfs and runs
@@ -7578,6 +7683,7 @@ if [ -n "$rootdev" ] && [ "$want_log" = 1 ]; then
     progress 86
     tame_batt_led
     setup_logdump
+    setup_earlytrace
 fi
 
 if [ -n "$rootdev" ]; then

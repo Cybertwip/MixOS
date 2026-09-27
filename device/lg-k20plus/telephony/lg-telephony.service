@@ -1,0 +1,12 @@
+[Unit]
+Description=LG K20 Plus telephony stack
+After=qrtr-ns.service systemd-udev-settle.service
+Wants=qrtr-ns.service systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/mixos/lg/telephony/modem-boot.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

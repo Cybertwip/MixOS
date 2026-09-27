@@ -111,8 +111,13 @@ def generate(sources: dict[str, str], device: str, panel: str, rev: str,
     hall_gpio = parse_int(keys, "LV517_HALL_GPIO")
     hall_code = parse_int(keys, "LV517_HALL_CODE")
     # rev-0 remaps the GPIO rocker to VOL_DOWN (PMIC takes VOL_UP).
-    key_code = parse_int(keys, "LV517_KEY_VOL_DOWN") if rev == "0" \
-        else parse_int(keys, "LV517_KEY_VOL_UP")
+    # The PMIC RESIN key always takes the other slot of the rocker.
+    if rev == "0":
+        key_code = parse_int(keys, "LV517_KEY_VOL_DOWN")
+        pmic_code = parse_int(keys, "LV517_KEY_VOL_UP")
+    else:
+        key_code = parse_int(keys, "LV517_KEY_VOL_UP")
+        pmic_code = parse_int(keys, "LV517_KEY_VOL_DOWN")
 
     touch_addr = addr_td4100 if panel == "td4100" else addr_4894
     touch_compat = "synaptics,rmi4-i2c" if panel == "td4100" else "lge,lg4894"
@@ -219,7 +224,7 @@ def generate(sources: dict[str, str], device: str, panel: str, rev: str,
 \t\thwlocks = <&tcsr_mutex 3>;
 \t}};
 
-\tsoc {{
+\tsoc: soc@0 {{
 \t\tcompatible = "simple-bus";
 \t\t#address-cells = <1>;
 \t\t#size-cells = <1>;
@@ -233,9 +238,15 @@ def generate(sources: dict[str, str], device: str, panel: str, rev: str,
 \t\t\t      <{gic_cpu:#x} 0x2000>;
 \t\t}};
 
+\t\trestart: restart@4ab000 {{
+\t\t\tcompatible = "qcom,pshold";
+\t\t\treg = <0x004ab000 0x4>;
+\t\t}};
+
 \t\ttcsr_mutex: hwlock@1905000 {{
 \t\t\tcompatible = "qcom,tcsr-mutex";
 \t\t\treg = <0x01905000 0x20000>;
+\t\t\t#hwlock-cells = <1>;
 \t\t}};
 
 \t\tapcs: mailbox@b011000 {{
@@ -244,62 +255,6 @@ def generate(sources: dict[str, str], device: str, panel: str, rev: str,
 \t\t\t\t     "syscon";
 \t\t\treg = <0x0b011000 0x1000>;
 \t\t\t#mbox-cells = <1>;
-\t\t}};
-
-\t\tsmp2p_modem: smp2p-modem {{
-\t\t\tcompatible = "qcom,smp2p";
-\t\t\tqcom,smem = <451>, <431>;
-\t\t\tinterrupts = <{GIC_SPI} 27 {IRQ_EDGE_RISING}>;
-\t\t\tmboxes = <&apcs 14>;
-\t\t\tqcom,local-pid = <0>;
-\t\t\tqcom,remote-pid = <1>;
-\t\t\tmodem_smp2p_out: master-kernel {{
-\t\t\t\tqcom,entry-name = "master-kernel";
-\t\t\t\t#qcom,smem-state-cells = <1>;
-\t\t\t}};
-\t\t\tmodem_smp2p_in: slave-kernel {{
-\t\t\t\tqcom,entry-name = "slave-kernel";
-\t\t\t\tinterrupt-controller;
-\t\t\t\t#interrupt-cells = <2>;
-\t\t\t}};
-\t\t}};
-
-\t\tsmp2p_wcnss: smp2p-wcnss {{
-\t\t\tcompatible = "qcom,smp2p";
-\t\t\tqcom,smem = <451>, <431>;
-\t\t\tinterrupts = <{GIC_SPI} 143 {IRQ_EDGE_RISING}>;
-\t\t\tmboxes = <&apcs 18>;
-\t\t\tqcom,local-pid = <0>;
-\t\t\tqcom,remote-pid = <4>;
-\t\t\twcnss_smp2p_out: master-kernel {{
-\t\t\t\tqcom,entry-name = "master-kernel";
-\t\t\t\t#qcom,smem-state-cells = <1>;
-\t\t\t\t}};
-\t\t\twcnss_smp2p_in: slave-kernel {{
-\t\t\t\tqcom,entry-name = "slave-kernel";
-\t\t\t\tinterrupt-controller;
-\t\t\t\t#interrupt-cells = <2>;
-\t\t\t}};
-\t\t}};
-
-\t\tsmd {{
-\t\t\tcompatible = "qcom,smd";
-\t\t\tmodem_edge: modem-edge {{
-\t\t\t\tinterrupts = <{GIC_SPI} 25 {IRQ_EDGE_RISING}>;
-\t\t\t\tqcom,ipc = <&apcs 8 12>;
-\t\t\t\tqcom,smd-edge = <0>;
-\t\t\t\tlabel = "modem";
-\t\t\t}};
-\t\t\twcnss_edge: wcnss-edge {{
-\t\t\t\tinterrupts = <{GIC_SPI} 142 {IRQ_EDGE_RISING}>;
-\t\t\t\tqcom,ipc = <&apcs 8 17>;
-\t\t\t\tqcom,smd-edge = <6>;
-\t\t\t\tlabel = "wcnss";
-\t\t\t\twcnss_ctrl {{
-\t\t\t\t\tcompatible = "qcom,wcnss";
-\t\t\t\t\tqcom,smd-channel = "WCNSS_CTRL";
-\t\t\t\t}};
-\t\t\t}};
 \t\t}};
 
 \t\tuart0: serial@{uart:x} {{
@@ -368,23 +323,54 @@ def generate(sources: dict[str, str], device: str, panel: str, rev: str,
 \t\t\t}};
 \t\t}};
 
+\t\tspmi_bus: spmi@{spmi:x} {{
+\t\t\tcompatible = "qcom,spmi-pmic-arb";
+\t\t\treg = <0x200f000 0x1000>,
+\t\t\t      <0x2400000 0x800000>,
+\t\t\t      <0x2c00000 0x800000>,
+\t\t\t      <0x3800000 0x200000>,
+\t\t\t      <0x200a000 0x2100>;
+\t\t\treg-names = "core", "chnls", "obsrvr", "intr", "cnfg";
+\t\t\tinterrupts = <{GIC_SPI} 190 {IRQ_LEVEL_HIGH}>;
+\t\t\t#address-cells = <2>;
+\t\t\t#size-cells = <0>;
+\t\t\tstatus = "okay";
+
+\t\t\tpmi8950_0: pmic@0 {{
+\t\t\t\tcompatible = "qcom,pmi8950", "qcom,spmi-pmic";
+\t\t\t\treg = <0 0>;
+\t\t\t\t#address-cells = <1>;
+\t\t\t\t#size-cells = <0>;
+
+\t\t\t\tpmi8950_wled: wled@d800 {{
+\t\t\t\t\tcompatible = "qcom,pmi8950-wled";
+\t\t\t\t\treg = <0xd800>;
+\t\t\t\t\tqcom,enabled-strings = <0 1 2 3>;
+\t\t\t\t\tqcom,current-limit-microamp = <20000>;
+\t\t\t\t\tstatus = "okay";
+\t\t\t\t}};
+
+\t\t\t\tpmi8950_pwrkey: pon@800 {{
+\t\t\t\t\tcompatible = "qcom,pm8941-pwrkey";
+\t\t\t\t\treg = <0x800>;
+\t\t\t\t\tstatus = "okay";
+\t\t\t\t}};
+
+\t\t\t\tpmi8950_resin: resin@810 {{
+\t\t\t\t\tcompatible = "qcom,pm8941-resin";
+\t\t\t\t\treg = <0x810>;
+\t\t\t\t\tlinux,code = <{pmic_code}>;
+\t\t\t\t\tstatus = "okay";
+\t\t\t\t}};
+\t\t\t}};
+\t\t}};
+
 \t\tpronto: pronto@{pronto:x} {{
 \t\t\tcompatible = "lge,pronto-wcnss";
 \t\t\treg = <{pronto:#x} {pronto_size:#x}>;
 \t\t\tinterrupts = <{GIC_SPI} 149 {IRQ_EDGE_RISING}>;
 \t\t\tmemory-region = <&wcnss_region>;
 \t\t\tstatus = "okay";
-\t\t}};
-
-\t\tmodem: modem-mss {{
-\t\t\tcompatible = "qcom,msm8917-mss-pil", "qcom,msm8916-mss-pil";
-\t\t\tmba-region = <&mba_region>;
-\t\t\tmpss-region = <&mpss_region>;
-\t\t\t/* Disabled: q6v5_mss needs CX/MX power domains and
-\t\t\t * GCC clocks (no rpmpd/gcc-msm8917 yet). Flip when
-\t\t\t * those land, or when a bootloader-on run proves
-\t\t\t * the domains stay up without them. */
-\t\t\tstatus = "disabled";
 \t\t}};
 
 \t\tkeys: keys@{tlmm:x} {{
@@ -396,6 +382,73 @@ def generate(sources: dict[str, str], device: str, panel: str, rev: str,
 \t\t}};
 \t}};
 
+\tsmp2p_modem: smp2p-modem {{
+\t\tcompatible = "qcom,smp2p";
+\t\tqcom,smem = <451>, <431>;
+\t\tinterrupts = <{GIC_SPI} 27 {IRQ_EDGE_RISING}>;
+\t\tmboxes = <&apcs 14>;
+\t\tqcom,local-pid = <0>;
+\t\tqcom,remote-pid = <1>;
+\t\tmodem_smp2p_out: master-kernel {{
+\t\t\tqcom,entry-name = "master-kernel";
+\t\t\t#qcom,smem-state-cells = <1>;
+\t\t}};
+\t\tmodem_smp2p_in: slave-kernel {{
+\t\t\tqcom,entry-name = "slave-kernel";
+\t\t\tinterrupt-controller;
+\t\t\t#interrupt-cells = <2>;
+\t\t}};
+\t}};
+
+\tsmp2p_wcnss: smp2p-wcnss {{
+\t\tcompatible = "qcom,smp2p";
+\t\tqcom,smem = <451>, <431>;
+\t\tinterrupts = <{GIC_SPI} 143 {IRQ_EDGE_RISING}>;
+\t\tmboxes = <&apcs 18>;
+\t\tqcom,local-pid = <0>;
+\t\tqcom,remote-pid = <4>;
+\t\twcnss_smp2p_out: master-kernel {{
+\t\t\tqcom,entry-name = "master-kernel";
+\t\t\t#qcom,smem-state-cells = <1>;
+\t\t\t}};
+\t\twcnss_smp2p_in: slave-kernel {{
+\t\t\tqcom,entry-name = "slave-kernel";
+\t\t\tinterrupt-controller;
+\t\t\t#interrupt-cells = <2>;
+\t\t}};
+\t}};
+
+\tsmd {{
+\t\tcompatible = "qcom,smd";
+\t\tmodem_edge: modem-edge {{
+\t\t\tinterrupts = <{GIC_SPI} 25 {IRQ_EDGE_RISING}>;
+\t\t\tqcom,ipc = <&apcs 8 12>;
+\t\t\tqcom,smd-edge = <0>;
+\t\t\tlabel = "modem";
+\t\t}};
+\t\twcnss_edge: wcnss-edge {{
+\t\t\tinterrupts = <{GIC_SPI} 142 {IRQ_EDGE_RISING}>;
+\t\t\tqcom,ipc = <&apcs 8 17>;
+\t\t\tqcom,smd-edge = <6>;
+\t\t\tlabel = "wcnss";
+\t\t\twcnss_ctrl {{
+\t\t\t\tcompatible = "qcom,wcnss";
+\t\t\t\tqcom,smd-channel = "WCNSS_CTRL";
+\t\t\t}};
+\t\t}};
+\t}};
+
+\tmodem: modem-mss {{
+\t\tcompatible = "qcom,msm8917-mss-pil", "qcom,msm8916-mss-pil";
+\t\tmba-region = <&mba_region>;
+\t\tmpss-region = <&mpss_region>;
+\t\t/* Disabled: q6v5_mss needs CX/MX power domains and
+\t\t * GCC clocks (no rpmpd/gcc-msm8917 yet). Flip when
+\t\t * those land, or when a bootloader-on run proves
+\t\t * the domains stay up without them. */
+\t\tstatus = "disabled";
+\t}};
+
 \t/* Unclaimed until the TLMM port lands; present so phandle
 \t * references (&tlmm) resolve. */
 \ttlmm: pinctrl {{
@@ -405,6 +458,11 @@ def generate(sources: dict[str, str], device: str, panel: str, rev: str,
 \t\tinterrupt-controller;
 \t\t#interrupt-cells = <2>;
 \t\tstatus = "disabled";
+\t}};
+
+\tlge_modem: lge-modem {{
+\t\tcompatible = "lge,lv517-modem";
+\t\tstatus = "okay";
 \t}};
 
 \tsound {{
@@ -419,7 +477,7 @@ def generate(sources: dict[str, str], device: str, panel: str, rev: str,
 \t\tstatus = "okay";
 \t}};
 
-\tframebuffer0: framebuffer@90000000 {{
+\tframebuffer0: framebuffer@{lk_fb_base:x} {{
 \t\tcompatible = "simple-framebuffer";
 \t\treg = <0x0 {lk_fb_base:#x} 0x0 0x1400000>;
 \t\twidth = <{width}>;

@@ -80,7 +80,7 @@ with tempfile.TemporaryDirectory(prefix="j36-diagnostic-mode-") as tmp:
                                          (False, "j36.diag=power", "0"),
                                          (True, "", "0")]:
         if embedded:
-            marker.write_text("v4\n")
+            marker.write_text("v5\n")
         elif marker.exists():
             marker.unlink()
         cmdline.write_text(argument + "\n")
@@ -89,7 +89,7 @@ with tempfile.TemporaryDirectory(prefix="j36-diagnostic-mode-") as tmp:
                                  + '\necho "$want_expand"'], text=True,
                                 capture_output=True, check=True)
         assert result.stdout.strip() == expected
-assert builder.index('stage "J36 DIAG v4: resize skipped"') < builder.index('\nexpand_root\n')
+assert builder.index('stage "J36 DIAG v5: resize skipped"') < builder.index('\nexpand_root\n')
 
 def function(name):
     start = builder.index(name + "() {\n")
@@ -135,4 +135,45 @@ echo "prev=$(cat "$watch_markfile.prev" 2>/dev/null)"
             assert word in out, (mode, mark, word, out)
         if not words:
             assert "stopped dead" not in out
-print("Power diagnostic: opt-in, embedded mode, resize bypass, no idle delay, rotation, mount cleanup, step marks and diag retry passed")
+
+with tempfile.TemporaryDirectory(prefix="j36-earlytrace-test-") as tmp:
+    root = Path(tmp)
+    script = root / "stage.sh"
+    staged = (function("ensure_run_tmpfs") +
+              function("setup_earlytrace")).replace("/newroot/", str(root) + "/")
+    script.write_text("""
+run_tmpfs=0
+rootdev=/dev/mmcblk0p2
+say() { echo "say: $*"; }
+detail() { :; }
+mount() { :; }
+""" + staged + "\nsetup_earlytrace\n")
+    for mode, want in [("power", True), ("", False)]:
+        run = root / "run"
+        if run.exists():
+            for f in sorted(run.rglob("*"), reverse=True):
+                if f.is_symlink() or f.is_file():
+                    f.unlink()
+                else:
+                    f.rmdir()
+        result = subprocess.run(["sh", str(script)], check=True, text=True,
+                                capture_output=True, env=dict(os.environ,
+                                    TEST_ROOT=str(root), power_diag=mode))
+        unit = run / "systemd/system/j36-early-trace.service"
+        prog = run / "j36/bin/j36-early-trace"
+        link = run / "systemd/system/sysinit.target.wants/j36-early-trace.service"
+        assert unit.exists() == want
+        assert prog.exists() == want
+        assert link.is_symlink() == want
+        if not want:
+            continue
+        assert "j36-early-0.txt" in result.stdout
+        assert "Before=sysinit.target" in unit.read_text()
+        assert "ExecStart=/bin/sh /run/j36/bin/j36-early-trace" in unit.read_text()
+        text = prog.read_text()
+        for needle in ("j36-early-", "is-system-running", "is-active mixdash.service",
+                       "sleep 2", "trace_complete="):
+            assert needle in text, needle
+        assert os.access(prog, os.X_OK)
+        subprocess.run(["sh", "-n", str(prog)], check=True)
+print("Power diagnostic: opt-in, embedded mode, resize bypass, no idle delay, rotation, mount cleanup, step marks, diag retry and early trace passed")

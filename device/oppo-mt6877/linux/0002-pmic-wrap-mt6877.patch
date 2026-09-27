@@ -19,7 +19,7 @@ diff --git a/drivers/soc/mediatek/mtk-pmic-wrap.c b/drivers/soc/mediatek/mtk-pmi
 index 0000000..0000000 100644
 --- a/drivers/soc/mediatek/mtk-pmic-wrap.c
 +++ b/drivers/soc/mediatek/mtk-pmic-wrap.c
-@@ -2450,6 +2450,7 @@ static const struct of_device_id of_pwrap_match_tbl[] = {
+@@ -2451,6 +2451,7 @@ static const struct of_device_id of_pwrap_match_tbl[] = {
  	{ .compatible = "mediatek,mt6795-pwrap", .data = &pwrap_mt6795 },
  	{ .compatible = "mediatek,mt6797-pwrap", .data = &pwrap_mt6797 },
  	{ .compatible = "mediatek,mt6873-pwrap", .data = &pwrap_mt6873 },

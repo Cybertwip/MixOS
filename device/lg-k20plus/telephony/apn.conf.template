@@ -1,0 +1,9 @@
+# APN template for the data scripts (see telephony/README.md).
+# Copy to /etc/mixos/apn.conf on the phone and fill in your carrier.
+
+# apn=internet
+# username=
+# password=
+# auth=none
+# protocol=IP
+# qmi-device=/dev/cdc-wdm0

@@ -1,0 +1,5 @@
+# LG K20 Plus modem: tag the glue device and start telephony on READY.
+ACTION=="add", SUBSYSTEM=="platform", DRIVER=="lg-lv517-modem", TAG+="systemd", ENV{SYSTEMD_WANTS}="lg-telephony.service"
+ACTION=="change", SUBSYSTEM=="platform", DRIVER=="lg-lv517-modem", ENV{STATE}=="ready", TAG+="systemd", ENV{SYSTEMD_WANTS}="lg-telephony.service"
+# The QMI control port ModemManager drives.
+ACTION=="add", SUBSYSTEM=="wwan", TAG+="systemd", ENV{SYSTEMD_WANTS}="ModemManager.service"

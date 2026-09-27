@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: all r36-ultra j36-ultra devenv devenv32 clean clean_devenv clean_devenv32 clean_complete
+.PHONY: all r36-ultra j36-ultra oppo lg mixos devenv devenv32 clean clean_devenv clean_devenv32 clean_complete
 
 DEBIAN_CODE_NAME ?= trixie
 ENABLE_CACHE ?= y
@@ -54,6 +54,22 @@ j36-ultra:
 	$(info parallel build jobs: $(BUILD_JOBS))
 	$(info Debian userspace architecture: $(R36_USERSPACE_ARCH))
 	env USERSPACE_ARCH="$(R36_USERSPACE_ARCH)" ./build-j36-ultra.sh
+
+# The phone families.  Each builds a boot.img + Debian rootfs tarball per
+# device (OPPO_DEVICE= / LG_DEVICE= picks one; the default is the primary
+# target).  macOS only, same Multipass VM as the handheld builds.
+oppo:
+	$(info MixOS OPPO phones will use Debian $(DEBIAN_CODE_NAME).)
+	./build-oppo.sh
+
+lg:
+	$(info MixOS LG phones will use Debian $(DEBIAN_CODE_NAME).)
+	./build-lg.sh
+
+# Everything: J36 Ultra, then every OPPO device, then every LG device.
+mixos:
+	$(info MixOS full build will use Debian $(DEBIAN_CODE_NAME).)
+	./build-mixos.sh
 
 devenv:
 	$(info MixOS will be built using the $(DEBIAN_CODE_NAME) release of Debian.)

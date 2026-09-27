@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MixOS project <mixos@example.invalid>
+Date: Sat, 27 Sep 2026 00:00:00 +0000
+Subject: [PATCH 1/1] remoteproc: qcom_q6v5_mss: add MSM8917 modem support
+
+The MSM8917 (Snapdragon 425) modem subsystem is the same Hexagon-generation
+MSS as MSM8916: same MBA/MPS download handshake, same set of shutdown-ack
+interrupts, same regulators-behind-RPM. Reuse the msm8916_mss data under
+the 8917 compatible so the LG K20 Plus modem can boot on mainline.
+
+CHECK on hardware: confirm MBA auth passes and the modem reaches running
+state before enabling the node (it ships disabled until the CX/MX power
+domains are proven up).
+---
+ drivers/remoteproc/qcom_q6v5_mss.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/remoteproc/qcom_q6v5_mss.c b/drivers/remoteproc/qcom_q6v5_mss.c
+index 0000000..0000000 100644
+--- a/drivers/remoteproc/qcom_q6v5_mss.c
++++ b/drivers/remoteproc/qcom_q6v5_mss.c
+@@ -2532,6 +2532,7 @@ static const struct of_device_id q6v5_of_match[] = {
+ 	{ .compatible = "qcom,q6v5-pil", .data = &msm8916_mss},
+ 	{ .compatible = "qcom,msm8909-mss-pil", .data = &msm8909_mss},
+ 	{ .compatible = "qcom,msm8916-mss-pil", .data = &msm8916_mss},
++	{ .compatible = "qcom,msm8917-mss-pil", .data = &msm8916_mss},
+ 	{ .compatible = "qcom,msm8953-mss-pil", .data = &msm8953_mss},
+ 	{ .compatible = "qcom,msm8974-mss-pil", .data = &msm8974_mss},
+ 	{ .compatible = "qcom,msm8996-mss-pil", .data = &msm8996_mss},
+-- 
+2.0.0

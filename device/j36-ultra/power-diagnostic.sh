@@ -18,7 +18,7 @@ power_diag_checkpoint() {
     # Alternate files so a cut during this write does not truncate the last
     # checkpoint. Sequence and boot ID distinguish old boots and partial files.
     {
-        echo "J36 power diagnostic v4 (resize bypassed)"
+        echo "J36 power diagnostic v5 (resize bypassed)"
         echo "sequence=$power_diag_seq stage=$*"
         echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
         echo "uptime=$(cat /proc/uptime)"
