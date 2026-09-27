@@ -847,7 +847,17 @@ func bringUpPhoneDA(cfg config, phone *phoneRoot, facts phoneFacts, emi *mtkPrel
 			// register writes, so it stays viable when the reset path
 			// is policy-blocked.
 			fmt.Printf("Automatic BROM reset was refused: %v\n", flagFailureAdvice(err))
-			fmt.Printf("Waiting up to %s for a BROM replug with the download key combo held.\n", window)
+			// A replug never reboots a battery-powered phone, so the
+			// keys would never be sampled; the crash reboot keeps the
+			// cable captive (see crashMTKPreloaderToBROM). The window
+			// is nonzero here, so the landing watch below always runs.
+			fmt.Println("Firing crash-to-BROM in 20s: hold Vol-up+Vol-down NOW and keep them held through any USB drop.")
+			for left := 20; left > 0; left -= 5 {
+				fmt.Printf("Crash in %ds; keys held?\n", left)
+				time.Sleep(5 * time.Second)
+			}
+			crashPhonePreloader(client, phone, facts)
+			fmt.Printf("Crash modes done; watching up to %s for the BROM landing.\n", window)
 		} else {
 			_ = client.port.Close()
 			client = nil
