@@ -109,6 +109,9 @@ type mtkSerialClient struct {
 type mtkSerialConnectOptions struct {
 	recoverFeedPayload bool
 	reuseFeedPayload   bool
+	// waitForUSB keeps phone discovery on raw USB even while unrelated tty
+	// nodes are present. BROM 0x0e8d:0x0003 need not expose a modem node.
+	waitForUSB bool
 	// handshakeWake pre-sends a lone 0xA0 before the handshake on USB
 	// transports. The reference flasher does this for non-BROM PIDs; the
 	// stray echo self-aligns into the loop, so it is harmless where

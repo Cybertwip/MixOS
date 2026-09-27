@@ -637,3 +637,58 @@ func TestPhoneFactsForHWCode(t *testing.T) {
 		t.Fatal("unknown hw code accepted, want refusal")
 	}
 }
+
+func TestCrashLandingVerdict(t *testing.T) {
+	gone := errors.New("usb device not configured: LIBUSB_ERROR_NO_DEVICE")
+	rows := []struct {
+		name    string
+		err     error
+		isBROM  bool
+		want    string
+		wantErr bool
+	}{
+		{"brom", nil, true, "DO NOT UNPLUG", false},
+		{"drop", gone, false, "rebooting", false},
+		{"refused", nil, false, "clean-refused", false},
+		{"weird", errors.New("short read"), false, "", true},
+	}
+	for _, row := range rows {
+		msg, err := crashLandingVerdict(row.err, row.isBROM, 0x5)
+		if row.wantErr {
+			if err == nil {
+				t.Fatalf("%s: verdict error = nil, want probe failure", row.name)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%s: verdict error = %v, want nil", row.name, err)
+		}
+		if !strings.Contains(msg, row.want) {
+			t.Fatalf("%s: verdict %q, want %q inside", row.name, msg, row.want)
+		}
+	}
+	if msg, _ := crashLandingVerdict(nil, true, 0x5); !strings.Contains(msg, "0x00000005") {
+		t.Fatalf("brom verdict %q, want config hex inside", msg)
+	}
+}
+
+func TestCountdownCrashKeys(t *testing.T) {
+	var buf bytes.Buffer
+	var sleeps []time.Duration
+	countdownCrashKeys(&buf, func(d time.Duration) { sleeps = append(sleeps, d) })
+	out := buf.String()
+	if !strings.Contains(out, "hold Vol-up+Vol-down NOW") {
+		t.Fatalf("countdown %q, want the keys instruction", out)
+	}
+	if got := strings.Count(out, "Crash in "); got != 4 {
+		t.Fatalf("countdown has %d steps, want 4 (20s in 5s steps)", got)
+	}
+	if len(sleeps) != 4 {
+		t.Fatalf("countdown slept %d times, want 4", len(sleeps))
+	}
+	for i, d := range sleeps {
+		if d != 5*time.Second {
+			t.Fatalf("sleep %d = %v, want 5s", i, d)
+		}
+	}
+}

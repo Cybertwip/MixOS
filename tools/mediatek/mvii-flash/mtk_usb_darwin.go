@@ -19,15 +19,18 @@ import (
 	"unsafe"
 )
 
-// The MediaTek BROM/preloader VCOM is a USB CDC-ACM device. On macOS the kernel
-// AppleUSBCDC driver binds it and exposes /dev/cu.usbmodem*, but that kernel
-// path injects control/interrupt traffic the MT6592 BROM does not tolerate, so
-// the device re-enumerates a beat after the handshake ("device not configured").
+// MediaTek BROM (0x0e8d:0x0003) is a raw USB device; preloader modes may also
+// expose a CDC-ACM /dev/cu.usbmodem* node. On macOS the kernel tty path can
+// inject traffic the MT6592 BROM does not tolerate, so the device re-enumerates
+// a beat after the handshake ("device not configured").
 //
 // This transport bypasses the tty driver entirely: it opens the device with
 // libusb, detaches the kernel driver (macOS device capture, requires sudo) and
 // talks to the BROM over its raw bulk IN/OUT endpoints, exactly like mtkclient.
-const mtkUSBVendorID = 0x0e8d
+const (
+	mtkUSBVendorID = 0x0e8d
+	mtkUSBBROMPID  = 0x0003
+)
 
 // Retail phones in preloader mode enumerate under their vendor's VID, not
 // MediaTek's: OPPO 0x22d9:0x0006, LG 0x1004:0x6000. BROM itself always
@@ -39,13 +42,17 @@ const (
 	mtkUSBLGPreloader   = 0x6000
 )
 
-// isMTKUSBFlashDevice reports whether a USB VID:PID pair is a flashable
-// target: anything MediaTek except the live debug console, plus the
-// vendor-VID preloader modes of retail phones.
+// isMTKUSBFlashDevice admits the MediaTek BROM and known preloader IDs,
+// plus the vendor-VID preloader modes of retail phones. Other MediaTek
+// products should not be claimed merely because they share VID 0x0e8d.
 func isMTKUSBFlashDevice(vid, pid uint16) bool {
 	switch vid {
 	case mtkUSBVendorID:
-		return pid != mviiDebugConsolePID
+		switch pid {
+		case mtkUSBBROMPID, 0x2000, 0x2001, 0x20ff, 0x3000, 0x6000:
+			return true
+		}
+		return false
 	case mtkUSBOppoVendorID:
 		return pid == mtkUSBOppoPreloader
 	case mtkUSBLGVendorID:
@@ -54,10 +61,17 @@ func isMTKUSBFlashDevice(vid, pid uint16) bool {
 	return false
 }
 
+func mtkUSBModeLabel(vid, pid uint16) string {
+	if vid == mtkUSBVendorID && pid == mtkUSBBROMPID {
+		return "BROM"
+	}
+	return "preloader"
+}
+
 var (
 	errMTKUSBTimeout  = errors.New("usb bulk timeout")
 	errMTKUSBClosed   = errors.New("usb port closed")
-	errMTKUSBNotFound = errors.New("no flashable MediaTek USB device found (VID 0x0e8d, 0x22d9, 0x1004)")
+	errMTKUSBNotFound = errors.New("no MediaTek BROM/preloader USB device found (BROM 0x0e8d:0x0003; preloader VID 0x0e8d, 0x22d9, 0x1004)")
 )
 
 var (
@@ -87,6 +101,8 @@ type mtkUSBPort struct {
 	iface  C.int
 	epIn   C.uchar
 	epOut  C.uchar
+	vid    uint16
+	pid    uint16
 	mu     sync.Mutex
 	closed bool
 	rbuf   []byte // bytes already pulled from the device but not yet consumed

@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -312,7 +313,7 @@ func acquirePhoneBROM(cfg config, phone *phoneRoot, facts phoneFacts, emi *mtkPr
 	deadline := time.Now().Add(window)
 	var lastErr error
 	for attempt := 1; ; attempt++ {
-		client, err := connectMTKSerialWithOptions(cfg.device, mtkSerialConnectOptions{handshakeWake: true})
+		client, err := connectMTKSerialWithOptions(cfg.device, mtkSerialConnectOptions{handshakeWake: true, waitForUSB: true})
 		if err == nil {
 			client.preloaderEMI = emi
 			target, err := probePhoneBROM(client, phone, facts)
@@ -359,7 +360,7 @@ func acquirePhoneBROMAuto(cfg config, emi *mtkPreloaderEMI) (*mtkSerialClient, m
 }
 
 func acquirePhoneBROMAutoOnce(cfg config, emi *mtkPreloaderEMI) (*mtkSerialClient, mtkTargetConfig, *phoneRoot, phoneFacts, error) {
-	client, err := connectMTKSerialWithOptions(cfg.device, mtkSerialConnectOptions{handshakeWake: true})
+	client, err := connectMTKSerialWithOptions(cfg.device, mtkSerialConnectOptions{handshakeWake: true, waitForUSB: true})
 	if err != nil {
 		return nil, mtkTargetConfig{}, nil, phoneFacts{}, err
 	}
@@ -667,18 +668,40 @@ func crashMTKPreloaderToBROM(cfg config) error {
 	crashPhonePreloader(client, phone, facts)
 	landed, err := probePhoneBROMOnce(client, phone, facts, true)
 	_ = client.port.Close()
+	msg, verr := crashLandingVerdict(err, client.isBROM, landed.Raw)
+	if verr != nil {
+		return verr
+	}
+	fmt.Println(msg)
+	return nil
+}
+
+// crashLandingVerdict classifies the post-crash probe into the operator's
+// next step: BROM means -unlock now, a dropped handle means the phone is
+// rebooting under held keys, a live preloader means every mode was
+// clean-refused, and anything else propagates as an error.
+func crashLandingVerdict(probeErr error, isBROM bool, raw uint32) (string, error) {
 	switch {
-	case err == nil && client.isBROM:
-		fmt.Printf("BROM landed (config 0x%08x). DO NOT UNPLUG: run -unlock now; it skips straight to SEND_AUTH.\n", landed.Raw)
-		return nil
-	case err != nil && isDeviceGoneError(err):
-		fmt.Println("USB dropped: the phone is rebooting. Keep the keys held and run -unlock -wait 2m to catch the landing.")
-		return nil
-	case err == nil:
-		fmt.Println("Still preloader: the secured unit clean-refused every mode. Remaining path: full power-off, then plug with Vol-up+Vol-down held and rerun -unlock -wait 5m.")
-		return nil
+	case probeErr == nil && isBROM:
+		return fmt.Sprintf("BROM landed (config 0x%08x). DO NOT UNPLUG: run -unlock now; it skips straight to SEND_AUTH.", raw), nil
+	case probeErr != nil && isDeviceGoneError(probeErr):
+		return "USB dropped: the phone is rebooting. Keep the keys held and run -unlock -wait 2m to catch the landing.", nil
+	case probeErr == nil:
+		return "Still preloader: the secured unit clean-refused every mode. Remaining path: full power-off, then plug with Vol-up+Vol-down held and rerun -unlock -wait 5m.", nil
 	default:
-		return fmt.Errorf("probe after crash modes: %w", err)
+		return "", fmt.Errorf("probe after crash modes: %w", probeErr)
+	}
+}
+
+// countdownCrashKeys gives the operator 20 seconds in 5-second steps to
+// hold the download keys before the crash modes fire: the reboot samples
+// the keys, so firing without them held wastes the only captive-cable
+// reboot. The sleeper is injected for tests.
+func countdownCrashKeys(w io.Writer, sleep func(time.Duration)) {
+	fmt.Fprintln(w, "Firing crash-to-BROM in 20s: hold Vol-up+Vol-down NOW and keep them held through any USB drop.")
+	for left := 20; left > 0; left -= 5 {
+		fmt.Fprintf(w, "Crash in %ds; keys held?\n", left)
+		sleep(5 * time.Second)
 	}
 }
 
@@ -851,11 +874,7 @@ func bringUpPhoneDA(cfg config, phone *phoneRoot, facts phoneFacts, emi *mtkPrel
 			// keys would never be sampled; the crash reboot keeps the
 			// cable captive (see crashMTKPreloaderToBROM). The window
 			// is nonzero here, so the landing watch below always runs.
-			fmt.Println("Firing crash-to-BROM in 20s: hold Vol-up+Vol-down NOW and keep them held through any USB drop.")
-			for left := 20; left > 0; left -= 5 {
-				fmt.Printf("Crash in %ds; keys held?\n", left)
-				time.Sleep(5 * time.Second)
-			}
+			countdownCrashKeys(os.Stdout, time.Sleep)
 			crashPhonePreloader(client, phone, facts)
 			fmt.Printf("Crash modes done; watching up to %s for the BROM landing.\n", window)
 		} else {
@@ -864,7 +883,7 @@ func bringUpPhoneDA(cfg config, phone *phoneRoot, facts phoneFacts, emi *mtkPrel
 			fmt.Printf("Reset requested; waiting up to %s for BROM to enumerate.\n", window)
 		}
 		client, target, err = waitPhoneBROM(cfg, phone, facts, client, window, func(device string) (*mtkSerialClient, error) {
-			return connectMTKSerialWithOptions(device, mtkSerialConnectOptions{handshakeWake: true})
+			return connectMTKSerialWithOptions(device, mtkSerialConnectOptions{handshakeWake: true, waitForUSB: true})
 		})
 		if err != nil {
 			return nil, mtkTargetConfig{}, err
