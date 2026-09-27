@@ -3721,7 +3721,6 @@ failed:
 enum {
     LK_BOOTMENU_POLL_MS = 20u,
     LK_BOOTMENU_POLLS_MAX = 1000u,
-    LK_BOOTMENU_BADGE_MS = 2000u,
     LK_BOOTMENU_MASK_W = 800u,
     LK_BOOTMENU_MASK_H = 48u,
     LK_BOOTMENU_MASK_MARGIN = 2u
@@ -3730,15 +3729,10 @@ enum {
 /* mixsplash's palette, shared so both screens grade alike: white stage ink,
  * pale-blue detail, Microsoft's accent bar. Dots are white, shadows black. */
 #define LK_BOOTMENU_STAGE_RGB 0xffffffu
-#define LK_BOOTMENU_DETAIL_RGB 0xbfd8f0u
-#define LK_BOOTMENU_BAR_RGB 0x0078d4u
 #define LK_BOOTMENU_BEACON_ANDROID 0xff004030u
 #define LK_BOOTMENU_BEACON_MIXOS 0xff203050u
 
-static const char kBootmenuPrompt[] = "PRESS ANY BUTTON TO BOOT INTO ANDROID";
-static const char kBootmenuAndroid[] = "BOOTING ANDROID";
-static const char kBootmenuMixOS[] = "BOOTING MIXOS";
-static char kBootmenuDetail[] = "Booting MixOS in 5";
+static const char kBootmenuPrompt[] = "PRESS MENU FOR ANDROID";
 
 /* The text pipe's coverage masks. .bss is NOLOAD, so these cost DRAM only. */
 static unsigned char g_menu_mask[LK_BOOTMENU_MASK_W * LK_BOOTMENU_MASK_H];
@@ -3901,34 +3895,6 @@ static void lk_menu_spinner(uint32_t t_ms) {
  * instead of filling with progress, over a track that darkens the splash,
  * with the glint travelling inside the fill. The whole row repaints over a
  * fresh snapshot every slice, because darkening twice would show. */
-static void lk_menu_bar(uint32_t elapsed_ms) {
-    const uint32_t w = (uint32_t)MVII_MT6592_LK_FB_WIDTH;
-    const uint32_t h = (uint32_t)MVII_MT6592_LK_FB_HEIGHT;
-    const uint32_t stride = (uint32_t)MVII_MT6592_LK_FB_PITCH / 4u;
-    volatile uint32_t* canvas = (volatile uint32_t*)(uintptr_t)g_draw_base;
-    const lk_menu_box_t b = lk_menu_bar_box(w, h);
-    const uint32_t permille = lk_bootmenu_bar_permille(elapsed_ms);
-    const uint32_t fill = (b.w * permille) / 1000u;
-    int32_t glint = -1;
-    uint32_t x, y;
-
-    lk_fb_snapshot_live(b.x, b.y, b.w, b.h);
-    lk_fb_blend_rect(b.x, b.y, b.w, b.h, (96u << 24u));
-    if (fill > 0u) lk_fb_blend_rect(b.x, b.y, fill, b.h, (235u << 24u) | LK_BOOTMENU_BAR_RGB);
-    if (fill > 24u) glint = (int32_t)(((elapsed_ms % 1000u) * fill) / 1000u);
-    if (glint < 0) return;
-    for (y = b.y; y < b.y + b.h; ++y) {
-        for (x = b.x; x < b.x + fill; ++x) {
-            int32_t d = (int32_t)(x - b.x) - glint;
-            uint32_t i;
-            if (d < 0) d = -d;
-            if (d >= 18) continue;
-            i = y * stride + x;
-            canvas[i] = lk_menu_add(canvas[i], (18 - d) * 4, (18 - d) * 5, (18 - d) * 5);
-        }
-    }
-}
-
 /* The splash pixels under the menu cluster, aside and back. Packed rows in
  * the save buffer, strided rows on the canvas; the box is the header's, and
  * run() refuses the menu if it ever outgrows the buffer. */
@@ -3960,35 +3926,15 @@ static void lk_menu_restore_splash(void) {
         for (xx = 0u; xx < w; ++xx) dst[(y + yy) * stride + x + xx] = src[yy * w + xx];
 }
 
-/* The tag: the choice as a stage line with the spinner under it, over a
- * splash-fresh cluster. It dwells in run() -- two seconds or one press --
- * and then the splash comes back; a tag that sits through the whole load
- * says nothing the spinner did not already say. */
-static void lk_bootmenu_badge(uint32_t android, uint32_t t_ms) {
+/* Keep a failed selection visible rather than silently booting another OS. */
+static void lk_bootmenu_error(const char *message) {
     const uint32_t w = (uint32_t)MVII_MT6592_LK_FB_WIDTH;
     const uint32_t h = (uint32_t)MVII_MT6592_LK_FB_HEIGHT;
     const lk_menu_box_t save = lk_menu_save_box(w, h);
-    const char* text = android != 0u ? kBootmenuAndroid : kBootmenuMixOS;
-
-    lk_fb_snapshot_live(save.x, save.y, save.w, save.h);
-    lk_menu_text(text, w / 2u, lk_menu_stage_y(h), 3u, LK_BOOTMENU_STAGE_RGB, 255u);
-    lk_menu_spinner(t_ms);
-    lk_fb_present(save.x, save.y, save.w, save.h);
-}
-
-/* The fallback tag, for the SD-decline path only: the eMMC image below is
- * what boots, so the panel must say so -- and this one stays, because it
- * names an exceptional path the operator did not choose. Self-contained:
- * targets, paints and presents itself, and leaves the target live. */
-static void lk_bootmenu_fallback_tag(void) {
-    const uint32_t w = (uint32_t)MVII_MT6592_LK_FB_WIDTH;
-    const uint32_t h = (uint32_t)MVII_MT6592_LK_FB_HEIGHT;
-    const lk_menu_box_t save = lk_menu_save_box(w, h);
-
+    if (!g_fb_live) return;
     lk_fb_target((uint32_t)MVII_MT6592_LK_SHADOW_ADDR);
     lk_fb_snapshot_live(save.x, save.y, save.w, save.h);
-    lk_menu_text(kBootmenuAndroid, w / 2u, lk_menu_stage_y(h), 3u, LK_BOOTMENU_STAGE_RGB,
-                 255u);
+    lk_menu_text(message, w / 2u, lk_menu_stage_y(h), 2u, LK_BOOTMENU_STAGE_RGB, 255u);
     lk_fb_present(save.x, save.y, save.w, save.h);
     lk_fb_target((uint32_t)MVII_MT6592_LK_FB_ADDR);
 }
@@ -4011,158 +3957,49 @@ static void lk_bootmenu_quiesce(void) {
     lk_gpio_val_bit(LK_KPD_PULLEN_BASE, LK_KPD_MENU_COL_PAD, 0u);
 }
 
-static uint32_t lk_bootmenu_edge(const uint32_t cur[LK_KPD_NUM_MEMS],
-                                 const uint32_t prev[LK_KPD_NUM_MEMS],
-                                 uint32_t menu, uint32_t prev_menu) {
-    uint32_t i;
-
-    if (menu != 0u && prev_menu == 0u) return 1u;
-    for (i = 0u; i < LK_KPD_NUM_MEMS; ++i) {
-        const uint32_t valid = (i == LK_KPD_NUM_MEMS - 1u) ? 0x00ffu : 0xffffu;
-        if ((((~cur[i]) & prev[i]) & valid) != 0u) return 1u;
-    }
-    return 0u;
-}
-
 static uint32_t lk_bootmenu_run(void) {
-    volatile uint16_t* const en =
-        (volatile uint16_t*)(uintptr_t)(LK_KPD_BASE + LK_KPD_EN);
-    volatile uint16_t* const deb =
-        (volatile uint16_t*)(uintptr_t)(LK_KPD_BASE + LK_KPD_DEBOUNCE);
     const uint32_t w = (uint32_t)MVII_MT6592_LK_FB_WIDTH;
     const uint32_t h = (uint32_t)MVII_MT6592_LK_FB_HEIGHT;
     const lk_menu_box_t save = lk_menu_save_box(w, h);
     const lk_menu_box_t spin = lk_menu_spinner_box(w, h);
-    uint32_t prev[LK_KPD_NUM_MEMS];
-    uint32_t cur[LK_KPD_NUM_MEMS];
-    uint32_t prev_menu;
-    uint32_t elapsed_ms = 0u;
-    uint32_t last_lit = 1u;
-    uint32_t last_s = 5u;
-    uint32_t polls = 0u;
-    uint32_t pressed = 0u;
-    uint32_t pick;
-    uint32_t i;
-    uint32_t t0;
-    uint32_t t1;
+    lk_bootmenu_key_t key = {0u, 0u};
+    uint32_t polls, elapsed_ms = 0u, pressed = 0u, t0;
 
-    /* The block may never have scanned: force it on, take one slice so the mem
-     * words hold a real scan, and only then read the baseline the edges below
-     * are measured against. Same prologue as the debug combo. */
-    *deb = (uint16_t)LK_KPD_DEBOUNCE_DEFAULT;
-    *en = 1u;
+    /* MENU has known muxing and pull-ups. Unwired keypad bits used to count
+     * as a button edge and could skip SD boot without an operator's choice. */
     lk_kpd_menu_arm();
-    lk_park_hold_ms(LK_BOOTMENU_POLL_MS);
-    (void)lk_kpd_scan(prev);
-    prev_menu = lk_kpd_menu_down();
-    lk_power_telemetry("menu-enter");
-
-    /* The dismiss restores exactly the save buffer; if the box ever outgrew
-     * it the menu bows out instead of painting past the restore. */
+    lk_park_hold_ms(100u);
     if (save.w * save.h * 4u > (uint32_t)MVII_LK_MENU_SAVE_BYTES) {
-        lk_log("lk: bootmenu save box outgrew its buffer; skipping menu\n");
         lk_bootmenu_quiesce();
         return LK_BOOTMENU_MIXOS;
     }
     lk_menu_save_splash();
-
-    /* Off-screen for the whole window: compose on the shadow, land with a
-     * present. Restored before the return. */
     lk_fb_target((uint32_t)MVII_MT6592_LK_SHADOW_ADDR);
     lk_fb_snapshot_live(save.x, save.y, save.w, save.h);
-    lk_menu_text(kBootmenuPrompt, w / 2u, lk_menu_stage_y(h), 2u, LK_BOOTMENU_STAGE_RGB,
-                 255u);
-    kBootmenuDetail[17] = (char)('0' + 5);
-    lk_menu_text(kBootmenuDetail, w / 2u, lk_menu_detail_y(h), 1u, LK_BOOTMENU_DETAIL_RGB,
-                 220u);
-    lk_menu_bar(0u);
+    lk_menu_text(kBootmenuPrompt, w / 2u, lk_menu_stage_y(h), 2u,
+                 LK_BOOTMENU_STAGE_RGB, 255u);
     lk_menu_spinner(0u);
     lk_fb_present(save.x, save.y, save.w, save.h);
 
     t0 = mt6592_delay_gpt_ticks();
     for (polls = 0u; polls < LK_BOOTMENU_POLLS_MAX; ++polls) {
-        uint32_t lit;
-        uint32_t s;
-        lk_menu_box_t tb;
-
         lk_park_hold_ms(LK_BOOTMENU_POLL_MS);
         elapsed_ms = lk_ms_since(t0);
-        (void)lk_kpd_scan(cur);
-        if (lk_bootmenu_edge(cur, prev, lk_kpd_menu_down(), prev_menu)) {
+        if (elapsed_ms >= LK_BOOTMENU_WINDOW_MS) break;
+        if (lk_bootmenu_sample(&key, lk_kpd_menu_down())) {
             pressed = 1u;
             break;
         }
-        for (i = 0u; i < LK_KPD_NUM_MEMS; ++i) prev[i] = cur[i];
-        prev_menu = lk_kpd_menu_down();
-        if (elapsed_ms >= LK_BOOTMENU_WINDOW_MS) break;
-
-        /* The pad scans every slice, but the screen repaints every fourth:
-         * twelve frames a second is smooth for a two-second ring and a
-         * five-second bar, and each repaint is tens of thousands of uncached
-         * words the CPU would otherwise spend as heat before the kernel even
-         * starts. The blink and the countdown ride the repaint slices; a
-         * sixty-millisecond delay on either is invisible. */
         if ((polls % 4u) != 0u) continue;
-        lit = ((elapsed_ms / 250u) % 2u == 0u) ? 1u : 0u;
-        s = lk_bootmenu_remaining_s(elapsed_ms);
-        lk_menu_bar(elapsed_ms);
         lk_menu_spinner(elapsed_ms);
-        if (lit != last_lit) {
-            tb = lk_menu_text_bounds(w / 2u, lk_menu_stage_y(h), kBootmenuPrompt, 2u);
-            lk_fb_snapshot_live(tb.x, tb.y, tb.w, tb.h);
-            lk_menu_text(kBootmenuPrompt, w / 2u, lk_menu_stage_y(h), 2u,
-                         LK_BOOTMENU_STAGE_RGB, lit != 0u ? 255u : 80u);
-            last_lit = lit;
-        }
-        if (s != last_s) {
-            kBootmenuDetail[17] = (char)('0' + s);
-            tb = lk_menu_text_bounds(w / 2u, lk_menu_detail_y(h), kBootmenuDetail, 1u);
-            lk_fb_snapshot_live(tb.x, tb.y, tb.w, tb.h);
-            lk_menu_text(kBootmenuDetail, w / 2u, lk_menu_detail_y(h), 1u,
-                         LK_BOOTMENU_DETAIL_RGB, 220u);
-            last_s = s;
-        }
-        lk_fb_present(save.x, save.y, save.w, save.h);
-    }
-
-    /* The tag dwells two seconds or one press, whichever comes first, with
-     * the ring alive under it so the wait reads as working, not wedged.
-     * Re-baselined first, so the press that chose cannot dismiss its own tag
-     * and the boot that follows starts from a splash with no menu on it. */
-    pick = lk_bootmenu_pick(pressed);
-    lk_bootmenu_badge(pick, elapsed_ms);
-    lk_park_hold_ms(LK_BOOTMENU_POLL_MS);
-    (void)lk_kpd_scan(prev);
-    prev_menu = lk_kpd_menu_down();
-    t1 = mt6592_delay_gpt_ticks();
-    for (polls = 0u; polls < 200u; ++polls) {
-        uint32_t dwell_ms;
-
-        lk_park_hold_ms(LK_BOOTMENU_POLL_MS);
-        dwell_ms = lk_ms_since(t1);
-        (void)lk_kpd_scan(cur);
-        if (lk_bootmenu_edge(cur, prev, lk_kpd_menu_down(), prev_menu)) break;
-        for (i = 0u; i < LK_KPD_NUM_MEMS; ++i) prev[i] = cur[i];
-        prev_menu = lk_kpd_menu_down();
-        if (dwell_ms >= (uint32_t)LK_BOOTMENU_BADGE_MS) break;
-        /* Same throttle as the window: the ring keeps its twelve frames and
-         * the pad keeps its twenty milliseconds. */
-        if ((polls % 4u) != 0u) continue;
-        lk_menu_spinner(elapsed_ms + dwell_ms);
         lk_fb_present(spin.x, spin.y, spin.w, spin.h);
     }
+    /* No second BOOTING badge, countdown or draining progress bar. */
     lk_menu_restore_splash();
-
     lk_fb_target((uint32_t)MVII_MT6592_LK_FB_ADDR);
-    lk_log("lk: bootmenu kpd");
-    for (i = 0u; i < LK_KPD_NUM_MEMS; ++i) lk_log_hex(" mem=", cur[i]);
-    lk_log_hex(" menu=", lk_kpd_menu_down());
-    lk_log_hex(" after_ms=", elapsed_ms);
-    lk_log(pressed != 0u ? " pick=android\n" : " pick=mixos-sd\n");
-    lk_power_telemetry("menu-exit");
-    /* After the last live matrix read above: the loads below see pristine pads. */
+    lk_log(pressed ? "lk: MENU selected Android\n" : "lk: default selected MixOS SD\n");
     lk_bootmenu_quiesce();
-    return pick;
+    return lk_bootmenu_pick(pressed);
 }
 #endif /* MVII_MT6592_LK_SD_HANDOFF */
 
@@ -4552,14 +4389,13 @@ void mvii_lk_main(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
     if (boot_android == 0u) {
         mt6592_pmic_power_hold();
         (void)lk_sd_boot();
-        /* Declined: the card is absent or unbootable, so the eMMC image below
-         * is what boots. Re-tag honestly -- the splash came back with the
-         * dismiss, so the fallback tag is the first thing said since. */
-        boot_android = 1u;
-        if (display_rc == 0) lk_bootmenu_fallback_tag();
-        lk_mark(MT6592_BOOT_STATUS_STAGE_LK_BOOT_SELECT,
-                "lk: SD hand-off declined; boot re-tagged android (eMMC fallback)\n",
-                LK_BOOTMENU_BEACON_ANDROID);
+        /* A failed MixOS load is not an Android selection. Keep the error
+         * visible; only the explicit MENU choice may enter the Android path. */
+        lk_mark(MT6592_BOOT_STATUS_STAGE_LK_BOOTIMG_FAILED,
+                "lk: MixOS SD boot failed; refusing automatic Android fallback\n",
+                LK_BEACON_FAILED);
+        lk_bootmenu_error("MIXOS SD BOOT FAILED");
+        for (;;) lk_park_hold_ms(100u);
     } else {
         lk_log("lk: SD hand-off skipped; boot tagged android\n");
     }
