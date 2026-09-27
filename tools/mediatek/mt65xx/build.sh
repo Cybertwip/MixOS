@@ -2,14 +2,16 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 WITHOUT_BATTERY=0
+DEVICE="j36-ultra"
 OUTPUT=""
 JOBS="${BUILD_JOBS:-4}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --without-battery) WITHOUT_BATTERY=1; shift ;;
+        --device) [[ $# -ge 2 ]] || { echo '--device needs a codename' >&2; exit 2; }; DEVICE="$2"; shift 2 ;;
         --output) [[ $# -ge 2 ]] || { echo '--output needs a directory' >&2; exit 2; }; OUTPUT="$2"; shift 2 ;;
         -h|--help)
-            echo 'Usage: tools/mediatek/build.sh [--without-battery] [--output DIR]'
+            echo 'Usage: tools/mediatek/mt65xx/build.sh [--device j36-ultra] [--without-battery] [--output DIR]'
             echo 'Builds lk.bin, lk-release.bin, MVIIFlash.bin and assets.bin.'
             echo 'The flash CLI is build/flash (built by build-flashtools.sh, above the device split).'
             echo 'Requires LLVM (clang, ld.lld, llvm-objcopy), CMake and Python 3.'
@@ -18,9 +20,10 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
 done
+[[ "$DEVICE" == j36-ultra ]] || { echo "unknown mt65xx device '$DEVICE' (only j36-ultra)" >&2; exit 2; }
 MODE=battery
 [[ "$WITHOUT_BATTERY" == 0 ]] || MODE=without-battery
-OUTPUT="${OUTPUT:-$ROOT/../../build/mediatek/j36-ultra/$MODE}"
+OUTPUT="${OUTPUT:-$ROOT/../../build/mt65xx/j36-ultra/$MODE}"
 mkdir -p "$OUTPUT"
 OUTPUT="$(cd "$OUTPUT" && pwd -P)"
 # The CLI moved to build/flash: remove the per-mode copy this script used to

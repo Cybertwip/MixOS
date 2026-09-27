@@ -3,12 +3,13 @@
 # LK images plus the flash CLI, one boot dir per variant. The developer
 # picks a boot dir and flashes from it; this script never picks for them.
 #
-# This script builds nothing itself. It runs tools/mediatek/build.sh once per
-# power mode -- battery, then without-battery -- which is what keeps it correct
-# when the firmware gains flags: build.sh owns the power-mode table, this
-# script only enumerates it. The device table lives here: j36-ultra is the
-# proven LK (tools/mediatek/firmware, MT6592), and the mt67xx/mt68xx phone
-# LKs (tools/mediatek/mt67xx, tools/mediatek/mt68xx) build the same way -- same command, same
+# This script builds nothing itself. It runs tools/mediatek/mt65xx/build.sh
+# once per power mode -- battery, then without-battery -- which is what keeps
+# it correct when the firmware gains flags: build.sh owns the power-mode
+# table, this script only enumerates it. The device table lives here:
+# j36-ultra is the proven LK (tools/mediatek/mt65xx, MT6592), and the
+# mt67xx/mt68xx phone LKs (tools/mediatek/mt67xx, tools/mediatek/mt68xx)
+# build the same way -- same command, same
 # boot-dir-pick-and-flash flow, no gates, because building is harmless. The
 # phone images are bring-up instruments that do not boot anything yet (see
 # each tree's LK-BRINGUP.md); the care goes into flashing, not building.
@@ -23,13 +24,13 @@
 #                      oppo-mt6833, lg-mt6739, oppo-mt6765). Families without LK
 #                      sources fail loudly with the reason.
 #   --list             print the device matrix and exit without building
-#   --battery-only     build only build/mediatek/j36-ultra/battery/boot
-#   --without-battery  build only build/mediatek/j36-ultra/without-battery/boot
+#   --battery-only     build only build/mt65xx/j36-ultra/battery/boot
+#   --without-battery  build only build/mt65xx/j36-ultra/without-battery/boot
 #   --tests            also run the flash-tool Go suite and the LK bootmenu C test
 #
 # After a build, flash from the one CLI above the device split, e.g.:
 #   cd build
-#   ./flash -root ./mediatek/j36-ultra/without-battery/boot -upload release \
+#   ./flash -root ./mt65xx/j36-ultra/without-battery/boot -upload release \
 #       -device /dev/cu.usbmodemXXXX -yes
 #   ./flash -root ./mt68xx/cph2381/boot -upload lk -backend fastboot \
 #       -partition <LK-name-from-scatter> [-serial <fastboot-serial>]
@@ -55,7 +56,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 lk_matrix() {
-    printf '%-14s %s\n' j36-ultra "builds: tools/mediatek/firmware -> build/mediatek/j36-ultra/<mode>/boot"
+    printf '%-14s %s\n' j36-ultra "builds: tools/mediatek/mt65xx -> build/mt65xx/j36-ultra/<mode>/boot"
     printf '%-14s %s\n' oppo-mt6877 "no LK sources: the Dimensity 900 LK is OPPO's closed bootloader; the phone keeps stock LK (OS image: ./build-oppo.sh)"
     printf '%-14s %s\n' lg-msm8917 "no LK sources: the MSM8917 boots Qualcomm aboot, not LK; the phone keeps stock aboot (OS image: ./build-lg.sh)"
     printf '%-14s %s\n' oppo-mt6833 "builds: tools/mediatek/mt68xx -> build/mt68xx/<device>/boot (bring-up LK)"
@@ -121,7 +122,7 @@ if [[ -n "$DEVICE" ]]; then
             esac
             echo "error: no LK sources for $DEVICE -- $reason; the phone keeps its stock bootloader" >&2
             echo "Build its OS image instead: $instead." >&2
-            echo "LK sources for it would start as a new tools/<soc>/ tree, not as modes here." >&2
+            echo "LK sources for it would start as a new tools/mediatek/<family>/ tree, not as modes here." >&2
             exit 1 ;;
         *) echo "Unknown device: $DEVICE (want j36-ultra, oppo-mt6877, lg-msm8917, oppo-mt6833, lg-mt6739, oppo-mt6765)" >&2; exit 2 ;;
     esac
@@ -144,25 +145,25 @@ export GOCACHE="${GOCACHE:-$ROOT/build/go-cache}"
 if [[ "$DO_J36" == 1 ]]; then
     for mode in $MODES; do
         if [[ "$mode" == "without-battery" ]]; then
-            "$ROOT/tools/mediatek/build.sh" --without-battery
+            "$ROOT/tools/mediatek/mt65xx/build.sh" --device j36-ultra --without-battery
         else
-            "$ROOT/tools/mediatek/build.sh"
+            "$ROOT/tools/mediatek/mt65xx/build.sh" --device j36-ultra
         fi
     done
 
-    # Every variant verified: the four artifacts tools/mediatek/build.sh
+    # Every variant verified: the four artifacts tools/mediatek/mt65xx/build.sh
     # promises, in each mode's boot dir. A developer picks a boot dir as-is,
     # so a silent shortfall here would ship as a broken flash there. (The
     # flash CLI is build/flash now, not a fifth copy per dir.)
     for mode in $MODES; do
-        dir="$ROOT/build/mediatek/j36-ultra/$mode/boot"
+        dir="$ROOT/build/mt65xx/j36-ultra/$mode/boot"
         for f in lk.bin lk-release.bin MVIIFlash.bin assets.bin; do
             [[ -s "$dir/$f" ]] || { echo "missing $dir/$f after build" >&2; exit 1; }
         done
     done
     printf '\nAll LK variants are built; pick a boot dir and flash from it:\n'
     for mode in $MODES; do
-        printf '  build/mediatek/j36-ultra/%s/boot/  (lk-release.bin -> LK/UBOOT slot)\n' "$mode"
+        printf '  build/mt65xx/j36-ultra/%s/boot/  (lk-release.bin -> LK/UBOOT slot)\n' "$mode"
     done
 fi
 
@@ -202,7 +203,7 @@ if [[ "$RUN_TESTS" == 1 ]]; then
         export GOCACHE="${GOCACHE:-$ROOT/build/go-cache}"
         (cd "$ROOT/tools/mediatek/mvii-flash" && go test ./)
         cc -std=c99 -Wall -Wextra -Werror \
-            "$ROOT/tools/mediatek/firmware/tests/test-bootmenu.c" \
+            "$ROOT/tools/mediatek/mt65xx/firmware/tests/test-bootmenu.c" \
             -o /tmp/j36-bootmenu-test && /tmp/j36-bootmenu-test
     fi
     for family in $PHONE_TESTS; do
