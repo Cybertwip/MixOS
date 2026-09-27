@@ -550,13 +550,17 @@ func crashPhonePreloader(c *mtkSerialClient, phone *phoneRoot, facts phoneFacts)
 	}
 }
 
-// needsPhoneAuth decides whether the SEND_AUTH step runs: on DAA targets
-// with a blob to send. It is only reached in BROM mode -- flashPhoneBROM
-// transitions out of preloader mode first, because the preloader neither
-// speaks 0xE2 (it goes silent with EOF) nor survives the DA upload.
-func needsPhoneAuth(target mtkTargetConfig, hasAuth bool) (bool, string) {
+// needsPhoneAuth decides whether the SEND_AUTH step runs. In BROM it runs
+// on DAA targets with a blob to send. In preloader mode it is skipped:
+// the preloader neither speaks 0xE2 (it goes silent with EOF) nor needs
+// it -- it verifies the vendor DA signature at SEND_DA time instead
+// (0x7024 DAA_SIG_VERIFY_FAILED on unsigned payloads).
+func needsPhoneAuth(target mtkTargetConfig, isBROM, hasAuth bool) (bool, string) {
 	if !target.DAA {
 		return false, ""
+	}
+	if !isBROM {
+		return false, "Preloader mode: skipping SEND_AUTH (the preloader verifies the vendor DA signature at SEND_DA instead)."
 	}
 	if !hasAuth {
 		return false, "Warning: BROM enforces DAA but no -auth file was given; attempting the DA upload without it."
@@ -683,32 +687,20 @@ func flashPhoneBROM(cfg config, phone *phoneRoot) error {
 		return err
 	}
 	if !client.isBROM {
-		// Preloader mode is a dead end for the upload: the DA stage
-		// addresses are BROM SRAM addresses, and the one observed
-		// preloader-mode attempt died mid-upload with a USB drop. Arm
-		// the reset-to-BROM flag when the unit allows it, then wait
-		// for a BROM session either way: a flag refusal must not abort
-		// the run, because a key-combo replug during the wait lands in
-		// BROM and continues this same invocation.
-		fmt.Println("Phone is in preloader mode; arming the reset-to-BROM flag.")
-		if err := setPhonePreloaderBROMFlag(client, facts); err != nil {
-			fmt.Printf("Warning: %v\n", flagFailureAdvice(err))
-		}
-		crashPhonePreloader(client, phone, facts)
-		client, target, err = waitPhoneBROM(cfg, phone, facts, client, 3*time.Minute,
-			func(device string) (*mtkSerialClient, error) {
-				return connectMTKSerialWithOptions(device, mtkSerialConnectOptions{handshakeWake: true})
-			})
-		if err != nil {
-			return err
-		}
-		client.preloaderEMI = emi
+		// Preloader mode is a first-class upload path, not a dead end:
+		// the secured preloader verifies the vendor DA signature at
+		// SEND_DA (unsigned payloads die with 0x7024) and runs the DA
+		// itself. The one observed preloader-mode drop has the exact
+		// signature of the macOS CDC-ACM flake (tty transport, deep in
+		// bulk transfer); over libusb that vector is gone. Past the DA
+		// jump the mode distinction evaporates -- the DA owns the CPU.
+		fmt.Println("Phone is in preloader mode; uploading the vendor DA through it.")
 	}
 	defer func() {
 		_ = client.port.Close()
 	}()
 
-	if send, msg := needsPhoneAuth(target, plan.auth != ""); send {
+	if send, msg := needsPhoneAuth(target, client.isBROM, plan.auth != ""); send {
 		authBlob, err := os.ReadFile(plan.auth)
 		if err != nil {
 			return fmt.Errorf("phone target %s: read auth file %s: %w", phone.device, plan.auth, err)
