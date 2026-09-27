@@ -33,8 +33,8 @@ main, UI headers), `firmware/scripts/` (slot wrap), `firmware/tests/`
 ## Build
 
 `./tools/mt68xx/build.sh --device cph2381` -- or the wired route,
-`./build-flashtools.sh --device oppo-mt6833` (needs `OPPO_A77_BRINGUP_ACK=1`,
-like the OS scaffold). Lands `lk.bin`, `lk.elf`, `FACTS.md`,
+`./build-flashtools.sh --device oppo-mt6833` (no gates: building is harmless,
+same as the j36). Lands `lk.bin`, `lk.elf`, `FACTS.md`,
 `build-info.txt` in `build/mt68xx/<device>/boot/`. `-DMT68XX_DEBUG_UART=N`
 rebuilds for UART N when silence says UART0 was wrong.
 

@@ -37,20 +37,30 @@ if "$ROOT/build-flashtools.sh" --device oppo-mt6877 >/dev/null 2>&1; then
 else
     echo "  --device oppo-mt6877: refused ok"
 fi
-# Phone LK families build -- but only behind their bring-up ACK. The ACKs
-# are emptied here so a leaked developer environment cannot turn this fast
-# gate check into a real multi-minute build.
-if OPPO_A77_BRINGUP_ACK= LG_K20_BRINGUP_ACK= \
-        "$ROOT/build-flashtools.sh" --device oppo-mt6833 >/dev/null 2>&1; then
-    echo "FAIL: --device oppo-mt6833 built without ACK"; fail=1
+# Phone LK families build ungated (building is harmless; flashing is the
+# gated step, and it is manual). A real build is minutes + LLVM, so this
+# stays static: both families must be in the default plan and routed
+# through the per-device builder + verifier.
+if ! grep -q 'DO_PHONES="oppo-mt6833 lg-mt6739"' "$ROOT/build-flashtools.sh"; then
+    echo "FAIL: phone LKs missing from the default plan"; fail=1
 else
-    echo "  --device oppo-mt6833: ACK gate ok"
+    echo "  default plan builds phones: ok"
 fi
-if OPPO_A77_BRINGUP_ACK= LG_K20_BRINGUP_ACK= \
-        "$ROOT/build-flashtools.sh" --device lg-mt6739 >/dev/null 2>&1; then
-    echo "FAIL: --device lg-mt6739 built without ACK"; fail=1
+if ! grep -q 'build_phone_lk "$matrix"' "$ROOT/build-flashtools.sh"; then
+    echo "FAIL: phone builds bypass build_phone_lk"; fail=1
 else
-    echo "  --device lg-mt6739: ACK gate ok"
+    echo "  phone builder wiring: ok"
+fi
+if ! grep -q 'lk.bin lk.elf FACTS.md build-info.txt' "$ROOT/build-flashtools.sh"; then
+    echo "FAIL: phone per-variant check missing"; fail=1
+else
+    echo "  phone per-variant check: ok"
+fi
+# Power modes are j36-only: narrowing them for a phone must fail fast.
+if "$ROOT/build-flashtools.sh" --device oppo-mt6833 --battery-only >/dev/null 2>&1; then
+    echo "FAIL: --battery-only accepted for a phone"; fail=1
+else
+    echo "  phone mode guard: ok"
 fi
 if "$ROOT/build-flashtools.sh" --device bogus >/dev/null 2>&1; then
     echo "FAIL: --device bogus accepted"; fail=1

@@ -32,8 +32,8 @@ main, UI headers), `firmware/scripts/` (slot wrap), `firmware/tests/`
 ## Build
 
 `./tools/mt67xx/build.sh --device lm-x120` -- or the wired route,
-`./build-flashtools.sh --device lg-mt6739` (needs `LG_K20_BRINGUP_ACK=1`,
-like the OS scaffold). Lands `lk.bin`, `lk.elf`, `FACTS.md`,
+`./build-flashtools.sh --device lg-mt6739` (no gates: building is harmless,
+same as the j36). Lands `lk.bin`, `lk.elf`, `FACTS.md`,
 `build-info.txt` in `build/mt67xx/<device>/boot/`. `-DMT67XX_DEBUG_UART=N`
 rebuilds for UART N when silence says UART0 was wrong.
 

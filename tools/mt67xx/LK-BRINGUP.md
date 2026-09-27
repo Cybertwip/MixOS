@@ -12,11 +12,14 @@ An LM-X120 with a stock LK backup (SP Flash Tool readback or mtkclient)
 reachable from bootrom, UART wired at 115200, and the recovery path tested
 BEFORE the first flash (read back the slot you are about to write and
 compare hashes). Without those, stop: nothing below is testable and every
-flash is a brick risk. Same gate as the OS tree: `LG_K20_BRINGUP_ACK=1`.
+flash is a brick risk. No ACK gate on the LK build itself (building is
+harmless); the gate that matters is this paragraph -- backup + recovery
+path tested before the first flash. (The OS tree's `LG_K20_BRINGUP_ACK=1`
+is separate: it guards the long VM image build, not this one.)
 
 ## Step 0 -- toolchain proof (host only, no phone)
 
-`./build-flashtools.sh --device lg-mt6739` (with the ACK) and the host UI
+`./build-flashtools.sh --device lg-mt6739` and the host UI
 test (`cc ... tools/mt67xx/firmware/tests/test-lk-ui.c`). Success is a boot
 dir with `lk.bin`, `lk.elf`, `FACTS.md`, `build-info.txt`, and PASS. This
 proves the derivation compiles and wraps; it proves nothing about the

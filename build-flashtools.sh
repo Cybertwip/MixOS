@@ -8,10 +8,11 @@
 # when the firmware gains flags: build.sh owns the power-mode table, this
 # script only enumerates it. The device table lives here: j36-ultra is the
 # proven LK (tools/mediatek/firmware, MT6592), and the mt67xx/mt68xx phone
-# LKs (tools/mt67xx, tools/mt68xx) build behind their bring-up ACKs -- same
-# command, same boot-dir-pick-and-flash flow, but the phone images are
-# bring-up instruments that do not boot anything yet (see each tree's
-# LK-BRINGUP.md). The remaining phones keep their stock bootloaders --
+# LKs (tools/mt67xx, tools/mt68xx) build the same way -- same command, same
+# boot-dir-pick-and-flash flow, no gates, because building is harmless. The
+# phone images are bring-up instruments that do not boot anything yet (see
+# each tree's LK-BRINGUP.md); the care goes into flashing, not building.
+# The remaining phones keep their stock bootloaders --
 # OPPO's closed LK on the MT6877, Qualcomm aboot on the MSM8917 -- so there
 # is nothing to build for them until vendor LK sources exist; --list states
 # that per family instead of failing.
@@ -20,8 +21,7 @@
 #
 #   --device NAME      build only one family (j36-ultra, oppo-mt6877, lg-msm8917,
 #                      oppo-mt6833, lg-mt6739). Families without LK sources fail
-#                      loudly with the reason; the phone LK families need their
-#                      bring-up ACK (OPPO_A77_BRINGUP_ACK / LG_K20_BRINGUP_ACK).
+#                      loudly with the reason.
 #   --list             print the device matrix and exit without building
 #   --battery-only     build only build/mediatek/j36-ultra/battery/boot
 #   --without-battery  build only build/mediatek/j36-ultra/without-battery/boot
@@ -52,24 +52,21 @@ lk_matrix() {
     printf '%-14s %s\n' j36-ultra "builds: tools/mediatek/firmware -> build/mediatek/j36-ultra/<mode>/boot"
     printf '%-14s %s\n' oppo-mt6877 "no LK sources: the Dimensity 900 LK is OPPO's closed bootloader; the phone keeps stock LK (OS image: ./build-oppo.sh)"
     printf '%-14s %s\n' lg-msm8917 "no LK sources: the MSM8917 boots Qualcomm aboot, not LK; the phone keeps stock aboot (OS image: ./build-lg.sh)"
-    printf '%-14s %s\n' oppo-mt6833 "builds: tools/mt68xx -> build/mt68xx/<device>/boot (bring-up LK; needs OPPO_A77_BRINGUP_ACK=1)"
-    printf '%-14s %s\n' lg-mt6739 "builds: tools/mt67xx -> build/mt67xx/<device>/boot (bring-up LK; needs LG_K20_BRINGUP_ACK=1)"
+    printf '%-14s %s\n' oppo-mt6833 "builds: tools/mt68xx -> build/mt68xx/<device>/boot (bring-up LK)"
+    printf '%-14s %s\n' lg-mt6739 "builds: tools/mt67xx -> build/mt67xx/<device>/boot (bring-up LK)"
 }
 # One phone LK family: every devices.sh row gets its own boot dir, and each
 # dir is verified before the next builds -- a developer picks a boot dir
 # as-is, so a silent shortfall here would ship as a broken flash there.
-# Dies without the family's bring-up ACK: these images build but do not
-# boot anything yet (see tools/<family>/LK-BRINGUP.md).
+# No ACK gate: building is cheap and harmless (same as the j36), and these
+# images do not boot anything yet -- the danger is flashing, which stays a
+# manual step behind each tree's LK-BRINGUP.md and the FACTS.md in the dir.
 build_phone_lk() {
-    local matrix="$1" family devices_fn ack_var dev rows dir f
+    local matrix="$1" family devices_fn dev rows dir f
     case "$matrix" in
-        oppo-mt6833) family="mt68xx"; devices_fn="a77_devices"; ack_var="OPPO_A77_BRINGUP_ACK" ;;
-        lg-mt6739) family="mt67xx"; devices_fn="k20_devices"; ack_var="LG_K20_BRINGUP_ACK" ;;
+        oppo-mt6833) family="mt68xx"; devices_fn="a77_devices" ;;
+        lg-mt6739) family="mt67xx"; devices_fn="k20_devices" ;;
     esac
-    if [[ "${!ack_var:-}" != 1 ]]; then
-        echo "error: $matrix is bring-up scaffolding (see tools/$family/LK-BRINGUP.md): it builds but will not boot. Set $ack_var=1 to build anyway." >&2
-        exit 1
-    fi
     # shellcheck disable=SC1090
     . "$ROOT/device/oppo-a77/devices.sh"
     # shellcheck disable=SC1090
@@ -121,19 +118,8 @@ if [[ -n "$DEVICE" ]]; then
 else
     DEVICE="j36-ultra"
     echo "NOTE: oppo-mt6877 and lg-msm8917 have no LK sources (stock bootloaders retained). See --list."
-    # The phone LKs join the default run only behind their ACKs: their
-    # images build but do not boot yet, and failing the default run on
-    # their account would hold the proven j36 build hostage.
-    if [[ "${OPPO_A77_BRINGUP_ACK:-}" == 1 ]]; then
-        DO_PHONES="$DO_PHONES oppo-mt6833"
-    else
-        echo "NOTE: oppo-mt6833 skipped (bring-up LK; set OPPO_A77_BRINGUP_ACK=1 to build it)."
-    fi
-    if [[ "${LG_K20_BRINGUP_ACK:-}" == 1 ]]; then
-        DO_PHONES="$DO_PHONES lg-mt6739"
-    else
-        echo "NOTE: lg-mt6739 skipped (bring-up LK; set LG_K20_BRINGUP_ACK=1 to build it)."
-    fi
+    echo "NOTE: oppo-mt6833 + lg-mt6739 are bring-up LKs (they build; they do not boot anything yet)."
+    DO_PHONES="oppo-mt6833 lg-mt6739"
     PHONE_TESTS="mt67xx mt68xx"
 fi
 
