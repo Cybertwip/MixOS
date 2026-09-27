@@ -1395,12 +1395,12 @@ func listBackends(cfg config) error {
 	fmt.Println("mtkclient: removed from this package")
 	fmt.Println("raw-block: available with -backend=raw-block -device /dev/diskN")
 	if usbDevs := listMTKUSBDevices(); len(usbDevs) > 0 {
-		fmt.Println("mtk-usb (libusb, VID 0x0e8d):")
+		fmt.Println("mtk-usb (libusb, VID 0x0e8d/0x22d9/0x1004):")
 		for _, dev := range usbDevs {
 			fmt.Printf("  device: %s\n", dev)
 		}
 	} else if runtime.GOOS == "darwin" {
-		fmt.Println("mtk-usb (libusb, VID 0x0e8d): none")
+		fmt.Println("mtk-usb (libusb, VID 0x0e8d/0x22d9/0x1004): none")
 	}
 	if ports := sweepSerialPorts(); len(ports) == 0 {
 		fmt.Println("serial ports (port sweep): none")
